@@ -1,6 +1,4 @@
-//! The native OpenAI Chat Completions surface: the `/v1/chat/completions`
-//! handler with its keyed-replay protocol, plus the chat-shaped settled,
-//! aggregated, guarded, and live-streaming response paths.
+//! Native Chat Completions: keyed replay, aggregation, guardrails and streaming.
 
 use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -65,15 +63,14 @@ pub(crate) async fn chat(
         Err(_) => return error_response(&PublicError::invalid_json()),
     };
 
-    // Replay-keyed chat runs the python engine's exact idempotency protocol
-    // natively: the shared control plane computes the tenant-scoped replay
-    // key (or escalates a request the native path cannot serve), then the
-    // bounded replay store dedupes concurrent duplicates and replays the
-    // owner's exact stored response. Headers are decoded latin-1 so any
-    // HTTP-legal value matches the python engine's view byte for byte.
-    // Only the standard Idempotency-Key opts into replay: callers reuse
-    // x-client-request-id as a session correlation id across distinct
-    // sequential requests, so it never keys an operation.
+    // The control plane computes tenant-scoped replay identity; native replay
+    // dedupes owners and joiners. Only Idempotency-Key opts in, never the
+    // session correlation X-Client-Request-Id. Those headers use Latin-1 for
+    // byte parity with Python; attribution tags require UTF-8 JSON.
+    let request_tags = match crate::request_tags::request_tags(&headers) {
+        Ok(tags) => tags,
+        Err(error) => return error_response(&error),
+    };
     let idempotency_key = latin1_header(&headers, "idempotency-key");
     let client_request_id = latin1_header(&headers, "x-client-request-id");
     let mut lease: Option<OwnerLease> = None;
@@ -83,6 +80,7 @@ pub(crate) async fn chat(
             "body": body_text,
             "idempotency_key": idempotency_key,
             "client_request_id": client_request_id,
+            "request_tags": request_tags,
         }));
         let scope_text = match state.bridge.call("claim_scope", scope_argument).await {
             Ok(text) => text,
@@ -122,6 +120,7 @@ pub(crate) async fn chat(
         "body": body_text,
         "idempotency_key": idempotency_key,
         "client_request_id": client_request_id,
+        "request_tags": request_tags,
         "client_ip": client_ip(&headers),
     }));
     let admission_text = match state.bridge.call("admit", admit_argument).await {
@@ -506,7 +505,7 @@ async fn respond_from_chat_events(
             }
         }
     };
-    let aggregated = match completed_chat_body_with_carrier(
+    let mut aggregated = match completed_chat_body_with_carrier(
         &admission.request_id,
         &admission.alias,
         created_at,
@@ -584,12 +583,12 @@ async fn respond_from_chat_events(
             .await
     };
     if !settled {
-        // Success is only reported once the terminal accounting write landed.
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
         }
         return error_response(&PublicError::internal());
     }
+    crate::billing::body(&guard.bridge, &admission.request_id, &mut aggregated.body).await;
     let headers = served_headers(&admission, client_request_id.as_deref(), served);
     if stream_body {
         let body = match encode_chat_sse(
@@ -599,7 +598,7 @@ async fn respond_from_chat_events(
             carrier.as_deref(),
             admission.reasoning_exposed_at(depth),
         ) {
-            Ok(body) => body,
+            Ok(body) => crate::billing::sse(&guard.bridge, &admission.request_id, body).await,
             Err(error) => return error_response(&error),
         };
         if let Some(mut owner) = lease.take() {
@@ -929,7 +928,11 @@ async fn stream_response(
                         replayable,
                         &mut capture,
                         &cached_headers,
-                        encoded.into_iter().map(Bytes::from).collect(),
+                        crate::billing::frames(&guard.bridge, &request_id, encoded)
+                            .await
+                            .into_iter()
+                            .map(Bytes::from)
+                            .collect(),
                     )
                     .await;
                     return;
