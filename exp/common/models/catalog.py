@@ -663,7 +663,6 @@ class GatewayDeploymentMetadata(ContractModel):
     dispatch: GatewayRungDispatchPolicy | None = None
     cache_retention_seconds: float | None = Field(default=None, gt=0, le=3600, allow_inf_nan=False)
     """Conservative declared cache lifetime; unknown means no plausible warmth claim."""
-    """Optional dispatch policy for this rung; ``None`` is fully inert."""
 
 
 class ModelRecord(ContractModel):
