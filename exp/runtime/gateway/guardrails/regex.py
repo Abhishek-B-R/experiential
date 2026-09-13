@@ -1,4 +1,11 @@
-"""Bounded RE2 detection with deterministic, in-memory text redaction."""
+"""Bounded RE2 detection with deterministic, in-memory text redaction.
+
+The detector is deterministic: its verdict on a prefix of a subject cannot be
+changed by text arriving later, except through a match that straddles the
+prefix boundary. That property lets a streamed completion be redacted
+incrementally, so :class:`RegexClassifier` also serves as the streaming
+redactor described in :mod:`exp.runtime.gateway.guardrails.streaming`.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +24,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailCheck,
     GuardrailCompletion,
 )
+from exp.runtime.gateway.guardrails.streaming import StreamingRedactor
 
 
 class BuiltinPattern(StrEnum):
@@ -38,6 +46,20 @@ _BUILTINS = {
 }
 _MAX_MATCHES = 4096
 _MAX_TEXT_BYTES = 1_048_576
+_LETTERS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_DIGITS = "0123456789"
+_EMAIL_ALPHABET = frozenset(_LETTERS + _DIGITS + ".!#$%&'*+/=?^_`{|}~-@")
+_CARD_ALPHABET = frozenset(_DIGITS + " -")
+_API_KEY_ALPHABET = frozenset(_LETTERS + _DIGITS + "_-")
+_HOLDS: dict[BuiltinPattern, tuple[frozenset[str], int]] = {
+    # One match of a family can only be built from that family's own
+    # characters, and can never be longer than its bound: an address with the
+    # RFC maximum local part and domain, a 19 digit card with separators, and
+    # a key token far past every issued prefix length.
+    BuiltinPattern.EMAIL: (_EMAIL_ALPHABET, 320),
+    BuiltinPattern.CREDIT_CARD: (_CARD_ALPHABET, 38),
+    BuiltinPattern.API_KEY: (_API_KEY_ALPHABET, 128),
+}
 
 
 class RegexAdapterDocument(ContractModel):
@@ -52,6 +74,17 @@ class RegexAdapterDocument(ContractModel):
     patterns: tuple[str, ...] = Field(default=(), max_length=32)
     builtin_patterns: tuple[BuiltinPattern, ...] = ()
     replacement: str = Field(default="[REDACTED]", min_length=1, max_length=128)
+    stream_window_characters: int = Field(default=512, ge=64, le=65_536)
+    """Most trailing characters ever held back while a stream is redacted.
+
+    A built-in family holds only its own trailing candidate run, which is
+    always shorter than this cap. An authored expression has no declared
+    alphabet or length, so it holds the whole window: the window must be at
+    least as long as the longest text that expression can match, because a
+    match shorter than the window can never reach from the released prefix
+    past the end of the buffered tail. Raise it for a custom pattern that can
+    match a longer run.
+    """
 
     @model_validator(mode="after")
     def _validate_patterns(self) -> RegexAdapterDocument:
@@ -91,6 +124,24 @@ def _compile(pattern: str) -> _Pattern:
         return cast(_Pattern, re2.compile(pattern, options=options))
     except re2.error:
         raise ValueError("invalid RE2 expression; check syntax and simplify the pattern") from None
+
+
+def _run_start(text: str, alphabet: frozenset[str], longest: int) -> int:
+    """Return where the trailing run of one family's characters begins.
+
+    Args:
+        text: Buffered completion tail.
+        alphabet: Every character one match of the family can contain.
+        longest: Most characters one match of the family can span.
+
+    Returns:
+        The offset of the first character that must stay buffered.
+    """
+    start = len(text)
+    floor = max(0, len(text) - longest)
+    while start > floor and text[start - 1] in alphabet:
+        start -= 1
+    return start
 
 
 def _valid_card(digits: list[int]) -> bool:
@@ -144,6 +195,53 @@ class RegexClassifier:
             ]
         )
         self._replacement = document.replacement
+        self._stream_window = document.stream_window_characters
+        self._holds = tuple(_HOLDS[kind] for kind in document.builtin_patterns)
+        self._authored = bool(document.patterns)
+
+    def stream_redactor(self) -> StreamingRedactor:
+        """Return this deterministic detector as its own streaming redactor."""
+        return self
+
+    def release_boundary(self, text: str) -> int:
+        """Return how many leading characters of a buffered tail are settled.
+
+        A match that later text can still grow into must end at the end of
+        the tail, so it is written entirely in one family's own characters
+        and is no longer than that family's bound. The boundary is therefore
+        the start of the trailing run of such characters, and everything
+        before it is settled: no later delta can reach back across a
+        character the family cannot match. An authored expression has no
+        declared alphabet, so it holds the whole configured window instead.
+        Luhn validation is not applied here, so a card candidate that is not
+        yet a valid card still holds the boundary back.
+
+        Args:
+            text: Buffered completion tail, oldest character first.
+
+        Returns:
+            The count of leading characters no later text can change.
+        """
+        boundary = len(text)
+        if self._authored:
+            boundary = max(0, len(text) - self._stream_window)
+        for alphabet, longest in self._holds:
+            boundary = min(boundary, _run_start(text, alphabet, longest))
+        return max(boundary, len(text) - self._stream_window, 0)
+
+    def redact(self, text: str) -> tuple[bool, str]:
+        """Return whether ``text`` matched and its fully redacted form.
+
+        Args:
+            text: One complete subject, or one settled prefix of a completion.
+
+        Returns:
+            The flag and the redacted text.
+
+        Raises:
+            ValueError: The subject breached an inspection bound.
+        """
+        return self._redact(text)
 
     def _redact(self, text: str) -> tuple[bool, str]:
         """Union matched spans before replacement so overlapping rules cannot leak tails."""

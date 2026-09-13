@@ -41,9 +41,17 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
-from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
+from exp.runtime.gateway.guardrails.contracts import (
+    GuardrailPolicy,
+    GuardrailRejected,
+    OutputGuardrailMode,
+)
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
-from exp.runtime.gateway.guardrails.native import enforce_native_input, enforce_native_output
+from exp.runtime.gateway.guardrails.native import (
+    enforce_native_input,
+    enforce_native_output,
+    enforce_native_output_segment,
+)
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
@@ -662,7 +670,7 @@ class NativeControlPlane(
             "maximum_total_attempts": MAXIMUM_TOTAL_ATTEMPTS,
             "maximum_same_deployment_attempts": MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
             "refusal_failover": authorization.refusal_failover,
-            "output_guardrail": bool(policy is not None and policy.output_checks),
+            "output_guardrail": self._output_guardrail_mode(policy, public_request).value,
         }
         if route.snapshot.throttle_redial is not None:
             # The pool's frozen backoff-and-redial schedule; absent (not
@@ -784,6 +792,48 @@ class NativeControlPlane(
                 is kept so the deadline sweep can still close it.
         """
         return self._accounting.abandon(argument)
+
+    def _output_guardrail_mode(
+        self,
+        policy: GuardrailPolicy | None,
+        request: GatewayRequest,
+    ) -> OutputGuardrailMode:
+        """Return the output enforcement shape this admission must use.
+
+        Args:
+            policy: Policy resolved during input enforcement, if any.
+            request: Canonical request after continuation expansion.
+
+        Returns:
+            ``off``, ``buffer``, or ``stream`` for the data plane.
+        """
+        if self._guardrails is None:
+            return OutputGuardrailMode.OFF
+        tools_offered = bool(
+            request.tools or request.provider_native_tools or request.provider_server_tools
+        )
+        reasoning_text = bool(
+            request.reasoning_summary is not None
+            or request.reasoning_effort is not None
+            or request.thinking_default_enable
+        )
+        return self._guardrails.output_mode(
+            policy,
+            streaming=request.stream,
+            tools_offered=tools_offered,
+            reasoning_text_requested=reasoning_text,
+        )
+
+    def enforce_output_segment(self, argument: str) -> str:
+        """Release the settled part of one streamed completion tail.
+
+        The data plane calls this once per provider delta (and once at the
+        stream's end) for an admission whose mode is ``stream``.
+        """
+        data = json.loads(argument)
+        entry = self._accounting.entry(str(data.get("request_id") or ""))
+        policy = None if entry is None else entry.policy
+        return enforce_native_output_segment(self._guardrails, policy, argument)
 
     def enforce_output(self, argument: str) -> str:
         """Run one output-chain callback for a native buffered completion."""

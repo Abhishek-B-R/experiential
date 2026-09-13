@@ -101,6 +101,75 @@ def encode_output_decision(
     return json.dumps(payload, separators=(",", ":"))
 
 
+def _guardrail_failure_payload(safe_message: str, failure_class: str = "guardrail") -> JsonObject:
+    """Return one sanitized failure body for a native decision."""
+    return {"failure_class": failure_class, "safe_message": safe_message}
+
+
+def _released_bytes(data: JsonObject) -> int:
+    """Return how many completion bytes the data plane already released."""
+    value = data.get("released_bytes")
+    return value if isinstance(value, int) else 0
+
+
+def enforce_native_output_segment(
+    engine: GuardrailEngine | None,
+    policy: GuardrailPolicy | None,
+    argument: str,
+) -> str:
+    """Redact and release the settled part of one streamed completion tail.
+
+    The data plane owns the buffer: it presents the tail it is holding and
+    receives back the text it may send now plus the text it must keep. The
+    call is synchronous on the caller's thread, because a deterministic
+    redactor is bounded CPU work and any hop would reintroduce the latency
+    this path exists to remove.
+
+    Args:
+        engine: Optional composed engine.
+        policy: Policy captured at admission. ``None`` means unguarded.
+        argument: JSON object with ``pending``, ``final``, and
+            ``released_bytes``.
+
+    Returns:
+        JSON decision with ``action`` plus either ``release``, ``pending``,
+        and ``flagged``, or a sanitized ``failure``.
+    """
+    data = cast(JsonObject, json.loads(argument))
+    if engine is None or policy is None:
+        return _encode_segment_failure(
+            _guardrail_failure_payload("A gateway guardrail could not complete this request.")
+        )
+    try:
+        segment = engine.release_output_segment(
+            policy=policy,
+            pending=str(data.get("pending") or ""),
+            final=bool(data.get("final")),
+            released_bytes=_released_bytes(data),
+        )
+    except GuardrailRejected as exc:
+        return _encode_segment_failure(
+            _guardrail_failure_payload(exc.failure.safe_message, exc.failure.failure_class.value)
+        )
+    return json.dumps(
+        {
+            "action": GuardrailAction.ALLOW.value,
+            "release": segment.release,
+            "pending": segment.pending,
+            "flagged": segment.flagged,
+        },
+        separators=(",", ":"),
+    )
+
+
+def _encode_segment_failure(failure: JsonObject) -> str:
+    """Encode one fail-closed streaming decision that releases nothing."""
+    return json.dumps(
+        {"action": GuardrailAction.ERROR.value, "failure": failure},
+        separators=(",", ":"),
+    )
+
+
 def enforce_native_output(
     engine: GuardrailEngine | None,
     policy: GuardrailPolicy | None,
