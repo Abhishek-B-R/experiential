@@ -233,7 +233,18 @@ def test_a_deterministic_output_policy_admits_without_the_python_callback(
     assert admission["guardrail_output_plan"] == {
         "protected": True,
         "max_response_bytes": 1_048_576,
-        "checks": [{"action": "modify", "adapter_id": "pii"}],
+        "policy_id": "member-policy",
+        "organization_id": "local",
+        "identity_id": "default",
+        "checks": [
+            {
+                "action": "modify",
+                "adapter_id": "pii",
+                "check_id": "output-pii",
+                "capability": "pii",
+                "timeout_ms": 100,
+            }
+        ],
     }
 
 

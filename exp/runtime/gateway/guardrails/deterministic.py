@@ -122,13 +122,21 @@ def native_input_request(
     for check in policy.input_checks:
         detector = detectors[check.adapter_id]
         remaining = deadline_monotonic - monotonic()
-        if min(check.timeout_ms / 1000.0, remaining) <= 0:
+        # The check runs under the tighter of its authored timeout and the
+        # remaining request deadline, exactly as the engine bounds it.
+        budget = min(check.timeout_ms / 1000.0, remaining)
+        if budget <= 0:
             _uncertain(policy, check)
             continue
         started = monotonic()
         try:
             messages, flagged, tool_match = _redacted_messages(detector, current)
         except ValueError:
+            _uncertain(policy, check)
+            continue
+        # A scan that overran its budget is uncertain: an inspection the
+        # engine would have abandoned never returns a verdict here.
+        if monotonic() - started > budget:
             _uncertain(policy, check)
             continue
         if not flagged:
@@ -255,8 +263,17 @@ def native_output_plan(
     return {
         "protected": policy.protected,
         "max_response_bytes": policy.max_response_bytes,
+        "policy_id": policy.policy_id,
+        "organization_id": policy.organization_id,
+        "identity_id": policy.identity_id,
         "checks": [
-            {"action": check.action.value, "adapter_id": check.adapter_id}
+            {
+                "action": check.action.value,
+                "adapter_id": check.adapter_id,
+                "check_id": check.check_id,
+                "capability": check.capability.value,
+                "timeout_ms": check.timeout_ms,
+            }
             for check in policy.output_checks
         ],
     }

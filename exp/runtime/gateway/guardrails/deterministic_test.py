@@ -54,6 +54,11 @@ _CORPUS = (
     "id-42 and id-7 and id-٤٢",
     "xabcdey",
     "a" * 500 + "@" + "example.com",
+    "a b",
+    "a\tb",
+    "a\fb",
+    "a\rb",
+    "a\vb",
 )
 
 
@@ -97,6 +102,7 @@ def _adapter(**overrides: object) -> JsonObject:
         RegexAdapterDocument(adapter_id="cards", builtin_patterns=(BuiltinPattern.CREDIT_CARD,)),
         RegexAdapterDocument(adapter_id="custom", patterns=("abc", "cde"), replacement=r"\1"),
         RegexAdapterDocument(adapter_id="ascii", patterns=(r"\bid-\d+\b",), replacement="[ID]"),
+        RegexAdapterDocument(adapter_id="space", patterns=(r"a\sb",), replacement="[WS]"),
         RegexAdapterDocument(
             adapter_id="mixed",
             patterns=(r"internal-[0-9]+", r"\w+@corp\.test"),
@@ -104,7 +110,7 @@ def _adapter(**overrides: object) -> JsonObject:
             replacement="*",
         ),
     ],
-    ids=["builtins", "cards", "literal_replacement", "ascii_classes", "mixed"],
+    ids=["builtins", "cards", "literal_replacement", "ascii_classes", "whitespace", "mixed"],
 )
 def test_native_detector_output_matches_the_python_adapter(
     document: RegexAdapterDocument,
@@ -194,6 +200,28 @@ def test_the_native_input_chain_refuses_matched_tool_arguments() -> None:
         )
 
 
+def test_the_native_input_chain_fails_closed_on_an_overrun_scan() -> None:
+    """A scan that finishes past its authored budget never returns a verdict."""
+    engine = engine_from_document(_adapter(builtin_patterns=["email"]))
+    policy = engine.policy_for("org", "identity")
+    assert policy is not None
+    detectors = compile_native_detectors(engine.deterministic_specifications)
+    ticks = iter((0.0, 0.0, 5.0))
+
+    def _clock() -> float:
+        """Advance past the authored 500 ms budget during the scan itself."""
+        return next(ticks)
+
+    with pytest.raises(GuardrailRejected):
+        native_input_request(
+            policy,
+            detectors,
+            _request(content="alice@example.com"),
+            monotonic=_clock,
+            deadline_monotonic=1e12,
+        )
+
+
 def test_the_native_input_chain_declines_a_hosted_adapter() -> None:
     """A chain the data plane cannot evaluate returns to the python engine."""
     engine = engine_from_document(_adapter(builtin_patterns=["email"]))
@@ -221,7 +249,18 @@ def test_a_deterministic_policy_resolves_into_an_admission_plan() -> None:
     assert plan == {
         "protected": True,
         "max_response_bytes": policy.max_response_bytes,
-        "checks": [{"action": "modify", "adapter_id": "patterns"}],
+        "policy_id": "redact",
+        "organization_id": "org",
+        "identity_id": "identity",
+        "checks": [
+            {
+                "action": "modify",
+                "adapter_id": "patterns",
+                "check_id": "output",
+                "capability": "pii",
+                "timeout_ms": 500,
+            }
+        ],
     }
 
 

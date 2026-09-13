@@ -26,10 +26,19 @@ use crate::guardrails::detector::Detector;
 pub type DetectorMap = HashMap<String, Arc<Detector>>;
 
 /// One resolved deterministic check in an output chain.
+///
+/// `check_id` and `capability` are the authored content-free identities the
+/// decision stream names. `timeout_ms` is the authored inspection budget,
+/// which bounds this check just as it bounds the python adapter.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PlanCheck {
     pub action: String,
     pub adapter_id: String,
+    #[serde(default)]
+    pub check_id: String,
+    #[serde(default)]
+    pub capability: String,
+    pub timeout_ms: u64,
 }
 
 /// The resolved deterministic output chain for one admitted request.
@@ -38,6 +47,12 @@ pub struct OutputPlan {
     #[serde(default)]
     pub protected: bool,
     pub max_response_bytes: usize,
+    #[serde(default)]
+    pub policy_id: String,
+    #[serde(default)]
+    pub organization_id: String,
+    #[serde(default)]
+    pub identity_id: String,
     pub checks: Vec<PlanCheck>,
 }
 
@@ -122,11 +137,29 @@ fn content_bytes(completion: &Completion) -> usize {
     crate::encode::compact_json(&subject).len()
 }
 
+/// Emit one content-free decision line, the native mirror of the python
+/// engine's `guardrail decision` record. It carries identities and latency
+/// only, never completion text, matches, or replacements.
+fn record(plan: &OutputPlan, check: Option<&PlanCheck>, action: &str, elapsed: Duration) {
+    let line = json!({
+        "event": "guardrail_decision",
+        "policy_id": plan.policy_id,
+        "organization_id": plan.organization_id,
+        "identity_id": plan.identity_id,
+        "check_id": check.map(|entry| entry.check_id.as_str()),
+        "capability": check.map(|entry| entry.capability.as_str()),
+        "action": action,
+        "latency_ms": elapsed.as_secs_f64() * 1000.0,
+    });
+    eprintln!("exp-gateway-native: {line}");
+}
+
 /// Apply the fail-closed rule for one uncertain check.
 ///
 /// Returns `Ok(())` when a non-protected identity skips the check and
 /// continues the remaining chain.
-fn uncertain(plan: &OutputPlan) -> Result<(), Failure> {
+fn uncertain(plan: &OutputPlan, check: &PlanCheck) -> Result<(), Failure> {
+    record(plan, Some(check), "error", Duration::ZERO);
     if plan.protected {
         return Err(error_failure());
     }
@@ -146,23 +179,29 @@ pub fn enforce(
 ) -> Result<Vec<Event>, Failure> {
     let completion = projection(&events);
     if content_bytes(&completion) > plan.max_response_bytes {
+        record(plan, None, "error", Duration::ZERO);
         return Err(error_failure());
     }
     let mut text = completion.text;
     let mut rewritten = false;
     for check in &plan.checks {
-        if deadline.saturating_duration_since(Instant::now()) == Duration::ZERO {
-            uncertain(plan)?;
+        // The check runs under the tighter of its authored timeout and the
+        // remaining request deadline, exactly as the python chain does.
+        let budget = Duration::from_millis(check.timeout_ms)
+            .min(deadline.saturating_duration_since(Instant::now()));
+        if budget == Duration::ZERO {
+            uncertain(plan, check)?;
             continue;
         }
         let Some(detector) = detectors.get(&check.adapter_id) else {
-            uncertain(plan)?;
+            uncertain(plan, check)?;
             continue;
         };
+        let started = Instant::now();
         let redacted = match detector.redact(&text) {
             Ok(value) => value,
             Err(_) => {
-                uncertain(plan)?;
+                uncertain(plan, check)?;
                 continue;
             }
         };
@@ -174,13 +213,18 @@ pub fn enforce(
                 Err(_) => limited = true,
             }
         }
-        if limited {
-            uncertain(plan)?;
+        let elapsed = started.elapsed();
+        // A scan that overran its budget is uncertain: an inspection the
+        // python chain would have abandoned never returns a verdict here.
+        if limited || elapsed > budget {
+            uncertain(plan, check)?;
             continue;
         }
         if !flagged {
+            record(plan, Some(check), "allow", elapsed);
             continue;
         }
+        record(plan, Some(check), &check.action, elapsed);
         match check.action.as_str() {
             "allow" => {}
             "modify" => {
@@ -226,9 +270,15 @@ mod tests {
         OutputPlan {
             protected,
             max_response_bytes: 1_048_576,
+            policy_id: "policy".to_string(),
+            organization_id: "org".to_string(),
+            identity_id: "identity".to_string(),
             checks: vec![PlanCheck {
                 action: action.to_string(),
                 adapter_id: "pii".to_string(),
+                check_id: "pii-out".to_string(),
+                capability: "pii".to_string(),
+                timeout_ms: 5_000,
             }],
         }
     }
@@ -337,6 +387,20 @@ mod tests {
         let skipped = enforce(&plan("modify", false), &empty, events, deadline())
             .expect("a non protected identity skips the check");
         assert!(matches!(skipped[0], Event::TextDelta(ref text) if text == "ada@example.com"));
+    }
+
+    #[test]
+    fn an_exhausted_check_timeout_is_an_uncertain_check() {
+        let events = vec![Event::TextDelta("ada@example.com".to_string())];
+        let mut expired = plan("modify", true);
+        expired.checks[0].timeout_ms = 0;
+        assert!(enforce(
+            &expired,
+            &detectors("pii", "[REDACTED]"),
+            events,
+            deadline(),
+        )
+        .is_err());
     }
 
     #[test]

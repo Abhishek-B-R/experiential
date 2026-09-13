@@ -44,11 +44,11 @@ fn perl_class(letter: char) -> Option<PerlClass> {
             inner: None,
         }),
         's' => Some(PerlClass {
-            outer: "[\\t\\n\\x0B\\x0C\\r ]",
-            inner: Some("\\t\\n\\x0B\\x0C\\r "),
+            outer: "[\\t\\n\\x0C\\r ]",
+            inner: Some("\\t\\n\\x0C\\r "),
         }),
         'S' => Some(PerlClass {
-            outer: "[^\\t\\n\\x0B\\x0C\\r ]",
+            outer: "[^\\t\\n\\x0C\\r ]",
             inner: None,
         }),
         _ => None,
@@ -157,6 +157,15 @@ mod tests {
         assert_eq!(to_rust_syntax(r"\d+").unwrap(), "[0-9]+");
         assert_eq!(to_rust_syntax(r"\w").unwrap(), "[0-9A-Za-z_]");
         assert_eq!(to_rust_syntax(r"\D").unwrap(), "[^0-9]");
+    }
+
+    #[test]
+    fn whitespace_excludes_the_vertical_tab_re2_omits() {
+        let translated = to_rust_syntax(r"a\sb").unwrap();
+        let expression = regex::Regex::new(&translated).unwrap();
+        assert!(expression.is_match("a b"));
+        assert!(expression.is_match("a\tb"));
+        assert!(!expression.is_match("a\u{000b}b"));
     }
 
     #[test]
