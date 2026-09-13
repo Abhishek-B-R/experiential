@@ -88,17 +88,18 @@ class GatewayPoolRecord(ContractModel):
     throttle_redial: GatewayThrottleRedialPolicy | None = None
     """Backoff-and-redial schedule for a throttled rung before the ladder advances.
 
-    When authored, a throttle on a rung worth waiting for (every rung when no
-    ``throttle_cache_threshold`` is authored; otherwise exactly the rungs
-    where the requesting organization's cached fraction meets the threshold)
-    is re-dialed on the SAME rung with exponential backoff up to the schedule's
-    redial cap, then fails over down the ladder, and surfaces to the caller
-    only when every rung is exhausted. Under every ``failover_mode`` this
-    replaces the surfacing throttle rule: with a redial schedule authored,
-    ``maximize_cache`` and a met threshold mean "back off on this rung", never
-    "return the 429 while another rung could serve". A rung below the
-    threshold still fails over cold immediately, because there is no warm
-    cache worth the wait. ``None`` (the default) keeps the unauthored
+    When authored, a throttle is re-dialed on the SAME rung with exponential
+    backoff, then fails over down the ladder, and surfaces to the caller only
+    when every rung is exhausted. How many redials a rung is worth for one
+    request is the schedule's ``max_attempts`` scaled by the cache at stake:
+    the full budget on every rung when no ``throttle_cache_threshold`` is
+    authored, otherwise the full budget where the requesting organization's
+    cached fraction meets the threshold, a proportional share below it, and
+    zero with no cache evidence (fail over at once). Under every
+    ``failover_mode`` this replaces the surfacing throttle rule: with a
+    redial schedule authored, ``maximize_cache`` and a met threshold mean
+    "back off on this rung", never "return the 429 while another rung could
+    serve". ``None`` (the default) keeps the unauthored
     behavior byte-identical; authoring is deployment-ordered exactly like the
     threshold.
     """

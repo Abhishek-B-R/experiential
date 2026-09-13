@@ -905,7 +905,7 @@ def test_throttle_redial_redials_the_warm_rung_through_its_window_until_the_cap(
             failover_mode="maximize_cache",
             throttle_redial=_REDIAL,
             throttle_backoff=backoff,
-            throttle_redials_so_far=redials,
+            throttle_redial_budget=_REDIAL.max_attempts - redials,
         )
 
     # Two redials of the warm rung after its throttled dispatch...
@@ -960,6 +960,7 @@ def test_throttle_redial_replaces_the_threshold_surfacing_rule_and_leaves_other_
             cached_fraction=0.9,
             throttle_redial=throttle_redial,
             throttle_backoff=throttle_backoff,
+            throttle_redial_budget=_REDIAL.max_attempts,
         )
 
     # Without a schedule the met threshold surfaces the throttle.
@@ -998,13 +999,16 @@ def test_dispatch_disclosure_names_a_backoff_redial_on_every_pool() -> None:
     )
 
 
-def test_wire_entry_carries_the_throttle_backoff_eligibility_flag() -> None:
-    """The admission-time verdict rides the wire entry; unauthored rungs say false."""
+def test_wire_entry_carries_the_throttle_redial_budget() -> None:
+    """The admission-time redial budget rides the wire entry; unauthored rungs carry zero."""
     route = _route()
     profile = GatewayWireProfile(dialect="openai_responses", url="https://provider.test")
-    assert not deployment_wire_entry(route, route.deployment, profile, {})[
-        "throttle_backoff_eligible"
-    ]
-    assert deployment_wire_entry(
-        route, route.deployment, profile, {}, throttle_backoff_eligible=True
-    )["throttle_backoff_eligible"]
+    assert (
+        deployment_wire_entry(route, route.deployment, profile, {})["throttle_redial_budget"] == 0
+    )
+    assert (
+        deployment_wire_entry(route, route.deployment, profile, {}, throttle_redial_budget=3)[
+            "throttle_redial_budget"
+        ]
+        == 3
+    )

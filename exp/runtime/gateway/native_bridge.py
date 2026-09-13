@@ -110,7 +110,7 @@ from exp.runtime.gateway.native_responses import (
     continued_request,
     responses_envelope,
 )
-from exp.runtime.gateway.native_rung_policy import throttle_backoff_eligibility
+from exp.runtime.gateway.native_rung_policy import throttle_redial_budgets
 from exp.runtime.gateway.native_rungs import build_rung_dispatch
 from exp.runtime.gateway.native_settlement import (
     gateway_updating_failure,
@@ -522,15 +522,15 @@ class NativeControlPlane(
             signers: list[GatewayDispatchSigner | None] = []
             dispatch_bindings: list[FrozenDispatchBinding | None] = []
             carrier_authorities: list[ReasoningCarrierAuthority | None] = []
-            # Which rungs a throttle is worth backing off on for THIS request
-            # (pool schedule authored, cache at stake meets any threshold),
+            # How long a throttle is worth waiting on per rung for THIS
+            # request (the pool's schedule scaled by the cache at stake),
             # decided here so the data plane never waits on a rung whose
             # throttle should fail over cold at once.
-            backoff_eligible = throttle_backoff_eligibility(
+            redial_budgets = throttle_redial_budgets(
                 self._accounting.loads, route, authorization.organization_id
             )
-            for deployment, (profile, client), eligible in zip(
-                route.deployments, resolved_wires, backoff_eligible, strict=True
+            for deployment, (profile, client), budget in zip(
+                route.deployments, resolved_wires, redial_budgets, strict=True
             ):
                 dispatch = build_rung_dispatch(
                     route,
@@ -540,7 +540,7 @@ class NativeControlPlane(
                     provider_request=provider_request,
                     public_request=public_request,
                     authorization=authorization,
-                    throttle_backoff_eligible=eligible,
+                    throttle_redial_budget=budget,
                 )
                 if dispatch.parallel_disclosure is not None:
                     parallel_disclosures.add(dispatch.parallel_disclosure)
@@ -646,6 +646,7 @@ class NativeControlPlane(
                 ),
                 affinity_fingerprint=placement.fingerprint,
                 sticky_preferred=placement.sticky_preferred,
+                throttle_redial_budgets=redial_budgets,
             )
         )
         response: JsonObject = {
