@@ -165,34 +165,21 @@ def test_a_digit_run_holds_no_more_than_one_card() -> None:
     assert segment.release + segment.pending == "1" * 400
 
 
-def test_an_authored_pattern_holds_the_whole_window() -> None:
-    """An expression with no declared alphabet keeps the configured window."""
+def test_an_authored_pattern_is_not_streamable() -> None:
+    """An expression of unknown span keeps its completions buffered.
+
+    Nothing bounds how far one authored match can reach, so no trailing
+    window can prove a released prefix is settled.
+    """
     detector = RegexClassifier(
         RegexAdapterDocument(
             adapter_id="detector",
             patterns=(r"SECRET-[0-9]+",),
-            stream_window_characters=64,
+            builtin_patterns=(BuiltinPattern.EMAIL,),
+            stream_window_characters=65_536,
         )
     )
-    pending = "plain prose " * 20
-    segment = release_segment(redactor=detector, pending=pending, final=False)
-    assert len(segment.pending) == 64
-    assert segment.release + segment.pending == pending
-
-
-def test_an_authored_pattern_still_redacts_across_a_split() -> None:
-    """The window keeps an authored match whole across delta boundaries."""
-    detector = RegexClassifier(
-        RegexAdapterDocument(
-            adapter_id="detector",
-            patterns=(r"SECRET-[0-9]+",),
-            stream_window_characters=64,
-        )
-    )
-    completion = "value SECRET-12345 done"
-    _, whole = detector.redact(completion)
-    for chunks in _splits(completion):
-        assert _stream(detector, chunks) == whole
+    assert detector.stream_redactor() is None
 
 
 def test_detector_advertises_the_streaming_capability() -> None:

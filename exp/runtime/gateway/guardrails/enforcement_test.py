@@ -1220,6 +1220,27 @@ def test_deterministic_modify_chain_streams() -> None:
     )
 
 
+def test_an_authored_regex_chain_keeps_the_buffered_path() -> None:
+    """An expression of unknown span offers no redactor, so the stream buffers."""
+    detector = RegexClassifier(
+        RegexAdapterDocument(adapter_id="scripted", patterns=(r"SECRET-[0-9]+",))
+    )
+    engine, _ = _engine(
+        classifier=detector,
+        checks=(_check("output-one", stage=GuardrailCheckStage.OUTPUT),),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert (
+        engine.output_mode(
+            policy,
+            streaming=True,
+            tools_offered=False,
+            reasoning_text_requested=False,
+        )
+        is OutputGuardrailMode.BUFFER
+    )
+
+
 @pytest.mark.parametrize(
     ("streaming", "tools_offered", "reasoning_text_requested"),
     [(False, False, False), (True, True, False), (True, False, True)],

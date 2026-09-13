@@ -77,13 +77,12 @@ class RegexAdapterDocument(ContractModel):
     stream_window_characters: int = Field(default=512, ge=64, le=65_536)
     """Most trailing characters ever held back while a stream is redacted.
 
-    A built-in family holds only its own trailing candidate run, which is
-    always shorter than this cap. An authored expression has no declared
-    alphabet or length, so it holds the whole window: the window must be at
-    least as long as the longest text that expression can match, because a
-    match shorter than the window can never reach from the released prefix
-    past the end of the buffered tail. Raise it for a custom pattern that can
-    match a longer run.
+    A built-in family holds only its own trailing candidate run, which this
+    cap bounds from above. The cap applies to a rule of built-in families
+    alone: a rule carrying an authored expression is never redacted
+    incrementally, because an RE2 expression declares neither the characters
+    nor the length one of its matches can span, so no window can be proven
+    long enough to keep a match from reaching past it.
     """
 
     @model_validator(mode="after")
@@ -199,9 +198,17 @@ class RegexClassifier:
         self._holds = tuple(_HOLDS[kind] for kind in document.builtin_patterns)
         self._authored = bool(document.patterns)
 
-    def stream_redactor(self) -> StreamingRedactor:
-        """Return this deterministic detector as its own streaming redactor."""
-        return self
+    def stream_redactor(self) -> StreamingRedactor | None:
+        """Return this detector as its own redactor when every match is bounded.
+
+        Releasing a prefix early is safe only against a match whose span is
+        known in advance, which is true of the built-in families and of no
+        authored expression, so an authored rule keeps the buffered path.
+
+        Returns:
+            The streaming redactor, or ``None`` for an authored rule.
+        """
+        return None if self._authored else self
 
     def release_boundary(self, text: str) -> int:
         """Return how many leading characters of a buffered tail are settled.
@@ -211,10 +218,10 @@ class RegexClassifier:
         and is no longer than that family's bound. The boundary is therefore
         the start of the trailing run of such characters, and everything
         before it is settled: no later delta can reach back across a
-        character the family cannot match. An authored expression has no
-        declared alphabet, so it holds the whole configured window instead.
-        Luhn validation is not applied here, so a card candidate that is not
-        yet a valid card still holds the boundary back.
+        character the family cannot match. Luhn validation is not applied
+        here, so a card candidate that is not yet a valid card still holds
+        the boundary back. An authored rule never reaches this method: it is
+        not streamable, so its completions stay buffered.
 
         Args:
             text: Buffered completion tail, oldest character first.
@@ -223,8 +230,6 @@ class RegexClassifier:
             The count of leading characters no later text can change.
         """
         boundary = len(text)
-        if self._authored:
-            boundary = max(0, len(text) - self._stream_window)
         for alphabet, longest in self._holds:
             boundary = min(boundary, _run_start(text, alphabet, longest))
         return max(boundary, len(text) - self._stream_window, 0)
