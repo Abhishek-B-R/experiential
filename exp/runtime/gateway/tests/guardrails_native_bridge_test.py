@@ -261,7 +261,7 @@ def test_streamed_deterministic_policy_admits_the_incremental_path(tmp_path: Pat
             json.dumps(
                 {
                     "request_id": admission["request_id"],
-                    "pending": "mail ada@example.com now " + "x" * 200,
+                    "pending": "mail ada@example.com now " + "x" * 200 + " done",
                     "final": False,
                     "settled_bytes": 0,
                 }
