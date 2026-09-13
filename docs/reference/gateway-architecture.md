@@ -181,6 +181,43 @@ result can advance to the next certified deployment, while mixed semantic output
 commits and flushes the original route. Provider-internal retry layers are disabled so every
 possible billable dispatch is visible to the gateway ledger.
 
+A provider throttle (HTTP 429, an overload answer, or a rate-limit error declared inside the
+stream) is classed `throttled` and is failover-eligible but never redialed on its own: the 429
+sets the rung's throttle window before the next candidate is chosen. What happens next is the
+pool's per-model policy. `failover_mode: maximize_availability` (the default) advances to the next
+certified rung; `maximize_cache` returns the 429 to the caller so it can retry the warm rung after
+the provider's backoff instead of restarting cold; `maximize_cache_affinity` advances to the
+deterministic rendezvous alternate. An authored `throttle_cache_threshold` (0..1) replaces the
+mode's fixed rule under every mode: the throttle surfaces exactly when the requesting
+organization's observed cached-token fraction on the throttled rung (the worker's EWMA of its
+settled `cached_input_tokens / input_tokens` there) is at or above the threshold, else fails over
+cold, disclosed on the cold attempt as `throttle_failover_cold` with the throttled rung as its
+`preferred_deployment_id`.
+
+A pool may additionally author a `throttle_redial` schedule (`max_attempts`, `base_delay_ms`,
+`max_delay_ms`). With it, a throttle is never returned while any way to serve the request
+remains. Before commitment, a throttle on a rung worth waiting for is re-dialed on the SAME
+deployment after a bounded wait: `base_delay_ms * 2^n` (equal-jittered into the upper half of the
+band, capped at `max_delay_ms`), floored at the provider's `Retry-After` when it states one within
+the cap; a `Retry-After` above `max_delay_ms` means the rung is out longer than the pool will
+wait, so the ladder advances instead. A wait never exceeds the rung's first-byte allowance and
+must leave the redial its own first-byte allowance under the request deadline; otherwise the
+ladder advances at once. Up to `max_attempts` redials per rung are made, then the throttle fails
+over down the ladder exactly like any failover-eligible failure, and only when every rung is
+exhausted does the typed 429 reach the caller, carrying the largest `Retry-After` any rung stated.
+Which rungs are "worth waiting for" is decided at admission per rung and carried on the wire
+entry as `throttle_backoff_eligible`: every rung when no `throttle_cache_threshold` is authored,
+otherwise exactly the rungs where the organization's cached fraction meets the threshold, so the
+gate now means "back off here" rather than "surface". Every redial is its own durably reserved
+attempt row (the attempt ordinal increments), claimed through the rung's own throttle window
+(this request is the one deliberately probing the rung back; other requests still avoid it), and
+disclosed as `dispatch_reason: throttle_backoff`; the cold advance after the budget is
+`throttle_failover_cold`. The worker's `throttle_backoff_redials` counter beside
+`throttle_surfaced_cache_preserving` and `throttle_failover_cold` traces the three outcomes. Pools
+that author no schedule keep byte-identical behavior; the hosted platform's recommended
+authoring for house GPT lanes, whose traffic is cache-heavy, is a schedule of three redials from a
+500 ms base capped at 8 s beside its existing 0.5 threshold.
+
 First-party CLI compatibility is capture-driven: the fields real Claude Code and Codex send by
 default are accepted and preserved. On the Messages surface, `output_config` forwards verbatim on
 Anthropic rungs (a canonical `effort` also rides `reasoning_effort`, caller keys always win over
@@ -277,7 +314,7 @@ policies force-admits past the bound rather than manufacturing a failure unbound
 would not have had.
 Every policy-routed dispatch is disclosed on its attempt row: `dispatch_reason` (`affinity`,
 `affinity_sticky`, `fair_share_shed`, `queue_bound`, `rate_limit`, `fresh_session_spill`,
-`rung_dead`, `saturated_overflow`), the bypassed
+`rung_dead`, `saturated_overflow`, `throttle_failover_cold`, `throttle_backoff`), the bypassed
 `preferred_deployment_id` with its frozen base token rates, and at settle a
 `counterfactual_cost_nano_usd` pricing the same observed usage at those preferred rates, so
 cost optimality is measurable from the ledger alone. Settlement also persists the provider's own

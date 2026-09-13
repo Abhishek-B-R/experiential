@@ -84,6 +84,10 @@ _CONTROL_PLANE_COUNTERS: tuple[tuple[str, str], ...] = (
         "Throttles failed over cold (cache below threshold).",
     ),
     (
+        "throttle_backoff_redials",
+        "Throttled rungs re-dialed after backoff.",
+    ),
+    (
         "reconciled_expired_requests",
         "Crashed requests reconciled at startup.",
     ),

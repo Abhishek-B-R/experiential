@@ -22,6 +22,7 @@ from exp.common.models.catalog import (
     ModelRecord,
     SFTModelProvenance,
 )
+from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import (
     FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION,
     SANE_MAX_SNAPSHOT_SCHEMA_VERSION,
@@ -331,6 +332,7 @@ def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
             "failover_mode",
             "pool_id",
             "throttle_cache_threshold",
+            "throttle_redial",
         ],
     }
 
@@ -769,6 +771,19 @@ def test_pool_throttle_cache_threshold_validates_normalizes_and_is_identity_iner
     authored = normalize_gateway_catalog(catalog(0.5))
     assert authored.pools[0].throttle_cache_threshold == 0.5
     assert authored.identity_sha256() != baseline.identity_sha256()
+    # The redial schedule rides the same hop and is just as inert unauthored.
+    assert baseline.pools[0].throttle_redial is None
+    schedule = GatewayThrottleRedialPolicy(max_attempts=3, base_delay_ms=500, max_delay_ms=8_000)
+    scheduled = catalog(None).model_copy(
+        update={
+            "gateway_pools": {
+                "threshold-pool": record(None).model_copy(update={"throttle_redial": schedule})
+            }
+        }
+    )
+    normalized = normalize_gateway_catalog(scheduled)
+    assert normalized.pools[0].throttle_redial == schedule
+    assert normalized.identity_sha256() != baseline.identity_sha256()
     # The normalized pool bounds the fraction exactly like the authored record.
     with pytest.raises(ValidationError):
         ExactModelPool(

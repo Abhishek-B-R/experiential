@@ -15,6 +15,7 @@ from exp.common.models.catalog import (
     ModelCatalog,
     ModelRecord,
 )
+from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import (
     ExactModelDeployment,
     FailoverMode,
@@ -34,7 +35,10 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.native_execution import InflightRequest, deployment_health_key
-from exp.runtime.gateway.native_rung_policy import failed_dispatch_candidate, reserve_rung_slot
+from exp.runtime.gateway.native_rung_policy import (
+    failed_dispatch_candidate,
+    reserve_rung_slot,
+)
 from exp.runtime.gateway.routing import CatalogRouteResolver, GatewayRoute
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
@@ -68,6 +72,7 @@ def _entry(
     *,
     failover_mode: FailoverMode = "maximize_availability",
     throttle_cache_threshold: float | None = None,
+    throttle_redial: GatewayThrottleRedialPolicy | None = None,
     affinity_fingerprint: bytes | None = None,
 ) -> InflightRequest:
     """Build one admitted request over the given rung ladder."""
@@ -92,6 +97,7 @@ def _entry(
             deployment_ids=tuple(item.deployment_id for item in deployments),
             failover_mode=failover_mode,
             throttle_cache_threshold=throttle_cache_threshold,
+            throttle_redial=throttle_redial,
         ),
         deployment=deployments[0],
         fallback_deployments=deployments[1:],

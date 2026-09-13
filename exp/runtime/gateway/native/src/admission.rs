@@ -19,6 +19,7 @@ use crate::metrics::METRICS;
 use crate::respond::error_response;
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
+use crate::throttle_backoff::ThrottleRedial;
 use crate::waterfall::{DeploymentWire, RoutePolicy};
 
 /// The wire configuration returned by one successful admission: the full
@@ -42,6 +43,11 @@ pub(crate) struct Admission {
     pub maximum_same_deployment_attempts: u32,
     #[serde(default)]
     pub refusal_failover: bool,
+    /// The pool's backoff-and-redial schedule for throttled rungs; absent on
+    /// pools that keep throttles failover-only, so their waterfall is
+    /// unchanged.
+    #[serde(default)]
+    pub throttle_redial: Option<ThrottleRedial>,
     /// Responses-only request-reflecting envelope fields; chat admissions
     /// omit it.
     #[serde(default)]
@@ -65,6 +71,7 @@ impl Admission {
             maximum_total_attempts: self.maximum_total_attempts.max(1),
             maximum_same_deployment_attempts: self.maximum_same_deployment_attempts.max(1),
             refusal_failover: self.refusal_failover,
+            throttle_redial: self.throttle_redial,
         }
     }
 

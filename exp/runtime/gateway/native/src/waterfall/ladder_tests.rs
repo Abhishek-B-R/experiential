@@ -1,0 +1,471 @@
+//! Ladder tests for throttle backoff-and-redial: a scripted python control
+//! plane and scripted local rungs drive `acquire_attempt` end to end, so the
+//! wait schedule, the `throttle_backoff` reservation flag, the commitment
+//! boundary, the ladder advance after the redial budget, and the exhaustion
+//! `Retry-After` are all observed on the real loop rather than on its parts.
+
+use std::collections::HashMap;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use pyo3::prelude::*;
+use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use super::*;
+use crate::upstream::build_client;
+
+/// A control plane that mirrors the python candidate policy for one two-rung
+/// route: a `throttle_backoff` reservation redials the same depth while the
+/// per-rung redial cap allows, a failover-eligible failure advances, and
+/// anything else exhausts with the failure echoed back. Every call is
+/// recorded so the test can read the ledger story.
+const PLANE_SOURCE: &std::ffi::CStr = cr#"
+import json
+import threading
+
+
+class Plane:
+    """Scripted control plane recording every reservation and settlement."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.starts = []
+        self.settles = []
+        self.counts = [0, 0]
+        self.max_redials = 2
+
+    def start_attempt(self, argument):
+        data = json.loads(argument)
+        with self.lock:
+            self.starts.append(data)
+            depth = data.get("current_depth")
+            failure = data.get("failure")
+            if depth is None:
+                candidate = 0
+            elif (
+                data.get("throttle_backoff")
+                and failure["failure_class"] == "throttled"
+                and self.counts[depth] <= self.max_redials
+            ):
+                candidate = depth
+            elif failure.get("failover_eligible") and depth + 1 < len(self.counts):
+                candidate = depth + 1
+            else:
+                return json.dumps({"exhausted": True, "failure": failure})
+            self.counts[candidate] += 1
+            ordinal = data["attempt_ordinal"]
+            return json.dumps({"attempt_id": f"attempt-{ordinal}", "route_depth": candidate})
+
+    def settle(self, argument):
+        with self.lock:
+            self.settles.append(json.loads(argument))
+        return "{}"
+
+    def abandon(self, argument):
+        return "{}"
+
+    def dump(self, argument):
+        with self.lock:
+            return json.dumps(
+                {"starts": self.starts, "settles": self.settles, "counts": self.counts}
+            )
+
+    def close_thread_resources(self, argument):
+        return "{}"
+"#;
+
+fn plane() -> Py<PyAny> {
+    Python::initialize();
+    Python::attach(|py| {
+        pyo3::types::PyModule::from_code(py, PLANE_SOURCE, c"ladder_plane.py", c"ladder_plane")
+            .expect("plane module compiles")
+            .getattr("Plane")
+            .expect("plane class exists")
+            .call0()
+            .expect("plane instantiates")
+            .unbind()
+    })
+}
+
+/// One scripted provider answer for one connection.
+#[derive(Clone)]
+enum Answer {
+    /// A 429 with the optional stated wait.
+    Throttle(Option<u32>),
+    /// A 200 event stream carrying these SSE frames, then `[DONE]`.
+    Stream(&'static [&'static str]),
+}
+
+fn render(answer: &Answer) -> String {
+    match answer {
+        Answer::Throttle(retry_after) => {
+            let body = "{\"error\":{\"message\":\"We're currently processing too many requests - \
+                        please try again later\",\"type\":\"server_error\",\"code\":null}}";
+            let header = retry_after
+                .map(|seconds| format!("retry-after: {seconds}\r\n"))
+                .unwrap_or_default();
+            format!(
+                "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\n{header}\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+        }
+        Answer::Stream(frames) => {
+            let mut body = String::new();
+            for frame in frames.iter() {
+                body.push_str("data: ");
+                body.push_str(frame);
+                body.push_str("\n\n");
+            }
+            body.push_str("data: [DONE]\n\n");
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+        }
+    }
+}
+
+/// One scripted rung: answers its connections in script order and records
+/// when each was accepted.
+struct Rung {
+    url: String,
+    accepted: Arc<Mutex<Vec<Instant>>>,
+}
+
+async fn spawn_rung(script: Vec<Answer>) -> Rung {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    let recorder = accepted.clone();
+    tokio::spawn(async move {
+        for answer in script {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            recorder.lock().expect("lock").push(Instant::now());
+            let mut buffer = [0u8; 16_384];
+            let _ = socket.read(&mut buffer).await;
+            socket
+                .write_all(render(&answer).as_bytes())
+                .await
+                .expect("write");
+            let _ = socket.shutdown().await;
+        }
+    });
+    Rung {
+        url: format!("http://{address}/v1/chat/completions"),
+        accepted,
+    }
+}
+
+fn wire(deployment_id: &str, url: &str, throttle_backoff_eligible: bool) -> DeploymentWire {
+    DeploymentWire {
+        provider: "openai".to_string(),
+        deployment_id: deployment_id.to_string(),
+        dialect: "openai_compatible".to_string(),
+        url: url.to_string(),
+        headers: HashMap::new(),
+        model_id: "gpt-test".to_string(),
+        billing_customer_managed: false,
+        timeout_seconds: 10.0,
+        upstream_payload: json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        }),
+        upstream_body: None,
+        fireworks_reasoning_route_sha256: None,
+        hunyuan_reasoning_route_sha256: None,
+        reasoning_output_exposed: false,
+        stop_sequences: Vec::new(),
+        serialize_tool_calls: false,
+        idempotency_key: format!("op-{deployment_id}"),
+        time_to_first_byte_base_seconds: None,
+        time_to_first_byte_seconds_per_million_input_tokens: None,
+        throttle_backoff_eligible,
+    }
+}
+
+const SCHEDULE: ThrottleRedial = ThrottleRedial {
+    max_attempts: 2,
+    base_delay_ms: 100,
+    max_delay_ms: 2_000,
+};
+
+const TEXT_FRAME: &str = "{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}";
+const THROTTLE_FRAME: &str = "{\"error\":{\"code\":\"rate_limit_exceeded\",\
+                              \"message\":\"Rate limit reached\"}}";
+
+/// Everything one ladder run needs, kept alive together.
+struct Harness {
+    bridge: Arc<Bridge>,
+    http: reqwest::Client,
+}
+
+impl Harness {
+    fn new() -> Self {
+        Self {
+            bridge: Arc::new(Bridge::new(plane(), 2).expect("bridge starts")),
+            http: build_client(Duration::from_secs(2)).expect("client"),
+        }
+    }
+
+    async fn run(
+        &self,
+        route: &[DeploymentWire],
+        throttle_redial: Option<ThrottleRedial>,
+        deadline: Duration,
+    ) -> (Won, AttemptGuard) {
+        let mut guard = AttemptGuard::new(
+            self.bridge.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            "request-throttle".to_string(),
+            Instant::now(),
+        );
+        let context = WaterfallContext {
+            bridge: &self.bridge,
+            http: &self.http,
+            request_id: "request-throttle",
+            raw_key: "key",
+            route,
+            policy: RoutePolicy {
+                maximum_total_attempts: 8,
+                maximum_same_deployment_attempts: 2,
+                refusal_failover: false,
+                throttle_redial,
+            },
+            deadline: Instant::now() + deadline,
+            time_to_first_byte: Duration::from_secs(5),
+            time_to_first_byte_slope_seconds_per_million_input_tokens: 0.0,
+            approximate_input_tokens: 10.0,
+            output_less_retention: None,
+        };
+        let won = acquire_attempt(&context, &mut guard).await;
+        (won, guard)
+    }
+
+    async fn story(&self) -> Value {
+        let text = self
+            .bridge
+            .call("dump", "{}".to_string())
+            .await
+            .expect("dump succeeds");
+        serde_json::from_str(&text).expect("story parses")
+    }
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime builds")
+        .block_on(future)
+}
+
+fn gaps(rung: &Rung) -> Vec<Duration> {
+    let accepted = rung.accepted.lock().expect("lock");
+    accepted.windows(2).map(|pair| pair[1] - pair[0]).collect()
+}
+
+async fn finish(mut guard: AttemptGuard, won: Won) -> Won {
+    if let Won::Committed(_) = &won {
+        guard.settle("completed", None, &[], None, true).await;
+    }
+    won
+}
+
+#[test]
+fn a_throttled_rung_is_redialed_after_backoff_and_then_serves() {
+    block_on(async {
+        let harness = Harness::new();
+        // Two throttles (the second stating a one-second wait), then service.
+        let rung_a = spawn_rung(vec![
+            Answer::Throttle(None),
+            Answer::Throttle(Some(1)),
+            Answer::Stream(&[TEXT_FRAME]),
+        ])
+        .await;
+        let rung_b = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
+        let route = [wire("a", &rung_a.url, true), wire("b", &rung_b.url, false)];
+        let (won, guard) = harness
+            .run(&route, Some(SCHEDULE), Duration::from_secs(60))
+            .await;
+        let won = finish(guard, won).await;
+        let Won::Committed(committed) = won else {
+            panic!("the warm rung serves after its redials");
+        };
+        assert_eq!(committed.depth, 0);
+        assert!(matches!(committed.prefix.first(), Some(Event::TextDelta(text)) if text == "hi"));
+        drop(committed);
+
+        // The rung saw three connections: the first redial after the
+        // jittered base wait, the second after the stated Retry-After.
+        let waits = gaps(&rung_a);
+        assert_eq!(waits.len(), 2);
+        assert!(waits[0] >= Duration::from_millis(50) && waits[0] < Duration::from_secs(1));
+        assert!(waits[1] >= Duration::from_secs(1) && waits[1] < Duration::from_secs(2));
+        assert!(rung_b.accepted.lock().expect("lock").is_empty());
+
+        // Every redial was its own reservation, flagged as a post-backoff
+        // redial of the same depth and carrying the throttle's stated wait.
+        let story = harness.story().await;
+        let starts = story["starts"].as_array().expect("starts");
+        assert_eq!(starts.len(), 3);
+        assert_eq!(starts[0]["throttle_backoff"], false);
+        assert_eq!(starts[0]["failure"], Value::Null);
+        for (ordinal, start) in starts.iter().enumerate().skip(1) {
+            assert_eq!(start["attempt_ordinal"], ordinal);
+            assert_eq!(start["current_depth"], 0);
+            assert_eq!(start["throttle_backoff"], true);
+            assert_eq!(start["failure"]["failure_class"], "throttled");
+        }
+        assert_eq!(starts[1]["failure"]["retry_after_seconds"], Value::Null);
+        assert_eq!(starts[2]["failure"]["retry_after_seconds"], 1);
+        // Both throttled attempts settled failed without finalizing the
+        // request; the served attempt settled last.
+        let settles = story["settles"].as_array().expect("settles");
+        assert_eq!(settles.len(), 3);
+        for settle in &settles[..2] {
+            assert_eq!(settle["outcome"], "failed");
+            assert_eq!(settle["finalize"], false);
+            assert_eq!(settle["failure"]["failure_class"], "throttled");
+        }
+        assert_eq!(settles[2]["outcome"], "completed");
+        assert_eq!(story["counts"], json!([3, 0]));
+    });
+}
+
+#[test]
+fn spent_redials_advance_the_ladder_and_exhaustion_carries_the_largest_retry_after() {
+    block_on(async {
+        let harness = Harness::new();
+        // The warm rung throttles through its whole redial budget, its last
+        // answer stating the longest wait; the cold rung (not worth waiting
+        // for) throttles once with a shorter one.
+        let rung_a = spawn_rung(vec![
+            Answer::Throttle(None),
+            Answer::Throttle(None),
+            Answer::Throttle(Some(9)),
+        ])
+        .await;
+        let rung_b = spawn_rung(vec![Answer::Throttle(Some(6))]).await;
+        let route = [wire("a", &rung_a.url, true), wire("b", &rung_b.url, false)];
+        let (won, guard) = harness
+            .run(&route, Some(SCHEDULE), Duration::from_secs(60))
+            .await;
+        let won = finish(guard, won).await;
+        let Won::Failed(error) = won else {
+            panic!("an exhausted ladder answers with the typed error");
+        };
+        assert_eq!(error.status_code, 429);
+        assert_eq!(error.code, "unavailable_route");
+        // The longest wait any rung asked for, not the last rung's.
+        assert_eq!(error.retry_after_seconds, Some(9));
+
+        assert_eq!(gaps(&rung_a).len(), 2);
+        assert_eq!(rung_b.accepted.lock().expect("lock").len(), 1);
+        let story = harness.story().await;
+        let starts = story["starts"].as_array().expect("starts");
+        // Initial dispatch, two redials, one cold failover; the cold rung's
+        // throttle exhausts on the data plane's own facts (no later rung),
+        // so no further reservation is asked for.
+        assert_eq!(starts.len(), 4);
+        assert_eq!(starts[1]["throttle_backoff"], true);
+        assert_eq!(starts[2]["throttle_backoff"], true);
+        assert_eq!(starts[3]["throttle_backoff"], false);
+        assert_eq!(starts[3]["current_depth"], 0);
+        assert_eq!(starts[3]["failure"]["retry_after_seconds"], 9);
+        assert_eq!(story["counts"], json!([3, 1]));
+        let settles = story["settles"].as_array().expect("settles");
+        assert_eq!(settles.len(), 4);
+        assert!(settles[..3]
+            .iter()
+            .all(|settle| settle["finalize"] == false));
+        assert_eq!(settles[3]["finalize"], true);
+        assert_eq!(settles[3]["failure"]["retry_after_seconds"], 6);
+    });
+}
+
+#[test]
+fn commitment_ends_redials_even_when_the_committed_stream_then_throttles() {
+    block_on(async {
+        let harness = Harness::new();
+        // The provider streams text, then declares a rate-limit error inside
+        // the stream. The text committed the deployment, so the throttle is
+        // the committed relay's to report: no redial, no failover.
+        let rung_a = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME, THROTTLE_FRAME])]).await;
+        let rung_b = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
+        let route = [wire("a", &rung_a.url, true), wire("b", &rung_b.url, true)];
+        let (won, guard) = harness
+            .run(&route, Some(SCHEDULE), Duration::from_secs(60))
+            .await;
+        let won = finish(guard, won).await;
+        let Won::Committed(committed) = won else {
+            panic!("the first semantic event commits the deployment");
+        };
+        assert_eq!(committed.depth, 0);
+        drop(committed);
+        assert_eq!(rung_a.accepted.lock().expect("lock").len(), 1);
+        assert!(rung_b.accepted.lock().expect("lock").is_empty());
+        let story = harness.story().await;
+        assert_eq!(story["starts"].as_array().expect("starts").len(), 1);
+    });
+}
+
+#[test]
+fn without_a_schedule_or_eligibility_a_throttle_stays_failover_only() {
+    for (schedule, eligible) in [(None, true), (Some(SCHEDULE), false)] {
+        block_on(async {
+            let harness = Harness::new();
+            let rung_a = spawn_rung(vec![Answer::Throttle(Some(1))]).await;
+            let rung_b = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
+            let route = [
+                wire("a", &rung_a.url, eligible),
+                wire("b", &rung_b.url, eligible),
+            ];
+            let (won, guard) = harness.run(&route, schedule, Duration::from_secs(60)).await;
+            let won = finish(guard, won).await;
+            let Won::Committed(committed) = won else {
+                panic!("the throttle fails over to the next rung");
+            };
+            assert_eq!(committed.depth, 1);
+            drop(committed);
+            assert_eq!(rung_a.accepted.lock().expect("lock").len(), 1);
+            let story = harness.story().await;
+            let starts = story["starts"].as_array().expect("starts");
+            assert_eq!(starts.len(), 2);
+            assert_eq!(starts[1]["throttle_backoff"], false);
+            assert_eq!(starts[1]["current_depth"], 0);
+        });
+    }
+}
+
+#[test]
+fn a_wait_that_cannot_fit_the_deadline_advances_instead_of_waiting() {
+    block_on(async {
+        let harness = Harness::new();
+        let rung_a = spawn_rung(vec![Answer::Throttle(None)]).await;
+        let rung_b = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
+        let route = [wire("a", &rung_a.url, true), wire("b", &rung_b.url, true)];
+        // Three seconds left, and the redial would need its own five-second
+        // first-byte allowance after the wait: the ladder advances at once.
+        let started = Instant::now();
+        let (won, guard) = harness
+            .run(&route, Some(SCHEDULE), Duration::from_secs(3))
+            .await;
+        let won = finish(guard, won).await;
+        let Won::Committed(committed) = won else {
+            panic!("the next rung serves");
+        };
+        assert_eq!(committed.depth, 1);
+        drop(committed);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let story = harness.story().await;
+        assert_eq!(story["starts"][1]["throttle_backoff"], false);
+    });
+}

@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256, sha256_json
 from exp.common.models.catalog import BillingSource, GatewayDeploymentMetadata, ModelCatalog
-from exp.common.models.dispatch_policy import FailoverMode
+from exp.common.models.dispatch_policy import FailoverMode, GatewayThrottleRedialPolicy
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.common.models.model import ModelAlias, ModelCapabilities
 from exp.common.models.nano_usd_upgrade import (
@@ -115,6 +115,10 @@ class ExactModelPool(ContractModel):
     # ``GatewayPoolRecord.throttle_cache_threshold``); ``None`` keeps each
     # failover mode's own throttle rule and contributes no identity bytes.
     throttle_cache_threshold: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    # The authored pool's backoff-and-redial schedule for throttled rungs (see
+    # ``GatewayPoolRecord.throttle_redial``); ``None`` keeps throttles
+    # failover-only and contributes no identity bytes.
+    throttle_redial: GatewayThrottleRedialPolicy | None = None
 
     @model_validator(mode="after")
     def _require_unique_deployments(self) -> ExactModelPool:
@@ -249,6 +253,7 @@ def normalize_gateway_catalog(catalog: ModelCatalog) -> NormalizedGatewayCatalog
                 equivalence=authored.equivalence,
                 failover_mode=authored.failover_mode,
                 throttle_cache_threshold=authored.throttle_cache_threshold,
+                throttle_redial=authored.throttle_redial,
             )
         )
         claimed_aliases.update(authored.deployment_aliases)

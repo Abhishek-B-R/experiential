@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final, Literal
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import (
     ExactModelDeployment,
     FailoverMode,
@@ -56,20 +57,31 @@ MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS = 2
 
 # The failure classes whose failover is a cache-stakes decision rather than a
 # fixed rule. A throttle (429) leaves the rung's prompt cache intact but
-# unreachable for this request: a same-request redial is impossible (the 429
-# sets the rung's throttle window before the next candidate is chosen, so an
-# immediate re-claim is refused), and failing over cold abandons the cache the
-# provider just built, strips the conversation's reasoning carry-over, and
-# rebills the whole context. So the only two moves are to SURFACE the throttle
-# (the caller retries the warm rung after the provider's backoff) or to ADVANCE
-# cold, and which is better depends on how much warm cache is actually at
-# stake. A pool authoring ``throttle_cache_threshold`` decides per request by
-# ``throttle_disposition`` below: surface when the requesting organization's
-# observed cached fraction on the throttled rung meets the threshold, advance
-# otherwise (an organization with no cache evidence reads as 0 and advances,
-# so a request is never stranded to protect cache that does not exist). With
-# no threshold the mode's fixed rule stands: ``maximize_cache`` surfaces every
-# throttle, ``maximize_availability`` and ``maximize_cache_affinity`` advance.
+# unreachable for this request right now: an immediate re-claim is refused
+# (the 429 sets the rung's throttle window before the next candidate is
+# chosen), and failing over cold abandons the cache the provider just built,
+# strips the conversation's reasoning carry-over, and rebills the whole
+# context. Without a ``throttle_redial`` schedule the only two moves are to
+# SURFACE the throttle (the caller retries the warm rung after the provider's
+# backoff) or to ADVANCE cold, and which is better depends on how much warm
+# cache is actually at stake. A pool authoring ``throttle_cache_threshold``
+# decides per request by ``throttle_disposition`` below: surface when the
+# requesting organization's observed cached fraction on the throttled rung
+# meets the threshold, advance otherwise (an organization with no cache
+# evidence reads as 0 and advances, so a request is never stranded to protect
+# cache that does not exist). With no threshold the mode's fixed rule stands:
+# ``maximize_cache`` surfaces every throttle, ``maximize_availability`` and
+# ``maximize_cache_affinity`` advance.
+#
+# A pool authoring ``throttle_redial`` adds the third move and removes the
+# surfacing one: the data plane waits out a backoff and asks to redial the SAME
+# rung (``throttle_backoff`` on its reservation), which passes the throttle
+# window because this request is the one deliberately probing the rung back;
+# once the redial cap is spent the ladder advances cold, and a throttle
+# surfaces only when every rung is exhausted. The cache-stakes gate then means
+# "back off here" rather than "surface": it is applied at admission per rung
+# (``DeploymentWire.throttle_backoff_eligible``) so a rung below the threshold
+# still fails over cold at once.
 #
 # TIMEOUT is deliberately NOT in this set. The classifier already decides, per
 # timeout, whether the same rung may be redialed: a genuine retryable timeout
@@ -84,20 +96,26 @@ MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS = 2
 # lane that never answered.
 _CACHE_PRESERVING_NO_FAILOVER_CLASSES = frozenset({GatewayFailureClass.THROTTLED})
 
-ThrottleDisposition = Literal["throttle_surfaced_cache_preserving", "throttle_failover_cold"]
-"""How a threshold-authoring pool disposed of one throttle, as a disclosure code.
+ThrottleDisposition = Literal[
+    "throttle_surfaced_cache_preserving", "throttle_failover_cold", "throttle_backoff"
+]
+"""How a policy-authoring pool disposed of one throttle, as a disclosure code.
 
 ``throttle_surfaced_cache_preserving`` ended the ladder so the caller retries
-the warm rung; ``throttle_failover_cold`` advanced past it. The failover code
-lands as the cold attempt's ``dispatch_reason`` with the throttled rung as its
-``preferred_deployment`` (the counterfactual the cold restart is measured
-against); the surfaced branch reserves no further attempt, so it is counted on
-the worker's control-plane metrics instead.
+the warm rung; ``throttle_failover_cold`` advanced past it; ``throttle_backoff``
+re-dialed the same rung after the data plane waited out the pool's
+``throttle_redial`` backoff. The failover code lands as the cold attempt's
+``dispatch_reason`` with the throttled rung as its ``preferred_deployment``
+(the counterfactual the cold restart is measured against); the backoff code
+lands as the redial's ``dispatch_reason`` on the same rung; the surfaced
+branch reserves no further attempt, so it is counted on the worker's
+control-plane metrics instead.
 """
 THROTTLE_SURFACED_CACHE_PRESERVING: Final[ThrottleDisposition] = (
     "throttle_surfaced_cache_preserving"
 )
 THROTTLE_FAILOVER_COLD: Final[ThrottleDisposition] = "throttle_failover_cold"
+THROTTLE_BACKOFF: Final[ThrottleDisposition] = "throttle_backoff"
 
 
 def throttle_disposition(
@@ -256,6 +274,7 @@ def dispatch_disclosure(
     policy_sheds: list[tuple[int, str]],
     forced_overflow: bool,
     sticky_preferred: bool = False,
+    throttle_backoff: bool = False,
 ) -> tuple[str | None, ExactModelDeployment | None]:
     """Name why the chosen rung serves and the bypassed preferred rung, if any.
 
@@ -271,6 +290,8 @@ def dispatch_disclosure(
     ``throttle_failover_cold`` advance past a throttled warm rung under an
     authored ``throttle_cache_threshold``), and the preferred rung is the
     bypassed rung itself (the counterfactual the bypass is measured against).
+    A post-backoff redial of a throttled rung is ``throttle_backoff`` on every
+    pool: the chosen rung is the preferred rung, so no counterfactual is named.
 
     Args:
         route: Frozen ordered route for this request.
@@ -280,11 +301,15 @@ def dispatch_disclosure(
         forced_overflow: Whether this dispatch was forced past a bound.
         sticky_preferred: Whether the route's depth 0 was chosen by a sticky
             spill binding rather than rendezvous order.
+        throttle_backoff: Whether this dispatch re-dials the rung that just
+            throttled after the data plane waited the pool's backoff.
 
     Returns:
         ``(dispatch_reason, preferred_deployment)``; the deployment is
         ``None`` whenever the chosen rung IS the disclosure's preferred rung.
     """
+    if throttle_backoff:
+        return THROTTLE_BACKOFF, None
     if route.snapshot.failover_mode == "maximize_cache_affinity":
         target_depth = 0
         if forced_overflow:
@@ -352,6 +377,8 @@ def next_route_candidate(
     failover_mode: FailoverMode = "maximize_availability",
     throttle_cache_threshold: float | None = None,
     cached_fraction: float = 0.0,
+    throttle_redial: GatewayThrottleRedialPolicy | None = None,
+    throttle_backoff: bool = False,
     maximum_total_attempts: int = MAXIMUM_TOTAL_ATTEMPTS,
     maximum_same_deployment_attempts: int = MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
 ) -> int | None:
@@ -361,6 +388,16 @@ def next_route_candidate(
     deployment while its bounded count and a health claim allow, and otherwise
     a failover-eligible failure (or an opted-in typed refusal) advances to the
     next claimable deployment.
+
+    A pool authoring ``throttle_redial`` turns a throttle into a bounded
+    backoff-and-redial on the warm rung first: when the data plane reports it
+    has waited the schedule (``throttle_backoff``), the same rung is claimed
+    through its own throttle window while the per-rung redial cap and the
+    total cap allow. With a schedule authored a throttle never surfaces
+    mid-ladder; once the redials are spent (or the data plane declined to
+    wait, because the wait would not fit the deadline or the rung was not
+    worth it) the throttle advances like any failover-eligible failure, and
+    the caller sees a 429 only when the whole ladder is exhausted.
 
     A throttle (429) is the one failure whose failover is a cache-stakes
     decision. When the pool authors ``throttle_cache_threshold`` it is the
@@ -401,6 +438,10 @@ def next_route_candidate(
         cached_fraction: The requesting organization's observed cached-token
             fraction on the rung at ``current_depth`` (0 without evidence);
             read only against an authored threshold.
+        throttle_redial: The pool's authored backoff-and-redial schedule, or
+            ``None`` to keep throttles failover-only.
+        throttle_backoff: Whether the data plane waited the schedule's
+            backoff and asks to redial the throttled rung.
         maximum_total_attempts: Hard cap across retries and deployments.
         maximum_same_deployment_attempts: Initial dispatch plus safe retries
             per deployment.
@@ -416,22 +457,32 @@ def next_route_candidate(
         and health.claim(keys[current_depth])
     ):
         return current_depth
-    # A throttle either surfaces (the caller retries the warm rung after the
-    # backoff window, keeping its cache) or advances cold. An authored threshold
-    # decides by the cache at stake; otherwise maximize_cache alone surfaces.
-    disposition = throttle_disposition(
-        failure,
-        throttle_cache_threshold=throttle_cache_threshold,
-        cached_fraction=cached_fraction,
-    )
-    if disposition == THROTTLE_SURFACED_CACHE_PRESERVING:
-        return None
-    if (
-        disposition is None
-        and failover_mode == "maximize_cache"
-        and failure.failure_class in _CACHE_PRESERVING_NO_FAILOVER_CLASSES
-    ):
-        return None
+    throttled = failure.failure_class in _CACHE_PRESERVING_NO_FAILOVER_CLASSES
+    if throttle_redial is not None and throttled:
+        # The data plane waited the pool's backoff: redial the warm rung
+        # through its own throttle window while the redial cap allows. The
+        # count includes the throttled dispatch itself, so ``max_attempts``
+        # bounds the redials that follow it.
+        if (
+            throttle_backoff
+            and attempt_counts[current_depth] <= throttle_redial.max_attempts
+            and health.claim_throttle_redial(keys[current_depth])
+        ):
+            return current_depth
+    else:
+        # A throttle either surfaces (the caller retries the warm rung after
+        # the backoff window, keeping its cache) or advances cold. An authored
+        # threshold decides by the cache at stake; otherwise maximize_cache
+        # alone surfaces.
+        disposition = throttle_disposition(
+            failure,
+            throttle_cache_threshold=throttle_cache_threshold,
+            cached_fraction=cached_fraction,
+        )
+        if disposition == THROTTLE_SURFACED_CACHE_PRESERVING:
+            return None
+        if disposition is None and failover_mode == "maximize_cache" and throttled:
+            return None
     refusal_eligible = failure.failure_class == GatewayFailureClass.REFUSAL and refusal_failover
     if not failure.failover_eligible and not refusal_eligible:
         return None
@@ -739,6 +790,7 @@ def deployment_wire_entry(
     headers: dict[str, str] | None = None,
     stop_sequences: Sequence[str] = (),
     serialize_tool_calls: bool = False,
+    throttle_backoff_eligible: bool = False,
 ) -> JsonObject:
     """Build one deployment's wire configuration for the admitted route.
 
@@ -762,6 +814,12 @@ def deployment_wire_entry(
         serialize_tool_calls: The caller sent ``parallel_tool_calls: false``
             and this rung's wire has no such control, so the data plane keeps
             one tool call per turn on its stream.
+        throttle_backoff_eligible: A throttle on this rung is worth waiting
+            for under the pool's ``throttle_redial`` schedule for THIS
+            request (the schedule is authored and the requesting
+            organization's cached fraction here meets any authored
+            threshold), so the data plane backs off and re-dials the rung
+            before the ladder advances. False keeps the rung failover-only.
 
     Returns:
         The JSON-compatible wire entry consumed by the data plane.
@@ -789,6 +847,10 @@ def deployment_wire_entry(
         # whose payload already carries the caller's stop field.
         "stop_sequences": list(stop_sequences),
         "serialize_tool_calls": serialize_tool_calls,
+        # Whether a throttle here is re-dialed with backoff before failover
+        # (pool schedule authored and this request's cache at stake meets any
+        # threshold); false keeps the historical failover-only throttle.
+        "throttle_backoff_eligible": throttle_backoff_eligible,
         "idempotency_key": deployment_operation_key(route, deployment),
         # First-byte allowance overrides; the data plane falls back to its
         # serving defaults when a deployment declares nothing.
