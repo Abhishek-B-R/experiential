@@ -259,6 +259,29 @@ fn classify(event: &Event) -> StreamAdmission {
     }
 }
 
+/// Return what a guarded or unguarded stream may send for one outward event.
+///
+/// A terminal flushes everything still buffered before it, so no character
+/// outlives the stream that carried it. Without a redactor the event passes
+/// through, which keeps the streaming routes free of guardrail branching.
+pub(crate) async fn released_events(
+    redactor: Option<&mut StreamRedactor>,
+    bridge: &Bridge,
+    outward: Event,
+    terminal: bool,
+) -> Result<Vec<Event>, Failure> {
+    let Some(redactor) = redactor else {
+        return Ok(vec![outward]);
+    };
+    let mut released = if terminal {
+        redactor.flush(bridge).await?
+    } else {
+        Vec::new()
+    };
+    released.extend(redactor.admit(bridge, outward).await?);
+    Ok(released)
+}
+
 /// Release a streamed completion incrementally under a deterministic check.
 ///
 /// The data plane owns the buffer and the ordering; Python owns the release

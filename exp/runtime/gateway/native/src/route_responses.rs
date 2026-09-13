@@ -25,14 +25,15 @@ use crate::encode_responses::{
 };
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
-use crate::guardrails::StreamRedactor;
+use crate::guardrails::{released_events, StreamRedactor};
 use crate::metrics::{classify_escalation, METRICS};
 use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey};
 use crate::respond::{
     bearer_key, cached_response, capture_frame, client_ip, complete_visible_refusal,
-    error_response, escalation_error, finish_stream_terminal, json_response, latin1_header,
-    read_body, send_bounded, settle_stream_end, sse_body_response,
+    emit_responses_failure, error_response, escalation_error, finish_stream_terminal,
+    json_response, latin1_header, outward_event, read_body, send_bounded, settle_stream_end,
+    sse_body_response,
 };
 use crate::responses_retention::{remember_argument, remember_continuation, ResponsesRetention};
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
@@ -819,40 +820,25 @@ async fn stream_responses(
             }
             // Mirror the relay's first-token time onto the guard as tokens stream.
             guard.record_first_token(committed.relay.first_token_at());
-            if matches!(
-                event,
-                Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
-            ) {
-                visible_refusal = true;
-            }
-            let outward = match &event {
-                Event::Failed(failure)
-                    if failure.failure_class == FailureClass::Refusal && visible_refusal =>
-                {
-                    Event::Completed
-                }
-                other => other.clone(),
+            let outward = outward_event(&event, &mut visible_refusal);
+            // A byte that reaches the caller has already been through the
+            // detector, and a terminal flushes whatever is still buffered.
+            let guarded = redactor.is_some();
+            let outward_events = match released_events(
+                redactor.as_mut(),
+                &guard.bridge,
+                outward,
+                event.is_terminal(),
+            )
+            .await
+            {
+                Ok(events) => events,
+                Err(failure) => fail_stream!(failure),
             };
-            // Guarded streams release their settled prefix here, and every
-            // remaining buffered character before a terminal: a byte that
-            // reaches the caller has already been through the detector.
-            let mut outward_events: Vec<Event> = Vec::new();
-            if let Some(redactor) = redactor.as_mut() {
-                if event.is_terminal() {
-                    match redactor.flush(&guard.bridge).await {
-                        Ok(released) => outward_events.extend(released),
-                        Err(failure) => fail_stream!(failure),
-                    }
-                }
-                match redactor.admit(&guard.bridge, outward).await {
-                    Ok(released) => outward_events.extend(released),
-                    Err(failure) => fail_stream!(failure),
-                }
+            if guarded {
                 for released in &outward_events {
                     retention.track(released);
                 }
-            } else {
-                outward_events.push(outward);
             }
             // The terminal is recorded before its frames flush, so a
             // disconnect during the final flush still settles by the
@@ -995,25 +981,4 @@ async fn stream_responses(
     builder
         .body(body)
         .unwrap_or_else(|_| Response::new(Body::empty()))
-}
-
-/// Emit the Responses encoder's sanitized failure lifecycle when the stream
-/// has not already reached a terminal.
-async fn emit_responses_failure(
-    sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
-    deadline: Instant,
-    encoder: &mut ResponsesSseEncoder,
-    failure: &Failure,
-) {
-    if encoder.saw_terminal() {
-        return;
-    }
-    let frames = encoder
-        .feed(&Event::Failed(failure.clone()))
-        .unwrap_or_default();
-    for frame in frames {
-        if !send_bounded(sender, deadline, Bytes::from(frame)).await {
-            return;
-        }
-    }
 }

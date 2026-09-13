@@ -15,6 +15,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailPolicy,
     GuardrailRejected,
     GuardrailToolCall,
+    OutputGuardrailMode,
 )
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 
@@ -56,6 +57,37 @@ def enforce_native_input(
             )
         ),
         policy,
+    )
+
+
+def native_output_mode(
+    engine: GuardrailEngine | None,
+    policy: GuardrailPolicy | None,
+    request: GatewayRequest,
+) -> OutputGuardrailMode:
+    """Return the output enforcement shape one admission must use.
+
+    Args:
+        engine: Optional composed engine. ``None`` leaves the stream untouched.
+        policy: Policy resolved during input enforcement, if any.
+        request: Canonical request after continuation expansion.
+
+    Returns:
+        ``off``, ``buffer``, or ``stream`` for the data plane.
+    """
+    if engine is None:
+        return OutputGuardrailMode.OFF
+    return engine.output_mode(
+        policy,
+        streaming=request.stream,
+        tools_offered=bool(
+            request.tools or request.provider_native_tools or request.provider_server_tools
+        ),
+        reasoning_text_requested=bool(
+            request.reasoning_summary is not None
+            or request.reasoning_effort is not None
+            or request.thinking_default_enable
+        ),
     )
 
 

@@ -26,12 +26,13 @@ use crate::encode_messages::{
 };
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
-use crate::guardrails::StreamRedactor;
+use crate::guardrails::{released_events, StreamRedactor};
 use crate::metrics::{classify_escalation, METRICS};
 use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::respond::{
     bearer_key, client_ip, complete_visible_refusal, escalation_error, json_response,
-    latin1_header_list, read_body, send_bounded, settle_stream_end, sse_body_response,
+    latin1_header_list, outward_event, read_body, send_bounded, settle_stream_end,
+    sse_body_response,
 };
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
 use crate::server::AppState;
@@ -644,40 +645,20 @@ async fn stream_messages(
             track_event(&event, &mut usage, &mut tool_names);
             // Mirror the relay's first-token time onto the guard as tokens stream.
             guard.record_first_token(committed.relay.first_token_at());
-            if matches!(
-                event,
-                Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
-            ) {
-                visible_refusal = true;
-            }
-            // A typed refusal after visible refusal output completes
-            // publicly; the ledger still records the provider's refusal.
-            let outward = match &event {
-                Event::Failed(failure)
-                    if failure.failure_class == FailureClass::Refusal && visible_refusal =>
-                {
-                    Event::Completed
-                }
-                other => other.clone(),
+            let outward = outward_event(&event, &mut visible_refusal);
+            // A byte that reaches the caller has already been through the
+            // detector, and a terminal flushes whatever is still buffered.
+            let outward_events = match released_events(
+                redactor.as_mut(),
+                &guard.bridge,
+                outward,
+                event.is_terminal(),
+            )
+            .await
+            {
+                Ok(events) => events,
+                Err(failure) => fail_stream!(failure),
             };
-            // Guarded streams release their settled prefix here, and every
-            // remaining buffered character before a terminal: a byte that
-            // reaches the caller has already been through the detector.
-            let mut outward_events: Vec<Event> = Vec::new();
-            if let Some(redactor) = redactor.as_mut() {
-                if event.is_terminal() {
-                    match redactor.flush(&guard.bridge).await {
-                        Ok(released) => outward_events.extend(released),
-                        Err(failure) => fail_stream!(failure),
-                    }
-                }
-                match redactor.admit(&guard.bridge, outward).await {
-                    Ok(released) => outward_events.extend(released),
-                    Err(failure) => fail_stream!(failure),
-                }
-            } else {
-                outward_events.push(outward);
-            }
             if event.is_terminal() {
                 if matches!(event, Event::Completed | Event::StoppedAtSequence(_)) {
                     // Mirrors the Chat stream: a tool turn with hidden
