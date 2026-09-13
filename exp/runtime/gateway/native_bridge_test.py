@@ -5849,20 +5849,20 @@ def _scheduled_pool_control_plane(root: Path) -> tuple[NativeControlPlane, str]:
 def test_admission_carries_the_throttle_redial_schedule_and_per_rung_eligibility(
     tmp_path: Path,
 ) -> None:
-    """The frozen retry facts grow the schedule only when authored; rungs say if they wait.
+    """The frozen retry facts grow the schedule only when authored; rungs say how long they wait.
 
     An unauthored pool's admission has no ``throttle_redial`` key at all and
-    every wire entry is ineligible, so the data plane's throttle handling is
+    every wire entry carries a zero redial budget, so the data plane's throttle handling is
     byte-identical to before. A pool authoring the schedule (and no
-    threshold) hands the data plane the exact schedule and marks every rung
-    worth backing off on.
+    threshold) hands the data plane the exact schedule and gives every rung the
+    schedule's full redial budget.
     """
     control, raw_key = _pool_control_plane(tmp_path / "plain")
     plain = _admit(control, raw_key, _chat_body())
     assert "throttle_redial" not in plain
     route = plain["route"]
     assert isinstance(route, list)
-    assert [wire["throttle_backoff_eligible"] for wire in route] == [False, False]
+    assert [wire["throttle_redial_budget"] for wire in route] == [0, 0]
 
     control, raw_key = _scheduled_pool_control_plane(tmp_path / "scheduled")
     scheduled = _admit(control, raw_key, _chat_body())
@@ -5874,4 +5874,4 @@ def test_admission_carries_the_throttle_redial_schedule_and_per_rung_eligibility
     assert scheduled["maximum_same_deployment_attempts"] == 2
     route = scheduled["route"]
     assert isinstance(route, list)
-    assert [wire["throttle_backoff_eligible"] for wire in route] == [True, True]
+    assert [wire["throttle_redial_budget"] for wire in route] == [3, 3]

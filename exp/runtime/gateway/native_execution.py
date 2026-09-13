@@ -79,9 +79,11 @@ MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS = 2
 # window because this request is the one deliberately probing the rung back;
 # once the redial cap is spent the ladder advances cold, and a throttle
 # surfaces only when every rung is exhausted. The cache-stakes gate then means
-# "back off here" rather than "surface": it is applied at admission per rung
-# (``DeploymentWire.throttle_backoff_eligible``) so a rung below the threshold
-# still fails over cold at once.
+# "how long to wait here" rather than "surface": it is applied at admission
+# per rung as a redial budget (``DeploymentWire.throttle_redial_budget``), the
+# full schedule at or above the threshold, a proportional share below it, and
+# zero with no cache evidence, so a rung with little at stake fails over
+# sooner and one with nothing at stake fails over at once.
 #
 # TIMEOUT is deliberately NOT in this set. The classifier already decides, per
 # timeout, whether the same rung may be redialed: a genuine retryable timeout
@@ -177,10 +179,13 @@ class InflightRequest:
     request: ServingRequest
     deadline_monotonic: float
     attempt_counts: list[int] = field(default_factory=list)
-    # Post-backoff redials reserved per route depth; the pool's
-    # ``throttle_redial.max_attempts`` caps only these, never a
-    # retryable-class redial of the same rung.
+    # Post-backoff redials reserved per route depth, and the budget each
+    # depth was given at admission (the schedule scaled by the cache at
+    # stake); only these redials spend it, never a retryable-class redial of
+    # the same rung. An entry built without the admission step gets the
+    # schedule's full budget on every rung.
     throttle_redials: list[int] = field(default_factory=list)
+    throttle_redial_budgets: tuple[int, ...] = ()
     total_attempts: int = 0
     active_attempt_id: str | None = None
     # Every reserved attempt's route depth, for health recording at settle.
@@ -224,6 +229,10 @@ class InflightRequest:
             self.attempt_counts = [0 for _ in self.route.deployments]
         if not self.throttle_redials:
             self.throttle_redials = [0 for _ in self.route.deployments]
+        if not self.throttle_redial_budgets:
+            schedule = self.route.snapshot.throttle_redial
+            budget = 0 if schedule is None else schedule.max_attempts
+            self.throttle_redial_budgets = tuple(budget for _ in self.route.deployments)
 
 
 def deployment_health_key(
@@ -385,7 +394,7 @@ def next_route_candidate(
     cached_fraction: float = 0.0,
     throttle_redial: GatewayThrottleRedialPolicy | None = None,
     throttle_backoff: bool = False,
-    throttle_redials_so_far: int = 0,
+    throttle_redial_budget: int = 0,
     maximum_total_attempts: int = MAXIMUM_TOTAL_ATTEMPTS,
     maximum_same_deployment_attempts: int = MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
 ) -> int | None:
@@ -449,10 +458,11 @@ def next_route_candidate(
             ``None`` to keep throttles failover-only.
         throttle_backoff: Whether the data plane waited the schedule's
             backoff and asks to redial the throttled rung.
-        throttle_redials_so_far: Post-backoff redials already reserved on
-            the rung at ``current_depth``; the schedule's cap counts only
-            these, so an earlier retryable-class redial there never spends
-            throttle budget.
+        throttle_redial_budget: Post-backoff redials this request may still
+            make on the rung at ``current_depth`` (its admission-time budget
+            less the redials already reserved there); the budget counts only
+            post-backoff redials, so an earlier retryable-class redial there
+            never spends it.
         maximum_total_attempts: Hard cap across retries and deployments.
         maximum_same_deployment_attempts: Initial dispatch plus safe retries
             per deployment.
@@ -474,7 +484,7 @@ def next_route_candidate(
         # through its own throttle window while the redial cap allows.
         if (
             throttle_backoff
-            and throttle_redials_so_far < throttle_redial.max_attempts
+            and throttle_redial_budget > 0
             and health.claim_throttle_redial(keys[current_depth])
         ):
             return current_depth
@@ -799,7 +809,7 @@ def deployment_wire_entry(
     headers: dict[str, str] | None = None,
     stop_sequences: Sequence[str] = (),
     serialize_tool_calls: bool = False,
-    throttle_backoff_eligible: bool = False,
+    throttle_redial_budget: int = 0,
 ) -> JsonObject:
     """Build one deployment's wire configuration for the admitted route.
 
@@ -823,12 +833,13 @@ def deployment_wire_entry(
         serialize_tool_calls: The caller sent ``parallel_tool_calls: false``
             and this rung's wire has no such control, so the data plane keeps
             one tool call per turn on its stream.
-        throttle_backoff_eligible: A throttle on this rung is worth waiting
-            for under the pool's ``throttle_redial`` schedule for THIS
-            request (the schedule is authored and the requesting
-            organization's cached fraction here meets any authored
-            threshold), so the data plane backs off and re-dials the rung
-            before the ladder advances. False keeps the rung failover-only.
+        throttle_redial_budget: How many post-backoff redials a throttle on
+            this rung is worth for THIS request under the pool's
+            ``throttle_redial`` schedule (the full schedule when the
+            requesting organization's cached fraction here meets any
+            authored threshold, a proportional share below it), so the data
+            plane backs off and re-dials the rung that many times before the
+            ladder advances. Zero keeps the rung failover-only.
 
     Returns:
         The JSON-compatible wire entry consumed by the data plane.
@@ -856,10 +867,10 @@ def deployment_wire_entry(
         # whose payload already carries the caller's stop field.
         "stop_sequences": list(stop_sequences),
         "serialize_tool_calls": serialize_tool_calls,
-        # Whether a throttle here is re-dialed with backoff before failover
-        # (pool schedule authored and this request's cache at stake meets any
-        # threshold); false keeps the historical failover-only throttle.
-        "throttle_backoff_eligible": throttle_backoff_eligible,
+        # How many times a throttle here is re-dialed with backoff before
+        # failover (the pool's schedule scaled by this request's cache at
+        # stake); zero keeps the historical failover-only throttle.
+        "throttle_redial_budget": throttle_redial_budget,
         "idempotency_key": deployment_operation_key(route, deployment),
         # First-byte allowance overrides; the data plane falls back to its
         # serving defaults when a deployment declares nothing.

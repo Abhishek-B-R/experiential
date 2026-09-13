@@ -56,13 +56,13 @@ def build_rung_dispatch(
     provider_request: GatewayRequest,
     public_request: GatewayRequest,
     authorization: AuthorizationSnapshot,
-    throttle_backoff_eligible: bool = False,
+    throttle_redial_budget: int = 0,
 ) -> RungDispatch:
     """Preflight, shape and freeze ``provider_request`` for one route rung.
 
-    ``throttle_backoff_eligible`` rides onto the wire entry unchanged: it is
-    the admission-time verdict that a throttle on this rung is worth waiting
-    for under the pool's ``throttle_redial`` schedule for this request.
+    ``throttle_redial_budget`` rides onto the wire entry unchanged: it is
+    the admission-time count of post-backoff redials a throttle on this rung
+    is worth under the pool's ``throttle_redial`` schedule for this request.
     """
     require_gateway_provider(deployment.provider)
     preflight_gateway_request(
@@ -94,7 +94,7 @@ def build_rung_dispatch(
         headers=request_headers,
         stop_sequences=emulated_stop_sequences(profile.dialect, rung_request),
         serialize_tool_calls=rung_request.serialize_tool_calls,
-        throttle_backoff_eligible=throttle_backoff_eligible,
+        throttle_redial_budget=throttle_redial_budget,
     )
     binding = (
         None
