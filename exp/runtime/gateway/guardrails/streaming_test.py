@@ -134,7 +134,7 @@ def test_boundary_beyond_the_tail_is_clamped() -> None:
 def test_flag_reports_the_segment_that_matched() -> None:
     """The flag follows the released segment, not the whole completion."""
     detector = _detector()
-    pending = "ada@example.com " + "x" * 200
+    pending = "ada@example.com " + "x" * 200 + " done "
     segment = release_segment(redactor=detector, pending=pending, final=False)
     assert segment.flagged
     assert "[REDACTED]" in segment.release
@@ -152,17 +152,31 @@ def test_only_the_trailing_candidate_run_is_held() -> None:
     assert segment.pending == "over"
 
 
-def test_a_digit_run_holds_no_more_than_one_card() -> None:
-    """A long digit run holds only as much as one card can span."""
+def test_an_unbroken_digit_run_holds_the_whole_tail() -> None:
+    """A run past the window settles nothing, so the tail stays buffered."""
     detector = RegexClassifier(
         RegexAdapterDocument(
             adapter_id="detector",
             builtin_patterns=(BuiltinPattern.CREDIT_CARD,),
+            stream_window_characters=64,
         )
     )
     segment = release_segment(redactor=detector, pending="1" * 400, final=False)
-    assert len(segment.pending) == 38
-    assert segment.release + segment.pending == "1" * 400
+    assert segment.release == ""
+    assert segment.pending == "1" * 400
+
+
+def test_a_match_longer_than_the_window_is_never_released_in_pieces() -> None:
+    """The built-in expressions are unbounded, so a long run buffers whole.
+
+    An address whose local part outruns the window must come out redacted,
+    not as a released prefix completed by a later delta.
+    """
+    detector = _detector(window=64)
+    completion = "start " + "a" * 600 + "@example.com done"
+    _, whole = detector.redact(completion)
+    assert "a" * 600 not in whole
+    assert _stream(detector, [completion[:300], completion[300:]]) == whole
 
 
 def test_an_authored_pattern_is_not_streamable() -> None:

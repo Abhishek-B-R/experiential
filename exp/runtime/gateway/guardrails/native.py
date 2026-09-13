@@ -138,9 +138,9 @@ def _guardrail_failure_payload(safe_message: str, failure_class: str = "guardrai
     return {"failure_class": failure_class, "safe_message": safe_message}
 
 
-def _released_bytes(data: JsonObject) -> int:
-    """Return how many completion bytes the data plane already released."""
-    value = data.get("released_bytes")
+def _settled_bytes(data: JsonObject) -> int:
+    """Return how many provider completion bytes already left the buffer."""
+    value = data.get("settled_bytes")
     return value if isinstance(value, int) else 0
 
 
@@ -161,7 +161,7 @@ def enforce_native_output_segment(
         engine: Optional composed engine.
         policy: Policy captured at admission. ``None`` means unguarded.
         argument: JSON object with ``pending``, ``final``, and
-            ``released_bytes``.
+            ``settled_bytes``.
 
     Returns:
         JSON decision with ``action`` plus either ``release``, ``pending``,
@@ -177,7 +177,7 @@ def enforce_native_output_segment(
             policy=policy,
             pending=str(data.get("pending") or ""),
             final=bool(data.get("final")),
-            released_bytes=_released_bytes(data),
+            settled_bytes=_settled_bytes(data),
         )
     except GuardrailRejected as exc:
         return _encode_segment_failure(

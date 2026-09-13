@@ -1353,9 +1353,9 @@ def test_released_segment_is_redacted_and_bounded() -> None:
     engine, policy = _regex_engine()
     segment = engine.release_output_segment(
         policy=policy,
-        pending="write to ada@example.com " + "x" * 600,
+        pending="write to ada@example.com " + "x" * 600 + " done",
         final=False,
-        released_bytes=0,
+        settled_bytes=0,
     )
     assert "ada@example.com" not in segment.release
     assert segment.flagged
@@ -1370,7 +1370,7 @@ def test_oversized_stream_fails_closed_and_releases_nothing() -> None:
             policy=policy,
             pending="x" * 64,
             final=True,
-            released_bytes=0,
+            settled_bytes=0,
         )
     assert failure.value.failure.safe_details.get("action") == GuardrailAction.ERROR.value
 
@@ -1405,5 +1405,5 @@ def test_adapter_failure_mid_stream_fails_closed() -> None:
             policy=policy,
             pending="anything",
             final=True,
-            released_bytes=0,
+            settled_bytes=0,
         )

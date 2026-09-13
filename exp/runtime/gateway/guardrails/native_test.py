@@ -325,7 +325,7 @@ def test_output_segment_without_an_engine_fails_closed() -> None:
         enforce_native_output_segment(
             None,
             None,
-            json.dumps({"pending": "text", "final": True, "released_bytes": 0}),
+            json.dumps({"pending": "text", "final": True, "settled_bytes": 0}),
         )
     )
     assert decision["action"] == "error"
@@ -369,9 +369,9 @@ def test_output_segment_releases_redacted_text() -> None:
             policy,
             json.dumps(
                 {
-                    "pending": "mail ada@example.com now " + "y" * 200,
+                    "pending": "mail ada@example.com now " + "y" * 200 + " done ",
                     "final": False,
-                    "released_bytes": 0,
+                    "settled_bytes": 0,
                 }
             ),
         )

@@ -263,7 +263,7 @@ def test_streamed_deterministic_policy_admits_the_incremental_path(tmp_path: Pat
                     "request_id": admission["request_id"],
                     "pending": "mail ada@example.com now " + "x" * 200,
                     "final": False,
-                    "released_bytes": 0,
+                    "settled_bytes": 0,
                 }
             )
         )
@@ -294,7 +294,7 @@ def test_unknown_request_segment_fails_closed(tmp_path: Path) -> None:
                     "request_id": "missing-request",
                     "pending": "mail ada@example.com now",
                     "final": True,
-                    "released_bytes": 0,
+                    "settled_bytes": 0,
                 }
             )
         )

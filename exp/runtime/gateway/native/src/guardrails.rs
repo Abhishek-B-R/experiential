@@ -292,7 +292,7 @@ pub struct StreamRedactor {
     request_id: String,
     channel: Option<TextChannel>,
     pending: String,
-    released_bytes: u64,
+    settled_bytes: u64,
 }
 
 impl StreamRedactor {
@@ -302,7 +302,7 @@ impl StreamRedactor {
             request_id: request_id.to_string(),
             channel: None,
             pending: String::new(),
-            released_bytes: 0,
+            settled_bytes: 0,
         }
     }
 
@@ -363,8 +363,9 @@ impl StreamRedactor {
             "request_id": self.request_id,
             "pending": self.pending,
             "final": final_segment,
-            "released_bytes": self.released_bytes,
+            "settled_bytes": self.settled_bytes,
         }));
+        let sent = self.pending.len();
         let payload = bridge
             .call("enforce_output_segment", argument)
             .await
@@ -375,10 +376,14 @@ impl StreamRedactor {
             return Err(decision.failure.clone().unwrap_or_else(closed_failure));
         }
         self.pending = decision.pending;
+        // The completion bound counts the bytes the provider produced, so a
+        // replacement shorter than its match must not shrink the running
+        // total. What left the buffer is what the tail lost, not what the
+        // caller received.
+        self.settled_bytes += sent.saturating_sub(self.pending.len()) as u64;
         if decision.release.is_empty() {
             return Ok(None);
         }
-        self.released_bytes += decision.release.len() as u64;
         Ok(Some(decision.release))
     }
 }
@@ -636,6 +641,55 @@ class Plane:
         let text = seen(&released);
         assert_eq!(text, "hello [R] world and more text");
         assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    fn settled_bytes_count_consumed_input_not_released_output() {
+        let (plane, bridge) = pyo3::Python::attach(|py| {
+            let object = pyo3::types::PyModule::from_code(
+                py,
+                SEGMENT_PLANE,
+                c"segment.py",
+                c"segment_bytes",
+            )
+            .expect("module compiles")
+            .getattr("Plane")
+            .expect("class exists")
+            .call1((false,))
+            .expect("plane instantiates")
+            .unbind();
+            let bridge = Bridge::new(object.clone_ref(py), 1).expect("bridge starts");
+            (object, bridge)
+        });
+        let mut redactor = StreamRedactor::new("req-1");
+        let released = block_on(async {
+            let mut all = Vec::new();
+            for delta in ["hello sec", "ret world", " and more text"] {
+                all.extend(
+                    redactor
+                        .admit(&bridge, Event::TextDelta(delta.to_string()))
+                        .await
+                        .expect("segment allowed"),
+                );
+            }
+            all.extend(redactor.flush(&bridge).await.expect("flush allowed"));
+            all
+        });
+        // The replacement is shorter than its match, so the caller sees fewer
+        // bytes than the provider produced. The bound follows the provider.
+        assert_eq!(seen(&released).len(), 29);
+        let settled = pyo3::Python::attach(|py| {
+            use pyo3::prelude::PyAnyMethods;
+            let calls = plane.bind(py).getattr("calls").expect("calls recorded");
+            let last = calls
+                .get_item(calls.len().expect("length") - 1)
+                .expect("one call");
+            last.get_item("settled_bytes")
+                .expect("field present")
+                .extract::<u64>()
+                .expect("integer")
+        });
+        assert_eq!(settled, 28);
     }
 
     #[test]

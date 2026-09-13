@@ -289,7 +289,7 @@ class GuardrailEngine:
         policy: GuardrailPolicy,
         pending: str,
         final: bool,
-        released_bytes: int,
+        settled_bytes: int,
     ) -> StreamSegment:
         """Redact and release the settled part of one buffered stream tail.
 
@@ -307,7 +307,9 @@ class GuardrailEngine:
             policy: Assigned identity policy.
             pending: Buffered completion tail, oldest character first.
             final: Whether the provider stream has ended.
-            released_bytes: Completion bytes already delivered to the caller.
+            settled_bytes: Provider completion bytes already released from
+                the buffer, counted before redaction so a short replacement
+                cannot shrink the completion against its bound.
 
         Returns:
             The redacted release, the tail to keep buffered, and the flag.
@@ -322,7 +324,7 @@ class GuardrailEngine:
         if check is None or redactor is None:
             self._record(policy, check, GuardrailAction.ERROR, 0.0)
             raise GuardrailRejected(guardrail_failure(action=GuardrailAction.ERROR))
-        if released_bytes + len(pending.encode("utf-8")) > policy.max_response_bytes:
+        if settled_bytes + len(pending.encode("utf-8")) > policy.max_response_bytes:
             self._record(policy, check, GuardrailAction.ERROR, 0.0)
             raise GuardrailRejected(guardrail_failure(action=GuardrailAction.ERROR))
         started = self._monotonic()

@@ -51,14 +51,14 @@ _DIGITS = "0123456789"
 _EMAIL_ALPHABET = frozenset(_LETTERS + _DIGITS + ".!#$%&'*+/=?^_`{|}~-@")
 _CARD_ALPHABET = frozenset(_DIGITS + " -")
 _API_KEY_ALPHABET = frozenset(_LETTERS + _DIGITS + "_-")
-_HOLDS: dict[BuiltinPattern, tuple[frozenset[str], int]] = {
+_HOLDS: dict[BuiltinPattern, frozenset[str]] = {
     # One match of a family can only be built from that family's own
-    # characters, and can never be longer than its bound: an address with the
-    # RFC maximum local part and domain, a 19 digit card with separators, and
-    # a key token far past every issued prefix length.
-    BuiltinPattern.EMAIL: (_EMAIL_ALPHABET, 320),
-    BuiltinPattern.CREDIT_CARD: (_CARD_ALPHABET, 38),
-    BuiltinPattern.API_KEY: (_API_KEY_ALPHABET, 128),
+    # characters, so a character outside the alphabet ends every candidate
+    # that could still grow. The expressions themselves are not length
+    # bounded, so no character inside the alphabet ever settles.
+    BuiltinPattern.EMAIL: _EMAIL_ALPHABET,
+    BuiltinPattern.CREDIT_CARD: _CARD_ALPHABET,
+    BuiltinPattern.API_KEY: _API_KEY_ALPHABET,
 }
 
 
@@ -75,14 +75,15 @@ class RegexAdapterDocument(ContractModel):
     builtin_patterns: tuple[BuiltinPattern, ...] = ()
     replacement: str = Field(default="[REDACTED]", min_length=1, max_length=128)
     stream_window_characters: int = Field(default=512, ge=64, le=65_536)
-    """Most trailing characters ever held back while a stream is redacted.
+    """How far back a stream looks for the character that settles a release.
 
-    A built-in family holds only its own trailing candidate run, which this
-    cap bounds from above. The cap applies to a rule of built-in families
-    alone: a rule carrying an authored expression is never redacted
-    incrementally, because an RE2 expression declares neither the characters
-    nor the length one of its matches can span, so no window can be proven
-    long enough to keep a match from reaching past it.
+    A built-in family holds its trailing run of candidate characters, and
+    the character before that run is what proves the rest settled. This is
+    how far back that character is looked for: a longer unbroken run holds
+    the whole tail instead, so a long match is buffered rather than released
+    in pieces. It never bounds a match, and a rule carrying an authored
+    expression is not streamed at all, because an RE2 expression declares
+    neither the characters nor the length one of its matches can span.
     """
 
     @model_validator(mode="after")
@@ -125,22 +126,27 @@ def _compile(pattern: str) -> _Pattern:
         raise ValueError("invalid RE2 expression; check syntax and simplify the pattern") from None
 
 
-def _run_start(text: str, alphabet: frozenset[str], longest: int) -> int:
+def _run_start(text: str, alphabet: frozenset[str], window: int) -> int:
     """Return where the trailing run of one family's characters begins.
+
+    The run is searched for over the trailing window only. A run that fills
+    the window has no proven start, so the whole tail stays buffered: the
+    family's expressions are not length bounded, and releasing inside a run
+    could cut a match that later text completes.
 
     Args:
         text: Buffered completion tail.
         alphabet: Every character one match of the family can contain.
-        longest: Most characters one match of the family can span.
+        window: Most characters searched back for the run's first character.
 
     Returns:
         The offset of the first character that must stay buffered.
     """
     start = len(text)
-    floor = max(0, len(text) - longest)
+    floor = max(0, len(text) - window)
     while start > floor and text[start - 1] in alphabet:
         start -= 1
-    return start
+    return 0 if start == floor and floor > 0 else start
 
 
 def _valid_card(digits: list[int]) -> bool:
@@ -214,11 +220,13 @@ class RegexClassifier:
         """Return how many leading characters of a buffered tail are settled.
 
         A match that later text can still grow into must end at the end of
-        the tail, so it is written entirely in one family's own characters
-        and is no longer than that family's bound. The boundary is therefore
-        the start of the trailing run of such characters, and everything
-        before it is settled: no later delta can reach back across a
-        character the family cannot match. Luhn validation is not applied
+        the tail and is written entirely in one family's own characters. The
+        boundary is therefore the start of the trailing run of such
+        characters, and everything before it is settled: no later delta can
+        reach back across a character the family cannot match. A run longer
+        than the configured window settles nothing, so an unbroken run of
+        candidate characters buffers instead of releasing a prefix a later
+        delta could turn into one long match. Luhn validation is not applied
         here, so a card candidate that is not yet a valid card still holds
         the boundary back. An authored rule never reaches this method: it is
         not streamable, so its completions stay buffered.
@@ -230,9 +238,9 @@ class RegexClassifier:
             The count of leading characters no later text can change.
         """
         boundary = len(text)
-        for alphabet, longest in self._holds:
-            boundary = min(boundary, _run_start(text, alphabet, longest))
-        return max(boundary, len(text) - self._stream_window, 0)
+        for alphabet in self._holds:
+            boundary = min(boundary, _run_start(text, alphabet, self._stream_window))
+        return max(boundary, 0)
 
     def redact(self, text: str) -> tuple[bool, str]:
         """Return whether ``text`` matched and its fully redacted form.
