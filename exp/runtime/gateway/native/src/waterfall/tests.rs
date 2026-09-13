@@ -22,7 +22,7 @@ fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         idempotency_key: "op".to_string(),
         time_to_first_byte_base_seconds: base,
         time_to_first_byte_seconds_per_million_input_tokens: slope,
-        throttle_backoff_eligible: false,
+        throttle_redial_budget: 0,
     }
 }
 

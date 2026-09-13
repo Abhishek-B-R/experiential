@@ -10,9 +10,9 @@ next candidate, reading the requesting organization's observed cached
 fraction on the failed rung so a pool authoring ``throttle_cache_threshold``
 can dispose of a throttle by the cache actually at stake, and honoring a
 post-backoff redial under an authored ``throttle_redial`` schedule.
-``throttle_backoff_eligibility`` applies the same cache-stakes gate at
-admission, per rung, so the data plane knows which rungs are worth waiting
-for before the first throttle arrives.
+``throttle_redial_budgets`` applies the same cache-stakes gate at
+admission, per rung, so the data plane knows how long each rung is worth
+waiting on before the first throttle arrives.
 """
 
 from __future__ import annotations
@@ -167,7 +167,9 @@ def failed_dispatch_candidate(
         cached_fraction=cached_fraction,
         throttle_redial=redial,
         throttle_backoff=throttle_backoff,
-        throttle_redials_so_far=entry.throttle_redials[current_depth],
+        throttle_redial_budget=(
+            entry.throttle_redial_budgets[current_depth] - entry.throttle_redials[current_depth]
+        ),
     )
     disposition = throttle_disposition(
         failure,
@@ -195,23 +197,26 @@ def failed_dispatch_candidate(
     return candidate, disposition
 
 
-def throttle_backoff_eligibility(
+def throttle_redial_budgets(
     loads: RungLoadRegistry,
     route: GatewayRoute,
     organization_id: str,
-) -> tuple[bool, ...]:
-    """Decide, per rung, whether a throttle there is worth backing off for.
+) -> tuple[int, ...]:
+    """Size, per rung, how many post-backoff redials this request may spend there.
 
     Read once at admission so the data plane knows before the first throttle
-    which rungs to redial with backoff and which to fail over cold at once.
-    Every rung is ineligible on a pool without a ``throttle_redial``
-    schedule (the historical failover-only throttle). With a schedule and no
-    ``throttle_cache_threshold`` every rung is eligible: the operator asked
-    for backoff on this pool. With both, exactly the rungs where the
-    requesting organization's observed cached fraction meets the threshold
-    are eligible, the same cache-stakes gate that would otherwise surface
-    the throttle, now meaning "wait here" instead of "return the 429". The
-    fraction is the admission-time EWMA, at most seconds older than the
+    how long each rung is worth waiting on. Every budget is zero on a pool
+    without a ``throttle_redial`` schedule (the historical failover-only
+    throttle). With a schedule and no ``throttle_cache_threshold`` every rung
+    gets the schedule's full ``max_attempts``: the operator asked for backoff
+    on this pool. With both, the budget scales with the cache at stake: the
+    full ``max_attempts`` when the requesting organization's observed cached
+    fraction on the rung meets the threshold, a proportional share
+    (``floor(max_attempts * fraction / threshold)``) below it, and zero with
+    no cache evidence, so a request with little to lose fails over sooner and
+    one with nothing to lose fails over at once. The same cache-stakes gate
+    that would otherwise surface the throttle now decides how long to wait.
+    The fraction is the admission-time EWMA, at most seconds older than the
     reading a failure-time decision would take.
 
     Args:
@@ -220,15 +225,18 @@ def throttle_backoff_eligibility(
         organization_id: The requesting organization.
 
     Returns:
-        One flag per route deployment, in route order.
+        One redial budget per route deployment, in route order.
     """
     snapshot = route.snapshot
-    if snapshot.throttle_redial is None:
-        return tuple(False for _ in route.deployments)
+    schedule = snapshot.throttle_redial
+    if schedule is None:
+        return tuple(0 for _ in route.deployments)
     threshold = snapshot.throttle_cache_threshold
-    if threshold is None:
-        return tuple(True for _ in route.deployments)
-    return tuple(
-        loads.cached_fraction(rung_load_key(deployment), organization_id) >= threshold
-        for deployment in route.deployments
-    )
+    if threshold is None or threshold <= 0:
+        return tuple(schedule.max_attempts for _ in route.deployments)
+    budgets: list[int] = []
+    for deployment in route.deployments:
+        fraction = loads.cached_fraction(rung_load_key(deployment), organization_id)
+        share = min(1.0, fraction / threshold)
+        budgets.append(int(schedule.max_attempts * share))
+    return tuple(budgets)

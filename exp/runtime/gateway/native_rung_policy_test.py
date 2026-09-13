@@ -38,7 +38,7 @@ from exp.runtime.gateway.native_execution import InflightRequest, deployment_hea
 from exp.runtime.gateway.native_rung_policy import (
     failed_dispatch_candidate,
     reserve_rung_slot,
-    throttle_backoff_eligibility,
+    throttle_redial_budgets,
 )
 from exp.runtime.gateway.routing import CatalogRouteResolver, GatewayRoute
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
@@ -376,29 +376,42 @@ def test_failed_dispatch_candidate_names_backoff_then_cold_under_a_redial_schedu
     ) == (None, None)
 
 
-def test_throttle_backoff_eligibility_gates_by_the_schedule_and_the_cache_at_stake() -> None:
-    """No schedule: nothing waits. Schedule alone: every rung. Plus threshold: warm rungs only."""
+def test_throttle_redial_budgets_scale_with_the_schedule_and_the_cache_at_stake() -> None:
+    """No schedule: zero. Schedule alone: the full cap. Plus threshold: scaled by warm cache."""
     deployments = (
         _deployment("deployment-a", connection_sha256="b" * 64),
         _deployment("deployment-b", connection_sha256="c" * 64),
     )
     loads = RungLoadRegistry()
     plain = _entry(deployments, failover_mode="maximize_cache")
-    assert throttle_backoff_eligibility(loads, plain.route, "organization-one") == (False, False)
+    assert throttle_redial_budgets(loads, plain.route, "organization-one") == (0, 0)
     scheduled = _entry(deployments, throttle_redial=_REDIAL)
-    assert throttle_backoff_eligibility(loads, scheduled.route, "organization-one") == (
-        True,
-        True,
-    )
+    assert throttle_redial_budgets(loads, scheduled.route, "organization-one") == (2, 2)
     gated = _entry(deployments, throttle_cache_threshold=0.5, throttle_redial=_REDIAL)
-    assert throttle_backoff_eligibility(loads, gated.route, "organization-one") == (False, False)
+    # No cache evidence: nothing to wait for, fail over at once.
+    assert throttle_redial_budgets(loads, gated.route, "organization-one") == (0, 0)
     # Another organization's warm cache on the rung does not count...
     loads.record_settle(
         ("deployment-a", "b" * 64), "organization-other", cached_tokens=9, input_tokens=10
     )
-    assert throttle_backoff_eligibility(loads, gated.route, "organization-one") == (False, False)
-    # ...the requesting organization's own does, rung by rung.
+    assert throttle_redial_budgets(loads, gated.route, "organization-one") == (0, 0)
+    # ...the requesting organization's own does, rung by rung: a fraction at
+    # or above the threshold earns the whole budget.
     loads.record_settle(
         ("deployment-a", "b" * 64), "organization-one", cached_tokens=9, input_tokens=10
     )
-    assert throttle_backoff_eligibility(loads, gated.route, "organization-one") == (True, False)
+    assert throttle_redial_budgets(loads, gated.route, "organization-one") == (2, 0)
+    # Below the threshold the budget is the proportional share, so a request
+    # with little cache at stake fails over sooner rather than never waiting.
+    loads.record_settle(
+        ("deployment-b", "c" * 64), "organization-one", cached_tokens=3, input_tokens=10
+    )
+    budgets = throttle_redial_budgets(loads, gated.route, "organization-one")
+    assert budgets[0] == 2
+    assert budgets[1] == 1
+    # A zero threshold means every cache reading meets it: the full budget.
+    free = _entry(deployments, throttle_cache_threshold=0.0, throttle_redial=_REDIAL)
+    assert throttle_redial_budgets(loads, free.route, "organization-one") == (2, 2)
+    # Entries built without the admission step default to the full budget.
+    assert scheduled.throttle_redial_budgets == (2, 2)
+    assert plain.throttle_redial_budgets == (0, 0)

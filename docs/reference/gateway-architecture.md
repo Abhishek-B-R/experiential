@@ -205,10 +205,13 @@ must leave the redial its own first-byte allowance under the request deadline; o
 ladder advances at once. Up to `max_attempts` redials per rung are made, then the throttle fails
 over down the ladder exactly like any failover-eligible failure, and only when every rung is
 exhausted does the typed 429 reach the caller, carrying the largest `Retry-After` any rung stated.
-Which rungs are "worth waiting for" is decided at admission per rung and carried on the wire
-entry as `throttle_backoff_eligible`: every rung when no `throttle_cache_threshold` is authored,
-otherwise exactly the rungs where the organization's cached fraction meets the threshold, so the
-gate now means "back off here" rather than "surface". Every redial is its own durably reserved
+How long each rung is worth waiting on is decided at admission per rung and carried on the wire
+entry as `throttle_redial_budget`, the post-backoff redials this request may spend there: the
+full `max_attempts` on every rung when no `throttle_cache_threshold` is authored, otherwise the
+full budget where the organization's cached fraction meets the threshold, a proportional share
+(`floor(max_attempts * fraction / threshold)`) below it, and zero with no cache evidence, so the
+gate now means "how long to wait here" rather than "surface": high stake spends the whole
+backoff budget, low stake fails over sooner, no stake fails over at once. Every redial is its own durably reserved
 attempt row (the attempt ordinal increments), claimed through the rung's own throttle window
 (this request is the one deliberately probing the rung back; other requests still avoid it), and
 disclosed as `dispatch_reason: throttle_backoff`; the cold advance after the budget is

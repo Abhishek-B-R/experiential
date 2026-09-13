@@ -162,7 +162,7 @@ async fn spawn_rung(script: Vec<Answer>) -> Rung {
     }
 }
 
-fn wire(deployment_id: &str, url: &str, throttle_backoff_eligible: bool) -> DeploymentWire {
+fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) -> DeploymentWire {
     DeploymentWire {
         provider: "openai".to_string(),
         deployment_id: deployment_id.to_string(),
@@ -186,7 +186,7 @@ fn wire(deployment_id: &str, url: &str, throttle_backoff_eligible: bool) -> Depl
         idempotency_key: format!("op-{deployment_id}"),
         time_to_first_byte_base_seconds: None,
         time_to_first_byte_seconds_per_million_input_tokens: None,
-        throttle_backoff_eligible,
+        throttle_redial_budget,
     }
 }
 
@@ -291,7 +291,7 @@ fn a_throttled_rung_is_redialed_after_backoff_and_then_serves() {
         ])
         .await;
         let rung_b = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
-        let route = [wire("a", &rung_a.url, true), wire("b", &rung_b.url, false)];
+        let route = [wire("a", &rung_a.url, 2), wire("b", &rung_b.url, 0)];
         let (won, guard) = harness
             .run(&route, Some(SCHEDULE), Duration::from_secs(60))
             .await;
@@ -354,7 +354,7 @@ fn spent_redials_advance_the_ladder_and_exhaustion_carries_the_largest_retry_aft
         ])
         .await;
         let rung_b = spawn_rung(vec![Answer::Throttle(Some(6))]).await;
-        let route = [wire("a", &rung_a.url, true), wire("b", &rung_b.url, false)];
+        let route = [wire("a", &rung_a.url, 2), wire("b", &rung_b.url, 0)];
         let (won, guard) = harness
             .run(&route, Some(SCHEDULE), Duration::from_secs(60))
             .await;
@@ -400,7 +400,7 @@ fn commitment_ends_redials_even_when_the_committed_stream_then_throttles() {
         // the committed relay's to report: no redial, no failover.
         let rung_a = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME, THROTTLE_FRAME])]).await;
         let rung_b = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
-        let route = [wire("a", &rung_a.url, true), wire("b", &rung_b.url, true)];
+        let route = [wire("a", &rung_a.url, 2), wire("b", &rung_b.url, 2)];
         let (won, guard) = harness
             .run(&route, Some(SCHEDULE), Duration::from_secs(60))
             .await;
@@ -418,15 +418,15 @@ fn commitment_ends_redials_even_when_the_committed_stream_then_throttles() {
 }
 
 #[test]
-fn without_a_schedule_or_eligibility_a_throttle_stays_failover_only() {
-    for (schedule, eligible) in [(None, true), (Some(SCHEDULE), false)] {
+fn without_a_schedule_or_a_budget_a_throttle_stays_failover_only() {
+    for (schedule, budget) in [(None, 2), (Some(SCHEDULE), 0)] {
         block_on(async {
             let harness = Harness::new();
             let rung_a = spawn_rung(vec![Answer::Throttle(Some(1))]).await;
             let rung_b = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
             let route = [
-                wire("a", &rung_a.url, eligible),
-                wire("b", &rung_b.url, eligible),
+                wire("a", &rung_a.url, budget),
+                wire("b", &rung_b.url, budget),
             ];
             let (won, guard) = harness.run(&route, schedule, Duration::from_secs(60)).await;
             let won = finish(guard, won).await;
@@ -451,7 +451,7 @@ fn a_wait_that_cannot_fit_the_deadline_advances_instead_of_waiting() {
         let harness = Harness::new();
         let rung_a = spawn_rung(vec![Answer::Throttle(None)]).await;
         let rung_b = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
-        let route = [wire("a", &rung_a.url, true), wire("b", &rung_b.url, true)];
+        let route = [wire("a", &rung_a.url, 2), wire("b", &rung_b.url, 2)];
         // Three seconds left, and the redial would need its own five-second
         // first-byte allowance after the wait: the ladder advances at once.
         let started = Instant::now();
@@ -467,5 +467,74 @@ fn a_wait_that_cannot_fit_the_deadline_advances_instead_of_waiting() {
         assert!(started.elapsed() < Duration::from_secs(1));
         let story = harness.story().await;
         assert_eq!(story["starts"][1]["throttle_backoff"], false);
+    });
+}
+
+#[test]
+fn a_low_stake_request_gets_fewer_redials_than_a_high_stake_one() {
+    block_on(async {
+        let harness = Harness::new();
+        // Both requests hit a rung that throttles three times in a row; the
+        // schedule allows two redials. Admission sized the high-stake
+        // request's budget at the full two (its cache meets the threshold)
+        // and the low-stake request's at one (cache below it).
+        let high_rung = spawn_rung(vec![
+            Answer::Throttle(None),
+            Answer::Throttle(None),
+            Answer::Throttle(None),
+        ])
+        .await;
+        let low_rung = spawn_rung(vec![
+            Answer::Throttle(None),
+            Answer::Throttle(None),
+            Answer::Throttle(None),
+        ])
+        .await;
+        let spill = spawn_rung(vec![
+            Answer::Stream(&[TEXT_FRAME]),
+            Answer::Stream(&[TEXT_FRAME]),
+        ])
+        .await;
+
+        let high_route = [wire("a", &high_rung.url, 2), wire("b", &spill.url, 2)];
+        let (won, guard) = harness
+            .run(&high_route, Some(SCHEDULE), Duration::from_secs(60))
+            .await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("the spill rung serves the high-stake request");
+        };
+        assert_eq!(committed.depth, 1);
+        drop(committed);
+        // Two redials of the warm rung before the cold advance.
+        assert_eq!(high_rung.accepted.lock().expect("lock").len(), 3);
+
+        let low_harness = Harness::new();
+        let low_route = [wire("a", &low_rung.url, 1), wire("b", &spill.url, 2)];
+        let (won, guard) = low_harness
+            .run(&low_route, Some(SCHEDULE), Duration::from_secs(60))
+            .await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("the spill rung serves the low-stake request");
+        };
+        assert_eq!(committed.depth, 1);
+        drop(committed);
+        // One redial only: the second throttle advances the ladder even
+        // though the schedule itself allows two.
+        assert_eq!(low_rung.accepted.lock().expect("lock").len(), 2);
+
+        let high = harness.story().await;
+        let low = low_harness.story().await;
+        assert_eq!(high["counts"], json!([3, 1]));
+        assert_eq!(low["counts"], json!([2, 1]));
+        let flags = |story: &Value| -> Vec<bool> {
+            story["starts"]
+                .as_array()
+                .expect("starts")
+                .iter()
+                .map(|start| start["throttle_backoff"] == true)
+                .collect()
+        };
+        assert_eq!(flags(&high), vec![false, true, true, false]);
+        assert_eq!(flags(&low), vec![false, true, false]);
     });
 }

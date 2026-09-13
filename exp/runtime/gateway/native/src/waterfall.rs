@@ -116,13 +116,14 @@ pub struct DeploymentWire {
     /// configuration's default applies when absent.
     #[serde(default)]
     pub time_to_first_byte_seconds_per_million_input_tokens: Option<f64>,
-    /// A throttle on this rung is worth waiting for on this request: the
-    /// pool authors a `throttle_redial` schedule and the requesting
-    /// organization's cached fraction here meets any authored threshold.
-    /// The waterfall then backs off and re-dials this rung before the ladder
-    /// advances; false keeps the rung's throttle failover-only.
+    /// How many post-backoff redials a throttle on this rung is worth on
+    /// this request: the pool's `throttle_redial` schedule scaled by the
+    /// requesting organization's cache at stake here (the full schedule at
+    /// or above any authored threshold, a proportional share below it). The
+    /// waterfall backs off and re-dials this rung that many times before the
+    /// ladder advances; zero keeps the rung's throttle failover-only.
     #[serde(default)]
-    pub throttle_backoff_eligible: bool,
+    pub throttle_redial_budget: u32,
 }
 
 /// The frozen retry-policy facts returned by admission.
@@ -290,10 +291,10 @@ pub(crate) fn successor_possible(
 }
 
 /// The wait before re-dialing a throttled rung, or `None` when the ladder
-/// should advance instead: the pool authors no schedule, the rung is not
-/// worth waiting for on this request, the failure is not a throttle, the
-/// total cap is reached, or the schedule itself declines (redial cap,
-/// `Retry-After` beyond the ceiling, or no room under the deadline).
+/// should advance instead: the pool authors no schedule, the rung's redial
+/// budget on this request is spent (or zero), the failure is not a throttle,
+/// the total cap is reached, or the schedule itself declines (`Retry-After`
+/// beyond the ceiling, or no room under the deadline).
 fn throttle_backoff_delay(
     ctx: &WaterfallContext<'_>,
     wire: &DeploymentWire,
@@ -302,14 +303,18 @@ fn throttle_backoff_delay(
     total_attempts: u32,
 ) -> Option<Duration> {
     let schedule = ctx.policy.throttle_redial?;
-    if !wire.throttle_backoff_eligible
+    if wire.throttle_redial_budget == 0
         || failure.failure_class != FailureClass::Throttled
         || total_attempts >= ctx.policy.maximum_total_attempts
     {
         return None;
     }
     BackoffQuery {
-        schedule,
+        // The rung's per-request budget never exceeds the schedule's cap.
+        schedule: ThrottleRedial {
+            max_attempts: schedule.max_attempts.min(wire.throttle_redial_budget),
+            ..schedule
+        },
         redials_so_far: throttle_redials_at_depth,
         retry_after_seconds: failure.retry_after_seconds,
         remaining_deadline: remaining(ctx.deadline),
