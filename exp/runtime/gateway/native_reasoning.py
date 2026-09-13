@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -24,6 +25,34 @@ from exp.runtime.gateway.reasoning_carrier import (
 )
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.openai_protocol.errors import public_failure_error
+
+_logger = logging.getLogger(__name__)
+
+
+def log_reasoning_continuation_rejection(
+    authorization: AuthorizationSnapshot, stage: str, reason: object
+) -> None:
+    """Record why a reasoning-carrier continuation failed, for operators only.
+
+    The caller sees one opaque 400 (naming the differing bound claim would be an
+    authentic-continuation oracle), but an operator needs the exact reason to tell
+    a genuine tamper from a benign authority drift. Nothing here carries a
+    credential or the plaintext reasoning; the catalog-generation fields make a
+    cross-worker or post-republish drift obvious when diffed against the issuing
+    turn's admission log.
+    """
+    _logger.warning(
+        "reasoning carrier continuation rejected",
+        extra={
+            "operation": "native_reasoning_continuation",
+            "stage": stage,
+            "reason": str(reason),
+            "request_id": authorization.request_id,
+            "alias": authorization.alias,
+            "alias_revision_id": authorization.alias_revision_id,
+            "catalog_sha256": authorization.catalog_sha256,
+        },
+    )
 
 
 def has_active_reasoning_content(request: GatewayRequest) -> bool:

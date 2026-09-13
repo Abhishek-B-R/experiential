@@ -42,6 +42,11 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
 from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
+from exp.runtime.gateway.guardrails.deterministic import (
+    NativeDetector,
+    compile_native_detectors,
+    native_output_plan,
+)
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import enforce_native_input, enforce_native_output
 from exp.runtime.gateway.native_accounting import (
@@ -99,6 +104,7 @@ from exp.runtime.gateway.native_images import NativeImagesMixin
 from exp.runtime.gateway.native_observability import NativeObservabilityMixin
 from exp.runtime.gateway.native_reasoning import (
     authenticate_reasoning_history,
+    log_reasoning_continuation_rejection,
     has_active_reasoning_content,
     seal_reasoning_carrier_content,
     strip_stale_reasoning_history,
@@ -219,6 +225,12 @@ class NativeControlPlane(
         self._budget_error_factory = budget_error_factory
         self._native_route_eligible = native_route_eligible
         self._guardrails = guardrails
+        # Deterministic rules compile once here, so a guarded request never
+        # pays a compile and a fully deterministic output chain never pays a
+        # callback at all.
+        self._guardrail_detectors = compile_native_detectors(
+            {} if guardrails is None else guardrails.deterministic_specifications
+        )
         # The accounting registry owns in-flight requests, per-dispatch
         # reservations, deployment-health circuits, and the deadline sweep.
         self._accounting = NativeAttemptAccounting(
@@ -230,6 +242,16 @@ class NativeControlPlane(
         # a fresh process pays that once at bind time, never on its first
         # request, and a corrupt table fails startup with its own message.
         reservation_encoder()
+
+    @property
+    def guardrail_detectors(self) -> dict[str, NativeDetector]:
+        """Return the compiled deterministic rules the data plane enforces.
+
+        The process host hands these to ``exp_gateway_native.serve`` so an
+        admission carrying a resolved deterministic chain is enforced in
+        plane. The same handles serve a streamed delta window.
+        """
+        return dict(self._guardrail_detectors)
 
     @property
     def request_timeout_seconds(self) -> float:
@@ -364,6 +386,7 @@ class NativeControlPlane(
                 authorization=authorization,
                 request=request,
                 deadline_monotonic=deadline,
+                detectors=self._guardrail_detectors,
             )
         except GuardrailRejected as exc:
             raise NativeBridgeError(public_failure_error(exc.failure)) from exc
@@ -629,6 +652,9 @@ class NativeControlPlane(
             self._accounting.finish_request_quietly(authorization, failure)
             raise error from exc
 
+        output_plan = (
+            None if policy is None else native_output_plan(policy, self._guardrail_detectors)
+        )
         self._accounting.register(
             InflightRequest(
                 authorization=authorization,
@@ -662,13 +688,17 @@ class NativeControlPlane(
             "maximum_total_attempts": MAXIMUM_TOTAL_ATTEMPTS,
             "maximum_same_deployment_attempts": MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
             "refusal_failover": authorization.refusal_failover,
-            "output_guardrail": bool(policy is not None and policy.output_checks),
+            "output_guardrail": bool(
+                policy is not None and policy.output_checks and output_plan is None
+            ),
         }
         if route.snapshot.throttle_redial is not None:
             # The pool's frozen backoff-and-redial schedule; absent (not
             # null) on pools that keep throttles failover-only, so an
             # unauthored pool's admission is byte-identical.
             response["throttle_redial"] = route.snapshot.throttle_redial.model_dump(mode="json")
+        if output_plan is not None:
+            response["guardrail_output_plan"] = output_plan
         if request.surface == GatewayApiSurface.MESSAGES:
             # Display-only: what `message_start` shows as input when the
             # upstream reports nothing before its final chunk. The ledger
