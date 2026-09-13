@@ -887,9 +887,13 @@ def test_throttle_redial_redials_the_warm_rung_through_its_window_until_the_cap(
     assert not health.claim(_KEYS[0])
 
     def candidate(
-        counts: list[int], *, backoff: bool, keys: tuple[DeploymentHealthKey, ...] = _KEYS
+        counts: list[int],
+        redials: int,
+        *,
+        backoff: bool,
+        keys: tuple[DeploymentHealthKey, ...] = _KEYS,
     ) -> int | None:
-        """Ask the frozen policy after ``counts`` dispatches so far."""
+        """Ask the frozen policy after ``counts`` dispatches and ``redials`` backoffs."""
         return next_route_candidate(
             health=health,
             keys=keys,
@@ -901,17 +905,21 @@ def test_throttle_redial_redials_the_warm_rung_through_its_window_until_the_cap(
             failover_mode="maximize_cache",
             throttle_redial=_REDIAL,
             throttle_backoff=backoff,
+            throttle_redials_so_far=redials,
         )
 
     # Two redials of the warm rung after its throttled dispatch...
-    assert candidate([1, 0], backoff=True) == 0
-    assert candidate([2, 0], backoff=True) == 0
+    assert candidate([1, 0], 0, backoff=True) == 0
+    assert candidate([2, 0], 1, backoff=True) == 0
     # ...then the budget is spent and the ladder advances cold (no surfacing).
-    assert candidate([3, 0], backoff=True) == 1
+    assert candidate([3, 0], 2, backoff=True) == 1
+    # A retryable-class redial of the same rung spends no throttle budget:
+    # three dispatches there but only one post-backoff redial still redials.
+    assert candidate([3, 0], 1, backoff=True) == 0
     # A throttle the data plane did not wait out advances at once.
-    assert candidate([1, 0], backoff=False) == 1
+    assert candidate([1, 0], 0, backoff=False) == 1
     # A single-rung ladder past its redials is exhausted, and only then.
-    assert candidate([3], backoff=True, keys=_KEYS[:1]) is None
+    assert candidate([3], 2, backoff=True, keys=_KEYS[:1]) is None
     # The hard total cap still bounds the whole story.
     assert (
         next_route_candidate(

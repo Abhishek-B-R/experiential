@@ -221,6 +221,7 @@ dependencies = [
  "h2",
  "http",
  "http-body-util",
+ "httpdate",
  "pyo3",
  "reqwest",
  "serde",

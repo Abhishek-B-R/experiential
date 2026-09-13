@@ -167,6 +167,7 @@ def failed_dispatch_candidate(
         cached_fraction=cached_fraction,
         throttle_redial=redial,
         throttle_backoff=throttle_backoff,
+        throttle_redials_so_far=entry.throttle_redials[current_depth],
     )
     disposition = throttle_disposition(
         failure,

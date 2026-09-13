@@ -298,7 +298,7 @@ fn throttle_backoff_delay(
     ctx: &WaterfallContext<'_>,
     wire: &DeploymentWire,
     failure: &Failure,
-    attempts_at_depth: u32,
+    throttle_redials_at_depth: u32,
     total_attempts: u32,
 ) -> Option<Duration> {
     let schedule = ctx.policy.throttle_redial?;
@@ -310,7 +310,7 @@ fn throttle_backoff_delay(
     }
     BackoffQuery {
         schedule,
-        redials_so_far: attempts_at_depth.saturating_sub(1),
+        redials_so_far: throttle_redials_at_depth,
         retry_after_seconds: failure.retry_after_seconds,
         remaining_deadline: remaining(ctx.deadline),
         first_byte_allowance: first_byte_allowance(
@@ -355,6 +355,9 @@ enum AttemptEnd {
 pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuard) -> Won {
     let mut total_attempts: u32 = 0;
     let mut counts: Vec<u32> = vec![0; ctx.route.len()];
+    // Post-backoff redials made per depth: the schedule's per-rung cap
+    // counts only these, never a retryable-class redial of the same rung.
+    let mut throttle_redials: Vec<u32> = vec![0; ctx.route.len()];
     let mut current_depth: Option<usize> = None;
     let mut last_failure: Option<Failure> = None;
     // The longest wait any throttled rung stated, so an exhausted ladder
@@ -477,8 +480,13 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 // A pre-commit throttle on a rung worth waiting for is
                 // re-dialed after the schedule's backoff; otherwise the
                 // existing redial and failover rules decide.
-                let backoff =
-                    throttle_backoff_delay(ctx, wire, &failure, counts[depth], total_attempts);
+                let backoff = throttle_backoff_delay(
+                    ctx,
+                    wire,
+                    &failure,
+                    throttle_redials[depth],
+                    total_attempts,
+                );
                 let possible = backoff.is_some()
                     || successor_possible(
                         ctx.policy,
@@ -506,6 +514,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                     // The failed attempt is settled; the wait is the only
                     // thing between it and the redial's own reservation.
                     tokio::time::sleep(delay).await;
+                    throttle_redials[depth] += 1;
                     throttle_backoff = true;
                 }
                 if possible {

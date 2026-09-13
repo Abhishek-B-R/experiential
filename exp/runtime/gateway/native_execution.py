@@ -177,6 +177,10 @@ class InflightRequest:
     request: ServingRequest
     deadline_monotonic: float
     attempt_counts: list[int] = field(default_factory=list)
+    # Post-backoff redials reserved per route depth; the pool's
+    # ``throttle_redial.max_attempts`` caps only these, never a
+    # retryable-class redial of the same rung.
+    throttle_redials: list[int] = field(default_factory=list)
     total_attempts: int = 0
     active_attempt_id: str | None = None
     # Every reserved attempt's route depth, for health recording at settle.
@@ -218,6 +222,8 @@ class InflightRequest:
         """Size the per-deployment attempt counters to the frozen route."""
         if not self.attempt_counts:
             self.attempt_counts = [0 for _ in self.route.deployments]
+        if not self.throttle_redials:
+            self.throttle_redials = [0 for _ in self.route.deployments]
 
 
 def deployment_health_key(
@@ -379,6 +385,7 @@ def next_route_candidate(
     cached_fraction: float = 0.0,
     throttle_redial: GatewayThrottleRedialPolicy | None = None,
     throttle_backoff: bool = False,
+    throttle_redials_so_far: int = 0,
     maximum_total_attempts: int = MAXIMUM_TOTAL_ATTEMPTS,
     maximum_same_deployment_attempts: int = MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
 ) -> int | None:
@@ -442,6 +449,10 @@ def next_route_candidate(
             ``None`` to keep throttles failover-only.
         throttle_backoff: Whether the data plane waited the schedule's
             backoff and asks to redial the throttled rung.
+        throttle_redials_so_far: Post-backoff redials already reserved on
+            the rung at ``current_depth``; the schedule's cap counts only
+            these, so an earlier retryable-class redial there never spends
+            throttle budget.
         maximum_total_attempts: Hard cap across retries and deployments.
         maximum_same_deployment_attempts: Initial dispatch plus safe retries
             per deployment.
@@ -460,12 +471,10 @@ def next_route_candidate(
     throttled = failure.failure_class in _CACHE_PRESERVING_NO_FAILOVER_CLASSES
     if throttle_redial is not None and throttled:
         # The data plane waited the pool's backoff: redial the warm rung
-        # through its own throttle window while the redial cap allows. The
-        # count includes the throttled dispatch itself, so ``max_attempts``
-        # bounds the redials that follow it.
+        # through its own throttle window while the redial cap allows.
         if (
             throttle_backoff
-            and attempt_counts[current_depth] <= throttle_redial.max_attempts
+            and throttle_redials_so_far < throttle_redial.max_attempts
             and health.claim_throttle_redial(keys[current_depth])
         ):
             return current_depth

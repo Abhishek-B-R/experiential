@@ -555,6 +555,8 @@ class NativeAttemptAccounting:
             self._bind_sticky_dispatch(entry, deployment)
             with self._lock:
                 entry.attempt_counts[candidate] += 1
+                if throttle_backoff:
+                    entry.throttle_redials[candidate] += 1
                 entry.total_attempts += 1
                 entry.active_attempt_id = attempt_id
                 entry.attempt_depths[attempt_id] = candidate
