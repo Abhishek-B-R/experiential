@@ -471,31 +471,70 @@ fn a_wait_that_cannot_fit_the_deadline_advances_instead_of_waiting() {
 }
 
 #[test]
-fn a_rung_budget_below_the_schedule_caps_its_redials() {
+fn a_low_stake_request_gets_fewer_redials_than_a_high_stake_one() {
     block_on(async {
         let harness = Harness::new();
-        // Admission gave this rung one redial (cache below the threshold):
-        // the first throttle is waited out, the second advances the ladder
-        // even though the schedule itself allows two.
-        let rung_a = spawn_rung(vec![Answer::Throttle(None), Answer::Throttle(None)]).await;
-        let rung_b = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
-        let route = [wire("a", &rung_a.url, 1), wire("b", &rung_b.url, 2)];
+        // Both requests hit a rung that throttles three times in a row; the
+        // schedule allows two redials. Admission sized the high-stake
+        // request's budget at the full two (its cache meets the threshold)
+        // and the low-stake request's at one (cache below it).
+        let high_rung = spawn_rung(vec![
+            Answer::Throttle(None),
+            Answer::Throttle(None),
+            Answer::Throttle(None),
+        ])
+        .await;
+        let low_rung = spawn_rung(vec![
+            Answer::Throttle(None),
+            Answer::Throttle(None),
+            Answer::Throttle(None),
+        ])
+        .await;
+        let spill = spawn_rung(vec![
+            Answer::Stream(&[TEXT_FRAME]),
+            Answer::Stream(&[TEXT_FRAME]),
+        ])
+        .await;
+
+        let high_route = [wire("a", &high_rung.url, 2), wire("b", &spill.url, 2)];
         let (won, guard) = harness
-            .run(&route, Some(SCHEDULE), Duration::from_secs(60))
+            .run(&high_route, Some(SCHEDULE), Duration::from_secs(60))
             .await;
-        let won = finish(guard, won).await;
-        let Won::Committed(committed) = won else {
-            panic!("the next rung serves after the budgeted redial");
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("the spill rung serves the high-stake request");
         };
         assert_eq!(committed.depth, 1);
         drop(committed);
-        assert_eq!(rung_a.accepted.lock().expect("lock").len(), 2);
-        let story = harness.story().await;
-        let starts = story["starts"].as_array().expect("starts");
-        assert_eq!(starts.len(), 3);
-        assert_eq!(starts[1]["throttle_backoff"], true);
-        assert_eq!(starts[2]["throttle_backoff"], false);
-        assert_eq!(starts[2]["current_depth"], 0);
-        assert_eq!(story["counts"], json!([2, 1]));
+        // Two redials of the warm rung before the cold advance.
+        assert_eq!(high_rung.accepted.lock().expect("lock").len(), 3);
+
+        let low_harness = Harness::new();
+        let low_route = [wire("a", &low_rung.url, 1), wire("b", &spill.url, 2)];
+        let (won, guard) = low_harness
+            .run(&low_route, Some(SCHEDULE), Duration::from_secs(60))
+            .await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("the spill rung serves the low-stake request");
+        };
+        assert_eq!(committed.depth, 1);
+        drop(committed);
+        // One redial only: the second throttle advances the ladder even
+        // though the schedule itself allows two.
+        assert_eq!(low_rung.accepted.lock().expect("lock").len(), 2);
+
+        let high = harness.story().await;
+        let low = low_harness.story().await;
+        assert_eq!(high["counts"], json!([3, 1]));
+        assert_eq!(low["counts"], json!([2, 1]));
+        let flags = |story: &Value| -> Vec<bool> {
+            story["starts"]
+                .as_array()
+                .expect("starts")
+                .iter()
+                .map(|start| start["throttle_backoff"] == true)
+                .collect()
+        };
+        assert_eq!(flags(&high), vec![false, true, true, false]);
+        assert_eq!(flags(&low), vec![false, true, false]);
     });
 }
