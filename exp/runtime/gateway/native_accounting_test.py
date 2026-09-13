@@ -14,6 +14,7 @@ from exp.common.models.catalog import (
     GatewayDeploymentMetadata,
     GatewayRungDispatchPolicy,
 )
+from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
 from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
 from exp.runtime.gateway.contracts import (
@@ -254,6 +255,7 @@ def _start(
     current_depth: int | None = None,
     failure: JsonObject | None = None,
     request_id: str = "request-one",
+    throttle_backoff: bool = False,
 ) -> JsonObject:
     """Call one start_attempt with the data plane's wire shape."""
     return json.loads(
@@ -264,6 +266,7 @@ def _start(
                     "attempt_ordinal": ordinal,
                     "current_depth": current_depth,
                     "failure": failure,
+                    "throttle_backoff": throttle_backoff,
                 }
             )
         )
@@ -550,6 +553,7 @@ def _admit(
     weight: int = 1,
     failover_mode: FailoverMode = "maximize_availability",
     throttle_cache_threshold: float | None = None,
+    throttle_redial: GatewayThrottleRedialPolicy | None = None,
     affinity_fingerprint: bytes | None = None,
     sticky_preferred: bool = False,
 ) -> InflightRequest:
@@ -570,6 +574,7 @@ def _admit(
             deployment_ids=tuple(item.deployment_id for item in deployments),
             failover_mode=failover_mode,
             throttle_cache_threshold=throttle_cache_threshold,
+            throttle_redial=throttle_redial,
         ),
         deployment=deployments[0],
         fallback_deployments=deployments[1:],
@@ -1648,7 +1653,7 @@ class TestThrottleCacheThreshold:
         assert ledger.started[0]["dispatch_reason"] is None
         assert ledger.started[1]["dispatch_reason"] == "throttle_failover_cold"
         assert ledger.started[1]["preferred_deployment_id"] == "deployment-a"
-        assert registry.throttle_cache_counters() == (0, 1)
+        assert registry.throttle_cache_counters() == (0, 1, 0)
 
     def test_warm_cache_surfaces_the_throttle_instead_of_failing_over(self) -> None:
         """At or above the threshold the ladder ends and the caller gets the throttle.
@@ -1702,7 +1707,7 @@ class TestThrottleCacheThreshold:
         # No cold attempt was reserved; the request terminalized as throttled.
         assert [row["deployment_id"] for row in ledger.started] == ["deployment-a", "deployment-a"]
         assert ledger.finished_requests[-1].failure_class == GatewayFailureClass.THROTTLED
-        assert registry.throttle_cache_counters() == (1, 0)
+        assert registry.throttle_cache_counters() == (1, 0, 0)
 
     def test_another_organizations_cache_never_counts(self) -> None:
         """The fraction is scoped to the requesting organization on the throttled rung."""
@@ -1776,7 +1781,7 @@ class TestThrottleCacheThreshold:
             registry, ordinal=1, current_depth=0, failure=_THROTTLE, request_id="request-2"
         )
         assert surfaced["exhausted"] is True
-        assert registry.throttle_cache_counters() == (0, 0)
+        assert registry.throttle_cache_counters() == (0, 0, 0)
 
     def test_cold_decision_that_exhausts_the_ladder_counts_no_failover(self) -> None:
         """A below-threshold throttle with nothing claimable ends as a plain exhausted throttle.
@@ -1815,4 +1820,70 @@ class TestThrottleCacheThreshold:
         )
         assert exhausted["exhausted"] is True
         assert len(ledger.started) == 1
-        assert registry.throttle_cache_counters() == (0, 0)
+        assert registry.throttle_cache_counters() == (0, 0, 0)
+
+
+class TestThrottleRedial:
+    """Post-backoff redials of a throttled rung and their disclosures."""
+
+    def test_backoff_redials_reserve_the_same_rung_then_the_cold_advance_is_disclosed(
+        self,
+    ) -> None:
+        """Each redial is its own attempt row on the warm rung; the spent budget fails over."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = (
+            _deployment("deployment-a", connection_sha256="b" * 64),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        _admit(
+            registry,
+            deployments,
+            request_id="request-1",
+            failover_mode="maximize_cache",
+            throttle_redial=GatewayThrottleRedialPolicy(
+                max_attempts=2, base_delay_ms=100, max_delay_ms=2_000
+            ),
+        )
+        first = _start(registry, ordinal=0, request_id="request-1")
+        assert first["route_depth"] == 0
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-1",
+        )
+        # The data plane waited the backoff: two redials of the throttled rung,
+        # each reserved through the rung's own throttle window.
+        for ordinal in (1, 2):
+            redial = _start(
+                registry,
+                ordinal=ordinal,
+                current_depth=0,
+                failure=_THROTTLE,
+                request_id="request-1",
+                throttle_backoff=True,
+            )
+            assert redial["route_depth"] == 0
+            assert ledger.started[ordinal]["dispatch_reason"] == "throttle_backoff"
+            assert ledger.started[ordinal]["preferred_deployment_id"] is None
+            _settle(
+                registry,
+                attempt_id=str(redial["attempt_id"]),
+                outcome="failed",
+                finalize=False,
+                failure=_THROTTLE,
+                request_id="request-1",
+            )
+        # The budget is spent: the data plane no longer asks to wait, and
+        # the throttle advances cold under maximize_cache instead of surfacing.
+        cold = _start(
+            registry, ordinal=3, current_depth=0, failure=_THROTTLE, request_id="request-1"
+        )
+        assert cold["route_depth"] == 1
+        assert ledger.started[3]["dispatch_reason"] == "throttle_failover_cold"
+        assert ledger.started[3]["preferred_deployment_id"] == "deployment-a"
+        assert [row["attempt_ordinal"] for row in ledger.started] == [0, 1, 2, 3]
+        assert registry.throttle_cache_counters() == (0, 1, 2)

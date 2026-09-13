@@ -206,3 +206,23 @@ def test_throttled_remaining_seconds_names_a_fully_throttled_route() -> None:
     # One key outside its window makes the route dispatchable again.
     now[0] += 21.0
     assert registry.throttled_remaining_seconds((first, second)) is None
+
+
+def test_throttle_redial_claim_passes_the_window_but_not_an_open_circuit() -> None:
+    """A post-backoff redial re-enters the throttled rung; a dead rung still refuses it."""
+    now = [100.0]
+    registry = DeploymentHealthRegistry(
+        failure_threshold=1, throttle_seconds=30.0, clock=lambda: now[0]
+    )
+
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
+    # Every other claim honors the window the provider asked for...
+    assert not registry.claim(_KEY)
+    assert not registry.claim_last_resort(_KEY)
+    assert not registry.claim_forced(_KEY)
+    # ...while the request that waited the backoff is the one probing back.
+    assert registry.claim_throttle_redial(_KEY)
+
+    # Operational deadness marked meanwhile opens the circuit: no redial.
+    registry.failed(_KEY, _failure(GatewayFailureClass.TRANSPORT))
+    assert not registry.claim_throttle_redial(_KEY)

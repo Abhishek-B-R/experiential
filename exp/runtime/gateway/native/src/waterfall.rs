@@ -6,13 +6,16 @@
 //! mirroring the python executor's semantics: each dispatch is durably
 //! reserved through the `start_attempt` bridge callback immediately before
 //! network work, same-deployment redials happen only for retryable failure
-//! classes and only before commitment, failover advances to the next
-//! certified deployment for failover-eligible failures before commitment,
-//! and the first outward semantic event permanently freezes the serving
-//! deployment. When the alias revision enables refusal failover, refusal
-//! deltas are withheld in a bounded in-memory buffer so a refusal-only
-//! terminal can advance to the next deployment without exposing the refused
-//! route; mixed output or buffer overflow commits and flushes. Candidate
+//! classes and only before commitment, a pre-commit throttle on a rung the
+//! pool's `throttle_redial` schedule marks worth waiting for is re-dialed on
+//! the same deployment after a bounded backoff (see `throttle_backoff`),
+//! failover advances to the next certified deployment for failover-eligible
+//! failures before commitment, and the first outward semantic event
+//! permanently freezes the serving deployment. When the alias revision
+//! enables refusal failover, refusal deltas are withheld in a bounded
+//! in-memory buffer so a refusal-only terminal can advance to the next
+//! deployment without exposing the refused route; mixed output or buffer
+//! overflow commits and flushes. Candidate
 //! selection policy (health circuits, budgets, attempt counting) stays in
 //! python: the loop only states its position and the classified failure, and
 //! the control plane answers with a reservation, a later depth, or
@@ -36,6 +39,9 @@ use crate::relay::{
     collection_public_error, ended_without_terminal, remaining, track_event, UpstreamRelay,
 };
 use crate::settlement::AttemptGuard;
+use crate::throttle_backoff::{
+    jitter_unit, track_retry_after, with_largest_retry_after, BackoffQuery, ThrottleRedial,
+};
 use crate::upstream::open_stream;
 
 /// Byte bound for withheld refusal deltas, matching the python executor's
@@ -110,6 +116,13 @@ pub struct DeploymentWire {
     /// configuration's default applies when absent.
     #[serde(default)]
     pub time_to_first_byte_seconds_per_million_input_tokens: Option<f64>,
+    /// A throttle on this rung is worth waiting for on this request: the
+    /// pool authors a `throttle_redial` schedule and the requesting
+    /// organization's cached fraction here meets any authored threshold.
+    /// The waterfall then backs off and re-dials this rung before the ladder
+    /// advances; false keeps the rung's throttle failover-only.
+    #[serde(default)]
+    pub throttle_backoff_eligible: bool,
 }
 
 /// The frozen retry-policy facts returned by admission.
@@ -118,6 +131,9 @@ pub struct RoutePolicy {
     pub maximum_total_attempts: u32,
     pub maximum_same_deployment_attempts: u32,
     pub refusal_failover: bool,
+    /// The pool's backoff-and-redial schedule for throttled rungs, when
+    /// authored.
+    pub throttle_redial: Option<ThrottleRedial>,
 }
 
 /// Everything one waterfall run needs besides its request guard.
@@ -273,6 +289,41 @@ pub(crate) fn successor_possible(
     same || failover
 }
 
+/// The wait before re-dialing a throttled rung, or `None` when the ladder
+/// should advance instead: the pool authors no schedule, the rung is not
+/// worth waiting for on this request, the failure is not a throttle, the
+/// total cap is reached, or the schedule itself declines (redial cap,
+/// `Retry-After` beyond the ceiling, or no room under the deadline).
+fn throttle_backoff_delay(
+    ctx: &WaterfallContext<'_>,
+    wire: &DeploymentWire,
+    failure: &Failure,
+    throttle_redials_at_depth: u32,
+    total_attempts: u32,
+) -> Option<Duration> {
+    let schedule = ctx.policy.throttle_redial?;
+    if !wire.throttle_backoff_eligible
+        || failure.failure_class != FailureClass::Throttled
+        || total_attempts >= ctx.policy.maximum_total_attempts
+    {
+        return None;
+    }
+    BackoffQuery {
+        schedule,
+        redials_so_far: throttle_redials_at_depth,
+        retry_after_seconds: failure.retry_after_seconds,
+        remaining_deadline: remaining(ctx.deadline),
+        first_byte_allowance: first_byte_allowance(
+            wire,
+            ctx.time_to_first_byte,
+            ctx.time_to_first_byte_slope_seconds_per_million_input_tokens,
+            ctx.approximate_input_tokens,
+        ),
+        jitter_unit: jitter_unit(ctx.request_id, total_attempts),
+    }
+    .delay()
+}
+
 /// One pre-commit attempt outcome, private to the waterfall loop.
 enum AttemptEnd {
     Committed(Box<CommittedAttempt>),
@@ -304,14 +355,27 @@ enum AttemptEnd {
 pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuard) -> Won {
     let mut total_attempts: u32 = 0;
     let mut counts: Vec<u32> = vec![0; ctx.route.len()];
+    // Post-backoff redials made per depth: the schedule's per-rung cap
+    // counts only these, never a retryable-class redial of the same rung.
+    let mut throttle_redials: Vec<u32> = vec![0; ctx.route.len()];
     let mut current_depth: Option<usize> = None;
     let mut last_failure: Option<Failure> = None;
+    // The longest wait any throttled rung stated, so an exhausted ladder
+    // tells the caller the whole story rather than the last rung's.
+    let mut largest_retry_after: Option<u32> = None;
+    // Whether this reservation re-dials the rung that just throttled after
+    // the schedule's backoff was waited out; consumed by one `start_attempt`.
+    let mut throttle_backoff = false;
     loop {
         let argument = compact_json(&json!({
             "request_id": ctx.request_id,
             "raw_key": ctx.raw_key,
             "attempt_ordinal": total_attempts,
             "current_depth": current_depth,
+            // A post-backoff redial of the throttled rung: the control plane
+            // claims the same depth through its own throttle window and
+            // discloses the attempt as `throttle_backoff`.
+            "throttle_backoff": std::mem::take(&mut throttle_backoff),
             "failure": last_failure.as_ref().map(|failure| json!({
                 "failure_class": failure.failure_class.as_str(),
                 "safe_message": failure.safe_message,
@@ -328,6 +392,9 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 // The refusal category survives the round trip so an exhausted
                 // refusal ladder still names its reason to the caller.
                 "refusal_reason": failure.refusal_reason.map(|reason| reason.as_str()),
+                // A throttle's stated wait survives too, so an exhausted
+                // throttle ladder advertises it as `Retry-After`.
+                "retry_after_seconds": failure.retry_after_seconds,
             })),
         }));
         let started_text = match ctx.bridge.call("start_attempt", argument).await {
@@ -362,6 +429,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                     "all exact-model deployments are unavailable",
                 )
             });
+            let failure = with_largest_retry_after(failure, largest_retry_after);
             return Won::Failed(collection_public_error(&failure.boundary()));
         }
         let (Some(attempt_id), Some(depth)) = (started.attempt_id, started.route_depth) else {
@@ -407,17 +475,29 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 if opened {
                     guard.mark_opened();
                 }
+                track_retry_after(&mut largest_retry_after, &failure);
                 let boundary = failure.clone().boundary();
-                let possible = successor_possible(
-                    ctx.policy,
-                    ctx.route.len(),
-                    ctx.deadline,
-                    total_attempts,
-                    counts[depth],
-                    depth,
+                // A pre-commit throttle on a rung worth waiting for is
+                // re-dialed after the schedule's backoff; otherwise the
+                // existing redial and failover rules decide.
+                let backoff = throttle_backoff_delay(
+                    ctx,
+                    wire,
                     &failure,
-                    refusal_eligible,
+                    throttle_redials[depth],
+                    total_attempts,
                 );
+                let possible = backoff.is_some()
+                    || successor_possible(
+                        ctx.policy,
+                        ctx.route.len(),
+                        ctx.deadline,
+                        total_attempts,
+                        counts[depth],
+                        depth,
+                        &failure,
+                        refusal_eligible,
+                    );
                 if !guard
                     .settle(
                         "failed",
@@ -429,6 +509,13 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                     .await
                 {
                     return Won::Failed(PublicError::internal());
+                }
+                if let Some(delay) = backoff {
+                    // The failed attempt is settled; the wait is the only
+                    // thing between it and the redial's own reservation.
+                    tokio::time::sleep(delay).await;
+                    throttle_redials[depth] += 1;
+                    throttle_backoff = true;
                 }
                 if possible {
                     current_depth = Some(depth);
@@ -444,6 +531,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                         events: exhaustion_flush,
                     });
                 }
+                let boundary = with_largest_retry_after(boundary, largest_retry_after);
                 return Won::Failed(collection_public_error(&boundary));
             }
         }
@@ -764,197 +852,6 @@ async fn run_attempt(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
-        DeploymentWire {
-            provider: "openai".to_string(),
-            deployment_id: "d".to_string(),
-            dialect: "openai_compatible".to_string(),
-            url: "https://provider.test".to_string(),
-            headers: HashMap::new(),
-            timeout_seconds: 60.0,
-            upstream_payload: Value::Null,
-            upstream_body: None,
-            fireworks_reasoning_route_sha256: None,
-            hunyuan_reasoning_route_sha256: None,
-            reasoning_output_exposed: false,
-            stop_sequences: Vec::new(),
-            serialize_tool_calls: false,
-            model_id: String::new(),
-            billing_customer_managed: false,
-            idempotency_key: "op".to_string(),
-            time_to_first_byte_base_seconds: base,
-            time_to_first_byte_seconds_per_million_input_tokens: slope,
-        }
-    }
-
-    #[test]
-    fn first_byte_allowance_scales_with_input_and_honors_overrides() {
-        let default_base = Duration::from_secs(15);
-        // No overrides, tiny request: effectively the flat default.
-        let flat = first_byte_allowance(&wire(None, None), default_base, 240.0, 100.0);
-        assert!((flat.as_secs_f64() - 15.024).abs() < 1e-6);
-        // No overrides, one million approximate tokens: base plus the
-        // full default slope.
-        let scaled = first_byte_allowance(&wire(None, None), default_base, 240.0, 1_000_000.0);
-        assert!((scaled.as_secs_f64() - 255.0).abs() < 1e-6);
-        // Deployment overrides replace both the base and the slope.
-        let overridden = first_byte_allowance(
-            &wire(Some(30.0), Some(60.0)),
-            default_base,
-            240.0,
-            500_000.0,
-        );
-        assert!((overridden.as_secs_f64() - 60.0).abs() < 1e-6);
-        // A zero slope pins the flat bound regardless of input size.
-        let pinned = first_byte_allowance(&wire(None, Some(0.0)), default_base, 240.0, 9e9);
-        assert!((pinned.as_secs_f64() - 15.0).abs() < 1e-6);
-    }
-
-    fn policy(refusal_failover: bool) -> RoutePolicy {
-        RoutePolicy {
-            maximum_total_attempts: 8,
-            maximum_same_deployment_attempts: 2,
-            refusal_failover,
-        }
-    }
-
-    fn far_deadline() -> Instant {
-        Instant::now() + Duration::from_secs(60)
-    }
-
-    #[test]
-    fn successor_requires_capacity_and_an_eligible_class() {
-        let retryable = Failure::new(FailureClass::ProviderInternal, "boom").with_retry(true, true);
-        // Same-deployment retry within the per-deployment cap.
-        assert!(successor_possible(
-            policy(false),
-            1,
-            far_deadline(),
-            1,
-            1,
-            0,
-            &retryable,
-            false,
-        ));
-        // The per-deployment cap forbids a redial but failover still runs.
-        assert!(successor_possible(
-            policy(false),
-            2,
-            far_deadline(),
-            2,
-            2,
-            0,
-            &retryable,
-            false,
-        ));
-        // A single-deployment route with the redial cap reached is exhausted.
-        assert!(!successor_possible(
-            policy(false),
-            1,
-            far_deadline(),
-            2,
-            2,
-            0,
-            &retryable,
-            false,
-        ));
-        // The hard total cap ends the ladder regardless of class.
-        assert!(!successor_possible(
-            policy(false),
-            4,
-            far_deadline(),
-            8,
-            1,
-            0,
-            &retryable,
-            false,
-        ));
-        // An expired deadline ends the ladder.
-        assert!(!successor_possible(
-            policy(false),
-            4,
-            Instant::now(),
-            1,
-            1,
-            0,
-            &retryable,
-            false,
-        ));
-    }
-
-    #[test]
-    fn ineligible_classes_never_advance_without_refusal_opt_in() {
-        let invalid = Failure::new(FailureClass::InvalidRequest, "bad request");
-        assert!(!successor_possible(
-            policy(false),
-            4,
-            far_deadline(),
-            1,
-            1,
-            0,
-            &invalid,
-            false,
-        ));
-        let refusal = Failure::new(FailureClass::Refusal, "provider refused the request");
-        assert!(!successor_possible(
-            policy(false),
-            4,
-            far_deadline(),
-            1,
-            1,
-            0,
-            &refusal,
-            false,
-        ));
-        // The refusal advances only when the alias revision opted in.
-        assert!(successor_possible(
-            policy(true),
-            4,
-            far_deadline(),
-            1,
-            1,
-            0,
-            &refusal,
-            true,
-        ));
-        // Refusal failover cannot pass the last deployment.
-        assert!(!successor_possible(
-            policy(true),
-            1,
-            far_deadline(),
-            1,
-            1,
-            0,
-            &refusal,
-            true,
-        ));
-    }
-
-    #[test]
-    fn failover_only_classes_skip_the_redial_and_advance() {
-        let throttled = Failure::new(FailureClass::Throttled, "throttled").with_retry(false, true);
-        assert!(successor_possible(
-            policy(false),
-            2,
-            far_deadline(),
-            1,
-            1,
-            0,
-            &throttled,
-            false,
-        ));
-        assert!(!successor_possible(
-            policy(false),
-            1,
-            far_deadline(),
-            1,
-            1,
-            0,
-            &throttled,
-            false,
-        ));
-    }
-}
+mod ladder_tests;
+#[cfg(test)]
+mod tests;

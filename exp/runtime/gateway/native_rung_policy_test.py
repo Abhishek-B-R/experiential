@@ -15,6 +15,7 @@ from exp.common.models.catalog import (
     ModelCatalog,
     ModelRecord,
 )
+from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import (
     ExactModelDeployment,
     FailoverMode,
@@ -34,7 +35,11 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.native_execution import InflightRequest, deployment_health_key
-from exp.runtime.gateway.native_rung_policy import failed_dispatch_candidate, reserve_rung_slot
+from exp.runtime.gateway.native_rung_policy import (
+    failed_dispatch_candidate,
+    reserve_rung_slot,
+    throttle_backoff_eligibility,
+)
 from exp.runtime.gateway.routing import CatalogRouteResolver, GatewayRoute
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
@@ -68,6 +73,7 @@ def _entry(
     *,
     failover_mode: FailoverMode = "maximize_availability",
     throttle_cache_threshold: float | None = None,
+    throttle_redial: GatewayThrottleRedialPolicy | None = None,
     affinity_fingerprint: bytes | None = None,
 ) -> InflightRequest:
     """Build one admitted request over the given rung ladder."""
@@ -92,6 +98,7 @@ def _entry(
             deployment_ids=tuple(item.deployment_id for item in deployments),
             failover_mode=failover_mode,
             throttle_cache_threshold=throttle_cache_threshold,
+            throttle_redial=throttle_redial,
         ),
         deployment=deployments[0],
         fallback_deployments=deployments[1:],
@@ -304,3 +311,94 @@ def test_authored_record_threshold_is_the_one_next_route_candidate_receives(
     assert received["current_depth"] == 0
     # The disclosure is computed from the same two inputs the policy received.
     assert disposition == "throttle_surfaced_cache_preserving"
+
+
+_REDIAL = GatewayThrottleRedialPolicy(max_attempts=2, base_delay_ms=100, max_delay_ms=2_000)
+
+
+def test_failed_dispatch_candidate_names_backoff_then_cold_under_a_redial_schedule() -> None:
+    """With a schedule a throttle redials (disclosed), then advances cold, never surfaces."""
+    deployments = (
+        _deployment("deployment-a", connection_sha256="b" * 64),
+        _deployment("deployment-b", connection_sha256="c" * 64),
+    )
+    entry = _entry(deployments, throttle_redial=_REDIAL)
+    health = DeploymentHealthRegistry(throttle_seconds=30.0)
+    keys = tuple(deployment_health_key(entry.authorization, item) for item in deployments)
+    loads = RungLoadRegistry()
+    health.failed(keys[0], _THROTTLE)
+
+    # The data plane waited the backoff: the same rung, disclosed as the redial.
+    assert failed_dispatch_candidate(
+        health=health,
+        loads=loads,
+        keys=keys,
+        entry=entry,
+        failure=_THROTTLE,
+        current_depth=0,
+        throttle_backoff=True,
+    ) == (0, "throttle_backoff")
+    # The redial budget is spent: the cold advance names the bypassed warm rung.
+    entry.attempt_counts = [3, 0]
+    entry.throttle_redials = [2, 0]
+    entry.total_attempts = 3
+    assert failed_dispatch_candidate(
+        health=health,
+        loads=loads,
+        keys=keys,
+        entry=entry,
+        failure=_THROTTLE,
+        current_depth=0,
+        throttle_backoff=True,
+    ) == (1, "throttle_failover_cold")
+    # Warm cache above an authored threshold no longer surfaces once a
+    # schedule is authored: without the data plane's wait it advances cold.
+    warm = _entry(deployments, throttle_cache_threshold=0.5, throttle_redial=_REDIAL)
+    loads.record_settle(
+        ("deployment-a", "b" * 64), "organization-one", cached_tokens=9, input_tokens=10
+    )
+    assert failed_dispatch_candidate(
+        health=health, loads=loads, keys=keys, entry=warm, failure=_THROTTLE, current_depth=0
+    ) == (1, "throttle_failover_cold")
+    # A single rung past its redials is a plain exhausted throttle.
+    single = _entry(deployments[:1], throttle_redial=_REDIAL)
+    single.attempt_counts = [3]
+    single.throttle_redials = [2]
+    single.total_attempts = 3
+    assert failed_dispatch_candidate(
+        health=health,
+        loads=loads,
+        keys=keys[:1],
+        entry=single,
+        failure=_THROTTLE,
+        current_depth=0,
+        throttle_backoff=True,
+    ) == (None, None)
+
+
+def test_throttle_backoff_eligibility_gates_by_the_schedule_and_the_cache_at_stake() -> None:
+    """No schedule: nothing waits. Schedule alone: every rung. Plus threshold: warm rungs only."""
+    deployments = (
+        _deployment("deployment-a", connection_sha256="b" * 64),
+        _deployment("deployment-b", connection_sha256="c" * 64),
+    )
+    loads = RungLoadRegistry()
+    plain = _entry(deployments, failover_mode="maximize_cache")
+    assert throttle_backoff_eligibility(loads, plain.route, "organization-one") == (False, False)
+    scheduled = _entry(deployments, throttle_redial=_REDIAL)
+    assert throttle_backoff_eligibility(loads, scheduled.route, "organization-one") == (
+        True,
+        True,
+    )
+    gated = _entry(deployments, throttle_cache_threshold=0.5, throttle_redial=_REDIAL)
+    assert throttle_backoff_eligibility(loads, gated.route, "organization-one") == (False, False)
+    # Another organization's warm cache on the rung does not count...
+    loads.record_settle(
+        ("deployment-a", "b" * 64), "organization-other", cached_tokens=9, input_tokens=10
+    )
+    assert throttle_backoff_eligibility(loads, gated.route, "organization-one") == (False, False)
+    # ...the requesting organization's own does, rung by rung.
+    loads.record_settle(
+        ("deployment-a", "b" * 64), "organization-one", cached_tokens=9, input_tokens=10
+    )
+    assert throttle_backoff_eligibility(loads, gated.route, "organization-one") == (True, False)

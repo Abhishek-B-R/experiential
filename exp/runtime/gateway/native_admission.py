@@ -27,6 +27,8 @@ from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, G
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_execution import (
+    DeadRung,
+    deployment_health_key,
     reorder_route_deployments,
     request_carries_cache_markers,
     select_route_deployments,
@@ -714,4 +716,58 @@ def resolve_admission_route(
         authorization=authorization,
         request=request,
         episode_namespace=episode,
+    )
+
+
+def record_dead_admission_rungs(
+    accounting: NativeAttemptAccounting,
+    authorization: AuthorizationSnapshot,
+    dead: tuple[DeadRung, ...],
+    *,
+    fallback_available: bool,
+) -> None:
+    """Record admission-dead rungs and surface a lead masked by fallback."""
+    if not dead:
+        return
+    for rung in dead:
+        accounting.health.failed(
+            deployment_health_key(authorization, rung.deployment),
+            rung.failure,
+        )
+    lead = next((rung for rung in dead if rung.index == 0), None)
+    lead_masked = lead is not None and fallback_available
+    accounting.record_admission_rung_skips(len(dead), lead_skipped=lead_masked)
+    if lead is not None and fallback_available:
+        _logger.warning(
+            "gateway admission skipped the lead rung for alias %r: served off a "
+            "fallback because deployment %r (provider %r) was dead at admission",
+            authorization.alias,
+            lead.deployment.deployment_id,
+            lead.deployment.provider,
+        )
+
+
+def log_reasoning_continuation_rejection(
+    authorization: AuthorizationSnapshot, stage: str, reason: object
+) -> None:
+    """Record why a reasoning-carrier continuation failed, for operators only.
+
+    The caller sees one opaque 400 (naming the differing bound claim would be an
+    authentic-continuation oracle), but an operator needs the exact reason to tell
+    a genuine tamper from a benign authority drift. Nothing here carries a
+    credential or the plaintext reasoning; the catalog-generation fields make a
+    cross-worker or post-republish drift obvious when diffed against the issuing
+    turn's admission log.
+    """
+    _logger.warning(
+        "reasoning carrier continuation rejected",
+        extra={
+            "operation": "native_reasoning_continuation",
+            "stage": stage,
+            "reason": str(reason),
+            "request_id": authorization.request_id,
+            "alias": authorization.alias,
+            "alias_revision_id": authorization.alias_revision_id,
+            "catalog_sha256": authorization.catalog_sha256,
+        },
     )

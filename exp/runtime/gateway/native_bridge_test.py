@@ -5802,3 +5802,76 @@ def test_count_tokens_estimates_without_accepting_a_request(tmp_path: Path) -> N
             json.dumps({"raw_key": raw_key, "body": json.dumps({"model": "coding"})})
         )
     assert json.loads(malformed.value.public_error_json)["status_code"] == 400
+
+
+def _scheduled_pool_control_plane(root: Path) -> tuple[NativeControlPlane, str]:
+    """Load the control plane over a pool authoring a throttle backoff-and-redial schedule.
+
+    Seeds the standard certified two-deployment pool, then authors the
+    schedule the way the hosted platform does: as catalog data on the pool
+    record behind a fresh alias revision, with no cache-stakes threshold so
+    every rung is worth waiting for.
+    """
+    from exp.common.models.catalog import load_model_catalog, write_model_catalog
+    from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
+    from exp.runtime.gateway.catalog_authority import snapshot_current_catalog
+
+    manager, raw_key = _configured_pool_gateway(root)
+    catalog_path = root / "models.toml"
+    catalog = load_model_catalog(catalog_path)
+    pool = catalog.gateway_pools["coding"].model_copy(
+        update={
+            "failover_mode": "maximize_cache",
+            "throttle_redial": GatewayThrottleRedialPolicy(
+                max_attempts=3, base_delay_ms=500, max_delay_ms=8_000
+            ),
+        }
+    )
+    write_model_catalog(
+        catalog_path, catalog.model_copy(update={"gateway_pools": {"coding": pool}})
+    )
+    _catalog, normalized, snapshot = snapshot_current_catalog(root)
+    manager.activate_direct_alias(
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="revision-pool-scheduled",
+        pool_id="coding",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    components = load_gateway_components(
+        root,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    return NativeControlPlane(components), raw_key
+
+
+def test_admission_carries_the_throttle_redial_schedule_and_per_rung_eligibility(
+    tmp_path: Path,
+) -> None:
+    """The frozen retry facts grow the schedule only when authored; rungs say if they wait.
+
+    An unauthored pool's admission has no ``throttle_redial`` key at all and
+    every wire entry is ineligible, so the data plane's throttle handling is
+    byte-identical to before. A pool authoring the schedule (and no
+    threshold) hands the data plane the exact schedule and marks every rung
+    worth backing off on.
+    """
+    control, raw_key = _pool_control_plane(tmp_path / "plain")
+    plain = _admit(control, raw_key, _chat_body())
+    assert "throttle_redial" not in plain
+    route = plain["route"]
+    assert isinstance(route, list)
+    assert [wire["throttle_backoff_eligible"] for wire in route] == [False, False]
+
+    control, raw_key = _scheduled_pool_control_plane(tmp_path / "scheduled")
+    scheduled = _admit(control, raw_key, _chat_body())
+    assert scheduled["throttle_redial"] == {
+        "max_attempts": 3,
+        "base_delay_ms": 500,
+        "max_delay_ms": 8_000,
+    }
+    assert scheduled["maximum_same_deployment_attempts"] == 2
+    route = scheduled["route"]
+    assert isinstance(route, list)
+    assert [wire["throttle_backoff_eligible"] for wire in route] == [True, True]

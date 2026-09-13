@@ -8,7 +8,11 @@ sheds it sideways, folding in the affinity pool's warm-session standing.
 ``failed_dispatch_candidate`` turns a classified failure into the ladder's
 next candidate, reading the requesting organization's observed cached
 fraction on the failed rung so a pool authoring ``throttle_cache_threshold``
-can dispose of a throttle by the cache actually at stake.
+can dispose of a throttle by the cache actually at stake, and honoring a
+post-backoff redial under an authored ``throttle_redial`` schedule.
+``throttle_backoff_eligibility`` applies the same cache-stakes gate at
+admission, per rung, so the data plane knows which rungs are worth waiting
+for before the first throttle arrives.
 """
 
 from __future__ import annotations
@@ -16,15 +20,18 @@ from __future__ import annotations
 import logging
 
 from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.runtime.gateway.contracts import GatewayFailure
+from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.native_execution import (
+    THROTTLE_BACKOFF,
+    THROTTLE_FAILOVER_COLD,
     InflightRequest,
     ThrottleDisposition,
     next_route_candidate,
     rung_load_key,
     throttle_disposition,
 )
+from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 
@@ -111,6 +118,7 @@ def failed_dispatch_candidate(
     entry: InflightRequest,
     failure: GatewayFailure,
     current_depth: int,
+    throttle_backoff: bool = False,
 ) -> tuple[int | None, ThrottleDisposition | None]:
     """Choose the ladder's next candidate after one classified failure.
 
@@ -119,6 +127,9 @@ def failed_dispatch_candidate(
     hands it with the pool's authored ``throttle_cache_threshold`` to the
     frozen candidate policy, so a throttle is surfaced or failed over by the
     warm cache it would abandon. Without a threshold the fraction is inert.
+    On a pool authoring ``throttle_redial`` a throttle instead redials the
+    warm rung when the data plane has waited the backoff, advances cold once
+    the redials are spent, and the disposition names which happened.
 
     Args:
         health: Revision-isolated circuit and throttle registry.
@@ -127,14 +138,18 @@ def failed_dispatch_candidate(
         entry: The owning in-flight request.
         failure: The classified failure that ended the previous dispatch.
         current_depth: Route position of the failed dispatch.
+        throttle_backoff: Whether the data plane waited the pool's backoff
+            and asks to redial the throttled rung.
 
     Returns:
         ``(candidate, disposition)``: the claimed route index or ``None``
         when the ladder is exhausted, and the throttle disposition when the
-        failure was a throttle on a threshold-authoring pool (else ``None``).
+        failure was a throttle on a threshold- or schedule-authoring pool
+        (else ``None``).
     """
     route = entry.route
     threshold = route.snapshot.throttle_cache_threshold
+    redial = route.snapshot.throttle_redial
     deployment = route.deployments[current_depth]
     cached_fraction = loads.cached_fraction(
         rung_load_key(deployment), entry.authorization.organization_id
@@ -150,12 +165,25 @@ def failed_dispatch_candidate(
         failover_mode=route.snapshot.failover_mode,
         throttle_cache_threshold=threshold,
         cached_fraction=cached_fraction,
+        throttle_redial=redial,
+        throttle_backoff=throttle_backoff,
+        throttle_redials_so_far=entry.throttle_redials[current_depth],
     )
     disposition = throttle_disposition(
         failure,
         throttle_cache_threshold=threshold,
         cached_fraction=cached_fraction,
     )
+    if redial is not None and failure.failure_class == GatewayFailureClass.THROTTLED:
+        # With a schedule authored a throttle never surfaces mid-ladder: it
+        # either redials the warm rung or advances cold past it, and an
+        # exhausted ladder is a plain exhausted throttle.
+        if candidate == current_depth:
+            disposition = THROTTLE_BACKOFF
+        elif candidate is not None:
+            disposition = THROTTLE_FAILOVER_COLD
+        else:
+            disposition = None
     if disposition is not None:
         _logger.debug(
             "gateway throttle on deployment %r disposed %s (cached fraction %.3f, threshold %s)",
@@ -165,3 +193,42 @@ def failed_dispatch_candidate(
             threshold,
         )
     return candidate, disposition
+
+
+def throttle_backoff_eligibility(
+    loads: RungLoadRegistry,
+    route: GatewayRoute,
+    organization_id: str,
+) -> tuple[bool, ...]:
+    """Decide, per rung, whether a throttle there is worth backing off for.
+
+    Read once at admission so the data plane knows before the first throttle
+    which rungs to redial with backoff and which to fail over cold at once.
+    Every rung is ineligible on a pool without a ``throttle_redial``
+    schedule (the historical failover-only throttle). With a schedule and no
+    ``throttle_cache_threshold`` every rung is eligible: the operator asked
+    for backoff on this pool. With both, exactly the rungs where the
+    requesting organization's observed cached fraction meets the threshold
+    are eligible, the same cache-stakes gate that would otherwise surface
+    the throttle, now meaning "wait here" instead of "return the 429". The
+    fraction is the admission-time EWMA, at most seconds older than the
+    reading a failure-time decision would take.
+
+    Args:
+        loads: The worker's per-rung load registry holding the cache EWMA.
+        route: The resolved ordered route about to be admitted.
+        organization_id: The requesting organization.
+
+    Returns:
+        One flag per route deployment, in route order.
+    """
+    snapshot = route.snapshot
+    if snapshot.throttle_redial is None:
+        return tuple(False for _ in route.deployments)
+    threshold = snapshot.throttle_cache_threshold
+    if threshold is None:
+        return tuple(True for _ in route.deployments)
+    return tuple(
+        loads.cached_fraction(rung_load_key(deployment), organization_id) >= threshold
+        for deployment in route.deployments
+    )

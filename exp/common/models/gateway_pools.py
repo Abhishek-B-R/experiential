@@ -1,8 +1,9 @@
 """Authored exact-model pools: operator equivalence evidence and per-pool failover policy.
 
 A pool names the ordered deployment aliases an operator has certified as one
-exact model, plus the two per-pool waterfall controls: the ``FailoverMode``
-literal and the cache-stakes ``throttle_cache_threshold``. Both controls are
+exact model, plus the three per-pool waterfall controls: the ``FailoverMode``
+literal, the cache-stakes ``throttle_cache_threshold``, and the
+backoff-and-redial ``throttle_redial`` schedule. Every control is
 additive-defaulted so an unauthored pool contributes zero identity bytes under
 the catalog's exclude-defaults digest.
 """
@@ -20,7 +21,7 @@ from exp.common.core.artifacts import (
     Sha256,
     assert_secret_free,
 )
-from exp.common.models.dispatch_policy import FailoverMode
+from exp.common.models.dispatch_policy import FailoverMode, GatewayThrottleRedialPolicy
 
 
 class GatewayEquivalenceCertification(ContractModel):
@@ -83,6 +84,23 @@ class GatewayPoolRecord(ContractModel):
     unknown field on read and then fails the pool's alias closed on the
     digest mismatch, so the platform authors it only once every serving
     worker runs a build that carries the field.
+    """
+    throttle_redial: GatewayThrottleRedialPolicy | None = None
+    """Backoff-and-redial schedule for a throttled rung before the ladder advances.
+
+    When authored, a throttle on a rung worth waiting for (every rung when no
+    ``throttle_cache_threshold`` is authored; otherwise exactly the rungs
+    where the requesting organization's cached fraction meets the threshold)
+    is re-dialed on the SAME rung with exponential backoff up to the schedule's
+    redial cap, then fails over down the ladder, and surfaces to the caller
+    only when every rung is exhausted. Under every ``failover_mode`` this
+    replaces the surfacing throttle rule: with a redial schedule authored,
+    ``maximize_cache`` and a met threshold mean "back off on this rung", never
+    "return the 429 while another rung could serve". A rung below the
+    threshold still fails over cold immediately, because there is no warm
+    cache worth the wait. ``None`` (the default) keeps the unauthored
+    behavior byte-identical; authoring is deployment-ordered exactly like the
+    threshold.
     """
 
     @model_validator(mode="after")

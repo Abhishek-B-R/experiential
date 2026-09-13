@@ -151,6 +151,27 @@ class DeploymentHealthRegistry:
             state = self._states.setdefault(key, _DeploymentHealth())
             return state.throttle_until <= now
 
+    def claim_throttle_redial(self, key: DeploymentHealthKey) -> bool:
+        """Admit one post-backoff redial of a rung inside its own throttle window.
+
+        The throttle window is the fleet-shared "leave this rung alone"
+        signal for OTHER requests; the request that was throttled and has
+        already waited the pool's backoff is the one deliberately probing the
+        rung back, so its redial passes the window. An open circuit (some
+        other failure class marked the rung dead meanwhile) still refuses,
+        because a dead rung has no cache worth the wait.
+
+        Args:
+            key: Catalog, deployment, and connection identity tuple.
+
+        Returns:
+            Whether the redial may dispatch this deployment now.
+        """
+        now = self._clock()
+        with self._lock:
+            state = self._states.setdefault(key, _DeploymentHealth())
+            return state.open_until <= now
+
     def dispatch_opened(self, key: DeploymentHealthKey) -> None:
         """Restore admission once one provider dispatch opens successfully.
 

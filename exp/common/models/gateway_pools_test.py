@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
+from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification, GatewayPoolRecord
 
 _CERTIFICATION = GatewayEquivalenceCertification(
@@ -17,13 +18,18 @@ _CERTIFICATION = GatewayEquivalenceCertification(
 )
 
 
-def _pool(*, throttle_cache_threshold: float | None = None) -> GatewayPoolRecord:
-    """Build one certified two-rung pool with an optional cache-stakes threshold."""
+def _pool(
+    *,
+    throttle_cache_threshold: float | None = None,
+    throttle_redial: GatewayThrottleRedialPolicy | None = None,
+) -> GatewayPoolRecord:
+    """Build one certified two-rung pool with optional throttle controls."""
     return GatewayPoolRecord(
         exact_model_id="exact-one",
         deployment_aliases=("route-a", "route-b"),
         equivalence=_CERTIFICATION,
         throttle_cache_threshold=throttle_cache_threshold,
+        throttle_redial=throttle_redial,
     )
 
 
@@ -63,6 +69,7 @@ def test_per_pool_controls_default_to_zero_identity_bytes() -> None:
     dumped = _pool().model_dump(mode="json", by_alias=True, exclude_defaults=True)
     assert "failover_mode" not in dumped
     assert "throttle_cache_threshold" not in dumped
+    assert "throttle_redial" not in dumped
     assert (
         _pool(throttle_cache_threshold=None).model_dump(
             mode="json", by_alias=True, exclude_defaults=True
@@ -72,3 +79,12 @@ def test_per_pool_controls_default_to_zero_identity_bytes() -> None:
     assert "throttle_cache_threshold" in _pool(throttle_cache_threshold=0.5).model_dump(
         mode="json", by_alias=True, exclude_defaults=True
     )
+    schedule = GatewayThrottleRedialPolicy(max_attempts=3, base_delay_ms=500, max_delay_ms=8_000)
+    authored = _pool(throttle_redial=schedule).model_dump(
+        mode="json", by_alias=True, exclude_defaults=True
+    )
+    assert authored["throttle_redial"] == {
+        "max_attempts": 3,
+        "base_delay_ms": 500,
+        "max_delay_ms": 8_000,
+    }

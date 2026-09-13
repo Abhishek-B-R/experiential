@@ -36,6 +36,7 @@ mod settlement;
 mod sse;
 mod stop_sequences;
 mod stream_errors;
+mod throttle_backoff;
 mod tool_serialization;
 mod upstream;
 mod waterfall;

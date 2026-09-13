@@ -17,6 +17,7 @@ from exp.common.models.content import (
     VideoContentPart,
     require_attachment_ceilings,
 )
+from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import (
     DeploymentId,
     ExactModelId,
@@ -964,3 +965,8 @@ class ExecutionSnapshot(ContractModel):
     # cached fraction on the throttled rung against it. ``None`` leaves the
     # failover mode's own throttle rule in force.
     throttle_cache_threshold: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    # The pool's backoff-and-redial schedule for throttled rungs, carried so
+    # the admission can hand the data plane its frozen retry facts and the
+    # per-attempt decision can honor a post-backoff redial. ``None`` keeps
+    # throttles failover-only.
+    throttle_redial: GatewayThrottleRedialPolicy | None = None
