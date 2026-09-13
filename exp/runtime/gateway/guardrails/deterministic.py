@@ -234,20 +234,21 @@ def _record(
 
 
 def native_output_plan(
-    policy: GuardrailPolicy,
+    policy: GuardrailPolicy | None,
     detectors: Mapping[str, NativeDetector],
 ) -> JsonObject | None:
     """Return the resolved output chain when the data plane can run it alone.
 
     Args:
-        policy: The assigned identity policy for this admission.
+        policy: The assigned identity policy, or ``None`` for unguarded
+            traffic.
         detectors: Compiled deterministic detectors, keyed by adapter.
 
     Returns:
         The authored-order chain, or ``None`` when the policy has no output
         stage or binds any adapter the data plane cannot evaluate.
     """
-    if not policy.output_checks:
+    if policy is None or not policy.output_checks:
         return None
     if any(check.adapter_id not in detectors for check in policy.output_checks):
         return None
