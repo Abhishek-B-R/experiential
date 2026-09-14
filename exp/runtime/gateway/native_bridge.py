@@ -12,8 +12,7 @@ Candidate selection, health circuits and budget skipping stay in this plane.
 
 Boundary errors raise :class:`NativeBridgeError` carrying sanitized protocol
 errors. Unsupported native routes finalize content-free and return an escalation
-disposition; the data plane records the reason and fails closed, never falling
-back to a different serving implementation.
+disposition; the data plane records the reason and fails closed, never falling back.
 """
 
 from __future__ import annotations
