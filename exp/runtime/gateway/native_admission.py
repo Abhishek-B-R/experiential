@@ -33,6 +33,7 @@ from exp.runtime.gateway.native_execution import (
     request_carries_cache_markers,
     select_route_deployments,
 )
+from exp.runtime.gateway.native_reasoning import rung_provider_request
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.prompt_cache_affinity import provider_prompt_cache_key
 from exp.runtime.gateway.prompt_size import require_prompt_fits_context_window
@@ -368,6 +369,8 @@ def _prefer_cache_capable_rungs(
         return route, resolved_wires
     if len(resolved_wires) < 2 or not request_carries_cache_markers(provider_request):
         return route, resolved_wires
+    if _keeps_issuing_rung_first(route):
+        return route, resolved_wires
     marker_capable = tuple(
         index
         for index, (profile, _client) in enumerate(resolved_wires)
@@ -382,6 +385,21 @@ def _prefer_cache_capable_rungs(
     return (
         reorder_route_deployments(route, order),
         tuple(resolved_wires[index] for index in order),
+    )
+
+
+def _keeps_issuing_rung_first(route: GatewayRoute) -> bool:
+    """Whether a reasoning continuation's issuing rung is on the route and must lead it.
+
+    The issuing rung alone can replay the request's thinking, so while it is
+    still dispatchable no cache-marker or affinity reorder may demote it and
+    its fallbacks stay in pool order. Once admission has narrowed it out as
+    dead the pin is stale: every surviving rung runs without the reasoning,
+    so the pool's normal ordering applies to them.
+    """
+    pinned = route.reasoning_pinned_deployment_id
+    return pinned is not None and any(
+        deployment.deployment_id == pinned for deployment in route.deployments
     )
 
 
@@ -422,7 +440,7 @@ def _affinity_ordered_rungs(
         identity_id=authorization.identity_id,
         material=material,
     )
-    if len(resolved_wires) < 2:
+    if len(resolved_wires) < 2 or _keeps_issuing_rung_first(route):
         return route, resolved_wires, AffinityPlacement(fingerprint=fingerprint)
     weighted_rungs = tuple(
         (
@@ -563,9 +581,15 @@ def protocol_compatible_indexes(
     for index, (deployment, (profile, _client)) in enumerate(
         zip(route.deployments, resolved_wires, strict=True)
     ):
+        # Each rung is probed with the request IT would dispatch: a
+        # reasoning-pinned route's fallback rung sees the request without the
+        # pinned provider's sealed reasoning, exactly as the dispatch build
+        # shapes it, so the builder's foreign-block rejection never narrows a
+        # legitimate failover rung out of the ladder.
+        rung_request = rung_provider_request(route, deployment, provider_request)
         try:
             preflight_gateway_request(
-                provider_request,
+                rung_request,
                 deployment.gateway.capabilities,
                 model_capabilities=deployment.capabilities,
                 public_stream=public_stream,
@@ -574,7 +598,7 @@ def protocol_compatible_indexes(
                     profile.dialect, emulate_parallel_tool_calls=emulate_parallel_tool_calls
                 ),
             )
-            dialect_stream_payload(profile, provider_request)
+            dialect_stream_payload(profile, rung_request)
         except (ProviderParameterError, ProviderCapabilityError) as exc:
             errors.append(exc)
             continue

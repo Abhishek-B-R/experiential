@@ -197,6 +197,29 @@ def failed_dispatch_candidate(
     return candidate, disposition
 
 
+def shed_keeps_pin(route: GatewayRoute, candidate: int) -> bool:
+    """Whether a policy shed of ``candidate`` must force-admit it rather than spill sideways.
+
+    True only for the issuing rung of a reasoning-pinned route. Its fallbacks
+    dispatch without the request's sealed reasoning, a loss reserved for a real
+    failover-eligible failure on the pinned rung (a throttle once its redial
+    budget is spent, provider quota, unavailability, transport), never for a
+    per-worker rate or concurrency shed the rung itself authored, which trips
+    under ordinary load. The shed is disclosed as ``saturated_overflow`` exactly
+    as a one-rung ladder's is.
+
+    Args:
+        route: The admitted route.
+        candidate: Route position of the rung that shed.
+
+    Returns:
+        Whether the accounting keeps the candidate and admits it past the policy.
+    """
+    return route.reasoning_pinned_deployment_id is not None and not route.requires_reasoning_strip(
+        route.deployments[candidate]
+    )
+
+
 def throttle_redial_budgets(
     loads: RungLoadRegistry,
     route: GatewayRoute,
@@ -225,7 +248,12 @@ def throttle_redial_budgets(
        bound to in the worker's ``StickySpillRegistry``
        (``sticky_deployment_id``) gets the full ``max_attempts``. The binding
        is direct evidence that the conversation's provider cache lives on
-       that rung, the same warm standing ``reserve_rung_slot`` honors.
+       that rung, the same warm standing ``reserve_rung_slot`` honors. The
+       issuing rung of a reasoning continuation
+       (``route.reasoning_pinned_deployment_id``) is the same case: it alone
+       can replay the request's thinking, so failing over past it costs the
+       turn's continuity as well as its cache, and it waits the whole
+       schedule before its fallbacks are tried.
     3. Otherwise the budget scales with the cache at stake: the full
        ``max_attempts`` when the requesting organization's observed cached
        fraction on the rung meets the threshold, a proportional share
@@ -263,9 +291,14 @@ def throttle_redial_budgets(
     if threshold is None or threshold <= 0:
         return tuple(schedule.max_attempts for _ in route.deployments)
     last_depth = len(route.deployments) - 1
+    pinned_deployment_id = route.reasoning_pinned_deployment_id
     budgets: list[int] = []
     for depth, deployment in enumerate(route.deployments):
-        if depth == last_depth or deployment.deployment_id == sticky_deployment_id:
+        if (
+            depth == last_depth
+            or deployment.deployment_id == sticky_deployment_id
+            or deployment.deployment_id == pinned_deployment_id
+        ):
             budgets.append(schedule.max_attempts)
             continue
         fraction = loads.cached_fraction(rung_load_key(deployment), organization_id)
