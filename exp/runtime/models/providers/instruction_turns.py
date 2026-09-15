@@ -30,10 +30,11 @@ the caller placed it. Every message that is not plain text is untouched.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 
 from exp.common.models.model import ModelMessage
-from exp.runtime.gateway.contracts import GatewayMessage
+from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
+from exp.runtime.models.providers.base import GatewayWireProfile
 
 SYSTEM_FOLD_DISCLOSURE = "messages.system->folded(system_messages_leading_only)"
 """Disclosure recorded when a route may fold non-leading instruction turns.
@@ -42,6 +43,26 @@ Reported in ``ignored_parameters`` like the other message-shape coercions so
 a caller can see that a rung on this route rewrote its system turns into the
 user turn rather than rejecting or silently dropping them.
 """
+
+
+def disclose_system_fold(
+    profiles: Iterable[GatewayWireProfile],
+    request: GatewayRequest,
+    ignored: list[str],
+) -> None:
+    """Record :data:`SYSTEM_FOLD_DISCLOSURE` when a rung on the route would fold a turn.
+
+    A rung whose template takes one leading system turn only rewrites every
+    other instruction turn into user text at encoding; the caller learns of
+    the rewrite at admission rather than from a provider 400. Nothing is
+    recorded when no rung declares the fold or no turn would move.
+    """
+    if (
+        any(profile.system_messages_leading_only for profile in profiles)
+        and fold_instruction_turns_after_the_first(request.messages) != request.messages
+        and SYSTEM_FOLD_DISCLOSURE not in ignored
+    ):
+        ignored.append(SYSTEM_FOLD_DISCLOSURE)
 
 
 def fold_trailing_instruction_turns[M: (GatewayMessage, ModelMessage)](
