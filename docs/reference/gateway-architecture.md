@@ -738,7 +738,20 @@ reasoning. Missing or null values remain absent. Plaintext is bounded to 8,388,6
 values exceeding that limit receive a named error with the limit and a retry instruction.
 Route narrowing prefers exposing rungs and discloses
 `messages.reasoning_content->dropped(unsupported_by_provider)` when a rung cannot replay it,
-including routes with no exposing rung. Gateway-issued carriers are recognized by their
+including routes with no exposing rung.
+
+A rung whose chat template accepts a system message only as the very first message declares
+`system_messages_leading_only` (the official Qwen3.6+ `chat_template.jinja` raises
+`System message must be at the beginning.` for any system turn that is not the first message, a
+second leading system turn included, so a vLLM origin serving it 400s the whole request; coding
+agents inject a system turn after the first user turn and after every tool result). On a
+declared rung the Chat wire builder merges a run of leading instruction turns into one system
+message and folds every later plain-text system or developer turn into user text in place
+(appended to a preceding text-only user turn, else re-roled as a user turn), for the Chat,
+Responses, and Messages surfaces alike, and admission discloses
+`messages.system->folded(system_messages_leading_only)` when a turn moved. An undeclared rung's
+messages are never rewritten; the 400 stays classified as a lane limitation the ladder fails
+over. Gateway-issued carriers are recognized by their
 scheme prefix and retain strict parsing, authentication, and route binding; malformed carriers
 never become plaintext history, and a carrier never reaches a rung other than the one that sealed
 it (the failover past a failed issuing rung strips it, see the reasoning-continuation ladder above).

@@ -11,14 +11,15 @@ from __future__ import annotations
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ChatMaxTokensField
 from exp.runtime.gateway.contracts import GatewayRequest
-from exp.runtime.models.providers.deepseek import (
-    fold_trailing_instruction_turns,
-    is_deepseek_model_id,
-)
+from exp.runtime.models.providers.deepseek import is_deepseek_model_id
 from exp.runtime.models.providers.errors import (
     ProviderResponseError,
 )
 from exp.runtime.models.providers.fireworks import prepare_gateway_reasoning_history
+from exp.runtime.models.providers.instruction_turns import (
+    fold_instruction_turns_after_the_first,
+    fold_trailing_instruction_turns,
+)
 from exp.runtime.models.providers.reasoning_compat import (
     openai_reasoning_effort,
     require_sampling_reasoning_compatibility,
@@ -220,6 +221,7 @@ def openai_compatible_stream_payload(
     hunyuan_reasoning_route_sha256: str | None = None,
     reasoning_output_exposed: bool = False,
     deepseek_reasoning_history: bool = False,
+    system_messages_leading_only: bool = False,
     forwards_service_tier: bool = False,
     forwards_prompt_cache_key: bool = False,
 ) -> JsonObject:
@@ -242,6 +244,10 @@ def openai_compatible_stream_payload(
             ``reasoning_content`` on every assistant message of the current turn
             (an absent one is backfilled empty on every assistant message); see
             ``openai_chat_message``.
+        system_messages_leading_only: Whether this rung's chat template accepts a
+            system message only as the very first message (the official Qwen3.6+
+            template raises otherwise), so every other instruction turn is folded
+            into user text; see ``fold_instruction_turns_after_the_first``.
 
     Returns:
         Chat Completions request that always asks the provider for terminal usage.
@@ -261,6 +267,10 @@ def openai_compatible_stream_payload(
     # Chat tool messages are text-only on every server behind this wire, so a
     # tool screenshot rides a following user turn (see the fold's docstring).
     messages = fold_tool_result_images(messages)
+    if system_messages_leading_only:
+        # The rung's template 400s on any system turn past the first; the
+        # text stays where the caller put it, as user text.
+        messages = fold_instruction_turns_after_the_first(messages)
     payload: JsonObject = {
         "model": model_id,
         "messages": [

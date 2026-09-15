@@ -63,6 +63,10 @@ from exp.runtime.models.providers.generation_parameter_validation import (
 from exp.runtime.models.providers.generation_parameter_validation import (
     require_route_numeric_parameter as _require_route_numeric_parameter,
 )
+from exp.runtime.models.providers.instruction_turns import (
+    SYSTEM_FOLD_DISCLOSURE,
+    fold_instruction_turns_after_the_first,
+)
 from exp.runtime.models.providers.messages_payloads import (
     anthropic_messages_stream_payload as anthropic_messages_stream_payload,
 )
@@ -861,6 +865,15 @@ def route_generation_parameter_requests(
     require_assistant_prefill_supported(profiles, request)
     require_tool_names_supported(profiles, request)
     disclose_anthropic_tool_schemas(profiles, request, ignored)
+    if (
+        any(profile.system_messages_leading_only for profile in profiles)
+        and fold_instruction_turns_after_the_first(request.messages) != request.messages
+        and SYSTEM_FOLD_DISCLOSURE not in ignored
+    ):
+        # A rung whose template takes one leading system turn only rewrites
+        # every other instruction turn into user text at encoding; the caller
+        # learns of the rewrite here rather than from a provider 400.
+        ignored.append(SYSTEM_FOLD_DISCLOSURE)
     # A mid-conversation system turn narrows out instruction-hoisting wires.
     if mid_conversation_system_present(request) and any(
         profile.dialect in {"gemini_generate_content", "bedrock_converse_stream"}
