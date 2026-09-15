@@ -80,6 +80,7 @@ from exp.runtime.openai_protocol.wire_models import (
     _ResponsesInputItem,
     _ResponsesRequest,
     _ResponseTool,
+    _TextPart,
     _WireModel,
 )
 
@@ -532,37 +533,69 @@ def decode_responses(
 _PROBE_OUTPUT_ITEM_ID = "msg_gateway_probe"
 """Placeholder item id the official probe sees on an id-less assistant message."""
 
-_TEXT_PART_TYPE_BY_ROLE = {
-    "user": "input_text",
-    "system": "input_text",
-    "developer": "input_text",
-    "assistant": "output_text",
-}
-"""The Responses text-part spelling each message role emits on the wire."""
-
 
 def _official_message_content(entry: JsonObject) -> JsonObject:
-    """Spell every text part of one message item the way its role emits it.
+    """Respell an assistant message's ``input_text`` parts as ``output_text`` for the probe.
 
-    The wire model accepts the three text-part spellings on either surface
-    (``text``, ``input_text``, ``output_text``) because the payload builder
-    re-emits a part by the message's ROLE, never by the caller's tag: a Chat
-    client's ``text`` part in a Responses user message serves exactly like
-    ``input_text``. The installed SDK types each role's parts by one spelling,
-    so only the probe copy is respelled; the canonical request is unchanged.
+    The probe now types an id-less assistant history message as an output
+    item (see ``decode_responses``), whose parts are ``output_text`` /
+    ``refusal``; an assistant ``input_text`` part decoded before that change
+    (the SDK's input-message type took it) and the payload builder re-emits
+    text parts by ROLE, so the acceptance is kept by respelling only the
+    probe copy. Every other spelling stays exactly as strict as
+    api.openai.com (probed 2026-09-15): the Chat ``text`` tag is refused on
+    any role and ``output_text`` is refused in a user message, each with the
+    accepted vocabulary named. Owner decision (2026-09-15): OpenAI parity by
+    default; the 7-day ledger showed 6 rejections across 4 organizations at
+    the first input item (the only slot that isolates a user-side spelling),
+    against 4,611 across 93 for the assistant-history shape.
     """
-    role = entry.get("role")
     content = entry.get("content")
-    spelling = _TEXT_PART_TYPE_BY_ROLE.get(role) if isinstance(role, str) else None
-    if spelling is None or not isinstance(content, list):
+    if entry.get("role") != "assistant" or not isinstance(content, list):
         return entry
     parts: list[JsonValue] = []
     for part in cast("list[JsonValue]", content):
-        if isinstance(part, dict) and part.get("type") in _TEXT_PART_TYPES:
-            parts.append({**part, "type": spelling})
+        if isinstance(part, dict) and part.get("type") == "input_text":
+            parts.append({**part, "type": "output_text"})
         else:
             parts.append(part)
     return {**entry, "content": parts}
+
+
+_INPUT_PART_VOCABULARY = "'input_text', 'input_image' or 'input_file'"
+"""What a user, system, or developer Responses message part may be."""
+
+
+def _require_responses_text_spelling(index: int, item: _ResponseMessage) -> None:
+    """Hold Responses text parts to api.openai.com's per-role spelling.
+
+    The shared content-part union admits the Chat ``text`` tag and both
+    Responses tags on either surface, and the installed SDK's output-message
+    type does not police part tags, so the parity rule is stated here: a
+    user/system/developer part is ``input_text``; an assistant part is
+    ``output_text`` (``input_text`` is kept there because the payload builder
+    re-emits by role and the shape decoded before this rule existed). The
+    provider refuses every other spelling (probed 2026-09-15: ``text`` on any
+    role, ``output_text`` in a user message), and the owner chose parity over
+    leniency: the 7-day ledger held 6 such rejections across 4 organizations
+    at the first input item, the only slot that isolates a user-side spelling.
+    """
+    for part_index, part in enumerate(item.image_capable_parts):
+        if not isinstance(part, _TextPart):
+            continue
+        if item.role == "assistant":
+            if part.type != "text":
+                continue
+            expected = "'output_text'"
+        elif part.type == "input_text":
+            continue
+        else:
+            expected = f"one of {_INPUT_PART_VOCABULARY}"
+        param = f"input.{index}.content.{part_index}.type"
+        raise invalid_field(
+            param,
+            f"Invalid value for '{param}': expected {expected}, but got '{part.type}' instead.",
+        )
 
 
 def _require_responses_input(request: _ResponsesRequest) -> None:
@@ -912,6 +945,7 @@ def _response_input_messages(
                 )
             replayed.append(ReplayedReasoning(index=index, block=block))
         elif isinstance(item, _ResponseMessage):
+            _require_responses_text_spelling(index, item)
             converted = _messages((item,), f"input.{index}")
             if converted and item.role == "assistant":
                 converted = (

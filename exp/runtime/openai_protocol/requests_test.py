@@ -4268,37 +4268,60 @@ def test_responses_decoder_accepts_an_assistant_history_message_without_an_item_
     assert typed.request == plain.request
 
 
-@pytest.mark.parametrize(
-    ("role", "spelling"),
-    [
-        ("user", "text"),
-        ("user", "output_text"),
-        ("assistant", "text"),
-        ("assistant", "input_text"),
-    ],
-)
-def test_responses_text_part_spellings_decode_by_role(role: str, spelling: str) -> None:
-    """Any text-part spelling decodes identically: the wire re-emits by role.
-
-    The payload builder spells a text part from the message's role (user →
-    ``input_text``, assistant → ``output_text``), never from the caller's tag,
-    so the Chat ``text`` spelling and a swapped input/output spelling serve
-    exactly like the canonical one instead of failing the official probe with
-    "expected one of 'input_text', but got a string".
-    """
-    canonical = "output_text" if role == "assistant" else "input_text"
+def test_responses_assistant_input_text_parts_keep_decoding() -> None:
+    """An assistant ``input_text`` part decoded before the probe typed assistant
+    history as an output item, and the wire re-emits text parts by role, so the
+    acceptance is kept: the canonical request equals the ``output_text`` form."""
 
     def body(part_type: str) -> JsonObject:
         return {
             "model": "coding",
             "input": [
                 {"role": "user", "content": "hi"},
-                {"role": role, "content": [{"type": part_type, "text": "yo"}]},
+                {"role": "assistant", "content": [{"type": part_type, "text": "yo"}]},
                 {"role": "user", "content": "more"},
             ],
         }
 
-    assert decode_responses(body(spelling)).request == decode_responses(body(canonical)).request
+    assert (
+        decode_responses(body("input_text")).request
+        == decode_responses(body("output_text")).request
+    )
+
+
+@pytest.mark.parametrize(
+    ("role", "spelling", "expected"),
+    [
+        ("user", "text", "one of 'input_text', 'input_image' or 'input_file'"),
+        ("system", "text", "one of 'input_text', 'input_image' or 'input_file'"),
+        ("user", "output_text", "one of 'input_text', 'input_image' or 'input_file'"),
+        ("assistant", "text", "'output_text'"),
+    ],
+)
+def test_responses_text_part_spellings_hold_openai_parity(
+    role: str, spelling: str, expected: str
+) -> None:
+    """The spellings api.openai.com refuses are refused here, naming the right one.
+
+    Probed live 2026-09-15: the Chat ``text`` tag is "Invalid value: 'text'" on
+    any role and ``output_text`` is refused in a user message. Owner decision:
+    parity, not leniency (6 such rejections across 4 organizations in 7 days).
+    """
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {"role": role, "content": [{"type": spelling, "text": "yo"}]},
+                    {"role": "user", "content": "more"},
+                ],
+            }
+        )
+    assert raised.value.detail.param == "input.0.content.0.type"
+    assert raised.value.detail.message == (
+        f"Invalid value for 'input.0.content.0.type': expected {expected}, "
+        f"but got '{spelling}' instead."
+    )
 
 
 def test_responses_unknown_content_part_type_names_the_accepted_vocabulary() -> None:
