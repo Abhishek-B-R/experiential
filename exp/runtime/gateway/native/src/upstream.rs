@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::dialects::Dialect;
 use crate::errors::{Failure, FailureClass};
 use crate::param_attribution::{
-    generic_error_code, rejected_by_lane_limitation, rejected_by_routing_gate,
+    bounded_masked_line, generic_error_code, rejected_by_lane_limitation, rejected_by_routing_gate,
     rejected_caller_reference_not_found, rejected_code, rejected_detail, rejected_model_not_found,
     rejected_parameter,
 };
@@ -165,7 +165,11 @@ pub async fn open_stream(
             if error.is_timeout() {
                 return Err(open_timeout_failure());
             }
-            return Err(transport_failure(None));
+            // The failure stays a content-free transport class on the wire;
+            // the engine's own account of WHICH transport fault (never
+            // provider text) rides to the ledger so the row is diagnosable.
+            return Err(transport_failure(None)
+                .with_provider_detail(Some(transport_error_detail("open", &error))));
         }
         Err(_) => return Err(open_timeout_failure()),
     };
@@ -185,6 +189,15 @@ pub async fn open_stream(
         // got wrong; every other class stays content-free. A 403 is read too,
         // only to tell an aggregator routing gate from a credential verdict,
         // and a 404 to tell a caller's dangling reference from a missing model.
+        // Every status-only classification carries the status itself as its
+        // ledger detail (`http 503`): the class alone could not tell a 502
+        // relay from a 500 model fault, and none of these classes relays
+        // detail to the caller.
+        let failure = if failure.failure_class == FailureClass::InvalidRequest {
+            failure
+        } else {
+            failure.with_provider_detail(Some(status_detail(status)))
+        };
         if failure.failure_class != FailureClass::InvalidRequest && status != 403 && status != 404 {
             return Err(failure);
         }
@@ -253,9 +266,9 @@ pub async fn open_stream(
             .as_deref()
             .is_some_and(|body| rejected_model_not_found(dialect, body))
         {
-            return Err(
-                transport_failure(Some(404)).with_rate_limit_facts(rate_limit.clone(), retry_after)
-            );
+            return Err(transport_failure(Some(404))
+                .with_provider_detail(Some(format!("{}: model_not_found", status_detail(status))))
+                .with_rate_limit_facts(rate_limit.clone(), retry_after));
         }
         let parameter = body
             .as_deref()
@@ -304,6 +317,64 @@ pub async fn open_stream(
             .with_provider_detail(detail));
     }
     Ok(response)
+}
+
+/// The ledger detail of one status-only classification.
+fn status_detail(status: u16) -> String {
+    format!("http {status}")
+}
+
+/// Longest transport cause text kept in a ledger detail.
+const TRANSPORT_CAUSE_LIMIT: usize = 120;
+
+/// The engine's own account of one connection-level failure, for the ledger.
+///
+/// A bare `transport` class hid what actually broke (2026-09-15: ~150
+/// transport settlements a day with no cause recorded), so the failure names
+/// the phase (`open` before headers, `stream` mid-body), reqwest's fault kind,
+/// and the innermost cause's own sentence (an OS error such as "Connection
+/// reset by peer (os error 54)", a TLS alert, hyper's "connection closed
+/// before message completed"). The reqwest layer's own text is skipped
+/// because it names the request URL; the cause text is then held to the same
+/// identifier mask as a provider sentence and bounded, so nothing shaped like
+/// a host or handle crosses. This is engine vocabulary about the engine's own
+/// socket, never provider body content, and no class it rides on relays
+/// detail to callers.
+pub(crate) fn transport_error_detail(phase: &str, error: &reqwest::Error) -> String {
+    let kind = if error.is_timeout() {
+        "timed out"
+    } else if error.is_connect() {
+        "connect failed"
+    } else if error.is_body() {
+        "body read failed"
+    } else if error.is_decode() {
+        "decode failed"
+    } else if error.is_request() {
+        "request failed"
+    } else if error.is_redirect() {
+        "redirect refused"
+    } else {
+        "failed"
+    };
+    let mut cause: Option<String> = None;
+    let mut source = std::error::Error::source(error);
+    while let Some(inner) = source {
+        cause = Some(inner.to_string());
+        source = inner.source();
+    }
+    let mut detail = format!("{phase} {kind}");
+    if let Some(cause) = cause {
+        let collapsed = cause.split_whitespace().collect::<Vec<_>>().join(" ");
+        let bounded: String = bounded_masked_line(&collapsed, &[])
+            .chars()
+            .take(TRANSPORT_CAUSE_LIMIT)
+            .collect();
+        if !bounded.is_empty() {
+            detail.push_str(": ");
+            detail.push_str(&bounded);
+        }
+    }
+    detail
 }
 
 /// Longest provider error body read for parameter attribution.
@@ -406,9 +477,12 @@ mod tests {
         assert!(failure.failover_eligible, "an unfunded rung must fail over");
         assert!(!failure.retryable_same_deployment);
         assert!(
-            failure.provider_detail.is_none() && failure.rejected_parameter.is_none(),
+            failure.rejected_parameter.is_none(),
             "a billing failure must stay content-free"
         );
+        // The only detail is the engine's own status token, never body text.
+        assert_eq!(failure.provider_detail.as_deref(), Some("http 402"));
+        assert!(!failure.public_error().message.contains("402"));
         assert!(
             !failure.safe_message.contains("request fields"),
             "the caller must never be told to fix their fields for a provider billing state"
@@ -491,6 +565,122 @@ mod tests {
             .provider_detail
             .as_deref()
             .is_some_and(|detail| detail.starts_with("Item with id 'rs_0000' not found")));
+    }
+
+    #[tokio::test]
+    async fn a_vllm_flat_400_with_trailing_help_text_relays_its_sentence() {
+        // Exact body captured live from an Azure Foundry DeepSeek deployment
+        // (2026-09-15): 438 such 400s in 48h had settled with no detail
+        // because the body is a flat vLLM object followed by a help line.
+        let failure = open_against_body(
+            "400 Bad Request",
+            "{\"object\":\"error\",\"message\":\"Tool 'g' not found in tools list.\",\
+             \"type\":\"BadRequestError\",\"param\":null,\"code\":400}\n\
+             Please check this guide to understand why this error code might have been returned \n\
+             https://docs.microsoft.com/en-us/azure/machine-learning/how-to-troubleshoot-online-endpoints#http-status-codes\n",
+            "DeepSeek-V4-Flash",
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::InvalidRequest);
+        assert_eq!(
+            failure.provider_detail.as_deref(),
+            Some("Tool 'g' not found in tools list.")
+        );
+        assert_eq!(
+            failure.public_error().message,
+            "provider rejected the request: Tool 'g' not found in tools list."
+        );
+    }
+
+    #[tokio::test]
+    async fn xai_and_novita_envelopes_relay_their_sentences() {
+        // xAI spells the sentence as a string `error` beside a `code`
+        // (captured live 2026-09-15).
+        let xai = open_against_body(
+            "400 Bad Request",
+            "{\"code\":\"invalid-argument\",\"error\":\"Argument not supported on this \
+             model: presencePenalty\"}",
+            "grok-4.20-multi-agent",
+        )
+        .await;
+        assert_eq!(xai.failure_class, FailureClass::InvalidRequest);
+        assert_eq!(
+            xai.provider_detail.as_deref(),
+            Some("Argument not supported on this model: presencePenalty")
+        );
+        // Novita answers a flat gRPC-style object whose `reason` is the token
+        // (captured live 2026-09-15).
+        let novita = open_against_body(
+            "400 Bad Request",
+            "{\"code\":400,\"reason\":\"INVALID_PARAMETER\",\"message\":\"tools is not \
+             supported by this model\",\"metadata\":{}}",
+            "deepseek/deepseek-v4.1-flash",
+        )
+        .await;
+        assert_eq!(novita.failure_class, FailureClass::InvalidRequest);
+        assert_eq!(
+            novita.provider_detail.as_deref(),
+            Some("tools is not supported by this model")
+        );
+    }
+
+    #[tokio::test]
+    async fn status_only_classifications_carry_the_status_as_ledger_detail() {
+        // A 503 relay fault and a 500 model fault were indistinguishable on
+        // the ledger; the status token now rides as the detail, ledger-only.
+        let failure = open_against_body(
+            "503 Service Unavailable",
+            "{\"error\":{\"message\":\"upstream connect error to 10.0.0.7\"}}",
+            "m",
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::ProviderInternal);
+        assert_eq!(failure.provider_detail.as_deref(), Some("http 503"));
+        assert_eq!(
+            failure.public_error().message,
+            "provider service failed; retry after a short delay",
+            "a server-side class never relays detail to the caller"
+        );
+        let throttled = open_against_body("429 Too Many Requests", "", "m").await;
+        assert_eq!(throttled.failure_class, FailureClass::Throttled);
+        assert_eq!(throttled.provider_detail.as_deref(), Some("http 429"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_names_the_transport_fault_for_the_ledger() {
+        // Bind then drop the listener so the port refuses the connect.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+        let client = build_client(Duration::from_secs(2)).expect("client");
+        let failure = open_stream(
+            &client,
+            &format!("http://{addr}/v1/chat/completions"),
+            &HashMap::new(),
+            "idem-refused",
+            &serde_json::json!({"model": "m", "messages": []}),
+            None,
+            Duration::from_secs(5),
+            Dialect::OpenAiCompatible,
+        )
+        .await
+        .expect_err("a refused connect is a failure");
+        assert_eq!(failure.failure_class, FailureClass::Transport);
+        let detail = failure
+            .provider_detail
+            .as_deref()
+            .expect("transport detail");
+        assert!(detail.starts_with("open connect failed"), "{detail}");
+        assert!(
+            !detail.contains("127.0.0.1") && !detail.contains(&addr.port().to_string()),
+            "the socket address never rides in the detail: {detail}"
+        );
+        assert_eq!(
+            failure.public_error().message,
+            "provider transport failed; retry the request"
+        );
     }
 
     #[tokio::test]

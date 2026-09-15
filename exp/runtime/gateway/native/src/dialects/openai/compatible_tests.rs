@@ -113,3 +113,79 @@ fn compatible_missing_or_invalid_deltas_still_fail_without_valid_annotations() {
         );
     }
 }
+
+/// An OpenAI-compatible lane that answers HTTP 200 with an error-shaped body
+/// (no `choices`) declares its failure in whichever envelope spelling it
+/// uses; each reaches the ledger with its sentence instead of dying as a
+/// malformed "choices must be an array" frame.
+#[test]
+fn error_shaped_success_frames_declare_the_provider_failure_with_detail() {
+    for (payload, expected_class, expected_detail) in [
+        (
+            json!({"object": "error", "message": "Tool 'g' not found in tools list.",
+                   "type": "BadRequestError", "param": null, "code": 400}),
+            FailureClass::InvalidRequest,
+            "400: Tool 'g' not found in tools list.",
+        ),
+        (
+            json!({"code": "invalid-argument", "error": "Argument not supported on this model: presencePenalty"}),
+            FailureClass::InvalidRequest,
+            "invalid-argument: Argument not supported on this model: presencePenalty",
+        ),
+        (
+            json!({"code": 400, "reason": "INVALID_PARAMETER",
+                   "message": "tools is not supported by this model", "metadata": {}}),
+            FailureClass::InvalidRequest,
+            "INVALID_PARAMETER: tools is not supported by this model",
+        ),
+        (
+            // A FastAPI validation list is the origin refusing the request's
+            // shape: its pydantic token classifies it as the caller's error.
+            json!({"detail": [{"loc": ["body", "messages", 0, "content"],
+                   "msg": "field required", "type": "value_error.missing"}]}),
+            FailureClass::InvalidRequest,
+            "value_error.missing: field required",
+        ),
+        (
+            // A plain-string detail names no class; it stays the provider's
+            // failure with its sentence kept for the ledger.
+            json!({"detail": "The origin could not load the model."}),
+            FailureClass::ProviderInternal,
+            "The origin could not load the model.",
+        ),
+        (
+            // API Management's envelope carries only a status and a sentence.
+            json!({"statusCode": 400, "message": "Invalid request body."}),
+            FailureClass::InvalidRequest,
+            "400: Invalid request body.",
+        ),
+    ] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+        let events = normalizer
+            .feed(&SseEvent {
+                event: None,
+                data: payload.to_string(),
+            })
+            .expect("an error-shaped frame is a declared failure, never malformed");
+        let failure = match events.as_slice() {
+            [Event::Failed(failure)] => failure,
+            other => panic!("expected one failed terminal for {payload}, got {other:?}"),
+        };
+        assert_eq!(failure.failure_class, expected_class, "{payload}");
+        assert_eq!(
+            failure.provider_detail.as_deref(),
+            Some(expected_detail),
+            "{payload}"
+        );
+    }
+    // A frame with no `choices` and no error marker is not an envelope: it
+    // keeps the strict malformed contract instead of settling as a failure.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    let malformed = normalizer
+        .feed(&SseEvent {
+            event: None,
+            data: json!({"message": "warming up"}).to_string(),
+        })
+        .expect_err("a bare message is not a declared failure");
+    assert_eq!(malformed.failure_class, FailureClass::MalformedResponse);
+}

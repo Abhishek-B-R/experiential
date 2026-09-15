@@ -54,28 +54,39 @@ impl Normalizer {
             return Ok(events);
         }
         let payload = parse_object(&frame.data)?;
-        if let Some(error) = payload.get("error").filter(|value| !value.is_null()) {
-            // An OpenAI-compatible relay declaring failure inside the stream
-            // names the mechanism only here; the bounded detail rides the
-            // failure into the ledger.
-            let (code, message) = match error.as_object() {
-                Some(error) => (
-                    error.get("code").and_then(|value| {
-                        value
-                            .as_str()
-                            .map(str::to_string)
-                            .or_else(|| value.as_i64().map(|numeric| numeric.to_string()))
-                    }),
-                    error.get("message").and_then(Value::as_str).map(|message| {
+        // An OpenAI-compatible relay declaring failure inside the stream (or
+        // an error-shaped body answered under HTTP 200 with no `choices`)
+        // names the mechanism only here; the bounded detail rides the failure
+        // into the ledger. The shared envelope reader covers every spelling
+        // the family answers: the documented `error` object, xAI's string
+        // `error`, and the flat vLLM / Novita / FastAPI objects.
+        // The reader itself decides what is error-shaped: a frame with a
+        // non-null `error`, or one carrying no `choices` that the reader
+        // recognizes (a flat object needs an error marker, so an ordinary
+        // chunk is never read as a failure).
+        let document = Value::Object(payload.clone());
+        let envelope = if payload.get("error").is_some_and(|value| !value.is_null())
+            || !payload.contains_key("choices")
+        {
+            crate::error_envelope::openai_family_envelope(&document)
+        } else {
+            None
+        };
+        if envelope.is_some() {
+            let (code, message) = match envelope {
+                Some(envelope) => {
+                    let message = envelope.message.map(|message| {
                         // An aggregator's generic sentence yields to the
                         // upstream provider's own (OpenRouter metadata.raw).
-                        crate::param_attribution::upstream_relayed_message(
-                            &Value::Object(error.clone()),
-                            message,
-                        )
-                        .unwrap_or_else(|| message.to_string())
-                    }),
-                ),
+                        envelope
+                            .error_object
+                            .and_then(|error| {
+                                crate::param_attribution::upstream_relayed_message(error, message)
+                            })
+                            .unwrap_or_else(|| message.to_string())
+                    });
+                    (envelope.code, message)
+                }
                 None => (None, None),
             };
             return Ok(vec![Event::Failed(self.provider_stream_failure(

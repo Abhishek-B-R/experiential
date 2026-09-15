@@ -11,6 +11,7 @@ mod dialects;
 mod encode;
 mod encode_messages;
 mod encode_responses;
+mod error_envelope;
 mod errors;
 mod events;
 mod eventstream;

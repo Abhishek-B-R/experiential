@@ -349,17 +349,21 @@ impl UpstreamRelay {
             };
             let chunk = match tokio::time::timeout(bound, self.stream.next()).await {
                 Ok(Some(Ok(chunk))) => chunk,
-                Ok(Some(Err(_))) => {
+                Ok(Some(Err(error))) => {
                     // A transport break mid-stream: recover a Gemini partial as
                     // Incomplete, otherwise surface the retryable transport
                     // failure. Pre-content it stays a retryable transport error
-                    // either way.
+                    // either way. The engine's account of the break (never
+                    // provider text) rides to the ledger.
                     self.recover_or_fail(
                         Failure::new(
                             FailureClass::Transport,
                             "provider transport failed; retry the request",
                         )
-                        .with_retry(true, true),
+                        .with_retry(true, true)
+                        .with_provider_detail(Some(
+                            crate::upstream::transport_error_detail("stream", &error),
+                        )),
                     )?;
                     continue;
                 }
@@ -832,6 +836,12 @@ mod h2_abort_tests {
         );
         assert_eq!(failure.failure_class, FailureClass::Transport);
         assert!(failure.failover_eligible, "an aborted rung fails over");
+        // The engine's account of the mid-stream break rides to the ledger.
+        let detail = failure
+            .provider_detail
+            .as_deref()
+            .expect("transport detail");
+        assert!(detail.starts_with("stream "), "{detail}");
     }
 
     #[tokio::test]
