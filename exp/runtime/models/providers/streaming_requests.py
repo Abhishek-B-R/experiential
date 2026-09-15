@@ -405,7 +405,8 @@ def route_generation_parameter_requests(
             required_defaults = {
                 profile.reasoning_effort
                 for profile in profiles
-                if profile.reasoning_effort_required and profile.reasoning_effort in portable_non_none
+                if profile.reasoning_effort_required
+                and profile.reasoning_effort in portable_non_none
             }
             if lane_default in portable_non_none:
                 provider_updates["reasoning_effort"] = lane_default

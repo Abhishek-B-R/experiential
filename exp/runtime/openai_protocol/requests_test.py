@@ -4363,8 +4363,12 @@ def test_responses_unknown_content_part_type_names_the_accepted_vocabulary() -> 
             }
         )
     assert chat_shape.value.detail.param == "input.0.content.0.type"
-    assert "but got 'image_url' instead" in chat_shape.value.detail.message
-    assert "'text'" not in chat_shape.value.detail.message
+    # A Chat spelling that IS a member of the shared union fails the official
+    # probe instead, whose literal fault names the members only (#951).
+    assert chat_shape.value.detail.message == (
+        "Invalid value for 'input.0.content.0.type': expected one of 'input_text', "
+        "'input_image' or 'input_file'."
+    )
     with pytest.raises(OpenAIProtocolError) as untyped:
         decode_responses(
             {"model": "coding", "input": [{"role": "user", "content": [{"text": "hi"}]}]}
