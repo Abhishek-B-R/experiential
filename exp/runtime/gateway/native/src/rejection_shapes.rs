@@ -8,6 +8,7 @@
 use serde_json::Value;
 
 use crate::dialects::Dialect;
+use crate::error_envelope::parse_error_document;
 use crate::param_attribution::{error_message_field, rejected_model_not_found};
 
 /// Sentences a provider answers with a 400 for a request shape the OpenAI
@@ -26,9 +27,8 @@ const LANE_LIMITATION_PHRASES: &[&str] = &[
 /// the dialect's message field is read, so request text echoed elsewhere in
 /// the body cannot change routing.
 pub fn rejected_by_lane_limitation(dialect: Dialect, body: &str) -> bool {
-    let value: Value = match serde_json::from_str(body) {
-        Ok(value) => value,
-        Err(_) => return false,
+    let Some(value) = parse_error_document(body) else {
+        return false;
     };
     error_message_field(dialect, &value).is_some_and(|message| {
         let lowered = message.to_ascii_lowercase();
@@ -51,9 +51,8 @@ pub fn rejected_by_routing_gate(dialect: Dialect, body: &str) -> bool {
     if dialect != Dialect::OpenAiCompatible {
         return false;
     }
-    let value: Value = match serde_json::from_str(body) {
-        Ok(value) => value,
-        Err(_) => return false,
+    let Some(value) = parse_error_document(body) else {
+        return false;
     };
     let Some(metadata) = value.get("error").and_then(|error| error.get("metadata")) else {
         return false;
@@ -153,9 +152,8 @@ pub fn rejected_caller_reference_not_found(dialect: Dialect, body: &str) -> bool
     ) {
         return false;
     }
-    let value: Value = match serde_json::from_str(body) {
-        Ok(value) => value,
-        Err(_) => return false,
+    let Some(value) = parse_error_document(body) else {
+        return false;
     };
     let Some(error) = value.get("error") else {
         return false;

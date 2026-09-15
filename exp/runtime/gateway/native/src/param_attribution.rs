@@ -13,18 +13,23 @@
 //!
 //! | dialect                 | source                                        |
 //! |-------------------------|-----------------------------------------------|
-//! | `OpenAiResponses`       | `error.param`, else fixed unknown-argument msg |
-//! | `OpenAiCompatible`      | `error.param`, else fixed unknown-argument msg |
+//! | `OpenAiResponses`       | envelope `param`, else fixed unknown-argument msg |
+//! | `OpenAiCompatible`      | envelope `param`, else fixed unknown-argument msg |
 //! | `AnthropicMessages`     | leading `path: ` or `` `path` `` message token |
 //! | `GeminiGenerateContent` | `fieldViolations[].field`, else `* path: ` msg |
 //! | `BedrockConverseStream` | none — no machine-readable parameter contract  |
 //!
-//! The explanation relayed alongside it comes from `error.message` for every
-//! dialect except Bedrock, which reports a bare top-level `message`.
+//! The explanation relayed alongside it comes from `error.message` for the
+//! Anthropic and Gemini dialects, from a bare top-level `message` for
+//! Bedrock, and for the OpenAI family from whichever envelope spelling the
+//! lane answered (`crate::error_envelope`: the documented nested object, xAI's
+//! string `error`, the flat vLLM/Novita/API-Management objects, FastAPI's
+//! `detail`).
 
 use serde_json::Value;
 
 use crate::dialects::Dialect;
+use crate::error_envelope::{openai_family_envelope, parse_error_document, ErrorEnvelope};
 pub use crate::rejection_shapes::{
     rejected_by_lane_limitation, rejected_by_routing_gate, rejected_caller_reference_not_found,
     upstream_relayed_message,
@@ -49,13 +54,13 @@ const UNKNOWN_ARGUMENT_PREFIXES: [&str; 2] = [
 /// fields, prose, oversized or non-path content, non-JSON — yields `None`
 /// and the caller keeps the content-free sanitized message.
 pub fn rejected_parameter(dialect: Dialect, body: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(body).ok()?;
+    let value = parse_error_document(body)?;
     let candidate = match dialect {
         Dialect::OpenAiResponses | Dialect::OpenAiCompatible => {
-            let error = value.get("error")?;
-            match error.get("param").and_then(Value::as_str) {
-                Some(param) => Some(param.to_string()),
-                None => unknown_argument_name(error.get("message")?.as_str()?),
+            let envelope = openai_family_envelope(&value)?;
+            match envelope.param {
+                Some(param) => Some(param),
+                None => unknown_argument_name(envelope.message?),
             }
         }
         Dialect::AnthropicMessages => {
@@ -79,12 +84,26 @@ const MODEL_NOT_FOUND_CODE: &str = "model_not_found";
 /// data or unrelated metadata).
 pub(crate) fn error_message_field(dialect: Dialect, value: &Value) -> Option<&str> {
     match dialect {
-        Dialect::OpenAiResponses
-        | Dialect::OpenAiCompatible
-        | Dialect::AnthropicMessages
-        | Dialect::GeminiGenerateContent => value.get("error")?.get("message")?.as_str(),
+        // The OpenAI family is spelled many ways by the lanes that speak it;
+        // the envelope reader owns every documented spelling.
+        Dialect::OpenAiResponses | Dialect::OpenAiCompatible => {
+            openai_family_envelope(value)?.message
+        }
+        Dialect::AnthropicMessages | Dialect::GeminiGenerateContent => {
+            value.get("error")?.get("message")?.as_str()
+        }
         // Bedrock reports a modeling error as a bare top-level `message`.
         Dialect::BedrockConverseStream => value.get("message")?.as_str(),
+    }
+}
+
+/// The OpenAI-family envelope of one parsed body, `None` for other dialects.
+fn family_envelope(dialect: Dialect, value: &Value) -> Option<ErrorEnvelope<'_>> {
+    match dialect {
+        Dialect::OpenAiResponses | Dialect::OpenAiCompatible => openai_family_envelope(value),
+        Dialect::AnthropicMessages
+        | Dialect::GeminiGenerateContent
+        | Dialect::BedrockConverseStream => None,
     }
 }
 
@@ -97,22 +116,11 @@ pub(crate) fn error_message_field(dialect: Dialect, value: &Value) -> Option<&st
 /// and the certified ladder must advance past it exactly as it does for a 404.
 /// Only the documented code field is read; the message is never inspected.
 pub fn rejected_model_not_found(dialect: Dialect, body: &str) -> bool {
-    let value: Value = match serde_json::from_str(body) {
-        Ok(value) => value,
-        Err(_) => return false,
+    let Some(value) = parse_error_document(body) else {
+        return false;
     };
-    match dialect {
-        Dialect::OpenAiResponses | Dialect::OpenAiCompatible => {
-            value
-                .get("error")
-                .and_then(|error| error.get("code"))
-                .and_then(Value::as_str)
-                == Some(MODEL_NOT_FOUND_CODE)
-        }
-        Dialect::AnthropicMessages
-        | Dialect::GeminiGenerateContent
-        | Dialect::BedrockConverseStream => false,
-    }
+    family_envelope(dialect, &value)
+        .is_some_and(|envelope| envelope.code.as_deref() == Some(MODEL_NOT_FOUND_CODE))
 }
 
 /// Extract the provider's own explanation from one client-error body.
@@ -139,11 +147,11 @@ pub fn rejected_model_not_found(dialect: Dialect, body: &str) -> bool {
 /// 2.1.251 or later"), and dropping that sentence left callers with a
 /// generic 400 for a client-side fix (2026-09-04 ledger).
 pub fn rejected_detail(dialect: Dialect, body: &str, request_words: &[&str]) -> Option<String> {
-    let value: Value = serde_json::from_str(body).ok()?;
+    let value = parse_error_document(body)?;
     let message = error_message_field(dialect, &value)?;
     if dialect == Dialect::OpenAiCompatible {
-        if let Some(relayed) = value
-            .get("error")
+        if let Some(relayed) = family_envelope(dialect, &value)
+            .and_then(|envelope| envelope.error_object)
             .and_then(|error| upstream_relayed_message(error, message))
         {
             return sanitized_detail(&relayed, request_words);
@@ -163,22 +171,27 @@ pub fn rejected_detail(dialect: Dialect, body: &str, request_words: &[&str]) -> 
 /// fields"). It also classifies the body: a content-filter code is the
 /// model's verdict on the content, not a request-shape error.
 pub fn rejected_code(dialect: Dialect, body: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(body).ok()?;
-    let error = match dialect {
+    let value = parse_error_document(body)?;
+    let token = match dialect {
         Dialect::BedrockConverseStream => return None,
-        _ => value.get("error")?,
-    };
-    let candidate = match dialect {
-        Dialect::GeminiGenerateContent => error.get("status").or_else(|| error.get("code")),
-        _ => error
-            .get("code")
-            .filter(|code| !code.is_null())
-            .or_else(|| error.get("type")),
-    }?;
-    let token = match candidate {
-        Value::String(text) => text.clone(),
-        Value::Number(number) => number.to_string(),
-        _ => return None,
+        Dialect::OpenAiResponses | Dialect::OpenAiCompatible => {
+            openai_family_envelope(&value)?.code?
+        }
+        Dialect::AnthropicMessages | Dialect::GeminiGenerateContent => {
+            let error = value.get("error")?;
+            let candidate = match dialect {
+                Dialect::GeminiGenerateContent => error.get("status").or_else(|| error.get("code")),
+                _ => error
+                    .get("code")
+                    .filter(|code| !code.is_null())
+                    .or_else(|| error.get("type")),
+            }?;
+            match candidate {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                _ => return None,
+            }
+        }
     };
     let identifier = !token.is_empty()
         && token.len() <= 64
@@ -852,6 +865,119 @@ mod request_word_tests {
             rejected_detail(Dialect::AnthropicMessages, body, &["claude-fable-5-1"]).as_deref(),
             Some("claude-fable-5-1 is retired on deployment [redacted]; contact your operator."),
             "an infrastructure label beside the known word is masked, the known word kept"
+        );
+    }
+
+    /// Exact bodies captured live on 2026-09-15 from the lanes whose client
+    /// errors settled with no detail: xAI (`{code, error: "<sentence>"}`),
+    /// Novita (`{code, reason, message, metadata}`), and an Azure Foundry
+    /// DeepSeek deployment (vLLM's flat object followed by a help line).
+    const XAI_BODY: &str = r#"{"code":"invalid-argument","error":"Incorrect API key provided. You can obtain an API key from https://console.x.ai."}"#;
+    const NOVITA_BODY: &str = r#"{"code":400,"reason":"INVALID_PARAMETER","message":"tools is not supported by this model","metadata":{}}"#;
+    const FOUNDRY_VLLM_BODY: &str = "{\"object\":\"error\",\"message\":\"Tool 'g' not found in tools list.\",\"type\":\"BadRequestError\",\"param\":null,\"code\":400}\nPlease check this guide to understand why this error code might have been returned \nhttps://docs.microsoft.com/en-us/azure/machine-learning/how-to-troubleshoot-online-endpoints#http-status-codes\n";
+
+    #[test]
+    fn every_openai_family_envelope_spelling_yields_its_sentence_and_token() {
+        assert_eq!(
+            rejected_detail(Dialect::OpenAiCompatible, XAI_BODY, &[]).as_deref(),
+            // The console URL is infrastructure and is masked; the sentence survives.
+            Some("Incorrect API key provided. You can obtain an API key from [redacted].")
+        );
+        assert_eq!(
+            rejected_code(Dialect::OpenAiCompatible, XAI_BODY).as_deref(),
+            Some("invalid-argument")
+        );
+        assert_eq!(
+            rejected_detail(Dialect::OpenAiCompatible, NOVITA_BODY, &[]).as_deref(),
+            Some("tools is not supported by this model")
+        );
+        assert_eq!(
+            rejected_code(Dialect::OpenAiCompatible, NOVITA_BODY).as_deref(),
+            Some("INVALID_PARAMETER")
+        );
+        assert_eq!(
+            rejected_detail(Dialect::OpenAiCompatible, FOUNDRY_VLLM_BODY, &[]).as_deref(),
+            Some("Tool 'g' not found in tools list.")
+        );
+        // A bare numeric status is a token the caller never sees as detail.
+        assert!(generic_error_code(
+            &rejected_code(Dialect::OpenAiCompatible, FOUNDRY_VLLM_BODY).expect("token")
+        ));
+        // The Responses dialect shares the family reader.
+        assert_eq!(
+            rejected_detail(Dialect::OpenAiResponses, NOVITA_BODY, &[]).as_deref(),
+            Some("tools is not supported by this model")
+        );
+    }
+
+    #[test]
+    fn fastapi_detail_yields_its_sentence_path_and_token() {
+        let body = r#"{"detail": [{"loc": ["body", "messages", 0, "content"],
+            "msg": "an image part is required", "type": "value_error"}]}"#;
+        assert_eq!(
+            rejected_detail(Dialect::OpenAiCompatible, body, &[]).as_deref(),
+            Some("an image part is required")
+        );
+        assert_eq!(
+            rejected_parameter(Dialect::OpenAiCompatible, body).as_deref(),
+            Some("messages[0].content")
+        );
+        assert_eq!(
+            rejected_code(Dialect::OpenAiCompatible, body).as_deref(),
+            Some("value_error")
+        );
+        let plain = r#"{"detail": "An image input is required for this model."}"#;
+        assert_eq!(
+            rejected_detail(Dialect::OpenAiCompatible, plain, &[]).as_deref(),
+            Some("An image input is required for this model.")
+        );
+    }
+
+    #[test]
+    fn trailing_text_after_the_json_document_no_longer_drops_the_body() {
+        // The same document without the help line reads identically, and a
+        // body that is not JSON at all still yields nothing.
+        let clean = FOUNDRY_VLLM_BODY.split('\n').next().expect("document");
+        assert_eq!(
+            rejected_detail(Dialect::OpenAiCompatible, clean, &[]),
+            rejected_detail(Dialect::OpenAiCompatible, FOUNDRY_VLLM_BODY, &[])
+        );
+        assert_eq!(
+            rejected_detail(Dialect::OpenAiCompatible, "<html>", &[]),
+            None
+        );
+        assert_eq!(
+            rejected_code(Dialect::OpenAiCompatible, "upstream said no"),
+            None
+        );
+        // A flat envelope reporting the model-not-found code takes the lane policy.
+        let flat_missing = r#"{"object":"error","message":"The model does not exist.","type":"NotFoundError","code":"model_not_found"}"#;
+        assert!(rejected_model_not_found(
+            Dialect::OpenAiCompatible,
+            flat_missing
+        ));
+        assert!(!rejected_model_not_found(
+            Dialect::OpenAiCompatible,
+            NOVITA_BODY
+        ));
+    }
+
+    #[test]
+    fn other_dialects_keep_reading_only_their_documented_message_field() {
+        // A flat `message` is Bedrock's shape, not Anthropic's or Gemini's.
+        let flat = r#"{"message": "The provided model does not support tool use."}"#;
+        assert_eq!(rejected_detail(Dialect::AnthropicMessages, flat, &[]), None);
+        assert_eq!(
+            rejected_detail(Dialect::GeminiGenerateContent, flat, &[]),
+            None
+        );
+        assert_eq!(
+            rejected_detail(Dialect::BedrockConverseStream, flat, &[]).as_deref(),
+            Some("The provided model does not support tool use.")
+        );
+        assert_eq!(
+            rejected_detail(Dialect::AnthropicMessages, XAI_BODY, &[]),
+            None
         );
     }
 

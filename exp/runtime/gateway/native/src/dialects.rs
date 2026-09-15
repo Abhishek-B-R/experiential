@@ -604,7 +604,8 @@ impl Normalizer {
                 FailureClass::Transport,
                 "provider transport failed; retry the request",
             )
-            .with_retry(true, true));
+            .with_retry(true, true)
+            .with_provider_detail(failure.provider_detail));
         }
         let mut events = Vec::new();
         if let Some(usage) = self.usage.take() {
