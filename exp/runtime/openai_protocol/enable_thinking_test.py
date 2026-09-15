@@ -35,6 +35,42 @@ def test_thinking_enabled_defers_to_the_model_default() -> None:
     assert request.ignored_parameters == ("thinking->translated(reasoning_effort)",)
 
 
+def test_thinking_adaptive_defers_to_the_model_default() -> None:
+    """Anthropic's 4.6+ on-mode is admitted on the Chat wire like ``enabled``.
+
+    Claude-configured clients (Anthropic SDKs, Claude Code shims, Cherry
+    Studio) pin ``thinking: {type: adaptive}`` on every model; 3,935 Chat
+    requests over 7 days were refused at decode for it (2026-09-15).
+    """
+    request = _decode(thinking={"type": "adaptive"})
+    assert request.reasoning_effort is None
+    assert request.thinking_default_enable is True
+    assert request.ignored_parameters == ("thinking->translated(reasoning_effort)",)
+
+
+def test_thinking_adaptive_budget_tokens_is_disclosed_not_carried() -> None:
+    request = _decode(thinking={"type": "adaptive", "budget_tokens": 4096})
+    assert request.thinking_default_enable is True
+    assert request.ignored_parameters == (
+        "budget_tokens->dropped(not_carried)",
+        "thinking->translated(reasoning_effort)",
+    )
+
+
+def test_thinking_unknown_type_names_the_members_not_the_json_type() -> None:
+    """A non-member string is a value fault; the members are the useful fact.
+
+    The old rendering ("expected one of 'enabled' or 'disabled', but got a
+    string instead") told callers their string was not a string.
+    """
+    with pytest.raises(OpenAIProtocolError) as error:
+        _decode(thinking={"type": "extended"})
+    assert error.value.detail.param == "thinking.type"
+    assert error.value.detail.message == (
+        "Invalid value for 'thinking.type': expected one of 'enabled', 'disabled' or 'adaptive'."
+    )
+
+
 def test_thinking_enabled_budget_tokens_is_disclosed_not_carried() -> None:
     request = _decode(thinking={"type": "enabled", "budget_tokens": 4096})
     assert request.thinking_default_enable is True
