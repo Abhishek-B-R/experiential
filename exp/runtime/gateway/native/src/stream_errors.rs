@@ -125,6 +125,9 @@ const QUOTA_CODES: &[&str] = &[
     "billing_not_active",
     // Novita answers an unfunded account with HTTP 403 and this reason.
     "not_enough_balance",
+    // Z.ai business code 1113 ("Insufficient balance or no resource package"),
+    // answered under HTTP 429 like its rate limits (1302) and overload (1305).
+    "1113",
 ];
 const AUTHENTICATION_CODES: &[&str] = &[
     "authentication_error",

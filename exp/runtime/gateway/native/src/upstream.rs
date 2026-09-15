@@ -954,6 +954,44 @@ mod tests {
         assert!(!failure.failover_eligible);
     }
 
+    #[tokio::test]
+    async fn a_429_whose_body_says_insufficient_balance_classes_provider_quota() {
+        // Z.ai: HTTP 429 + business code 1113 is the ACCOUNT out of money, not a
+        // rate limit. The class must be the quota family (so the house pool's
+        // exhaustion sweep sees a dead account and rotates or closes it), the
+        // rung must fail over, and the body must never be relayed.
+        let failure = open_against_body(
+            "429 Too Many Requests",
+            "{\"error\":{\"code\":\"1113\",\"message\":\"Insufficient balance or no \
+             resource package. Please recharge.\"}}",
+            "glm-4.6",
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::ProviderQuota);
+        assert!(failure.failover_eligible && !failure.retryable_same_deployment);
+        assert!(
+            failure.provider_detail.is_none() && failure.rejected_parameter.is_none(),
+            "a billing failure must stay content-free"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_429_whose_body_is_a_rate_limit_stays_throttled() {
+        // Z.ai 1302 (requests rate limit) and every other provider's 429 keep
+        // the throttle class and its Retry-After facts.
+        let failure = open_against_body(
+            "429 Too Many Requests",
+            "{\"error\":{\"code\":\"1302\",\"message\":\"Rate limit reached for \
+             requests\"}}",
+            "glm-4.6",
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::Throttled);
+        assert!(failure.failover_eligible && !failure.retryable_same_deployment);
+        let bare = open_against_body("429 Too Many Requests", "", "glm-4.6").await;
+        assert_eq!(bare.failure_class, FailureClass::Throttled);
+    }
+
     #[test]
     fn header_phase_timeout_fails_over_without_a_same_deployment_redial() {
         // A lead that connects but never completes the response-header phase must
