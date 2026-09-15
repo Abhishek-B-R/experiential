@@ -94,6 +94,17 @@ fn flat_envelope(value: &Value) -> ErrorEnvelope<'_> {
     if let Some(detail) = value.get("detail") {
         return fastapi_envelope(detail);
     }
+    // A bare `{message}` beside no token or error marker is not an envelope
+    // on this family (Bedrock's bare message is its own dialect's shape): a
+    // flat body must also carry a `reason`, `code`, `type`, `statusCode`, or
+    // `object: "error"` to be read.
+    let declares_error = value.get("object").and_then(Value::as_str) == Some("error")
+        || ["reason", "code", "type", "statusCode"]
+            .iter()
+            .any(|key| value.get(*key).is_some_and(|field| !field.is_null()));
+    if !declares_error {
+        return ErrorEnvelope::default();
+    }
     ErrorEnvelope {
         message: value.get("message").and_then(Value::as_str),
         // Novita's `reason` is the vocabulary token (`INVALID_PARAMETER`);
@@ -283,6 +294,7 @@ mod tests {
             r#"{"choices": []}"#,
             r#"{"error": null}"#,
             r#"{"detail": 5}"#,
+            r#"{"message": "something happened"}"#,
         ] {
             let value = parse_error_document(body).expect("parses");
             assert!(openai_family_envelope(&value).is_none(), "{body}");
