@@ -5130,6 +5130,34 @@ def test_the_route_floors_to_the_largest_declared_minimum() -> None:
     assert public.ignored_parameters == ()
 
 
+def test_a_declared_minimum_never_floors_a_native_responses_route() -> None:
+    """A Responses caller below the surface's own minimum keeps the named
+    admission rejection even when the Responses rung declares a floor: sub-16
+    is invalid on that surface, so the lane fact must not turn a contract
+    error into a silent rewrite. A Responses value on a COMPATIBLE rung that
+    declares the floor still rides it (the provider's refusal, not the
+    surface's)."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        maximum_output_tokens=1,
+        maximum_output_tokens_parameter="max_output_tokens",
+        stream=True,
+    )
+    responses_rung = GatewayWireProfile(
+        dialect="openai_responses", url="https://openai.test", minimum_output_tokens=16
+    )
+    with pytest.raises(ProviderParameterError, match="must be at least 16"):
+        route_generation_parameter_requests((responses_rung,), request)
+
+    compatible_rung = GatewayWireProfile(
+        dialect="openai_compatible", url="https://relay.test", minimum_output_tokens=16
+    )
+    public, provider = route_generation_parameter_requests((compatible_rung,), request)
+    assert provider.maximum_output_tokens == 16
+    assert "max_output_tokens->16" in public.ignored_parameters
+
+
 def test_chat_surface_sub_16_output_ceiling_rides_the_openai_floor() -> None:
     """A Chat-surface max_tokens below OpenAI's minimum translated onto an
     OpenAI rung rides the disclosed 16-token floor (the Messages-surface

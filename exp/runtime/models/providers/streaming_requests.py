@@ -211,14 +211,20 @@ def route_generation_parameter_requests(
         # Bedrock: "max_tokens must be at least 16"). It floors on EVERY
         # surface, because the refusal is the provider's, not the wire's.
         # The route floors to the LARGEST minimum any rung declares, so no
-        # rung of the waterfall dispatches a value it would refuse.
+        # rung of the waterfall dispatches a value it would refuse. A native
+        # Responses request on an all-Responses route is the one exception:
+        # sub-16 is invalid on its own surface and keeps the named admission
+        # rejection below, whatever a rung declares.
+        native_responses_route = request.surface == GatewayApiSurface.RESPONSES and all(
+            profile.dialect == "openai_responses" for profile in profiles
+        )
         output_floor = max(
             (
                 OPENAI_MINIMUM_OUTPUT_TOKENS if translated_onto_openai_wire else 0,
                 *(
                     profile.minimum_output_tokens
                     for profile in profiles
-                    if profile.minimum_output_tokens is not None
+                    if profile.minimum_output_tokens is not None and not native_responses_route
                 ),
             )
         )
