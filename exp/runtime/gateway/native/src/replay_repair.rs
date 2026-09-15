@@ -88,10 +88,23 @@ pub struct ReplayRepairMemory {
     state: Mutex<MemoryState>,
 }
 
+/// One remembered digest: when it was last replayed, and the sequence number
+/// of the insertion that placed it in the order queue.
+#[derive(Clone, Copy)]
+struct Remembered {
+    last_seen: Instant,
+    sequence: u64,
+}
+
 #[derive(Default)]
 struct MemoryState {
-    last_seen: HashMap<[u8; 32], Instant>,
-    insertion_order: VecDeque<[u8; 32]>,
+    entries: HashMap<[u8; 32], Remembered>,
+    /// Insertion order as `(digest, sequence)`. A digest forgotten on recall
+    /// and learned again gets a new sequence, so its stale queue entry is
+    /// recognized and skipped by the capacity sweep instead of evicting the
+    /// fresh one.
+    insertion_order: VecDeque<([u8; 32], u64)>,
+    next_sequence: u64,
 }
 
 impl ReplayRepairMemory {
@@ -103,24 +116,48 @@ impl ReplayRepairMemory {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for digest in digests {
-            if state.last_seen.insert(digest, now).is_none() {
-                state.insertion_order.push_back(digest);
+            match state.entries.get_mut(&digest) {
+                Some(entry) => entry.last_seen = now,
+                None => {
+                    let sequence = state.next_sequence;
+                    state.next_sequence += 1;
+                    state.entries.insert(
+                        digest,
+                        Remembered {
+                            last_seen: now,
+                            sequence,
+                        },
+                    );
+                    state.insertion_order.push_back((digest, sequence));
+                }
             }
         }
-        // The order queue also carries digests that already expired on
-        // recall; popping them costs nothing, and the map alone is what the
-        // capacity bounds.
-        while state.last_seen.len() > MEMORY_CAPACITY {
-            match state.insertion_order.pop_front() {
-                Some(oldest) => {
-                    state.last_seen.remove(&oldest);
-                }
-                None => break,
+        // Evict oldest insertions first. A queue entry whose sequence the
+        // map no longer holds is stale (its digest expired on recall, or was
+        // learned again under a newer sequence) and is popped for free; the
+        // map alone is what the capacity bounds.
+        while state.entries.len() > MEMORY_CAPACITY {
+            let Some((oldest, sequence)) = state.insertion_order.pop_front() else {
+                break;
+            };
+            if state
+                .entries
+                .get(&oldest)
+                .is_some_and(|entry| entry.sequence == sequence)
+            {
+                state.entries.remove(&oldest);
             }
         }
         while state.insertion_order.len() > 2 * MEMORY_CAPACITY {
-            if let Some(oldest) = state.insertion_order.pop_front() {
-                state.last_seen.remove(&oldest);
+            let Some((oldest, sequence)) = state.insertion_order.pop_front() else {
+                break;
+            };
+            if state
+                .entries
+                .get(&oldest)
+                .is_some_and(|entry| entry.sequence == sequence)
+            {
+                state.entries.remove(&oldest);
             }
         }
     }
@@ -132,15 +169,16 @@ impl ReplayRepairMemory {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match state.last_seen.get_mut(digest) {
-            Some(seen) if now.duration_since(*seen) <= MEMORY_TTL => {
-                *seen = now;
+        match state.entries.get_mut(digest) {
+            Some(entry) if now.duration_since(entry.last_seen) <= MEMORY_TTL => {
+                entry.last_seen = now;
                 true
             }
             Some(_) => {
                 // Expired: drop the entry in constant time and leave its
-                // place in the insertion order to the capacity sweep.
-                state.last_seen.remove(digest);
+                // place in the insertion order to the capacity sweep, which
+                // recognizes the stale sequence.
+                state.entries.remove(digest);
                 false
             }
             None => false,
@@ -153,7 +191,7 @@ impl ReplayRepairMemory {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .last_seen
+            .entries
             .len()
     }
 
@@ -551,7 +589,7 @@ mod tests {
         // An expired entry is forgotten on recall.
         {
             let mut state = memory.state.lock().expect("lock");
-            *state.last_seen.get_mut(&one).expect("entry") =
+            state.entries.get_mut(&one).expect("entry").last_seen =
                 Instant::now() - MEMORY_TTL - Duration::from_secs(1);
         }
         assert!(!memory.recall(&one));
@@ -575,6 +613,39 @@ mod tests {
             "the first insertion went first"
         );
         assert!(memory.recall(&digests[MEMORY_CAPACITY]));
+    }
+
+    #[test]
+    fn a_relearned_digest_survives_the_sweep_of_its_stale_queue_entry() {
+        let memory = ReplayRepairMemory::default();
+        let relearned = payload_digest("key", "relearned");
+        memory.remember([relearned]);
+        // Expire it and forget it on recall: its first queue entry is now stale.
+        {
+            let mut state = memory.state.lock().expect("lock");
+            state.entries.get_mut(&relearned).expect("entry").last_seen =
+                Instant::now() - MEMORY_TTL - Duration::from_secs(1);
+        }
+        assert!(!memory.recall(&relearned));
+        // Fill to one under capacity, learn it again (now the NEWEST live
+        // insertion, at capacity), then add one more: the sweep pops the
+        // stale entry first and must skip it, evicting the oldest live
+        // insertion instead of the freshly relearned digest.
+        let filler: Vec<[u8; 32]> = (0..MEMORY_CAPACITY - 1)
+            .map(|index| payload_digest("key", &format!("filler-{index}")))
+            .collect();
+        memory.remember(filler.iter().copied());
+        memory.remember([relearned]);
+        assert_eq!(memory.len(), MEMORY_CAPACITY);
+        let newest = payload_digest("key", "newest");
+        memory.remember([newest]);
+        assert_eq!(memory.len(), MEMORY_CAPACITY);
+        assert!(memory.recall(&relearned), "the stale entry evicted nothing");
+        assert!(
+            !memory.recall(&filler[0]),
+            "the oldest live insertion went instead"
+        );
+        assert!(memory.recall(&newest));
     }
 
     #[test]
