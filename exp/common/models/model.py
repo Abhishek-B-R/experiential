@@ -491,6 +491,19 @@ class ModelCapabilities(ContractModel):
     undeclared origin never gets a carrier route, and exposure still requires
     ``reasoning_output_exposed`` on top.
     """
+    system_messages_leading_only: bool = False
+    """Whether this rung's chat template accepts a system message only as the first message.
+
+    The official Qwen3.6+ ``chat_template.jinja`` raises ``System message must
+    be at the beginning.`` for any system turn that is not the first message
+    (a second leading system turn included), so a vLLM origin serving that
+    template 400s the whole request when a coding agent injects a system turn
+    mid-conversation. On a declared rung the Chat wire builder folds every
+    instruction turn past the first into user text in place; an undeclared
+    rung's messages are never rewritten. A per-rung serving-stack fact, so it
+    is an operator declaration and stays out of the frozen identity like the
+    other gateway flags.
+    """
     chat_max_tokens_field: ChatMaxTokensField | None = None
     minimum_temperature: float | None = Field(default=None, ge=0, le=2)
     maximum_temperature: float | None = Field(default=None, ge=0, le=2)
@@ -585,6 +598,7 @@ class ModelCapabilities(ContractModel):
             "sampling_requires_reasoning_none",
             "reasoning_output_exposed",
             "reasoning_content_native",
+            "system_messages_leading_only",
             "chat_max_tokens_field",
             "minimum_temperature",
             "maximum_temperature",

@@ -63,6 +63,7 @@ from exp.runtime.models.providers.generation_parameter_validation import (
 from exp.runtime.models.providers.generation_parameter_validation import (
     require_route_numeric_parameter as _require_route_numeric_parameter,
 )
+from exp.runtime.models.providers.instruction_turns import disclose_system_fold
 from exp.runtime.models.providers.messages_payloads import (
     anthropic_messages_stream_payload as anthropic_messages_stream_payload,
 )
@@ -861,6 +862,7 @@ def route_generation_parameter_requests(
     require_assistant_prefill_supported(profiles, request)
     require_tool_names_supported(profiles, request)
     disclose_anthropic_tool_schemas(profiles, request, ignored)
+    disclose_system_fold(profiles, request, ignored)
     # A mid-conversation system turn narrows out instruction-hoisting wires.
     if mid_conversation_system_present(request) and any(
         profile.dialect in {"gemini_generate_content", "bedrock_converse_stream"}

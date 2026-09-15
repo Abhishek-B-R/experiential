@@ -58,6 +58,7 @@ from exp.runtime.gateway.native_bridge_errors import capability_param as _public
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.instruction_turns import SYSTEM_FOLD_DISCLOSURE
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
@@ -6284,3 +6285,92 @@ def test_admission_carries_the_throttle_redial_schedule_and_per_rung_eligibility
     route = gated["route"]
     assert isinstance(route, list)
     assert [wire["throttle_redial_budget"] for wire in route] == [0, 3]
+
+
+def test_leading_only_rung_folds_mid_conversation_system_turns_on_chat_and_messages(
+    tmp_path: Path,
+) -> None:
+    """A vLLM rung serving the Qwen3.6+ template gets exactly one, leading, system turn.
+
+    The official template raises ``System message must be at the beginning.``
+    for any other placement; Claude Code injects a system turn after the first
+    user turn and after every tool_result. On a rung declaring
+    ``system_messages_leading_only`` the wire payload carries those as user
+    text, disclosed in ``ignored_parameters``, on the Chat surface (system at
+    index 3) and on the Messages surface (an in-list system turn after the
+    tool_result) alike.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://gateway.xplabs.ai/qwen/v1",
+        capabilities=ModelCapabilities(supports_tools=True, system_messages_leading_only=True),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "shared-secret"})
+    )
+    chat = _admit(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "coding",
+                "messages": [
+                    {"role": "system", "content": "You are Claude Code."},
+                    {"role": "user", "content": "Diagnose the regression."},
+                    {"role": "assistant", "content": "Reading the failing test first."},
+                    {"role": "system", "content": "# Environment\nPlatform: linux"},
+                    {"role": "user", "content": "Go ahead."},
+                ],
+            }
+        ),
+    )
+    chat_messages = _payload_messages(chat)
+    assert [message["role"] for message in chat_messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "user",
+    ]
+    assert chat_messages[3]["content"] == "# Environment\nPlatform: linux"
+    assert SYSTEM_FOLD_DISCLOSURE in cast(list[str], chat["ignored_parameters"])
+
+    messages = _admit(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "coding",
+                "max_tokens": 64,
+                "system": "You are Claude Code.",
+                "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+                "messages": [
+                    {"role": "user", "content": "Diagnose the regression."},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "toolu_01", "name": "Read", "input": {}}
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "toolu_01", "content": "ok"}
+                        ],
+                    },
+                    {"role": "system", "content": "<total_tokens>1</total_tokens>"},
+                ],
+            }
+        ),
+        surface="messages",
+    )
+    messages_payload = _payload_messages(messages)
+    assert [message["role"] for message in messages_payload] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "user",
+    ]
+    assert messages_payload[4]["content"] == "<total_tokens>1</total_tokens>"
+    assert SYSTEM_FOLD_DISCLOSURE in cast(list[str], messages["ignored_parameters"])

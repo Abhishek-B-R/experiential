@@ -36,7 +36,6 @@ from exp.runtime.models.providers.base import (
     ReasoningWireFormat,
 )
 from exp.runtime.models.providers.deepseek import (
-    fold_trailing_instruction_turns,
     is_deepseek_base_url,
     is_deepseek_model_id,
 )
@@ -54,6 +53,10 @@ from exp.runtime.models.providers.fireworks import (
     reasoning_content_route_sha256,
 )
 from exp.runtime.models.providers.hunyuan import is_hunyuan_base_url
+from exp.runtime.models.providers.instruction_turns import (
+    fold_instruction_turns_after_the_first,
+    fold_trailing_instruction_turns,
+)
 from exp.runtime.models.providers.reasoning_compat import (
     openai_reasoning_effort,
     require_sampling_reasoning_compatibility,
@@ -83,6 +86,7 @@ def openai_compatible_request(
     reasoning_wire_format: ReasoningWireFormat = "reasoning_effort",
     sampling_requires_reasoning_none: bool = False,
     deepseek_reasoning_history: bool = False,
+    system_messages_leading_only: bool = False,
 ) -> JsonObject:
     """Convert a EXP request into one non-streaming Chat Completions payload.
 
@@ -107,6 +111,10 @@ def openai_compatible_request(
             of the current turn; every assistant message is backfilled with an
             empty one (the typed request carries no reasoning to forward), the
             same rule the streaming builder applies in ``openai_chat_message``.
+        system_messages_leading_only: Whether this rung's chat template accepts a
+            system message only as the very first message; every other
+            instruction turn is folded into user text, the same rule as the
+            streaming builder (``fold_instruction_turns_after_the_first``).
 
     Returns:
         A JSON object for ``/chat/completions``.
@@ -118,6 +126,8 @@ def openai_compatible_request(
     if deepseek_reasoning_history or is_deepseek_model_id(model_id):
         # Same DeepSeek trailing-instruction rule as the streaming builder.
         messages = fold_trailing_instruction_turns(messages)
+    if system_messages_leading_only:
+        messages = fold_instruction_turns_after_the_first(messages)
     payload: JsonObject = {
         "model": model_id,
         "messages": [
@@ -472,6 +482,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         sampling_requires_reasoning_none: bool = False,
         reasoning_output_exposed: bool = False,
         reasoning_content_native: bool = False,
+        system_messages_leading_only: bool = False,
     ) -> None:
         """Create one compatible client with explicit model wire capabilities.
 
@@ -483,6 +494,13 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         recognition and need no declaration. The declaration decides the
         carrier route and exposure only; the ``prompt_cache_key`` node pin stays
         keyed on Tencent's hosts.
+
+        ``system_messages_leading_only`` declares that this origin's chat
+        template accepts a system message only as the very first message (the
+        official Qwen3.6+ template raises ``System message must be at the
+        beginning.`` for any other position, a second leading system turn
+        included), so every other instruction turn is folded into user text
+        before dispatch instead of 400ing the whole request.
         """
         super().__init__(
             model=model,
@@ -523,6 +541,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         # message of the current turn in thinking mode (400 otherwise); both the
         # streaming wire profile and the buffered request builder read this.
         self._deepseek_reasoning_history = is_deepseek_base_url(self._base_url)
+        self._system_messages_leading_only = system_messages_leading_only
 
     def gateway_wire_profile(self) -> GatewayWireProfile:
         """Return the Chat Completions wire profile for this connection."""
@@ -559,6 +578,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             # agent loop by default is wrong, and the stamp only governs
             # output exposure.
             deepseek_reasoning_history=self._deepseek_reasoning_history,
+            system_messages_leading_only=self._system_messages_leading_only,
             # Tencent's prefix cache is per node behind its load balancer;
             # prompt_cache_key pins a session to one node (verified live
             # 2026-09-05). The hint stays host-keyed: a rung declaring
@@ -588,6 +608,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             reasoning_wire_format=self.reasoning_wire_format,
             sampling_requires_reasoning_none=self._sampling_requires_reasoning_none,
             deepseek_reasoning_history=self._deepseek_reasoning_history,
+            system_messages_leading_only=self._system_messages_leading_only,
         )
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:

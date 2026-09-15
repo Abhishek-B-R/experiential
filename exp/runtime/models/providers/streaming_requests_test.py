@@ -46,6 +46,7 @@ from exp.runtime.models.providers.gemini_requests import gemini_generate_request
 from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
 )
+from exp.runtime.models.providers.instruction_turns import SYSTEM_FOLD_DISCLOSURE
 from exp.runtime.models.providers.streaming_requests import (
     TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
     anthropic_messages_stream_payload,
@@ -5360,3 +5361,30 @@ def test_claude_code_beta_tokens_disclose_without_dropping_the_request_on_a_fore
     } <= set(public.ignored_parameters)
     assert [tool.name for tool in provider.tools] == ["Bash"]
     assert provider.messages == request.messages
+
+
+def test_a_leading_only_rung_discloses_the_system_fold_only_when_a_turn_moves() -> None:
+    """The fold is a message rewrite the caller learns of through ignored_parameters."""
+    leading_only = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://qwen.test/v1/chat/completions",
+        model_id="qwen3.8-27b",
+        system_messages_leading_only=True,
+    )
+    plain = GatewayWireProfile(dialect="openai_compatible", url="https://other.test")
+    mid_system = _chat_request().model_copy(
+        update={
+            "messages": (
+                GatewayMessage(role="system", content="You are precise."),
+                GatewayMessage(role="user", content="hi"),
+                GatewayMessage(role="system", content="Now be terse."),
+            )
+        }
+    )
+    public_request, _routed = route_generation_parameter_requests((plain, leading_only), mid_system)
+    assert SYSTEM_FOLD_DISCLOSURE in public_request.ignored_parameters
+    undisclosed, _routed = route_generation_parameter_requests((plain,), mid_system)
+    assert SYSTEM_FOLD_DISCLOSURE not in undisclosed.ignored_parameters
+    leading_only_shape = mid_system.model_copy(update={"messages": mid_system.messages[:2]})
+    quiet, _routed = route_generation_parameter_requests((leading_only,), leading_only_shape)
+    assert SYSTEM_FOLD_DISCLOSURE not in quiet.ignored_parameters

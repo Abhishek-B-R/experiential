@@ -249,6 +249,19 @@ class GatewayWireProfile:
     Independent of ``reasoning_output_exposed``, which still decides alone
     whether the caller SEES the reasoning deltas on output."""
 
+    system_messages_leading_only: bool = False
+    """Whether this rung's chat template accepts a system message ONLY as the
+    very first message.
+
+    The official Qwen3.6+ ``chat_template.jinja`` raises ``System message must
+    be at the beginning.`` for any system turn that is not ``loop.first`` (a
+    second leading system turn included), so a vLLM origin serving it 400s
+    the whole request; coding agents put instruction turns mid-conversation
+    on every tool loop. A catalog stamp (``ModelCapabilities
+    .system_messages_leading_only``), never a hostname rule: the Chat wire
+    builder folds every instruction turn past the first into user text on a
+    declared rung and leaves every other rung's messages untouched."""
+
     token_limit_key: ChatMaxTokensField = "max_tokens"
     """Wire field carrying the output-token ceiling on Chat Completions."""
 

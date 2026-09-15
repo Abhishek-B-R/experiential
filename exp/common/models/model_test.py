@@ -120,6 +120,7 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
         "sampling_requires_reasoning_none": False,
         "reasoning_output_exposed": False,
         "reasoning_content_native": False,
+        "system_messages_leading_only": False,
         "chat_max_tokens_field": None,
         "minimum_temperature": None,
         "maximum_temperature": None,
@@ -471,5 +472,14 @@ def test_reasoning_content_native_is_a_gateway_flag_outside_the_frozen_identity(
     assert ModelCapabilities().reasoning_content_native is False
     assert (
         ModelCapabilities(reasoning_content_native=True).identity_sha256()
+        == ModelCapabilities().identity_sha256()
+    )
+
+
+def test_system_messages_leading_only_is_a_gateway_flag_outside_the_frozen_identity() -> None:
+    """The leading-only system declaration defaults off and never re-digests a catalog."""
+    assert ModelCapabilities().system_messages_leading_only is False
+    assert (
+        ModelCapabilities(system_messages_leading_only=True).identity_sha256()
         == ModelCapabilities().identity_sha256()
     )
