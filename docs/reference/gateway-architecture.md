@@ -207,7 +207,19 @@ or tool-call semantic event commits the deployment, after which the gateway neve
 providers. Typed refusal fallback is disabled unless the active alias revision explicitly enables
 it. Opted-in refusal deltas are withheld only in a bounded in-memory buffer: a refusal-only terminal
 result can advance to the next certified deployment, while mixed semantic output or buffer overflow
-commits and flushes the original route. Provider-internal retry layers are disabled so every
+commits and flushes the original route. A `stop` that bills output or reasoning tokens yet carried no
+semantic event (a reasoning-only turn on a rung whose reasoning the gateway strips) is a typed
+`provider_internal` failure, not an empty success: it redials once, then takes the ladder, and on the
+last rung the caller receives that error rather than `content: []` with `end_turn`; a zero-token stop
+that REPORTS zero tokens and a budget truncation before the first delta stay honest output-less
+answers. A `stop` with no semantic event and NO usage report at all is read by the caller's own
+output cap (the admission carries `maximum_output_tokens`): on a capped request it is a budget the
+provider's private reasoning exhausted before the first visible token, mislabelled as a plain stop
+(Meta muse-spark under a small `max_tokens`), and answers `length` / `max_tokens` / `incomplete`
+with the ledger settled `incomplete`; on an uncapped request it is the provider delivering nothing
+and takes the same ladder as the billed empty stop. The Messages surface
+applies the same rule after commitment, when every committed event was one it cannot render.
+Provider-internal retry layers are disabled so every
 possible billable dispatch is visible to the gateway ledger.
 
 A provider throttle (HTTP 429, an overload answer, or a rate-limit error declared inside the

@@ -243,6 +243,7 @@ impl Harness {
             time_to_first_byte_slope_seconds_per_million_input_tokens: 0.0,
             approximate_input_tokens: 10.0,
             output_less_retention: None,
+            output_token_cap: None,
         };
         let won = acquire_attempt(&context, &mut guard).await;
         (won, guard)

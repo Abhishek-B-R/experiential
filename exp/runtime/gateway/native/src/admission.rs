@@ -63,6 +63,14 @@ pub(crate) struct Admission {
     /// reports nothing before its final chunk; display-only, never settled.
     #[serde(default)]
     pub input_token_estimate: Option<u64>,
+    /// The caller's own output cap (`max_tokens`, `max_completion_tokens`
+    /// or `max_output_tokens`, normalized by the control plane), absent when
+    /// the request is uncapped. The waterfall reads it to classify a `stop`
+    /// that carried no output and no usage report: on a capped request that
+    /// is a budget the provider's hidden reasoning exhausted (an honest
+    /// `length`), never a completed empty answer.
+    #[serde(default)]
+    pub maximum_output_tokens: Option<u64>,
 }
 
 impl Admission {

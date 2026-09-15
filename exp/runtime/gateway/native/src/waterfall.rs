@@ -171,6 +171,14 @@ pub struct WaterfallContext<'a> {
     /// attempt's settlement so the control plane can still resolve the
     /// request's continuation context.
     pub output_less_retention: Option<String>,
+    /// The caller's output cap when the request carries one. A `stop` with
+    /// no semantic output and NO usage report on a capped request is read
+    /// as the budget exhausted before the first visible token (the provider
+    /// mislabelled a truncation; Meta's muse-spark lanes do this whenever
+    /// hidden reasoning eats `max_tokens`, 2026-09-15) and answers
+    /// `Incomplete`; the same shape on an uncapped request is the provider
+    /// delivering nothing at all and takes the ladder.
+    pub output_token_cap: Option<u64>,
 }
 
 /// The effective first-byte allowance for one attempt: the deployment's (or
@@ -819,41 +827,134 @@ async fn run_attempt(
                         opened: true,
                     };
                 }
-                // A successful terminal with no semantic output: retain the
-                // output-less continuation while the attempt is still in
-                // flight, settle, then answer with the tracked usage ahead of
-                // the terminal so the encoders keep the client-visible token
-                // accounting.
-                let retention_failure = match &ctx.output_less_retention {
-                    Some(argument) => ctx.bridge.call("remember", argument.clone()).await.err(),
-                    None => None,
-                };
-                let outcome = if matches!(event, Event::Incomplete) {
-                    "incomplete"
-                } else {
-                    "completed"
-                };
-                if !guard
-                    .settle(outcome, usage.as_ref(), &tool_names, None, true)
-                    .await
-                {
-                    return AttemptEnd::Accounting;
+                if billed_empty_completion(&event, usage.as_ref()) {
+                    // A `stop` that billed output tokens yet carried no
+                    // semantic event is the provider's fault, not an answer
+                    // (a reasoning-only turn on a rung whose reasoning the
+                    // gateway strips): it takes the ladder like any other
+                    // pre-commit failure instead of settling an empty success.
+                    return AttemptEnd::Ladder {
+                        failure: Failure::empty_completion(),
+                        refusal_eligible: false,
+                        exhaustion_flush: Vec::new(),
+                        usage,
+                        tool_names,
+                        opened: true,
+                    };
                 }
-                if let Some(error) = retention_failure {
-                    // The provider outcome settled above, exactly like a
-                    // committed attempt's retention failure; only the HTTP
-                    // result reports it.
-                    return AttemptEnd::Retention(error);
+                if unreported_empty_completion(&event, usage.as_ref()) {
+                    if ctx.output_token_cap.is_some() {
+                        // A `stop` with no output and no usage report on a
+                        // capped request: the only benign reading is a
+                        // budget the provider's hidden reasoning exhausted
+                        // before the first visible token, mislabelled as a
+                        // plain stop (Meta muse-spark under a small
+                        // `max_tokens`, 2026-09-15). Answer `Incomplete` so
+                        // the caller sees `length` and raises the cap,
+                        // instead of an empty completed answer.
+                        return settle_output_less(
+                            ctx,
+                            guard,
+                            Event::Incomplete,
+                            usage,
+                            tool_names,
+                            depth,
+                        )
+                        .await;
+                    }
+                    // Uncapped, nothing sent, nothing accounted: the provider
+                    // delivered nothing at all. Nothing was committed outward,
+                    // so the ladder is safe, exactly like the billed twin.
+                    return AttemptEnd::Ladder {
+                        failure: Failure::empty_completion(),
+                        refusal_eligible: false,
+                        exhaustion_flush: Vec::new(),
+                        usage,
+                        tool_names,
+                        opened: true,
+                    };
                 }
-                let mut events = Vec::with_capacity(2);
-                if let Some(tracked) = usage {
-                    events.push(Event::Usage(tracked));
-                }
-                events.push(event);
-                return AttemptEnd::Settled(SettledAttempt { depth, events });
+                // A successful terminal with no semantic output and nothing
+                // billed for it (a budget exhausted before the first delta,
+                // a zero-token stop): retain the output-less continuation
+                // while the attempt is still in flight, settle, then answer
+                // with the tracked usage ahead of the terminal so the
+                // encoders keep the client-visible token accounting.
+                return settle_output_less(ctx, guard, event, usage, tool_names, depth).await;
             }
         }
     }
+}
+
+/// Settle one output-less terminal (`Completed` or `Incomplete`) reached
+/// before any semantic event: retain the output-less continuation while the
+/// attempt is still in flight, settle, then answer with the tracked usage
+/// ahead of the terminal so the encoders keep the client-visible token
+/// accounting.
+async fn settle_output_less(
+    ctx: &WaterfallContext<'_>,
+    guard: &mut AttemptGuard,
+    terminal: Event,
+    usage: Option<Usage>,
+    tool_names: Vec<String>,
+    depth: usize,
+) -> AttemptEnd {
+    let retention_failure = match &ctx.output_less_retention {
+        Some(argument) => ctx.bridge.call("remember", argument.clone()).await.err(),
+        None => None,
+    };
+    let outcome = if matches!(terminal, Event::Incomplete) {
+        "incomplete"
+    } else {
+        "completed"
+    };
+    if !guard
+        .settle(outcome, usage.as_ref(), &tool_names, None, true)
+        .await
+    {
+        return AttemptEnd::Accounting;
+    }
+    if let Some(error) = retention_failure {
+        // The provider outcome settled above, exactly like a committed
+        // attempt's retention failure; only the HTTP result reports it.
+        return AttemptEnd::Retention(error);
+    }
+    let mut events = Vec::with_capacity(2);
+    if let Some(tracked) = usage {
+        events.push(Event::Usage(tracked));
+    }
+    events.push(terminal);
+    AttemptEnd::Settled(SettledAttempt { depth, events })
+}
+
+/// Whether a successful terminal with no semantic output is an unreported
+/// empty completion: the turn ended `Completed` while the provider sent no
+/// usage report at all. A zero-token stop WITH a report is the provider
+/// saying "nothing" and accounting for it; no report and no output means the
+/// gateway cannot tell an empty answer from a budget the provider's hidden
+/// reasoning exhausted (Meta muse-spark, 2026-09-15: role delta, empty delta
+/// `finish_reason: stop`, `[DONE]`, no usage frame, whenever `max_tokens` is
+/// below the model's private reasoning), so the caller must not receive a
+/// completed empty answer either way.
+pub(crate) fn unreported_empty_completion(terminal: &Event, usage: Option<&Usage>) -> bool {
+    matches!(terminal, Event::Completed) && usage.is_none()
+}
+
+/// Whether a successful terminal with no semantic output is a billed empty
+/// completion: the turn ended `Completed` (the provider's plain `stop`) while
+/// its reported usage counts at least one output or reasoning token. A budget
+/// truncation (`Incomplete`), a stop sequence, a paused turn, an unreported
+/// usage, or a zero-token stop are honest output-less endings and stay
+/// settled as they are; only a paid-for `stop` that delivered nothing fails.
+pub(crate) fn billed_empty_completion(terminal: &Event, usage: Option<&Usage>) -> bool {
+    if !matches!(terminal, Event::Completed) {
+        return false;
+    }
+    let Some(usage) = usage else {
+        return false;
+    };
+    usage.output_tokens.is_some_and(|tokens| tokens > 0)
+        || usage.reasoning_tokens.is_some_and(|tokens| tokens > 0)
 }
 
 #[cfg(test)]

@@ -217,6 +217,7 @@ pub(crate) async fn responses(
             &ResponsesRetention::default(),
             None,
         )),
+        output_token_cap: admission.maximum_output_tokens,
     };
     let won = acquire_attempt(&context, &mut guard).await;
 

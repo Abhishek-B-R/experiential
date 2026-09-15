@@ -1304,6 +1304,27 @@ def test_bridge_error_payload_is_openai_shaped() -> None:
     }
 
 
+def test_admit_stamps_the_callers_output_cap(tmp_path: Path) -> None:
+    """A capped request carries its normalized cap on the admission.
+
+    The data plane reads it to tell a budget the provider's hidden reasoning
+    exhausted (a `stop` with no output and no usage on a capped request, the
+    Meta muse-spark shape) from a provider that delivered nothing at all.
+    """
+    control, raw_key = _control_plane(tmp_path)
+    assert control.authenticate(json.dumps({"raw_key": raw_key})) == "{}"
+
+    body = json.dumps(
+        {
+            "model": "coding",
+            "max_completion_tokens": 40,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    )
+    admission = _admit_started(control, raw_key, body)
+    assert admission["maximum_output_tokens"] == 40
+
+
 def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:
     """Admission decodes the raw body, returns the shared upstream payload, and
     settlement lands in the usage report."""
@@ -1326,6 +1347,8 @@ def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:
     assert admission["route_reason"] == "direct"
     assert admission["stream"] is False
     assert admission["include_usage"] is False
+    # An uncapped request stamps no cap: the admission stays byte-identical.
+    assert "maximum_output_tokens" not in admission
 
     decoded = decode_chat(json.loads(_chat_body()))
     provider_request = decoded.request.model_copy(update={"stream": True, "include_usage": True})
