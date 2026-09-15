@@ -163,7 +163,14 @@ def _is_plain_instruction(message: GatewayMessage | ModelMessage) -> bool:
     if message.content_parts:
         return False
     if isinstance(message, GatewayMessage):
-        return message.provider_native_item is None and message.provider_anthropic_block is None
+        # Any block-structured carrier (a replayed native item, an Anthropic
+        # block, the ordered plural block set) means the text is not the
+        # whole message; only ``provider_text_blocks`` is a pure text marker.
+        return (
+            message.provider_native_item is None
+            and message.provider_anthropic_block is None
+            and message.provider_anthropic_blocks is None
+        )
     return True
 
 

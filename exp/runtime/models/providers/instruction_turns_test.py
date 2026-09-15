@@ -173,6 +173,23 @@ def test_leading_only_fold_leaves_non_text_instructions_in_place() -> None:
     assert folded[3].content == "Reminder."
 
 
+def test_leading_only_fold_leaves_an_instruction_with_ordered_anthropic_blocks_in_place() -> None:
+    """The plural block carrier is structure the text does not describe; it is never rewritten."""
+    carried = GatewayMessage(
+        role="system",
+        content="Reminder.",
+        provider_anthropic_blocks=({"type": "text", "text": "Reminder."},),
+    )
+    messages = (
+        GatewayMessage(role="system", content="You are precise."),
+        GatewayMessage(role="user", content="hi"),
+        carried,
+    )
+    folded = fold_instruction_turns_after_the_first(messages)
+    assert folded == messages
+    assert fold_trailing_instruction_turns(messages) == messages
+
+
 def test_leading_only_fold_applies_to_model_messages() -> None:
     folded = fold_instruction_turns_after_the_first(
         (
