@@ -217,7 +217,7 @@ def terminal_from_settlement(
     terminal = GatewayEvent(
         kind=kind,
         sequence_number=0,
-        usage=usage,
+        usage=_credible_usage(kind, usage),
         failure=failure if kind == GatewayEventKind.FAILED else None,
     )
     return terminal, failure
@@ -243,6 +243,38 @@ def first_token_at_from_settlement(data: JsonObject) -> datetime | None:
         return datetime.fromisoformat(raw)
     except ValueError:
         return None
+
+
+def _credible_usage(kind: GatewayEventKind, usage: GatewayUsage | None) -> GatewayUsage | None:
+    """Drop a finished attempt's all-zero token report: it is not an observation.
+
+    A provider that finished serving a request processed at least its prompt,
+    so a usage object reporting zero input AND zero output tokens on a
+    completed or incomplete terminal cannot be what the provider metered.
+    Production 2026-09-15: 2.2% of the OpenAI lane's ``max_output_tokens``
+    truncations (1,634 attempts across 192 organizations in 30 days) arrived
+    with every count zero, while the identical prompt at the identical budget
+    reported ~56k input / 64 reasoning tokens the other 98% of the time, at
+    the same latency. Filing such a report as observed settles the attempt as
+    provider-confirmed free; filing it as UNKNOWN (no usage) keeps it inside
+    the ledger's unknown-usage review counters and its nightly invariant, and
+    keeps the zero out of the cache-fraction calibration. Failed terminals are
+    left alone: their zeros already settle at nothing and a billed refusal
+    keys on positive counts. Tool names are the stream's, not the meter's, so
+    they survive the demotion.
+
+    Args:
+        kind: The normalized terminal kind of the settlement.
+        usage: The usage the data plane reported, if any.
+
+    Returns:
+        The usage the ledger should record.
+    """
+    if usage is None or kind not in {GatewayEventKind.COMPLETED, GatewayEventKind.INCOMPLETE}:
+        return usage
+    if usage.input_tokens != 0 or usage.output_tokens != 0:
+        return usage
+    return GatewayUsage(tool_names=usage.tool_names) if usage.tool_names else None
 
 
 def _usage_from_payload(

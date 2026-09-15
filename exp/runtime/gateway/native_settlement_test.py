@@ -73,6 +73,69 @@ def test_terminal_from_settlement_normalizes_usage_and_tools() -> None:
     assert terminal.usage.tool_names == ("search", "fetch")
 
 
+def test_all_zero_token_report_on_a_finished_attempt_settles_as_unknown() -> None:
+    """A finished attempt whose provider report is zero everywhere carries no usage.
+
+    The OpenAI lane's truncations intermittently report zero input and zero
+    output tokens for a prompt the provider processed; the ledger must file
+    that as unknown usage, never as an observed free attempt.
+    """
+    zero = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 0,
+    }
+    for outcome in ("completed", "incomplete"):
+        terminal, failure = terminal_from_settlement(
+            {"outcome": outcome, "usage": dict(zero), "tool_names": [], "failure": None}
+        )
+        assert failure is None
+        assert terminal.kind == GatewayEventKind(outcome)
+        assert terminal.usage is None
+
+    # The stream's tool names are not the meter's: they survive the demotion
+    # without token counts, exactly like a tool-only settlement.
+    with_tools, _ = terminal_from_settlement(
+        {"outcome": "incomplete", "usage": dict(zero), "tool_names": ["search"], "failure": None}
+    )
+    assert with_tools.usage is not None
+    assert with_tools.usage.input_tokens is None
+    assert with_tools.usage.output_tokens is None
+    assert with_tools.usage.tool_names == ("search",)
+
+
+def test_partial_zero_reports_and_failed_zero_reports_stay_observed() -> None:
+    """Only the all-zero FINISHED report is demoted; every other shape is kept verbatim."""
+    # A truncation that processed the prompt but produced nothing (OpenRouter
+    # codex lanes at a 16-token budget) is a real observation.
+    input_only, _ = terminal_from_settlement(
+        {
+            "outcome": "incomplete",
+            "usage": {"input_tokens": 13, "output_tokens": 0, "reasoning_tokens": 0},
+            "tool_names": [],
+            "failure": None,
+        }
+    )
+    assert input_only.usage is not None
+    assert input_only.usage.input_tokens == 13
+    assert input_only.usage.output_tokens == 0
+
+    # A failed terminal's zeros settle at nothing either way and a billed
+    # refusal keys on positive counts, so the report is kept as sent.
+    failed, failure = terminal_from_settlement(
+        {
+            "outcome": "failed",
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "tool_names": [],
+            "failure": {"failure_class": "provider_internal", "safe_message": "boom"},
+        }
+    )
+    assert failure is not None
+    assert failed.usage is not None
+    assert failed.usage.input_tokens == 0
+
+
 def test_terminal_from_settlement_normalizes_failure() -> None:
     """Failed payloads attach the sanitized failure to the terminal."""
     terminal, failure = terminal_from_settlement(
