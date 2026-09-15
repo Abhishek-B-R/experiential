@@ -2,7 +2,7 @@
 
 Clients express "turn thinking on" three non-canonical ways on
 /v1/chat/completions: the Responses-style nested ``reasoning:{effort}``, the
-Anthropic-style ``thinking:{type}``, and the vLLM-native
+Anthropic-style ``thinking:{type}`` (``enabled`` or ``adaptive``), and the vLLM-native
 ``chat_template_kwargs:{enable_thinking}``. Each is admitted and translated here
 to the canonical flat ``reasoning_effort`` (never dropped — dropping would leave
 thinking silently off), so one caller payload works in any shape. The
@@ -52,7 +52,9 @@ def translate_enable_thinking(request: _ChatRequest) -> _EnableThinkingResult:
     thinking_enable: bool | None = None
     thinking_present = request.thinking is not None
     if request.thinking is not None:
-        thinking_enable = request.thinking.type == "enabled"
+        # ``adaptive`` is Anthropic's 4.6+ on-mode; on this surface it carries
+        # the same intent as ``enabled`` (think at the route's default depth).
+        thinking_enable = request.thinking.type in {"enabled", "adaptive"}
 
     cck_enable = (
         request.chat_template_kwargs.enable_thinking

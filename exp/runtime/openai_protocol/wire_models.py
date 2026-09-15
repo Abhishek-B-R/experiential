@@ -442,14 +442,19 @@ class _ChatReasoning(_WireModel):
 
 
 class _ThinkingConfig(_WireModel):
-    """Anthropic-style ``thinking`` enable/disable config on a Chat request.
+    """Anthropic-style ``thinking`` config on a Chat request.
 
-    Translated to the canonical reasoning control: ``enabled`` turns thinking on
-    at the model's default effort, ``disabled`` maps to ``reasoning_effort=none``.
-    ``budget_tokens`` has no canonical equivalent and is disclosed as not carried.
+    Translated to the canonical reasoning control: ``enabled`` and ``adaptive``
+    turn thinking on at the model's default effort (``adaptive`` is the only
+    on-mode Anthropic's 4.6+ generation accepts, and the value Anthropic SDKs
+    and Claude-configured clients send on every model), ``disabled`` maps to
+    ``reasoning_effort=none``. ``budget_tokens`` has no canonical equivalent
+    and is disclosed as not carried. 3,935 Chat requests over 7 days (19
+    organizations, Claude and MiniMax routes alike) were refused at decode for
+    sending ``adaptive`` before it was admitted here (2026-09-15).
     """
 
-    type: Literal["enabled", "disabled"]
+    type: Literal["enabled", "disabled", "adaptive"]
     budget_tokens: int | None = Field(default=None, ge=0)
 
 

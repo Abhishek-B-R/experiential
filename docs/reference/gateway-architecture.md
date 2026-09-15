@@ -633,6 +633,20 @@ reasoning model such as GPT-6 Astra) is dropped and disclosed (`temperature->dro
 so the model still answers with its own default; the 400 remains only for a value outside a
 supporting route's declared range, which is a genuine caller error.
 
+**An Anthropic-shaped `thinking` object on the Chat wire is a reasoning control, `adaptive`
+included.** Clients configured for Claude send `thinking: {type: "adaptive"}` (the 4.6+
+generation's only on-mode) to `/v1/chat/completions` on every model; the decoder reads `adaptive`
+and `enabled` alike as "think at the route's default depth" (`thinking->translated(reasoning_effort)`:
+the LANE default, the first rung in route order pinning a catalog `reasoning_default_effort` every
+rung can serve, as on the Messages surface; a route pinning none takes its one required default or
+the lowest portable tier), `disabled` as
+`reasoning_effort: none`, and a `budget_tokens` beside either as not carried. An Anthropic rung
+then receives the adaptive object plus `output_config.effort`; every other reasoning rung receives
+its own effort field; a route with no reasoning effort at all still refuses by name. A `type`
+outside the three members is refused naming the members, never the arriving JSON type (3,935
+Chat requests over 7 days died at decode as "expected one of 'enabled' or 'disabled', but got a
+string instead", 2026-09-15).
+
 **`parallel_tool_calls` is honoured on every route.** A rung whose wire carries the control forwards it.
 On a rung without it (Gemini, Bedrock, an OpenAI-compatible server that ignores the field), `true` is
 dropped as the provider's own default (`parallel_tool_calls->dropped(provider_default)`) and `false` is

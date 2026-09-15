@@ -591,6 +591,7 @@ def _shape_message(param: str, details: list[ErrorDetails]) -> str | None:
     """
     expected: list[str] = []
     got: str | None = None
+    member_error = False
     for detail in details:
         if detail["type"] == "string_too_long":
             # The bound and the arriving LENGTH are both display-safe facts
@@ -606,6 +607,10 @@ def _shape_message(param: str, details: list[ErrorDetails]) -> str | None:
                 )
         phrase = _EXPECTED_BY_ERROR_TYPE.get(detail["type"])
         if detail["type"] in {"literal_error", "enum"}:
+            # The value arrived as the right JSON type but is not a member of
+            # the closed set, so naming the arriving type ("got a string
+            # instead") would misdescribe the fault: the members are the fact.
+            member_error = True
             context = detail.get("ctx") or {}
             allowed = context.get("expected")
             if isinstance(allowed, str):
@@ -619,7 +624,7 @@ def _shape_message(param: str, details: list[ErrorDetails]) -> str | None:
     if not expected:
         return None
     description = " or ".join(expected)
-    if got is not None:
+    if got is not None and not member_error:
         return f"Invalid value for '{param}': expected {description}, but got {got} instead."
     return f"Invalid value for '{param}': expected {description}."
 

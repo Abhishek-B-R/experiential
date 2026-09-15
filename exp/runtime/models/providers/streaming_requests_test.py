@@ -57,6 +57,7 @@ from exp.runtime.models.providers.streaming_requests import (
     route_generation_parameter_requests,
 )
 from exp.runtime.openai_protocol.model_adapter import model_request
+from exp.runtime.openai_protocol.requests import decode_chat
 
 _PNG_BASE64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
@@ -1510,6 +1511,56 @@ def test_thinking_default_enable_resolves_the_required_default_effort() -> None:
     assert provider.reasoning_effort == "medium"
 
 
+def test_thinking_default_enable_reads_the_lane_default_before_the_lowest_tier() -> None:
+    """A catalog default the lane pins without REQUIRING it on the wire still
+    names the think-mode depth (production Claude lanes carry
+    ``reasoning_default_effort`` with ``reasoning_effort_required: false``);
+    the lowest portable tier is only the fallback for a route with no default."""
+    profile = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test",
+        model_id="claude-opus-5",
+        supports_reasoning=True,
+        reasoning_wire_format="anthropic_adaptive",
+        reasoning_effort="high",
+        supported_reasoning_efforts=("low", "medium", "high", "xhigh", "max"),
+    )
+    request = _chat_request().model_copy(update={"thinking_default_enable": True})
+
+    _public, provider = route_generation_parameter_requests((profile,), request)
+
+    assert provider.reasoning_effort == "high"
+
+
+def test_thinking_default_enable_skips_a_lane_default_a_fallback_cannot_serve() -> None:
+    """A lead default outside a fallback's ladder is not portable, so the route
+    falls back to the shared rule instead of dispatching an effort one rung rejects."""
+    profiles = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://lead.test",
+            model_id="provider/reasoner",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+            reasoning_effort="xhigh",
+            supported_reasoning_efforts=("low", "medium", "high", "xhigh"),
+        ),
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://fallback.test",
+            model_id="provider/reasoner",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+            supported_reasoning_efforts=("low", "medium", "high"),
+        ),
+    )
+    request = _chat_request().model_copy(update={"thinking_default_enable": True})
+
+    _public, provider = route_generation_parameter_requests(profiles, request)
+
+    assert provider.reasoning_effort == "low"
+
+
 def test_thinking_default_enable_falls_back_to_the_lowest_non_none_effort() -> None:
     """When the model requires no default, a level-less enable picks the lowest tier."""
     profile = GatewayWireProfile(
@@ -1525,6 +1576,103 @@ def test_thinking_default_enable_falls_back_to_the_lowest_non_none_effort() -> N
     _public, provider = route_generation_parameter_requests((profile,), request)
 
     assert provider.reasoning_effort == "low"
+
+
+def test_chat_adaptive_thinking_dispatches_natively_on_a_mixed_claude_route() -> None:
+    """``thinking: {type: adaptive}`` on the Chat wire reaches an Anthropic rung
+    as the adaptive object plus the lane's default effort, and the OpenRouter
+    fallback of the same production-shaped pool as a plain reasoning effort.
+
+    Every one of the 3,935 refusals over 7 days (2026-09-15) died at decode, so
+    the whole path from the caller's shape to the provider payload is pinned.
+    """
+    decoded = decode_chat(
+        cast(
+            JsonObject,
+            {
+                "model": "claude-opus-5",
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "adaptive"},
+            },
+        )
+    ).request
+    assert decoded.thinking_default_enable is True
+    profiles = (
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://anthropic.test",
+            model_id="claude-opus-5",
+            supports_reasoning=True,
+            reasoning_wire_format="anthropic_adaptive",
+            reasoning_effort="medium",
+            reasoning_effort_required=True,
+            supported_reasoning_efforts=("low", "medium", "high", "xhigh", "max"),
+        ),
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://openrouter.test",
+            model_id="anthropic/claude-opus-5",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+            reasoning_effort="high",
+            reasoning_effort_required=True,
+            supported_reasoning_efforts=("low", "medium", "high", "xhigh", "max"),
+        ),
+    )
+
+    public, provider = route_generation_parameter_requests(profiles, decoded)
+
+    # The LANE default names the depth (the anthropic lead's catalog
+    # ``reasoning_default_effort``), exactly as the Messages surface resolves a
+    # budget-less config; never a collapse to the lowest portable tier.
+    assert provider.reasoning_effort == "medium"
+    assert "thinking->translated(reasoning_effort)" in public.ignored_parameters
+    anthropic_payload = anthropic_messages_stream_payload(
+        "claude-opus-5",
+        provider,
+        supports_temperature=True,
+        supports_reasoning=True,
+        reasoning_effort="medium",
+    )
+    assert anthropic_payload["thinking"] == {"type": "adaptive"}
+    assert anthropic_payload["output_config"] == {"effort": "medium"}
+    openrouter_payload = openai_compatible_stream_payload(
+        "anthropic/claude-opus-5",
+        provider,
+        supports_temperature=True,
+        supports_reasoning=True,
+        reasoning_effort="high",
+    )
+    assert "thinking" not in openrouter_payload
+
+
+def test_chat_adaptive_thinking_maps_to_effort_on_a_non_anthropic_reasoner() -> None:
+    """A MiniMax-style effort route reads Anthropic's adaptive object as
+    "think at the lane default" rather than refusing the value by name."""
+    decoded = decode_chat(
+        cast(
+            JsonObject,
+            {
+                "model": "minimax-m3-free",
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "adaptive"},
+            },
+        )
+    ).request
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://openrouter.test",
+        model_id="minimax/minimax-m3:free",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        reasoning_effort="medium",
+        reasoning_effort_required=True,
+        supported_reasoning_efforts=("low", "medium", "high"),
+    )
+
+    _public, provider = route_generation_parameter_requests((profile,), decoded)
+
+    assert provider.reasoning_effort == "medium"
 
 
 def test_thinking_default_enable_on_a_non_reasoning_route_surfaces() -> None:
