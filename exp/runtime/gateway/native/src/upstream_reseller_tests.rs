@@ -136,3 +136,53 @@ async fn a_resellers_flat_model_not_found_400_takes_the_lane_policy() {
     assert_eq!(failure.failure_class, FailureClass::ProviderNotFound);
     assert!(failure.failover_eligible);
 }
+
+#[tokio::test]
+async fn a_429_whose_body_stalls_never_outlives_the_header_phase_budget() {
+    // The throttle-body read is bounded twice over: its own 250 ms budget and
+    // what is left of the rung's header-phase window, which the waterfall
+    // already sizes to the caller's remaining deadline (`open_bound`). A
+    // provider that answers 429 and then never sends its body must fail over
+    // as a content-free throttle within that window, never after the stall.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut buffer = [0u8; 8192];
+        let _ = socket.read(&mut buffer).await;
+        // Headers promise a body that never comes.
+        socket
+            .write_all(
+                b"HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\n\
+                  content-length: 200\r\n\r\n",
+            )
+            .await
+            .expect("write");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    let client = build_client(Duration::from_secs(2)).expect("client");
+    let started = Instant::now();
+    let failure = open_stream(
+        &client,
+        &format!("http://{addr}/v1/chat/completions"),
+        &HashMap::new(),
+        "idem-429-stall",
+        &serde_json::json!({"model": "m", "messages": []}),
+        None,
+        Duration::from_millis(100),
+        Dialect::OpenAiCompatible,
+    )
+    .await
+    .expect_err("a 429 is a failure");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "the stalled body must not be waited out: {elapsed:?}"
+    );
+    assert_eq!(failure.failure_class, FailureClass::Throttled);
+    assert!(failure.failover_eligible);
+    assert_eq!(failure.provider_detail.as_deref(), Some("http 429"));
+}
