@@ -10,7 +10,7 @@
 use serde_json::Value;
 
 use crate::dialects::Dialect;
-use crate::error_envelope::parse_error_document;
+use crate::error_envelope::{openai_family_envelope, parse_error_document};
 use crate::param_attribution::{error_message_field, rejected_model_not_found};
 use crate::stream_errors::is_refusal_code;
 
@@ -75,47 +75,60 @@ pub fn rejected_by_routing_gate(dialect: Dialect, body: &str) -> bool {
 /// `encrypted_content`.
 const INVALID_ENCRYPTED_CONTENT_CODE: &str = "invalid_encrypted_content";
 
+/// The fixed head and verdict of OpenAI's sentence for that refusal ("The
+/// encrypted content <blob> could not be verified. Reason: ..."). The reason
+/// tail varies and a relay may append its own trace id, so only these two
+/// fragments are matched.
+const ENCRYPTED_CONTENT_SENTENCE_HEAD: &str = "The encrypted content ";
+const ENCRYPTED_CONTENT_SENTENCE_VERDICT: &str = " could not be verified";
+
 /// Whether a 4xx body is the native Responses wire refusing replayed encrypted
-/// reasoning. OpenAI answers `code: invalid_encrypted_content` ("The encrypted
-/// content ... could not be verified") when a reasoning item's
-/// `encrypted_content` was sealed by another organization or tenant, or is not
-/// a payload it issued at all. Only the documented code decides: the reason
-/// sentence varies ("organization_id did not match the target organization",
-/// "could not be decrypted or parsed") and is never matched. Other dialects
-/// have no such item and keep the plain client-error verdict.
+/// reasoning: a reasoning item's `encrypted_content` was sealed by another
+/// organization or tenant, or is not a payload the provider issued at all.
+///
+/// The body is read through the shared OpenAI-family envelope reader, so
+/// every spelling the Responses-wire lanes answer decides the same way:
+/// OpenAI and Azure carry `code: invalid_encrypted_content`; Novita's relay
+/// re-envelopes the refusal flat with the generic `type` and its own trace
+/// id, keeping only OpenAI's sentence, so the sentence's fixed head and
+/// verdict decide too; OpenRouter's relay wraps OpenAI's own document under
+/// `error.metadata.raw`, which is read recursively. Other dialects have no
+/// such item and keep the plain client-error verdict.
 pub fn rejected_encrypted_reasoning(dialect: Dialect, body: &str) -> bool {
     if dialect != Dialect::OpenAiResponses {
         return false;
     }
-    let value: Value = match serde_json::from_str(body) {
-        Ok(value) => value,
-        Err(_) => return false,
-    };
-    let Some(error) = value.get("error") else {
-        return false;
-    };
-    // OpenAI and Azure answer the code at the top level. An aggregator's
-    // Responses relay (OpenRouter) re-envelopes the upstream body under a
-    // numeric status and carries OpenAI's own document in `metadata.raw`
-    // (a JSON string or an object); the verdict is read there too.
-    error_code_is(error, INVALID_ENCRYPTED_CONTENT_CODE)
-        || relayed_upstream_document(error).is_some_and(|upstream| {
-            upstream
-                .get("error")
-                .is_some_and(|inner| error_code_is(inner, INVALID_ENCRYPTED_CONTENT_CODE))
-        })
+    parse_error_document(body).is_some_and(|document| encrypted_reasoning_verdict(&document))
 }
 
-/// Whether one error object's `code` is exactly this string.
-fn error_code_is(error: &Value, code: &str) -> bool {
-    error.get("code").and_then(Value::as_str) == Some(code)
+/// The verdict on one parsed error document, following an aggregator's
+/// relayed upstream document one level down.
+fn encrypted_reasoning_verdict(document: &Value) -> bool {
+    let Some(envelope) = openai_family_envelope(document) else {
+        return false;
+    };
+    envelope.code.as_deref() == Some(INVALID_ENCRYPTED_CONTENT_CODE)
+        || envelope
+            .message
+            .is_some_and(names_refused_encrypted_content)
+        || envelope
+            .error_object
+            .and_then(relayed_upstream_document)
+            .is_some_and(|upstream| encrypted_reasoning_verdict(&upstream))
+}
+
+/// Whether one provider sentence is OpenAI's refusal of an encrypted payload.
+fn names_refused_encrypted_content(message: &str) -> bool {
+    let sentence = message.trim_start();
+    sentence.starts_with(ENCRYPTED_CONTENT_SENTENCE_HEAD)
+        && sentence.contains(ENCRYPTED_CONTENT_SENTENCE_VERDICT)
 }
 
 /// The upstream error DOCUMENT an aggregator carried in `metadata.raw`, when
 /// that field holds JSON as a string or as an object.
 fn relayed_upstream_document(error: &Value) -> Option<Value> {
     match error.get("metadata")?.get("raw")? {
-        Value::String(text) => serde_json::from_str::<Value>(text).ok(),
+        Value::String(text) => parse_error_document(text),
         raw @ Value::Object(_) => Some(raw.clone()),
         _ => None,
     }
@@ -445,16 +458,22 @@ mod tests {
             Dialect::OpenAiResponses,
             unparseable
         ));
-        // The sentence alone, under another code, is not the verdict.
-        let other_code = r#"{"error":{"message":"The encrypted content rs_1 could not be verified.","type":"invalid_request_error","code":"invalid_value"}}"#;
-        assert!(!rejected_encrypted_reasoning(
-            Dialect::OpenAiResponses,
-            other_code
-        ));
+        // OpenAI's sentence decides even when a relay dropped the code, and
+        // another sentence under another code does not.
         let no_code = r#"{"error":{"message":"The encrypted content rs_1 could not be verified.","type":"invalid_request_error","code":null}}"#;
-        assert!(!rejected_encrypted_reasoning(
+        assert!(rejected_encrypted_reasoning(
             Dialect::OpenAiResponses,
             no_code
+        ));
+        let other_sentence = r#"{"error":{"message":"Invalid value for 'input[1].id': expected a value.","type":"invalid_request_error","code":"invalid_value"}}"#;
+        assert!(!rejected_encrypted_reasoning(
+            Dialect::OpenAiResponses,
+            other_sentence
+        ));
+        let bare_message = r#"{"message":"The encrypted content rs_1 could not be verified."}"#;
+        assert!(!rejected_encrypted_reasoning(
+            Dialect::OpenAiResponses,
+            bare_message
         ));
         // Only the Responses wire carries reasoning items.
         assert!(!rejected_encrypted_reasoning(
@@ -485,6 +504,19 @@ mod tests {
         assert!(rejected_encrypted_reasoning(
             Dialect::OpenAiResponses,
             object_raw
+        ));
+        // Novita's Responses relay re-envelopes the refusal flat: the generic
+        // `type` as its only token, `code: 0`, and OpenAI's sentence with the
+        // relay's trace id appended (live, gpt-5.6-luna, 2026-09-15 16:49Z).
+        let novita = r#"{"code":0,"message":"The encrypted content gAAA...WA== could not be verified. Reason: Encrypted content could not be decrypted or parsed. trace_id: 9f3c2b7a1d4e","type":"invalid_request_error"}"#;
+        assert!(rejected_encrypted_reasoning(
+            Dialect::OpenAiResponses,
+            novita
+        ));
+        let novita_other = r#"{"code":0,"message":"Function tools with reasoning_effort are not supported. trace_id: 9f3c","type":"invalid_request_error"}"#;
+        assert!(!rejected_encrypted_reasoning(
+            Dialect::OpenAiResponses,
+            novita_other
         ));
         // Azure OpenAI's v1 Responses endpoint answers OpenAI's shape verbatim.
         let azure = r#"{"error":{"message":"The encrypted content gAAA...ke== could not be verified. Reason: Encrypted content could not be decrypted or parsed.","type":"invalid_request_error","param":null,"code":"invalid_encrypted_content"}}"#;
