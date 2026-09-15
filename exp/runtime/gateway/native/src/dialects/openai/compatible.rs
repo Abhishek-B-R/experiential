@@ -60,6 +60,43 @@ fn synthesized_call_id(index: u32) -> String {
     format!("call_gw{index}_{nanos:x}_{process:x}_{serial:x}")
 }
 
+/// At most this many key names, each cut to this many characters, describe
+/// an unrecognized frame shape in the malformed reason.
+const FRAME_KEY_NAMES_LIMIT: usize = 8;
+const FRAME_KEY_NAME_CHARS: usize = 32;
+
+/// The sorted, bounded key names of one frame: its SHAPE for the ledger, with
+/// no value ever read. A key is provider-supplied text, so only an
+/// identifier-shaped one (ASCII alphanumerics, `_`, `.`, `-`) is named; any
+/// other key (a newline, an ANSI escape, a delimiter) reads as
+/// `non-identifier` so the reason stays one clean line.
+fn frame_key_names(payload: &serde_json::Map<String, Value>) -> String {
+    let mut keys: Vec<String> = payload
+        .keys()
+        .map(|key| {
+            let identifier = !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+            if identifier {
+                key.chars().take(FRAME_KEY_NAME_CHARS).collect()
+            } else {
+                "non-identifier".to_string()
+            }
+        })
+        .collect();
+    keys.sort();
+    let shown = keys.len().min(FRAME_KEY_NAMES_LIMIT);
+    let mut line = keys[..shown].join(", ");
+    if keys.len() > shown {
+        line.push_str(", …");
+    }
+    if line.is_empty() {
+        line.push_str("none");
+    }
+    line
+}
+
 impl Normalizer {
     pub(in crate::dialects) fn feed_openai_compatible(
         &mut self,
@@ -122,11 +159,18 @@ impl Normalizer {
         // relay's trailing usage-only chunk (Novita, 19 attempts in two days,
         // 2026-09-14..15): its usage was taken above and nothing else is
         // decoded from it. A choices-less frame carrying anything else, and
-        // an explicitly non-array `choices`, stay malformed.
+        // an explicitly non-array `choices`, stay malformed, and the reason
+        // names the frame's KEY NAMES (never values) so the next unknown
+        // shape a provider sends is diagnosable from the ledger.
         let choices = match payload.get("choices") {
             None | Some(Value::Null) if is_metadata_only_frame(&payload) => return Ok(events),
             Some(Value::Array(choices)) => choices,
-            _ => return Err(malformed("OpenAI-compatible choices must be an array")),
+            _ => {
+                return Err(malformed(&format!(
+                    "OpenAI-compatible choices must be an array (frame keys: {})",
+                    frame_key_names(&payload)
+                )))
+            }
         };
         if choices.is_empty() {
             return Ok(events);

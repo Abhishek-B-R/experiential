@@ -248,6 +248,23 @@ mod tests {
     use crate::param_attribution::rejected_detail;
 
     #[test]
+    fn a_resellers_flat_lane_limitation_sentence_is_read_on_the_compatible_dialect() {
+        // Novita's envelope has no `error` object; the sentence still decides.
+        let flat = r#"{"code":400,"reason":"INVALID_REQUEST_BODY","message":"System message must be at the beginning.","metadata":{}}"#;
+        assert!(rejected_by_lane_limitation(Dialect::OpenAiCompatible, flat));
+        assert!(!rejected_by_lane_limitation(
+            Dialect::AnthropicMessages,
+            flat
+        ));
+        let other =
+            r#"{"code":400,"reason":"INVALID_REQUEST_BODY","message":"max_tokens too large"}"#;
+        assert!(!rejected_by_lane_limitation(
+            Dialect::OpenAiCompatible,
+            other
+        ));
+    }
+
+    #[test]
     fn an_aggregators_generic_sentence_yields_to_the_upstream_message() {
         let body = r#"{"error":{"message":"Provider returned error","code":400,
             "metadata":{"raw":"{\"error\":{\"message\":\"Input exceeds the maximum context window.\",\"type\":\"invalid_request_error\"}}",

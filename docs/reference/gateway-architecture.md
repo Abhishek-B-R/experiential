@@ -693,6 +693,19 @@ dropped by the identifier screen, the provider's documented code or type token (
 `INVALID_ARGUMENT`) is relayed instead of nothing, and a content-filter code under a 4xx (Azure,
 Gemini) is filed and answered as a `refusal` rather than a request-shape error.
 
+**A reseller's reason token classifies the failure, and a 429 body is read for its token.** On the
+OpenAI-compatible dialect Novita's flat envelope (`{code, reason, message, metadata}`, read by the
+shared envelope reader) also decides the class by its `reason`: `INVALID_REQUEST_BODY` is a generic
+token (classified, never relayed alone), `MODEL_NOT_FOUND` under any 4xx takes the lane policy,
+`NOT_ENOUGH_BALANCE` under a 403 is `provider_quota` (the class the house exhaustion sweep reads, not a
+credential verdict), `RATE_LIMIT_EXCEEDED` / `TOKEN_LIMIT_EXCEEDED` throttle, and `FAILED_TO_AUTH` /
+`ACCESS_DENY` authenticate, pre-stream and inside a stream frame alike. A 429 body is now read too,
+under a 250 ms budget so throttle failover stays near-immediate: OpenAI's `insufficient_quota` under a
+429 is `provider_quota`, and any other non-generic token rides into the ledger as `http 429: <token>`
+(Novita's 429s carry rate-limit headers showing the account's quota untouched, so only the token says
+which window closed); the public throttle error is unchanged. A frame with a non-array `choices` stays
+malformed and its reason names the frame's sorted key names (never a value).
+
 **Sampling controls a route cannot carry are dropped with disclosure, not refused.** A
 `temperature` or `top_p` sent to a route where some rung's provider rejects the field outright (a
 reasoning model such as GPT-6 Astra) is dropped and disclosed (`temperature->dropped(unsupported_by_provider)`)

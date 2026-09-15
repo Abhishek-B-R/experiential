@@ -188,7 +188,9 @@ pub async fn open_stream(
         // path plus the provider's own bounded explanation of what the caller
         // got wrong; every other class stays content-free. A 403 is read too,
         // only to tell an aggregator routing gate from a credential verdict,
-        // and a 404 to tell a caller's dangling reference from a missing model.
+        // a 404 to tell a caller's dangling reference from a missing model,
+        // and a 429 to tell an exhausted ACCOUNT from a throttle and to file
+        // the provider's code token (never its sentence) in the ledger.
         // Every status-only classification carries the status itself as its
         // ledger detail (`http 503`): the class alone could not tell a 502
         // relay from a 500 model fault, and none of these classes relays
@@ -198,19 +200,59 @@ pub async fn open_stream(
         } else {
             failure.with_provider_detail(Some(status_detail(status)))
         };
-        if failure.failure_class != FailureClass::InvalidRequest && status != 403 && status != 404 {
+        if failure.failure_class != FailureClass::InvalidRequest
+            && status != 403
+            && status != 404
+            && status != 429
+        {
             return Err(failure);
         }
         // The attribution read never outlives the rung's own header-phase
         // budget: a provider that answers its status and then stalls the body
         // costs at most what was left of that window, never a further two
-        // seconds past the caller's deadline.
-        let body_budget =
-            ERROR_BODY_READ_TIMEOUT.min(phase_timeout.saturating_sub(phase_started.elapsed()));
+        // seconds past the caller's deadline. A throttle is the hot path
+        // under load and its failover must stay near-immediate, so its read
+        // gets only the short budget: the small envelope normally arrives
+        // with the headers, and a provider that stalls after a 429 simply
+        // fails over content-free as before.
+        let read_timeout = if status == 429 {
+            THROTTLE_BODY_READ_TIMEOUT
+        } else {
+            ERROR_BODY_READ_TIMEOUT
+        };
+        let body_budget = read_timeout.min(phase_timeout.saturating_sub(phase_started.elapsed()));
         let body = match tokio::time::timeout(body_budget, bounded_error_body(response)).await {
             Ok(Some(body)) => Some(body),
             _ => None,
         };
+        if status == 429 {
+            // OpenAI answers an out-of-quota account with 429
+            // `insufficient_quota`, the same status as a throttle. A status-
+            // only read filed both as `throttled`, so the house exhaustion
+            // sweep (which reads `provider_quota`) never saw the account die.
+            // Any other code token rides the failure into the ledger only
+            // (a throttle's public error never relays detail): Novita's
+            // `RATE_LIMIT_EXCEEDED` versus `TOKEN_LIMIT_EXCEEDED` names which
+            // window closed, which its headers do not (2026-09-14: 205
+            // Novita 429s with 992-999 of 1000 requests remaining and no
+            // Retry-After).
+            let code = body
+                .as_deref()
+                .and_then(|body| rejected_code(dialect, body));
+            let detail = code
+                .as_deref()
+                .filter(|token| !generic_error_code(token))
+                .map(|token| format!("{}: {token}", status_detail(status)));
+            if crate::stream_errors::is_quota_code(code.as_deref()) {
+                return Err(transport_failure(Some(402))
+                    .with_provider_detail(detail)
+                    .with_rate_limit_facts(rate_limit.clone(), retry_after));
+            }
+            return Err(match detail {
+                Some(detail) => failure.with_provider_detail(Some(detail)),
+                None => failure,
+            });
+        }
         if status == 404 {
             // OpenAI answers 404 for an `item_reference`, `conversation`, or
             // similar handle the caller sent but the provider does not hold
@@ -256,6 +298,21 @@ pub async fn open_stream(
                 )
                 .with_retry(false, true)
                 .with_rate_limit_facts(rate_limit.clone(), retry_after));
+            }
+            // A reseller's balance verdict under a 403 (Novita answers an
+            // unfunded account `403 NOT_ENOUGH_BALANCE`) is the ACCOUNT's
+            // funding state, not a credential one: it takes the quota class
+            // the house exhaustion sweep and pool rotation read, with the
+            // status and token as its ledger detail like every other
+            // operator-facing class.
+            let code = body
+                .as_deref()
+                .and_then(|body| rejected_code(dialect, body));
+            if crate::stream_errors::is_quota_code(code.as_deref()) {
+                let token = code.unwrap_or_default();
+                return Err(transport_failure(Some(402))
+                    .with_provider_detail(Some(format!("{}: {token}", status_detail(status))))
+                    .with_rate_limit_facts(rate_limit.clone(), retry_after));
             }
             return Err(failure);
         }
@@ -407,6 +464,11 @@ const ERROR_BODY_READ_LIMIT: usize = 16 * 1024;
 /// abandoned and the failure stays content-free.
 const ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Bound on a 429 body read: only the code token is wanted, the envelope
+/// normally rides in the same segment as the headers, and a throttle's
+/// failover must not wait on a provider that dribbles its error body.
+const THROTTLE_BODY_READ_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// Read at most `ERROR_BODY_READ_LIMIT` bytes of one error response body.
 async fn bounded_error_body(mut response: reqwest::Response) -> Option<String> {
     let mut collected: Vec<u8> = Vec::new();
@@ -512,7 +574,11 @@ mod tests {
         );
     }
 
-    async fn open_against_body(status_line: &str, body: &'static str, model: &str) -> Failure {
+    pub(super) async fn open_against_body(
+        status_line: &str,
+        body: &'static str,
+        model: &str,
+    ) -> Failure {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -905,3 +971,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "upstream_reseller_tests.rs"]
+mod reseller_tests;
