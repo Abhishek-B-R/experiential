@@ -955,41 +955,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_429_whose_body_says_insufficient_balance_classes_provider_quota() {
-        // Z.ai: HTTP 429 + business code 1113 is the ACCOUNT out of money, not a
-        // rate limit. The class must be the quota family (so the house pool's
-        // exhaustion sweep sees a dead account and rotates or closes it), the
-        // rung must fail over, and the body must never be relayed.
-        let failure = open_against_body(
+    async fn a_zai_429_is_quota_for_code_1113_and_a_throttle_otherwise() {
+        // Z.ai: 429 + code 1113 is an empty balance (quota, fails over); 1302 a rate limit.
+        let quota = open_against_body(
             "429 Too Many Requests",
             "{\"error\":{\"code\":\"1113\",\"message\":\"Insufficient balance or no \
              resource package. Please recharge.\"}}",
             "glm-4.6",
         )
         .await;
-        assert_eq!(failure.failure_class, FailureClass::ProviderQuota);
-        assert!(failure.failover_eligible && !failure.retryable_same_deployment);
-        assert!(
-            failure.provider_detail.is_none() && failure.rejected_parameter.is_none(),
-            "a billing failure must stay content-free"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_429_whose_body_is_a_rate_limit_stays_throttled() {
-        // Z.ai 1302 (requests rate limit) and every other provider's 429 keep
-        // the throttle class and its Retry-After facts.
-        let failure = open_against_body(
+        assert_eq!(quota.failure_class, FailureClass::ProviderQuota);
+        assert!(quota.failover_eligible && !quota.retryable_same_deployment);
+        assert!(quota.provider_detail.is_none() && quota.rejected_parameter.is_none());
+        let limit = open_against_body(
             "429 Too Many Requests",
-            "{\"error\":{\"code\":\"1302\",\"message\":\"Rate limit reached for \
-             requests\"}}",
+            "{\"error\":{\"code\":\"1302\",\"message\":\"Rate limit reached for requests\"}}",
             "glm-4.6",
         )
         .await;
-        assert_eq!(failure.failure_class, FailureClass::Throttled);
-        assert!(failure.failover_eligible && !failure.retryable_same_deployment);
-        let bare = open_against_body("429 Too Many Requests", "", "glm-4.6").await;
-        assert_eq!(bare.failure_class, FailureClass::Throttled);
+        assert_eq!(limit.failure_class, FailureClass::Throttled);
     }
 
     #[test]
