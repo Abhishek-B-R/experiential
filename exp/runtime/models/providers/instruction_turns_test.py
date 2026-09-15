@@ -7,6 +7,7 @@ from exp.common.models.model import ModelMessage
 from exp.runtime.gateway.contracts import GatewayMessage
 from exp.runtime.models.providers.instruction_turns import (
     fold_instruction_turns_after_the_first,
+    fold_instruction_turns_after_the_leading_run,
     fold_trailing_instruction_turns,
 )
 
@@ -201,3 +202,45 @@ def test_leading_only_fold_applies_to_model_messages() -> None:
     )
     assert [message.role for message in folded] == ["system", "user", "user"]
     assert folded[1].content == "hi\n\nReminder."
+
+
+def test_leading_run_fold_keeps_the_whole_leading_run_and_folds_the_rest() -> None:
+    """Hoisting wires keep each leading instruction as its own part; later ones become user text."""
+    leading_a = GatewayMessage(role="system", content="You are precise.")
+    leading_b = GatewayMessage(role="developer", content="Answer in French.")
+    folded = fold_instruction_turns_after_the_leading_run(
+        (
+            leading_a,
+            leading_b,
+            GatewayMessage(role="user", content="hi"),
+            GatewayMessage(role="system", content="Now be terse."),
+            GatewayMessage(role="assistant", content="ok"),
+            GatewayMessage(role="tool", content="done", tool_call_id="call-1"),
+            GatewayMessage(role="system", content="<total_tokens>1</total_tokens>"),
+        )
+    )
+    assert folded[0] == leading_a
+    assert folded[1] == leading_b
+    assert [message.role for message in folded] == [
+        "system",
+        "developer",
+        "user",
+        "assistant",
+        "tool",
+        "user",
+    ]
+    assert folded[2].content == "hi\n\nNow be terse."
+    assert folded[5].content == "<total_tokens>1</total_tokens>"
+
+
+def test_leading_run_fold_returns_the_input_when_only_leading_instructions_exist() -> None:
+    messages = (
+        GatewayMessage(role="system", content="a"),
+        GatewayMessage(role="system", content="b"),
+        GatewayMessage(role="user", content="hi"),
+    )
+    assert fold_instruction_turns_after_the_leading_run(messages) is messages
+    # The first-only fold merges the same run into one turn.
+    merged = fold_instruction_turns_after_the_first(messages)
+    assert [message.role for message in merged] == ["system", "user"]
+    assert merged[0].content == "a\n\nb"

@@ -46,7 +46,10 @@ from exp.runtime.models.providers.gemini_requests import gemini_generate_request
 from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
 )
-from exp.runtime.models.providers.instruction_turns import SYSTEM_FOLD_DISCLOSURE
+from exp.runtime.models.providers.instruction_turns import (
+    HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE,
+    SYSTEM_FOLD_DISCLOSURE,
+)
 from exp.runtime.models.providers.streaming_requests import (
     TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
     anthropic_messages_stream_payload,
@@ -3081,7 +3084,8 @@ def test_mid_conversation_system_stays_positional_on_capable_wires() -> None:
     on the Anthropic wire (a `system` role inside `messages` is refused there
     unless it directly precedes an assistant turn or ends the array, and
     haiku-4-5 refuses it outright; live 2026-09-07), verbatim on the OpenAI
-    wires, and it narrows out instruction-hoisting rungs."""
+    wires, and on the instruction-hoisting rungs (Gemini, Bedrock) it rides
+    as user text at its position with the fold disclosed."""
     request = GatewayRequest(
         surface=GatewayApiSurface.MESSAGES,
         messages=(
@@ -3116,12 +3120,30 @@ def test_mid_conversation_system_stays_positional_on_capable_wires() -> None:
         {"role": "system", "content": "answer in uppercase"},
     ]
 
+    gemini_payload = gemini_generate_content_stream_payload("gemini-2.5-pro", request)
+    assert gemini_payload["systemInstruction"] == {"parts": [{"text": "lead instructions"}]}
+    assert gemini_payload["contents"] == [
+        {"role": "user", "parts": [{"text": "hi\n\nanswer in uppercase"}]},
+    ]
+    bedrock_payload = bedrock_converse_stream_payload("us.anthropic.claude-sonnet-4-5", request)
+    assert bedrock_payload["system"] == [{"text": "lead instructions"}]
+    assert bedrock_payload["messages"] == [
+        {"role": "user", "content": [{"text": "hi\n\nanswer in uppercase"}]},
+    ]
+
     anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
     gemini = GatewayWireProfile(dialect="gemini_generate_content", url="https://gemini.test")
-    with pytest.raises(ProviderParameterError) as hoisting:
-        route_generation_parameter_requests((anthropic, gemini), request)
-    assert hoisting.value.param == "messages"
+    bedrock = GatewayWireProfile(dialect="bedrock_converse_stream", url="https://bedrock.test")
+    # The route is served, not refused (1,747 requests in the seven days to
+    # 2026-09-15, almost all Claude Code on the Chat wire); the fold is disclosed.
+    public, _provider = route_generation_parameter_requests((anthropic, gemini), request)
+    assert HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE in public.ignored_parameters
+    public, _provider = route_generation_parameter_requests((bedrock,), request)
+    assert HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE in public.ignored_parameters
     public, _provider = route_generation_parameter_requests((anthropic,), request)
+    assert public.ignored_parameters == ()
+    leading_only = request.model_copy(update={"messages": request.messages[:2]})
+    public, _provider = route_generation_parameter_requests((gemini, bedrock), leading_only)
     assert public.ignored_parameters == ()
 
 

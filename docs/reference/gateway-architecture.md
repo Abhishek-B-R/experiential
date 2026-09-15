@@ -769,7 +769,18 @@ message and folds every later plain-text system or developer turn into user text
 Responses, and Messages surfaces alike, and admission discloses
 `messages.system->folded(system_messages_leading_only)` when a turn moved. An undeclared rung's
 messages are never rewritten; the 400 stays classified as a lane limitation the ladder fails
-over. Gateway-issued carriers are recognized by their
+over.
+
+The instruction-hoisting wires (Gemini `systemInstruction`, Bedrock Converse `system`) carry
+instructions only outside the turn list, so a system turn after conversation start has no
+positional carrier there. Those rungs fold it the way the Anthropic wire does: the leading
+instruction run is hoisted as-is (one part per message), every later plain-text system or
+developer turn rides as user text at its position (appended to a preceding text-only user turn,
+else its own user turn; Converse merges adjacent user blocks), and admission discloses
+`messages.system->folded(system_instruction_wire)`. Until 0.7.77 such a route was refused
+outright ("A system message after conversation start is not supported by this model route";
+1,747 requests in the seven days to 2026-09-15, almost all Claude Code on `/v1/chat/completions`
+against Gemini aliases and Claude aliases whose waterfall carries a Bedrock rung). Gateway-issued carriers are recognized by their
 scheme prefix and retain strict parsing, authentication, and route binding; malformed carriers
 never become plaintext history, and a carrier never reaches a rung other than the one that sealed
 it (the failover past a failed issuing rung strips it, see the reasoning-continuation ladder above).

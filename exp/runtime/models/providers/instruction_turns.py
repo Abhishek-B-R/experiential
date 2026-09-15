@@ -20,6 +20,16 @@ do not:
   the ladder fails over, and a route with no other rung surfaces it).
   :func:`fold_instruction_turns_after_the_first` is applied on a rung that
   declares ``system_messages_leading_only``.
+* The instruction-HOISTING wires (Gemini ``systemInstruction``, Bedrock
+  Converse ``system``) carry instructions only outside the turn list, so a
+  system turn after conversation start has no positional carrier there;
+  the gateway used to refuse the whole route ("A system message after
+  conversation start is not supported by this model route": 1,747 requests
+  in the seven days to 2026-09-15, almost all Claude Code on
+  ``/v1/chat/completions`` against Gemini aliases and Claude aliases whose
+  waterfall carries a Bedrock rung). :func:`fold_instruction_turns_after_the_leading_run`
+  folds those turns into user text exactly as the Anthropic wire already
+  does, leaving the leading run to be hoisted.
 
 Both folds preserve position and text: an instruction run whose preceding
 message is a text-only ``user`` turn is appended to that turn (blank-line
@@ -44,6 +54,16 @@ a caller can see that a rung on this route rewrote its system turns into the
 user turn rather than rejecting or silently dropping them.
 """
 
+HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE = "messages.system->folded(system_instruction_wire)"
+"""Disclosure recorded when an instruction-hoisting rung on the route folds a turn.
+
+Same vocabulary as :data:`SYSTEM_FOLD_DISCLOSURE`; the reason names the wire
+family (Gemini ``systemInstruction`` / Bedrock Converse ``system``) rather
+than a rung capability, because every rung on those wires behaves this way.
+"""
+
+_HOISTING_DIALECTS = frozenset({"gemini_generate_content", "bedrock_converse_stream"})
+
 
 def disclose_system_fold(
     profiles: Iterable[GatewayWireProfile],
@@ -57,12 +77,22 @@ def disclose_system_fold(
     the rewrite at admission rather than from a provider 400. Nothing is
     recorded when no rung declares the fold or no turn would move.
     """
+    profiles = tuple(profiles)
     if (
         any(profile.system_messages_leading_only for profile in profiles)
         and fold_instruction_turns_after_the_first(request.messages) != request.messages
         and SYSTEM_FOLD_DISCLOSURE not in ignored
     ):
         ignored.append(SYSTEM_FOLD_DISCLOSURE)
+    if (
+        any(profile.dialect in _HOISTING_DIALECTS for profile in profiles)
+        and fold_instruction_turns_after_the_leading_run(request.messages) != request.messages
+        and HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE not in ignored
+    ):
+        # Gemini and Bedrock hoist instructions out of the turn list, so a
+        # later instruction rides as user text at its position (the same
+        # treatment the Anthropic wire gives it); disclosed at admission.
+        ignored.append(HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE)
 
 
 def fold_trailing_instruction_turns[M: (GatewayMessage, ModelMessage)](
@@ -126,21 +156,48 @@ def fold_instruction_turns_after_the_first[M: (GatewayMessage, ModelMessage)](
     Returns:
         The folded conversation; the input tuple itself when nothing changes.
     """
+    return _fold_after_leading(messages, merge_leading=True)
+
+
+def fold_instruction_turns_after_the_leading_run[M: (GatewayMessage, ModelMessage)](
+    messages: Sequence[M],
+) -> tuple[M, ...]:
+    """Keep the leading instruction run intact; fold every later instruction into user text.
+
+    For the instruction-hoisting wires (Gemini ``systemInstruction``, Bedrock
+    Converse ``system``): the leading run is hoisted by the payload builder
+    as-is (one part per message, so its bytes and count are unchanged), and
+    every plain instruction after conversation start is appended to the
+    preceding text-only ``user`` turn, else re-roled as a ``user`` turn in
+    place -- the treatment the Anthropic wire already gives such a turn.
+
+    Args:
+        messages: The ordered conversation for one provider request.
+
+    Returns:
+        The folded conversation; the input tuple itself when nothing changes.
+    """
+    return _fold_after_leading(messages, merge_leading=False)
+
+
+def _fold_after_leading[M: (GatewayMessage, ModelMessage)](
+    messages: Sequence[M],
+    *,
+    merge_leading: bool,
+) -> tuple[M, ...]:
+    """Shared body of the two leading-run folds."""
     ordered = tuple(messages)
     leading = 0
     while leading < len(ordered) and _is_plain_instruction(ordered[leading]):
         leading += 1
     head: list[M] = []
-    if leading > 0:
+    if leading > 0 and merge_leading and leading > 1:
         first = ordered[0]
-        if leading == 1:
-            head.append(first)
-        else:
-            merged = "\n\n".join(message.content or "" for message in ordered[:leading])
-            head.append(
-                first.model_copy(update={"content": merged, **_cleared_text_carriers(first)})
-            )
-    changed = leading > 1
+        merged = "\n\n".join(message.content or "" for message in ordered[:leading])
+        head.append(first.model_copy(update={"content": merged, **_cleared_text_carriers(first)}))
+    else:
+        head.extend(ordered[:leading])
+    changed = merge_leading and leading > 1
     index = leading
     while index < len(ordered):
         message = ordered[index]

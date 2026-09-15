@@ -20,6 +20,9 @@ from exp.runtime.models.providers.audios import reject_audio_part
 from exp.runtime.models.providers.documents import bedrock_document_block
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.images import bedrock_image_block
+from exp.runtime.models.providers.instruction_turns import (
+    fold_instruction_turns_after_the_leading_run,
+)
 from exp.runtime.models.providers.videos import bedrock_video_block
 
 BEDROCK_MAXIMUM_INLINE_MEDIA_BYTES = 25_000_000
@@ -135,7 +138,11 @@ def converse_body(
             return
         messages.append({"role": role, "content": content})
 
-    for message in request.messages:
+    # Converse's top-level ``system`` has no position inside messages, so an
+    # instruction after conversation start rides as user text where the
+    # caller put it (``push`` merges it into an adjacent user turn); only the
+    # leading run is hoisted.
+    for message in fold_instruction_turns_after_the_leading_run(request.messages):
         if message.role == "system":
             if message.content is None:
                 raise ValueError("system messages need text content")
