@@ -389,3 +389,22 @@ fn a_frame_with_non_array_choices_names_its_shape_in_the_malformed_reason() {
         "OpenAI-compatible choices must be an array (frame keys: choices, id, object, usage)"
     );
 }
+
+#[test]
+fn a_frames_hostile_key_names_are_masked_in_the_malformed_reason() {
+    // Keys are provider text: a newline, an ANSI escape, or a delimiter in a
+    // key must not reach the ledger line; the key reads as `non-identifier`.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    let failure = normalizer
+        .feed(&SseEvent {
+            event: None,
+            data: json!({"choices": "nope", "id": "x", "line\nbreak": 1, "\u{1b}[31mred": 2, "a, b": 3}).to_string(),
+        })
+        .expect_err("a non-array choices stays malformed");
+    assert_eq!(
+        failure.safe_message,
+        "OpenAI-compatible choices must be an array (frame keys: choices, id, non-identifier, non-identifier, non-identifier)"
+    );
+    assert!(!failure.safe_message.contains('\n'));
+    assert!(!failure.safe_message.contains('\u{1b}'));
+}

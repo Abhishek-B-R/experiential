@@ -66,11 +66,24 @@ const FRAME_KEY_NAMES_LIMIT: usize = 8;
 const FRAME_KEY_NAME_CHARS: usize = 32;
 
 /// The sorted, bounded key names of one frame: its SHAPE for the ledger, with
-/// no value ever read.
+/// no value ever read. A key is provider-supplied text, so only an
+/// identifier-shaped one (ASCII alphanumerics, `_`, `.`, `-`) is named; any
+/// other key (a newline, an ANSI escape, a delimiter) reads as
+/// `non-identifier` so the reason stays one clean line.
 fn frame_key_names(payload: &serde_json::Map<String, Value>) -> String {
     let mut keys: Vec<String> = payload
         .keys()
-        .map(|key| key.chars().take(FRAME_KEY_NAME_CHARS).collect())
+        .map(|key| {
+            let identifier = !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+            if identifier {
+                key.chars().take(FRAME_KEY_NAME_CHARS).collect()
+            } else {
+                "non-identifier".to_string()
+            }
+        })
         .collect();
     keys.sort();
     let shown = keys.len().min(FRAME_KEY_NAMES_LIMIT);
