@@ -32,7 +32,7 @@ use crate::dialects::Dialect;
 use crate::error_envelope::{openai_family_envelope, parse_error_document, ErrorEnvelope};
 pub use crate::rejection_shapes::{
     content_filtered_completion, rejected_by_lane_limitation, rejected_by_routing_gate,
-    rejected_caller_reference_not_found, upstream_relayed_message,
+    rejected_caller_reference_not_found, rejected_encrypted_reasoning, upstream_relayed_message,
 };
 
 /// Longest parameter path relayed; anything longer is treated as prose.

@@ -283,6 +283,13 @@ pub struct Failure {
     /// reach the caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_headers: Option<Box<serde_json::Map<String, serde_json::Value>>>,
+    /// The provider refused a replayed reasoning item's `encrypted_content`
+    /// (OpenAI `invalid_encrypted_content`: a payload sealed by another
+    /// organization or tenant, or one it never issued). In-process only: the
+    /// waterfall re-dials the same rung once with those items stripped, so the
+    /// flag never crosses the bridge and never reaches settlement.
+    #[serde(skip)]
+    pub encrypted_reasoning_rejected: bool,
 }
 
 impl Failure {
@@ -298,6 +305,7 @@ impl Failure {
             customer_owned: false,
             refusal_reason: None,
             rate_limit_headers: None,
+            encrypted_reasoning_rejected: false,
         }
     }
 
@@ -359,6 +367,12 @@ impl Failure {
         if self.failure_class == FailureClass::Throttled && self.retry_after_seconds.is_none() {
             self.retry_after_seconds = retry_after_seconds;
         }
+        self
+    }
+
+    /// Mark whether the provider refused replayed encrypted reasoning.
+    pub fn with_encrypted_reasoning_rejected(mut self, rejected: bool) -> Self {
+        self.encrypted_reasoning_rejected = rejected;
         self
     }
 

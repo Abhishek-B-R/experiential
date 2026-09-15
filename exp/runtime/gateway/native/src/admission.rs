@@ -16,11 +16,12 @@ use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::Event;
 use crate::guardrails;
 use crate::metrics::METRICS;
+use crate::replay_repair::replay_repair_headers;
 use crate::respond::error_response;
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
 use crate::throttle_backoff::ThrottleRedial;
-use crate::waterfall::{DeploymentWire, RoutePolicy};
+use crate::waterfall::{DeploymentWire, RoutePolicy, Served};
 
 /// The wire configuration returned by one successful admission: the full
 /// ordered certified route (one wire configuration per deployment, each with
@@ -142,6 +143,19 @@ pub(crate) fn commit_dependent(admission: &Admission, depth: usize) -> Vec<(Stri
             admission.route_reason.clone(),
         ),
     ]
+}
+
+/// Every header one served attempt carries: the request identity, the rung
+/// that served, and any data-plane repair of the replayed input.
+pub(crate) fn served_headers(
+    admission: &Admission,
+    client_request_id: Option<&str>,
+    served: Served,
+) -> Vec<(String, String)> {
+    let mut headers = commit_independent(admission, client_request_id);
+    headers.extend(commit_dependent(admission, served.depth));
+    headers.extend(replay_repair_headers(served.encrypted_reasoning_stripped));
+    headers
 }
 
 /// Build one request guard bound to this server's settlement bookkeeping.

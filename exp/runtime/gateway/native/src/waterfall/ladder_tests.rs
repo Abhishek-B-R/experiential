@@ -94,12 +94,23 @@ fn plane() -> Py<PyAny> {
 enum Answer {
     /// A 429 with the optional stated wait.
     Throttle(Option<u32>),
+    /// A 400 carrying this exact JSON body.
+    Rejected(&'static str),
     /// A 200 event stream carrying these SSE frames, then `[DONE]`.
     Stream(&'static [&'static str]),
+    /// A 200 native Responses event stream carrying these SSE frames and
+    /// then a `response.completed` terminal (the Responses wire has no
+    /// `[DONE]`).
+    ResponsesStream(&'static [&'static str]),
 }
 
 fn render(answer: &Answer) -> String {
     match answer {
+        Answer::Rejected(body) => format!(
+            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len(),
+        ),
         Answer::Throttle(retry_after) => {
             let body = "{\"error\":{\"message\":\"We're currently processing too many requests - \
                         please try again later\",\"type\":\"server_error\",\"code\":null}}";
@@ -112,14 +123,21 @@ fn render(answer: &Answer) -> String {
                 body.len(),
             )
         }
-        Answer::Stream(frames) => {
+        Answer::Stream(frames) | Answer::ResponsesStream(frames) => {
             let mut body = String::new();
             for frame in frames.iter() {
                 body.push_str("data: ");
                 body.push_str(frame);
                 body.push_str("\n\n");
             }
-            body.push_str("data: [DONE]\n\n");
+            match answer {
+                Answer::ResponsesStream(_) => {
+                    body.push_str("data: ");
+                    body.push_str(RESPONSES_COMPLETED_FRAME);
+                    body.push_str("\n\n");
+                }
+                _ => body.push_str("data: [DONE]\n\n"),
+            }
             format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
                  content-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -130,10 +148,41 @@ fn render(answer: &Answer) -> String {
 }
 
 /// One scripted rung: answers its connections in script order and records
-/// when each was accepted.
+/// when each was accepted and the request body it carried.
 struct Rung {
     url: String,
     accepted: Arc<Mutex<Vec<Instant>>>,
+    bodies: Arc<Mutex<Vec<String>>>,
+}
+
+/// Read one whole HTTP/1.1 request (headers, then `content-length` bytes of
+/// body) and return the body text.
+async fn read_request_body(socket: &mut tokio::net::TcpStream) -> String {
+    let mut received: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 16_384];
+    loop {
+        let header_end = received
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|at| at + 4);
+        if let Some(header_end) = header_end {
+            let headers = String::from_utf8_lossy(&received[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if received.len() >= header_end + content_length {
+                return String::from_utf8_lossy(&received[header_end..header_end + content_length])
+                    .into_owned();
+            }
+        }
+        let read = socket.read(&mut chunk).await.unwrap_or(0);
+        if read == 0 {
+            return String::new();
+        }
+        received.extend_from_slice(&chunk[..read]);
+    }
 }
 
 async fn spawn_rung(script: Vec<Answer>) -> Rung {
@@ -142,13 +191,15 @@ async fn spawn_rung(script: Vec<Answer>) -> Rung {
         .expect("bind");
     let address = listener.local_addr().expect("address");
     let accepted = Arc::new(Mutex::new(Vec::new()));
+    let bodies = Arc::new(Mutex::new(Vec::new()));
     let recorder = accepted.clone();
+    let body_recorder = bodies.clone();
     tokio::spawn(async move {
         for answer in script {
             let (mut socket, _) = listener.accept().await.expect("accept");
             recorder.lock().expect("lock").push(Instant::now());
-            let mut buffer = [0u8; 16_384];
-            let _ = socket.read(&mut buffer).await;
+            let body = read_request_body(&mut socket).await;
+            body_recorder.lock().expect("lock").push(body);
             socket
                 .write_all(render(&answer).as_bytes())
                 .await
@@ -159,6 +210,7 @@ async fn spawn_rung(script: Vec<Answer>) -> Rung {
     Rung {
         url: format!("http://{address}/v1/chat/completions"),
         accepted,
+        bodies,
     }
 }
 
@@ -189,6 +241,58 @@ fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) -> Deployme
         throttle_redial_budget,
     }
 }
+
+/// One native Responses rung whose replayed input carries a reasoning item
+/// sealed elsewhere beside the caller's visible turns.
+fn responses_wire(
+    deployment_id: &str,
+    url: &str,
+    with_encrypted_reasoning: bool,
+) -> DeploymentWire {
+    // The Codex shape: the call replays with the provider id of its turn.
+    let mut input = vec![
+        json!({"role": "user", "content": "plan the change"}),
+        json!({"type": "function_call", "id": "fc_turn_1", "call_id": "call_1", "name": "exec", "arguments": "{}"}),
+        json!({"type": "function_call_output", "call_id": "call_1", "output": "ok"}),
+        json!({"role": "user", "content": "now apply it"}),
+    ];
+    if with_encrypted_reasoning {
+        input.insert(
+            1,
+            json!({"type": "reasoning", "summary": [], "encrypted_content": "rsn_sealed_elsewhere=="}),
+        );
+    }
+    DeploymentWire {
+        dialect: "openai_responses".to_string(),
+        url: url.replace("/v1/chat/completions", "/v1/responses"),
+        upstream_payload: json!({
+            "model": "gpt-test",
+            "input": input,
+            "store": false,
+            "stream": true,
+            "include": ["reasoning.encrypted_content"],
+        }),
+        ..wire(deployment_id, url, 0)
+    }
+}
+
+/// OpenAI's verdict on a replayed reasoning payload it cannot decrypt, as
+/// answered live to a customer's stateless Responses turn (2026-09-15).
+const INVALID_ENCRYPTED_CONTENT_BODY: &str = concat!(
+    "{\"error\":{\"message\":\"The encrypted content rsn_...hA== could not be verified. ",
+    "Reason: Encrypted content could not be decrypted or parsed.\",",
+    "\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_encrypted_content\"}}"
+);
+
+const RESPONSES_COMPLETED_FRAME: &str = concat!(
+    "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",",
+    "\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"total_tokens\":15}}}"
+);
+
+const RESPONSES_TEXT_FRAME: &str = concat!(
+    "{\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",",
+    "\"output_index\":0,\"content_index\":0,\"delta\":\"applied\"}"
+);
 
 const SCHEDULE: ThrottleRedial = ThrottleRedial {
     max_attempts: 2,
@@ -537,5 +641,191 @@ fn a_low_stake_request_gets_fewer_redials_than_a_high_stake_one() {
         };
         assert_eq!(flags(&high), vec![false, true, true, false]);
         assert_eq!(flags(&low), vec![false, true, false]);
+    });
+}
+
+#[test]
+fn a_refused_encrypted_reasoning_item_is_stripped_and_the_same_rung_redialed() {
+    block_on(async {
+        let harness = Harness::new();
+        let before = METRICS.snapshot()["encrypted_reasoning_stripped"]
+            .as_u64()
+            .expect("counter");
+        // The rung refuses the sealed-elsewhere payload, then serves the
+        // stripped replay on its second connection.
+        let rung_a = spawn_rung(vec![
+            Answer::Rejected(INVALID_ENCRYPTED_CONTENT_BODY),
+            Answer::ResponsesStream(&[RESPONSES_TEXT_FRAME]),
+        ])
+        .await;
+        let rung_b = spawn_rung(vec![Answer::ResponsesStream(&[RESPONSES_TEXT_FRAME])]).await;
+        let route = [
+            responses_wire("a", &rung_a.url, true),
+            responses_wire("b", &rung_b.url, true),
+        ];
+        let (won, guard) = harness.run(&route, None, Duration::from_secs(60)).await;
+        let won = finish(guard, won).await;
+        let Won::Committed(committed) = won else {
+            panic!("the same rung serves the stripped replay");
+        };
+        assert_eq!(committed.depth, 0);
+        assert!(committed.encrypted_reasoning_stripped);
+        assert!(matches!(
+            committed.prefix.first(),
+            Some(Event::ProviderOutputItemStarted { .. })
+        ));
+        drop(committed);
+
+        // Two dials of the same rung: the replay as sent, then without the
+        // refused item; the visible turns and tool items travel both times.
+        let bodies = rung_a.bodies.lock().expect("lock").clone();
+        assert_eq!(bodies.len(), 2);
+        let sent: Value = serde_json::from_str(&bodies[0]).expect("first body");
+        let repaired: Value = serde_json::from_str(&bodies[1]).expect("second body");
+        assert_eq!(sent["input"].as_array().expect("input").len(), 5);
+        let repaired_input = repaired["input"].as_array().expect("input");
+        assert_eq!(repaired_input.len(), 4);
+        assert!(repaired_input
+            .iter()
+            .all(|item| item.get("encrypted_content").is_none()));
+        // The call the stripped reasoning governed replays id-less (the
+        // provider would demand the reasoning item back for `fc_turn_1`).
+        assert_eq!(sent["input"][2]["id"], "fc_turn_1");
+        assert_eq!(repaired_input[1]["type"], "function_call");
+        assert!(repaired_input[1].get("id").is_none());
+        assert_eq!(repaired_input[1]["call_id"], "call_1");
+        assert_eq!(repaired_input[3]["content"], "now apply it");
+        assert_eq!(repaired["include"], json!(["reasoning.encrypted_content"]));
+        assert!(rung_b.accepted.lock().expect("lock").is_empty());
+
+        // One reservation covers both dials: the ledger sees one attempt,
+        // settled completed, never a failed 400 and never a failover.
+        let story = harness.story().await;
+        assert_eq!(story["starts"].as_array().expect("starts").len(), 1);
+        let settles = story["settles"].as_array().expect("settles");
+        assert_eq!(settles.len(), 1);
+        assert_eq!(settles[0]["outcome"], "completed");
+        assert_eq!(story["counts"], json!([1, 0]));
+        let after = METRICS.snapshot()["encrypted_reasoning_stripped"]
+            .as_u64()
+            .expect("counter");
+        assert!(after > before);
+    });
+}
+
+#[test]
+fn a_second_refusal_of_the_stripped_replay_surfaces_the_providers_400() {
+    block_on(async {
+        let harness = Harness::new();
+        let rung_a = spawn_rung(vec![
+            Answer::Rejected(INVALID_ENCRYPTED_CONTENT_BODY),
+            Answer::Rejected(INVALID_ENCRYPTED_CONTENT_BODY),
+        ])
+        .await;
+        let rung_b = spawn_rung(vec![Answer::ResponsesStream(&[RESPONSES_TEXT_FRAME])]).await;
+        let route = [
+            responses_wire("a", &rung_a.url, true),
+            responses_wire("b", &rung_b.url, true),
+        ];
+        let (won, guard) = harness.run(&route, None, Duration::from_secs(60)).await;
+        let won = finish(guard, won).await;
+        let Won::Failed(error) = won else {
+            panic!("a client error is the caller's, never walked down the ladder");
+        };
+        assert_eq!(error.status_code, 400, "{error:?}");
+        // Exactly one repair: the rung was dialed twice and no other rung.
+        assert_eq!(rung_a.accepted.lock().expect("lock").len(), 2);
+        assert!(rung_b.accepted.lock().expect("lock").is_empty());
+        // Both dials ran under the one reservation, and a client error asks
+        // the control plane for no successor.
+        let story = harness.story().await;
+        assert_eq!(story["starts"].as_array().expect("starts").len(), 1);
+        let settles = story["settles"].as_array().expect("settles");
+        assert_eq!(settles.len(), 1);
+        assert_eq!(settles[0]["outcome"], "failed");
+        assert_eq!(settles[0]["failure"]["failure_class"], "invalid_request");
+    });
+}
+
+#[test]
+fn the_verdict_on_a_replay_with_nothing_to_strip_surfaces_at_once() {
+    block_on(async {
+        let harness = Harness::new();
+        let rung_a = spawn_rung(vec![Answer::Rejected(INVALID_ENCRYPTED_CONTENT_BODY)]).await;
+        let route = [responses_wire("a", &rung_a.url, false)];
+        let (won, guard) = harness.run(&route, None, Duration::from_secs(60)).await;
+        let won = finish(guard, won).await;
+        let Won::Failed(error) = won else {
+            panic!("nothing to repair: the provider's 400 is the answer");
+        };
+        let story = harness.story().await;
+        assert_eq!(error.status_code, 400, "{error:?} {story}");
+        assert_eq!(rung_a.accepted.lock().expect("lock").len(), 1);
+        assert_eq!(rung_a.bodies.lock().expect("lock").len(), 1);
+    });
+}
+
+#[test]
+fn a_remembered_repair_is_redialed_without_earning_the_refusal_again() {
+    block_on(async {
+        let harness = Harness::new();
+        // The rung refuses the foreign payload, throttles the stripped
+        // re-dial, and serves the post-backoff redial: that redial must
+        // carry the stripped payload directly, not the refused original.
+        let rung_a = spawn_rung(vec![
+            Answer::Rejected(INVALID_ENCRYPTED_CONTENT_BODY),
+            Answer::Throttle(None),
+            Answer::ResponsesStream(&[RESPONSES_TEXT_FRAME]),
+        ])
+        .await;
+        let rung_b = spawn_rung(vec![Answer::ResponsesStream(&[RESPONSES_TEXT_FRAME])]).await;
+        let route = [
+            DeploymentWire {
+                throttle_redial_budget: 2,
+                ..responses_wire("a", &rung_a.url, true)
+            },
+            responses_wire("b", &rung_b.url, true),
+        ];
+        let (won, guard) = harness
+            .run(&route, Some(SCHEDULE), Duration::from_secs(60))
+            .await;
+        let won = finish(guard, won).await;
+        let Won::Committed(committed) = won else {
+            panic!("the redialed rung serves the remembered stripped payload");
+        };
+        assert_eq!(committed.depth, 0);
+        assert!(committed.encrypted_reasoning_stripped);
+        drop(committed);
+
+        // Three dials: the replay as sent, the stripped re-dial, and the
+        // post-backoff redial that starts from the stripped payload.
+        let bodies = rung_a.bodies.lock().expect("lock").clone();
+        assert_eq!(bodies.len(), 3);
+        let has_encrypted = |body: &str| {
+            let value: Value = serde_json::from_str(body).expect("body");
+            value["input"]
+                .as_array()
+                .expect("input")
+                .iter()
+                .any(|item| item.get("encrypted_content").is_some())
+        };
+        assert!(has_encrypted(&bodies[0]));
+        assert!(!has_encrypted(&bodies[1]));
+        assert!(!has_encrypted(&bodies[2]));
+        assert!(rung_b.accepted.lock().expect("lock").is_empty());
+
+        // Two reservations: the first covers the refusal and its stripped
+        // re-dial (settled failed on the throttle), the second is the
+        // post-backoff redial of the same depth that served.
+        let story = harness.story().await;
+        let starts = story["starts"].as_array().expect("starts");
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[1]["throttle_backoff"], true);
+        assert_eq!(starts[1]["current_depth"], 0);
+        assert_eq!(starts[1]["failure"]["failure_class"], "throttled");
+        let settles = story["settles"].as_array().expect("settles");
+        assert_eq!(settles.len(), 2);
+        assert_eq!(settles[0]["outcome"], "failed");
+        assert_eq!(settles[1]["outcome"], "completed");
     });
 }
