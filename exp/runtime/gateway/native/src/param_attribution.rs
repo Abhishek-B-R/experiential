@@ -31,8 +31,8 @@ use serde_json::Value;
 use crate::dialects::Dialect;
 use crate::error_envelope::{openai_family_envelope, parse_error_document, ErrorEnvelope};
 pub use crate::rejection_shapes::{
-    rejected_by_lane_limitation, rejected_by_routing_gate, rejected_caller_reference_not_found,
-    upstream_relayed_message,
+    content_filtered_completion, rejected_by_lane_limitation, rejected_by_routing_gate,
+    rejected_caller_reference_not_found, upstream_relayed_message,
 };
 
 /// Longest parameter path relayed; anything longer is treated as prose.
@@ -226,7 +226,7 @@ pub fn generic_error_code(token: &str) -> bool {
 /// while the handle itself is the only part that must not cross. Words the
 /// request itself carried stay. An over-long sentence is cut to the bound
 /// with an ellipsis rather than dropped.
-fn sanitized_detail(message: &str, request_words: &[&str]) -> Option<String> {
+pub(crate) fn sanitized_detail(message: &str, request_words: &[&str]) -> Option<String> {
     let trimmed = message.trim();
     if trimmed.is_empty() {
         return None;
