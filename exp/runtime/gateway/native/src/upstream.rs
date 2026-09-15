@@ -8,9 +8,9 @@ use serde_json::Value;
 use crate::dialects::Dialect;
 use crate::errors::{Failure, FailureClass};
 use crate::param_attribution::{
-    bounded_masked_line, generic_error_code, rejected_by_lane_limitation, rejected_by_routing_gate,
-    rejected_caller_reference_not_found, rejected_code, rejected_detail, rejected_model_not_found,
-    rejected_parameter,
+    bounded_masked_line, content_filtered_completion, generic_error_code,
+    rejected_by_lane_limitation, rejected_by_routing_gate, rejected_caller_reference_not_found,
+    rejected_code, rejected_detail, rejected_model_not_found, rejected_parameter, sanitized_detail,
 };
 use crate::rate_limit_headers::{harvest_rate_limit_headers, retry_after_seconds};
 
@@ -281,6 +281,29 @@ pub async fn open_stream(
             .and_then(Value::as_str)
             .into_iter()
             .collect();
+        // A 4xx whose body is a COMPLETION finished `content_filter` (Azure
+        // Foundry's DeepSeek lanes answer their output filter this way, with
+        // no error envelope at all) is the model's verdict on the content:
+        // file and answer it as a refusal, the blocked label kept ledger-only,
+        // never as a request-shape error and never a failover (the next rung
+        // refuses the same content or, worse, serves it).
+        if let Some(filtered) = body
+            .as_deref()
+            .and_then(|body| content_filtered_completion(dialect, body))
+        {
+            let reason = crate::stream_errors::refusal_reason(
+                Some(&filtered.code),
+                filtered.message.as_deref(),
+            );
+            let detail = filtered
+                .message
+                .as_deref()
+                .and_then(|message| sanitized_detail(message, &request_words))
+                .or(Some(filtered.code));
+            return Err(Failure::refusal(reason)
+                .with_provider_detail(detail)
+                .with_rate_limit_facts(rate_limit.clone(), retry_after));
+        }
         let code = body
             .as_deref()
             .and_then(|body| rejected_code(dialect, body));
@@ -740,6 +763,40 @@ mod tests {
             failure.public_error().message,
             "provider refused the request: content policy"
         );
+    }
+
+    #[tokio::test]
+    async fn an_azure_completion_finished_content_filter_under_a_400_is_a_refusal() {
+        // Captured live from Azure AI Foundry (DeepSeek-V4-Flash, 2026-09-15):
+        // a 400 carrying a chat.completion body and no error envelope.
+        let failure = open_against_body(
+            "400 Bad Request",
+            "{\"id\":\"chatcmpl-802d5a802bf84292896e446052595\",\"model\":\"\",\"choices\":\
+             [{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\"},\
+             \"finish_reason\":\"content_filter\",\"content_filter_results\":{\"error\":\
+             {\"code\":\"content_filter\",\"message\":\"Response content blocked by label \
+             'MultiSeverity_ViolenceScore'.\"}}}],\"usage\":{\"prompt_tokens\":55,\
+             \"total_tokens\":55},\"created\":1789466192,\"object\":\"chat.completion\",\
+             \"prompt_filter_results\":null}",
+            "DeepSeek-V4-Flash",
+        )
+        .await;
+        assert_eq!(failure.failure_class, FailureClass::Refusal);
+        assert_eq!(
+            failure.refusal_reason,
+            Some(crate::errors::RefusalReason::ContentPolicy)
+        );
+        assert!(!failure.failover_eligible);
+        assert!(!failure.retryable_same_deployment);
+        // The quoted label is caller-visible vocabulary, so the sentence
+        // survives the identifier screen into the ledger; the caller still
+        // gets only the bounded refusal.
+        assert_eq!(
+            failure.provider_detail.as_deref(),
+            Some("Response content blocked by label 'MultiSeverity_ViolenceScore'.")
+        );
+        assert_eq!(failure.public_error().status_code, 400);
+        assert_eq!(failure.public_error().code, "refusal");
     }
 
     #[tokio::test]

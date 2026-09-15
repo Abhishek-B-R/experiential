@@ -2,14 +2,17 @@
 //! off a client-error body: an aggregator's generic sentence hiding the
 //! upstream's own, a lane limitation a caller cannot fix, an aggregator
 //! routing gate that is not a credential verdict, and a 404 that refuses a
-//! handle the caller sent rather than naming a missing model. Each reads only
-//! the dialect's documented fields and never logs body text.
+//! handle the caller sent rather than naming a missing model, and a content
+//! filter verdict stated inside a completion body rather than an error
+//! envelope. Each reads only the dialect's documented fields and never logs
+//! body text.
 
 use serde_json::Value;
 
 use crate::dialects::Dialect;
 use crate::error_envelope::parse_error_document;
 use crate::param_attribution::{error_message_field, rejected_model_not_found};
+use crate::stream_errors::is_refusal_code;
 
 /// Sentences a provider answers with a 400 for a request shape the OpenAI
 /// contract allows but THIS lane's serving stack cannot carry (a chat
@@ -183,6 +186,62 @@ const CALLER_REFERENCE_SENTENCES: &[&str] = &[
     "Response with id ",
 ];
 
+/// A content-filter verdict a provider states INSIDE a completion body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilteredCompletion {
+    /// The provider's refusal code (`content_filter`), read from the choice's
+    /// `content_filter_results.error.code`, else its finish reason.
+    pub code: String,
+    /// The provider's sentence naming what was blocked, when it gave one.
+    pub message: Option<String>,
+}
+
+/// Read a 4xx body that is a CHAT COMPLETION carrying a content-filter finish
+/// rather than an error envelope.
+///
+/// Azure AI Foundry's model-inference surface (DeepSeek-V4-Flash, captured
+/// live 2026-09-15) answers a non-streaming request whose OUTPUT its content
+/// safety layer blocked with HTTP 400 and a `chat.completion` object: no
+/// top-level `error`, `choices[0].finish_reason = "content_filter"`,
+/// `choices[0].message.content = ""`, and the verdict under
+/// `choices[0].content_filter_results.error` (`{code: "content_filter",
+/// message: "Response content blocked by label 'MultiSeverity_ViolenceScore'."}`).
+/// The envelope readers see no error there, so 438 such refusals in 48h
+/// settled as the generic request-shape 400 with no detail. The finish reason
+/// is the authoritative verdict: a `content_filter`/`safety` finish on the
+/// first choice is the model's answer to the content, never a request-shape
+/// error, and the nested code names the category. Only the OpenAI-compatible
+/// chat wire is read; other dialects state their verdicts in their own
+/// envelopes.
+pub fn content_filtered_completion(dialect: Dialect, body: &str) -> Option<FilteredCompletion> {
+    if dialect != Dialect::OpenAiCompatible {
+        return None;
+    }
+    let value = parse_error_document(body)?;
+    let choice = value.get("choices")?.as_array()?.first()?.as_object()?;
+    let finish = choice.get("finish_reason")?.as_str()?;
+    if !matches!(finish, "content_filter" | "safety") {
+        return None;
+    }
+    let verdict = choice
+        .get("content_filter_results")
+        .and_then(|results| results.get("error"))
+        .and_then(Value::as_object);
+    let nested_code = verdict
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        .filter(|code| is_refusal_code(Some(code)))
+        .map(str::to_string);
+    Some(FilteredCompletion {
+        code: nested_code.unwrap_or_else(|| finish.to_string()),
+        message: verdict
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+            .map(str::to_string),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +315,53 @@ mod tests {
             Dialect::OpenAiResponses,
             "<html>"
         ));
+    }
+
+    /// The Azure Foundry DeepSeek body captured live on 2026-09-15 (key
+    /// redacted, nothing else edited).
+    const AZURE_FILTERED_COMPLETION: &str = r#"{"id":"chatcmpl-802d5a802bf84292896e446052595","model":"","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"content_filter","content_filter_results":{"error":{"code":"content_filter","message":"Response content blocked by label 'MultiSeverity_ViolenceScore'."}}}],"usage":{"prompt_tokens":55,"total_tokens":55},"created":1789466192,"object":"chat.completion","prompt_filter_results":null}"#;
+
+    #[test]
+    fn azure_filtered_completion_body_is_read_as_the_provider_verdict() {
+        let filtered =
+            content_filtered_completion(Dialect::OpenAiCompatible, AZURE_FILTERED_COMPLETION)
+                .expect("a content_filter finish inside a completion is a verdict");
+        assert_eq!(filtered.code, "content_filter");
+        assert_eq!(
+            filtered.message.as_deref(),
+            Some("Response content blocked by label 'MultiSeverity_ViolenceScore'.")
+        );
+        // The verdict rides the finish reason even without the nested error.
+        let bare = content_filtered_completion(
+            Dialect::OpenAiCompatible,
+            r#"{"choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"content_filter"}]}"#,
+        )
+        .expect("finish reason alone names the verdict");
+        assert_eq!(bare.code, "content_filter");
+        assert_eq!(bare.message, None);
+    }
+
+    #[test]
+    fn completions_that_are_not_filtered_and_other_dialects_are_not_verdicts() {
+        let stopped = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
+        assert_eq!(
+            content_filtered_completion(Dialect::OpenAiCompatible, stopped),
+            None
+        );
+        assert_eq!(
+            content_filtered_completion(Dialect::OpenAiResponses, AZURE_FILTERED_COMPLETION),
+            None
+        );
+        assert_eq!(
+            content_filtered_completion(
+                Dialect::OpenAiCompatible,
+                r#"{"error":{"code":"content_filter"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            content_filtered_completion(Dialect::OpenAiCompatible, "not json"),
+            None
+        );
     }
 }
