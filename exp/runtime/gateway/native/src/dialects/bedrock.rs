@@ -235,6 +235,9 @@ impl Normalizer {
             ));
         }
         match reason {
+            // A call cut mid-fragment under a non-truncating stop reason was
+            // dropped at its block stop; the turn is the provider's cut.
+            "end_turn" | "stop_sequence" | "tool_use" if self.dropped_cut_call => Event::Incomplete,
             "end_turn" | "stop_sequence" | "tool_use" => Event::Completed,
             "max_tokens" | "model_context_window_exceeded" => Event::Incomplete,
             // The Bedrock stop reason names the content verdict.
@@ -504,27 +507,7 @@ mod bedrock_tests {
 
     #[test]
     fn bedrock_tool_fragment_at_the_output_budget_is_incomplete_not_malformed() {
-        let fragment = |stop_reason: &str| {
-            vec![
-                event(
-                    "contentBlockStart",
-                    &json!({
-                        "contentBlockIndex": 0,
-                        "start": {"toolUse": {"toolUseId": "call-1", "name": "lookup"}},
-                    }),
-                ),
-                event(
-                    "contentBlockDelta",
-                    &json!({"contentBlockIndex": 0, "delta": {"toolUse": {"input": "{\"city\": \"Par"}}}),
-                ),
-                event("contentBlockStop", &json!({"contentBlockIndex": 0})),
-                event("messageStop", &json!({"stopReason": stop_reason})),
-                event(
-                    "metadata",
-                    &json!({"usage": {"inputTokens": 1, "outputTokens": 1}}),
-                ),
-            ]
-        };
+        let fragment = |stop_reason: &str| tool_stream(stop_reason, "{\"city\": \"Par");
         let (events, failure) = run_stream(&fragment("max_tokens"));
         assert!(failure.is_none());
         assert!(!events
@@ -535,11 +518,52 @@ mod bedrock_tests {
             Some(json!("incomplete"))
         );
 
-        let (events, failure) = run_stream(&fragment("end_turn"));
+        // Bedrock's DeepSeek and Qwen shims close the block on an open
+        // fragment and report `tool_use`/`end_turn` (production 2026-09-09..15,
+        // 33 attempts): the stop reason misreports the cut, so the call is
+        // dropped and the turn settles Incomplete, never a 502.
+        for stop_reason in ["end_turn", "tool_use"] {
+            let (events, failure) = run_stream(&fragment(stop_reason));
+            assert!(failure.is_none());
+            assert!(!events
+                .iter()
+                .any(|event| event["kind"] == "tool_call_completed"));
+            assert_eq!(
+                events.last().map(|event| event["kind"].clone()),
+                Some(json!("incomplete")),
+                "{stop_reason}: {events:?}"
+            );
+        }
+
+        // A syntax error INSIDE the arguments is corruption, not a cut, and a
+        // non-truncating stop reason still surfaces it.
+        let (events, failure) = run_stream(&tool_stream("end_turn", "{\"city\": }"));
         assert!(failure.is_none());
         let last = events.last().expect("terminal");
         assert_eq!(last["kind"], "failed");
         assert_eq!(last["failure_class"], "malformed_response");
+    }
+
+    fn tool_stream(stop_reason: &str, input: &str) -> Vec<Vec<u8>> {
+        vec![
+            event(
+                "contentBlockStart",
+                &json!({
+                    "contentBlockIndex": 0,
+                    "start": {"toolUse": {"toolUseId": "call-1", "name": "lookup"}},
+                }),
+            ),
+            event(
+                "contentBlockDelta",
+                &json!({"contentBlockIndex": 0, "delta": {"toolUse": {"input": input}}}),
+            ),
+            event("contentBlockStop", &json!({"contentBlockIndex": 0})),
+            event("messageStop", &json!({"stopReason": stop_reason})),
+            event(
+                "metadata",
+                &json!({"usage": {"inputTokens": 1, "outputTokens": 1}}),
+            ),
+        ]
     }
 
     #[test]

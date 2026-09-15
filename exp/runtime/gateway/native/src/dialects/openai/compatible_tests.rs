@@ -286,18 +286,21 @@ fn length_finish_without_done_sentinel_is_incomplete() {
 /// content and then closed is still a malformed ending, so a mid-answer
 /// disconnect cannot be mistaken for a complete turn.
 #[test]
-fn eof_without_finish_reason_stays_malformed() {
+fn eof_without_finish_reason_after_output_is_the_providers_cut() {
+    // No finish reason and the connection closed on served text: the
+    // provider cut the answer (gpt-5.6-luna, 33 of 34 terminal-less streams
+    // post-commit, 2026-09-14). The served tokens are real, so the turn
+    // settles Incomplete instead of a 502 nothing can fail over from; before
+    // any output the stream stays terminal-less (see `cut_tests`).
     let frames = [text_frame("half an ans")];
     let (events, failure) = drain_stream_fixture(Dialect::OpenAiCompatible, &wire(&frames, false));
+    assert!(failure.is_none(), "{failure:?}");
     assert_eq!(
         events,
-        vec![json!({"kind": "text_delta", "text": "half an ans"})]
-    );
-    let failure = failure.expect("terminal-less stream fails closed");
-    assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
-    assert_eq!(
-        failure.safe_message,
-        "provider stream ended without a terminal event"
+        vec![
+            json!({"kind": "text_delta", "text": "half an ans"}),
+            json!({"kind": "incomplete"}),
+        ]
     );
 }
 
