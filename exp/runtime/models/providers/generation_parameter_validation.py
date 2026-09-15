@@ -40,6 +40,58 @@ def profile_reasoning_efforts(profile: GatewayWireProfile) -> tuple[str, ...]:
     )
 
 
+def resolve_level_less_enable(
+    profiles: Sequence[GatewayWireProfile], *, effort_path: str
+) -> str | None:
+    """Resolve a level-less "enable thinking" to the tier the route should pin.
+
+    The LANE default (the first rung in route order pinning an active catalog
+    ``reasoning_default_effort``) when every rung can serve it, else a
+    route-wide required default when portable, else the LOWEST portable
+    non-none tier (default-not-high avoids surprising cost).
+
+    Returns ``None`` when the enable is already satisfied: no rung can be
+    turned off (``none`` on no ladder: kimi-k2-thinking) and the ladders share
+    no tier to pin, so whichever rung serves reasons anyway (the caller
+    discloses the no-op; 605 rejections across 44 organizations in the 7 days
+    to 2026-09-15 told callers to "choose a reasoning model" about one).
+
+    Raises:
+        ProviderParameterError: No rung offers a reasoning mode, or the rungs
+            CAN be off yet share no on-tier (clearing the enable there could
+            serve the request without the reasoning the caller asked for).
+    """
+    portable = set(REASONING_EFFORTS)
+    for profile in profiles:
+        portable.intersection_update(profile_reasoning_efforts(profile))
+    portable_non_none = tuple(e for e in REASONING_EFFORTS if e in portable and e != "none")
+    if not portable_non_none:
+        if all(
+            profile.supports_reasoning and "none" not in profile_reasoning_efforts(profile)
+            for profile in profiles
+        ):
+            return None
+        raise ProviderParameterError(
+            message=(
+                "This model does not support thinking: no rung on its route offers a "
+                "reasoning mode. Remove the enable-thinking field or choose a reasoning model."
+            ),
+            param=effort_path,
+            code="unsupported_parameter",
+        )
+    lane_default = lane_default_reasoning_effort(profiles)
+    if lane_default in portable_non_none:
+        return lane_default
+    required_defaults = {
+        profile.reasoning_effort
+        for profile in profiles
+        if profile.reasoning_effort_required and profile.reasoning_effort in portable_non_none
+    }
+    if len(required_defaults) == 1:
+        return next(iter(required_defaults))
+    return portable_non_none[0]
+
+
 def lane_default_reasoning_effort(profiles: Sequence[GatewayWireProfile]) -> str | None:
     """Return the depth a level-less "think" asks for on a route of effort rungs.
 
