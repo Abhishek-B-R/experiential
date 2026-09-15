@@ -120,7 +120,14 @@ pub fn rejected_model_not_found(dialect: Dialect, body: &str) -> bool {
         return false;
     };
     family_envelope(dialect, &value)
-        .is_some_and(|envelope| envelope.code.as_deref() == Some(MODEL_NOT_FOUND_CODE))
+        // Novita spells the same verdict as its flat `reason` token,
+        // `MODEL_NOT_FOUND`; the comparison is case-insensitive for it.
+        .is_some_and(|envelope| {
+            envelope
+                .code
+                .as_deref()
+                .is_some_and(|code| code.eq_ignore_ascii_case(MODEL_NOT_FOUND_CODE))
+        })
 }
 
 /// Extract the provider's own explanation from one client-error body.
@@ -210,7 +217,12 @@ pub fn generic_error_code(token: &str) -> bool {
     let lower = token.to_ascii_lowercase();
     matches!(
         lower.as_str(),
-        "invalid_request_error" | "invalid_request" | "bad_request" | "error" | "invalid_argument"
+        "invalid_request_error"
+            | "invalid_request"
+            | "invalid_request_body"
+            | "bad_request"
+            | "error"
+            | "invalid_argument"
     ) || lower.chars().all(|c| c.is_ascii_digit())
 }
 

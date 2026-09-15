@@ -116,3 +116,22 @@ fn other_dialects_keep_reading_only_their_documented_message_field() {
         None
     );
 }
+
+#[test]
+fn novita_reason_tokens_classify_without_being_relayed_as_detail() {
+    // The documented 400 reason says nothing beyond "rejected", so it is
+    // classified but never relayed on its own; the flat MODEL_NOT_FOUND
+    // reason is the catalog's fault (lane policy), case-insensitively.
+    assert!(generic_error_code("INVALID_REQUEST_BODY"));
+    let missing =
+        r#"{"code":404,"reason":"MODEL_NOT_FOUND","message":"Model not found","metadata":{}}"#;
+    assert!(rejected_model_not_found(Dialect::OpenAiCompatible, missing));
+    assert!(!rejected_model_not_found(
+        Dialect::AnthropicMessages,
+        missing
+    ));
+    assert!(!rejected_model_not_found(
+        Dialect::OpenAiCompatible,
+        NOVITA_BODY
+    ));
+}

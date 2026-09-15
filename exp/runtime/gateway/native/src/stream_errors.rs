@@ -56,6 +56,8 @@ const INVALID_REQUEST_CODES: &[&str] = &[
     "unsupported_value",
     "failed_precondition",
     "out_of_range",
+    // Novita's flat-envelope 400 reason (documented LLM error table).
+    "invalid_request_body",
 ];
 /// pydantic/FastAPI validation tokens (`value_error.missing`, `type_error.integer`,
 /// `validation_error`): the origin refused the request's shape.
@@ -112,6 +114,8 @@ const THROTTLED_CODES: &[&str] = &[
     "resource_exhausted",
     "slow_down",
     "server_overloaded",
+    // Novita's per-token throttle beside its per-request one.
+    "token_limit_exceeded",
 ];
 const QUOTA_CODES: &[&str] = &[
     "insufficient_quota",
@@ -119,6 +123,8 @@ const QUOTA_CODES: &[&str] = &[
     "insufficient_credits",
     "billing_hard_limit_reached",
     "billing_not_active",
+    // Novita answers an unfunded account with HTTP 403 and this reason.
+    "not_enough_balance",
 ];
 const AUTHENTICATION_CODES: &[&str] = &[
     "authentication_error",
@@ -129,6 +135,9 @@ const AUTHENTICATION_CODES: &[&str] = &[
     "access_denied",
     "account_deactivated",
     "invalid_authentication",
+    // Novita's flat-envelope credential verdicts.
+    "failed_to_auth",
+    "access_deny",
 ];
 const NOT_FOUND_CODES: &[&str] = &["model_not_found", "not_found", "not_found_error"];
 
@@ -264,6 +273,14 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 /// filter, safety, or data-inspection code). Used where only the code may
 /// decide, never a sentence: a pre-stream 4xx body's prose can say "blocked by"
 /// about a rate limit or a firewall.
+pub fn is_quota_code(code: Option<&str>) -> bool {
+    code.is_some_and(|value| QUOTA_CODES.contains(&value.trim().to_ascii_lowercase().as_str()))
+}
+
+/// Whether one provider code names the ACCOUNT's funding state (out of
+/// quota, balance, or credits). Used where the HTTP status alone would file
+/// the body under another class: Novita answers an unfunded account with a
+/// 403 and OpenAI with a 429, a credential and a throttle status elsewhere.
 pub fn is_refusal_code(code: Option<&str>) -> bool {
     code.is_some_and(|value| {
         let lowered = value.trim().to_ascii_lowercase();

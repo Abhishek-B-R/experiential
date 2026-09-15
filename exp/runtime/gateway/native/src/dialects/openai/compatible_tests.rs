@@ -318,3 +318,74 @@ fn eof_after_finish_keeps_the_strict_tool_argument_contract() {
     let failure = failure.expect("broken arguments stay malformed");
     assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
 }
+#[test]
+fn a_resellers_flat_error_frame_is_classified_by_its_reason_token() {
+    // Novita declares failure inside a stream in the same flat envelope it
+    // answers pre-stream (no `error` object, the token under `reason`); each
+    // documented reason lands in its class with the sentence as detail.
+    let cases = [
+        (
+            json!({"code": 429, "reason": "RATE_LIMIT_EXCEEDED", "message": "Too many requests, please try again later", "metadata": {}}),
+            FailureClass::Throttled,
+        ),
+        (
+            json!({"code": 429, "reason": "TOKEN_LIMIT_EXCEEDED", "message": "Token limit exceeded, please try again later", "metadata": {}}),
+            FailureClass::Throttled,
+        ),
+        (
+            json!({"code": 400, "reason": "INVALID_REQUEST_BODY", "message": "max_tokens must be less than or equal to 131072", "metadata": {}}),
+            FailureClass::InvalidRequest,
+        ),
+        (
+            json!({"code": 403, "reason": "NOT_ENOUGH_BALANCE", "message": "Insufficient balance", "metadata": {}}),
+            FailureClass::ProviderQuota,
+        ),
+        (
+            json!({"code": 401, "reason": "FAILED_TO_AUTH", "message": "failed to authenticate API key", "metadata": {}}),
+            FailureClass::ProviderAuthentication,
+        ),
+        (
+            json!({"code": 503, "reason": "SERVICE_NOT_AVAILABLE", "message": "Service unavailable", "metadata": {}}),
+            FailureClass::ProviderInternal,
+        ),
+    ];
+    for (payload, expected) in cases {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+        let events = normalizer
+            .feed(&SseEvent {
+                event: None,
+                data: payload.to_string(),
+            })
+            .expect("a declared failure is an event, not a malformed frame");
+        let [Event::Failed(failure)] = events.as_slice() else {
+            panic!("expected one Failed event, got {events:?}");
+        };
+        assert_eq!(failure.failure_class, expected, "{payload}");
+        let message = payload["message"].as_str().unwrap();
+        assert!(
+            failure
+                .provider_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains(message)),
+            "the provider's sentence rides the failure into the ledger: {failure:?}"
+        );
+    }
+}
+
+#[test]
+fn a_frame_with_non_array_choices_names_its_shape_in_the_malformed_reason() {
+    // The malformed reason carries the frame's key names (never its values)
+    // so an unknown shape is diagnosable from the ledger.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    let failure = normalizer
+        .feed(&SseEvent {
+            event: None,
+            data: json!({"id": "chatcmpl-1", "object": "chat.completion.chunk", "choices": "nope", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}).to_string(),
+        })
+        .expect_err("a non-array choices stays malformed");
+    assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+    assert_eq!(
+        failure.safe_message,
+        "OpenAI-compatible choices must be an array (frame keys: choices, id, object, usage)"
+    );
+}
