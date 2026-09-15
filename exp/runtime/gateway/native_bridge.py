@@ -686,6 +686,13 @@ class NativeControlPlane(
             # upstream reports nothing before its final chunk. The ledger
             # never reads it; settlement keeps the provider's meters.
             response["input_token_estimate"] = counted_input_tokens(public_request)
+        if public_request.maximum_output_tokens is not None:
+            # The caller's own cap, whichever field spelled it. The data
+            # plane reads it only to classify a `stop` that carried no output
+            # and no usage report: capped, that is a budget the provider's
+            # hidden reasoning exhausted (`length`); uncapped, a failed
+            # attempt. An uncapped admission stays byte-identical.
+            response["maximum_output_tokens"] = public_request.maximum_output_tokens
         if request.surface == GatewayApiSurface.RESPONSES:
             response["surface"] = "responses"
             response["envelope"] = responses_envelope(public_request)

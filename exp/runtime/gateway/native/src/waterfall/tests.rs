@@ -194,3 +194,77 @@ fn failover_only_classes_skip_the_redial_and_advance() {
         false,
     ));
 }
+
+fn usage(output_tokens: Option<u64>, reasoning_tokens: Option<u64>) -> Usage {
+    Usage {
+        input_tokens: Some(9),
+        output_tokens,
+        cached_input_tokens: None,
+        cache_creation_input_tokens: None,
+        reasoning_tokens,
+    }
+}
+
+#[test]
+fn a_billed_stop_with_no_output_is_an_empty_completion() {
+    // The live OpenRouter DeepSeek shape: reasoning billed, nothing sent.
+    assert!(billed_empty_completion(
+        &Event::Completed,
+        Some(&usage(Some(147), Some(148)))
+    ));
+    // One EOS token and nothing else is still a paid-for empty answer.
+    assert!(billed_empty_completion(
+        &Event::Completed,
+        Some(&usage(Some(1), Some(0)))
+    ));
+    // A wire that reports thinking outside the output leg still counts it.
+    assert!(billed_empty_completion(
+        &Event::Completed,
+        Some(&usage(Some(0), Some(30)))
+    ));
+    let failure = Failure::empty_completion();
+    assert_eq!(failure.failure_class, FailureClass::ProviderInternal);
+    assert!(failure.retryable_same_deployment && failure.failover_eligible);
+}
+
+#[test]
+fn honest_output_less_endings_are_not_empty_completions() {
+    // A zero-token stop is the provider saying nothing, not billing for it.
+    assert!(!billed_empty_completion(
+        &Event::Completed,
+        Some(&usage(Some(0), None))
+    ));
+    // No usage report proves nothing was spent.
+    assert!(!billed_empty_completion(&Event::Completed, None));
+    // Truncation, a stop sequence, and a paused turn keep their own shapes.
+    let billed = usage(Some(16), None);
+    assert!(!billed_empty_completion(&Event::Incomplete, Some(&billed)));
+    assert!(!billed_empty_completion(
+        &Event::StoppedAtSequence("END".to_string()),
+        Some(&billed)
+    ));
+    assert!(!billed_empty_completion(&Event::PausedTurn, Some(&billed)));
+}
+
+#[test]
+fn a_stop_with_no_usage_report_and_no_output_is_an_unreported_empty_completion() {
+    // The live Meta muse-spark shape: empty stop, no usage frame at all.
+    assert!(unreported_empty_completion(&Event::Completed, None));
+    // A report of zero tokens is the provider accounting for "nothing".
+    assert!(!unreported_empty_completion(
+        &Event::Completed,
+        Some(&usage(Some(0), None))
+    ));
+    // A billed stop is the billed twin's case, never this one.
+    assert!(!unreported_empty_completion(
+        &Event::Completed,
+        Some(&usage(Some(12), None))
+    ));
+    // Truncation, a stop sequence and a paused turn keep their own shapes.
+    assert!(!unreported_empty_completion(&Event::Incomplete, None));
+    assert!(!unreported_empty_completion(
+        &Event::StoppedAtSequence("END".to_string()),
+        None
+    ));
+    assert!(!unreported_empty_completion(&Event::PausedTurn, None));
+}
