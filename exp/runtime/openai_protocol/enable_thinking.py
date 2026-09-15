@@ -120,10 +120,9 @@ def translate_enable_thinking(request: _ChatRequest) -> _EnableThinkingResult:
     # Explicit flat reasoning_effort wins: every present alternate field is a no-op
     # the caller is told about, and the flat value is passed through unchanged.
     if request.reasoning_effort is not None:
-        disclosures = [
-            *dropped,
-            *(_IGNORED.format(path=path) for path, present in alternates if present),
-        ]
+        # Each alternate object is ignored WHOLE, so its inner fields are not
+        # separately reported as translated or dropped.
+        disclosures = [_IGNORED.format(path=path) for path, present in alternates if present]
         return _EnableThinkingResult(request.reasoning_effort, False, tuple(disclosures))
 
     # No explicit flat value: fold the alternate fields into one intent. Each

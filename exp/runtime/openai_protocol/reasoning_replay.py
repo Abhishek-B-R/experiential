@@ -38,11 +38,22 @@ REASONING_DETAILS_TRANSLATED = "messages.reasoning_details->translated(reasoning
 """Disclosure: ``reasoning.text`` blocks were folded into plaintext replay."""
 
 REASONING_DETAILS_DROPPED = "messages.reasoning_details->dropped(not_replayable)"
-"""Disclosure: encrypted or summary blocks (or blocks shadowed by an explicit
-plaintext field) were validated and dropped."""
+"""Disclosure: encrypted or summary blocks were validated and dropped."""
+
+REASONING_DETAILS_SHADOWED = "messages.reasoning_details->dropped(shadowed)"
+"""Disclosure: the blocks were dropped whole because an explicit plaintext
+field (``reasoning_content`` or ``reasoning``) carried the turn's reasoning."""
 
 REASONING_TRANSLATED = "messages.reasoning->translated(reasoning_content)"
 """Disclosure: OpenRouter's plaintext ``reasoning`` was replayed as reasoning_content."""
+
+REASONING_SHADOWED = "messages.reasoning->dropped(shadowed_by_reasoning_content)"
+"""Disclosure: the plaintext ``reasoning`` was dropped because the gateway's
+own ``reasoning_content`` was present on the same turn."""
+
+
+class ReplayedReasoningTooLong(ValueError):
+    """The concatenated ``reasoning.text`` blocks exceed the plaintext replay bound."""
 
 
 class ReasoningDetail(BaseModel):
@@ -109,23 +120,35 @@ def fold_replayed_reasoning(
     Returns:
         The effective replay text (``None`` when the turn carries none) and
         the disclosures owed for the OpenRouter fields.
+
+    Raises:
+        ReplayedReasoningTooLong: The ``reasoning.text`` blocks together exceed
+            the plaintext replay bound.
     """
     details = tuple(reasoning_details or ())
     disclosures: list[str] = []
     if reasoning_content is not None:
-        if reasoning is not None or details:
-            disclosures.append(REASONING_DETAILS_DROPPED)
+        if reasoning is not None:
+            disclosures.append(REASONING_SHADOWED)
+        if details:
+            disclosures.append(REASONING_DETAILS_SHADOWED)
         return FoldedReasoning(reasoning_content, "reasoning_content", tuple(disclosures))
     if reasoning is not None:
         disclosures.append(REASONING_TRANSLATED)
         if details:
-            disclosures.append(REASONING_DETAILS_DROPPED)
+            disclosures.append(REASONING_DETAILS_SHADOWED)
         return FoldedReasoning(reasoning, "reasoning", tuple(disclosures))
-    texts = [
-        detail.text
-        for detail in details
-        if detail.type == REASONING_TEXT_DETAIL_TYPE and detail.text is not None
-    ]
+    texts: list[str] = []
+    total = 0
+    for detail in details:
+        if detail.type != REASONING_TEXT_DETAIL_TYPE or detail.text is None:
+            continue
+        total += len(detail.text)
+        if total > MAXIMUM_REASONING_CARRIER_BYTES:
+            # Bounded while accumulating: the joined text is never built past
+            # the limit the canonical block would refuse anyway.
+            raise ReplayedReasoningTooLong
+        texts.append(detail.text)
     if texts:
         disclosures.append(REASONING_DETAILS_TRANSLATED)
     if len(texts) != len(details):

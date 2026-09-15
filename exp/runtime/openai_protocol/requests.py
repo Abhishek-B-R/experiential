@@ -47,7 +47,10 @@ from exp.runtime.openai_protocol.manifest import (
 )
 from exp.runtime.openai_protocol.media_parts import message_content
 from exp.runtime.openai_protocol.prompt_cache_key_alias import fold_prompt_cache_key_alias
-from exp.runtime.openai_protocol.reasoning_replay import fold_replayed_reasoning
+from exp.runtime.openai_protocol.reasoning_replay import (
+    ReplayedReasoningTooLong,
+    fold_replayed_reasoning,
+)
 from exp.runtime.openai_protocol.responses_input import (
     ReplayedFunctionCall,
     ReplayedFunctionOutput,
@@ -558,11 +561,19 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
         provider_reasoning: tuple[
             SealedReasoningContentBlock | ExposedReasoningContentBlock, ...
         ] = ()
-        folded = fold_replayed_reasoning(
-            reasoning_content=message.reasoning_content,
-            reasoning=message.reasoning,
-            reasoning_details=message.reasoning_details,
-        )
+        try:
+            folded = fold_replayed_reasoning(
+                reasoning_content=message.reasoning_content,
+                reasoning=message.reasoning,
+                reasoning_details=message.reasoning_details,
+            )
+        except ReplayedReasoningTooLong as exc:
+            param = f"{prefix}.{message_index}.reasoning_details"
+            raise invalid_field(
+                param,
+                f"'{param}' plaintext reasoning exceeds 8,388,608 characters. "
+                "Shorten the replayed reasoning_details and retry.",
+            ) from exc
         if folded.plaintext is not None:
             param = f"{prefix}.{message_index}.{folded.source_field}"
             # The scheme is fixed by the carrier's own opaque prefix. A known
@@ -623,11 +634,16 @@ def _replayed_reasoning_disclosures(messages: Sequence[_Message]) -> tuple[str, 
     """Collect the OpenRouter replay disclosures owed across a transcript, once each."""
     disclosures: list[str] = []
     for message in messages:
-        folded = fold_replayed_reasoning(
-            reasoning_content=message.reasoning_content,
-            reasoning=message.reasoning,
-            reasoning_details=message.reasoning_details,
-        )
+        try:
+            folded = fold_replayed_reasoning(
+                reasoning_content=message.reasoning_content,
+                reasoning=message.reasoning,
+                reasoning_details=message.reasoning_details,
+            )
+        except ReplayedReasoningTooLong:
+            # ``_messages`` names the field in its own 400 before this runs
+            # on the Chat path; the Responses path folds the same message.
+            continue
         for disclosure in folded.disclosures:
             if disclosure not in disclosures:
                 disclosures.append(disclosure)

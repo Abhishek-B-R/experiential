@@ -381,13 +381,20 @@ def route_generation_parameter_requests(
         for profile in profiles:
             portable.intersection_update(_profile_reasoning_efforts(profile))
         portable_non_none = tuple(e for e in REASONING_EFFORTS if e in portable and e != "none")
-        if not portable_non_none and all(profile.supports_reasoning for profile in profiles):
-            # Every rung reasons intrinsically and offers no effort ladder to
-            # pin (kimi-k2-thinking, the DeepSeek thinking rungs): "turn
-            # thinking on" is already satisfied, so the enable is a disclosed
-            # no-op rather than the 400 that told callers to "choose a
-            # reasoning model" about a reasoning model (605 rejections across
-            # 44 organizations in the 7 days to 2026-09-15).
+        always_reasons = all(
+            profile.supports_reasoning and "none" not in _profile_reasoning_efforts(profile)
+            for profile in profiles
+        )
+        if not portable_non_none and always_reasons:
+            # Every rung reasons and none of them can be turned off (no
+            # ``none`` on any ladder: kimi-k2-thinking, the DeepSeek thinking
+            # rungs), so "turn thinking on" is already satisfied whichever
+            # rung serves; the enable is a disclosed no-op rather than the 400
+            # that told callers to "choose a reasoning model" about a
+            # reasoning model (605 rejections across 44 organizations in the
+            # 7 days to 2026-09-15). A route whose rungs CAN be off but share
+            # no on-tier keeps the rejection below: clearing the enable there
+            # could run the request without the reasoning the caller asked for.
             provider_updates["thinking_default_enable"] = False
             ignored.append(f"{effort_path}->ignored(model_always_reasons)")
         elif not portable_non_none:

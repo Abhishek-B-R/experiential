@@ -4544,7 +4544,8 @@ def test_chat_decoder_replays_openrouter_reasoning_details_as_plaintext_history(
     assert own_block.kind == "exposed_reasoning_content"
     assert own_block.content == "gateway text"
     assert both.request.ignored_parameters == (
-        "messages.reasoning_details->dropped(not_replayable)",
+        "messages.reasoning->dropped(shadowed_by_reasoning_content)",
+        "messages.reasoning_details->dropped(shadowed)",
     )
     # A reasoning-only assistant turn may ride the OpenRouter field too.
     reasoning_only = decode_chat(

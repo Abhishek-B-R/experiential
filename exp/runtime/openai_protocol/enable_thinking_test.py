@@ -194,3 +194,17 @@ def test_explicit_flat_effort_reports_every_present_alternate_spelling() -> None
         "reasoning->ignored(explicit_reasoning_effort)",
         "enable_thinking->ignored(explicit_reasoning_effort)",
     )
+
+
+def test_explicit_flat_effort_ignores_alternate_objects_whole() -> None:
+    """When the flat effort wins, an alternate object's inner fields are not
+    separately reported as translated or dropped."""
+    request = _decode(
+        reasoning_effort="low",
+        reasoning={"max_tokens": 2048, "exclude": True},
+        thinking={"type": "enabled", "budget_tokens": 4096},
+    )
+    assert request.ignored_parameters == (
+        "reasoning->ignored(explicit_reasoning_effort)",
+        "thinking->ignored(explicit_reasoning_effort)",
+    )
