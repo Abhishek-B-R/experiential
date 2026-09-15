@@ -852,8 +852,15 @@ async fn run_attempt(
                         // `max_tokens`, 2026-09-15). Answer `Incomplete` so
                         // the caller sees `length` and raises the cap,
                         // instead of an empty completed answer.
-                        return settle_output_less(ctx, guard, Event::Incomplete, usage, tool_names, depth)
-                            .await;
+                        return settle_output_less(
+                            ctx,
+                            guard,
+                            Event::Incomplete,
+                            usage,
+                            tool_names,
+                            depth,
+                        )
+                        .await;
                     }
                     // Uncapped, nothing sent, nothing accounted: the provider
                     // delivered nothing at all. Nothing was committed outward,
