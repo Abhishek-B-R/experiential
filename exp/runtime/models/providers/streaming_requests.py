@@ -46,7 +46,6 @@ from exp.runtime.models.providers.fireworks import (
 from exp.runtime.models.providers.generation_parameter_validation import (
     anthropic_reasoning_disengaged,
     disclose_anthropic_tool_schemas,
-    mid_conversation_system_present,
     require_assistant_prefill_supported,
     require_tool_names_supported,
     resolve_level_less_enable,
@@ -835,20 +834,6 @@ def route_generation_parameter_requests(
     require_tool_names_supported(profiles, request)
     disclose_anthropic_tool_schemas(profiles, request, ignored)
     disclose_system_fold(profiles, request, ignored)
-    # A mid-conversation system turn narrows out instruction-hoisting wires.
-    if mid_conversation_system_present(request) and any(
-        profile.dialect in {"gemini_generate_content", "bedrock_converse_stream"}
-        for profile in profiles
-    ):
-        raise ProviderParameterError(
-            message=(
-                "A system message after conversation start is not supported by this "
-                "model route. Move the instruction to the leading system prompt or "
-                "choose a different model."
-            ),
-            param="messages",
-            code="unsupported_parameter",
-        )
 
     encrypted_reasoning_present = any(
         block.kind == "encrypted_reasoning"

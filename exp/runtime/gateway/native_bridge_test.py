@@ -58,7 +58,10 @@ from exp.runtime.gateway.native_bridge_errors import capability_param as _public
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers.errors import ProviderCapabilityError
-from exp.runtime.models.providers.instruction_turns import SYSTEM_FOLD_DISCLOSURE
+from exp.runtime.models.providers.instruction_turns import (
+    HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE,
+    SYSTEM_FOLD_DISCLOSURE,
+)
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
@@ -6374,3 +6377,95 @@ def test_leading_only_rung_folds_mid_conversation_system_turns_on_chat_and_messa
     ]
     assert messages_payload[4]["content"] == "<total_tokens>1</total_tokens>"
     assert SYSTEM_FOLD_DISCLOSURE in cast(list[str], messages["ignored_parameters"])
+
+
+def test_gemini_rung_folds_a_mid_conversation_system_turn_instead_of_refusing(
+    tmp_path: Path,
+) -> None:
+    """Claude Code's Chat-wire shape against a Gemini alias is served, not refused.
+
+    A system turn after conversation start used to fail the whole route at
+    shaping ("A system message after conversation start is not supported by
+    this model route"; 1,747 requests in the seven days to 2026-09-15). On the
+    hoisting wire the leading run still rides systemInstruction, the later
+    instruction rides as user text at its position, and admission discloses
+    the fold.
+    """
+    from exp.common.models import GatewayTokenPrices
+    from exp.runtime.gateway.catalog_authority import (
+        ConnectionConfig,
+        upsert_connection,
+        upsert_singleton_deployment,
+    )
+
+    manager, raw_key = _configured_gateway(tmp_path)
+    upsert_connection(
+        tmp_path,
+        name="gemini-main",
+        connection=ConnectionConfig(provider="gemini", api_key_env="GEMINI_TEST_KEY"),
+        replace=False,
+    )
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="gem",
+        connection_name="gemini-main",
+        provider_model="gemini-2.5-pro",
+        exact_model_id="gemini-revision-exact",
+        revision=None,
+        capabilities=ModelCapabilities(),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="gem",
+        alias_name="gem",
+        revision_id="revision-gem",
+        pool_id="gem",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="gem")
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={
+                "TEST_PROVIDER_KEY": "provider-secret-canary",
+                "GEMINI_TEST_KEY": "gemini-secret-canary",
+            },
+        )
+    )
+    admission = _admit(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "gem",
+                "messages": [
+                    {"role": "system", "content": "You are Claude Code."},
+                    {"role": "user", "content": "Diagnose the regression."},
+                    {"role": "system", "content": "# Environment\nPlatform: linux"},
+                    {"role": "assistant", "content": "Reading the failing test first."},
+                    {"role": "user", "content": "Go ahead."},
+                ],
+            }
+        ),
+    )
+    route = admission["route"]
+    assert isinstance(route, list)
+    wire = route[0]
+    assert isinstance(wire, dict)
+    assert wire["dialect"] == "gemini_generate_content"
+    payload = wire["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert payload["systemInstruction"] == {"parts": [{"text": "You are Claude Code."}]}
+    assert payload["contents"] == [
+        {
+            "role": "user",
+            "parts": [{"text": "Diagnose the regression.\n\n# Environment\nPlatform: linux"}],
+        },
+        {"role": "model", "parts": [{"text": "Reading the failing test first."}]},
+        {"role": "user", "parts": [{"text": "Go ahead."}]},
+    ]
+    assert HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE in cast(list[str], admission["ignored_parameters"])

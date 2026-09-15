@@ -293,15 +293,3 @@ def disclose_anthropic_tool_schemas(
             note = f"tools[{index}].parameters->reshaped({kind})"
             if note not in ignored:
                 ignored.append(note)
-
-
-def mid_conversation_system_present(request: GatewayRequest) -> bool:
-    """Whether a system turn appears after the conversation has begun."""
-    conversation_started = False
-    for message in request.messages:
-        if message.role in {"system", "developer"} and message.provider_native_item is None:
-            if conversation_started:
-                return True
-        else:
-            conversation_started = True
-    return False

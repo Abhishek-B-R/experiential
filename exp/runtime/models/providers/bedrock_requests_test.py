@@ -278,3 +278,33 @@ def test_converse_request_emits_named_document_blocks_in_caller_order() -> None:
             }
         },
     ]
+
+
+def test_converse_folds_a_mid_conversation_system_turn_into_the_adjacent_user_turn() -> None:
+    """Converse's top-level system hoists only the leading run; later ones ride as user blocks.
+
+    After a tool result the folded instruction is merged into the same user
+    message by ``push`` (Converse requires alternating roles), so the
+    transcript stays well-formed with the text at its original position.
+    """
+    request = _tool_transcript_request()
+    payload = converse_request(
+        "us.anthropic.claude-sonnet-4-5",
+        request.model_copy(
+            update={
+                "messages": (
+                    *request.messages[:2],
+                    ModelMessage(role="system", content="Reply in lowercase."),
+                    *request.messages[2:],
+                    ModelMessage(role="system", content="<total_tokens>1</total_tokens>"),
+                )
+            }
+        ),
+    )
+    assert payload["system"] == [{"text": "You are precise."}]
+    messages = cast(list[JsonObject], payload["messages"])
+    assert [message["role"] for message in messages] == ["user", "assistant", "user"]
+    assert messages[0]["content"] == [{"text": "Create a ticket.\n\nReply in lowercase."}]
+    last = cast(list[JsonObject], messages[2]["content"])
+    assert "toolResult" in last[0]
+    assert last[1] == {"text": "<total_tokens>1</total_tokens>"}
