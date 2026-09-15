@@ -139,9 +139,25 @@ fn error_shaped_success_frames_declare_the_provider_failure_with_detail() {
             "INVALID_PARAMETER: tools is not supported by this model",
         ),
         (
-            json!({"detail": "An image input is required for this model."}),
+            // A FastAPI validation list is the origin refusing the request's
+            // shape: its pydantic token classifies it as the caller's error.
+            json!({"detail": [{"loc": ["body", "messages", 0, "content"],
+                   "msg": "field required", "type": "value_error.missing"}]}),
+            FailureClass::InvalidRequest,
+            "value_error.missing: field required",
+        ),
+        (
+            // A plain-string detail names no class; it stays the provider's
+            // failure with its sentence kept for the ledger.
+            json!({"detail": "The origin could not load the model."}),
             FailureClass::ProviderInternal,
-            "An image input is required for this model.",
+            "The origin could not load the model.",
+        ),
+        (
+            // API Management's envelope carries only a status and a sentence.
+            json!({"statusCode": 400, "message": "Invalid request body."}),
+            FailureClass::InvalidRequest,
+            "400: Invalid request body.",
         ),
     ] {
         let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
@@ -162,4 +178,14 @@ fn error_shaped_success_frames_declare_the_provider_failure_with_detail() {
             "{payload}"
         );
     }
+    // A frame with no `choices` and no error marker is not an envelope: it
+    // keeps the strict malformed contract instead of settling as a failure.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    let malformed = normalizer
+        .feed(&SseEvent {
+            event: None,
+            data: json!({"message": "warming up"}).to_string(),
+        })
+        .expect_err("a bare message is not a declared failure");
+    assert_eq!(malformed.failure_class, FailureClass::MalformedResponse);
 }

@@ -60,14 +60,19 @@ impl Normalizer {
         // into the ledger. The shared envelope reader covers every spelling
         // the family answers: the documented `error` object, xAI's string
         // `error`, and the flat vLLM / Novita / FastAPI objects.
-        let declares_error = payload.get("error").is_some_and(|value| !value.is_null())
-            || (!payload.contains_key("choices")
-                && (payload.get("object").and_then(Value::as_str) == Some("error")
-                    || payload.contains_key("detail")
-                    || (payload.contains_key("message") && payload.contains_key("code"))));
-        if declares_error {
-            let document = Value::Object(payload.clone());
-            let envelope = crate::error_envelope::openai_family_envelope(&document);
+        // The reader itself decides what is error-shaped: a frame with a
+        // non-null `error`, or one carrying no `choices` that the reader
+        // recognizes (a flat object needs an error marker, so an ordinary
+        // chunk is never read as a failure).
+        let document = Value::Object(payload.clone());
+        let envelope = if payload.get("error").is_some_and(|value| !value.is_null())
+            || !payload.contains_key("choices")
+        {
+            crate::error_envelope::openai_family_envelope(&document)
+        } else {
+            None
+        };
+        if envelope.is_some() {
             let (code, message) = match envelope {
                 Some(envelope) => {
                     let message = envelope.message.map(|message| {

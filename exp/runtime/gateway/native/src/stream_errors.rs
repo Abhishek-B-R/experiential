@@ -57,6 +57,14 @@ const INVALID_REQUEST_CODES: &[&str] = &[
     "failed_precondition",
     "out_of_range",
 ];
+/// pydantic/FastAPI validation tokens (`value_error.missing`, `type_error.integer`,
+/// `validation_error`): the origin refused the request's shape.
+fn is_validation_code(code: &str) -> bool {
+    ["value_error", "type_error", "validation_error"]
+        .iter()
+        .any(|prefix| code == *prefix || code.starts_with(&format!("{prefix}.")))
+}
+
 /// Provider codes that are content verdicts, grouped by the bounded reason
 /// each names. The flat union is `REFUSAL_CODES`.
 const CYBER_POLICY_CODES: &[&str] = &[
@@ -371,6 +379,7 @@ pub fn classify_stream_error(code: Option<&str>, message: Option<&str>) -> Strea
     }
     if INVALID_REQUEST_CODES.contains(&code_ref)
         || numeric_class == Some(FailureClass::InvalidRequest)
+        || is_validation_code(code_ref)
     {
         return StreamErrorKind::InvalidRequest;
     }
