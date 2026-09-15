@@ -309,7 +309,12 @@ engine-derived ones); OpenRouter's `reasoning` object (`effort`, or a `max_token
 effort (a budget becomes a budgeted `thinking` config on Anthropic rungs and the nearest tier
 elsewhere), and when it is present it wins: a `thinking` config beside it and a disagreeing
 `output_config.effort` drop with disclosure, `exclude` is disclosed rather than honored, and an
-effort the route cannot serve is rejected as `reasoning.effort`; mid-conversation `system` turns keep their position on wires that express
+effort the route cannot serve is rejected as `reasoning.effort`. The Chat surface admits the
+same OpenRouter object (`effort`, `enabled`, `max_tokens` snapped to the nearest tier, `exclude`
+disclosed) beside the other enable-thinking spellings (`thinking`, `chat_template_kwargs`,
+DashScope's top-level `enable_thinking`), all translated to the one canonical effort, and
+replays OpenRouter's `reasoning` / `reasoning_details` (the `reasoning.text` blocks) as the
+same caller-owned plaintext history a `reasoning_content` echo is; mid-conversation `system` turns keep their position on wires that express
 them (instruction-hoisting rungs narrow out), and `thinking.display` rides the verbatim thinking
 config. The conditional Claude Code fields `diagnostics` and `speed` forward verbatim on
 Anthropic rungs with their required `anthropic-beta` tokens and drop with disclosure elsewhere.

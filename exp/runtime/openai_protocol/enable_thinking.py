@@ -15,6 +15,7 @@ for a level-less enable is resolved later, at the route adaptation seam, via
 from __future__ import annotations
 
 from exp.common.models.model import ReasoningEffort
+from exp.runtime.models.providers.reasoning_compat import thinking_config_reasoning_effort
 from exp.runtime.openai_protocol.errors import invalid_field
 from exp.runtime.openai_protocol.wire_models import _ChatRequest
 
@@ -22,7 +23,7 @@ from exp.runtime.openai_protocol.wire_models import _ChatRequest
 _TRANSLATED = "{path}->translated(reasoning_effort)"
 _IGNORED = "{path}->ignored(explicit_reasoning_effort)"
 _BUDGET_DROPPED = "budget_tokens->dropped(not_carried)"
-_MAX_TOKENS_DROPPED = "reasoning.max_tokens->dropped(not_carried)"
+_MAX_TOKENS_TRANSLATED = "reasoning.max_tokens->translated(reasoning_effort)"
 _EXCLUDE_DROPPED = "reasoning.exclude->dropped(not_carried)"
 
 
@@ -76,9 +77,10 @@ def translate_enable_thinking(request: _ChatRequest) -> _EnableThinkingResult:
     The explicit flat ``reasoning_effort`` always wins; a level-less enable defers
     to the model default (``thinking_default_enable``). Alternate fields that
     disagree on enable-vs-disable are a caller error and rejected by name.
-    OpenRouter's ``max_tokens`` budget and ``exclude`` switch have no canonical
-    equivalent and are disclosed as not carried (like Anthropic's
-    ``budget_tokens``); they still count as the enable they imply.
+    OpenRouter's ``max_tokens`` budget maps to the nearest effort tier through
+    the same table the Messages surface uses for a thinking budget (disclosed as
+    translated); ``exclude`` has no canonical equivalent and is disclosed as not
+    carried.
     """
     reasoning = request.reasoning
     reasoning_intent = _reasoning_object_intent(request)
@@ -104,7 +106,7 @@ def translate_enable_thinking(request: _ChatRequest) -> _EnableThinkingResult:
     if request.thinking is not None and request.thinking.budget_tokens is not None:
         dropped.append(_BUDGET_DROPPED)
     if reasoning is not None and reasoning.max_tokens is not None:
-        dropped.append(_MAX_TOKENS_DROPPED)
+        dropped.append(_MAX_TOKENS_TRANSLATED)
     if reasoning is not None and reasoning.exclude:
         dropped.append(_EXCLUDE_DROPPED)
 
@@ -149,8 +151,14 @@ def translate_enable_thinking(request: _ChatRequest) -> _EnableThinkingResult:
     if votes[0] is False:
         # All present fields disable → canonical none.
         return _EnableThinkingResult("none", False, tuple(disclosures))
-    # Enabled: a nested reasoning effort pins the level; otherwise defer the
-    # model-aware default to the adaptation seam.
+    # Enabled: a nested reasoning effort pins the level, a budget snaps to its
+    # nearest tier; otherwise defer the model-aware default to the adaptation
+    # seam.
     if reasoning is not None and reasoning.effort is not None:
         return _EnableThinkingResult(reasoning.effort, False, tuple(disclosures))
+    if reasoning is not None and reasoning.max_tokens is not None:
+        budget_effort = thinking_config_reasoning_effort(
+            {"type": "enabled", "budget_tokens": reasoning.max_tokens}
+        )
+        return _EnableThinkingResult(budget_effort, False, tuple(disclosures))
     return _EnableThinkingResult(None, True, tuple(disclosures))

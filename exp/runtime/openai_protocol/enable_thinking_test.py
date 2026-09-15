@@ -148,13 +148,16 @@ def test_openrouter_reasoning_enabled_translates_to_the_canonical_control() -> N
     assert disabled.thinking_default_enable is False
 
 
-def test_openrouter_reasoning_budget_enables_and_is_disclosed_not_carried() -> None:
-    """A ``max_tokens`` budget implies enable; the budget itself has no canonical carrier."""
-    request = _decode(reasoning={"max_tokens": 2048})
-    assert request.reasoning_effort is None
-    assert request.thinking_default_enable is True
+@pytest.mark.parametrize(
+    ("budget", "effort"), [(1024, "low"), (4096, "low"), (8192, "medium"), (32768, "high")]
+)
+def test_openrouter_reasoning_budget_snaps_to_the_nearest_tier(budget: int, effort: str) -> None:
+    """A ``max_tokens`` budget maps through the Messages surface's budget table."""
+    request = _decode(reasoning={"max_tokens": budget})
+    assert request.reasoning_effort == effort
+    assert request.thinking_default_enable is False
     assert request.ignored_parameters == (
-        "reasoning.max_tokens->dropped(not_carried)",
+        "reasoning.max_tokens->translated(reasoning_effort)",
         "reasoning->translated(reasoning_effort)",
     )
 
