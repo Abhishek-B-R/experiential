@@ -49,13 +49,11 @@ from exp.runtime.models.providers.generation_parameter_validation import (
     mid_conversation_system_present,
     require_assistant_prefill_supported,
     require_tool_names_supported,
+    resolve_level_less_enable,
     serves_reasoning_summary,
 )
 from exp.runtime.models.providers.generation_parameter_validation import (
     effective_profile_reasoning_effort as _effective_profile_reasoning_effort,
-)
-from exp.runtime.models.providers.generation_parameter_validation import (
-    lane_default_reasoning_effort as _lane_default_reasoning_effort,
 )
 from exp.runtime.models.providers.generation_parameter_validation import (
     profile_reasoning_efforts as _profile_reasoning_efforts,
@@ -367,41 +365,15 @@ def route_generation_parameter_requests(
     ):
         ignore("presence_penalty", "presence_penalty->dropped(unsupported_by_provider)")
     if request.thinking_default_enable and request.reasoning_effort is None:
-        # A level-less "enable thinking" (from a translated thinking:{enabled} /
-        # thinking:{adaptive} or chat_template_kwargs:{enable_thinking:true})
-        # resolves to the model's own default effort here, at the serving route,
-        # the same way the Messages surface resolves a budget-less config: the
-        # LANE default (the first rung in route order pinning an active catalog
-        # ``reasoning_default_effort``) when every rung can serve it, else a
-        # route-wide required default when portable, else the LOWEST portable
-        # non-none tier (default-not-high avoids surprising cost). A route that
-        # supports no reasoning effort cannot enable thinking, so it surfaces
-        # rather than silently not thinking.
-        portable = set(REASONING_EFFORTS)
-        for profile in profiles:
-            portable.intersection_update(_profile_reasoning_efforts(profile))
-        portable_non_none = tuple(e for e in REASONING_EFFORTS if e in portable and e != "none")
-        if not portable_non_none:
-            raise ProviderParameterError(
-                message=(
-                    "This model route cannot enable thinking: it supports no reasoning "
-                    "effort. Remove the enable-thinking field or choose a reasoning model."
-                ),
-                param=effort_path,
-                code="unsupported_parameter",
-            )
-        lane_default = _lane_default_reasoning_effort(profiles)
-        required_defaults = {
-            profile.reasoning_effort
-            for profile in profiles
-            if profile.reasoning_effort_required and profile.reasoning_effort in portable_non_none
-        }
-        if lane_default in portable_non_none:
-            provider_updates["reasoning_effort"] = lane_default
-        elif len(required_defaults) == 1:
-            provider_updates["reasoning_effort"] = next(iter(required_defaults))
+        # A level-less "enable thinking" (a translated thinking:{enabled|adaptive},
+        # chat_template_kwargs / enable_thinking, reasoning:{enabled}) resolves
+        # to the route's default depth here (generation_parameter_validation).
+        resolved_default = resolve_level_less_enable(profiles, effort_path=effort_path)
+        if resolved_default is None:
+            provider_updates["thinking_default_enable"] = False
+            ignored.append(f"{effort_path}->ignored(model_always_reasons)")
         else:
-            provider_updates["reasoning_effort"] = portable_non_none[0]
+            provider_updates["reasoning_effort"] = resolved_default
     if request.reasoning_effort is not None:
         portable_efforts = set(REASONING_EFFORTS)
         for profile in profiles:

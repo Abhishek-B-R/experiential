@@ -1823,6 +1823,53 @@ def test_thinking_default_enable_on_a_non_reasoning_route_surfaces() -> None:
     assert raised.value.code == "unsupported_parameter"
 
 
+def test_thinking_default_enable_on_an_always_reasoning_route_is_a_disclosed_no_op() -> None:
+    """A route whose every rung reasons intrinsically (no effort ladder to pin)
+    already satisfies "turn thinking on": the enable is disclosed, never a 400
+    telling the caller to pick a reasoning model about a reasoning model."""
+    profiles = tuple(
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url=f"https://{name}.test",
+            model_id=f"{name}/always-thinks",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+            supported_reasoning_efforts=ladder,
+        )
+        # Both rungs reason; their ladders share no tier to pin.
+        for name, ladder in (("lead", ("low",)), ("spill", ("high",)))
+    )
+    request = _chat_request().model_copy(update={"thinking_default_enable": True})
+
+    public_request, provider = route_generation_parameter_requests(profiles, request)
+
+    assert provider.reasoning_effort is None
+    assert provider.thinking_default_enable is False
+    assert "reasoning_effort->ignored(model_always_reasons)" in public_request.ignored_parameters
+
+
+def test_thinking_default_enable_on_optional_reasoning_rungs_with_no_shared_tier_rejects() -> None:
+    """Rungs that CAN be off (``none`` on the ladder) but share no on-tier still
+    reject: clearing the enable could serve the request without reasoning."""
+    profiles = tuple(
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url=f"https://{name}.test",
+            model_id=f"{name}/optional",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+            supported_reasoning_efforts=ladder,
+        )
+        for name, ladder in (("lead", ("none", "low")), ("spill", ("none", "high")))
+    )
+    request = _chat_request().model_copy(update={"thinking_default_enable": True})
+
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(profiles, request)
+
+    assert raised.value.code == "unsupported_parameter"
+
+
 def test_payload_builder_rejects_conditional_sampling_without_admission() -> None:
     """Direct provider use retains the same local guard as gateway admission."""
     with pytest.raises(ProviderParameterError, match="reasoning_effort is 'none'"):

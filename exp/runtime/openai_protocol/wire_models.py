@@ -24,6 +24,7 @@ from exp.common.models.content import (
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort
 from exp.runtime.gateway.reasoning_carrier import MAXIMUM_REASONING_CARRIER_BYTES
 from exp.runtime.openai_protocol.cache_control import EphemeralCacheControl
+from exp.runtime.openai_protocol.reasoning_replay import ReasoningDetail
 
 
 class _WireModel(BaseModel):
@@ -264,6 +265,15 @@ class _AssistantToolCall(_WireModel):
     type: Literal["function"] = "function"
     function: _FunctionCall
     cache_control: EphemeralCacheControl | None = None
+    index: int | None = Field(default=None, ge=0)
+    """Streaming delta ordinal, validated and dropped.
+
+    Accumulators that assemble an assistant message from ``tool_calls``
+    stream deltas keep the delta's ``index`` on the finished call and replay
+    it with the message; OpenAI ignores it on a request (2,069 rejections
+    across 99 organizations in the 7 days to 2026-09-15). It orders nothing
+    here: the array position already does.
+    """
 
 
 class _Message(_WireModel):
@@ -313,6 +323,16 @@ class _Message(_WireModel):
         default=None,
         max_length=MAXIMUM_REASONING_CARRIER_BYTES,
     )
+    reasoning: str | None = Field(default=None, max_length=MAXIMUM_REASONING_CARRIER_BYTES)
+    """OpenRouter's plaintext reasoning on a replayed assistant turn.
+
+    OpenRouter returns the model's reasoning as ``message.reasoning`` and
+    documents passing it back on the next turn; the gateway folds it onto
+    the same plaintext replay path as ``reasoning_content``
+    (:mod:`exp.runtime.openai_protocol.reasoning_replay`).
+    """
+    reasoning_details: tuple[ReasoningDetail, ...] | None = None
+    """OpenRouter's structured reasoning blocks on a replayed assistant turn."""
 
     @property
     def image_capable_parts(self) -> tuple[_ContentPart, ...]:
@@ -332,6 +352,8 @@ class _Message(_WireModel):
             and self.content is None
             and not self.history_tool_calls
             and self.reasoning_content is None
+            and self.reasoning is None
+            and not self.reasoning_details
         ):
             # A reasoning-only assistant turn is a shape the gateway itself
             # returns (an exposed rung's length-cut thinking turn: content null,
@@ -345,8 +367,15 @@ class _Message(_WireModel):
             raise ValueError("name is valid only for tool messages")
         if self.role != "assistant" and self.history_tool_calls:
             raise ValueError("tool_calls are valid only for assistant messages")
-        if self.role != "assistant" and self.reasoning_content is not None:
-            raise ValueError("reasoning_content is valid only for assistant messages")
+        if self.role != "assistant" and (
+            self.reasoning_content is not None
+            or self.reasoning is not None
+            or self.reasoning_details is not None
+        ):
+            raise ValueError(
+                "reasoning_content, reasoning, and reasoning_details are valid only "
+                "for assistant messages"
+            )
         # Tool results carry images (agents report screenshots there); other roles stay text-only.
         media = {type(part) for part in self.image_capable_parts} - {_TextPart}
         if media and self.role not in ("user", "tool"):
@@ -439,11 +468,26 @@ class _ChatStreamOptions(_WireModel):
 
 
 class _ChatReasoning(_WireModel):
-    """Nested ``reasoning`` object on a Chat request (the Responses shape some
-    clients also send on /v1/chat/completions). Translated to the canonical flat
-    ``reasoning_effort``; only ``effort`` is accepted here."""
+    """Nested ``reasoning`` object on a Chat request.
+
+    The Responses-style ``effort`` some clients send on /v1/chat/completions,
+    plus OpenRouter's unified reasoning object (``enabled``, ``max_tokens``,
+    ``exclude``; docs "Reasoning Tokens", read 2026-09-15). All are translated
+    to the canonical reasoning control at decode; ``effort`` and ``max_tokens``
+    are mutually exclusive there as on OpenRouter.
+    """
 
     effort: ReasoningEffort | None = None
+    enabled: bool | None = None
+    max_tokens: int | None = Field(default=None, gt=0)
+    exclude: bool | None = None
+
+    @model_validator(mode="after")
+    def _require_one_depth_control(self) -> _ChatReasoning:
+        """Reject an effort tier beside a token budget (OpenRouter's own rule)."""
+        if self.effort is not None and self.max_tokens is not None:
+            raise ValueError("reasoning.effort and reasoning.max_tokens are mutually exclusive")
+        return self
 
 
 class _ThinkingConfig(_WireModel):
@@ -533,6 +577,11 @@ class _ChatRequest(_WireModel):
     reasoning: _ChatReasoning | None = None
     thinking: _ThinkingConfig | None = None
     chat_template_kwargs: _ChatTemplateKwargs | None = None
+    enable_thinking: bool | None = None
+    """DashScope's top-level enable-thinking switch (``extra_body``), translated
+    like the vLLM ``chat_template_kwargs`` spelling: Qwen-family clients send it
+    on every request (4,658 rejections across 110 organizations in the 7 days
+    to 2026-09-15)."""
     response_format: _ChatResponseFormat | None = None
     stream: bool = False
     stream_options: _ChatStreamOptions | None = None
@@ -552,65 +601,6 @@ class _ChatRequest(_WireModel):
         if self.stream_options is not None and not self.stream:
             raise ValueError("stream_options requires stream=true")
         return self
-
-
-class _EmbeddingsRequest(_WireModel):
-    """Closed gateway embeddings request profile.
-
-    ``input`` narrows the official OpenAI union to text only: the token-array
-    forms (``list[int]`` / ``list[list[int]]``) pass official validation but
-    are rejected here with a field-specific 400, since this surface serves
-    visible text, not pre-tokenized ids.
-    """
-
-    model: str = Field(min_length=1, max_length=256)
-    input: str | tuple[str, ...]
-    dimensions: int | None = Field(default=None, gt=0)
-    encoding_format: Literal["float", "base64"] | None = None
-    user: str | None = Field(default=None, max_length=1024)
-
-    @field_validator("input")
-    @classmethod
-    def _require_nonempty_input(cls, value: str | tuple[str, ...]) -> str | tuple[str, ...]:
-        """Reject empty text, an empty array, or empty array members."""
-        if isinstance(value, str):
-            if not value:
-                raise ValueError("input must not be an empty string")
-            return value
-        if not value:
-            raise ValueError("input must not be an empty array")
-        if any(not text for text in value):
-            raise ValueError("input array must not contain empty strings")
-        return value
-
-
-class _ImagesRequest(_WireModel):
-    """Closed gateway image-generation request profile (OpenAI Images API)."""
-
-    model: str = Field(min_length=1, max_length=256)
-    prompt: str = Field(min_length=1, max_length=32_000)
-    n: int | None = Field(default=None, ge=1, le=10)
-    size: (
-        Literal[
-            "auto",
-            "256x256",
-            "512x512",
-            "1024x1024",
-            "1536x1024",
-            "1024x1536",
-            "1792x1024",
-            "1024x1792",
-        ]
-        | None
-    ) = None
-    quality: Literal["standard", "hd", "low", "medium", "high", "auto"] | None = None
-    background: Literal["transparent", "opaque", "auto"] | None = None
-    output_format: Literal["png", "jpeg", "webp"] | None = None
-    output_compression: int | None = Field(default=None, ge=0, le=100)
-    moderation: Literal["low", "auto"] | None = None
-    response_format: Literal["url", "b64_json"] | None = None
-    style: Literal["vivid", "natural"] | None = None
-    user: str | None = Field(default=None, max_length=1024)
 
 
 class _ResponseTool(_WireModel):

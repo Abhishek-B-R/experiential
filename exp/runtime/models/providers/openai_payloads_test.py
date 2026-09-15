@@ -434,3 +434,33 @@ def test_undeclared_rungs_keep_their_mid_conversation_system_turns() -> None:
     payload = openai_compatible_stream_payload("qwen3.8-27b", _claude_code_tool_loop_shape())
     roles = [m["role"] for m in cast(list[JsonObject], payload["messages"])]
     assert roles == ["system", "user", "system", "assistant", "tool", "system"]
+
+
+def test_responses_wire_emits_instruction_only_requests_as_input_items() -> None:
+    """A request that is only instructions still sends a non-empty ``input``.
+
+    The provider refuses an empty ``input`` ("One of 'input' or
+    'previous_response_id' ... must be provided") but serves the same
+    instructions as input items (probed live 2026-09-15, api.openai.com);
+    845 Responses attempts for one organization were billed as provider
+    rejections in three days for exactly this shape.
+    """
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="system", content="You are terse."),
+            GatewayMessage(role="developer", content="Answer in French."),
+        ),
+        stream=True,
+    )
+    payload = openai_responses_stream_payload("gpt-5.4", request, supports_temperature=True)
+    assert payload["input"] == [
+        {"role": "system", "content": "You are terse."},
+        {"role": "developer", "content": "Answer in French."},
+    ]
+    assert "instructions" not in payload
+    # With a conversation present, leading instructions keep riding the field.
+    conversational = openai_responses_stream_payload(
+        "gpt-5.4", _developer_conversation(), supports_temperature=True
+    )
+    assert conversational["instructions"] == "Follow policy."
