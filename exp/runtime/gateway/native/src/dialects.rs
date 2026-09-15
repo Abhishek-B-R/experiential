@@ -550,23 +550,39 @@ impl Normalizer {
     /// Synthesize the terminal events for a stream that closed cleanly without
     /// an explicit terminal frame.
     ///
-    /// Gemini legitimately ends some streams right after its last content frame
-    /// without a `finishReason` frame. When content was already emitted, fold
-    /// the last-seen usage and complete normally instead of rejecting a real
-    /// answer as malformed; a stream that produced no content at all stays
-    /// terminal-less so `stream_ended` (or the relay) still fails it closed.
-    /// Returns no events when a terminal already ended the stream.
-    pub fn on_stream_end(&mut self) -> Vec<Event> {
-        if self.terminal || self.dialect != Dialect::GeminiGenerateContent || !self.emitted_output {
-            return Vec::new();
+    /// Two dialects legitimately end a stream this way. Gemini ends some
+    /// streams right after its last content frame without a `finishReason`
+    /// frame: when content was already emitted, fold the last-seen usage and
+    /// complete normally instead of rejecting a real answer as malformed. An
+    /// OpenAI-compatible server may send its `finish_reason` chunk and close
+    /// without the `[DONE]` sentinel (Azure AI Foundry's DeepSeek lanes do so
+    /// on a content-filtered turn): the finish reason already names the
+    /// ending, so it settles exactly as `[DONE]` would (refusal, Incomplete,
+    /// or Completed) — see `openai_compatible_stream_end`. A stream that
+    /// produced neither stays terminal-less so `stream_ended` (or the relay)
+    /// still fails it closed. Returns no events when a terminal already ended
+    /// the stream; an error only when finishing the open tool calls fails
+    /// (a syntactically invalid streamed argument object stays malformed).
+    pub fn on_stream_end(&mut self) -> Result<Vec<Event>, Failure> {
+        if self.terminal {
+            return Ok(Vec::new());
         }
-        let mut events = Vec::new();
-        if let Some(usage) = self.usage.take() {
-            events.push(Event::Usage(usage));
+        let events = match self.dialect {
+            Dialect::OpenAiCompatible => self.openai_compatible_stream_end()?,
+            Dialect::GeminiGenerateContent if self.emitted_output => {
+                let mut events = Vec::new();
+                if let Some(usage) = self.usage.take() {
+                    events.push(Event::Usage(usage));
+                }
+                events.push(Event::Completed);
+                events
+            }
+            _ => Vec::new(),
+        };
+        if events.iter().any(Event::is_terminal) {
+            self.terminal = true;
         }
-        events.push(Event::Completed);
-        self.terminal = true;
-        events
+        Ok(events)
     }
 
     /// Recover a Gemini stream that emitted content and then terminated
@@ -677,7 +693,10 @@ pub fn drain_stream_fixture(dialect: Dialect, chunks: &[Vec<u8>]) -> (Vec<Value>
     }
     // A clean stream close after content, with no terminal frame, completes
     // normally (mirroring the relay's EOF handling) instead of failing closed.
-    let synthesized = normalizer.on_stream_end();
+    let synthesized = match normalizer.on_stream_end() {
+        Ok(events) => events,
+        Err(failure) => return recover_or_report(&mut normalizer, simplified, failure),
+    };
     if !synthesized.is_empty() {
         simplified.extend(synthesized.iter().map(simplified_event));
         return (simplified, None);
