@@ -827,6 +827,14 @@ pub struct ToolAccumulator {
     /// Bytes streamed after the argument object closed, never emitted to the
     /// caller; reconciled by [`ToolAccumulator::complete`].
     pub withheld_tail: String,
+    /// Whether the call's start (its name) has been emitted to the caller. A
+    /// relay may open a tool entry with an empty name and supply it later;
+    /// until then the entry accumulates silently and, if it never earns a
+    /// name or an argument, is dropped as a phantom instead of failing.
+    pub started: bool,
+    /// Whether the call id was minted by the gateway because the provider
+    /// streamed a null or empty one; a later restated id is then ignored.
+    pub id_synthesized: bool,
 }
 
 /// Opaque tool IDs share the Python model bound, including signature carriers.
@@ -847,6 +855,8 @@ impl ToolAccumulator {
             server: false,
             scan: JsonValueScan::default(),
             withheld_tail: String::new(),
+            started: true,
+            id_synthesized: false,
         }
     }
 

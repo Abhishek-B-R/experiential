@@ -11,7 +11,10 @@ mod anthropic;
 mod bedrock;
 mod deferred_tools;
 mod relay_finish;
-pub(in crate::dialects) use relay_finish::finish_open_tools_relay;
+mod stream_end;
+pub(in crate::dialects) use relay_finish::{
+    complete_streamed_tool_or_drop_cut, drop_cut_call, finish_open_tools_relay,
+};
 mod gemini;
 mod openai;
 
@@ -266,6 +269,9 @@ fn complete_streamed_tool(
     tool: &mut ToolAccumulator,
     events: &mut Vec<Event>,
 ) -> Result<(), Failure> {
+    if relay_finish::drop_phantom_tool(tool) {
+        return Ok(());
+    }
     tool.completed = true;
     // Only JSON function calls need the empty-object seed; custom (freeform)
     // input is legitimately empty text.
@@ -293,7 +299,7 @@ fn complete_streamed_tool(
         let bytes = tool.raw_arguments.len() + tool.withheld_tail.len();
         let line = serde_json::json!({
             "event": "malformed_tool_arguments",
-            "name": tool.name,
+            "name": bounded_wire_token(&tool.name),
             "bytes": bytes,
             "reason": message,
         });
@@ -406,6 +412,9 @@ pub struct Normalizer {
     // `messageStop` both follow the block): a budget truncation drops the
     // call and ends Incomplete; any other ending surfaces this failure.
     deferred_tool_failure: Option<Failure>,
+    // A call the provider cut mid-fragment was dropped under an ending that
+    // did not declare truncation; the terminal then settles Incomplete.
+    dropped_cut_call: bool,
 }
 
 impl Normalizer {
@@ -440,6 +449,7 @@ impl Normalizer {
             reasoning_content_route_sha256,
             request_words: Vec::new(),
             deferred_tool_failure: None,
+            dropped_cut_call: false,
         }
     }
 
@@ -545,44 +555,6 @@ impl Normalizer {
             FailureClass::MalformedResponse,
             "provider stream ended without a terminal event",
         ))
-    }
-
-    /// Synthesize the terminal events for a stream that closed cleanly without
-    /// an explicit terminal frame.
-    ///
-    /// Two dialects legitimately end a stream this way. Gemini ends some
-    /// streams right after its last content frame without a `finishReason`
-    /// frame: when content was already emitted, fold the last-seen usage and
-    /// complete normally instead of rejecting a real answer as malformed. An
-    /// OpenAI-compatible server may send its `finish_reason` chunk and close
-    /// without the `[DONE]` sentinel (Azure AI Foundry's DeepSeek lanes do so
-    /// on a content-filtered turn): the finish reason already names the
-    /// ending, so it settles exactly as `[DONE]` would (refusal, Incomplete,
-    /// or Completed) — see `openai_compatible_stream_end`. A stream that
-    /// produced neither stays terminal-less so `stream_ended` (or the relay)
-    /// still fails it closed. Returns no events when a terminal already ended
-    /// the stream; an error only when finishing the open tool calls fails
-    /// (a syntactically invalid streamed argument object stays malformed).
-    pub fn on_stream_end(&mut self) -> Result<Vec<Event>, Failure> {
-        if self.terminal {
-            return Ok(Vec::new());
-        }
-        let events = match self.dialect {
-            Dialect::OpenAiCompatible => self.openai_compatible_stream_end()?,
-            Dialect::GeminiGenerateContent if self.emitted_output => {
-                let mut events = Vec::new();
-                if let Some(usage) = self.usage.take() {
-                    events.push(Event::Usage(usage));
-                }
-                events.push(Event::Completed);
-                events
-            }
-            _ => Vec::new(),
-        };
-        if events.iter().any(Event::is_terminal) {
-            self.terminal = true;
-        }
-        Ok(events)
     }
 
     /// Recover a Gemini stream that emitted content and then terminated

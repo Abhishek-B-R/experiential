@@ -8,7 +8,29 @@ use super::super::{
     finish_open_tools_relay, finish_open_tools_truncated, malformed, parse_object, Normalizer,
 };
 use crate::errors::Failure;
-use crate::events::{openai_compatible_usage, require_string, require_u64, Event, ToolAccumulator};
+use crate::events::{openai_compatible_usage, require_u64, Event, ToolAccumulator};
+
+/// One optional wire text: absent or null reads as `None`, text as itself,
+/// and any other JSON type is the malformed shape it always was.
+fn wire_text(value: Option<&Value>, label: &str) -> Result<Option<String>, Failure> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.clone())),
+        Some(_) => Err(malformed(&format!("{label} must be text"))),
+    }
+}
+
+/// Mint a call id for a relay that streamed none: unique per (stream, tool
+/// index) through the wall clock, so a client pairing its tool result by id
+/// never collides across turns, and short enough for every provider's replay
+/// bound.
+fn synthesized_call_id(index: u32) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    format!("call_gw{index}_{nanos:x}")
+}
 
 impl Normalizer {
     pub(in crate::dialects) fn feed_openai_compatible(
@@ -68,10 +90,15 @@ impl Normalizer {
                 );
             }
         }
-        let choices = payload
-            .get("choices")
-            .and_then(Value::as_array)
-            .ok_or_else(|| malformed("OpenAI-compatible choices must be an array"))?;
+        // A frame without `choices` is metadata only (a relay's trailing
+        // usage-only chunk or keepalive: Novita, 19 attempts in two days,
+        // 2026-09-14..15); its usage was taken above and nothing else is
+        // decoded from it. An explicitly non-array `choices` stays malformed.
+        let choices = match payload.get("choices") {
+            None | Some(Value::Null) => return Ok(events),
+            Some(Value::Array(choices)) => choices,
+            Some(_) => return Err(malformed("OpenAI-compatible choices must be an array")),
+        };
         if choices.is_empty() {
             return Ok(events);
         }
@@ -140,41 +167,78 @@ impl Normalizer {
                             .ok_or_else(|| {
                                 malformed("OpenAI-compatible tool function must be an object")
                             })?;
-                    if let Some(tool) = self.tools.get(&index) {
+                    let restated_id = wire_text(item.get("id"), "OpenAI-compatible tool ID")?;
+                    let restated_name =
+                        wire_text(function.get("name"), "OpenAI-compatible tool name")?;
+                    if let Some(tool) = self.tools.get_mut(&index) {
                         // An identity is only restated when it is non-empty:
                         // DashScope (Qwen) argument deltas carry `"id": ""`
                         // (documented shape, live 2026-09-03), and an empty
                         // placeholder names nothing, so only a different
-                        // NON-EMPTY id or name is a stream that changed identity.
-                        if let Some(Value::String(repeated_id)) = item.get("id") {
-                            if !repeated_id.is_empty() && repeated_id != &tool.call_id {
+                        // NON-EMPTY id or name is a stream that changed
+                        // identity. A gateway-minted id yields to nothing:
+                        // the caller already holds it.
+                        if let Some(repeated_id) = restated_id.filter(|id| !id.is_empty()) {
+                            if repeated_id != tool.call_id && !tool.id_synthesized {
                                 return Err(malformed(
                                     "OpenAI-compatible stream changed a tool-call ID",
                                 ));
                             }
                         }
-                        if let Some(Value::String(repeated_name)) = function.get("name") {
-                            if !repeated_name.is_empty() && repeated_name != &tool.name {
+                        if let Some(repeated_name) = restated_name.filter(|name| !name.is_empty()) {
+                            if !tool.started {
+                                // The relay opened the entry nameless and names
+                                // it now: the call starts here, with whatever
+                                // arguments accumulated silently meanwhile.
+                                tool.name = repeated_name;
+                                tool.started = true;
+                                events.push(Event::ToolCallStarted {
+                                    index,
+                                    call_id: tool.call_id.clone(),
+                                    name: tool.name.clone(),
+                                    namespace: None,
+                                    caller: None,
+                                });
+                                if !tool.raw_arguments.is_empty() {
+                                    events.push(Event::ToolArgumentsDelta {
+                                        index,
+                                        delta: tool.raw_arguments.clone(),
+                                    });
+                                }
+                            } else if repeated_name != tool.name {
                                 return Err(malformed(
                                     "OpenAI-compatible stream changed a tool-call name",
                                 ));
                             }
                         }
                     } else {
-                        let call_id = require_string(item, "id", "OpenAI-compatible tool ID")
-                            .map_err(|message| malformed(&message))?;
-                        let name = require_string(function, "name", "OpenAI-compatible tool name")
-                            .map_err(|message| malformed(&message))?;
+                        // A null or empty id is a relay that never minted one
+                        // (Z.ai GLM via Fireworks/OpenRouter, live 2026-09-05..15):
+                        // the gateway mints a stable id so the call is
+                        // callable, since the caller pairs its tool result
+                        // by this id and nothing else. A null or empty NAME
+                        // opens the entry unstarted (no start event yet): a
+                        // later frame may name it, and one that never does
+                        // and never argues is dropped as a phantom at finish.
+                        let (call_id, id_synthesized) = match restated_id {
+                            Some(id) if !id.is_empty() => (id, false),
+                            _ => (synthesized_call_id(index), true),
+                        };
+                        let name = restated_name.unwrap_or_default();
                         self.reserve_tool_entry(index)?;
-                        self.tools
-                            .insert(index, ToolAccumulator::new(call_id.clone(), name.clone()));
-                        events.push(Event::ToolCallStarted {
-                            index,
-                            call_id,
-                            name,
-                            namespace: None,
-                            caller: None,
-                        });
+                        let mut tool = ToolAccumulator::new(call_id.clone(), name.clone());
+                        tool.id_synthesized = id_synthesized;
+                        tool.started = !name.is_empty();
+                        if tool.started {
+                            events.push(Event::ToolCallStarted {
+                                index,
+                                call_id,
+                                name,
+                                namespace: None,
+                                caller: None,
+                            });
+                        }
+                        self.tools.insert(index, tool);
                     }
                     if let Some(fragment) = function.get("arguments") {
                         if !fragment.is_null() {
@@ -195,7 +259,9 @@ impl Normalizer {
                             // client that concatenates deltas must end up
                             // with exactly the completed call's bytes.
                             if let Some(delta) = tool.push_arguments(&raw_fragment) {
-                                events.push(Event::ToolArgumentsDelta { index, delta });
+                                if tool.started {
+                                    events.push(Event::ToolArgumentsDelta { index, delta });
+                                }
                             }
                         }
                     }
@@ -234,7 +300,7 @@ impl Normalizer {
         let (mut events, cut_mid_fragment) = if finish == Some("length") {
             (finish_open_tools_truncated(&mut self.tools)?, false)
         } else {
-            finish_open_tools_relay(&mut self.tools)?
+            finish_open_tools_relay(&mut self.tools, finish.unwrap_or("none"))?
         };
         if let Some(usage) = self.usage.take() {
             events.push(Event::Usage(usage));

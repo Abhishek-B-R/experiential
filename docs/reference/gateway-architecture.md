@@ -57,8 +57,35 @@ streams `{}` then `""` for every zero-argument call — so the deltas a client r
 concatenate to the completed call's bytes. Any other tail, and any syntax error inside the
 object, keeps the strict contract: the attempt fails as `malformed_response` (a provider
 fault, eligible to fail over to a later deployment), the ledger names the parse position and
-byte count, and the operator log names the tool; argument bytes are never logged or repaired
-by guessing.
+byte count, and the operator log names the tool (bounded to an identifier token, since a
+relay can put arbitrary model output in the name field); argument bytes are never logged or
+repaired by guessing.
+
+Arguments that END mid-value (valid JSON so far that simply stops) are the provider's cut,
+whatever it declared about the ending: a Chat relay's `stop`/`tool_calls` finish, OpenAI's
+own Responses `function_call` item marked `completed` (gpt-5.6-luna, exp#896), a Bedrock or
+Anthropic block stop followed by `tool_use`/`end_turn`, or a stream that closes without its
+terminal frame. A model never ends a well-formed call mid-string, so every dialect drops the
+cut call (operator log `tool_arguments_cut_mid_fragment` with what the provider declared) and
+the turn settles `incomplete` (`finish_reason: length`), exactly as a provider-declared
+`max_tokens` truncation does; the caller's remedy is a larger budget, never a retry of a
+"malformed" provider. Only a syntax error INSIDE the arguments is corruption and stays
+`malformed_response`.
+
+Two relay shapes decode leniently instead of failing: a tool call streamed with a null or
+empty `id` gets a gateway-minted id (`call_gw<index>_<clock>`; a real id restated later is
+ignored, since the caller already holds the minted one), and an entry with an empty name
+and no arguments is a placeholder, dropped without starting a call (a nameless entry that
+does carry arguments still fails: a name cannot be invented). A Chat frame with no `choices`
+key is metadata only. A Responses reasoning-summary `done` text that differs from its
+relayed deltas is logged, not failed (the summary is display-only prose).
+
+A stream that closes cleanly WITHOUT its terminal frame is judged by what it served: before
+any output it is `provider stream ended without a terminal event` (failover-eligible, nothing
+to preserve); after output, Gemini completes (its documented shape), an OpenAI-compatible
+relay that already declared its finish settles by that finish, and every other wire settles
+`incomplete` with open items closed and any mid-fragment call dropped (operator log
+`stream_ended_without_terminal_after_output`).
 
 ## The data plane
 
@@ -635,11 +662,12 @@ fix, and settlement files it as `invalid_request`. House rungs keep the operator
 
 **Tool calls cut off at the output budget are incomplete, not malformed.** On wires that reveal the
 stop reason only after the tool block closes (Anthropic `message_delta`, Bedrock `messageStop`), a
-tool call whose arguments fail to parse at its block stop is held rather than failed; a
-provider-declared `max_tokens` truncation then drops the unfinished call and ends the stream
-`incomplete` (the caller's remedy is a larger budget), while any other ending surfaces the parse
-failure as the malformed stream it is, exactly as the Chat-compatible `finish_reason: length` path
-already did.
+tool call whose arguments END mid-value at its block stop is the provider's cut whatever stop
+reason follows (Bedrock's DeepSeek and Qwen shims report `tool_use`): it is dropped and the stream
+ends `incomplete` (the caller's remedy is a larger budget). A call whose arguments carry a syntax
+error is held rather than failed; a provider-declared `max_tokens` truncation forgives it, while
+any other ending surfaces the parse failure as the malformed stream it is, exactly as the
+Chat-compatible `finish_reason: length` path already did.
 
 **Pre-stream 4xx bodies keep the provider's code.** When a client-error body's sentence must be
 dropped by the identifier screen, the provider's documented code or type token (`invalid_value`,
