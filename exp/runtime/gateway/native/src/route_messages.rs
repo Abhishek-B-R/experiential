@@ -37,8 +37,8 @@ use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
 use crate::waterfall::{
-    acquire_attempt, billed_empty_completion, CommittedAttempt, SettledAttempt, WaterfallContext,
-    Won,
+    acquire_attempt, billed_empty_completion, unreported_empty_completion, CommittedAttempt,
+    SettledAttempt, WaterfallContext, Won,
 };
 
 /// Anthropic-enveloped variant of `error_response` for the Messages surface,
@@ -444,9 +444,10 @@ async fn respond_from_messages_events(
     json_response(StatusCode::OK, &aggregated.body, &headers)
 }
 
-/// Whether an aggregated Messages turn is a billed empty completion: its
-/// terminal is `Completed`, its usage counts output, and no content block
-/// survived aggregation (every committed event was one this surface drops).
+/// Whether an aggregated Messages turn is an empty completion: its terminal
+/// is `Completed`, its usage either counts output or was never reported, and
+/// no content block survived aggregation (every committed event was one this
+/// surface drops).
 fn aggregated_empty_completion(
     events: &[Event],
     aggregated: &AggregatedMessage,
@@ -460,7 +461,13 @@ fn aggregated_empty_completion(
         .get("content")
         .and_then(Value::as_array)
         .is_some_and(Vec::is_empty);
-    content_empty && billed_empty_completion(terminal, aggregated.usage.as_ref().or(usage))
+    let usage = aggregated.usage.as_ref().or(usage);
+    // Post-commit there is no cap to read against: a committed turn that
+    // rendered no block is a failed attempt whether the provider billed it or
+    // sent no usage frame at all; only a report of zero tokens is honest.
+    content_empty
+        && (billed_empty_completion(terminal, usage)
+            || unreported_empty_completion(terminal, usage))
 }
 
 fn encode_messages_sse(
@@ -723,7 +730,8 @@ async fn stream_messages(
                         Err(failure) => fail_stream!(failure),
                     }
                     if !encoder.has_content_blocks()
-                        && billed_empty_completion(&event, usage.as_ref())
+                        && (billed_empty_completion(&event, usage.as_ref())
+                            || unreported_empty_completion(&event, usage.as_ref()))
                     {
                         // The deployment committed on events this surface
                         // cannot render (hidden reasoning on an unexposed
