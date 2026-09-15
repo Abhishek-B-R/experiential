@@ -22,7 +22,6 @@
 //! exhaustion.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -38,6 +37,7 @@ use crate::rate_limit_headers::harvest_rate_limit_headers;
 use crate::relay::{
     collection_public_error, ended_without_terminal, remaining, track_event, UpstreamRelay,
 };
+use crate::replay_repair::{log_encrypted_reasoning_stripped, without_encrypted_reasoning};
 use crate::settlement::AttemptGuard;
 use crate::throttle_backoff::{
     jitter_unit, track_retry_after, with_largest_retry_after, BackoffQuery, ThrottleRedial,
@@ -51,153 +51,6 @@ pub const MAXIMUM_WITHHELD_REFUSAL_BYTES: usize = 65_536;
 /// Event-count bound for withheld refusal deltas, matching the python
 /// executor's `_MAX_WITHHELD_REFUSAL_EVENTS`.
 pub const MAXIMUM_WITHHELD_REFUSAL_EVENTS: usize = 256;
-
-/// One deployment's wire configuration inside the admitted ordered route.
-/// Payloads are built python-side per deployment, since model identities and
-/// dialects may differ across one certified pool.
-#[derive(Debug, Clone, Deserialize)]
-pub struct DeploymentWire {
-    pub provider: String,
-    pub deployment_id: String,
-    pub dialect: String,
-    pub url: String,
-    pub headers: HashMap<String, String>,
-    /// Exact provider model identifier the payload carries; a caller-known
-    /// word the stream-error detail screen must not redact.
-    #[serde(default)]
-    pub model_id: String,
-    /// Whether this rung dispatches on the customer's own (BYOK) credential.
-    /// A rejected credential or exhausted account on such a rung is the
-    /// customer's configuration, surfaced as their 400, never operator
-    /// deadness that fails over.
-    #[serde(default)]
-    pub billing_customer_managed: bool,
-    pub timeout_seconds: f64,
-    /// Structured payload the data plane serializes itself; null for
-    /// body-signing dialects, whose route entry carries `upstream_body`.
-    #[serde(default)]
-    pub upstream_payload: Value,
-    /// Exact pre-serialized body for body-signing dialects (Bedrock SigV4).
-    /// When present it is sent verbatim: the signature covers these exact
-    /// bytes, so re-serializing a structured payload here could invalidate
-    /// it.
-    #[serde(default)]
-    pub upstream_body: Option<String>,
-    #[serde(default)]
-    pub fireworks_reasoning_route_sha256: Option<String>,
-    /// Tencent Hunyuan preserved-thinking route identity; like the Fireworks
-    /// field it turns on provider reasoning-content capture and stamps each
-    /// delta with this exact route, but seals under the Hunyuan carrier scheme.
-    #[serde(default)]
-    pub hunyuan_reasoning_route_sha256: Option<String>,
-    /// When true, this rung returns the model's plaintext `reasoning_content`
-    /// to the caller for display (Tencent/DeepSeek think mode). The sealed
-    /// round-trip carrier is emitted independently; elsewhere reasoning stays
-    /// stripped. Defaults false so every other provider is unchanged.
-    #[serde(default)]
-    pub reasoning_output_exposed: bool,
-    /// Caller stop sequences the data plane enforces on this rung's stream
-    /// because the provider wire has no stop field (OpenAI Responses). The
-    /// relay cuts visible text at the first match and terminates with
-    /// `Event::StoppedAtSequence`. Empty when the payload carries `stop`.
-    #[serde(default)]
-    pub stop_sequences: Vec<String>,
-    /// The caller sent `parallel_tool_calls: false` and this rung's wire has
-    /// no such control: the relay serializes the turn to one tool call.
-    #[serde(default)]
-    pub serialize_tool_calls: bool,
-    pub idempotency_key: String,
-    /// Deployment override for the flat first-byte allowance; the serving
-    /// configuration's default applies when absent.
-    #[serde(default)]
-    pub time_to_first_byte_base_seconds: Option<f64>,
-    /// Deployment override for the input-scaled first-byte allowance in
-    /// seconds per million approximate input tokens; the serving
-    /// configuration's default applies when absent.
-    #[serde(default)]
-    pub time_to_first_byte_seconds_per_million_input_tokens: Option<f64>,
-    /// How many post-backoff redials a throttle on this rung is worth on
-    /// this request: the pool's `throttle_redial` schedule scaled by the
-    /// requesting organization's cache at stake here (the full schedule at
-    /// or above any authored threshold, a proportional share below it). The
-    /// waterfall backs off and re-dials this rung that many times before the
-    /// ladder advances; zero keeps the rung's throttle failover-only.
-    #[serde(default)]
-    pub throttle_redial_budget: u32,
-}
-
-/// The frozen retry-policy facts returned by admission.
-#[derive(Debug, Clone, Copy)]
-pub struct RoutePolicy {
-    pub maximum_total_attempts: u32,
-    pub maximum_same_deployment_attempts: u32,
-    pub refusal_failover: bool,
-    /// The pool's backoff-and-redial schedule for throttled rungs, when
-    /// authored.
-    pub throttle_redial: Option<ThrottleRedial>,
-}
-
-/// Everything one waterfall run needs besides its request guard.
-pub struct WaterfallContext<'a> {
-    pub bridge: &'a Arc<Bridge>,
-    pub http: &'a reqwest::Client,
-    pub request_id: &'a str,
-    /// The presented virtual key, forwarded so hosted budget-error policy
-    /// can shape a rejected reservation for the caller.
-    pub raw_key: &'a str,
-    pub route: &'a [DeploymentWire],
-    pub policy: RoutePolicy,
-    pub deadline: Instant,
-    /// Fail-fast flat bound on the wait for each physical attempt's first
-    /// provider byte. Applied per attempt (each redial and each failover
-    /// advance gets a fresh window); it bounds the connect/header/first-byte
-    /// phase only and never caps generation once the provider has started
-    /// answering. Deployments may override it per wire entry.
-    pub time_to_first_byte: Duration,
-    /// Default input-scaled first-byte allowance in seconds per million
-    /// approximate input tokens, so a very large prompt whose prefill
-    /// legitimately takes longer than the flat bound is not misread as a
-    /// dead lane. Deployments may override it per wire entry.
-    pub time_to_first_byte_slope_seconds_per_million_input_tokens: f64,
-    /// Approximate input tokens for this request: the raw body's bytes
-    /// divided by four. An allowance heuristic only, never a billing
-    /// quantity.
-    pub approximate_input_tokens: f64,
-    /// The bridge `remember` argument retaining an output-less turn: a
-    /// successful terminal reached before any semantic output still answers
-    /// the caller with a response id, and a response id the caller received
-    /// must stay continuable (api.openai.com persists `incomplete` responses
-    /// too). Only the Responses route carries one; it runs ahead of the
-    /// attempt's settlement so the control plane can still resolve the
-    /// request's continuation context.
-    pub output_less_retention: Option<String>,
-    /// The caller's output cap when the request carries one. A `stop` with
-    /// no semantic output and NO usage report on a capped request is read
-    /// as the budget exhausted before the first visible token (the provider
-    /// mislabelled a truncation; Meta's muse-spark lanes do this whenever
-    /// hidden reasoning eats `max_tokens`, 2026-09-15) and answers
-    /// `Incomplete`; the same shape on an uncapped request is the provider
-    /// delivering nothing at all and takes the ladder.
-    pub output_token_cap: Option<u64>,
-}
-
-/// The effective first-byte allowance for one attempt: the deployment's (or
-/// serving default's) flat base plus its input-scaled allowance.
-pub(crate) fn first_byte_allowance(
-    wire: &DeploymentWire,
-    default_base: Duration,
-    default_slope_seconds_per_million: f64,
-    approximate_input_tokens: f64,
-) -> Duration {
-    let base = wire
-        .time_to_first_byte_base_seconds
-        .unwrap_or(default_base.as_secs_f64());
-    let slope = wire
-        .time_to_first_byte_seconds_per_million_input_tokens
-        .unwrap_or(default_slope_seconds_per_million);
-    let scaled = slope * (approximate_input_tokens.max(0.0) / 1_000_000.0);
-    Duration::from_secs_f64((base + scaled).max(0.001))
-}
 
 /// The winning outcome of one waterfall run.
 pub enum Won {
@@ -222,12 +75,45 @@ pub struct CommittedAttempt {
     /// Whether refusal deltas already reached (or will reach) the caller;
     /// a later typed refusal terminal then completes instead of failing.
     pub visible_refusal: bool,
+    /// Whether this attempt served the re-dial that stripped the replayed
+    /// encrypted reasoning items the rung refused (disclosed to the caller
+    /// through `crate::replay_repair::REPLAY_REPAIR_HEADER`).
+    pub encrypted_reasoning_stripped: bool,
 }
 
 /// One attempt whose terminal was reached and settled before commitment.
 pub struct SettledAttempt {
     pub depth: usize,
     pub events: Vec<Event>,
+    /// See [`CommittedAttempt::encrypted_reasoning_stripped`].
+    pub encrypted_reasoning_stripped: bool,
+}
+
+/// The facts of the attempt that served, as the response surfaces name them.
+#[derive(Debug, Clone, Copy)]
+pub struct Served {
+    pub depth: usize,
+    pub encrypted_reasoning_stripped: bool,
+}
+
+impl CommittedAttempt {
+    /// The serving facts of this committed attempt.
+    pub fn served(&self) -> Served {
+        Served {
+            depth: self.depth,
+            encrypted_reasoning_stripped: self.encrypted_reasoning_stripped,
+        }
+    }
+}
+
+impl SettledAttempt {
+    /// The serving facts of this settled attempt.
+    pub fn served(&self) -> Served {
+        Served {
+            depth: self.depth,
+            encrypted_reasoning_stripped: self.encrypted_reasoning_stripped,
+        }
+    }
 }
 
 fn is_semantic(event: &Event) -> bool {
@@ -352,6 +238,9 @@ enum AttemptEnd {
         usage: Option<Usage>,
         tool_names: Vec<String>,
         opened: bool,
+        /// Whether the failing dial was the stripped re-dial, so an
+        /// exhaustion flush of its withheld output still discloses it.
+        encrypted_reasoning_stripped: bool,
     },
     /// Accounting failed mid-attempt; the request is answered internal.
     Accounting,
@@ -371,6 +260,12 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
     // Post-backoff redials made per depth: the schedule's per-rung cap
     // counts only these, never a retryable-class redial of the same rung.
     let mut throttle_redials: Vec<u32> = vec![0; ctx.route.len()];
+    // Per depth, the replayed payload with the encrypted reasoning items the
+    // rung refused stripped out: every later dial of that rung in this
+    // request (a throttle redial, a same-rung retry) sends it directly
+    // instead of earning the refusal again. Another rung may still decrypt
+    // the original, so it starts from the payload as replayed.
+    let mut repaired: Vec<Option<Value>> = vec![None; ctx.route.len()];
     let mut current_depth: Option<usize> = None;
     let mut last_failure: Option<Failure> = None;
     // The longest wait any throttled rung stated, so an exhausted ladder
@@ -471,7 +366,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
         guard.rebind(attempt_id);
         total_attempts += 1;
         counts[depth] += 1;
-        let end = run_attempt(ctx, guard, wire, depth).await;
+        let end = run_attempt(ctx, guard, wire, depth, &mut repaired[depth]).await;
         match end {
             AttemptEnd::Committed(committed) => return Won::Committed(committed),
             AttemptEnd::Settled(settled) => return Won::Settled(settled),
@@ -484,6 +379,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 usage,
                 tool_names,
                 opened,
+                encrypted_reasoning_stripped,
             } => {
                 if opened {
                     guard.mark_opened();
@@ -542,6 +438,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                     return Won::Settled(SettledAttempt {
                         depth,
                         events: exhaustion_flush,
+                        encrypted_reasoning_stripped,
                     });
                 }
                 let boundary = with_largest_retry_after(boundary, largest_retry_after);
@@ -599,6 +496,7 @@ async fn run_attempt(
     guard: &mut AttemptGuard,
     wire: &DeploymentWire,
     depth: usize,
+    repaired: &mut Option<Value>,
 ) -> AttemptEnd {
     let Some(dialect) = Dialect::from_str(&wire.dialect) else {
         // Admission validated every dialect; reaching here is wire drift.
@@ -612,6 +510,7 @@ async fn run_attempt(
             usage: None,
             tool_names: Vec::new(),
             opened: false,
+            encrypted_reasoning_stripped: false,
         };
     };
     // Body-signing dialects sign immediately before every physical attempt
@@ -633,6 +532,7 @@ async fn run_attempt(
                 usage: None,
                 tool_names: Vec::new(),
                 opened: false,
+                encrypted_reasoning_stripped: false,
             };
         }
     };
@@ -642,23 +542,32 @@ async fn run_attempt(
     // that never answers is abandoned in seconds, not after the full
     // per-deployment timeout.
     let phase_timeout = Duration::from_secs_f64(wire.timeout_seconds.max(0.001));
-    let first_byte_deadline = Instant::now()
-        + first_byte_allowance(
+    let first_byte_allowance_for = || {
+        first_byte_allowance(
             wire,
             ctx.time_to_first_byte,
             ctx.time_to_first_byte_slope_seconds_per_million_input_tokens,
             ctx.approximate_input_tokens,
-        );
+        )
+    };
+    let mut first_byte_deadline = Instant::now() + first_byte_allowance_for();
     let open_bound = remaining(ctx.deadline)
         .min(phase_timeout)
         .min(remaining(first_byte_deadline));
+    // A dial of this rung already stripped the refused encrypted reasoning
+    // in this request: send the remembered payload straight away.
+    let mut encrypted_reasoning_stripped = repaired.is_some();
     let response = match open_stream(
         ctx.http,
         &wire.url,
         &headers,
         &wire.idempotency_key,
-        &wire.upstream_payload,
-        wire.upstream_body.as_deref(),
+        repaired.as_ref().unwrap_or(&wire.upstream_payload),
+        if repaired.is_some() {
+            None
+        } else {
+            wire.upstream_body.as_deref()
+        },
         open_bound,
         dialect,
     )
@@ -666,13 +575,70 @@ async fn run_attempt(
     {
         Ok(response) => response,
         Err(failure) => {
-            return AttemptEnd::Ladder {
-                failure: customer_owned(failure, wire),
-                refusal_eligible: false,
-                exhaustion_flush: Vec::new(),
-                usage: None,
-                tool_names: Vec::new(),
-                opened: false,
+            // The rung refused a replayed reasoning item's encrypted payload
+            // (sealed by another organization or tenant, or never issued by
+            // this provider): one re-dial of the same rung, same reservation,
+            // with those items stripped, before the caller's 400 may surface.
+            // A payload with nothing to strip, or a refusal of the stripped
+            // payload itself, surfaces.
+            let stripped = (!encrypted_reasoning_stripped
+                && failure.encrypted_reasoning_rejected
+                && wire.upstream_body.is_none())
+            .then(|| without_encrypted_reasoning(&wire.upstream_payload))
+            .flatten();
+            let Some(stripped) = stripped else {
+                return AttemptEnd::Ladder {
+                    failure: customer_owned(failure, wire),
+                    refusal_eligible: false,
+                    exhaustion_flush: Vec::new(),
+                    usage: None,
+                    tool_names: Vec::new(),
+                    opened: false,
+                    encrypted_reasoning_stripped: false,
+                };
+            };
+            // The refusal is the fact worth remembering, whatever the
+            // re-dial then does: a later dial of this rung must not earn it
+            // again.
+            let stripped = repaired.insert(stripped);
+            // The stripped dial is a physical attempt of its own and gets a
+            // fresh first-byte window, exactly like a same-rung redial; the
+            // refused open and its error-body read must not eat into it.
+            first_byte_deadline = Instant::now() + first_byte_allowance_for();
+            let open_bound = remaining(ctx.deadline)
+                .min(phase_timeout)
+                .min(remaining(first_byte_deadline));
+            match open_stream(
+                ctx.http,
+                &wire.url,
+                &headers,
+                &wire.idempotency_key,
+                stripped,
+                None,
+                open_bound,
+                dialect,
+            )
+            .await
+            {
+                Ok(response) => {
+                    // Counted and logged only once the repaired dial opened:
+                    // a refused re-dial is a failure, not a repair.
+                    METRICS.record_encrypted_reasoning_stripped();
+                    log_encrypted_reasoning_stripped(ctx.request_id, wire);
+                    encrypted_reasoning_stripped = true;
+                    response
+                }
+                Err(failure) => {
+                    return AttemptEnd::Ladder {
+                        failure: customer_owned(failure, wire),
+                        refusal_eligible: false,
+                        exhaustion_flush: Vec::new(),
+                        usage: None,
+                        tool_names: Vec::new(),
+                        opened: false,
+                        encrypted_reasoning_stripped: false,
+                    }
+                }
             }
         }
     };
@@ -722,6 +688,7 @@ async fn run_attempt(
                     usage,
                     tool_names,
                     opened: true,
+                    encrypted_reasoning_stripped,
                 }
             }
             Err(failure) => {
@@ -732,6 +699,7 @@ async fn run_attempt(
                     usage,
                     tool_names,
                     opened: true,
+                    encrypted_reasoning_stripped,
                 }
             }
         };
@@ -758,6 +726,7 @@ async fn run_attempt(
                         usage,
                         tool_names,
                         visible_refusal: true,
+                        encrypted_reasoning_stripped,
                     }));
                 }
                 withheld_bytes += event_bytes;
@@ -782,6 +751,7 @@ async fn run_attempt(
                 usage,
                 tool_names,
                 visible_refusal,
+                encrypted_reasoning_stripped,
             }));
         }
         if !event.is_terminal() {
@@ -807,6 +777,7 @@ async fn run_attempt(
                     usage,
                     tool_names,
                     opened: true,
+                    encrypted_reasoning_stripped,
                 };
             }
             _ => {
@@ -825,6 +796,7 @@ async fn run_attempt(
                         usage,
                         tool_names,
                         opened: true,
+                        encrypted_reasoning_stripped,
                     };
                 }
                 if billed_empty_completion(&event, usage.as_ref()) {
@@ -840,6 +812,7 @@ async fn run_attempt(
                         usage,
                         tool_names,
                         opened: true,
+                        encrypted_reasoning_stripped,
                     };
                 }
                 if unreported_empty_completion(&event, usage.as_ref()) {
@@ -859,6 +832,7 @@ async fn run_attempt(
                             usage,
                             tool_names,
                             depth,
+                            encrypted_reasoning_stripped,
                         )
                         .await;
                     }
@@ -872,6 +846,7 @@ async fn run_attempt(
                         usage,
                         tool_names,
                         opened: true,
+                        encrypted_reasoning_stripped,
                     };
                 }
                 // A successful terminal with no semantic output and nothing
@@ -880,7 +855,16 @@ async fn run_attempt(
                 // while the attempt is still in flight, settle, then answer
                 // with the tracked usage ahead of the terminal so the
                 // encoders keep the client-visible token accounting.
-                return settle_output_less(ctx, guard, event, usage, tool_names, depth).await;
+                return settle_output_less(
+                    ctx,
+                    guard,
+                    event,
+                    usage,
+                    tool_names,
+                    depth,
+                    encrypted_reasoning_stripped,
+                )
+                .await;
             }
         }
     }
@@ -898,6 +882,7 @@ async fn settle_output_less(
     usage: Option<Usage>,
     tool_names: Vec<String>,
     depth: usize,
+    encrypted_reasoning_stripped: bool,
 ) -> AttemptEnd {
     let retention_failure = match &ctx.output_less_retention {
         Some(argument) => ctx.bridge.call("remember", argument.clone()).await.err(),
@@ -924,7 +909,11 @@ async fn settle_output_less(
         events.push(Event::Usage(tracked));
     }
     events.push(terminal);
-    AttemptEnd::Settled(SettledAttempt { depth, events })
+    AttemptEnd::Settled(SettledAttempt {
+        depth,
+        events,
+        encrypted_reasoning_stripped,
+    })
 }
 
 /// Whether a successful terminal with no semantic output is an unreported
@@ -956,6 +945,10 @@ pub(crate) fn billed_empty_completion(terminal: &Event, usage: Option<&Usage>) -
     usage.output_tokens.is_some_and(|tokens| tokens > 0)
         || usage.reasoning_tokens.is_some_and(|tokens| tokens > 0)
 }
+
+mod wire;
+pub(crate) use wire::first_byte_allowance;
+pub use wire::{DeploymentWire, RoutePolicy, WaterfallContext};
 
 #[cfg(test)]
 mod ladder_tests;

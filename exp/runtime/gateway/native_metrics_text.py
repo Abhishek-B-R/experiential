@@ -23,6 +23,10 @@ _PREFIX = "exp_gateway_"
 _DATA_PLANE_COUNTERS: tuple[tuple[str, str], ...] = (
     ("served_requests", "Requests admitted and served natively."),
     ("open_retries", "Same-deployment retries at the upstream open phase."),
+    (
+        "encrypted_reasoning_stripped",
+        "Redials without refused encrypted reasoning.",
+    ),
     ("settlement_retries", "Settlement deliveries retried after a failed write."),
     ("settlement_give_ups", "Settlements whose bounded retries were all exhausted."),
 )

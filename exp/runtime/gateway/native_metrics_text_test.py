@@ -74,6 +74,7 @@ def _snapshot() -> JsonObject:
                 "other": 0,
             },
             "open_retries": 2,
+            "encrypted_reasoning_stripped": 1,
             "settlement_retries": 1,
             "settlement_give_ups": 0,
             "active_requests": 1,
@@ -177,6 +178,9 @@ exp_gateway_served_requests_total 7
 # HELP exp_gateway_open_retries_total Same-deployment retries at the upstream open phase.
 # TYPE exp_gateway_open_retries_total counter
 exp_gateway_open_retries_total 2
+# HELP exp_gateway_encrypted_reasoning_stripped_total Redials without refused encrypted reasoning.
+# TYPE exp_gateway_encrypted_reasoning_stripped_total counter
+exp_gateway_encrypted_reasoning_stripped_total 1
 # HELP exp_gateway_settlement_retries_total Settlement deliveries retried after a failed write.
 # TYPE exp_gateway_settlement_retries_total counter
 exp_gateway_settlement_retries_total 1

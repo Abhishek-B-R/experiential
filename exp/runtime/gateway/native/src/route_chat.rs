@@ -15,8 +15,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::admission::{
-    acquire_permit, apply_output_guardrail, commit_dependent, commit_independent, new_guard,
-    wire_drift_response, Admission,
+    acquire_permit, apply_output_guardrail, new_guard, served_headers, wire_drift_response,
+    Admission,
 };
 use crate::encode::{
     chat_data, compact_json, completed_chat_body_with_carrier, completed_chat_body_with_ignored,
@@ -285,6 +285,7 @@ async fn settled_chat_response(
     mut lease: Option<OwnerLease>,
     client_request_id: Option<String>,
 ) -> Response {
+    let served = settled.served();
     let mut events = settled.events;
     let refusal_completed = complete_visible_refusal(&mut events);
     if refusal_completed.is_none() {
@@ -298,8 +299,7 @@ async fn settled_chat_response(
                     Ok(body) => body,
                     Err(error) => return error_response(&error),
                 };
-                let mut headers = commit_independent(admission, client_request_id.as_deref());
-                headers.extend(commit_dependent(admission, settled.depth));
+                let headers = served_headers(admission, client_request_id.as_deref(), served);
                 if let Some(mut owner) = lease.take() {
                     owner.abandon().await;
                 }
@@ -311,8 +311,7 @@ async fn settled_chat_response(
             return error_response(&error);
         }
     }
-    let mut headers = commit_independent(admission, client_request_id.as_deref());
-    headers.extend(commit_dependent(admission, settled.depth));
+    let headers = served_headers(admission, client_request_id.as_deref(), served);
     if admission.stream {
         let body = match encode_chat_sse(admission, created_at, &events, None, false) {
             Ok(body) => body,
@@ -475,7 +474,7 @@ pub(crate) async fn seal_reasoning_candidate(
 async fn respond_from_chat_events(
     admission: Admission,
     mut guard: AttemptGuard,
-    depth: usize,
+    served: crate::waterfall::Served,
     mut events: Vec<Event>,
     usage: Option<Usage>,
     tool_names: Vec<String>,
@@ -484,6 +483,7 @@ async fn respond_from_chat_events(
     client_request_id: Option<String>,
     stream_body: bool,
 ) -> Response {
+    let depth = served.depth;
     let refusal_completed = complete_visible_refusal(&mut events);
     let carrier = if refusal_completed.is_some() {
         None
@@ -585,8 +585,7 @@ async fn respond_from_chat_events(
         }
         return error_response(&PublicError::internal());
     }
-    let mut headers = commit_independent(&admission, client_request_id.as_deref());
-    headers.extend(commit_dependent(&admission, depth));
+    let headers = served_headers(&admission, client_request_id.as_deref(), served);
     if stream_body {
         let body = match encode_chat_sse(
             &admission,
@@ -673,7 +672,7 @@ async fn completed_response(
     respond_from_chat_events(
         admission,
         guard,
-        committed.depth,
+        committed.served(),
         events,
         committed.usage,
         committed.tool_names,
@@ -744,7 +743,7 @@ async fn guarded_chat_response(
     respond_from_chat_events(
         admission,
         guard,
-        committed.depth,
+        committed.served(),
         events,
         committed.usage,
         committed.tool_names,
@@ -768,8 +767,7 @@ async fn stream_response(
     client_request_id: Option<String>,
 ) -> Response {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-    let mut header_pairs = commit_independent(&admission, client_request_id.as_deref());
-    header_pairs.extend(commit_dependent(&admission, committed.depth));
+    let header_pairs = served_headers(&admission, client_request_id.as_deref(), committed.served());
     let include_usage = admission.include_usage;
     let request_id = admission.request_id.clone();
     let alias = admission.alias.clone();

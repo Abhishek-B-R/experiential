@@ -17,8 +17,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::admission::{
-    acquire_permit, apply_output_guardrail, commit_dependent, commit_independent, new_guard,
-    Admission,
+    acquire_permit, apply_output_guardrail, new_guard, served_headers, Admission,
 };
 use crate::encode::compact_json;
 use crate::encode_messages::{
@@ -263,6 +262,7 @@ async fn messages_wire_drift_response(
 /// terminal with no semantic output, or an exhausted ladder flushing its
 /// bounded withheld refusal output ahead of the failing terminal.
 async fn settled_messages_response(admission: &Admission, settled: SettledAttempt) -> Response {
+    let served = settled.served();
     let mut events = settled.events;
     let refusal_completed = complete_visible_refusal(&mut events);
     if refusal_completed.is_none() {
@@ -275,15 +275,13 @@ async fn settled_messages_response(admission: &Admission, settled: SettledAttemp
                     Ok(body) => body,
                     Err(error) => return messages_error_response(&error),
                 };
-                let mut headers = commit_independent(admission, None);
-                headers.extend(commit_dependent(admission, settled.depth));
+                let headers = served_headers(admission, None, served);
                 return sse_body_response(&headers, body);
             }
             return messages_error_response(&error);
         }
     }
-    let mut headers = commit_independent(admission, None);
-    headers.extend(commit_dependent(admission, settled.depth));
+    let headers = served_headers(admission, None, served);
     // A settled attempt carries no semantic output, so no reasoning was
     // issued and nothing needs sealing; exposure only governs display.
     let exposed = admission.reasoning_exposed_at(settled.depth);
@@ -317,12 +315,13 @@ async fn settled_messages_response(admission: &Admission, settled: SettledAttemp
 async fn respond_from_messages_events(
     admission: Admission,
     mut guard: AttemptGuard,
-    depth: usize,
+    served: crate::waterfall::Served,
     mut events: Vec<Event>,
     usage: Option<Usage>,
     tool_names: Vec<String>,
     stream_body: bool,
 ) -> Response {
+    let depth = served.depth;
     let refusal_completed = complete_visible_refusal(&mut events);
     // A tool turn's hidden reasoning leaves only as the sealed carrier, so it
     // is sealed under the gateway authority before the body is assembled,
@@ -432,8 +431,7 @@ async fn respond_from_messages_events(
         // Success is only reported once the terminal accounting write landed.
         return messages_error_response(&PublicError::internal());
     }
-    let mut headers = commit_independent(&admission, None);
-    headers.extend(commit_dependent(&admission, depth));
+    let headers = served_headers(&admission, None, served);
     if stream_body {
         let body = match encode_messages_sse(&admission, &events, carrier.as_deref(), exposed) {
             Ok(body) => body,
@@ -531,7 +529,7 @@ async fn completed_messages(
     respond_from_messages_events(
         admission,
         guard,
-        committed.depth,
+        committed.served(),
         events,
         committed.usage,
         committed.tool_names,
@@ -589,7 +587,7 @@ async fn guarded_messages(
     respond_from_messages_events(
         admission,
         guard,
-        committed.depth,
+        committed.served(),
         events,
         committed.usage,
         committed.tool_names,
@@ -606,11 +604,7 @@ async fn stream_messages(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-    let header_pairs = {
-        let mut headers = commit_independent(&admission, None);
-        headers.extend(commit_dependent(&admission, committed.depth));
-        headers
-    };
+    let header_pairs = served_headers(&admission, None, committed.served());
     let request_id = admission.request_id.clone();
     let alias = admission.alias.clone();
     let ignored_parameters = admission.ignored_parameters.clone();

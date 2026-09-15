@@ -23,6 +23,7 @@ mod rate_limit_headers;
 mod rejection_shapes;
 mod relay;
 mod replay;
+mod replay_repair;
 mod respond;
 mod responses_retention;
 mod route_batches;

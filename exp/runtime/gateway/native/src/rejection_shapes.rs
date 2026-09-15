@@ -71,6 +71,56 @@ pub fn rejected_by_routing_gate(dialect: Dialect, body: &str) -> bool {
     walked_funnel && failed_step
 }
 
+/// OpenAI-family `error.code` refusing a replayed reasoning item's
+/// `encrypted_content`.
+const INVALID_ENCRYPTED_CONTENT_CODE: &str = "invalid_encrypted_content";
+
+/// Whether a 4xx body is the native Responses wire refusing replayed encrypted
+/// reasoning. OpenAI answers `code: invalid_encrypted_content` ("The encrypted
+/// content ... could not be verified") when a reasoning item's
+/// `encrypted_content` was sealed by another organization or tenant, or is not
+/// a payload it issued at all. Only the documented code decides: the reason
+/// sentence varies ("organization_id did not match the target organization",
+/// "could not be decrypted or parsed") and is never matched. Other dialects
+/// have no such item and keep the plain client-error verdict.
+pub fn rejected_encrypted_reasoning(dialect: Dialect, body: &str) -> bool {
+    if dialect != Dialect::OpenAiResponses {
+        return false;
+    }
+    let value: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let Some(error) = value.get("error") else {
+        return false;
+    };
+    // OpenAI and Azure answer the code at the top level. An aggregator's
+    // Responses relay (OpenRouter) re-envelopes the upstream body under a
+    // numeric status and carries OpenAI's own document in `metadata.raw`
+    // (a JSON string or an object); the verdict is read there too.
+    error_code_is(error, INVALID_ENCRYPTED_CONTENT_CODE)
+        || relayed_upstream_document(error).is_some_and(|upstream| {
+            upstream
+                .get("error")
+                .is_some_and(|inner| error_code_is(inner, INVALID_ENCRYPTED_CONTENT_CODE))
+        })
+}
+
+/// Whether one error object's `code` is exactly this string.
+fn error_code_is(error: &Value, code: &str) -> bool {
+    error.get("code").and_then(Value::as_str) == Some(code)
+}
+
+/// The upstream error DOCUMENT an aggregator carried in `metadata.raw`, when
+/// that field holds JSON as a string or as an object.
+fn relayed_upstream_document(error: &Value) -> Option<Value> {
+    match error.get("metadata")?.get("raw")? {
+        Value::String(text) => serde_json::from_str::<Value>(text).ok(),
+        raw @ Value::Object(_) => Some(raw.clone()),
+        _ => None,
+    }
+}
+
 /// Aggregator sentences that say nothing about what was refused.
 const GENERIC_AGGREGATOR_MESSAGES: &[&str] = &["provider returned error", "provider error"];
 
@@ -380,5 +430,80 @@ mod tests {
             content_filtered_completion(Dialect::OpenAiCompatible, "not json"),
             None
         );
+    }
+
+    #[test]
+    fn the_responses_wire_names_refused_encrypted_reasoning_by_code_alone() {
+        // OpenAI's two documented reason sentences carry the same code.
+        let foreign_organization = r#"{"error":{"message":"The encrypted content for item rs_0d09 could not be verified. Reason: Encrypted content organization_id did not match the target organization.","type":"invalid_request_error","param":null,"code":"invalid_encrypted_content"}}"#;
+        let unparseable = r#"{"error":{"message":"The encrypted content rsn_...hA== could not be verified. Reason: Encrypted content could not be decrypted or parsed.","type":"invalid_request_error","param":null,"code":"invalid_encrypted_content"}}"#;
+        assert!(rejected_encrypted_reasoning(
+            Dialect::OpenAiResponses,
+            foreign_organization
+        ));
+        assert!(rejected_encrypted_reasoning(
+            Dialect::OpenAiResponses,
+            unparseable
+        ));
+        // The sentence alone, under another code, is not the verdict.
+        let other_code = r#"{"error":{"message":"The encrypted content rs_1 could not be verified.","type":"invalid_request_error","code":"invalid_value"}}"#;
+        assert!(!rejected_encrypted_reasoning(
+            Dialect::OpenAiResponses,
+            other_code
+        ));
+        let no_code = r#"{"error":{"message":"The encrypted content rs_1 could not be verified.","type":"invalid_request_error","code":null}}"#;
+        assert!(!rejected_encrypted_reasoning(
+            Dialect::OpenAiResponses,
+            no_code
+        ));
+        // Only the Responses wire carries reasoning items.
+        assert!(!rejected_encrypted_reasoning(
+            Dialect::OpenAiCompatible,
+            foreign_organization
+        ));
+        assert!(!rejected_encrypted_reasoning(
+            Dialect::OpenAiResponses,
+            "not json"
+        ));
+    }
+
+    #[test]
+    fn a_relayed_encrypted_reasoning_verdict_is_read_through_the_aggregator_envelope() {
+        // OpenRouter's Responses relay: numeric status, generic sentence, and
+        // OpenAI's own document as a JSON string under metadata.raw.
+        let openrouter = r#"{"error":{"message":"Provider returned error","code":400,
+            "metadata":{"raw":"{\"error\":{\"message\":\"The encrypted content for item rs_0d09 could not be verified. Reason: Encrypted content organization_id did not match the target organization.\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_encrypted_content\"}}",
+            "provider_name":"OpenAI"}}}"#;
+        assert!(rejected_encrypted_reasoning(
+            Dialect::OpenAiResponses,
+            openrouter
+        ));
+        // The same envelope carrying the document as an object.
+        let object_raw = r#"{"error":{"message":"Provider returned error","code":400,
+            "metadata":{"raw":{"error":{"message":"x","type":"invalid_request_error","code":"invalid_encrypted_content"}},
+            "provider_name":"OpenAI"}}}"#;
+        assert!(rejected_encrypted_reasoning(
+            Dialect::OpenAiResponses,
+            object_raw
+        ));
+        // Azure OpenAI's v1 Responses endpoint answers OpenAI's shape verbatim.
+        let azure = r#"{"error":{"message":"The encrypted content gAAA...ke== could not be verified. Reason: Encrypted content could not be decrypted or parsed.","type":"invalid_request_error","param":null,"code":"invalid_encrypted_content"}}"#;
+        assert!(rejected_encrypted_reasoning(
+            Dialect::OpenAiResponses,
+            azure
+        ));
+        // A relayed document under another code, or raw text, is not the verdict.
+        let other = r#"{"error":{"message":"Provider returned error","code":400,
+            "metadata":{"raw":"{\"error\":{\"message\":\"bad\",\"code\":\"invalid_value\"}}"}}}"#;
+        assert!(!rejected_encrypted_reasoning(
+            Dialect::OpenAiResponses,
+            other
+        ));
+        let text = r#"{"error":{"message":"Provider returned error","code":400,
+            "metadata":{"raw":"invalid_encrypted_content"}}}"#;
+        assert!(!rejected_encrypted_reasoning(
+            Dialect::OpenAiResponses,
+            text
+        ));
     }
 }
