@@ -107,10 +107,20 @@ impl Normalizer {
         let choice = choices[0]
             .as_object()
             .ok_or_else(|| malformed("OpenAI-compatible choice must be an object"))?;
-        let delta = choice
-            .get("delta")
-            .and_then(Value::as_object)
-            .ok_or_else(|| malformed("OpenAI-compatible delta must be an object"))?;
+        // Azure asynchronous content-filter annotations carry no delta. Treat
+        // their metadata-only choice as an empty delta, then still process the
+        // finish reason below: an annotation can terminate with content_filter.
+        // An explicitly invalid delta or an unrecognized missing-delta frame
+        // remains malformed.
+        let is_filter_annotation = ["content_filter_results", "content_filter_offsets"]
+            .iter()
+            .all(|field| choice.get(*field).is_some_and(Value::is_object));
+        let empty_delta = serde_json::Map::new();
+        let delta = match choice.get("delta") {
+            Some(Value::Object(delta)) => delta,
+            None if is_filter_annotation => &empty_delta,
+            _ => return Err(malformed("OpenAI-compatible delta must be an object")),
+        };
         if let Some(Value::String(content)) = delta.get("content") {
             if !content.is_empty() {
                 events.push(Event::TextDelta(content.clone()));
@@ -226,3 +236,7 @@ impl Normalizer {
         Ok(events)
     }
 }
+
+#[cfg(test)]
+#[path = "compatible_tests.rs"]
+mod tests;
