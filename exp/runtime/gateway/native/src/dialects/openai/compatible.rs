@@ -20,16 +20,24 @@ fn wire_text(value: Option<&Value>, label: &str) -> Result<Option<String>, Failu
     }
 }
 
-/// Mint a call id for a relay that streamed none: unique per (stream, tool
-/// index) through the wall clock, so a client pairing its tool result by id
-/// never collides across turns, and short enough for every provider's replay
-/// bound.
+/// Process-wide mint counter: two streams decoded in the same clock tick
+/// (or a clock that cannot be read) still receive distinct ids.
+static SYNTHESIZED_CALL_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Mint a call id for a relay that streamed none. A client pairs its tool
+/// result by this id and nothing else, and providers replay it, so it must
+/// never collide: the wall clock separates turns, the process id separates
+/// worker processes, the counter separates concurrent streams inside one, and
+/// the tool index separates calls within a stream. Short enough for every
+/// provider's replay bound.
 fn synthesized_call_id(index: u32) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(0);
-    format!("call_gw{index}_{nanos:x}")
+    let serial = SYNTHESIZED_CALL_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let process = std::process::id();
+    format!("call_gw{index}_{nanos:x}_{process:x}_{serial:x}")
 }
 
 impl Normalizer {

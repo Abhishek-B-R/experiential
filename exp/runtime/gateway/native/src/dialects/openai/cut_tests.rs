@@ -74,6 +74,31 @@ fn a_null_tool_call_id_is_minted_by_the_gateway_and_a_late_id_is_ignored() {
 }
 
 #[test]
+fn minted_ids_never_repeat_within_a_process() {
+    // Two streams decoded in the same clock tick must not share an id: the
+    // client pairs its tool result by id alone.
+    let mint = || {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+        let events = normalizer
+            .feed(&compatible_chunk(
+                serde_json::json!({"tool_calls": [{
+                    "index": 0, "id": null, "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }]}),
+                None,
+            ))
+            .expect("a null id is minted");
+        match events.as_slice() {
+            [Event::ToolCallStarted { call_id, .. }, ..] => call_id.clone(),
+            other => panic!("unexpected events: {other:?}"),
+        }
+    };
+    let ids: std::collections::BTreeSet<String> = (0..64).map(|_| mint()).collect();
+    assert_eq!(ids.len(), 64, "{ids:?}");
+    assert!(ids.iter().all(|id| id.len() <= 64), "replay bound: {ids:?}");
+}
+
+#[test]
 fn an_empty_tool_call_id_is_minted_too() {
     let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
     let started = normalizer
