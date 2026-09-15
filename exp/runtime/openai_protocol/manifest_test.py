@@ -61,6 +61,9 @@ def test_manifests_classify_explicit_exclusions() -> None:
     assert chat["top_logprobs"] == CompatibilityDisposition.UNSUPPORTED
     assert chat["top_k"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["top_p"] == CompatibilityDisposition.SUPPORTED
+    # Every enable-thinking spelling is admitted and translated, never dropped.
+    for spelling in ("reasoning", "thinking", "chat_template_kwargs", "enable_thinking"):
+        assert chat[spelling] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["service_tier"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert responses["service_tier"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert responses["background"] == CompatibilityDisposition.UNSUPPORTED

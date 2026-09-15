@@ -64,6 +64,9 @@ CHAT_MANIFEST = CompatibilityManifest(
         _field(
             "chat_template_kwargs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"
         ),
+        # DashScope's top-level spelling of the same switch (Qwen-family clients
+        # send it via extra_body); translated exactly like chat_template_kwargs.
+        _field("enable_thinking", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
         _field("logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
         # Sampling penalties: admitted and adapted per rung — honored where the

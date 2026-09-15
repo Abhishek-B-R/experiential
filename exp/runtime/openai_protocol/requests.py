@@ -9,8 +9,7 @@ from typing import Literal, cast
 from openai.types import EmbeddingCreateParams
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses.response_create_params import ResponseCreateParams
-from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError
-from pydantic_core import ErrorDetails
+from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError, field_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.common.models.model import ToolCall
@@ -39,7 +38,7 @@ from exp.runtime.openai_protocol.cache_control import (
     drop_opencode_cache_control,
 )
 from exp.runtime.openai_protocol.enable_thinking import translate_enable_thinking
-from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field, unsupported_field
+from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
     EMBEDDINGS_MANIFEST,
@@ -48,6 +47,7 @@ from exp.runtime.openai_protocol.manifest import (
 )
 from exp.runtime.openai_protocol.media_parts import message_content
 from exp.runtime.openai_protocol.prompt_cache_key_alias import fold_prompt_cache_key_alias
+from exp.runtime.openai_protocol.reasoning_replay import fold_replayed_reasoning
 from exp.runtime.openai_protocol.responses_input import (
     ReplayedFunctionCall,
     ReplayedFunctionOutput,
@@ -62,8 +62,8 @@ from exp.runtime.openai_protocol.structured_text import (
     chat_structured_text,
     responses_structured_text,
 )
+from exp.runtime.openai_protocol.validation_errors import validation_protocol_error
 from exp.runtime.openai_protocol.wire_models import (
-    HOSTED_TOOL_ITEM_TYPES_ASSISTANT,
     HOSTED_TOOL_ITEM_TYPES_TOOL,
     _AdditionalToolsItem,
     _AssistantToolCall,
@@ -71,7 +71,6 @@ from exp.runtime.openai_protocol.wire_models import (
     _ChatTool,
     _CustomToolCall,
     _CustomToolCallOutput,
-    _EmbeddingsRequest,
     _FunctionCall,
     _HostedToolItemEcho,
     _Message,
@@ -81,7 +80,39 @@ from exp.runtime.openai_protocol.wire_models import (
     _ResponsesInputItem,
     _ResponsesRequest,
     _ResponseTool,
+    _WireModel,
 )
+
+
+class _EmbeddingsRequest(_WireModel):
+    """Closed gateway embeddings request profile.
+
+    ``input`` narrows the official OpenAI union to text only: the token-array
+    forms (``list[int]`` / ``list[list[int]]``) pass official validation but
+    are rejected here with a field-specific 400, since this surface serves
+    visible text, not pre-tokenized ids.
+    """
+
+    model: str = Field(min_length=1, max_length=256)
+    input: str | tuple[str, ...]
+    dimensions: int | None = Field(default=None, gt=0)
+    encoding_format: Literal["float", "base64"] | None = None
+    user: str | None = Field(default=None, max_length=1024)
+
+    @field_validator("input")
+    @classmethod
+    def _require_nonempty_input(cls, value: str | tuple[str, ...]) -> str | tuple[str, ...]:
+        """Reject empty text, an empty array, or empty array members."""
+        if isinstance(value, str):
+            if not value:
+                raise ValueError("input must not be an empty string")
+            return value
+        if not value:
+            raise ValueError("input must not be an empty array")
+        if any(not text for text in value):
+            raise ValueError("input array must not contain empty strings")
+        return value
+
 
 _CHAT_OFFICIAL = TypeAdapter(CompletionCreateParams)
 _RESPONSES_OFFICIAL = TypeAdapter(ResponseCreateParams)
@@ -112,6 +143,8 @@ class DecodedEmbeddingsRequest(ContractModel):
 _CHAT_MESSAGE_EXTENSION_KEYS = frozenset(
     {
         "reasoning_content",
+        "reasoning",
+        "reasoning_details",
         "provider_specific_fields",
         "thinking_blocks",
         "reasoning_items",
@@ -120,9 +153,11 @@ _CHAT_MESSAGE_EXTENSION_KEYS = frozenset(
 )
 """Message keys the strict wire model owns; hidden from official validation.
 
-``reasoning_content`` is the authenticated Chat extension; the other four are
-LiteLLM's message-dump keys, which ``_Message`` admits only in their empty (or,
-for ``provider_specific_fields``, dropped-and-disclosed) forms.
+``reasoning_content`` is the authenticated Chat extension and ``reasoning`` /
+``reasoning_details`` are OpenRouter's replayed-reasoning fields (folded by
+``reasoning_replay``); the other four are LiteLLM's message-dump keys, which
+``_Message`` admits only in their empty (or, for ``provider_specific_fields``,
+dropped-and-disclosed) forms.
 """
 
 
@@ -182,7 +217,7 @@ def decode_chat(
     _validate_official(
         _CHAT_OFFICIAL,
         _without_chat_message_extensions(payload),
-        extension_fields={"top_k", "reasoning_effort"},
+        extension_fields={"top_k", "reasoning_effort", "enable_thinking"},
     )
     request = _validate_wire(_ChatRequest, payload)
     idempotency_key, client_request_id = _validated_operation_headers(
@@ -214,6 +249,7 @@ def decode_chat(
                 *alias_disclosures,
                 *json_object_disclosure,
                 *thinking.disclosures,
+                *_replayed_reasoning_disclosures(request.messages),
             ),
             maximum_output_tokens=maximum,
             maximum_output_tokens_parameter=(
@@ -246,7 +282,7 @@ def decode_chat(
             client_request_id=client_request_id,
         )
     except ValidationError as exc:
-        raise _validation_protocol_error(exc) from exc
+        raise validation_protocol_error(exc) from exc
     return DecodedGatewayRequest(alias=request.model, request=canonical)
 
 
@@ -278,7 +314,7 @@ def decode_embeddings(payload: JsonObject) -> DecodedEmbeddingsRequest:
             user=request.user,
         )
     except ValidationError as exc:
-        raise _validation_protocol_error(exc) from exc
+        raise validation_protocol_error(exc) from exc
     return DecodedEmbeddingsRequest(alias=request.model, request=canonical)
 
 
@@ -306,6 +342,7 @@ def decode_responses(
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
     request = _validate_wire(_ResponsesRequest, payload)
+    _require_responses_input(request)
     official_probe = dict(payload)
     if isinstance(raw := payload.get("input"), list):
         # The installed SDK lags the live surface on echoed output items:
@@ -318,8 +355,30 @@ def decode_responses(
         adapted: list[JsonValue] = []
         for index, entry in enumerate(cast("list[JsonValue]", raw)):
             if isinstance(entry, dict):
-                entry = _official_image_details(entry, f"input.{index}")
-            if isinstance(entry, dict) and entry.get("type") == "message":
+                entry = _official_message_content(_official_image_details(entry, f"input.{index}"))
+            if (
+                isinstance(entry, dict)
+                and entry.get("role") == "assistant"
+                and entry.get("type") in (None, "message")
+                and entry.get("id") is None
+                and isinstance(entry.get("content"), list)
+            ):
+                # An assistant history message with typed parts and no item
+                # id is what every Chat-to-Responses bridge sends (LiteLLM,
+                # the AI SDK); the provider serves it (probed live
+                # 2026-09-15, api.openai.com) but the SDK's input-message
+                # type admits only input parts and its output-message type
+                # requires id and status, so the probe sees a completed
+                # output item. The wire model keeps the id absent.
+                adapted.append(
+                    {
+                        **{key: value for key, value in entry.items() if key != "phase"},
+                        "type": "message",
+                        "id": _PROBE_OUTPUT_ITEM_ID,
+                        "status": "completed",
+                    }
+                )
+            elif isinstance(entry, dict) and entry.get("type") == "message":
                 item = {key: value for key, value in entry.items() if key != "phase"}
                 if item.get("id") is not None and "status" not in item:
                     item["status"] = "completed"
@@ -385,7 +444,14 @@ def decode_responses(
             tool_choice=_responses_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=responses_structured_text(request.text),
-            ignored_parameters=alias_disclosures,
+            ignored_parameters=(
+                *alias_disclosures,
+                *_replayed_reasoning_disclosures(
+                    ()
+                    if isinstance(request.input, str)
+                    else tuple(item for item in request.input if isinstance(item, _ResponseMessage))
+                ),
+            ),
             maximum_output_tokens=request.max_output_tokens,
             maximum_output_tokens_parameter=(
                 "max_output_tokens" if request.max_output_tokens is not None else None
@@ -431,7 +497,17 @@ def decode_responses(
             client_request_id=client_request_id,
         )
     except ValidationError as exc:
-        raise _validation_protocol_error(exc) from exc
+        error = validation_protocol_error(exc)
+        if error.detail.param == "messages":
+            # The canonical transcript is empty: every input item was
+            # consumed without a turn (``input: []`` beside a
+            # previous_response_id). Name the field the caller sent.
+            raise invalid_field(
+                "input",
+                "Invalid value for 'input': a continuation needs at least one new input "
+                "item; resend the turn you want answered.",
+            ) from exc
+        raise error from exc
     developer_messages_param = None
     if request.instructions is not None:
         developer_messages_param = "instructions"
@@ -450,6 +526,59 @@ def decode_responses(
         alias=request.model,
         request=canonical,
         developer_messages_param=developer_messages_param,
+    )
+
+
+_PROBE_OUTPUT_ITEM_ID = "msg_gateway_probe"
+"""Placeholder item id the official probe sees on an id-less assistant message."""
+
+_TEXT_PART_TYPE_BY_ROLE = {
+    "user": "input_text",
+    "system": "input_text",
+    "developer": "input_text",
+    "assistant": "output_text",
+}
+"""The Responses text-part spelling each message role emits on the wire."""
+
+
+def _official_message_content(entry: JsonObject) -> JsonObject:
+    """Spell every text part of one message item the way its role emits it.
+
+    The wire model accepts the three text-part spellings on either surface
+    (``text``, ``input_text``, ``output_text``) because the payload builder
+    re-emits a part by the message's ROLE, never by the caller's tag: a Chat
+    client's ``text`` part in a Responses user message serves exactly like
+    ``input_text``. The installed SDK types each role's parts by one spelling,
+    so only the probe copy is respelled; the canonical request is unchanged.
+    """
+    role = entry.get("role")
+    content = entry.get("content")
+    spelling = _TEXT_PART_TYPE_BY_ROLE.get(role) if isinstance(role, str) else None
+    if spelling is None or not isinstance(content, list):
+        return entry
+    parts: list[JsonValue] = []
+    for part in cast("list[JsonValue]", content):
+        if isinstance(part, dict) and part.get("type") in _TEXT_PART_TYPES:
+            parts.append({**part, "type": spelling})
+        else:
+            parts.append(part)
+    return {**entry, "content": parts}
+
+
+def _require_responses_input(request: _ResponsesRequest) -> None:
+    """Refuse an empty ``input`` with nothing to continue from, before any dispatch.
+
+    OpenAI treats ``""`` and ``[]`` as an absent ``input`` and answers 400
+    ``One of "input" or "previous_response_id" ... must be provided``; this
+    gateway used to forward the empty request and bill the attempt (845 such
+    provider rejections for one organization in the 3 days to 2026-09-15).
+    """
+    if request.previous_response_id is not None or request.input:
+        return
+    raise invalid_field(
+        "input",
+        "Invalid value for 'input': provide at least one input item or a non-empty "
+        "string, or set previous_response_id to continue a stored conversation.",
     )
 
 
@@ -501,7 +630,7 @@ def _validate_official(
         }
         adapter.validate_python(official_payload)
     except ValidationError as exc:
-        raise _validation_protocol_error(exc) from exc
+        raise validation_protocol_error(exc) from exc
 
 
 def _validate_wire[ModelT: BaseModel](model: type[ModelT], payload: JsonObject) -> ModelT:
@@ -509,172 +638,7 @@ def _validate_wire[ModelT: BaseModel](model: type[ModelT], payload: JsonObject) 
     try:
         return model.model_validate(payload)
     except ValidationError as exc:
-        raise _validation_protocol_error(exc) from exc
-
-
-_LOCATION_NOISE = {"body", "non-streaming", "streaming"}
-_UNION_BRANCH_TYPES = {"str", "int", "float", "bool", "list", "tuple", "dict", "NoneType"}
-_OUTPUT_ITEM_VARIANTS = {
-    "message",
-    "function_call",
-    "function_call_output",
-    "reasoning",
-    "additional_tools",
-    "custom_tool_call",
-    "custom_tool_call_output",
-    # Hosted-tool echo variants share the same union-branch label shape.
-    *HOSTED_TOOL_ITEM_TYPES_TOOL,
-    *HOSTED_TOOL_ITEM_TYPES_ASSISTANT,
-}
-
-
-def _cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
-    """Drop pydantic union-branch labels so the path names request fields."""
-    cleaned: list[str] = []
-    for part in location:
-        text = str(part)
-        if text in _LOCATION_NOISE:
-            continue
-        # Typed-dict union branches are labeled with their class name, which
-        # no request field ever shares: every public field is lower case.
-        if isinstance(part, str) and (
-            part.startswith("_") or "[" in text or text in _UNION_BRANCH_TYPES or text[:1].isupper()
-        ):
-            continue
-        if text in _OUTPUT_ITEM_VARIANTS and cleaned and cleaned[-1].isdigit():
-            continue
-        # A discriminated part whose tag is also its payload field name
-        # (``file.file``, ``image_url.image_url``) reports the tag once.
-        if cleaned and cleaned[-1] == text and not text.isdigit():
-            continue
-        cleaned.append(text)
-    return tuple(cleaned)
-
-
-_WIRE_TYPE_NAMES = {
-    "str": "a string",
-    "int": "an integer",
-    "float": "a number",
-    "bool": "a boolean",
-    "list": "an array",
-    "tuple": "an array",
-    "dict": "an object",
-    "NoneType": "null",
-}
-"""JSON-shape names for python input types, used in expected/got messages."""
-
-_EXPECTED_BY_ERROR_TYPE = {
-    "string_type": "a string",
-    "string_too_short": "a non-empty string",
-    "int_type": "an integer",
-    "int_parsing": "an integer",
-    "float_type": "a number",
-    "float_parsing": "a number",
-    "bool_type": "a boolean",
-    "list_type": "an array",
-    "tuple_type": "an array",
-    "dict_type": "an object",
-    "model_type": "an object",
-    "model_attributes_type": "an object",
-    "missing": "a value",
-    "none_required": "null",
-}
-"""Shape-level expectations for the pydantic error types worth naming."""
-
-
-def _shape_message(param: str, details: list[ErrorDetails]) -> str | None:
-    """Describe what shape a field expected versus what arrived.
-
-    Only structural facts appear: expectations come from this gateway's own
-    wire models and the got side is the JSON type of the caller's value,
-    never the value itself and never provider prose.
-    """
-    expected: list[str] = []
-    got: str | None = None
-    member_error = False
-    for detail in details:
-        if detail["type"] == "string_too_long":
-            # The bound and the arriving LENGTH are both display-safe facts
-            # (the value itself is never echoed); stating them saves the
-            # caller from bisecting the ceiling out of a bare rejection.
-            context = detail.get("ctx") or {}
-            maximum = context.get("max_length")
-            value = detail.get("input")
-            if isinstance(maximum, int) and isinstance(value, str):
-                return (
-                    f"Invalid value for '{param}': expected at most "
-                    f"{maximum:,} characters, but got {len(value):,}."
-                )
-        phrase = _EXPECTED_BY_ERROR_TYPE.get(detail["type"])
-        if detail["type"] in {"literal_error", "enum"}:
-            # The value arrived as the right JSON type but is not a member of
-            # the closed set, so naming the arriving type ("got a string
-            # instead") would misdescribe the fault: the members are the fact.
-            member_error = True
-            context = detail.get("ctx") or {}
-            allowed = context.get("expected")
-            if isinstance(allowed, str):
-                phrase = f"one of {allowed}"
-        if phrase is not None and phrase not in expected:
-            expected.append(phrase)
-        # A missing-field complaint carries the parent object as its input,
-        # so it contributes no honest "got" type.
-        if detail["type"] != "missing" and "input" in detail:
-            got = _WIRE_TYPE_NAMES.get(type(detail["input"]).__name__, got)
-    if not expected:
-        return None
-    description = " or ".join(expected)
-    if got is not None and not member_error:
-        return f"Invalid value for '{param}': expected {description}, but got {got} instead."
-    return f"Invalid value for '{param}': expected {description}."
-
-
-def _validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
-    """Convert Pydantic locations into stable dotted OpenAI ``param`` paths.
-
-    Union validation reports every branch's complaints. Errors group by
-    their branch (the location minus its final field segment); among the
-    most field-specific groups, the branch the caller actually meant is the
-    one with the fewest complaints, so its deepest cleaned location names
-    the real field (an echoed item's ``input.1.caller``), never a union
-    branch label such as ``input.str``. The chosen field's own complaints
-    then name the expected shape against the arriving JSON type.
-    """
-    groups: dict[tuple[str | int, ...], list[tuple[tuple[str, ...], ErrorDetails]]] = {}
-    for detail in error.errors(include_url=False):
-        groups.setdefault(tuple(detail["loc"][:-1]), []).append(
-            (_cleaned_location(detail["loc"]), detail)
-        )
-    if not groups:
-        return invalid_field("body")
-    deepest = max(len(location) for members in groups.values() for location, _ in members)
-    candidates = [
-        members
-        for members in groups.values()
-        if any(len(location) == deepest for location, _ in members)
-    ]
-    best = min(candidates, key=len)
-    location = max((cleaned for cleaned, _ in best), key=len, default=())
-    param = ".".join(location) or "body"
-    details = [detail for cleaned, detail in best if cleaned == location]
-    if param == "body":
-        # A whole-request rule (such as the attachment count ceiling) has no
-        # field of its own, so its own wording is the only useful message.
-        for detail in details:
-            if detail["type"] == "value_error":
-                return invalid_field(param, detail["msg"].removeprefix("Value error, ") + ".")
-    for detail in details:
-        # A field validator's own wording states this gateway's exact value
-        # constraint (only our wire models raise these, so the text is
-        # display-safe and never echoes the caller's value).
-        if detail["type"] == "value_error":
-            return invalid_field(
-                param,
-                f"Invalid value for {param!r}: "
-                + detail["msg"].removeprefix("Value error, ")
-                + ".",
-            )
-    return invalid_field(param, _shape_message(param, details))
+        raise validation_protocol_error(exc) from exc
 
 
 def _validated_operation_headers(
@@ -713,14 +677,20 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
         provider_reasoning: tuple[
             SealedReasoningContentBlock | ExposedReasoningContentBlock, ...
         ] = ()
-        if message.reasoning_content is not None:
-            param = f"{prefix}.{message_index}.reasoning_content"
+        folded = fold_replayed_reasoning(
+            reasoning_content=message.reasoning_content,
+            reasoning=message.reasoning,
+            reasoning_details=message.reasoning_details,
+        )
+        if folded.plaintext is not None:
+            param = f"{prefix}.{message_index}.{folded.source_field}"
             # The scheme is fixed by the carrier's own opaque prefix. A known
             # prefix MUST parse as that provider's carrier. Text under no known
             # prefix is the plaintext an exposure-gated rung itself returned on
-            # an assistant turn (Tencent/DeepSeek): it decodes as caller-owned
-            # history and route admission decides which rungs may carry it.
-            scheme = scheme_for_carrier(message.reasoning_content)
+            # an assistant turn (Tencent/DeepSeek), or the plaintext OpenRouter
+            # handed the caller: it decodes as caller-owned history and route
+            # admission decides which rungs may carry it.
+            scheme = scheme_for_carrier(folded.plaintext)
             if scheme is None:
                 # Plaintext reasoning is caller-owned history on ANY assistant
                 # turn, tool-call turns included: AI-SDK clients re-serialize a
@@ -732,19 +702,17 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
                 # applies only to text presented AS a gateway-issued carrier,
                 # which keeps its strict path below).
                 try:
-                    provider_reasoning = (
-                        ExposedReasoningContentBlock(content=message.reasoning_content),
-                    )
+                    provider_reasoning = (ExposedReasoningContentBlock(content=folded.plaintext),)
                 except ValidationError as exc:
                     raise invalid_field(
                         param,
                         f"'{param}' plaintext reasoning exceeds 8,388,608 characters. "
-                        "Shorten the replayed reasoning_content and retry.",
+                        f"Shorten the replayed {folded.source_field} and retry.",
                     ) from exc
             else:
                 try:
                     provider_reasoning = (
-                        parse_reasoning_content_carrier(message.reasoning_content, scheme=scheme),
+                        parse_reasoning_content_carrier(folded.plaintext, scheme=scheme),
                     )
                 except ValueError as exc:
                     raise invalid_field(
@@ -768,6 +736,21 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
             )
         )
     return tuple(converted)
+
+
+def _replayed_reasoning_disclosures(messages: Sequence[_Message]) -> tuple[str, ...]:
+    """Collect the OpenRouter replay disclosures owed across a transcript, once each."""
+    disclosures: list[str] = []
+    for message in messages:
+        folded = fold_replayed_reasoning(
+            reasoning_content=message.reasoning_content,
+            reasoning=message.reasoning,
+            reasoning_details=message.reasoning_details,
+        )
+        for disclosure in folded.disclosures:
+            if disclosure not in disclosures:
+                disclosures.append(disclosure)
+    return tuple(disclosures)
 
 
 def _tool_call(call: _AssistantToolCall, param: str) -> ToolCall:

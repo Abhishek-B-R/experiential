@@ -124,3 +124,70 @@ def test_agreeing_enable_fields_prefer_the_nested_level() -> None:
     request = _decode(reasoning={"effort": "medium"}, thinking={"type": "enabled"})
     assert request.reasoning_effort == "medium"
     assert request.thinking_default_enable is False
+
+
+def test_top_level_enable_thinking_translates_like_chat_template_kwargs() -> None:
+    """DashScope's top-level switch enables at the model default or disables to none."""
+    enabled = _decode(enable_thinking=True)
+    assert enabled.reasoning_effort is None
+    assert enabled.thinking_default_enable is True
+    assert enabled.ignored_parameters == ("enable_thinking->translated(reasoning_effort)",)
+    disabled = _decode(enable_thinking=False)
+    assert disabled.reasoning_effort == "none"
+    assert disabled.thinking_default_enable is False
+
+
+def test_openrouter_reasoning_enabled_translates_to_the_canonical_control() -> None:
+    """``reasoning.enabled`` is OpenRouter's literal on/off vote."""
+    enabled = _decode(reasoning={"enabled": True})
+    assert enabled.reasoning_effort is None
+    assert enabled.thinking_default_enable is True
+    assert enabled.ignored_parameters == ("reasoning->translated(reasoning_effort)",)
+    disabled = _decode(reasoning={"enabled": False})
+    assert disabled.reasoning_effort == "none"
+    assert disabled.thinking_default_enable is False
+
+
+def test_openrouter_reasoning_budget_enables_and_is_disclosed_not_carried() -> None:
+    """A ``max_tokens`` budget implies enable; the budget itself has no canonical carrier."""
+    request = _decode(reasoning={"max_tokens": 2048})
+    assert request.reasoning_effort is None
+    assert request.thinking_default_enable is True
+    assert request.ignored_parameters == (
+        "reasoning.max_tokens->dropped(not_carried)",
+        "reasoning->translated(reasoning_effort)",
+    )
+
+
+def test_openrouter_reasoning_exclude_is_disclosed_not_carried() -> None:
+    """``exclude: true`` (hide reasoning in the response) is accepted and disclosed."""
+    request = _decode(reasoning={"effort": "high", "exclude": True})
+    assert request.reasoning_effort == "high"
+    assert request.ignored_parameters == (
+        "reasoning.exclude->dropped(not_carried)",
+        "reasoning->translated(reasoning_effort)",
+    )
+    # exclude:false is the default and carries nothing to disclose.
+    assert _decode(reasoning={"effort": "high", "exclude": False}).ignored_parameters == (
+        "reasoning->translated(reasoning_effort)",
+    )
+
+
+def test_openrouter_reasoning_object_rejects_internal_contradictions_by_field() -> None:
+    """``enabled: false`` beside a tier or budget, or a tier beside a budget, is named."""
+    with pytest.raises(OpenAIProtocolError) as disagree:
+        _decode(reasoning={"effort": "high", "enabled": False})
+    assert disagree.value.detail.param == "reasoning.enabled"
+    with pytest.raises(OpenAIProtocolError) as both:
+        _decode(reasoning={"effort": "high", "max_tokens": 10})
+    assert both.value.detail.param == "reasoning"
+    assert "mutually exclusive" in both.value.detail.message
+
+
+def test_explicit_flat_effort_reports_every_present_alternate_spelling() -> None:
+    request = _decode(reasoning_effort="low", reasoning={"enabled": True}, enable_thinking=True)
+    assert request.reasoning_effort == "low"
+    assert request.ignored_parameters == (
+        "reasoning->ignored(explicit_reasoning_effort)",
+        "enable_thinking->ignored(explicit_reasoning_effort)",
+    )

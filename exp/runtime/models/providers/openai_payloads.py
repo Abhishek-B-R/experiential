@@ -97,6 +97,7 @@ def openai_responses_stream_payload(
     # ``stop_sequences`` (see ``deployment_wire_entry``), cutting the stream
     # at the first match and reporting a stop-sequence terminal.
     instructions: list[str] = []
+    instruction_roles: list[str] = []
     items: list[JsonObject] = []
     for message in request.messages:
         if message.provider_native_item is not None:
@@ -120,8 +121,21 @@ def openai_responses_stream_payload(
                 items.append({"role": message.role, "content": message.content})
             else:
                 instructions.append(message.content)
+                instruction_roles.append(message.role)
         else:
             items.extend(responses_items(message))
+    if not items and instructions:
+        # A request that is ONLY instructions (a system-prompt-only Chat call,
+        # a Responses body whose input is a lone system item) has nothing for
+        # the ``input`` field, and the provider refuses an empty one ("One of
+        # 'input' or 'previous_response_id' ... must be provided") while it
+        # serves the same instructions as input items (probed live
+        # 2026-09-15, api.openai.com). Emit them as items instead.
+        items = [
+            {"role": role, "content": content}
+            for role, content in zip(instruction_roles, instructions, strict=True)
+        ]
+        instructions = []
     # Upstream storage stays disabled regardless of the caller's `store`
     # selector: continuation state is gateway-owned, the gateway never
     # references a provider-stored response, and disabled storage is what
