@@ -347,10 +347,7 @@ class _Message(_WireModel):
             raise ValueError("tool_calls are valid only for assistant messages")
         if self.role != "assistant" and self.reasoning_content is not None:
             raise ValueError("reasoning_content is valid only for assistant messages")
-        # A tool result carries images (Copilot, Codex and other agents put
-        # a screenshot into the tool message that reports it, and the
-        # canonical tool message holds text and image parts); every other
-        # non-user role stays text-only, as do video, audio and file parts.
+        # Tool results carry images (agents report screenshots there); other roles stay text-only.
         media = {type(part) for part in self.image_capable_parts} - {_TextPart}
         if media and self.role not in ("user", "tool"):
             raise ValueError(
