@@ -16,42 +16,7 @@ impl Normalizer {
         frame: &crate::sse::SseEvent,
     ) -> Result<Vec<Event>, Failure> {
         if frame.data == "[DONE]" {
-            let finish = self.finish_reason.as_deref();
-            // A tool call cut off by the output budget (finish_reason=length,
-            // arguments still an open JSON fragment) is the provider's honest
-            // truncation, not a malformed stream: it surfaces as Incomplete
-            // with the truncated call dropped, exactly what the caller must
-            // act on (raise max_tokens), never as a 502. Live shape: Tencent
-            // TokenHub glm-5.3 at max_tokens=32 streamed `{"` + `city` then
-            // finished with length (staging, 2026-09-03). Under any other
-            // finish a relay may still close a call mid-fragment
-            // (finish_open_tools_relay): that cut call is dropped and the turn
-            // settles Incomplete too; a syntax error inside the arguments
-            // keeps the strict contract and stays malformed.
-            let (mut events, cut_mid_fragment) = if finish == Some("length") {
-                (finish_open_tools_truncated(&mut self.tools)?, false)
-            } else {
-                finish_open_tools_relay(&mut self.tools)?
-            };
-            if let Some(usage) = self.usage.take() {
-                events.push(Event::Usage(usage));
-            }
-            if self.refusal_seen || matches!(finish, Some("content_filter" | "safety")) {
-                // A `content_filter`/`safety` finish reason names the category;
-                // a bare visible-refusal delta names none (Unspecified).
-                let reason = match finish {
-                    Some(code @ ("content_filter" | "safety")) => {
-                        crate::stream_errors::refusal_reason(Some(code), None)
-                    }
-                    _ => crate::errors::RefusalReason::Unspecified,
-                };
-                events.push(Event::Failed(Failure::refusal(reason)));
-            } else if finish == Some("length") || cut_mid_fragment {
-                events.push(Event::Incomplete);
-            } else {
-                events.push(Event::Completed);
-            }
-            return Ok(events);
+            return self.finish_openai_compatible_stream();
         }
         let payload = parse_object(&frame.data)?;
         // An OpenAI-compatible relay declaring failure inside the stream (or
@@ -245,6 +210,74 @@ impl Normalizer {
             }
         }
         Ok(events)
+    }
+
+    /// End an OpenAI-compatible stream on the finish reason it carried.
+    ///
+    /// Reached from the `[DONE]` sentinel, or from a clean EOF that arrived
+    /// after a `finish_reason` chunk (`openai_compatible_stream_end`): the
+    /// finish reason is the provider's declared end of the choice, and both
+    /// paths settle it identically.
+    fn finish_openai_compatible_stream(&mut self) -> Result<Vec<Event>, Failure> {
+        let finish = self.finish_reason.as_deref();
+        // A tool call cut off by the output budget (finish_reason=length,
+        // arguments still an open JSON fragment) is the provider's honest
+        // truncation, not a malformed stream: it surfaces as Incomplete
+        // with the truncated call dropped, exactly what the caller must
+        // act on (raise max_tokens), never as a 502. Live shape: Tencent
+        // TokenHub glm-5.3 at max_tokens=32 streamed `{"` + `city` then
+        // finished with length (staging, 2026-09-03). Under any other
+        // finish a relay may still close a call mid-fragment
+        // (finish_open_tools_relay): that cut call is dropped and the turn
+        // settles Incomplete too; a syntax error inside the arguments
+        // keeps the strict contract and stays malformed.
+        let (mut events, cut_mid_fragment) = if finish == Some("length") {
+            (finish_open_tools_truncated(&mut self.tools)?, false)
+        } else {
+            finish_open_tools_relay(&mut self.tools)?
+        };
+        if let Some(usage) = self.usage.take() {
+            events.push(Event::Usage(usage));
+        }
+        if self.refusal_seen || matches!(finish, Some("content_filter" | "safety")) {
+            // A `content_filter`/`safety` finish reason names the category;
+            // a bare visible-refusal delta names none (Unspecified).
+            let reason = match finish {
+                Some(code @ ("content_filter" | "safety")) => {
+                    crate::stream_errors::refusal_reason(Some(code), None)
+                }
+                _ => crate::errors::RefusalReason::Unspecified,
+            };
+            events.push(Event::Failed(Failure::refusal(reason)));
+        } else if finish == Some("length") || cut_mid_fragment {
+            events.push(Event::Incomplete);
+        } else {
+            events.push(Event::Completed);
+        }
+        Ok(events)
+    }
+
+    /// Terminal events for an OpenAI-compatible stream that closed cleanly
+    /// without the `[DONE]` sentinel but after a `finish_reason` chunk.
+    ///
+    /// The OpenAI contract ends a choice with its non-null `finish_reason`;
+    /// `[DONE]` is the sentinel OpenAI's own server appends afterwards, and
+    /// not every compatible server does. Azure AI Foundry's DeepSeek
+    /// deployments (DeepSeek-V4-Flash, live 2026-09-15) end a content-filtered
+    /// stream with the `finish_reason: "content_filter"` chunk and close the
+    /// connection at once, so ~900 refusals a day on that lane were filed as
+    /// "provider stream ended without a terminal event" 502s instead of the
+    /// refusal the provider declared. A finish reason already seen is a
+    /// complete ending: settle it exactly as `[DONE]` would (refusal,
+    /// Incomplete, or Completed). Without one, nothing is synthesized and the
+    /// stream stays terminal-less for `stream_ended` to fail closed.
+    pub(in crate::dialects) fn openai_compatible_stream_end(
+        &mut self,
+    ) -> Result<Vec<Event>, Failure> {
+        if self.finish_reason.is_none() {
+            return Ok(Vec::new());
+        }
+        self.finish_openai_compatible_stream()
     }
 }
 

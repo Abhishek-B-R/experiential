@@ -1,4 +1,5 @@
-//! Azure annotation-only frames share the compatible content and finish lifecycle.
+//! Azure annotation-only frames share the compatible content and finish lifecycle,
+//! and a finish reason without the `[DONE]` sentinel is still a complete ending.
 
 use crate::dialects::{drain_stream_fixture, Dialect, Normalizer};
 use crate::errors::FailureClass;
@@ -188,4 +189,129 @@ fn error_shaped_success_frames_declare_the_provider_failure_with_detail() {
         })
         .expect_err("a bare message is not a declared failure");
     assert_eq!(malformed.failure_class, FailureClass::MalformedResponse);
+}
+
+fn wire(frames: &[Value], done: bool) -> Vec<Vec<u8>> {
+    let mut text = frames
+        .iter()
+        .map(|value| format!("data: {value}\n\n"))
+        .collect::<String>();
+    if done {
+        text += "data: [DONE]\n\n";
+    }
+    // Decode across arbitrary transport boundaries, including inside JSON.
+    text.as_bytes().chunks(11).map(<[u8]>::to_vec).collect()
+}
+
+fn text_frame(content: &str) -> Value {
+    json!({"choices": [{"index": 0, "delta": {"content": content}, "finish_reason": null}]})
+}
+
+fn finish_frame(finish: &str) -> Value {
+    json!({"choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})
+}
+
+/// Azure AI Foundry's DeepSeek-V4-Flash deployment (live 2026-09-15) ends a
+/// content-filtered stream with the `finish_reason: "content_filter"` chunk
+/// and closes the connection without `data: [DONE]`. The finish reason is the
+/// provider's declared ending, so the stream settles as the refusal it named
+/// instead of "provider stream ended without a terminal event".
+#[test]
+fn content_filter_finish_without_done_sentinel_is_the_declared_refusal() {
+    let frames = [
+        json!({"choices": [], "prompt_filter_results": []}),
+        text_frame("The court"),
+        text_frame(" remanded"),
+        finish_frame("content_filter"),
+    ];
+    let (events, failure) = drain_stream_fixture(Dialect::OpenAiCompatible, &wire(&frames, false));
+    assert!(failure.is_none(), "{failure:?}");
+    assert_eq!(
+        events,
+        vec![
+            json!({"kind": "text_delta", "text": "The court"}),
+            json!({"kind": "text_delta", "text": " remanded"}),
+            json!({"kind": "refusal_delta", "text": ""}),
+            json!({
+                "kind": "failed",
+                "failure_class": "refusal",
+                "safe_message": "provider refused the request: content policy",
+                "refusal_reason": "content_policy",
+            }),
+        ]
+    );
+}
+
+/// A `stop` finish followed by EOF (no sentinel) completes and folds the
+/// trailing usage exactly as the `[DONE]` path does.
+#[test]
+fn stop_finish_without_done_sentinel_completes_with_usage() {
+    let frames = [
+        text_frame("OK"),
+        finish_frame("stop"),
+        json!({"choices": [], "usage": {"prompt_tokens": 13, "completion_tokens": 1, "total_tokens": 14}}),
+    ];
+    let with_done = drain_stream_fixture(Dialect::OpenAiCompatible, &wire(&frames, true));
+    let without_done = drain_stream_fixture(Dialect::OpenAiCompatible, &wire(&frames, false));
+    assert!(
+        with_done.1.is_none() && without_done.1.is_none(),
+        "{with_done:?} {without_done:?}"
+    );
+    assert_eq!(with_done.0, without_done.0);
+    assert_eq!(
+        without_done.0,
+        vec![
+            json!({"kind": "text_delta", "text": "OK"}),
+            json!({"kind": "usage", "input_tokens": 13, "output_tokens": 1, "cached_input_tokens": null, "reasoning_tokens": null}),
+            json!({"kind": "completed"}),
+        ]
+    );
+}
+
+/// A `length` finish then EOF keeps the truncation contract: the open tool
+/// fragment is dropped and the turn settles Incomplete, never malformed.
+#[test]
+fn length_finish_without_done_sentinel_is_incomplete() {
+    let frames = [
+        json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1",
+            "type": "function", "function": {"name": "lookup", "arguments": "{\"city"}}]}}]}),
+        finish_frame("length"),
+    ];
+    let (events, failure) = drain_stream_fixture(Dialect::OpenAiCompatible, &wire(&frames, false));
+    assert!(failure.is_none(), "{failure:?}");
+    assert_eq!(events.last(), Some(&json!({"kind": "incomplete"})));
+}
+
+/// Without a finish reason nothing is synthesized: a stream that emitted
+/// content and then closed is still a malformed ending, so a mid-answer
+/// disconnect cannot be mistaken for a complete turn.
+#[test]
+fn eof_without_finish_reason_stays_malformed() {
+    let frames = [text_frame("half an ans")];
+    let (events, failure) = drain_stream_fixture(Dialect::OpenAiCompatible, &wire(&frames, false));
+    assert_eq!(
+        events,
+        vec![json!({"kind": "text_delta", "text": "half an ans"})]
+    );
+    let failure = failure.expect("terminal-less stream fails closed");
+    assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+    assert_eq!(
+        failure.safe_message,
+        "provider stream ended without a terminal event"
+    );
+}
+
+/// The synthesized ending runs the same tool contract as `[DONE]`: a finish
+/// other than `length` over a syntactically broken argument object stays
+/// malformed rather than completing a corrupt call.
+#[test]
+fn eof_after_finish_keeps_the_strict_tool_argument_contract() {
+    let frames = [
+        json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1",
+            "type": "function", "function": {"name": "lookup", "arguments": "{\"city\": [1,}"}}]}}]}),
+        finish_frame("tool_calls"),
+    ];
+    let (_, failure) = drain_stream_fixture(Dialect::OpenAiCompatible, &wire(&frames, false));
+    let failure = failure.expect("broken arguments stay malformed");
+    assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
 }

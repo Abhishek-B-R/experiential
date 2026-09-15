@@ -394,13 +394,22 @@ impl UpstreamRelay {
                             }
                         }
                     }
-                    // A Gemini stream may end cleanly after its last content
-                    // frame without a finishReason frame; synthesize the
-                    // terminal completion (folding the last-seen usage) so a
-                    // real answer is not thrown away as malformed. A stream
-                    // that produced no content stays terminal-less and the
-                    // caller still synthesizes `ended_without_terminal`.
-                    self.pending.extend(self.normalizer.on_stream_end());
+                    // A stream may end cleanly without a terminal frame: a
+                    // Gemini stream after its last content frame (no
+                    // finishReason), or an OpenAI-compatible stream whose
+                    // finish_reason chunk arrived without a `[DONE]` sentinel
+                    // (Azure Foundry's DeepSeek content-filter ending). The
+                    // normalizer synthesizes the terminal the dialect already
+                    // declared so a real answer or refusal is not thrown away
+                    // as malformed; a stream that declared nothing stays
+                    // terminal-less and the caller still synthesizes
+                    // `ended_without_terminal`.
+                    match self.normalizer.on_stream_end() {
+                        Ok(events) => self.pending.extend(events),
+                        Err(failure) => {
+                            self.recover_or_fail(failure)?;
+                        }
+                    }
                     continue;
                 }
                 Err(_) => {
