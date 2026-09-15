@@ -30,7 +30,8 @@ impl Normalizer {
         // 2026-09-15); it settles exactly as `[DONE]` would.
         if self.dialect == Dialect::OpenAiCompatible && self.finish_reason.is_some() {
             self.log_stream_end("declared_finish");
-            return self.end_with(self.openai_compatible_stream_end()?);
+            let events = self.openai_compatible_stream_end()?;
+            return self.end_with(events);
         }
         if !self.emitted_output {
             return Ok(Vec::new());
@@ -54,7 +55,8 @@ impl Normalizer {
                         self.openai_close_unfinished_items(ProviderOutputItemStatus::Incomplete),
                     );
                 }
-                let (tool_events, _dropped) = finish_open_tools_relay(&mut self.tools, "stream_end")?;
+                let (tool_events, _dropped) =
+                    finish_open_tools_relay(&mut self.tools, "stream_end")?;
                 events.extend(tool_events);
                 if let Some(usage) = self.usage.take() {
                     events.push(Event::Usage(usage));

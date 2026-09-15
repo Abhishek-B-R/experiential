@@ -20,6 +20,26 @@ fn wire_text(value: Option<&Value>, label: &str) -> Result<Option<String>, Failu
     }
 }
 
+/// Whether a choices-less chunk carries only the OpenAI chunk envelope's
+/// metadata keys (identity, timing, usage, Azure's prompt-filter report), so
+/// nothing a decoder would need is being skipped.
+fn is_metadata_only_frame(payload: &serde_json::Map<String, Value>) -> bool {
+    const METADATA_KEYS: [&str; 9] = [
+        "id",
+        "object",
+        "created",
+        "model",
+        "system_fingerprint",
+        "service_tier",
+        "usage",
+        "prompt_filter_results",
+        "obfuscation",
+    ];
+    payload
+        .keys()
+        .all(|key| METADATA_KEYS.contains(&key.as_str()))
+}
+
 /// Process-wide mint counter: two streams decoded in the same clock tick
 /// (or a clock that cannot be read) still receive distinct ids.
 static SYNTHESIZED_CALL_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -98,14 +118,15 @@ impl Normalizer {
                 );
             }
         }
-        // A frame without `choices` is metadata only (a relay's trailing
-        // usage-only chunk or keepalive: Novita, 19 attempts in two days,
-        // 2026-09-14..15); its usage was taken above and nothing else is
-        // decoded from it. An explicitly non-array `choices` stays malformed.
+        // A frame without `choices` whose keys are all chunk metadata is a
+        // relay's trailing usage-only chunk (Novita, 19 attempts in two days,
+        // 2026-09-14..15): its usage was taken above and nothing else is
+        // decoded from it. A choices-less frame carrying anything else, and
+        // an explicitly non-array `choices`, stay malformed.
         let choices = match payload.get("choices") {
-            None | Some(Value::Null) => return Ok(events),
+            None | Some(Value::Null) if is_metadata_only_frame(&payload) => return Ok(events),
             Some(Value::Array(choices)) => choices,
-            Some(_) => return Err(malformed("OpenAI-compatible choices must be an array")),
+            _ => return Err(malformed("OpenAI-compatible choices must be an array")),
         };
         if choices.is_empty() {
             return Ok(events);

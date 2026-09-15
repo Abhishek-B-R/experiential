@@ -250,16 +250,23 @@ fn a_frame_without_choices_is_metadata_only() {
         events.as_slice(),
         [Event::Usage(usage), Event::Completed] if usage.output_tokens == Some(1)
     ));
-    let mut strict = Normalizer::new(Dialect::OpenAiCompatible);
-    let bad = SseEvent {
-        event: None,
-        data: serde_json::json!({"choices": {"index": 0}}).to_string(),
-    };
-    assert!(strict
-        .feed(&bad)
-        .expect_err("a non-array choices stays malformed")
-        .safe_message
-        .contains("choices must be an array"));
+    // A non-array `choices`, and a choices-less frame carrying anything but
+    // chunk metadata, keep the strict contract.
+    for bad in [
+        serde_json::json!({"choices": {"index": 0}}),
+        serde_json::json!({"id": "x", "delta": {"content": "smuggled"}}),
+    ] {
+        let mut strict = Normalizer::new(Dialect::OpenAiCompatible);
+        let frame = SseEvent {
+            event: None,
+            data: bad.to_string(),
+        };
+        assert!(strict
+            .feed(&frame)
+            .expect_err("stays malformed")
+            .safe_message
+            .contains("choices must be an array"));
+    }
 }
 
 #[test]
