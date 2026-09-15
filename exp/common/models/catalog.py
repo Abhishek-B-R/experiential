@@ -458,12 +458,8 @@ class GatewayDeploymentCapabilities(ContractModel):
     named parameter error instead of forwarding it and surfacing the provider's
     opaque 4xx (e.g. Gemini caps ``stopSequences`` at 5)."""
     minimum_output_tokens: int | None = Field(default=None, ge=1)
-    """Smallest output-token ceiling the provider accepts (a lane fact, not a wire fact).
-
-    Perplexity sonar / Sakana fugu via OpenRouter and grok-4.6 on Bedrock 400
-    any ``max_tokens`` below 16 on a wire that carries 1; a smaller caller value
-    is floored to this with disclosure (``<parameter>-><floor>``) on every
-    surface, like the Messages-onto-OpenAI translation floor. ``None``: no floor."""
+    """Provider output-token floor (sonar/fugu via OpenRouter, grok-4.6 on Bedrock: 16); a
+    smaller caller ceiling is floored to it with disclosure on every surface (see the profile)."""
     supported_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
     """Exact caller values this deployment can preserve without normalization.
 
