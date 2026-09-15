@@ -446,6 +446,25 @@ discarded before provider dispatch and canonical replay identity; the `url` and
 `detail` remain authoritative. A data URL keeps its embedded MIME type, and a
 remote URL is forwarded for the provider to fetch. Unknown image fields and
 malformed URLs or base64 remain rejected.
+A Chat `role: "tool"` message accepts `image_url` parts beside its text (GitHub Copilot Chat,
+Codex Desktop and node agents report a screenshot inside the tool message that took it; the
+old `valid only for user messages` 400 refused ~1,000 such requests a week and wedged every
+later turn of those sessions, because the block is baked into the caller's history). The
+result decodes as the canonical tool message with text and image parts, the same shape the
+Anthropic `tool_result` image block and the Responses `function_call_output` part list
+produce; video, audio and file parts inside a tool message stay a named 400, and every other
+non-user role stays text-only. Each wire then carries the image: natively inside the tool
+result on Anthropic, native Responses and Bedrock (`ToolResultContentBlock.image`), and on Chat
+Completions and Gemini, whose tool results are text-only, folded into ONE user message that
+follows the last tool message of the contiguous run (a user message between two results of a
+parallel batch breaks the provider's tool-call linkage): each tool message keeps its text with
+a numbered `[image N: attached in the next user message]` marker where the image stood, the
+user message opens with a fixed header and introduces each image by number and
+`tool_call_id`, and the route discloses
+`messages.content.tool_result.image->following_user_message`. Only a rung with no image input
+at all still degrades the tool image to placeholder text with the
+`messages.content.tool_result.image->placeholder` disclosure (`capability_policy`); a top-level
+user image keeps the fail-closed contract because the caller can re-send it.
 Both OpenAI surfaces accept the Vercel AI SDK's camelCase `promptCacheKey` (sent verbatim by
 opencode and other `ai-sdk` coding clients) as an alias of `prompt_cache_key`: it is renamed
 before manifest validation and decodes exactly as the documented field. When both spellings

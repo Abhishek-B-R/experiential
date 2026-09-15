@@ -35,6 +35,7 @@ from exp.runtime.models.providers.bedrock_requests import converse_body
 from exp.runtime.models.providers.dialect_dispatch import (
     CACHE_CONTROL_NOT_FORWARDED_SUFFIX,
     THINKING_HISTORY_DROP_DISCLOSURE,
+    TOOL_RESULT_IMAGE_FOLD_DISCLOSURE,
 )
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
@@ -47,7 +48,6 @@ from exp.runtime.models.providers.generation_route_compat import (
 )
 from exp.runtime.models.providers.streaming_requests import (
     TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
-    TOOL_RESULT_IMAGE_PLACEHOLDER,
     anthropic_messages_stream_payload,
     bedrock_converse_stream_payload,
     dialect_stream_payload,
@@ -55,6 +55,10 @@ from exp.runtime.models.providers.streaming_requests import (
     openai_compatible_stream_payload,
     openai_responses_stream_payload,
     route_generation_parameter_requests,
+)
+from exp.runtime.models.providers.wire_messages import (
+    TOOL_RESULT_IMAGE_FOLD_HEADER,
+    tool_result_image_marker,
 )
 from exp.runtime.openai_protocol.model_adapter import model_request
 from exp.runtime.openai_protocol.requests import decode_chat
@@ -621,10 +625,11 @@ def _tool_image_message() -> GatewayMessage:
     )
 
 
-def test_a_mixed_route_degrades_tool_result_images_with_disclosure() -> None:
-    """A non-Anthropic rung cannot express a tool-result image, so the route
-    substitutes positional placeholder text and discloses the drop instead of
-    rejecting a block the caller cannot remove from history."""
+def test_a_mixed_route_keeps_tool_result_images_and_discloses_the_chat_fold() -> None:
+    """A Chat rung beside an Anthropic rung no longer degrades the screenshot:
+    the shared provider request keeps the image (the Anthropic rung emits it
+    natively, the Chat rung folds it into a following user turn at payload
+    build) and the route discloses the fold, never the placeholder."""
     request = GatewayRequest(
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
         messages=(GatewayMessage(role="user", content="go"), _tool_image_message()),
@@ -636,12 +641,141 @@ def test_a_mixed_route_degrades_tool_result_images_with_disclosure() -> None:
 
     public_request, provider_request = route_generation_parameter_requests(profiles, request)
 
-    tool_message = provider_request.messages[-1]
-    assert tool_message.content_parts == ()
-    assert tool_message.content == "tool said:" + TOOL_RESULT_IMAGE_PLACEHOLDER
-    assert TOOL_RESULT_IMAGE_DROP_DISCLOSURE in public_request.ignored_parameters
-    # The public request keeps the caller's original history.
+    assert provider_request.messages[-1].images
+    assert TOOL_RESULT_IMAGE_FOLD_DISCLOSURE in public_request.ignored_parameters
+    assert TOOL_RESULT_IMAGE_DROP_DISCLOSURE not in public_request.ignored_parameters
     assert public_request.messages[-1].images
+
+    anthropic_payload = dialect_stream_payload(profiles[0], provider_request)
+    anthropic_messages = cast("list[JsonObject]", anthropic_payload["messages"])
+    # Anthropic merges the adjacent user turn and the tool result into one message.
+    result_block = cast("list[JsonObject]", anthropic_messages[-1]["content"])[-1]
+    assert result_block["type"] == "tool_result"
+    assert [block["type"] for block in cast("list[JsonObject]", result_block["content"])] == [
+        "text",
+        "image",
+    ]
+
+    chat_payload = dialect_stream_payload(profiles[1], provider_request)
+    chat_messages = cast("list[JsonObject]", chat_payload["messages"])
+    assert [message["role"] for message in chat_messages] == ["user", "tool", "user"]
+    assert chat_messages[1]["content"] == "tool said:" + tool_result_image_marker(1)
+    folded = cast("list[JsonObject]", chat_messages[2]["content"])
+    assert folded[0] == {"type": "text", "text": TOOL_RESULT_IMAGE_FOLD_HEADER}
+    assert folded[1] == {"type": "text", "text": "\nImage 1 (tool_call_id call-1):"}
+    assert folded[2]["type"] == "image_url"
+
+
+def test_the_chat_fold_lands_after_the_last_result_of_a_parallel_batch() -> None:
+    """Two results of one parallel tool batch stay contiguous: the user turn
+    carrying both screenshots follows the LAST tool message (a user message
+    between them would break the provider's tool-call linkage), and the
+    images are numbered across the batch in caller order."""
+    second = GatewayMessage(
+        role="tool",
+        tool_call_id="call-2",
+        content="second",
+        content_parts=(
+            ImageContentPart(media_type="image/png", data="Yg=="),
+            TextContentPart(text="second"),
+        ),
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="go"),
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(
+                    ToolCall(call_id="call-1", name="shot", arguments={}),
+                    ToolCall(call_id="call-2", name="shot", arguments={}),
+                ),
+            ),
+            _tool_image_message(),
+            second,
+            GatewayMessage(role="assistant", content="seen"),
+            GatewayMessage(role="user", content="next"),
+        ),
+    )
+    profile = GatewayWireProfile(dialect="openai_compatible", url="https://b.test")
+
+    payload = dialect_stream_payload(profile, request)
+
+    messages = cast("list[JsonObject]", payload["messages"])
+    assert [message["role"] for message in messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "tool",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert messages[2]["content"] == "tool said:" + tool_result_image_marker(1)
+    assert messages[3]["content"] == tool_result_image_marker(2) + "second"
+    folded = cast("list[JsonObject]", messages[4]["content"])
+    assert [part["type"] for part in folded] == ["text", "text", "image_url", "text", "image_url"]
+    assert folded[3] == {"type": "text", "text": "\nImage 2 (tool_call_id call-2):"}
+    assert cast("JsonObject", folded[4]["image_url"])["url"] == "data:image/png;base64,Yg=="
+
+
+def test_a_gemini_route_folds_tool_result_images_into_a_following_user_content() -> None:
+    """Gemini's functionResponse is JSON text; the screenshot rides the next
+    user content as inline_data and the route discloses the fold."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="go"),
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(ToolCall(call_id="call-1", name="shot", arguments={}),),
+            ),
+            _tool_image_message(),
+        ),
+    )
+    profile = GatewayWireProfile(dialect="gemini_generate_content", url="https://g.test")
+
+    public_request, provider_request = route_generation_parameter_requests((profile,), request)
+    payload = dialect_stream_payload(profile, provider_request)
+
+    assert TOOL_RESULT_IMAGE_FOLD_DISCLOSURE in public_request.ignored_parameters
+    contents = cast("list[JsonObject]", payload["contents"])
+    assert [content["role"] for content in contents] == ["user", "model", "user", "user"]
+    response = cast("list[JsonObject]", contents[2]["parts"])[0]["functionResponse"]
+    assert cast("JsonObject", response)["response"] == {
+        "content": "tool said:" + tool_result_image_marker(1)
+    }
+    folded = cast("list[JsonObject]", contents[3]["parts"])
+    assert folded[0] == {"text": TOOL_RESULT_IMAGE_FOLD_HEADER}
+    assert folded[2] == {"inline_data": {"mime_type": "image/png", "data": "aGk="}}
+
+
+def test_a_bedrock_route_carries_tool_result_images_inside_the_tool_result() -> None:
+    """Converse documents ``ToolResultContentBlock.image``, so the screenshot
+    re-emits inside the toolResult beside its text with nothing disclosed."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="go"),
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(ToolCall(call_id="call-1", name="shot", arguments={}),),
+            ),
+            _tool_image_message(),
+        ),
+    )
+    profile = GatewayWireProfile(dialect="bedrock_converse_stream", url="https://b.test")
+
+    public_request, provider_request = route_generation_parameter_requests((profile,), request)
+    payload = dialect_stream_payload(profile, provider_request)
+
+    assert public_request.ignored_parameters == ()
+    messages = cast("list[JsonObject]", payload["messages"])
+    result = cast("list[JsonObject]", messages[-1]["content"])[0]["toolResult"]
+    assert cast("JsonObject", result)["content"] == [
+        {"text": "tool said:"},
+        {"image": {"format": "png", "source": {"bytes": "aGk="}}},
+    ]
 
 
 def test_an_all_anthropic_route_keeps_tool_result_images() -> None:
@@ -4700,9 +4834,10 @@ def test_an_all_responses_route_keeps_tool_result_images() -> None:
     assert TOOL_RESULT_IMAGE_DROP_DISCLOSURE not in public_request.ignored_parameters
 
 
-def test_a_responses_and_chat_route_still_degrades_tool_result_images() -> None:
-    """A chat fallback rung has no tool-image carrier, so the mixed route
-    keeps the disclosed placeholder degrade."""
+def test_a_responses_and_chat_route_keeps_tool_result_images() -> None:
+    """A chat fallback rung folds the screenshot into a user turn, so the
+    mixed route keeps the image on the shared request and discloses the fold
+    instead of degrading every rung to the placeholder."""
     request = GatewayRequest(
         surface=GatewayApiSurface.RESPONSES,
         messages=(GatewayMessage(role="user", content="go"), _tool_image_message()),
@@ -4714,8 +4849,9 @@ def test_a_responses_and_chat_route_still_degrades_tool_result_images() -> None:
 
     public_request, provider_request = route_generation_parameter_requests(profiles, request)
 
-    assert provider_request.messages[-1].content_parts == ()
-    assert TOOL_RESULT_IMAGE_DROP_DISCLOSURE in public_request.ignored_parameters
+    assert provider_request.messages[-1].images
+    assert TOOL_RESULT_IMAGE_FOLD_DISCLOSURE in public_request.ignored_parameters
+    assert TOOL_RESULT_IMAGE_DROP_DISCLOSURE not in public_request.ignored_parameters
 
 
 def _attributed_history_request() -> GatewayRequest:

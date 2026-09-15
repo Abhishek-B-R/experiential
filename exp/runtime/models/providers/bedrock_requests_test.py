@@ -84,6 +84,31 @@ def test_converse_request_preserves_tool_ids_and_named_choice() -> None:
     assert result_payload["toolUseId"] == "call-old"
 
 
+def test_converse_request_carries_a_tool_result_image_inside_the_tool_result() -> None:
+    """A tool screenshot re-emits as a ``ToolResultContentBlock.image`` beside its text."""
+    request = _tool_transcript_request()
+    screenshot = ModelMessage(
+        role="tool",
+        tool_call_id="call-old",
+        content="created",
+        content_parts=(
+            TextContentPart(text="created"),
+            ImageContentPart(media_type="image/png", data="aGk="),
+        ),
+    )
+    request = request.model_copy(update={"messages": request.messages[:-1] + (screenshot,)})
+
+    payload = converse_request("us.anthropic.claude-sonnet-4-5", request)
+
+    messages = cast("list[JsonObject]", payload["messages"])
+    result = cast("JsonObject", cast("list[JsonObject]", messages[2]["content"])[0]["toolResult"])
+    assert result["toolUseId"] == "call-old"
+    assert result["content"] == [
+        {"text": "created"},
+        {"image": {"format": "png", "source": {"bytes": "aGk="}}},
+    ]
+
+
 def test_converse_request_gates_top_p_and_model_specific_top_k() -> None:
     """Bedrock keeps top-p standard and puts certified top-k in the model extension map."""
     request = _tool_transcript_request().model_copy(update={"top_p": 0.8, "top_k": 20})

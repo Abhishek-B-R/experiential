@@ -831,6 +831,76 @@ def test_tool_result_image_degrades_with_disclosure_on_a_non_vision_route(stream
     assert accounting.recorded == 1
 
 
+@pytest.mark.parametrize("stream", [True, False])
+def test_a_chat_tool_screenshot_is_admitted_and_folded_on_a_vision_chat_route(stream: bool) -> None:
+    """The Copilot/Codex repro (an ``image_url`` part inside a ``role: "tool"``
+    message on /v1/chat/completions) decodes, admits on an image-capable Chat
+    rung with the image intact, and the route discloses the user-turn fold
+    the Chat payload applies; nothing is coerced."""
+    from exp.runtime.models.providers.dialect_dispatch import (
+        TOOL_RESULT_IMAGE_FOLD_DISCLOSURE,
+    )
+    from exp.runtime.openai_protocol.requests import decode_chat
+
+    body: JsonObject = {
+        "model": "coding",
+        "stream": stream,
+        "messages": [
+            {"role": "user", "content": "take a screenshot"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "screenshot", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": [
+                    {"type": "text", "text": "Screenshot taken:"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{_TOOL_IMAGE_PNG}"},
+                    },
+                ],
+            },
+        ],
+    }
+    request = decode_chat(body).request.model_copy(update={"include_usage": True})
+    vision = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+            supports_image_input=True,
+        )
+    )
+    deployments = (_deployment("luna", provider="azure_openai", gateway=vision),)
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    client = cast(NativeWireClient, object())
+    wires = ((GatewayWireProfile(dialect="openai_compatible", url="https://chat.test"), client),)
+    accounting = _AdmissionCoercionCounter()
+
+    _narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+
+    tool_message = provider.messages[-1]
+    assert tool_message.role == "tool"
+    assert [part.kind for part in tool_message.content_parts] == ["text", "image"]
+    assert tool_message.images[0].data == _TOOL_IMAGE_PNG
+    assert TOOL_RESULT_IMAGE_FOLD_DISCLOSURE in public.ignored_parameters
+    assert accounting.recorded == 0
+
+
 def test_a_thinking_config_translates_through_admission_on_an_openai_route() -> None:
     """The full admit loop serves a thinking config on an all-OpenAI route.
 

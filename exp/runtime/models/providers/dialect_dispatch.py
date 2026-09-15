@@ -32,6 +32,12 @@ if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
 
 TOOL_RESULT_IMAGE_DROP_DISCLOSURE = "messages.content.tool_result.image->placeholder"
+TOOL_RESULT_IMAGE_FOLD_DISCLOSURE = "messages.content.tool_result.image->following_user_message"
+"""Disclosed when a rung carries tool-result images in a user turn that follows
+the tool run (Chat Completions and Gemini define no image carrier inside a tool
+result; see ``wire_messages.fold_tool_result_images``)."""
+TOOL_RESULT_IMAGE_FOLD_DIALECTS = frozenset({"openai_compatible", "gemini_generate_content"})
+"""Dialects whose payload builders fold tool-result images into a user turn."""
 THINKING_HISTORY_DROP_DISCLOSURE = "messages.thinking->dropped(unsupported_by_provider)"
 
 CACHE_CONTROL_NOT_FORWARDED_SUFFIX = (
@@ -55,8 +61,12 @@ The wording never claims caching is off or on."""
 
 A tool screenshot is baked into the caller's conversation history: rejecting
 it wedges every later turn of a multi-turn session, which is strictly worse
-than a disclosed degrade. Top-level user images keep the fail-closed contract
-because the caller can re-send those differently.
+than a disclosed degrade. Every wire now carries the image itself (natively
+inside the tool result on Anthropic, Responses and Bedrock; folded into a
+following user turn on Chat Completions and Gemini), so the degrade remains
+only for a rung with no image input at all (``capability_policy``). Top-level
+user images keep the fail-closed contract because the caller can re-send those
+differently.
 """
 
 TOOL_RESULT_IMAGE_PLACEHOLDER = "[image omitted: this model route cannot carry tool-result images]"

@@ -25,6 +25,7 @@ from exp.runtime.models.providers.reasoning_compat import (
 )
 from exp.runtime.models.providers.wire_messages import (
     add_openai_tools,
+    fold_tool_result_images,
     openai_chat_message,
     responses_items,
 )
@@ -257,6 +258,9 @@ def openai_compatible_stream_payload(
         # DeepSeek ends a tools+reasoning turn empty when the conversation
         # ends on an instruction; see fold_trailing_instruction_turns.
         messages = fold_trailing_instruction_turns(messages)
+    # Chat tool messages are text-only on every server behind this wire, so a
+    # tool screenshot rides a following user turn (see the fold's docstring).
+    messages = fold_tool_result_images(messages)
     payload: JsonObject = {
         "model": model_id,
         "messages": [

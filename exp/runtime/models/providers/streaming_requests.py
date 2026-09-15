@@ -15,6 +15,8 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.models.providers.dialect_dispatch import (
     CACHE_CONTROL_NOT_FORWARDED_SUFFIX,
     THINKING_HISTORY_DROP_DISCLOSURE,
+    TOOL_RESULT_IMAGE_FOLD_DIALECTS,
+    TOOL_RESULT_IMAGE_FOLD_DISCLOSURE,
 )
 from exp.runtime.models.providers.dialect_dispatch import (
     SERVICE_TIER_DIALECTS as SERVICE_TIER_DIALECTS,
@@ -453,25 +455,20 @@ def route_generation_parameter_requests(
             code="unsupported_parameter",
         )
 
-    # Two wires define an image carrier inside a tool result: Anthropic
-    # (tool_result image blocks) and native Responses (the SDK
-    # function_call_output part list). A homogeneous route on either keeps
-    # the images; a route with any rung that has no carrier degrades them to
-    # positional placeholder text with disclosure instead of rejecting: the
-    # block is baked into the caller's history, so a rejection wedges the
-    # whole session, and a silent drop at encoding would misstate what the
-    # model saw. A non-vision rung on a keeping route still rejects at
-    # preflight and the route-wide coercion applies the same disclosed
-    # degrade.
-    if any(message.role == "tool" and message.images for message in request.messages) and not (
-        all(profile.dialect == "anthropic_messages" for profile in profiles)
-        or all(profile.dialect == "openai_responses" for profile in profiles)
+    # Every dialect carries a tool-result image: natively inside the tool
+    # result on Anthropic (tool_result image blocks), native Responses (the SDK
+    # function_call_output part list) and Bedrock (toolResult image blocks),
+    # and folded into a user turn that follows the tool run on Chat
+    # Completions and Gemini, whose tool results are text-only. The fold is
+    # disclosed once per route; a rung with no image input at all still
+    # rejects at preflight and the route-wide coercion applies the disclosed
+    # placeholder degrade (the block is baked into the caller's history, so a
+    # rejection would wedge the whole session).
+    if any(message.role == "tool" and message.images for message in request.messages) and any(
+        profile.dialect in TOOL_RESULT_IMAGE_FOLD_DIALECTS for profile in profiles
     ):
-        stripped = strip_tool_result_images(request.messages)
-        if stripped is not None:
-            provider_updates["messages"] = stripped
-            if TOOL_RESULT_IMAGE_DROP_DISCLOSURE not in ignored:
-                ignored.append(TOOL_RESULT_IMAGE_DROP_DISCLOSURE)
+        if TOOL_RESULT_IMAGE_FOLD_DISCLOSURE not in ignored:
+            ignored.append(TOOL_RESULT_IMAGE_FOLD_DISCLOSURE)
 
     # Only the Anthropic wire has a tool-result error flag. Every other wire
     # folds the flag into the result text at encoding (a fixed prefix, see
