@@ -184,37 +184,60 @@ def route_generation_parameter_requests(
                 param=param,
                 code="invalid_parameter",
             )
-        if (
-            request.maximum_output_tokens < OPENAI_MINIMUM_OUTPUT_TOKENS
-            and (
-                request.surface == GatewayApiSurface.MESSAGES
-                and any(
-                    profile.dialect in {"openai_responses", "openai_compatible"}
-                    for profile in profiles
-                )
-                # A Chat value keeps native semantics on a chat wire (some
-                # compatible providers accept an output ceiling of 1); only
-                # the TRANSLATED Responses wire imposes OpenAI's minimum, so
-                # the floor covers exactly the routes that translate.
-                or request.surface == GatewayApiSurface.CHAT_COMPLETIONS
-                and any(profile.dialect == "openai_responses" for profile in profiles)
+        # Two floors, one rewrite. The OpenAI wire floor is a TRANSLATION
+        # fact: Anthropic and Chat Completions accept output ceilings down to
+        # 1 (Claude Code probes with exactly that after a /model switch) while
+        # OpenAI rejects max_output_tokens below 16, so a Messages or Chat
+        # value translated onto an OpenAI Responses rung rides the provider
+        # floor with disclosure instead of surfacing a provider 400 the
+        # caller cannot act on (2026-09-05 stragglers). A Chat value keeps
+        # native semantics on a chat wire (some compatible providers accept
+        # an output ceiling of 1); only the TRANSLATED Responses wire imposes
+        # OpenAI's minimum. A native Responses caller keeps the named
+        # admission rejection below: sub-16 is invalid on its own surface.
+        translated_onto_openai_wire = (
+            request.surface == GatewayApiSurface.MESSAGES
+            and any(
+                profile.dialect in {"openai_responses", "openai_compatible"} for profile in profiles
             )
+        ) or (
+            request.surface == GatewayApiSurface.CHAT_COMPLETIONS
+            and any(profile.dialect == "openai_responses" for profile in profiles)
+        )
+        # The declared floor is a LANE fact the catalog stamps per rung
+        # (``GatewayWireProfile.minimum_output_tokens``): a provider that
+        # refuses small ceilings on a wire that natively carries them
+        # (Perplexity sonar and Sakana fugu via OpenRouter, grok-4.6 on
+        # Bedrock: "max_tokens must be at least 16"). It floors on EVERY
+        # surface, because the refusal is the provider's, not the wire's.
+        # The route floors to the LARGEST minimum any rung declares, so no
+        # rung of the waterfall dispatches a value it would refuse. A native
+        # Responses request on an all-Responses route is the one exception:
+        # sub-16 is invalid on its own surface and keeps the named admission
+        # rejection below, whatever a rung declares.
+        native_responses_route = request.surface == GatewayApiSurface.RESPONSES and all(
+            profile.dialect == "openai_responses" for profile in profiles
+        )
+        output_floor = max(
+            (
+                OPENAI_MINIMUM_OUTPUT_TOKENS if translated_onto_openai_wire else 0,
+                *(
+                    profile.minimum_output_tokens
+                    for profile in profiles
+                    if profile.minimum_output_tokens is not None and not native_responses_route
+                ),
+            )
+        )
+        if (
+            request.maximum_output_tokens < output_floor
             # The floored value must stay within every rung's declared output
             # ceiling; a route capped below the floor keeps the caller value
             # and the provider's own rejection.
-            and (not route_limits or min(route_limits) >= OPENAI_MINIMUM_OUTPUT_TOKENS)
+            and (not route_limits or min(route_limits) >= output_floor)
         ):
-            # Anthropic and Chat Completions accept output ceilings down to
-            # 1 (Claude Code probes with exactly that after a /model switch)
-            # while OpenAI rejects max_output_tokens below 16, so a Messages
-            # or Chat value translated onto an OpenAI Responses rung rides
-            # the provider floor with disclosure instead of surfacing a
-            # provider 400 the caller cannot act on (2026-09-05 stragglers).
-            # A native Responses caller keeps the named admission rejection
-            # below: sub-16 is invalid on its own surface.
-            provider_updates["maximum_output_tokens"] = OPENAI_MINIMUM_OUTPUT_TOKENS
+            provider_updates["maximum_output_tokens"] = output_floor
             parameter = request.maximum_output_tokens_parameter or "max_tokens"
-            path = f"{parameter}->{OPENAI_MINIMUM_OUTPUT_TOKENS}"
+            path = f"{parameter}->{output_floor}"
             if path not in ignored:
                 ignored.append(path)
     elif any(profile.dialect == "anthropic_messages" for profile in profiles):
