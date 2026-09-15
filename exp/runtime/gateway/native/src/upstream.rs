@@ -954,6 +954,28 @@ mod tests {
         assert!(!failure.failover_eligible);
     }
 
+    #[tokio::test]
+    async fn a_zai_429_is_quota_for_code_1113_and_a_throttle_otherwise() {
+        // Z.ai: 429 + code 1113 is an empty balance (quota, fails over); 1302 a rate limit.
+        let quota = open_against_body(
+            "429 Too Many Requests",
+            "{\"error\":{\"code\":\"1113\",\"message\":\"Insufficient balance or no \
+             resource package. Please recharge.\"}}",
+            "glm-4.6",
+        )
+        .await;
+        assert_eq!(quota.failure_class, FailureClass::ProviderQuota);
+        assert!(quota.failover_eligible && !quota.retryable_same_deployment);
+        assert!(quota.provider_detail.is_none() && quota.rejected_parameter.is_none());
+        let limit = open_against_body(
+            "429 Too Many Requests",
+            "{\"error\":{\"code\":\"1302\",\"message\":\"Rate limit reached for requests\"}}",
+            "glm-4.6",
+        )
+        .await;
+        assert_eq!(limit.failure_class, FailureClass::Throttled);
+    }
+
     #[test]
     fn header_phase_timeout_fails_over_without_a_same_deployment_redial() {
         // A lead that connects but never completes the response-header phase must
