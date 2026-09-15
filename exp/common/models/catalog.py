@@ -457,6 +457,19 @@ class GatewayDeploymentCapabilities(ContractModel):
     field). A concrete value lets admission reject an over-limit list locally with a
     named parameter error instead of forwarding it and surfacing the provider's
     opaque 4xx (e.g. Gemini caps ``stopSequences`` at 5)."""
+    minimum_output_tokens: int | None = Field(default=None, ge=1)
+    """Smallest output-token ceiling this deployment's provider accepts.
+
+    A lane fact, never a wire-dialect fact: Perplexity's sonar family and
+    Sakana's fugu models (relayed by OpenRouter) and xAI's grok-4.6 on
+    Bedrock answer any ``max_tokens`` below 16 with a 400 the caller cannot
+    act on, while the Chat Completions wire they share carries ceilings down
+    to 1. A caller value below this floor is raised to it with disclosure
+    (``<parameter>-><floor>`` in ``ignored_parameters``) on EVERY public
+    surface, exactly as a Messages-surface value translated onto an OpenAI
+    wire already is; ``None`` declares no floor and keeps the wire's native
+    semantics. The floor is honored only when every rung's declared output
+    ceiling admits it."""
     supported_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
     """Exact caller values this deployment can preserve without normalization.
 

@@ -5053,6 +5053,83 @@ def test_route_refuses_a_whole_empty_user_turn_before_an_anthropic_dispatch() ->
     assert public.ignored_parameters == ()
 
 
+def test_a_declared_lane_minimum_floors_the_chat_wire_with_disclosure() -> None:
+    """A rung that declares ``minimum_output_tokens`` floors a smaller Chat
+    ceiling on its own wire, with the same disclosure the OpenAI translation
+    floor carries, instead of dispatching the value the provider 400s
+    ("Perplexity: max_tokens must be at least 16", 30-day ledger: every sonar
+    and fugu alias, 6-8 distinct orgs each)."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        maximum_output_tokens=12,
+        maximum_output_tokens_parameter="max_tokens",
+        stream=True,
+        include_usage=True,
+    )
+    sonar = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://openrouter.ai/api/v1/chat/completions",
+        model_id="perplexity/sonar",
+        minimum_output_tokens=16,
+    )
+    public, provider = route_generation_parameter_requests((sonar,), request)
+    assert provider.maximum_output_tokens == 16
+    assert public.ignored_parameters == ("max_tokens->16",)
+    payload = dialect_stream_payload(sonar, provider)
+    assert payload["max_tokens"] == 16
+
+    # The Messages surface floors identically (one contract on both wires),
+    # and the disclosure names the caller's own parameter.
+    public, provider = route_generation_parameter_requests(
+        (sonar,), _messages_request(maximum_output_tokens=1)
+    )
+    assert provider.maximum_output_tokens == 16
+    assert "max_tokens->16" in public.ignored_parameters
+
+    # A value at or above the floor is untouched and undisclosed.
+    at_floor = request.model_copy(update={"maximum_output_tokens": 16})
+    public, provider = route_generation_parameter_requests((sonar,), at_floor)
+    assert provider.maximum_output_tokens == 16
+    assert public.ignored_parameters == ()
+
+
+def test_the_route_floors_to_the_largest_declared_minimum() -> None:
+    """A waterfall floors once, to the largest minimum any rung declares, so
+    no rung dispatches a ceiling it would refuse; an undeclared sibling keeps
+    riding the floored value (it accepts every ceiling)."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        maximum_output_tokens=4,
+        maximum_output_tokens_parameter="max_completion_tokens",
+        stream=True,
+    )
+    floored = GatewayWireProfile(
+        dialect="openai_compatible", url="https://a.test", minimum_output_tokens=16
+    )
+    higher = GatewayWireProfile(
+        dialect="bedrock_converse_stream", url="https://b.test", minimum_output_tokens=32
+    )
+    plain = GatewayWireProfile(dialect="openai_compatible", url="https://c.test")
+    public, provider = route_generation_parameter_requests((plain, floored, higher), request)
+    assert provider.maximum_output_tokens == 32
+    assert public.ignored_parameters == ("max_completion_tokens->32",)
+
+    # A route whose declared output ceiling sits below the floor cannot ride
+    # it: the gateway never dispatches above a rung's declared capability, so
+    # the caller value stands and the provider's own rejection follows.
+    capped = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://d.test",
+        minimum_output_tokens=16,
+        maximum_output_tokens=8,
+    )
+    public, provider = route_generation_parameter_requests((capped,), request)
+    assert provider.maximum_output_tokens == 4
+    assert public.ignored_parameters == ()
+
+
 def test_chat_surface_sub_16_output_ceiling_rides_the_openai_floor() -> None:
     """A Chat-surface max_tokens below OpenAI's minimum translated onto an
     OpenAI rung rides the disclosed 16-token floor (the Messages-surface
