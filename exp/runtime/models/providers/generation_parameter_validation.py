@@ -12,7 +12,10 @@ from exp.runtime.models.providers.anthropic_tool_compat import (
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderParameterError
-from exp.runtime.models.providers.reasoning_compat import supported_reasoning_efforts
+from exp.runtime.models.providers.reasoning_compat import (
+    REASONING_EFFORTS,
+    supported_reasoning_efforts,
+)
 
 
 def effective_profile_reasoning_effort(
@@ -35,6 +38,35 @@ def profile_reasoning_efforts(profile: GatewayWireProfile) -> tuple[str, ...]:
         configured_effort=profile.reasoning_effort,
         explicit_efforts=profile.supported_reasoning_efforts or None,
     )
+
+
+def lane_default_reasoning_effort(profiles: Sequence[GatewayWireProfile]) -> str | None:
+    """Return the depth a level-less "think" asks for on a route of effort rungs.
+
+    A budget-less thinking config (``adaptive``, or the bare ``enabled`` Claude
+    Code sends) asks the MODEL to pick its depth, and on an effort rung the
+    model's own depth is its catalog default (``reasoning_default_effort``,
+    carried on the wire profile as ``reasoning_effort``): the first rung in
+    route order that pins an active default it can serve names the tier, so an
+    operator sets a lane's think-mode depth by catalog, not by code. A ``none``
+    default is not a depth (that rung reasons only when asked) and is skipped.
+
+    Args:
+        profiles: Ordered wire profiles for every live route deployment.
+
+    Returns:
+        The lane's default tier, or ``None`` when no rung pins a servable one.
+    """
+    for profile in profiles:
+        default = profile.reasoning_effort
+        if (
+            default is not None
+            and default in REASONING_EFFORTS
+            and default != "none"
+            and default in profile_reasoning_efforts(profile)
+        ):
+            return default
+    return None
 
 
 def require_route_numeric_parameter(

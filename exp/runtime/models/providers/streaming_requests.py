@@ -53,6 +53,9 @@ from exp.runtime.models.providers.generation_parameter_validation import (
     effective_profile_reasoning_effort as _effective_profile_reasoning_effort,
 )
 from exp.runtime.models.providers.generation_parameter_validation import (
+    lane_default_reasoning_effort as _lane_default_reasoning_effort,
+)
+from exp.runtime.models.providers.generation_parameter_validation import (
     profile_reasoning_efforts as _profile_reasoning_efforts,
 )
 from exp.runtime.models.providers.generation_parameter_validation import (
@@ -338,12 +341,16 @@ def route_generation_parameter_requests(
     ):
         ignore("presence_penalty", "presence_penalty->dropped(unsupported_by_provider)")
     if request.thinking_default_enable and request.reasoning_effort is None:
-        # A level-less "enable thinking" (from a translated thinking:{enabled} or
-        # chat_template_kwargs:{enable_thinking:true}) resolves to the model's own
-        # default effort here, at the serving route: a route-wide required default
-        # when portable, else the LOWEST portable non-none tier (default-not-high
-        # avoids surprising cost). A route that supports no reasoning effort cannot
-        # enable thinking, so it surfaces rather than silently not thinking.
+        # A level-less "enable thinking" (from a translated thinking:{enabled} /
+        # thinking:{adaptive} or chat_template_kwargs:{enable_thinking:true})
+        # resolves to the model's own default effort here, at the serving route,
+        # the same way the Messages surface resolves a budget-less config: the
+        # LANE default (the first rung in route order pinning an active catalog
+        # ``reasoning_default_effort``) when every rung can serve it, else a
+        # route-wide required default when portable, else the LOWEST portable
+        # non-none tier (default-not-high avoids surprising cost). A route that
+        # supports no reasoning effort cannot enable thinking, so it surfaces
+        # rather than silently not thinking.
         portable = set(REASONING_EFFORTS)
         for profile in profiles:
             portable.intersection_update(_profile_reasoning_efforts(profile))
@@ -357,14 +364,18 @@ def route_generation_parameter_requests(
                 param=effort_path,
                 code="unsupported_parameter",
             )
+        lane_default = _lane_default_reasoning_effort(profiles)
         required_defaults = {
             profile.reasoning_effort
             for profile in profiles
             if profile.reasoning_effort_required and profile.reasoning_effort in portable_non_none
         }
-        provider_updates["reasoning_effort"] = (
-            next(iter(required_defaults)) if len(required_defaults) == 1 else portable_non_none[0]
-        )
+        if lane_default in portable_non_none:
+            provider_updates["reasoning_effort"] = lane_default
+        elif len(required_defaults) == 1:
+            provider_updates["reasoning_effort"] = next(iter(required_defaults))
+        else:
+            provider_updates["reasoning_effort"] = portable_non_none[0]
     if request.reasoning_effort is not None:
         portable_efforts = set(REASONING_EFFORTS)
         for profile in profiles:

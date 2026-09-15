@@ -636,8 +636,10 @@ supporting route's declared range, which is a genuine caller error.
 **An Anthropic-shaped `thinking` object on the Chat wire is a reasoning control, `adaptive`
 included.** Clients configured for Claude send `thinking: {type: "adaptive"}` (the 4.6+
 generation's only on-mode) to `/v1/chat/completions` on every model; the decoder reads `adaptive`
-and `enabled` alike as "think at the route's default depth" (`thinking->translated(reasoning_effort)`,
-the lane's `reasoning_default_effort` or the lowest portable tier), `disabled` as
+and `enabled` alike as "think at the route's default depth" (`thinking->translated(reasoning_effort)`:
+the LANE default, the first rung in route order pinning a catalog `reasoning_default_effort` every
+rung can serve, as on the Messages surface; a route pinning none takes its one required default or
+the lowest portable tier), `disabled` as
 `reasoning_effort: none`, and a `budget_tokens` beside either as not carried. An Anthropic rung
 then receives the adaptive object plus `output_config.effort`; every other reasoning rung receives
 its own effort field; a route with no reasoning effort at all still refuses by name. A `type`
