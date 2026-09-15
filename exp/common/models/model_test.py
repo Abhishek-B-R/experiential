@@ -26,6 +26,7 @@ from exp.common.models import (
     Usage,
     combine_economics,
 )
+from exp.common.models.content import ImageContentPart, TextContentPart, VideoContentPart
 from exp.common.tasks import ToolSchema
 
 _CAPABILITIES_DIGEST = "a" * 64
@@ -203,6 +204,34 @@ def test_model_messages_reject_tool_and_assistant_fields_on_the_wrong_roles() ->
         ModelMessage(role="user", assistant_action=AssistantAction(content="wrong"))
     with pytest.raises(ValidationError, match="tool messages require tool_call_id"):
         ModelMessage(role="tool", content="missing linkage")
+
+
+def test_model_messages_carry_image_parts_on_user_and_tool_roles_only() -> None:
+    """A tool result holds a screenshot beside its text; no other non-user role does."""
+    image = ImageContentPart(media_type="image/png", data="aGk=")
+    tool = ModelMessage(
+        role="tool",
+        tool_call_id="call-1",
+        content="shot",
+        content_parts=(TextContentPart(text="shot"), image),
+    )
+    assert tool.images == (image,)
+    with pytest.raises(ValidationError, match="valid only for user and tool messages"):
+        ModelMessage(
+            role="assistant",
+            content="shot",
+            content_parts=(TextContentPart(text="shot"), image),
+        )
+    with pytest.raises(ValidationError, match="tool messages carry only text and image parts"):
+        ModelMessage(
+            role="tool",
+            tool_call_id="call-1",
+            content="clip",
+            content_parts=(
+                TextContentPart(text="clip"),
+                VideoContentPart(media_type="video/mp4", data="aGk="),
+            ),
+        )
 
 
 def test_tool_call_preserves_optional_raw_arguments_without_changing_legacy_payloads() -> None:

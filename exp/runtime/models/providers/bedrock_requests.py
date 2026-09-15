@@ -148,7 +148,7 @@ def converse_body(
                     {
                         "toolResult": {
                             "toolUseId": message.tool_call_id or "",
-                            "content": [{"text": message.content or ""}],
+                            "content": _tool_result_blocks(message),
                         }
                     }
                 ],
@@ -236,6 +236,26 @@ def _require_inline_media_within_payload(request: ModelRequest, payload: JsonObj
             param="messages",
             code="invalid_parameter",
         )
+
+
+def _tool_result_blocks(message: ModelMessage) -> list[JsonObject]:
+    """Emit one tool result's Converse content blocks in caller order.
+
+    A tool screenshot re-emits as a ``ToolResultContentBlock.image`` beside
+    its text (the union Converse documents for tool results; the model
+    contract restricts tool messages to text and image parts). Empty text
+    parts drop because Converse rejects an empty text block; a text-only
+    result keeps its single text block.
+    """
+    if not message.content_parts:
+        return [{"text": message.content or ""}]
+    blocks: list[JsonObject] = []
+    for part in message.content_parts:
+        if part.kind == "image":
+            blocks.append(bedrock_image_block(part))
+        elif part.kind == "text" and part.text:
+            blocks.append({"text": part.text})
+    return blocks or [{"text": message.content or ""}]
 
 
 def _multimodal_blocks(message: ModelMessage) -> list[JsonObject]:

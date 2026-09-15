@@ -2053,6 +2053,90 @@ def test_chat_decoder_retains_image_parts_in_caller_order() -> None:
     assert image.detail == "high"
 
 
+def _copilot_tool_screenshot_body(role: str, part: JsonObject) -> JsonObject:
+    """One Copilot/Codex-shaped Chat body whose tool result carries a media part.
+
+    The production rejection (``Invalid value for 'messages.N': image, video,
+    and audio parts are valid only for user messages``, ~1,000 a week from
+    GitHubCopilotChat, Codex Desktop and node agents) is exactly this
+    shape: an ``image_url`` part inside the ``role: "tool"`` message that
+    reports a screenshot.
+    """
+    return {
+        "model": "coding",
+        "messages": [
+            {"role": "user", "content": "take a screenshot"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "screenshot", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": role,
+                **({"tool_call_id": "call-1"} if role == "tool" else {}),
+                "content": [{"type": "text", "text": "Screenshot taken:"}, part],
+            },
+        ],
+    }
+
+
+def test_chat_decoder_accepts_image_parts_inside_a_tool_message() -> None:
+    """A tool result keeps its screenshot beside its text as a canonical tool message."""
+    part: JsonObject = {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}", "detail": "high"},
+    }
+
+    decoded = decode_chat(_copilot_tool_screenshot_body("tool", part))
+
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.role == "tool"
+    assert tool_message.tool_call_id == "call-1"
+    assert tool_message.content == "Screenshot taken:"
+    assert [item.kind for item in tool_message.content_parts] == ["text", "image"]
+    assert tool_message.images[0].data == _PNG_BASE64
+    assert decoded.request.images == tool_message.images
+
+
+def test_chat_decoder_still_rejects_image_parts_on_an_assistant_message() -> None:
+    """No wire carries an image inside an assistant turn; the 400 names the tool exception."""
+    part: JsonObject = {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
+    }
+
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(_copilot_tool_screenshot_body("assistant", part))
+
+    assert captured.value.detail.code == "invalid_parameter"
+    assert captured.value.detail.param == "messages.2"
+    assert "valid only for user messages" in captured.value.detail.message
+    assert "tool message may carry image parts" in captured.value.detail.message
+
+
+@pytest.mark.parametrize(
+    "part",
+    [
+        {"type": "video_url", "video_url": {"url": "https://example.test/clip.mp4"}},
+        {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+    ],
+)
+def test_chat_decoder_rejects_non_image_media_inside_a_tool_message(part: JsonObject) -> None:
+    """Tool results carry text and images only; video and audio stay a named 400."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(_copilot_tool_screenshot_body("tool", part))
+
+    assert captured.value.detail.code == "invalid_parameter"
+    assert captured.value.detail.param == "messages.2"
+    assert "tool messages carry only text and image parts" in captured.value.detail.message
+
+
 @pytest.mark.parametrize("media_type", ["image/png", "image/jpeg", "image/gif", "image/webp", None])
 @pytest.mark.parametrize(
     "url", ["https://example.test/attachment", f"data:image/png;base64,{_PNG_BASE64}"]

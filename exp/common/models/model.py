@@ -315,7 +315,7 @@ class ModelMessage(ContractModel):
     tool_call_id: str | None = None
     assistant_action: AssistantAction | None = None
     content_parts: tuple[MessageContentPart, ...] = Field(default=(), exclude=True)
-    """Ordered caller content parts when a user message carries attachments.
+    """Ordered caller content parts when a user or tool message carries attachments.
 
     Empty on every text-only message. The text parts concatenate to
     ``content``, so selectors, simulators, and persisted artifacts keep
@@ -336,8 +336,14 @@ class ModelMessage(ContractModel):
         if self.role == "tool" and self.tool_call_id is None:
             raise ValueError("tool messages require tool_call_id")
         if self.content_parts:
-            if self.role != "user":
-                raise ValueError("content parts are valid only for user messages")
+            # Tool results carry screenshots too (Bedrock toolResult image
+            # blocks); the Gemini and Bedrock wires build from this contract.
+            if self.role not in ("user", "tool"):
+                raise ValueError("content parts are valid only for user and tool messages")
+            if self.role == "tool" and any(
+                part.kind not in ("text", "image") for part in self.content_parts
+            ):
+                raise ValueError("tool messages carry only text and image parts")
             texts = [part.text for part in self.content_parts if part.kind == "text"]
             if (self.content or "") != "".join(texts):
                 raise ValueError("content parts must flatten to the message content")

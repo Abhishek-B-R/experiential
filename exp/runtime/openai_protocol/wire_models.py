@@ -347,10 +347,18 @@ class _Message(_WireModel):
             raise ValueError("tool_calls are valid only for assistant messages")
         if self.role != "assistant" and self.reasoning_content is not None:
             raise ValueError("reasoning_content is valid only for assistant messages")
-        if self.role != "user" and any(
-            not isinstance(part, _TextPart) for part in self.image_capable_parts
-        ):
-            raise ValueError("image, video, and audio parts are valid only for user messages")
+        # A tool result carries images (Copilot, Codex and other agents put
+        # a screenshot into the tool message that reports it, and the
+        # canonical tool message holds text and image parts); every other
+        # non-user role stays text-only, as do video, audio and file parts.
+        media = {type(part) for part in self.image_capable_parts} - {_TextPart}
+        if media and self.role not in ("user", "tool"):
+            raise ValueError(
+                "image, video, and audio parts are valid only for user messages "
+                "(a tool message may carry image parts beside its text)"
+            )
+        if self.role == "tool" and media - {_ChatImagePart, _ResponsesImagePart}:
+            raise ValueError("tool messages carry only text and image parts")
         call_ids = tuple(call.id for call in self.history_tool_calls)
         if len(call_ids) != len(set(call_ids)):
             raise ValueError("assistant tool call IDs must be unique")
