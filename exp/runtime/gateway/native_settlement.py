@@ -260,8 +260,12 @@ def _credible_usage(kind: GatewayEventKind, usage: GatewayUsage | None) -> Gatew
     the ledger's unknown-usage review counters and its nightly invariant, and
     keeps the zero out of the cache-fraction calibration. Failed terminals are
     left alone: their zeros already settle at nothing and a billed refusal
-    keys on positive counts. Tool names are the stream's, not the meter's, so
-    they survive the demotion.
+    keys on positive counts. The whole usage goes, tool names included: the
+    control plane files ANY non-null usage as observed (a tool-only usage is
+    its convention for a provider that omitted the meter but streamed calls),
+    and a tool call is output the meter should have counted, so tool names on
+    an all-zero report describe a stream whose meter is not credible; losing
+    ``tools_used`` on that row beats filing it as observed.
 
     Args:
         kind: The normalized terminal kind of the settlement.
@@ -274,7 +278,7 @@ def _credible_usage(kind: GatewayEventKind, usage: GatewayUsage | None) -> Gatew
         return usage
     if usage.input_tokens != 0 or usage.output_tokens != 0:
         return usage
-    return GatewayUsage(tool_names=usage.tool_names) if usage.tool_names else None
+    return None
 
 
 def _usage_from_payload(

@@ -94,15 +94,13 @@ def test_all_zero_token_report_on_a_finished_attempt_settles_as_unknown() -> Non
         assert terminal.kind == GatewayEventKind(outcome)
         assert terminal.usage is None
 
-    # The stream's tool names are not the meter's: they survive the demotion
-    # without token counts, exactly like a tool-only settlement.
+    # Tool names ride the same usage object and the control plane files any
+    # non-null usage as observed, so an all-zero report drops them too: a
+    # tool call is output the meter should have counted.
     with_tools, _ = terminal_from_settlement(
         {"outcome": "incomplete", "usage": dict(zero), "tool_names": ["search"], "failure": None}
     )
-    assert with_tools.usage is not None
-    assert with_tools.usage.input_tokens is None
-    assert with_tools.usage.output_tokens is None
-    assert with_tools.usage.tool_names == ("search",)
+    assert with_tools.usage is None
 
 
 def test_partial_zero_reports_and_failed_zero_reports_stay_observed() -> None:
