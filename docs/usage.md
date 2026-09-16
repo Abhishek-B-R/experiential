@@ -10,6 +10,13 @@ The root surface is deliberately small:
 | `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Launch the guided end-to-end build when traces are omitted, or use one explicit local source for automation. | Simulation, serving RAG, fit RAG, syllabus, evaluation evidence, and a runnable automatic router. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
 | `exp optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
+| `exp optimize claas init APPLICATION ...` | Configure a user/application LoRA, frozen base/tokenizer revisions, and finite limits; optionally select paired traffic-workflow harness/judge aliases. | Private application configuration and optional traffic-workflow settings. |
+| `exp optimize claas capture APPLICATION --alias ALIAS ...` | Opt an authenticated application's traffic into bounded content capture. | Capture binding applied on gateway restart. |
+| `exp optimize claas bind APPLICATION --alias ALIAS --execution PATH ...` | Bind one private student runtime and print its vLLM launch arguments. | Paused serving binding, registry, and execution settings. |
+| `exp optimize claas activate APPLICATION ...` | Verify and load the active revision before opening gateway admission. | Ready serving state for one registry generation. |
+| `exp optimize claas train APPLICATION [--cycles N] ...` | Run the configured traffic workflow through generic CLaaS, an upstream veRL update, paired evaluation, and conditional activation. | Cycle evidence, resumable checkpoint, and promotion decision. |
+| `exp optimize claas rollback APPLICATION ...` | Drain traffic and restore the previous verified revision. | Updated registry and serving readiness. |
+| `exp optimize claas status APPLICATION ...` | Inspect the selected user's local application settings. | Configuration JSON without provider calls. |
 | `exp --root ROOT [--check]` | Validate or start the initialized authenticated default gateway on loopback; the native data plane serves every route, including Chat Completions, Responses, and Anthropic Messages. | OpenAI-compatible and Anthropic Messages endpoints, readiness routes, and content-free usage view. |
 | `exp --project PROJECT --root ROOT [--ghost]` | Activate a frozen policy as one project-backed alias and launch the normal gateway. | The same authenticated OpenAI endpoint and SQLite accounting as the default gateway. |
 | `exp config gateway ...` | Author provider references, identities, virtual keys, grants, aliases, certified exact-model pools, monthly limits, status, and usage without optimizer roles. | Private SQLite authority, immutable catalog snapshots, and versioned receipts. |
@@ -52,7 +59,11 @@ specific variables avoid overwriting an upstream provider's `OPENAI_API_KEY`. Th
 unavailable alias and provider configuration; fix that configuration and rerun `exp`. If the
 one-time key was not saved, issue a replacement with
 `exp config gateway key issue IDENTITY --key-id KEY --json`.
-The gateway writes no prompts, responses, tool arguments, raw keys, or provider secrets to SQLite.
+By default, the gateway writes no prompts, responses, tool arguments, raw keys, or provider secrets
+to SQLite. Explicit CLaaS capture stores source content and feedback in a separate bounded local
+store, scoped to the authenticated user and application. Selecting the optional traffic workflow's
+harness and judge aliases during initialization authorizes the configured providers to receive that application's corresponding
+source and evaluation content.
 `GET /usage` and `GET /usage.json` expose the same schema-v2 content-free overall and per-identity
 counts, token usage, latency, terminal states, and attributed estimated cost. Their attempt-only
 `by_billing_source` buckets conserve attempts, tokens, known cost, unknown-cost attempts, and
@@ -152,3 +163,15 @@ quality measurement can call the separate `build_fidelity_evaluation_plan` and
 `build_fidelity_report` APIs; those results never enter router fitting or activation. Fidelity
 reports contain measurements only, never an approval or denial. See the
 [router contracts](reference/router_optimization_config.md).
+
+CLaaS learning commands require conservative estimates before credential resolution.
+The per-command ceiling is hard, including interactive invocation; `--yes` cannot exceed it.
+The optional traffic workflow reserves every scheduled provider call and optional Modal compute
+allocation. Its mining and scenario generation are separate from the generic CLaaS learning core;
+Python callers can supply other scenarios, environments, and evaluators without provider aliases. Missing
+feedback stays absent, reserved evaluation groups are excluded before learning, and adapter promotion
+requires complete paired held-out improvement. See the [CLaaS reference](reference/claas.md)
+for environment integration, training, evaluation, and rollback. No model-quality improvement or GPU runtime
+compatibility is inferred from deterministic CPU and HTTP tests. The optional `claas-verl` backend
+uses upstream veRL workers for optimizer and checkpoint execution; its actual CUDA training path
+remains unrun in the CPU-only verification environment.

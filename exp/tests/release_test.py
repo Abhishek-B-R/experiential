@@ -78,6 +78,7 @@ REQUIRED_SDIST_MEMBERS = frozenset(
         "README.md",
         "assets/experiential-workflow.png",
         "docs/reference/gateway-architecture.md",
+        "docs/reference/claas.md",
         "docs/release-scope.md",
         "docs/usage.md",
         "pyproject.toml",
@@ -3195,6 +3196,10 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
     usage = (docs / "usage.md").read_text(encoding="utf-8")
     assert "exp optimize router" in usage
     assert "exp optimize model" in usage
+    for command in ("init", "status", "capture", "bind", "activate", "train", "rollback"):
+        assert f"exp optimize claas {command}" in usage
+    assert "reference/claas.md" in usage
+    assert (docs / "reference" / "claas.md").is_file()
     assert "exp config gateway" in usage
     assert "exp config gateway pool certify" in usage
     assert "exp --root ROOT" in usage

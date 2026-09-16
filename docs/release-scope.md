@@ -1,13 +1,13 @@
 # Release scope
 
 This release supports the current source and one wheel with either core dependencies or the
-optional `sft` dependency extra on their documented local paths. It claims only behavior exercised
+optional `sft`, `claas-verl`, or `claas-modal` dependency extras on their documented local paths. It claims only behavior exercised
 on the exact release checkout.
 
 ## Supported and verified
 
 - Root CLI commands are exactly `build`, `config`, `login`, `optimize`, and `run`; an invocation with no subcommand
-  opens the default gateway home screen. Optimizer commands are exactly `router` and `model`.
+  opens the default gateway home screen. Optimizer commands are exactly `router`, `model`, and `claas`.
 - `exp login` opens the Platform approval flow for Experiential Cloud, stores the returned
   organization key in the user-data credential file, and synchronizes the authenticated account's
   hosted provider/model identities into the secret-free project catalog; no credential value is
@@ -50,6 +50,30 @@ on the exact release checkout.
   one malformed sandbox failure in the denominator and claims structural terminal agreement only.
 - Exact-checkout CI supplies the full 40-hex Git revision, recursively verifies every evidence
   artifact and manifest input, and publishes machine-readable JSON plus JUnit evidence.
+
+## CLaaS evidence
+
+The CLaaS learning core accepts supplied scenarios, environments, and evaluators. It coordinates
+exact-token rollouts, SDPO/REINFORCE/hybrid objectives, frozen paired evaluation, per-user/application
+adapter identity, wake/sleep execution, versioned activation, and rollback. An optional traffic
+workflow composes Rust capture, binary/scalar/text feedback, explicit episode membership, failure
+mining, scenario synthesis, and a world-model harness. These generation steps are not prerequisites
+of the learning core. Their provider settings live separately from core learning configuration.
+
+The optional public `claas-verl` dependency uses upstream veRL `TrainingWorker` and FSDP execution
+for backward passes, optimizer updates, scheduling, and training checkpoint state. CLaaS supplies its
+SDPO objective and feedback-teacher extension. Modal runs the same worker and owns only compute and
+artifact transport. The package does not publish or depend on a private veRL fork.
+
+Deterministic coverage checks objective calculations, worker and adapter-export contracts, gateway
+HTTP tool episodes, paused-admission draining, stale-revision
+rejection, failure recovery, and permanent evaluation source-group exclusions. These checks do not
+prove that the upstream GPU worker has trained successfully. Controlled judge outputs test activation
+decisions; they do not demonstrate learned task-quality improvement.
+
+Actual veRL CUDA execution, full-size model training or serving, paid world-model calls, Modal GPU
+launches, and measured task-quality improvement remain unrun for this feature. See the
+[CLaaS reference](reference/claas.md) for the supplied-environment contract and optional traffic workflow.
 
 ## Gateway provider evidence matrix
 

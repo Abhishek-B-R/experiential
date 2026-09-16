@@ -130,7 +130,7 @@ uv run pytest -q
   in `fit/`, and evaluation preparation in `evaluation/`. The durable judgment ledger remains at
   `judgment_budget.py`.
 - The root CLI is locked to `build`, `optimize`, `config`, and `run`. The optimize group is locked
-  to `router` and `model`; the config group is locked to `budget`, `gateway`, `judge`, `providers`,
+  to `router`, `model`, and `claas`; the config group is locked to `budget`, `gateway`, `judge`, `providers`,
   and `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag, is a
   deliberate change to the locked surface and needs the same scrutiny as a public API change.
 - Every paid CLI command uses `exp.cli.shared.consent.require_spend_consent` after a credential-free
@@ -150,6 +150,17 @@ uv run pytest -q
   pointer, drift, and catalog-provenance coverage. The seam composes a persisted dataset into an
   SFT run and stops there; training-objective, promotion, and route-registration concerns belong to
   their own owners.
+- `exp/optimize/claas/` owns environment-agnostic continual-learning orchestration, training
+  objectives, evaluation orchestration, and adapter promotion. Its core accepts supplied scenarios,
+  environments, and evaluators; it must not require traffic mining, scenario synthesis, a world
+  model, or a judge provider. `exp/optimize/workflows/traffic_learning/` composes traffic selection,
+  mining, synthesis, and its world-model environment separately from the learning core. Simulation
+  primitives stay under `exp/simulation/`. Capture and feedback request hooks stay in the Rust
+  gateway; portable experience contracts live in `exp/common/claas/`. Public veRL workers own optimizer execution and
+  training checkpoint state. CLaaS adds its objective and feedback-teacher extension through that
+  worker boundary, rather than implementing a separate optimizer loop. Optional GPU workers are
+  explicit runtime selections, and Modal contains infrastructure lifecycle and artifact transport
+  only. The `exp optimize claas` command group owns local setup and bounded workflow execution.
 
 ## Python
 

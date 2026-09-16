@@ -10,7 +10,7 @@ from exp.cli.app import app
 
 EXPECTED_SUBCOMMANDS = {
     "config": {"budget", "gateway", "judge", "providers", "telemetry"},
-    "optimize": {"model", "router"},
+    "optimize": {"model", "router", "claas"},
 }
 
 

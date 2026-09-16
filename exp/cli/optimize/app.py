@@ -2,9 +2,8 @@
 
 """`exp optimize`: the one switch over the product optimizers.
 
-The group is exactly two commands: `router` (the guarded offline kNN path) and
-`model` (automatic routed-interaction SFT). This module owns the switch only,
-so no optimization logic lives here.
+The group owns router fitting, routed-interaction SFT, and local CLaaS applications.
+This module owns composition only, so no optimization logic lives here.
 """
 
 from __future__ import annotations
@@ -13,10 +12,27 @@ import typer
 
 from exp.cli.optimize.model import optimize_model
 from exp.cli.optimize.router import router
+from exp.cli.shared.defer import add_deferred_typer
 
 optimize_app = typer.Typer(
     help="Offline optimization of frozen project artifacts.",
     no_args_is_help=True,
+)
+add_deferred_typer(
+    optimize_app,
+    name="claas",
+    module="exp.cli.optimize.claas.app",
+    attr="claas_app",
+    help="Configure and run local continual-learning applications.",
+    known_names=(
+        "activate",
+        "bind",
+        "capture",
+        "init",
+        "rollback",
+        "status",
+        "train",
+    ),
 )
 
 optimize_app.command(
