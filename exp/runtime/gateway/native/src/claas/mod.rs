@@ -1,5 +1,8 @@
 //! Opt-in local application capture, isolated from content-free accounting.
 
+pub(crate) mod feedback;
+mod feedback_contracts;
+mod feedback_store;
 mod store;
 mod stream;
 
