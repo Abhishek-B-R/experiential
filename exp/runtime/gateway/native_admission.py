@@ -38,6 +38,7 @@ from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_stage_admission import stage_affinity_ordered_rungs
 from exp.runtime.gateway.prompt_cache_affinity import provider_prompt_cache_key
 from exp.runtime.gateway.prompt_size import context_window_compatible_indexes
+from exp.runtime.gateway.recovery_binding import bind_recovery_profiles
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.sticky_affinity import AffinityPlacement, sticky_first_order
 from exp.runtime.models.providers import (
@@ -335,6 +336,13 @@ def admitted_route_requests(
             }
         )
     provider_request = _with_cache_affinity(provider_request, authorization)
+    resolved_wires = bind_recovery_profiles(
+        route.deployments,
+        resolved_wires,
+        authorization.organization_id,
+        accounting.recovery_host,
+        request_region=provider_request.inference_geo,
+    )
     route, resolved_wires = _prefer_cache_capable_rungs(route, resolved_wires, provider_request)
     route, resolved_wires, placement = _affinity_ordered_rungs(
         route,

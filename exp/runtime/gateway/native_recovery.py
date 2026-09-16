@@ -19,6 +19,7 @@ from exp.runtime.gateway.recovery import (
     SessionCacheKey,
     SessionRecoveryRegistry,
 )
+from exp.runtime.gateway.recovery_binding import frozen_scope
 from exp.runtime.gateway.replay_identity import canonical_request_sha256
 
 _logger = logging.getLogger(__name__)
@@ -121,10 +122,15 @@ def record_departure(
             key = session_cache_key(entry)
         if key is None:
             return False
+        scope = frozen_scope(
+            entry.recovery_bindings, deployment, entry.authorization.organization_id
+        )
+        if scope is None:
+            return False
         registry.depart(
             key,
             deployment.deployment_id,
-            registry.scope(deployment, entry.authorization.organization_id, host),
+            scope,
             cause,
             retry_after_seconds=retry_after_seconds,
         )
@@ -132,6 +138,25 @@ def record_departure(
         _logger.warning("Session recovery departure observation skipped")
         return False
     return True
+
+
+def observe_reserved_attempt(
+    host: RecoveryHost | None,
+    entry: InflightRequest,
+    attempt_id: str,
+    deployment: ExactModelDeployment,
+) -> None:
+    """Observe a successful reservation using only its retained resolved-wire binding."""
+    if host is None:
+        return
+    try:
+        scope = frozen_scope(
+            entry.recovery_bindings, deployment, entry.authorization.organization_id
+        )
+        if scope is not None and scope.region_scope is not None:
+            host.attempt_started(attempt_id, scope.operational())
+    except Exception:  # noqa: BLE001 - optional observer cannot undo a reservation.
+        _logger.warning("Recovery attempt observation skipped")
 
 
 def record_session_outcome(
@@ -191,10 +216,15 @@ def record_session_outcome(
         elif usage is not None:
             dispatch = deployment.gateway.dispatch
             stage = entry.route.snapshot.stage_for_depth(depth)
+            scope = frozen_scope(
+                entry.recovery_bindings, deployment, entry.authorization.organization_id
+            )
+            if scope is None:
+                return
             registry.record_success(
                 key,
                 deployment.deployment_id,
-                registry.scope(deployment, entry.authorization.organization_id, host),
+                scope,
                 cached_tokens=usage.cached_input_tokens or 0,
                 cache_write_tokens=usage.cache_creation_input_tokens or 0,
                 retention_seconds=deployment.gateway.cache_retention_seconds,

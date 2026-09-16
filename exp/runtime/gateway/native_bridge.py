@@ -122,6 +122,7 @@ from exp.runtime.gateway.reasoning_carrier import (
     ReasoningCarrierAuthority,
 )
 from exp.runtime.gateway.recovery import RecoveryHost
+from exp.runtime.gateway.recovery_binding import validated_recovery_binding
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -662,6 +663,18 @@ class NativeControlPlane(
                 sticky_preferred=placement.sticky_preferred,
                 throttle_redial_budgets=redial_budgets,
                 recovery_reason=placement.recovery_reason,
+                recovery_bindings={
+                    deployment.deployment_id: binding
+                    for deployment, (profile, _) in zip(
+                        route.deployments, resolved_wires, strict=True
+                    )
+                    if (
+                        binding := validated_recovery_binding(
+                            deployment, profile, authorization.organization_id
+                        )
+                    )
+                    is not None
+                },
             )
         )
         response: JsonObject = {

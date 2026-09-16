@@ -12,6 +12,7 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
 from exp.runtime.gateway.boundary import boundary_protocol_error
+from exp.runtime.gateway.budget_continuation import denied_destination_pool
 from exp.runtime.gateway.budgets import (
     BudgetReservationRejected,
     BudgetScopeKind,
@@ -27,6 +28,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.ledger import AttemptRejectedError
+from exp.runtime.gateway.native_bridge_errors import encoded_public_error, internal_protocol_error
 from exp.runtime.gateway.native_components import SyncWriteLedger
 from exp.runtime.gateway.native_execution import (
     THROTTLE_BACKOFF,
@@ -40,7 +42,11 @@ from exp.runtime.gateway.native_execution import (
     dispatch_disclosure,
     rung_load_key,
 )
-from exp.runtime.gateway.native_recovery import record_departure, record_session_outcome
+from exp.runtime.gateway.native_recovery import (
+    observe_reserved_attempt,
+    record_departure,
+    record_session_outcome,
+)
 from exp.runtime.gateway.native_rung_policy import (
     failed_dispatch_candidate,
     reserve_rung_slot,
@@ -82,17 +88,7 @@ class NativeBridgeError(Exception):
             error: Sanitized protocol error carrying its HTTP representation.
         """
         super().__init__(error.detail.message)
-        self.public_error_json = json.dumps(
-            {
-                "status_code": error.status_code,
-                "code": error.detail.code,
-                "message": error.detail.message,
-                "error_type": error.detail.type,
-                "param": error.detail.param,
-                "retry_after_seconds": error.retry_after_seconds,
-            },
-            separators=(",", ":"),
-        )
+        self.public_error_json = encoded_public_error(error)
 
 
 def authority_error(exception: Exception) -> NativeBridgeError:
@@ -105,16 +101,6 @@ def authority_error(exception: Exception) -> NativeBridgeError:
         A boundary error carrying the matching public OpenAI error.
     """
     return NativeBridgeError(boundary_protocol_error(exception))
-
-
-def internal_protocol_error() -> OpenAIProtocolError:
-    """Return the public internal error for a broken data-plane wire contract."""
-    return OpenAIProtocolError(
-        status_code=500,
-        code="internal_error",
-        message="The gateway request failed.",
-        error_type="api_error",
-    )
 
 
 class NativeAttemptAccounting:
@@ -440,6 +426,10 @@ class NativeAttemptAccounting:
                     candidate = policy_sheds[0][0]
                 else:
                     break
+            if route.snapshot.stage_for_depth(candidate).pool_id in entry.denied_destination_pools:
+                self._health.release_probe(keys[candidate])
+                candidate = claim_route_from(self._health, keys, candidate + 1)
+                continue
             deployment = deployment_priced_for_service_tier(
                 route.deployments[candidate],
                 getattr(entry.request, "service_tier", None),
@@ -506,6 +496,13 @@ class NativeAttemptAccounting:
                 if ticket is not None:
                     self._loads.release_ticket(ticket)
                 self._health.release_probe(keys[candidate])
+                denied_pool = denied_destination_pool(exc, route.snapshot, candidate)
+                if denied_pool is not None:
+                    entry.denied_destination_pools.add(denied_pool)
+                    last_failure = budget_quota_failure()
+                    forced_overflow = False
+                    candidate = claim_route_from(self._health, keys, candidate + 1)
+                    continue
                 if exc.scope_kind is not BudgetScopeKind.DEPLOYMENT:
                     error = (
                         NativeBridgeError(budget_quota_protocol_error())
@@ -556,6 +553,7 @@ class NativeAttemptAccounting:
             elif throttle_backoff:
                 self._count_throttle_disposition(THROTTLE_BACKOFF)
             self._bind_sticky_dispatch(entry, deployment)
+            observe_reserved_attempt(self.recovery_host, entry, attempt_id, deployment)
             with self._lock:
                 if forced_overflow and not throttle_backoff:
                     self._rung_saturated_overflows += 1

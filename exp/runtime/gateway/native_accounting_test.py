@@ -37,6 +37,7 @@ from exp.runtime.gateway.native_accounting import (
 from exp.runtime.gateway.native_execution import InflightRequest, deployment_health_key
 from exp.runtime.gateway.native_recovery_test import RecoveryHostFake
 from exp.runtime.gateway.native_settlement import failure_from_boundary_payload, ledger_failure
+from exp.runtime.gateway.recovery import FrozenRecoveryBinding
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.openai_protocol.errors import (
     THROTTLED_RETRY_AFTER_SECONDS,
@@ -549,6 +550,19 @@ def test_recovery_observer_failure_cannot_block_durable_settlement_cleanup(
     entry = _admit(registry, deployments, request_id="recovery-fault")
     entry.request = _request().model_copy(
         update={"provider_prompt_cache_key": "xpl-test-session", "prompt_cache_key": "session"}
+    )
+    deployment = entry.route.deployment
+    invalid_scope = (
+        RecoveryHostFake()
+        .scope_for(deployment, entry.authorization.organization_id)
+        .model_copy(update={"provider" if fault == "raise" else fault: "synthetic-private-detail"})
+    )
+    entry.recovery_bindings[deployment.deployment_id] = FrozenRecoveryBinding(
+        deployment.deployment_id,
+        deployment.connection_sha256,
+        "https://test.invalid",
+        deployment.provider_model,
+        invalid_scope,
     )
     started = _start(registry, ordinal=0, request_id=entry.authorization.request_id)
     settlement = json.dumps(

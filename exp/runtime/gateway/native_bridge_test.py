@@ -5655,7 +5655,9 @@ def test_internal_admission_failures_log_the_real_exception(
     assert fields["operation"] == "native_admit"
 
 
-def _affinity_pool_control_plane(root: Path) -> tuple[NativeControlPlane, str, Path]:
+def _affinity_pool_control_plane(
+    root: Path, environment: dict[str, str] | None = None
+) -> tuple[NativeControlPlane, str, Path]:
     """Load the control plane over a pool opted into cache-affinity routing.
 
     Seeds the standard certified two-deployment pool, then authors the opt-in
@@ -5702,7 +5704,9 @@ def _affinity_pool_control_plane(root: Path) -> tuple[NativeControlPlane, str, P
     )
     components = load_gateway_components(
         root,
-        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+        if environment is None
+        else environment,
     )
     return NativeControlPlane(components), raw_key, manager.database_path
 
@@ -5749,7 +5753,17 @@ def test_bridge_carries_scoped_verified_warmth_to_registered_request(
     tmp_path: Path, trial: bool
 ) -> None:
     """Real offline admission preserves retained/trial evidence without populating sticky state."""
-    control, raw_key, _database = _affinity_pool_control_plane(tmp_path)
+    from uuid import uuid4
+
+    from exp.runtime.models.credentials import CredentialResolution, DispatchCredentialReceipt
+    from exp.runtime.models.credentials_test import AtomicEnvironment
+
+    environment = AtomicEnvironment(
+        CredentialResolution(
+            "provider-secret-canary", "environment", receipt=DispatchCredentialReceipt(uuid4())
+        )
+    )
+    control, raw_key, _database = _affinity_pool_control_plane(tmp_path, environment)
     accounting = control._accounting  # noqa: SLF001 - inspect the native reservation boundary.
     host = Host()
     accounting.recovery_host = host
@@ -5764,7 +5778,7 @@ def test_bridge_carries_scoped_verified_warmth_to_registered_request(
         accounting.recovery.record_success(
             key,
             deployment.deployment_id,
-            host.scope_for(deployment, original.authorization.organization_id),
+            original.recovery_bindings[deployment.deployment_id].scope,
             cached_tokens=80,
             cache_write_tokens=0,
             retention_seconds=100,
@@ -5774,7 +5788,7 @@ def test_bridge_carries_scoped_verified_warmth_to_registered_request(
         accounting.recovery.depart(
             key,
             lead.deployment_id,
-            host.scope_for(lead, original.authorization.organization_id),
+            original.recovery_bindings[lead.deployment_id].scope,
             "local_capacity",
             retry_after_seconds=0,
         )
@@ -5794,6 +5808,38 @@ def test_bridge_carries_scoped_verified_warmth_to_registered_request(
     started = _start_first(control, admission)
     assert started["route_depth"] == 0
     assert accounting.sticky.size() == 0
+
+
+def test_mutable_host_scope_without_atomic_credential_receipt_cannot_recover(
+    tmp_path: Path,
+) -> None:
+    """An uninstrumented environment serves normally but cannot borrow fabricated warmth."""
+    control, raw_key, _database = _affinity_pool_control_plane(tmp_path)
+    accounting = control._accounting
+    host = Host()
+    accounting.recovery_host = host
+    first = _admit(control, raw_key, _chat_body(), client_request_id="unbound-session")
+    entry = accounting.entry(str(first["request_id"]))
+    assert entry is not None
+    assert not entry.recovery_bindings
+    key = session_cache_key(entry)
+    assert key is not None
+    fallback = entry.route.deployments[-1]
+    accounting.recovery.record_success(
+        key,
+        fallback.deployment_id,
+        host.scope_for(fallback, entry.authorization.organization_id),
+        cached_tokens=80,
+        cache_write_tokens=0,
+        retention_seconds=100,
+        sticky_seconds=60,
+    )
+    second = _admit(control, raw_key, _chat_body(), client_request_id="unbound-session")
+    next_entry = accounting.entry(str(second["request_id"]))
+    assert next_entry is not None
+    assert next_entry.route.deployment == entry.route.deployment
+    assert next_entry.verified_warm_deployment_id is None and next_entry.recovery_reason is None
+    assert _start_first(control, second)["route_depth"] == 0
 
 
 def test_foundry_deepseek_zero_argument_call_with_a_stray_empty_string_delta_completes() -> None:

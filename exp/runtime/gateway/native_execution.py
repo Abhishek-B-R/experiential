@@ -41,6 +41,7 @@ from exp.runtime.gateway.model_plan import project_stage_selection
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_settlement import deployment_operation_key
 from exp.runtime.gateway.reasoning_carrier import ReasoningCarrierAuthority
+from exp.runtime.gateway.recovery import FrozenRecoveryBinding
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.rung_admission import RungLoadKey
 from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
@@ -228,9 +229,11 @@ class InflightRequest:
     # Whether the route's depth 0 was chosen by a live sticky binding rather
     # than rendezvous order, for the ``affinity_sticky`` disclosure.
     sticky_preferred: bool = False
+    recovery_bindings: dict[str, FrozenRecoveryBinding] = field(default_factory=dict, repr=False)
     recovery_recorded_attempts: set[str] = field(default_factory=set)
     recovery_reason: str | None = None
     overflow_used: bool = False
+    denied_destination_pools: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         """Size the per-deployment attempt counters to the frozen route."""

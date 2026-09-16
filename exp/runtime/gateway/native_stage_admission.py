@@ -21,6 +21,7 @@ from exp.runtime.gateway.native_execution import (
 from exp.runtime.gateway.native_recovery import recovery_prefix_digest
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.recovery import SessionCacheKey
+from exp.runtime.gateway.recovery_binding import validated_recovery_binding
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.sticky_affinity import AffinityPlacement
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -116,9 +117,19 @@ def stage_affinity_ordered_rungs(
     if not registry.has_retained_history(key):
         return route, wires, placement
     candidates = tuple(
-        (d.deployment_id, registry.scope(d, authorization.organization_id, host))
-        for d in route.deployments[:recovery_depth]
+        (deployment.deployment_id, binding.scope)
+        for deployment, (profile, _) in zip(
+            route.deployments[:recovery_depth], wires[:recovery_depth], strict=True
+        )
+        if (
+            binding := validated_recovery_binding(
+                deployment, profile, authorization.organization_id
+            )
+        )
+        is not None
     )
+    if not candidates:
+        return route, wires, placement
     by_id = {d.deployment_id: d for d in route.deployments[:recovery_depth]}
 
     def eligible(deployment_id: str) -> bool:

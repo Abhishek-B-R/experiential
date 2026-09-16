@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 from exp.common.core.artifacts import JsonObject, sha256_json
@@ -17,7 +17,11 @@ from exp.common.models import (
     ReasoningEffort,
     known_model_metadata,
 )
-from exp.runtime.models.credentials import read_connection_api_key
+from exp.runtime.models.credentials import (
+    DispatchCredentialReceipt,
+    read_connection_api_key,
+    read_connection_credential,
+)
 from exp.runtime.models.preflight import CapabilityRequirement, preflight_capabilities
 from exp.runtime.models.providers.anthropic import ANTHROPIC_BASE_URL, AnthropicClient
 from exp.runtime.models.providers.async_transport import (
@@ -123,6 +127,7 @@ class ResolvedModel:
     client: ModelClient
     embedding_client: EmbeddingClient | None
     served_model_id: str | None = None
+    credential_receipt: DispatchCredentialReceipt | None = field(default=None, repr=False)
 
 
 class RuntimeModelCatalog:
@@ -288,11 +293,10 @@ class RuntimeModelCatalog:
                 bedrock_client if capabilities.supports_embeddings is not False else None,
                 served_model_id=record.served_model_id,
             )
-        api_key = read_connection_api_key(
-            connection,
-            connection_id=record.connection,
-            environment=self._environment,
+        credential = read_connection_credential(
+            connection, connection_id=record.connection, environment=self._environment
         )
+        api_key = credential.value
         if provider == "vertex":
             if connection.base_url is None:
                 raise ModelConnectionError(
@@ -388,6 +392,7 @@ class RuntimeModelCatalog:
                 openai_client,
                 openai_client if capabilities.supports_embeddings is not False else None,
                 served_model_id=record.served_model_id,
+                credential_receipt=credential.receipt,
             )
         if provider == "azure":
             if connection.base_url is None or connection.api_version is None:
@@ -555,6 +560,7 @@ class RuntimeModelCatalog:
             http_client,
             embedding_client,
             served_model_id=record.served_model_id,
+            credential_receipt=credential.receipt,
         )
 
     def preflight(

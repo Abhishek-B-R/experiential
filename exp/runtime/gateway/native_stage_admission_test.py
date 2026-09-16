@@ -4,13 +4,19 @@ import json
 import time
 from dataclasses import dataclass, replace
 from typing import Literal
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
 from exp.common.models.catalog import GatewayRungDispatchPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
 from exp.runtime.gateway import native_stage_admission
-from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest, GatewayUsage
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
+    GatewayMessage,
+    GatewayRequest,
+    GatewayUsage,
+)
 from exp.runtime.gateway.model_plan import model_execution_snapshot
 from exp.runtime.gateway.model_plan_test import catalog
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
@@ -27,8 +33,11 @@ from exp.runtime.gateway.native_execution import (
 )
 from exp.runtime.gateway.native_execution_test import _route
 from exp.runtime.gateway.native_recovery import record_session_outcome, session_cache_key
-from exp.runtime.gateway.native_stage_admission import stage_affinity_ordered_rungs
+from exp.runtime.gateway.native_responses import ContinuationContext
+from exp.runtime.gateway.native_stage_admission import stage_affinity_ordered_rungs as _stage_order
 from exp.runtime.gateway.recovery import (
+    FrozenRecoveryBinding,
+    OperationalScope,
     RecoveryScope,
     RecoverySnapshot,
     SessionCacheKey,
@@ -36,7 +45,10 @@ from exp.runtime.gateway.recovery import (
 )
 from exp.runtime.gateway.recovery_test import Clock
 from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.sticky_affinity import AffinityPlacement
+from exp.runtime.models.credentials import DispatchCredentialReceipt
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.protocol import NativeWireClient
 
 
 @dataclass
@@ -52,13 +64,62 @@ class Host:
             exact_model_id=deployment.exact_model_id,
             endpoint_scope=deployment.connection_sha256,
             region_scope="region",
-            credential_scope=self.credential,
+            credential_scope=str(uuid5(NAMESPACE_URL, self.credential)),
             organization_id=organization_id,
         )
+
+    def observe_scope(self, scope: OperationalScope) -> None:
+        """Register test topology without mutable credential lookup."""
+        return None
+
+    def attempt_started(self, attempt_id: str, scope: OperationalScope) -> None:
+        """Accept reserved test topology without mutable credential lookup."""
+        return None
 
     def snapshot(self) -> RecoverySnapshot:
         """Return no fleet recovery evidence, so a healthy warm fallback stays retained."""
         return RecoverySnapshot(loaded_at=1000)
+
+
+def stage_affinity_ordered_rungs(
+    route: GatewayRoute,
+    wires: tuple[tuple[GatewayWireProfile, NativeWireClient], ...],
+    request: GatewayRequest,
+    *,
+    accounting: NativeAttemptAccounting,
+    authorization: AuthorizationSnapshot,
+    continuation: ContinuationContext | None,
+) -> tuple[
+    GatewayRoute, tuple[tuple[GatewayWireProfile, NativeWireClient], ...], AffinityPlacement
+]:
+    """Bind synthetic resolved profiles as production admission does before scheduling."""
+    host = accounting.recovery_host
+    if isinstance(host, Host):
+        bound = []
+        for deployment, (profile, client) in zip(route.deployments, wires, strict=True):
+            scope = host.scope_for(deployment, authorization.organization_id)
+            receipt = DispatchCredentialReceipt(uuid5(NAMESPACE_URL, host.credential))
+            binding = FrozenRecoveryBinding(
+                deployment.deployment_id,
+                deployment.connection_sha256,
+                profile.url,
+                profile.model_id,
+                scope,
+                profile.operational_region,
+                profile.dialect,
+            )
+            bound.append(
+                (replace(profile, credential_receipt=receipt, recovery_binding=binding), client)
+            )
+        wires = tuple(bound)
+    return _stage_order(
+        route,
+        wires,
+        request,
+        accounting=accounting,
+        authorization=authorization,
+        continuation=continuation,
+    )
 
 
 def test_settlement_records_successful_session_cache_once_and_never_dispatch_only() -> None:
@@ -88,6 +149,13 @@ def test_settlement_records_successful_session_cache_once_and_never_dispatch_onl
     registry = SessionRecoveryRegistry(clock=Clock())
     host = Host()
     scope = host.scope_for(route.deployment, auth.organization_id)
+    entry.recovery_bindings[route.deployment.deployment_id] = FrozenRecoveryBinding(
+        route.deployment.deployment_id,
+        route.deployment.connection_sha256,
+        "https://test.invalid",
+        route.deployment.provider_model,
+        scope,
+    )
     assert (
         registry.choose(
             key, ((route.deployment.deployment_id, scope),), eligible=lambda _: True, snapshot=None

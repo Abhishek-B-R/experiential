@@ -1,6 +1,6 @@
 """Recovery history hashes actual prefix input independently from cache routing hints."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 from unittest.mock import patch
 
@@ -27,6 +27,8 @@ from exp.runtime.gateway.native_recovery import (
     session_cache_key,
 )
 from exp.runtime.gateway.recovery import (
+    FrozenRecoveryBinding,
+    OperationalScope,
     RecoveryLease,
     RecoveryObservation,
     RecoveryScope,
@@ -131,6 +133,14 @@ class RecoveryHostFake:
             return scope.model_copy(update={self.fault: "synthetic-private-detail"})
         return scope
 
+    def observe_scope(self, scope: OperationalScope) -> None:
+        """Accept detached operational demand without resolving credentials."""
+        self.calls += 1
+
+    def attempt_started(self, attempt_id: str, scope: OperationalScope) -> None:
+        """Accept an actual attempt's detached topology."""
+        self.calls += 1
+
     def snapshot(self) -> RecoverySnapshot:
         """Return an empty host view without provider or credential access."""
         return RecoverySnapshot(loaded_at=1000)
@@ -167,6 +177,16 @@ def recovery_entry() -> InflightRequest:
         request=request(),
         deadline_monotonic=10,
         attempt_depths={"attempt": 0, "departure": 0, "fallback": 1},
+        recovery_bindings={
+            d.deployment_id: FrozenRecoveryBinding(
+                d.deployment_id,
+                d.connection_sha256,
+                "https://test.invalid",
+                d.provider_model,
+                RecoveryHostFake().scope_for(d, route.snapshot.authorization.organization_id),
+            )
+            for d in route.deployments
+        },
     )
 
 
@@ -217,7 +237,7 @@ def test_settled_outcome_hashes_once_and_duplicate_does_no_work(
                 failure,
             )
     assert derive.call_count == 1
-    assert host.calls == 1
+    assert host.calls == 0
     assert entry.recovery_recorded_attempts == {"attempt"}
 
 
@@ -255,6 +275,14 @@ def test_invalid_host_scope_records_nothing_and_remains_retryable(
 ) -> None:
     """Host failures never create cache evidence, departures, or completion markers."""
     registry, host, entry = SessionRecoveryRegistry(), RecoveryHostFake(fault), recovery_entry()
+    deployment_id = entry.route.deployment.deployment_id
+    valid = entry.recovery_bindings[deployment_id]
+    entry.recovery_bindings[deployment_id] = replace(
+        valid,
+        scope=valid.scope.model_copy(
+            update={"provider" if fault == "raise" else fault: "synthetic-private-detail"}
+        ),
+    )
     key = session_cache_key(entry)
     assert key is not None
     failure = (
@@ -270,6 +298,7 @@ def test_invalid_host_scope_records_nothing_and_remains_retryable(
     assert "synthetic-private-detail" not in caplog.text
     assert caplog.records and all(record.exc_info is None for record in caplog.records)
     host.fault = None
+    entry.recovery_bindings[deployment_id] = valid
     record_session_outcome(registry, host, entry, "attempt", usage, failure)
     assert entry.recovery_recorded_attempts == {"attempt"}
     assert key in registry._sessions  # noqa: SLF001 - only the valid retry may write history.
@@ -394,6 +423,12 @@ def test_newer_malformed_outcome_blocks_older_shared_healthy_observation() -> No
     clock.now += 1
     other = recovery_entry()
     other.authorization = other.authorization.model_copy(update={"organization_id": "other-org"})
+    other.recovery_bindings = {
+        name: replace(
+            binding, scope=binding.scope.model_copy(update={"organization_id": "other-org"})
+        )
+        for name, binding in other.recovery_bindings.items()
+    }
     record_session_outcome(
         registry,
         host,

@@ -54,6 +54,9 @@ def _resolved_wire_profile(
         )
         return replace(
             profile,
+            credential_receipt=runtime_model.credential_receipt
+            if not profile.signs_request_body
+            else None,
             model_id=profile.model_id or runtime_model.snapshot.model_id,
             billing_customer_managed=(deployment.billing_source == BillingSource.CUSTOMER_MANAGED),
             service_tier_pricing_enabled=capabilities.service_tier_pricing_enabled,

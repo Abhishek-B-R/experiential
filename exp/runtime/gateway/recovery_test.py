@@ -189,9 +189,11 @@ def test_other_account_cannot_clear_account_specific_failure(cause: str) -> None
         == "fallback"
     )
     matching = snapshot(clock, cause=cause, authoritative=True)
+    # Shared snapshots contain no atomic credential generation. Even a matching
+    # topology cannot clear account-scoped failures until that authority exists.
     assert (
         registry.choose(key(), candidates, eligible=eligible, snapshot=matching).deployment_id
-        == "primary"
+        == "fallback"
     )
 
 

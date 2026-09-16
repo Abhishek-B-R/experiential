@@ -14,10 +14,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from exp.common.core.artifacts import ContractModel
-from exp.common.models.gateway_catalog import ExactModelDeployment
 
 RecoveryCause = Literal["transport", "throttle", "credential", "local_capacity"]
 RecoveryReason = Literal[
@@ -29,33 +28,80 @@ RecoveryReason = Literal[
 ]
 
 
-class RecoveryScope(ContractModel):
-    """Opaque operational identity; credential/account rotation changes its scope."""
+class OperationalScope(ContractModel):
+    """Stable nonsecret service topology suitable for shared transport observations."""
 
     provider: str
     exact_model_id: str
     endpoint_scope: str
-    region_scope: str
-    credential_scope: str
-    organization_id: str
+    region_scope: str | None
+
+
+class RecoveryScope(OperationalScope):
+    """Worker-local credential and tenant binding, excluded from serialized evidence."""
+
+    credential_scope: str = Field(exclude=True, repr=False)
+    organization_id: str = Field(exclude=True, repr=False)
+
+    def operational(self) -> OperationalScope:
+        """Detach shareable topology without credential or tenant identity."""
+        return OperationalScope(
+            provider=self.provider,
+            exact_model_id=self.exact_model_id,
+            endpoint_scope=self.endpoint_scope,
+            region_scope=self.region_scope,
+        )
+
+
+@dataclass(frozen=True, repr=False)
+class FrozenRecoveryBinding:
+    """Private correspondence between one resolved wire and its local recovery scope."""
+
+    deployment_id: str
+    connection_sha256: str
+    wire_url: str
+    wire_model: str
+    scope: RecoveryScope
+    wire_region: str | None = None
+    wire_dialect: str | None = None
+
+    def __repr__(self) -> str:
+        """Keep topology and account binding out of incidental diagnostics."""
+        return "FrozenRecoveryBinding([REDACTED])"
 
 
 class RecoveryObservation(ContractModel):
     """One first-party, narrowly scoped outcome, never an official status feed."""
 
-    scope: RecoveryScope
+    scope: OperationalScope
     cause: RecoveryCause
     observed_at: float = Field(ge=0, allow_inf_nan=False)
     healthy: bool
     authoritative: bool = False
+
+    @field_validator("scope", mode="before")
+    @classmethod
+    def _detach_scope(
+        cls, value: OperationalScope | dict[str, str | None]
+    ) -> OperationalScope | dict[str, str | None]:
+        """Strip worker-private subclass fields before storing shared observations."""
+        return value.operational() if isinstance(value, RecoveryScope) else value
 
 
 class RecoveryLease(ContractModel):
     """A fleet-allocated bounded half-open authorization consumed at most once."""
 
     lease_id: str = Field(min_length=1)
-    scope: RecoveryScope
+    scope: OperationalScope
     expires_at: float = Field(ge=0, allow_inf_nan=False)
+
+    @field_validator("scope", mode="before")
+    @classmethod
+    def _detach_scope(
+        cls, value: OperationalScope | dict[str, str | None]
+    ) -> OperationalScope | dict[str, str | None]:
+        """Strip worker-private subclass fields before storing shared leases."""
+        return value.operational() if isinstance(value, RecoveryScope) else value
 
 
 class RecoverySnapshot(ContractModel):
@@ -69,8 +115,12 @@ class RecoverySnapshot(ContractModel):
 class RecoveryHost(Protocol):
     """Cheap local access to shared observations and preallocated recovery leases."""
 
-    def scope_for(self, deployment: ExactModelDeployment, organization_id: str) -> RecoveryScope:
-        """Identify the actual endpoint, model, region and credential without secrets."""
+    def observe_scope(self, scope: OperationalScope) -> None:
+        """Register bounded demand for already-frozen shareable service topology."""
+        ...
+
+    def attempt_started(self, attempt_id: str, scope: OperationalScope) -> None:
+        """Bind an actual reserved attempt to its frozen service topology."""
         ...
 
     def snapshot(self) -> RecoverySnapshot:
@@ -128,22 +178,28 @@ class _SessionHistory:
     retained_age_deadline: float = 0
 
 
-def _matches(left: RecoveryScope, right: RecoveryScope, cause: RecoveryCause) -> bool:
-    """Infrastructure can recover across tenants; account failures cannot."""
-    shared = (
-        left.provider == right.provider
+def _matches(left: RecoveryScope, right: OperationalScope, cause: RecoveryCause) -> bool:
+    """Only transport facts cross workers; unknown region never acts as a wildcard."""
+    return (
+        cause == "transport"
+        and left.provider == right.provider
         and left.exact_model_id == right.exact_model_id
         and bool(left.endpoint_scope)
         and left.endpoint_scope == right.endpoint_scope
-        and bool(left.region_scope)
+        and left.region_scope is not None
         and left.region_scope == right.region_scope
     )
-    return shared and (cause == "transport" or left == right)
 
 
 def _negative_key(scope: RecoveryScope, cause: RecoveryCause) -> tuple[str, ...]:
     """Share infrastructure negatives locally without sharing account-specific state."""
-    shared = (cause, scope.provider, scope.exact_model_id, scope.endpoint_scope, scope.region_scope)
+    shared = (
+        cause,
+        scope.provider,
+        scope.exact_model_id,
+        scope.endpoint_scope,
+        scope.region_scope or "",
+    )
     return (
         shared if cause == "transport" else (*shared, scope.organization_id, scope.credential_scope)
     )
@@ -173,28 +229,6 @@ class SessionRecoveryRegistry:
         self._consumed: dict[str, float] = {}
         self._negative: OrderedDict[tuple[str, ...], float] = OrderedDict()
         self._lock = threading.Lock()
-
-    def scope(
-        self, deployment: ExactModelDeployment, organization_id: str, host: RecoveryHost | None
-    ) -> RecoveryScope:
-        """Use explicit host credential identity or conservative connection-local identity."""
-        if host is not None:
-            scope = host.scope_for(deployment, organization_id)
-            if (
-                scope.provider != deployment.provider
-                or scope.exact_model_id != deployment.exact_model_id
-                or scope.organization_id != organization_id
-            ):
-                raise ValueError("recovery scope must match the authorized actual deployment")
-            return scope
-        return RecoveryScope(
-            provider=deployment.provider,
-            exact_model_id=deployment.exact_model_id,
-            endpoint_scope=deployment.connection_sha256,
-            region_scope="unknown",
-            credential_scope="",
-            organization_id=organization_id,
-        )
 
     def _history(self, key: SessionCacheKey) -> _SessionHistory:
         """Get or create an LRU entry while holding the registry lock."""
@@ -401,7 +435,7 @@ class SessionRecoveryRegistry:
                     if (
                         lease.lease_id not in self._consumed
                         and lease.expires_at > now
-                        and scope == lease.scope
+                        and scope.operational() == lease.scope
                     ):
                         if len(self._consumed) >= self._maximum:
                             break

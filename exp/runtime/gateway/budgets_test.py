@@ -526,27 +526,27 @@ def test_root_backfill_overflow_rolls_back_limit_and_partial_charges(tmp_path: P
         ).fetchone() == (0,)
 
 
-def test_reachable_child_budget_authoring_remains_explicitly_rejected(tmp_path: Path) -> None:
-    """Reachable child authoring stays fail-closed until verified scope support is added."""
+def test_reachable_child_budget_authoring_uses_pinned_graph(tmp_path: Path) -> None:
+    """Only reachable child pools and their actual leaves can receive allocations."""
     clock = _Clock()
     store, ledger, budgets, key = _authority(tmp_path, clock)
     catalog = _activate_chain(store, tmp_path)
     snapshot = _accepted_chain(store, ledger, clock, key, catalog)
     assert snapshot.stage_for_depth(1).pool_id == "child-pool"
     for kind in (BudgetScopeKind.POOL, BudgetScopeKind.DEPLOYMENT):
-        with pytest.raises(ValueError, match="pool is not the active revision target"):
-            budgets.set_limit(
-                organization_id="org",
-                period="2026-08",
-                scope=BudgetScope(
-                    kind=kind,
-                    alias_id="coding",
-                    pool_id="child-pool",
-                    deployment_id="child" if kind is BudgetScopeKind.DEPLOYMENT else None,
-                ),
-                limit_nano_usd=100,
-            )
-    assert budgets.limits(organization_id="org", period="2026-08") == ()
+        changed, limit = budgets.set_limit(
+            organization_id="org",
+            period="2026-08",
+            scope=BudgetScope(
+                kind=kind,
+                alias_id="coding",
+                pool_id="child-pool",
+                deployment_id="child" if kind is BudgetScopeKind.DEPLOYMENT else None,
+            ),
+            limit_nano_usd=100,
+        )
+        assert changed and limit.scope.pool_id == "child-pool"
+    assert len(budgets.limits(organization_id="org", period="2026-08")) == 2
 
 
 def test_maximum_attempt_cost_is_integer_conservative_and_unknown_prices_fail_closed() -> None:
@@ -1202,14 +1202,14 @@ def test_pool_and_deployment_budget_scopes_require_real_targets(tmp_path: Path) 
     _store, _ledger, budgets, _key = _authority(tmp_path, clock)
     _write_snapshot(tmp_path)
 
-    with pytest.raises(ValueError, match="pool is not the active revision target"):
+    with pytest.raises(ValueError, match="not reachable|root pool is missing"):
         budgets.set_limit(
             organization_id="org",
             period="2026-08",
             scope=BudgetScope(kind=BudgetScopeKind.POOL, alias_id="coding", pool_id="ghost"),
             limit_nano_usd=100,
         )
-    with pytest.raises(ValueError, match="deployment is not in its pool"):
+    with pytest.raises(ValueError, match="not reachable"):
         budgets.set_limit(
             organization_id="org",
             period="2026-08",
@@ -1257,7 +1257,7 @@ def test_retargeted_alias_rejects_previous_pool_scope(tmp_path: Path) -> None:
         catalog_sha256=_catalog().identity_sha256(),
     )
 
-    with pytest.raises(ValueError, match="pool is not the active revision target"):
+    with pytest.raises(ValueError, match="not reachable|root pool is missing"):
         budgets.set_limit(
             organization_id="org",
             period="2026-08",

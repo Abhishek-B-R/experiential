@@ -342,7 +342,7 @@ class SQLiteAttemptLedger:
         period_start = budget_period_start(current_budget_period(now))
         request = connection.execute(
             """
-            SELECT organization_id, identity_id, alias_id, terminal_state
+            SELECT organization_id, identity_id, alias_id, alias_revision_id, terminal_state
             FROM gateway_requests
             WHERE request_id = ?
             """,
@@ -350,7 +350,11 @@ class SQLiteAttemptLedger:
         ).fetchone()
         if request is None:
             raise GatewayLedgerError("attempt request was not durably accepted")
-        if str(request["organization_id"]) != snapshot.authorization.organization_id:
+        if (
+            str(request["organization_id"]) != snapshot.authorization.organization_id
+            or str(request["identity_id"]) != snapshot.authorization.identity_id
+            or str(request["alias_revision_id"]) != snapshot.authorization.alias_revision_id
+        ):
             raise GatewayLedgerError("attempt authority differs from accepted request")
         if request["terminal_state"] is not None:
             raise GatewayLedgerError("attempt request is already terminal")
@@ -451,6 +455,8 @@ class SQLiteAttemptLedger:
             alias_id=str(request["alias_id"]),
             pool_id=stage.pool_id,
             root_pool_id=snapshot.pool_id,
+            request_id=snapshot.authorization.request_id,
+            alias_revision_id=snapshot.authorization.alias_revision_id,
             deployment_id=deployment.deployment_id,
             attempt_id=attempt_id,
             period_start=period_start,
