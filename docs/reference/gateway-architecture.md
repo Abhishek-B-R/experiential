@@ -40,13 +40,10 @@ It serves:
 this same gateway application. It does not create a router HTTP server. Gateway startup and readiness
 perform no provider request. Only an authorized model request may cross the provider boundary.
 
-Tool-call identifiers on Chat Completions and Responses are opaque strings of 1 to
-65,536 characters. Replay the complete returned identifier in both the assistant call
-and its tool result, including any signature suffix. The gateway preserves the identifier
-verbatim on OpenAI-compatible Chat routes; it does not decode or strip provider signatures.
-Output guardrail byte limits count the complete serialized completion, including
-tool IDs, tool names, arguments, and JSON framing.
-Provider-specific wire restrictions still apply when routing to a different API dialect.
+Chat Completions and Responses tool-call IDs are opaque strings of 1 to 65,536 characters.
+Replay each complete ID, including any signature suffix, in both the assistant call and tool result.
+OpenAI-compatible Chat routes preserve IDs verbatim; other API dialects may restrict their wire shape.
+Output guardrail byte limits count the full serialized completion, including tool IDs, names, arguments, and JSON framing.
 
 Streamed function-call arguments must assemble to one JSON object. On OpenAI-compatible
 Chat streams the gateway stops relaying argument deltas at the byte that closes that object:
@@ -322,7 +319,10 @@ A caller `anthropic-beta` header forwards through an exact token allowlist (nota
 `context-1m-2025-08-07`, which activates the provider's 1M context window; without it the
 provider serves 200K); non-allowlisted tokens drop with a per-token
 `anthropic-beta.<token>` disclosure, never a rejection and never a blind forward. On the Responses surface, `client_metadata` and `text.verbosity` forward on native rungs
-and drop with disclosure elsewhere; Codex-native input items (`additional_tools` tool namespaces,
+and drop with disclosure elsewhere. Chat `verbosity` accepts `low`, `medium`, or `high` as the
+same hint: forwarded as `text.verbosity` on native Responses routes and omitted with a
+`verbosity` disclosure on other routes. Invalid values remain named parameter errors.
+Codex-native input items (`additional_tools` tool namespaces,
 `custom_tool_call`/`custom_tool_call_output` freeform history) and non-function top-level tool
 declarations (`custom` freeform-grammar tools, `namespace` tool trees, `web_search`,
 `tool_search`) carry byte-for-byte at their caller positions and require a homogeneous native

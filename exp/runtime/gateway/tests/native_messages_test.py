@@ -2362,3 +2362,97 @@ def test_hosted_web_search_serves_and_continues_through_the_native_responses_lan
     message_echo = cast(JsonObject, replay[hosted_position + 1])
     assert message_echo["type"] == "message"
     assert message_echo["id"] == "msg_cited"
+
+
+@pytest.mark.parametrize("stream", (False, True))
+def test_chat_verbosity_reaches_the_native_responses_provider(
+    responses_engine: _ServingEngine, stream: bool
+) -> None:
+    """Serve Chat verbosity through the gateway and retain it on the provider wire."""
+    with _ResponsesUpstream.payloads_lock:
+        before = len(_ResponsesUpstream.payloads)
+    response = httpx.post(
+        f"{responses_engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={
+            "model": "responses",
+            "messages": [{"role": "user", "content": "look up a result"}],
+            "verbosity": "high",
+            "stream": stream,
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "data: [DONE]" in response.text
+    else:
+        assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+    assert "x-experiential-ignored-parameters" not in response.text
+    with _ResponsesUpstream.payloads_lock:
+        dispatched = _ResponsesUpstream.payloads[before:]
+    assert len(dispatched) == 1
+    assert dispatched[0]["text"] == {"verbosity": "high"}
+    assert "verbosity" not in dispatched[0]
+
+
+@pytest.mark.parametrize("stream", (False, True))
+def test_chat_verbosity_serves_with_disclosure_on_a_compatible_provider(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """Serve an unsupported hint without forwarding it or losing its public disclosure."""
+    with _SseUpstream.payloads_lock:
+        before = len(_SseUpstream.payloads)
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "fast-token"}],
+            "verbosity": "low",
+            "stream": stream,
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        chunks = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert any(
+            chunk.get("x-experiential-ignored-parameters") == ["verbosity"] for chunk in chunks
+        )
+        assert "data: [DONE]" in response.text
+    else:
+        assert response.json()["choices"][0]["message"]["content"] == "hello world"
+        assert response.json()["x-experiential-ignored-parameters"] == ["verbosity"]
+    with _SseUpstream.payloads_lock:
+        dispatched = _SseUpstream.payloads[before:]
+    assert len(dispatched) == 1
+    assert "verbosity" not in dispatched[0]
+    assert "text" not in dispatched[0]
+
+
+def test_invalid_chat_verbosity_is_rejected_before_provider_dispatch(
+    engine: _ServingEngine,
+) -> None:
+    """Reject an invalid hint as a named client error without paying for an attempt."""
+    with _SseUpstream.payloads_lock:
+        before = len(_SseUpstream.payloads)
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "fast-token"}],
+            "verbosity": "verbose",
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "verbosity"
+    assert response.json()["error"]["code"] == "invalid_parameter"
+    with _SseUpstream.payloads_lock:
+        assert len(_SseUpstream.payloads) == before

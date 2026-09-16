@@ -3273,6 +3273,34 @@ def test_client_metadata_and_verbosity_forward_native_and_disclose_elsewhere() -
     assert provider.text_verbosity is None
 
 
+@pytest.mark.parametrize("mixed", (False, True))
+def test_chat_verbosity_forwards_native_responses_and_discloses_elsewhere(mixed: bool) -> None:
+    """Forward the hint only when every route supports the native Responses wire."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"),),
+        text_verbosity="low",
+        stream=True,
+        include_usage=True,
+    )
+    responses = GatewayWireProfile(dialect="openai_responses", url="https://openai.test")
+    compatible = GatewayWireProfile(dialect="openai_compatible", url="https://deepseek.test")
+
+    public, provider = route_generation_parameter_requests((responses,), request)
+    assert public.ignored_parameters == ()
+    assert provider.text_verbosity == "low"
+    payload = openai_responses_stream_payload("gpt-5.6-luna", provider, supports_temperature=False)
+    assert payload["text"] == {"verbosity": "low"}
+
+    profiles = (responses, compatible) if mixed else (compatible,)
+    public, provider = route_generation_parameter_requests(profiles, request)
+    assert public.ignored_parameters == ("verbosity",)
+    assert provider.text_verbosity is None
+    payload = openai_compatible_stream_payload("deepseek-flash", provider)
+    assert "verbosity" not in payload
+    assert "text" not in payload
+
+
 def test_diagnostics_speed_and_betas_forward_on_anthropic_and_disclose_elsewhere() -> None:
     """The conditional Claude Code carriers ride Anthropic rungs verbatim
     with their required beta tokens merged into one header; a route with
