@@ -74,6 +74,66 @@ pub fn rejected_by_account_quota(dialect: Dialect, body: &str) -> bool {
     })
 }
 
+/// The head of Novita's relay sentence when ITS decoder choked on the upstream
+/// error it received: "failed to decode error response: json: cannot unmarshal
+/// number into Go struct field ResponseError.error.code of type string, raw:
+/// {"error":{"code":0,"message":"Exceeded maximum number of images (50)
+/// allowed in the request."}} trace_id: …" (gpt-5.6-luna on the Responses
+/// wire, 2026-09-16 04:58-05:31Z, six customer 400s). The relay's own
+/// sentence says nothing; the UPSTREAM document after `raw: ` carries the
+/// real code and sentence (a caller's image limit here, a 429 elsewhere).
+const DECODE_FAILURE_HEAD: &str = "failed to decode error response:";
+const DECODE_FAILURE_RAW_MARKER: &str = "raw: ";
+
+/// The upstream `(code, sentence)` a relay's decode-failure sentence embeds,
+/// or `None` for any other sentence. The embedded text is parsed as its first
+/// JSON document (the relay appends its own trace id after it); a truncated
+/// document still yields its `"message"` field by a bounded scan, because the
+/// relay cuts long upstream bodies.
+pub fn relayed_decode_failure(message: &str) -> Option<(Option<String>, String)> {
+    let trimmed = message.trim_start();
+    if !trimmed
+        .get(..DECODE_FAILURE_HEAD.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(DECODE_FAILURE_HEAD))
+    {
+        return None;
+    }
+    let raw_start = trimmed.find(DECODE_FAILURE_RAW_MARKER)? + DECODE_FAILURE_RAW_MARKER.len();
+    let raw = trimmed[raw_start..].trim_start();
+    if let Some(document) = parse_error_document(raw) {
+        // A zero code is the upstream's "no code" (it is what broke the relay's
+        // decoder), never an HTTP status: it must not classify as one.
+        let code = openai_family_envelope(&document)
+            .and_then(|envelope| envelope.code)
+            .filter(|code| code != "0");
+        let sentence = json_error_sentence(&document)?;
+        return Some((code, sentence));
+    }
+    Some((None, quoted_message_field(raw)?))
+}
+
+/// The `"message":"…"` value of one (possibly unterminated) JSON fragment.
+fn quoted_message_field(raw: &str) -> Option<String> {
+    const KEY: &str = "\"message\":\"";
+    let start = raw.find(KEY)? + KEY.len();
+    let rest = &raw[start..];
+    let end = rest.find('"').unwrap_or(rest.len());
+    let text = rest[..end].trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// The upstream `(code, sentence)` behind a 4xx body whose sentence is a
+/// relay decode failure (see [`relayed_decode_failure`]); only the dialect's
+/// message field is read.
+pub fn rejected_via_decode_failure(
+    dialect: Dialect,
+    body: &str,
+) -> Option<(Option<String>, String)> {
+    let value = parse_error_document(body)?;
+    let message = error_message_field(dialect, &value)?;
+    relayed_decode_failure(message)
+}
+
 /// Whether a 403 body is an aggregator ROUTING verdict rather than a
 /// credential one. OpenRouter runs its routing funnel only AFTER the key has
 /// authenticated, and reports the funnel it walked (`metadata.routing_funnel`)
