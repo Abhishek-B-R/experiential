@@ -164,10 +164,25 @@ def test_cuda_upstream_verl_update_native_resume_and_export(tmp_path: Path) -> N
         Path(second.checkpoint.path) / "verl/actor/optim_world_size_1_rank_0.pt",
         weights_only=True,
     )
+    assert state["state"]
     assert all(float(cast(torch.Tensor, value["step"])) == 2 for value in state["state"].values())
     assert (
         verify_checkpoint(second.checkpoint, first_job.spec).serving_adapter_directory == "student"
     )
+    resumed_student = load_file(
+        str(Path(second.checkpoint.path) / "student/adapter_model.safetensors")
+    )
+    resumed_teacher = load_file(
+        str(Path(second.checkpoint.path) / "teacher/adapter_model.safetensors")
+    )
+    rate = first_job.spec.teacher_update_rate
+    for name in resumed_teacher:
+        torch.testing.assert_close(
+            resumed_teacher[name].float(),
+            teacher[name].float() * (1 - rate) + resumed_student[name].float() * rate,
+            atol=1e-5,
+            rtol=0.02,
+        )
 
 
 def tiny_qwen() -> Qwen3_5ForConditionalGeneration:
