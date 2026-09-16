@@ -10,7 +10,7 @@ from typing import Literal, Protocol
 
 from exp.common.claas import Experience, ExperienceProvenance
 from exp.common.claas.scenarios import EnvironmentEpisode, EnvironmentStep, Scenario
-from exp.common.core.artifacts import ContractModel
+from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.common.core.files import write_text_atomic
 from exp.common.models import AssistantAction, ModelMessage
 from exp.common.tasks import ToolSchema
@@ -50,7 +50,12 @@ class ServingController(Protocol):
         ...
 
     async def sample_for_evaluation(
-        self, messages: tuple[ModelMessage, ...], tools: tuple[ToolSchema, ...], request_id: str
+        self,
+        messages: tuple[ModelMessage, ...],
+        tools: tuple[ToolSchema, ...],
+        request_id: str,
+        *,
+        max_tokens: int | None = None,
     ) -> PolicySample:
         """Sample exact token evidence while public traffic remains paused."""
         ...
@@ -63,10 +68,19 @@ class ServingController(Protocol):
 class RevisionPolicy:
     """Load the exact evaluation revision before each action on one shared GPU."""
 
-    def __init__(self, serving: ServingController, revision: ServingRevision) -> None:
+    def __init__(
+        self,
+        serving: ServingController,
+        revision: ServingRevision,
+        *,
+        maximum_response_tokens: int = 2048,
+    ) -> None:
         """Bind immutable policy identity without loading or sampling."""
+        if isinstance(maximum_response_tokens, bool) or not 1 <= maximum_response_tokens <= 131072:
+            raise ValueError("maximum_response_tokens must be between one and 131072")
         self.serving = serving
         self.revision = revision
+        self.maximum_response_tokens = maximum_response_tokens
 
     @property
     def policy_revision(self) -> str:
@@ -78,7 +92,9 @@ class RevisionPolicy:
     ) -> AssistantAction:
         """Load the bound revision, then sample one action on the private endpoint."""
         await self.serving.load_revision(self.revision)
-        sample = await self.serving.sample_for_evaluation(messages, tools, request_id)
+        sample = await self.serving.sample_for_evaluation(
+            messages, tools, request_id, max_tokens=self.maximum_response_tokens
+        )
         _verify_sample(sample, self.revision)
         return sample.action
 
@@ -139,11 +155,17 @@ async def collect_practice(
             reason: Literal["terminal", "step_limit", "failed"] = "failed"
             samples: list[PolicySample] = []
             experiences: list[Experience] = []
+            execution_error: BaseException | None = None
             try:
                 for step in range(limits.maximum_episode_steps):
                     request_id = f"{identity}-{step}"
                     sample = await asyncio.wait_for(
-                        serving.sample_for_evaluation(messages, scenario.tools, request_id),
+                        serving.sample_for_evaluation(
+                            messages,
+                            scenario.tools,
+                            request_id,
+                            max_tokens=limits.maximum_response_tokens,
+                        ),
                         timeout=operation_timeout_seconds,
                     )
                     _verify_sample(sample, revision)
@@ -209,18 +231,40 @@ async def collect_practice(
                         break
                 else:
                     reason = "step_limit"
+            except BaseException as error:
+                execution_error = error
+                raise
             finally:
-                evidence = await asyncio.wait_for(
-                    session.close(reason), timeout=operation_timeout_seconds
-                )
-                receipt = PracticeReceipt(
-                    episode=EnvironmentEpisode(
-                        scenario=scenario, steps=tuple(steps), end_reason=reason, evidence=evidence
-                    ),
-                    samples=tuple(samples),
-                    experiences=tuple(experiences),
-                )
-                write_text_atomic(directory / f"{identity}.json", receipt.model_dump_json() + "\n")
+                evidence: JsonObject
+                try:
+                    evidence = await asyncio.wait_for(
+                        session.close(reason), timeout=operation_timeout_seconds
+                    )
+                except BaseException as error:
+                    evidence = {
+                        "close_complete": False,
+                        "cleanup_failure_type": type(error).__name__,
+                        "execution_end_reason": reason,
+                    }
+                    if execution_error is not None:
+                        evidence["execution_failure_type"] = type(execution_error).__name__
+                    reason = "failed"
+                    if execution_error is None:
+                        raise
+                finally:
+                    receipt = PracticeReceipt(
+                        episode=EnvironmentEpisode(
+                            scenario=scenario,
+                            steps=tuple(steps),
+                            end_reason=reason,
+                            evidence=evidence,
+                        ),
+                        samples=tuple(samples),
+                        experiences=tuple(experiences),
+                    )
+                    write_text_atomic(
+                        directory / f"{identity}.json", receipt.model_dump_json() + "\n"
+                    )
             if len(examples) >= spec.max_batch_examples or tokens >= spec.max_batch_tokens:
                 break
         if len(examples) >= spec.max_batch_examples or tokens >= spec.max_batch_tokens:

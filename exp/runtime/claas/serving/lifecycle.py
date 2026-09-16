@@ -63,6 +63,8 @@ class VllmServingLifecycle:
         """Start paused until explicit wake and revision loading establish readiness."""
         if base.adapter_directory is not None:
             raise ValueError("base must identify the frozen model without an adapter")
+        if isinstance(max_tokens, bool) or not 1 <= max_tokens <= 131072:
+            raise ValueError("max_tokens must be between one and 131072")
         if not math.isfinite(drain_timeout_seconds) or not 0 < drain_timeout_seconds <= 3600:
             raise ValueError("drain timeout must be finite, positive, and at most one hour")
         self._client = client
@@ -205,10 +207,17 @@ class VllmServingLifecycle:
         return await self._sample(messages, tools, request_id, evaluation=False)
 
     async def sample_for_evaluation(
-        self, messages: tuple[ModelMessage, ...], tools: tuple[ToolSchema, ...], request_id: str
+        self,
+        messages: tuple[ModelMessage, ...],
+        tools: tuple[ToolSchema, ...],
+        request_id: str,
+        *,
+        max_tokens: int | None = None,
     ) -> PolicySample:
-        """Sample a loaded candidate while public admission remains closed."""
-        return await self._sample(messages, tools, request_id, evaluation=True)
+        """Sample a private candidate within both the caller and serving token caps."""
+        return await self._sample(
+            messages, tools, request_id, evaluation=True, max_tokens=max_tokens
+        )
 
     async def _sample(
         self,
@@ -217,15 +226,20 @@ class VllmServingLifecycle:
         request_id: str,
         *,
         evaluation: bool,
+        max_tokens: int | None = None,
     ) -> PolicySample:
         """Pin one revision until its complete sampling operation leaves the drain set."""
+        if max_tokens is not None and (
+            isinstance(max_tokens, bool) or not 1 <= max_tokens <= 131072
+        ):
+            raise ValueError("max_tokens must be between one and 131072")
         revision = await self._begin_request(evaluation=evaluation)
         try:
             sampler = VllmPolicySampler(
                 client=self._client,
                 revision=revision,
                 decoder=self._decoder,
-                max_tokens=self._max_tokens,
+                max_tokens=min(self._max_tokens, max_tokens or self._max_tokens),
             )
             return await sampler.sample(messages, tools, request_id)
         finally:

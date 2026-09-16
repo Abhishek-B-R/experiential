@@ -236,3 +236,54 @@ def test_pending_evaluation_blocks_preparation_before_partition_or_manifest_chan
         if path.name != "evaluation-holdouts.json"
     }
     assert after == before
+
+
+@pytest.mark.parametrize("filename", ["partitions.json", "evaluation.json"])
+@pytest.mark.parametrize("dangling", [False, True])
+def test_preparation_rejects_symlinked_owned_state(
+    tmp_path: Path, filename: str, dangling: bool
+) -> None:
+    """A linked ledger cannot disclose or overwrite a separate application's state."""
+    directory = tmp_path / "application"
+    directory.mkdir()
+    prepare_evidence(
+        directory=directory,
+        experiences=traffic(),
+        world_model=model_snapshot(),
+        judge_model=model_snapshot(),
+        minimum_tasks=1,
+    )
+    path = directory / filename
+    original = path.read_bytes()
+    target = tmp_path / "external.json"
+    path.unlink()
+    if not dangling:
+        target.write_bytes(original)
+    path.symlink_to(target)
+    with pytest.raises(ValueError, match="regular owned file"):
+        prepare_evidence(
+            directory=directory,
+            experiences=traffic(),
+            world_model=model_snapshot(),
+            judge_model=model_snapshot(),
+            minimum_tasks=1,
+        )
+    assert path.is_symlink()
+    assert not target.exists() if dangling else target.read_bytes() == original
+
+
+@pytest.mark.parametrize("filename", ["partitions.json", "evaluation.json"])
+def test_preparation_bounds_state_before_reading_json(tmp_path: Path, filename: str) -> None:
+    """An oversized sparse file is rejected before reading or attempting JSON validation."""
+    path = tmp_path / filename
+    with path.open("wb") as handle:
+        handle.truncate(64_000_001)
+    with pytest.raises(ValueError, match="64 MB bound"):
+        prepare_evidence(
+            directory=tmp_path,
+            experiences=traffic(),
+            world_model=model_snapshot(),
+            judge_model=model_snapshot(),
+            minimum_tasks=1,
+        )
+    assert path.stat().st_size == 64_000_001

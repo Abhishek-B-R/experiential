@@ -5,7 +5,7 @@ from typing import Literal
 
 from exp.common.claas import Experience
 from exp.common.core.artifacts import ContractModel, sha256_json
-from exp.common.core.files import write_text_atomic
+from exp.common.core.files import write_bytes_atomic
 from exp.common.models import ModelSnapshot
 from exp.optimize.workflows.traffic_learning.evaluation import (
     DEFAULT_RUBRIC,
@@ -18,6 +18,25 @@ from exp.simulation.claas.partition import (
     exclude_response_groups,
     split_experiences,
 )
+
+_MAXIMUM_STATE_BYTES = 64_000_000
+
+
+def _read_owned_state(path: Path, label: str) -> bytes | None:
+    """Reject linked, nonregular, or oversized state before parsing or replacing it."""
+    if path.is_symlink():
+        raise ValueError(f"{label} must be a regular owned file")
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise ValueError(f"{label} must be a regular owned file")
+    if path.stat().st_size > _MAXIMUM_STATE_BYTES:
+        raise ValueError(f"{label} exceeds its 64 MB bound")
+    with path.open("rb") as handle:
+        payload = handle.read(_MAXIMUM_STATE_BYTES + 1)
+    if len(payload) > _MAXIMUM_STATE_BYTES:
+        raise ValueError(f"{label} exceeds its 64 MB bound")
+    return payload
 
 
 class PartitionLedger(ContractModel):
@@ -45,27 +64,34 @@ def prepare_evidence(
     traffic when either stable partition is empty.
     """
     experiences = exclude_response_groups(experiences, load_evaluation_holdouts(directory))
-    path = directory / "evaluation.json"
-    if path.exists():
-        previous = EvaluationManifest.model_validate_json(path.read_bytes())
-        retained = {item.experience_id: sha256_json(item) for item in experiences}
-        if any(
-            retained.get(item.experience_id) != sha256_json(item)
-            for task in previous.tasks
-            for item in task.grounding
-        ):
-            # Retirement does not depend on having enough new traffic to replace the cohort.
-            path.unlink()
     seed = "claas-local-v1"
-    split = split_experiences(experiences, seed=seed)
     ledger_path = directory / "partitions.json"
+    ledger_payload = _read_owned_state(ledger_path, "partition ledger")
     ledger = (
-        PartitionLedger.model_validate_json(ledger_path.read_bytes())
-        if ledger_path.exists()
+        PartitionLedger.model_validate_json(ledger_payload)
+        if ledger_payload is not None
         else PartitionLedger(seed=seed, assignments={})
     )
     if ledger.seed != seed:
         raise ValueError("partition seed changed; initialize a new application")
+    path = directory / "evaluation.json"
+    evaluation_payload = _read_owned_state(path, "evaluation manifest")
+    previous_manifest = (
+        EvaluationManifest.model_validate_json(evaluation_payload)
+        if evaluation_payload is not None
+        else None
+    )
+    if previous_manifest is not None:
+        retained = {item.experience_id: sha256_json(item) for item in experiences}
+        if any(
+            retained.get(item.experience_id) != sha256_json(item)
+            for task in previous_manifest.tasks
+            for item in task.grounding
+        ):
+            # Retirement does not depend on having enough new traffic to replace the cohort.
+            path.unlink()
+            previous_manifest = None
+    split = split_experiences(experiences, seed=seed)
     assignments = dict(ledger.assignments)
     for name, sources in (("fit", split.fit), ("held_out", split.held_out)):
         for item in sources:
@@ -76,9 +102,9 @@ def prepare_evidence(
                     "use a new application for the corrected episode grouping"
                 )
             assignments[item.response_id] = "fit" if name == "fit" else "held_out"
-    save_manifest = not path.exists()
-    if path.exists():
-        manifest = EvaluationManifest.model_validate_json(path.read_bytes())
+    save_manifest = previous_manifest is None
+    if previous_manifest is not None:
+        manifest = previous_manifest
         if (
             manifest.scope != split.scope
             or manifest.world_model != world_model
@@ -98,9 +124,15 @@ def prepare_evidence(
             f"held-out evaluation has {len(manifest.tasks)} tasks; collect at least "
             f"{minimum_tasks} independently held-out workflows before training"
         )
-    write_text_atomic(
-        ledger_path, PartitionLedger(seed=seed, assignments=assignments).model_dump_json() + "\n"
-    )
+    ledger_payload = (
+        PartitionLedger(seed=seed, assignments=assignments).model_dump_json() + "\n"
+    ).encode()
+    evaluation_payload = (manifest.model_dump_json() + "\n").encode()
+    if len(ledger_payload) > _MAXIMUM_STATE_BYTES:
+        raise ValueError("partition ledger exceeds its 64 MB bound")
+    if len(evaluation_payload) > _MAXIMUM_STATE_BYTES:
+        raise ValueError("evaluation manifest exceeds its 64 MB bound")
+    write_bytes_atomic(ledger_path, ledger_payload, follow_symlinks=False)
     if save_manifest:
-        write_text_atomic(path, manifest.model_dump_json() + "\n")
+        write_bytes_atomic(path, evaluation_payload, follow_symlinks=False)
     return split, manifest

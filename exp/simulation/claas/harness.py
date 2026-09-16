@@ -390,11 +390,13 @@ class ClaasWorldSession(AbstractContextManager["ClaasWorldSession"]):
             maximum_output_tokens=self._world.limits.maximum_output_tokens,
         )
 
-    def end(self) -> WorldEpisode:
-        """Close once and return immutable episode evidence without further provider calls."""
+    def end(
+        self, *, reason: Literal["caller_ended", "limit", "error"] = "caller_ended"
+    ) -> WorldEpisode:
+        """Close with the caller's reason unless the world already recorded its final state."""
         with self._lock:
             if self._end_reason is None:
-                self._end_reason = "caller_ended"
+                self._end_reason = reason
             return WorldEpisode(
                 scenario=self.scenario,
                 steps=tuple(self._steps),
