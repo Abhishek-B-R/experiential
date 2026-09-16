@@ -107,14 +107,21 @@ fn encrypted_reasoning_verdict(document: &Value) -> bool {
     let Some(envelope) = openai_family_envelope(document) else {
         return false;
     };
-    envelope.code.as_deref() == Some(INVALID_ENCRYPTED_CONTENT_CODE)
-        || envelope
-            .message
-            .is_some_and(names_refused_encrypted_content)
+    refuses_encrypted_reasoning(envelope.code.as_deref(), envelope.message)
         || envelope
             .error_object
             .and_then(relayed_upstream_document)
             .is_some_and(|upstream| encrypted_reasoning_verdict(&upstream))
+}
+
+/// Whether one provider error, as its code token and sentence, refuses
+/// replayed encrypted reasoning. Shared by the pre-stream body predicate and
+/// the in-stream `response.failed` classification: OpenRouter's Responses
+/// relay answers 200 and then fails the stream with OpenAI's sentence under
+/// the code `invalid_prompt`, so the sentence decides there as well.
+pub(crate) fn refuses_encrypted_reasoning(code: Option<&str>, message: Option<&str>) -> bool {
+    code == Some(INVALID_ENCRYPTED_CONTENT_CODE)
+        || message.is_some_and(names_refused_encrypted_content)
 }
 
 /// Whether one provider sentence is OpenAI's refusal of an encrypted payload.
@@ -484,6 +491,25 @@ mod tests {
             Dialect::OpenAiResponses,
             "not json"
         ));
+    }
+
+    #[test]
+    fn the_shared_predicate_reads_the_code_or_the_sentence() {
+        // OpenRouter's Responses relay fails the stream under `invalid_prompt`
+        // with OpenAI's sentence (live, gpt-5.6-sol, 2026-09-16 00:25Z).
+        assert!(refuses_encrypted_reasoning(
+            Some("invalid_prompt"),
+            Some("The encrypted content rsn_...Ypi9 could not be verified. Reason: Encrypted content could not be decrypted or parsed.")
+        ));
+        assert!(refuses_encrypted_reasoning(
+            Some("invalid_encrypted_content"),
+            None
+        ));
+        assert!(!refuses_encrypted_reasoning(
+            Some("invalid_prompt"),
+            Some("Invalid prompt: we've limited access to this content.")
+        ));
+        assert!(!refuses_encrypted_reasoning(None, None));
     }
 
     #[test]

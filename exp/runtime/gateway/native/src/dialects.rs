@@ -221,7 +221,13 @@ impl Normalizer {
             log_provider_declared_failure(dialect, detail);
         }
         let kind = crate::stream_errors::classify_stream_error(code, message);
+        // A Responses relay that refuses replayed encrypted reasoning INSIDE
+        // the stream (200, then `response.failed`) carries the same repair
+        // mark as the pre-stream 4xx, so the waterfall can strip and re-dial.
+        let encrypted_reasoning_rejected = dialect == "openai_responses"
+            && crate::rejection_shapes::refuses_encrypted_reasoning(code, message);
         crate::stream_errors::stream_failure(kind, detail)
+            .with_encrypted_reasoning_rejected(encrypted_reasoning_rejected)
     }
 }
 
