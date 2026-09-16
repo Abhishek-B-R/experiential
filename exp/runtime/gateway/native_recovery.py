@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import logging
+
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.affinity import affinity_fingerprint, affinity_seed_material
 from exp.runtime.gateway.contracts import (
     GatewayFailure,
-    GatewayFailureClass,
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.gateway.health import health_failure_cause
 from exp.runtime.gateway.native_execution import InflightRequest
 from exp.runtime.gateway.recovery import (
     RecoveryCause,
@@ -18,6 +20,8 @@ from exp.runtime.gateway.recovery import (
     SessionRecoveryRegistry,
 )
 from exp.runtime.gateway.replay_identity import canonical_request_sha256
+
+_logger = logging.getLogger(__name__)
 
 
 def recovery_prefix_digest(request: GatewayRequest) -> str | None:
@@ -92,10 +96,31 @@ def record_departure(
     deployment: ExactModelDeployment,
     cause: RecoveryCause,
     retry_after_seconds: float = 0,
-) -> None:
-    """Record a departure reason without implying dispatch warmed a cache."""
-    key = session_cache_key(entry)
-    if key is not None:
+    *,
+    key: SessionCacheKey | None = None,
+) -> bool:
+    """Record an optional departure without implying dispatch warmed a cache.
+
+    Args:
+        registry: Worker-local recovery history.
+        host: Optional scope authority. None disables observation entirely.
+        entry: Owning request with authorized tenant and stable prefix input.
+        deployment: Actual deployment being left.
+        cause: Health failure or local admission reason for leaving.
+        retry_after_seconds: Provider backoff that bounds the next recovery trial.
+        key: Already derived session key, avoiding repeat hashing at settlement.
+
+    Returns:
+        Whether the departure was recorded. Invalid scopes and observer failures
+        record nothing and emit only a content-free diagnostic.
+    """
+    if host is None:
+        return False
+    try:
+        if key is None:
+            key = session_cache_key(entry)
+        if key is None:
+            return False
         registry.depart(
             key,
             deployment.deployment_id,
@@ -103,6 +128,10 @@ def record_departure(
             cause,
             retry_after_seconds=retry_after_seconds,
         )
+    except Exception:  # noqa: BLE001 - optional observation cannot fail admission or settlement.
+        _logger.warning("Session recovery departure observation skipped")
+        return False
+    return True
 
 
 def record_session_outcome(
@@ -113,43 +142,67 @@ def record_session_outcome(
     usage: GatewayUsage | None,
     failure: GatewayFailure | None,
 ) -> None:
-    """Record each settled outcome once, separate from aggregate fairness samples."""
-    depth = entry.attempt_depths.get(attempt_id)
-    key = session_cache_key(entry)
-    if depth is None or key is None or attempt_id in entry.recovery_recorded_attempts:
+    """Observe settled recovery evidence without affecting durable accounting.
+
+    Both direct and swept settlements call this after the terminal write lands.
+    Unconfigured hosts, repeated observations, unknown attempts and irrelevant
+    outcomes return before hashing request input. Health-affecting failures record
+    their shared circuit classification as a departure. Successful provider usage
+    can establish bounded cache evidence; only the actual stage's affinity policy
+    may also retain placement. Aggregate fairness sampling is independent.
+
+    Scope validation must succeed before any history is written. Optional observer
+    errors are logged without exception details and cannot prevent finalization.
+    An attempt is marked observed only after the registry call succeeds, allowing
+    a later delivery to retry failed observation without duplicating completed work.
+
+    Args:
+        registry: Worker-local, tenant-scoped recovery history.
+        host: Optional authority for endpoint, model and credential scope.
+        entry: Request and frozen route that own the settled attempt.
+        attempt_id: Durable attempt identifier with a recorded route depth.
+        usage: Provider-reported terminal usage, or None when unavailable.
+        failure: Normalized terminal failure, or None for successful completion.
+    """
+    if host is None or attempt_id in entry.recovery_recorded_attempts:
         return
-    entry.recovery_recorded_attempts.add(attempt_id)
-    deployment = entry.route.deployments[depth]
-    if failure is not None:
-        causes: dict[GatewayFailureClass, RecoveryCause] = {
-            GatewayFailureClass.THROTTLED: "throttle",
-            GatewayFailureClass.PROVIDER_AUTHENTICATION: "credential",
-            GatewayFailureClass.PROVIDER_QUOTA: "credential",
-            GatewayFailureClass.PROVIDER_NOT_FOUND: "credential",
-            GatewayFailureClass.TRANSPORT: "transport",
-            GatewayFailureClass.TIMEOUT: "transport",
-            GatewayFailureClass.PROVIDER_INTERNAL: "transport",
-        }
-        cause = causes.get(failure.failure_class)
-        if cause is not None:
-            record_departure(
+    depth = entry.attempt_depths.get(attempt_id)
+    if depth is None:
+        return
+    cause = None if failure is None else health_failure_cause(failure.failure_class)
+    if (failure is not None and cause is None) or (failure is None and usage is None):
+        return
+    try:
+        key = session_cache_key(entry)
+        if key is None:
+            return
+        deployment = entry.route.deployments[depth]
+        if failure is not None and cause is not None:
+            if not record_departure(
                 registry,
                 host,
                 entry,
                 deployment,
                 cause,
                 retry_after_seconds=float(failure.retry_after_seconds or 0),
+                key=key,
+            ):
+                return
+        elif usage is not None:
+            dispatch = deployment.gateway.dispatch
+            stage = entry.route.snapshot.stage_for_depth(depth)
+            registry.record_success(
+                key,
+                deployment.deployment_id,
+                registry.scope(deployment, entry.authorization.organization_id, host),
+                cached_tokens=usage.cached_input_tokens or 0,
+                cache_write_tokens=usage.cache_creation_input_tokens or 0,
+                retention_seconds=deployment.gateway.cache_retention_seconds,
+                sticky_seconds=dispatch.sticky_spill_seconds
+                if dispatch is not None and stage.failover_mode == "maximize_cache_affinity"
+                else None,
             )
+    except Exception:  # noqa: BLE001 - optional observation cannot fail durable settlement.
+        _logger.warning("Session recovery outcome observation skipped")
         return
-    if usage is None:
-        return
-    dispatch = deployment.gateway.dispatch
-    registry.record_success(
-        key,
-        deployment.deployment_id,
-        registry.scope(deployment, entry.authorization.organization_id, host),
-        cached_tokens=usage.cached_input_tokens or 0,
-        cache_write_tokens=usage.cache_creation_input_tokens or 0,
-        retention_seconds=deployment.gateway.cache_retention_seconds,
-        sticky_seconds=None if dispatch is None else dispatch.sticky_spill_seconds,
-    )
+    entry.recovery_recorded_attempts.add(attempt_id)

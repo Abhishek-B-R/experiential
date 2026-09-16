@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from exp.runtime.gateway.affinity import (
     affinity_fingerprint,
     affinity_seed_material,
@@ -52,11 +54,12 @@ def stage_affinity_ordered_rungs(
             request_id=authorization.request_id,
         ),
     )
+    placement = AffinityPlacement(fingerprint=fingerprint, recovery_scoped=True)
     if route.reasoning_pinned_deployment_id is not None and any(
         deployment.deployment_id == route.reasoning_pinned_deployment_id
         for deployment in route.deployments
     ):
-        return route, wires, AffinityPlacement(fingerprint=fingerprint)
+        return route, wires, placement
     order: list[int] = []
     offset = 0
     stages = route.snapshot.model_stages or (route.snapshot.stage_for_depth(0),)
@@ -85,18 +88,38 @@ def stage_affinity_ordered_rungs(
         offset += len(stage.deployment_ids)
     route = reorder_route_deployments(route, tuple(order))
     wires = tuple(wires[i] for i in order)
-    registry = accounting.recovery
     host = accounting.recovery_host
     # Without an explicit credential scope there is no reliable cache-sharing
     # identity. Missing host data means normal bounded routing, not guessed warmth.
+    if host is None:
+        return route, wires, placement
+    # Sticky placement is exclusive to affinity stages. A descendant may not
+    # skip an earlier availability/cache stage or an unauthorized model boundary.
+    recovery_depth = 0
+    for depth in range(len(route.deployments)):
+        stage = route.snapshot.stage_for_depth(depth)
+        if stage.failover_mode != "maximize_cache_affinity" or (
+            stage.exact_model_id != route.snapshot.exact_model_id
+            and not authorization.descendant_start_authorized
+        ):
+            break
+        recovery_depth += 1
+    if not recovery_depth:
+        return route, wires, placement
     prefix = recovery_prefix_digest(request)
-    if host is None or prefix is None:
-        return route, wires, AffinityPlacement(fingerprint=fingerprint)
+    if prefix is None:
+        return route, wires, placement
+    key = SessionCacheKey(
+        authorization.organization_id, authorization.identity_id, fingerprint, prefix
+    )
+    registry = accounting.recovery
+    if not registry.has_retained_history(key):
+        return route, wires, placement
     candidates = tuple(
         (d.deployment_id, registry.scope(d, authorization.organization_id, host))
-        for d in route.deployments
+        for d in route.deployments[:recovery_depth]
     )
-    by_id = {d.deployment_id: d for d in route.deployments}
+    by_id = {d.deployment_id: d for d in route.deployments[:recovery_depth]}
 
     def eligible(deployment_id: str) -> bool:
         """Require current graph membership and unsuppressed actual deployment health."""
@@ -104,7 +127,17 @@ def stage_affinity_ordered_rungs(
             deployment_health_key(authorization, by_id[deployment_id])
         )
 
-    input_tokens = worst_case_input_tokens(request)
+    # Only token-window headroom needs BPE. Compute once outside the recovery
+    # lock, never lazily from the callback choose invokes under that lock.
+    input_tokens = (
+        worst_case_input_tokens(request)
+        if any(
+            d.gateway.dispatch is not None and d.gateway.dispatch.tokens_per_minute is not None
+            for d in by_id.values()
+        )
+        and registry.has_retained_history(key, live_only=True)
+        else None
+    )
 
     def headroom(deployment_id: str) -> bool:
         """Require actual local concurrency, rate and fair-share headroom for a trial."""
@@ -112,6 +145,13 @@ def stage_affinity_ordered_rungs(
         policy = deployment.gateway.dispatch
         if policy is None:
             return True
+        reserved_tokens = 0
+        if policy.tokens_per_minute is not None:
+            # History can arrive after the preflight. Defer its elective trial
+            # rather than checking a token window with an underestimated prompt.
+            if input_tokens is None:
+                return False
+            reserved_tokens = input_tokens + worst_case_output_tokens(request, deployment)
         return accounting.loads.can_admit(
             (deployment.deployment_id, deployment.connection_sha256),
             organization_id=authorization.organization_id,
@@ -121,16 +161,12 @@ def stage_affinity_ordered_rungs(
             requests_per_minute=policy.requests_per_minute,
             tokens_per_minute=policy.tokens_per_minute,
             cache_priority_alpha=policy.cache_priority_alpha,
-            reserved_tokens=input_tokens + worst_case_output_tokens(request, deployment),
+            reserved_tokens=reserved_tokens,
         )
 
+    decision_started = time.monotonic()
     decision = registry.choose(
-        SessionCacheKey(
-            authorization.organization_id,
-            authorization.identity_id,
-            fingerprint,
-            prefix,
-        ),
+        key,
         candidates,
         eligible=eligible,
         snapshot=host.snapshot(),
@@ -140,13 +176,6 @@ def stage_affinity_ordered_rungs(
         start = next(
             i for i, d in enumerate(route.deployments) if d.deployment_id == decision.deployment_id
         )
-        if (
-            start
-            and route.snapshot.stage_for_depth(start).exact_model_id
-            != route.snapshot.exact_model_id
-            and not authorization.descendant_start_authorized
-        ):
-            return route, wires, AffinityPlacement(fingerprint=fingerprint)
         if start:
             indexes = tuple(range(start, len(route.deployments)))
             route = select_route_deployments(route, indexes)
@@ -161,5 +190,8 @@ def stage_affinity_ordered_rungs(
             sticky_deployment_id=decision.deployment_id
             if decision.reason == "retained_warm_fallback"
             else None,
+            verified_warm_deployment_id=decision.deployment_id,
+            verified_warm_until_monotonic=decision_started + decision.warm_remaining_seconds,
+            recovery_scoped=True,
         ),
     )

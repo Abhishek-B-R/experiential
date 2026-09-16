@@ -150,7 +150,22 @@ def expand_model_chain(
     cursor = 0
 
     def visit(model_id: str, ancestry: tuple[str, ...], position: int | None) -> None:
-        """Visit one canonical model once and preserve its forward parent suffix."""
+        """Append a model's depth-first segments without revisiting canonical IDs.
+
+        Mutate the shared visited list, cursor, examined-rung count, segments, and
+        events. A repeated model emits a skip event; an unavailable model emits its
+        entry and unavailability events but contributes no deployments. References
+        split direct segments so the parent's remaining suffix stays after the child.
+
+        Args:
+            model_id: Canonical model to enter in the authorized chain map.
+            ancestry: Parent path, excluding this model.
+            position: Reference's position in its parent, or None for the root.
+
+        Raises:
+            ModelChainConfigurationError: A chain is missing or mismatched, or the
+                traversal exceeds the independent model or examined-rung limit.
+        """
         nonlocal examined, cursor
         if model_id in visited:
             events.append(

@@ -1,8 +1,15 @@
 """Native admission consumes session evidence while respecting stage and host gates."""
 
+import json
+import time
+from dataclasses import dataclass, replace
+from typing import Literal
+
 import pytest
 
-from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.models.catalog import GatewayRungDispatchPolicy
+from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
+from exp.runtime.gateway import native_stage_admission
 from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest, GatewayUsage
 from exp.runtime.gateway.model_plan import model_execution_snapshot
 from exp.runtime.gateway.model_plan_test import catalog
@@ -13,18 +20,30 @@ from exp.runtime.gateway.native_admission import (
     _prefer_cache_capable_rungs,
 )
 from exp.runtime.gateway.native_admission_test import _affinity_fixture, _marked_request
-from exp.runtime.gateway.native_execution import InflightRequest, select_route_deployments
+from exp.runtime.gateway.native_execution import (
+    InflightRequest,
+    rung_load_key,
+    select_route_deployments,
+)
 from exp.runtime.gateway.native_execution_test import _route
 from exp.runtime.gateway.native_recovery import record_session_outcome, session_cache_key
 from exp.runtime.gateway.native_stage_admission import stage_affinity_ordered_rungs
-from exp.runtime.gateway.recovery import RecoveryScope, RecoverySnapshot, SessionRecoveryRegistry
+from exp.runtime.gateway.recovery import (
+    RecoveryScope,
+    RecoverySnapshot,
+    SessionCacheKey,
+    SessionRecoveryRegistry,
+)
 from exp.runtime.gateway.recovery_test import Clock
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models.providers.base import GatewayWireProfile
 
 
+@dataclass
 class Host:
     """In-memory immutable observation host with explicit credential identity."""
+
+    credential: str = "credential"
 
     def scope_for(self, deployment: ExactModelDeployment, organization_id: str) -> RecoveryScope:
         """Freeze a known credential scope per destination model."""
@@ -33,7 +52,7 @@ class Host:
             exact_model_id=deployment.exact_model_id,
             endpoint_scope=deployment.connection_sha256,
             region_scope="region",
-            credential_scope="credential",
+            credential_scope=self.credential,
             organization_id=organization_id,
         )
 
@@ -154,3 +173,400 @@ def test_live_reasoning_pin_precedes_stage_cache_and_recovery_ordering(
     if has_stages:
         assert admitted.snapshot.exact_model_id == "root"
         assert all(s.ancestry == ("root", "child") for s in admitted.snapshot.model_stages)
+
+
+@pytest.mark.parametrize("trial", [False, True], ids=["retained", "trial"])
+@pytest.mark.parametrize(
+    "isolation",
+    ["same", "organization", "identity", "prefix", "credential", "no_host"],
+)
+def test_verified_session_warmth_survives_capacity_admission_without_scope_leaks(
+    trial: bool,
+    isolation: Literal["same", "organization", "identity", "prefix", "credential", "no_host"],
+) -> None:
+    """A retained or trial warm lane bypasses only the fresh threshold for its exact scope."""
+    route, wires = _affinity_fixture()
+    dispatch = GatewayRungDispatchPolicy(
+        concurrency_bound=4, fresh_session_spill_fraction=0.5, sticky_spill_seconds=60
+    )
+    deployments = tuple(
+        d.model_copy(update={"gateway": d.gateway.model_copy(update={"dispatch": dispatch})})
+        for d in route.deployments
+    )
+    route = route.model_copy(
+        update={
+            "deployment": deployments[0],
+            "fallback_deployments": deployments[1:],
+            "snapshot": route.snapshot.model_copy(
+                update={"model_stages": (route.snapshot.stage_for_depth(0),)}
+            ),
+        }
+    )
+    request = GatewayRequest(
+        surface=route.snapshot.authorization.surface,
+        messages=(
+            GatewayMessage(role="system", content="stable prefix"),
+            GatewayMessage(role="user", content="turn"),
+        ),
+        prompt_cache_key="session",
+        provider_prompt_cache_key="xpl-session",
+    )
+    host = Host()
+    clock = Clock()
+    accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=host)
+    accounting.recovery = SessionRecoveryRegistry(clock=clock)
+    authorization = route.snapshot.authorization
+    ordered, _, _ = stage_affinity_ordered_rungs(
+        route,
+        wires,
+        request,
+        accounting=accounting,
+        authorization=authorization,
+        continuation=None,
+    )
+    original = InflightRequest(authorization, ordered, request, time.monotonic() + 30)
+    key = session_cache_key(original)
+    assert key is not None
+    lead, fallback, _last = ordered.deployments
+    for deployment in (lead, fallback) if trial else (fallback,):
+        accounting.recovery.record_success(
+            key,
+            deployment.deployment_id,
+            host.scope_for(deployment, authorization.organization_id),
+            cached_tokens=80,
+            cache_write_tokens=0,
+            retention_seconds=100,
+            sticky_seconds=60,
+        )
+    if trial:
+        accounting.recovery.depart(
+            key,
+            lead.deployment_id,
+            host.scope_for(lead, authorization.organization_id),
+            "local_capacity",
+        )
+        clock.now += 6
+    warm_id = (lead if trial else fallback).deployment_id
+    if isolation in ("organization", "identity"):
+        authorization = authorization.model_copy(update={f"{isolation}_id": "different"})
+    elif isolation == "prefix":
+        request = request.model_copy(
+            update={"messages": (GatewayMessage(role="system", content="changed"),)}
+        )
+    elif isolation == "credential":
+        host.credential = "rotated"
+    elif isolation == "no_host":
+        accounting.recovery_host = None
+
+    # The warm lane is at the fresh threshold, with a cold C still available.
+    # Isolated requests fill every lane to expose any stale sticky bypass.
+    # Same-fingerprint sticky data must not confer scoped cache standing.
+    occupied = ordered.deployments[:2] if isolation == "same" else route.deployments
+    for deployment in occupied:
+        for _ in range(2):
+            assert isinstance(
+                accounting.loads.reserve(
+                    rung_load_key(deployment),
+                    organization_id=authorization.organization_id,
+                    weight=1,
+                    bound=4,
+                    fair_share=False,
+                ),
+                str,
+            )
+    changed = replace(original, authorization=authorization, request=request)
+    changed_key = session_cache_key(changed)
+    assert changed_key is not None
+    accounting.sticky.bind(changed_key.fingerprint, warm_id, ttl_seconds=60)
+    admitted, _, placement = stage_affinity_ordered_rungs(
+        route,
+        wires,
+        request,
+        accounting=accounting,
+        authorization=authorization,
+        continuation=None,
+    )
+    assert placement.recovery_scoped
+    assert placement.verified_warm_deployment_id == (warm_id if isolation == "same" else None)
+    assert accounting.sticky.size() == 1
+    accounting.sticky.clear(changed_key.fingerprint)
+    entry = InflightRequest(
+        authorization,
+        admitted,
+        request,
+        time.monotonic() + 30,
+        affinity_fingerprint=placement.fingerprint,
+        verified_warm_deployment_id=placement.verified_warm_deployment_id,
+        verified_warm_until_monotonic=placement.verified_warm_until_monotonic,
+        recovery_scoped=placement.recovery_scoped,
+        recovery_reason=placement.recovery_reason,
+    )
+    # A populated ordinary binding is deliberately present for isolated requests.
+    if isolation != "same":
+        accounting.sticky.bind(changed_key.fingerprint, warm_id, ttl_seconds=60)
+    accounting.register(entry)
+    started = json.loads(
+        accounting.start_attempt(
+            json.dumps({"request_id": authorization.request_id, "attempt_ordinal": 0})
+        )
+    )
+    selected = admitted.deployments[started["route_depth"]]
+    if isolation == "same":
+        assert selected.deployment_id == warm_id
+        assert accounting.rung_rate_counters() == (0, 0)
+        assert accounting.sticky.size() == 0
+    else:
+        # Every cold lane sheds, so the bounded emergency overflow is the only
+        # admission. A stale sticky binding must not silently admit any lane.
+        assert accounting.rung_rate_counters() == (0, 3)
+        assert entry.overflow_used
+
+
+@pytest.mark.parametrize("non_affinity", ["maximize_availability", "maximize_cache"])
+@pytest.mark.parametrize("barrier", [0, 1, 2, None])
+def test_recovery_cannot_cross_current_non_affinity_stage(
+    non_affinity: FailoverMode,
+    barrier: int | None,
+) -> None:
+    """Stale affinity history cannot skip or retain a currently non-affinity model stage."""
+    route, wires = _affinity_fixture()
+    deployments = tuple(
+        d.model_copy(update={"exact_model_id": f"model-{depth}"})
+        for depth, d in enumerate(route.deployments)
+    )
+    stages = tuple(
+        route.snapshot.stage_for_depth(0).model_copy(
+            update={
+                "stage_index": depth,
+                "exact_model_id": d.exact_model_id,
+                "deployment_ids": (d.deployment_id,),
+                "ancestry": tuple(f"model-{i}" for i in range(depth + 1)),
+                "failover_mode": non_affinity if depth == barrier else "maximize_cache_affinity",
+            }
+        )
+        for depth, d in enumerate(deployments)
+    )
+    authorization = route.snapshot.authorization.model_copy(
+        update={"descendant_start_authorized": True}
+    )
+    route = route.model_copy(
+        update={
+            "deployment": deployments[0],
+            "fallback_deployments": deployments[1:],
+            "snapshot": route.snapshot.model_copy(
+                update={
+                    "authorization": authorization,
+                    "exact_model_id": "model-0",
+                    "model_stages": stages,
+                }
+            ),
+        }
+    )
+    request = GatewayRequest(
+        surface=authorization.surface,
+        messages=(GatewayMessage(role="user", content="prefix"),),
+        prompt_cache_key="session",
+        provider_prompt_cache_key="xpl-session",
+    )
+    host = Host()
+    accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=host)
+    key = session_cache_key(InflightRequest(authorization, route, request, 10))
+    assert key is not None
+    retained = deployments[-1]
+    accounting.recovery.record_success(
+        key,
+        retained.deployment_id,
+        host.scope_for(retained, authorization.organization_id),
+        cached_tokens=80,
+        cache_write_tokens=0,
+        retention_seconds=100,
+        sticky_seconds=60,
+    )
+    admitted, _, placement = stage_affinity_ordered_rungs(
+        route,
+        wires,
+        request,
+        accounting=accounting,
+        authorization=authorization,
+        continuation=None,
+    )
+    if barrier is None:
+        assert admitted.deployments == (retained,)
+        assert placement.verified_warm_deployment_id == retained.deployment_id
+    else:
+        assert admitted is route
+        assert placement.verified_warm_deployment_id is None
+        assert not placement.sticky_preferred
+
+
+@pytest.mark.parametrize("has_stages", [False, True])
+@pytest.mark.parametrize("mode", ["maximize_availability", "maximize_cache"])
+def test_recovery_ignores_stale_affinity_history_after_mode_change(
+    has_stages: bool, mode: FailoverMode
+) -> None:
+    """A current direct or staged non-affinity pool keeps its authored leading deployment."""
+    route, wires = _affinity_fixture(mode)
+    if has_stages:
+        route = route.model_copy(
+            update={
+                "snapshot": route.snapshot.model_copy(
+                    update={"model_stages": (route.snapshot.stage_for_depth(0),)}
+                )
+            }
+        )
+    authorization = route.snapshot.authorization
+    request = GatewayRequest(
+        surface=authorization.surface,
+        messages=(GatewayMessage(role="user", content="prefix"),),
+        prompt_cache_key="session",
+        provider_prompt_cache_key="xpl-session",
+    )
+    host = Host()
+    accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=host)
+    key = session_cache_key(InflightRequest(authorization, route, request, 10))
+    assert key is not None
+    retained = route.deployments[1]
+    accounting.recovery.record_success(
+        key,
+        retained.deployment_id,
+        host.scope_for(retained, authorization.organization_id),
+        cached_tokens=80,
+        cache_write_tokens=0,
+        retention_seconds=100,
+        sticky_seconds=60,
+    )
+    admitted, _, placement = _affinity_ordered_rungs(
+        route,
+        wires,
+        request,
+        accounting=accounting,
+        authorization=authorization,
+        continuation=None,
+    )
+    assert admitted is route
+    assert placement.verified_warm_deployment_id is None
+    assert not placement.sticky_preferred
+
+
+@pytest.mark.parametrize("history", ["empty", "live", "expired", "renewed"])
+@pytest.mark.parametrize("with_token_window", [False, True])
+def test_recovery_tokenizes_only_retained_history_with_token_headroom_policy(
+    history: Literal["empty", "live", "expired", "renewed"],
+    with_token_window: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """New sessions and policy-free history avoid BPE; token-window trials get one estimate."""
+    route, wires = _affinity_fixture()
+    dispatch = (
+        GatewayRungDispatchPolicy(tokens_per_minute=100, sticky_spill_seconds=60)
+        if with_token_window
+        else None
+    )
+    deployments = tuple(
+        d.model_copy(update={"gateway": d.gateway.model_copy(update={"dispatch": dispatch})})
+        for d in route.deployments
+    )
+    route = route.model_copy(
+        update={"deployment": deployments[0], "fallback_deployments": deployments[1:]}
+    )
+    authorization = route.snapshot.authorization
+    request = GatewayRequest(
+        surface=authorization.surface,
+        messages=(GatewayMessage(role="user", content="large prefix" * 1000),),
+        prompt_cache_key="session",
+        provider_prompt_cache_key="xpl-session",
+    )
+    host = Host()
+    clock = Clock()
+    accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=host)
+    accounting.recovery = SessionRecoveryRegistry(clock=clock)
+    ordered, _, _ = stage_affinity_ordered_rungs(
+        route, wires, request, accounting=accounting, authorization=authorization, continuation=None
+    )
+    key = session_cache_key(InflightRequest(authorization, ordered, request, 10))
+    assert key is not None
+    lead, retained, _last = ordered.deployments
+    if history != "empty":
+        for deployment in (lead, retained):
+            accounting.recovery.record_success(
+                key,
+                deployment.deployment_id,
+                host.scope_for(deployment, authorization.organization_id),
+                cached_tokens=80,
+                cache_write_tokens=0,
+                retention_seconds=100,
+                sticky_seconds=60,
+            )
+        accounting.recovery.depart(
+            key,
+            lead.deployment_id,
+            host.scope_for(lead, authorization.organization_id),
+            "local_capacity",
+        )
+        clock.now += 61 if history in ("expired", "renewed") else 6
+    calls: list[GatewayRequest] = []
+    if history == "renewed":
+        original_preflight = accounting.recovery.has_retained_history
+
+        def concurrent_renewal(key: SessionCacheKey, *, live_only: bool = False) -> bool:
+            """Renew a retained cursor immediately after the expired live preflight."""
+            result = original_preflight(key, live_only=live_only)
+            if live_only:
+                accounting.recovery.record_success(
+                    key,
+                    retained.deployment_id,
+                    host.scope_for(retained, authorization.organization_id),
+                    cached_tokens=80,
+                    cache_write_tokens=0,
+                    retention_seconds=100,
+                    sticky_seconds=60,
+                )
+            return result
+
+        monkeypatch.setattr(accounting.recovery, "has_retained_history", concurrent_renewal)
+
+    def estimate(value: GatewayRequest) -> int:
+        """Prove estimation happens outside the non-reentrant registry lock."""
+        assert accounting.recovery.has_retained_history(key)
+        calls.append(value)
+        return 50
+
+    monkeypatch.setattr(native_stage_admission, "worst_case_input_tokens", estimate)
+    _, _, placement = stage_affinity_ordered_rungs(
+        route, wires, request, accounting=accounting, authorization=authorization, continuation=None
+    )
+    assert len(calls) == int(history == "live" and with_token_window)
+    expected = {
+        "empty": None,
+        "live": "recovered_preferred_route",
+        "expired": "cache_expired",
+        "renewed": "retained_warm_fallback" if with_token_window else "cache_expired",
+    }
+    assert placement.recovery_reason == expected[history]
+
+
+def test_no_recovery_host_skips_prefix_digest(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A no-host route still schedules affinity without hashing an unused recovery prefix."""
+    route, wires = _affinity_fixture()
+    request = GatewayRequest(
+        surface=route.snapshot.authorization.surface,
+        messages=(GatewayMessage(role="user", content="prefix"),),
+    )
+    accounting = NativeAttemptAccounting(_RecordingLedger())
+
+    def unexpected_prefix(_request: GatewayRequest) -> str | None:
+        """Reject recovery-specific work when no host can establish credential scope."""
+        pytest.fail("no-host admission hashed the recovery prefix")
+
+    monkeypatch.setattr(native_stage_admission, "recovery_prefix_digest", unexpected_prefix)
+    admitted, _, placement = stage_affinity_ordered_rungs(
+        route,
+        wires,
+        request,
+        accounting=accounting,
+        authorization=route.snapshot.authorization,
+        continuation=None,
+    )
+    assert set(admitted.snapshot.deployment_ids) == set(route.snapshot.deployment_ids)
+    assert placement.fingerprint is not None
+    assert placement.verified_warm_deployment_id is None

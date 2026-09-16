@@ -56,6 +56,8 @@ from exp.runtime.gateway.native_bridge import (
 )
 from exp.runtime.gateway.native_bridge_errors import capability_param as _public_capability_param
 from exp.runtime.gateway.native_components import NativeGatewayComponents
+from exp.runtime.gateway.native_recovery import session_cache_key
+from exp.runtime.gateway.native_stage_admission_test import Host
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.instruction_turns import (
@@ -5740,6 +5742,58 @@ def test_affinity_pool_routes_each_session_deterministically(tmp_path: Path) -> 
             (str(started["attempt_id"]),),
         ).fetchone()
     assert row == ("affinity", None)
+
+
+@pytest.mark.parametrize("trial", [False, True], ids=["retained", "trial"])
+def test_bridge_carries_scoped_verified_warmth_to_registered_request(
+    tmp_path: Path, trial: bool
+) -> None:
+    """Real offline admission preserves retained/trial evidence without populating sticky state."""
+    control, raw_key, _database = _affinity_pool_control_plane(tmp_path)
+    accounting = control._accounting  # noqa: SLF001 - inspect the native reservation boundary.
+    host = Host()
+    accounting.recovery_host = host
+    body = _chat_body()
+    initial = _admit(control, raw_key, body, client_request_id="warm-session")
+    original = accounting.entry(str(initial["request_id"]))
+    assert original is not None
+    key = session_cache_key(original)
+    assert key is not None
+    lead, fallback = original.route.deployments
+    for deployment in (lead, fallback) if trial else (fallback,):
+        accounting.recovery.record_success(
+            key,
+            deployment.deployment_id,
+            host.scope_for(deployment, original.authorization.organization_id),
+            cached_tokens=80,
+            cache_write_tokens=0,
+            retention_seconds=100,
+            sticky_seconds=60,
+        )
+    if trial:
+        accounting.recovery.depart(
+            key,
+            lead.deployment_id,
+            host.scope_for(lead, original.authorization.organization_id),
+            "local_capacity",
+            retry_after_seconds=0,
+        )
+        # Expire only the registry's local trial cooldown, not cache evidence.
+        accounting.recovery._clock = lambda: time.time() + 6  # noqa: SLF001
+    admission = _admit(control, raw_key, body, client_request_id="warm-session")
+    entry = accounting.entry(str(admission["request_id"]))
+    assert entry is not None and entry.recovery_scoped
+    expected = lead if trial else fallback
+    assert entry.route.deployment == expected
+    assert entry.verified_warm_deployment_id == expected.deployment_id
+    assert time.monotonic() < entry.verified_warm_until_monotonic
+    assert entry.recovery_reason == (
+        "recovered_preferred_route" if trial else "retained_warm_fallback"
+    )
+    assert accounting.sticky.size() == 0
+    started = _start_first(control, admission)
+    assert started["route_depth"] == 0
+    assert accounting.sticky.size() == 0
 
 
 def test_foundry_deepseek_zero_argument_call_with_a_stray_empty_string_delta_completes() -> None:

@@ -21,6 +21,7 @@ from exp.common.models.content import (
     VideoContentPart,
 )
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
+from exp.common.models.gateway_chains import ModelExecutionStage
 from exp.common.models.model import ModelCapabilities
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -47,6 +48,7 @@ from exp.runtime.gateway.native_admission import (
 from exp.runtime.gateway.native_dispatch import NativeWireClient
 from exp.runtime.gateway.native_execution import deployment_health_key
 from exp.runtime.gateway.prompt_size import MAXIMUM_BYTES_PER_TOKEN
+from exp.runtime.gateway.recovery import SessionRecoveryRegistry
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -194,6 +196,42 @@ def test_cache_marked_requests_dispatch_marker_honoring_rungs_first() -> None:
         _marked_request(),
     )
     assert route.deployment.deployment_id == "shim"
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_staged_marker_ordering_is_owned_by_stage_scheduler(pinned: bool) -> None:
+    """Rank stage markers once, while preserving a live reasoning issuer."""
+    route = _mixed_route("maximize_cache")
+    stage = ModelExecutionStage(
+        stage_index=0,
+        exact_model_id=route.snapshot.exact_model_id,
+        pool_id=route.snapshot.pool_id,
+        deployment_ids=route.snapshot.deployment_ids,
+        failover_mode="maximize_cache",
+    )
+    route = route.model_copy(
+        update={
+            "snapshot": route.snapshot.model_copy(update={"model_stages": (stage,)}),
+            "reasoning_pinned_deployment_id": "shim" if pinned else None,
+        }
+    )
+    wires = _wires()
+    request = _marked_request()
+    unchanged, unchanged_wires = _prefer_cache_capable_rungs(route, wires, request)
+    assert unchanged is route
+    assert unchanged_wires is wires
+    ordered, ordered_wires, _placement = _affinity_ordered_rungs(
+        unchanged,
+        unchanged_wires,
+        request,
+        accounting=_affinity_accounting(),
+        authorization=route.snapshot.authorization,
+        continuation=None,
+    )
+    expected = ("shim", "native") if pinned else ("native", "shim")
+    assert ordered.snapshot.deployment_ids == expected
+    assert ordered.snapshot.model_stages[0].deployment_ids == expected
+    assert ordered_wires[0][0].dialect == ("openai_compatible" if pinned else "anthropic_messages")
 
 
 def test_reasoning_pin_holds_the_issuing_rung_first_only_while_it_survives() -> None:
@@ -1582,7 +1620,7 @@ def _order(route: GatewayRoute) -> tuple[str, ...]:
 
 
 class _AffinityAccounting:
-    """Just the sticky and health registries affinity ordering reads."""
+    """The local registries read by direct and staged affinity ordering."""
 
     recovery_host = None
 
@@ -1590,6 +1628,7 @@ class _AffinityAccounting:
         """Compose fresh empty registries."""
         self.sticky = StickySpillRegistry()
         self.health = DeploymentHealthRegistry()
+        self.recovery = SessionRecoveryRegistry()
 
 
 def _affinity_accounting() -> NativeAttemptAccounting:

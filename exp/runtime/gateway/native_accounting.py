@@ -495,7 +495,10 @@ class NativeAttemptAccounting:
                     route_reason=route.attempt_route_reason(route.deployments[candidate]),
                     fallback_reason=route.fallback_reason,
                     dispatch_reason=entry.recovery_reason
-                    if candidate == 0 and entry.recovery_reason is not None
+                    if candidate == 0
+                    and entry.total_attempts == 0
+                    and entry.recovery_reason is not None
+                    and dispatch_reason in (None, "affinity", "affinity_sticky")
                     else dispatch_reason,
                     preferred_deployment=preferred_deployment,
                 )

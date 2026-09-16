@@ -656,6 +656,9 @@ class NativeControlPlane(
                     for profile, _client in resolved_wires
                 ),
                 affinity_fingerprint=placement.fingerprint,
+                verified_warm_deployment_id=placement.verified_warm_deployment_id,
+                verified_warm_until_monotonic=placement.verified_warm_until_monotonic,
+                recovery_scoped=placement.recovery_scoped,
                 sticky_preferred=placement.sticky_preferred,
                 throttle_redial_budgets=redial_budgets,
                 recovery_reason=placement.recovery_reason,

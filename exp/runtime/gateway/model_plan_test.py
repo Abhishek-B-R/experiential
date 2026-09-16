@@ -1,6 +1,8 @@
 """Frozen model stages preserve exact identity, segment order and destination policy."""
 
 from datetime import UTC, datetime
+from itertools import permutations
+from unittest.mock import patch
 
 import pytest
 
@@ -11,11 +13,13 @@ from exp.common.models.gateway_chains_test import chain
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.runtime.gateway.contracts import (
     DirectTarget,
+    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayFailure,
     GatewayFailureClass,
     GatewayMessage,
     GatewayRequest,
+    ProjectTarget,
 )
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.model_plan import model_execution_snapshot, project_stage_selection
@@ -277,6 +281,65 @@ def test_global_reorder_is_rejected_and_hint_reachability_is_authorized() -> Non
     assert hinted.snapshot.deployment_ids == ("b1", "a2")
     assert hinted.reasoning_pinned_deployment_id == "b1"
     assert hinted.requires_reasoning_strip(hinted.fallback_deployments[0])
+
+
+@pytest.mark.parametrize(
+    "surface",
+    [GatewayApiSurface.CHAT_COMPLETIONS, GatewayApiSurface.RESPONSES, GatewayApiSurface.MESSAGES],
+)
+def test_project_selection_never_enters_authored_model_references(
+    surface: GatewayApiSurface,
+) -> None:
+    """Selecting exact A through a project cannot authorize A's direct-only A-to-B chain."""
+    normalized = catalog()
+    digest = normalized.identity_sha256()
+    auth = _route().snapshot.authorization.model_copy(
+        update={
+            "surface": surface,
+            "catalog_sha256": digest,
+            "target": ProjectTarget(
+                project_ref="project-one", activation_ref="activation-one", catalog_sha256=digest
+            ),
+        }
+    )
+    with patch.object(
+        NormalizedGatewayCatalog, "chains_by_model", wraps=normalized.chains_by_model
+    ) as chains:
+        plan = model_execution_snapshot(normalized, auth, normalized.pools[0])
+    chains.assert_not_called()
+    assert plan.deployment_ids == ("a1", "a2")
+    assert plan.exact_model_id == "a"
+    assert plan.pool_id == "pool-a"
+    assert plan.failover_mode == "maximize_cache"
+    assert plan.throttle_cache_threshold == 0.5
+    assert plan.model_stages == ()
+    assert plan.traversal_events == ()
+
+
+def test_unstaged_projection_only_updates_selected_ids_and_stage_field() -> None:
+    """All direct-route subsets and permutations avoid temporary execution stages."""
+    snapshot = _route().snapshot
+    assert "model_stages" not in snapshot.model_fields_set
+    with patch.object(ExecutionSnapshot, "stage_for_depth", autospec=True) as stage_for_depth:
+        for size in range(len(snapshot.deployment_ids) + 1):
+            for indexes in permutations(range(len(snapshot.deployment_ids)), size):
+                projected = project_stage_selection(snapshot, indexes)
+                expected = snapshot.model_copy(
+                    update={
+                        "deployment_ids": tuple(snapshot.deployment_ids[i] for i in indexes),
+                        "model_stages": (),
+                    }
+                )
+                assert projected == expected
+                assert projected.model_fields_set == expected.model_fields_set
+    stage_for_depth.assert_not_called()
+
+
+@pytest.mark.parametrize("indexes", [(-1,), (3,), (0, -1), (0, 3)])
+def test_unstaged_projection_rejects_out_of_range_depths(indexes: tuple[int, ...]) -> None:
+    """The direct fast path keeps the cursor's ValueError guard, including negative depths."""
+    with pytest.raises(ValueError, match="execution route depth is outside the authorized plan"):
+        project_stage_selection(_route().snapshot, indexes)
 
 
 @pytest.mark.parametrize("surface", [GatewayApiSurface.EMBEDDINGS, GatewayApiSurface.IMAGES])

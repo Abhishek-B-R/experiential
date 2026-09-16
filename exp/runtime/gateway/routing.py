@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from concurrent.futures import Future, wait
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Protocol
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, stable_id
@@ -20,6 +21,7 @@ from exp.common.models.gateway_catalog import (
     NormalizedGatewayCatalog,
     is_foreign_snapshot,
 )
+from exp.common.models.gateway_chains import GatewayModelChain
 from exp.common.routing.policy import RoutingDecision
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -144,9 +146,10 @@ class RouteResolver(Protocol):
 
 @dataclass(frozen=True)
 class _CatalogView:
-    """One revision-scoped catalog plus its indexed pools and deployments."""
+    """One revision-scoped catalog with immutable chain, pool, and deployment indexes."""
 
     catalog: NormalizedGatewayCatalog
+    chains: Mapping[str, GatewayModelChain]
     pools: Mapping[str, ExactModelPool]
     deployments: Mapping[str, ExactModelDeployment]
 
@@ -427,7 +430,9 @@ class CatalogRouteResolver:
         target = authorization.target
         if isinstance(target, DirectTarget):
             root_pool = self._pool(view, target.pool_id)
-            plan = model_execution_snapshot(view.catalog, authorization, root_pool)
+            plan = model_execution_snapshot(
+                view.catalog, authorization, root_pool, chains=view.chains, pools=view.pools
+            )
             if deployment_id not in plan.deployment_ids:
                 raise GatewayRoutingError(
                     "reasoning carrier deployment is not reachable in current authority"
@@ -453,10 +458,9 @@ class CatalogRouteResolver:
         deployment = view.deployments.get(deployment_id)
         if deployment is None or deployment.exact_model_id != pool.exact_model_id:
             raise GatewayRoutingError("reasoning carrier deployment identity is invalid")
-        plan = model_execution_snapshot(view.catalog, authorization, pool)
-        if isinstance(target, DirectTarget):
+        if not isinstance(target, DirectTarget):
             plan = model_execution_snapshot(
-                view.catalog, authorization, self._pool(view, target.pool_id)
+                view.catalog, authorization, pool, chains=view.chains, pools=view.pools
             )
         pinned_depth = plan.deployment_ids.index(deployment_id)
         if plan.model_stages:
@@ -544,7 +548,9 @@ class CatalogRouteResolver:
     ) -> GatewayRoute:
         """Build one ordered execution route from a certified exact-model pool."""
         try:
-            snapshot = model_execution_snapshot(view.catalog, authorization, pool)
+            snapshot = model_execution_snapshot(
+                view.catalog, authorization, pool, chains=view.chains, pools=view.pools
+            )
         except ValueError as exc:
             raise GatewayRoutingError(str(exc)) from exc
         deployments: list[ExactModelDeployment] = []
@@ -587,14 +593,9 @@ def _index_catalogs(
         ValueError: A same-version catalog does not match its declared digest.
     """
     indexed: dict[tuple[str, str], _CatalogView] = {}
-    # A repoint mints every alias key against ONE immutable catalog object
-    # (hundreds of keys per snapshot in production), and identity_sha256
-    # re-hashes the whole multi-megabyte document, so the digest is computed
-    # once per distinct object and compared per key; the frozen view is built
-    # and shared once per object too. Per-key hashing made one state build
-    # re-hash the same 6.5 MB catalog 732 times (~35 s of a ~51 s build).
-    # Object ids are stable here because ``catalogs`` keeps every catalog
-    # alive for the whole loop.
+    # Hundreds of alias revisions can share one immutable catalog. Hash and index
+    # each distinct object once, but verify every key's digest independently.
+    # ``catalogs`` keeps object IDs stable by retaining them for the whole loop.
     identity_by_object: dict[int, str] = {}
     view_by_object: dict[int, _CatalogView] = {}
     for key, catalog in catalogs.items():
@@ -610,10 +611,11 @@ def _index_catalogs(
         if view is None:
             view = _CatalogView(
                 catalog=catalog,
-                pools={pool.pool_id: pool for pool in catalog.pools},
-                deployments={
-                    deployment.deployment_id: deployment for deployment in catalog.deployments
-                },
+                chains=MappingProxyType(catalog.chains_by_model() if catalog.model_chains else {}),
+                pools=MappingProxyType({pool.pool_id: pool for pool in catalog.pools}),
+                deployments=MappingProxyType(
+                    {deployment.deployment_id: deployment for deployment in catalog.deployments}
+                ),
             )
             view_by_object[id(catalog)] = view
         indexed[key] = view

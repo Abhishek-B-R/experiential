@@ -215,6 +215,11 @@ class InflightRequest:
     # so dispatch reservation can read and refresh the worker-local sticky
     # binding and apply the fresh-session spill threshold.
     affinity_fingerprint: bytes | None = None
+    # Only this admission's tenant/prefix/credential-verified recovery choice is
+    # warm on scoped routes. Unscoped sticky bindings cannot supply that evidence.
+    verified_warm_deployment_id: str | None = None
+    verified_warm_until_monotonic: float = 0
+    recovery_scoped: bool = False
     # Attempts whose settled usage already fed the cache-priority EWMA: a
     # settlement can land through the direct path AND the retained-settlement
     # sweep (both idempotent at the ledger), so the fold is guarded to exactly

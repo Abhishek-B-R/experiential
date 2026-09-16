@@ -448,11 +448,10 @@ class SQLiteBudgetStore:
     ) -> None:
         """Require the scoped pool, and any scoped deployment, to exist for the alias.
 
-        The pool must be the direct target of the alias's active revision, because
-        runtime routing and budget charging match on the active revision only. A
+        New limits require the direct target of the alias's active revision. A
         deployment scope must additionally name a deployment inside that pool in the
         active revision's pinned catalog snapshot, verified against the registered
-        digest, so a stored limit always references attempts the ledger can charge.
+        digest. Reachable child pools alone do not authorize new allocation targets.
         """
         row = connection.execute(
             """
@@ -948,11 +947,22 @@ def _attempt_scope_predicate(
             str(row["identity_id"]),
         )
     if kind is BudgetScopeKind.POOL:
-        return f"{base} AND r.alias_id = ? AND a.pool_id = ?", (
-            organization_id,
-            period_start,
-            str(row["alias_id"]),
-            str(row["pool_id"]),
+        # Charge the destination or the accepted revision's root, never the active alias.
+        return (
+            f"""{base} AND r.alias_id = ? AND (a.pool_id = ? OR EXISTS (
+            SELECT 1 FROM alias_revisions AS revision
+            WHERE revision.organization_id = r.organization_id
+              AND revision.alias_id = r.alias_id
+              AND revision.revision_id = r.alias_revision_id
+              AND revision.pool_id = ?
+        ))""",
+            (
+                organization_id,
+                period_start,
+                str(row["alias_id"]),
+                str(row["pool_id"]),
+                str(row["pool_id"]),
+            ),
         )
     return f"{base} AND r.alias_id = ? AND a.pool_id = ? AND a.deployment_id = ?", (
         organization_id,

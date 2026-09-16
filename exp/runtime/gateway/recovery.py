@@ -114,6 +114,7 @@ class RecoveryDecision:
     deployment_id: str | None = None
     reason: RecoveryReason = "normal_selection"
     trial: bool = False
+    warm_remaining_seconds: float = 0
 
 
 @dataclass
@@ -238,7 +239,26 @@ class SessionRecoveryRegistry:
         retention_seconds: float | None,
         sticky_seconds: float | None,
     ) -> None:
-        """Retain only successful cache evidence; price, dispatch and EWMA prove nothing."""
+        """Retain successful cache evidence under finite residency and sticky bounds.
+
+        Missing credential identity, nonpositive cache counts, or unknown/nonpositive
+        retention leave history unchanged. Residency is capped by the registry's
+        maximum age. Repeated evidence within that window preserves its original
+        four-times-TTL deadline; an expired or changed scope starts a new window.
+        Each session retains at most 256 deployment evidence records.
+
+        Args:
+            key: Tenant, caller session, and stable-prefix identity.
+            deployment_id: Actual deployment that reported successful usage.
+            scope: Verified endpoint, model, region, and credential identity.
+            cached_tokens: Provider-reported cache-read input tokens.
+            cache_write_tokens: Provider-reported cache-creation input tokens.
+            retention_seconds: Known provider cache lifetime in seconds, or None.
+            sticky_seconds: Requested placement lifetime in seconds. None or a
+                nonpositive value records residency without changing placement.
+                Positive placement is bounded by residency and a separate
+                four-times-lifetime deadline for the retained deployment.
+        """
         if (
             not scope.credential_scope
             or max(cached_tokens, cache_write_tokens) <= 0
@@ -263,6 +283,32 @@ class SessionRecoveryRegistry:
                     history.retained_age_deadline = now + 4 * lifetime
                 history.retained = deployment_id
                 history.retained_until = min(now + lifetime, history.retained_age_deadline)
+
+    def has_retained_history(self, key: SessionCacheKey, *, live_only: bool = False) -> bool:
+        """Check whether a session has a retained cursor before expensive admission work.
+
+        This is a conservative preflight, not permission to reuse cache evidence.
+        Callers may keep ordinary routing when it returns false; a concurrent new
+        sample can affect the next request instead. A true result still requires
+        choose() to validate scope, expiry, health, and recovery authority.
+
+        Args:
+            key: The current tenant, session, and actual stable-prefix identity.
+            live_only: Exclude an expired retained cursor when deciding whether
+                token-window recovery checks need a prompt estimate.
+
+        Returns:
+            Whether retained history exists. By default this includes expired
+            history so choose() can preserve its cache-expired disclosure.
+        """
+        now = self._clock()
+        with self._lock:
+            history = self._sessions.get(key)
+            return (
+                history is not None
+                and history.retained is not None
+                and (not live_only or history.retained_until > now)
+            )
 
     def choose(
         self,
@@ -317,7 +363,12 @@ class SessionRecoveryRegistry:
                     continue
                 if departed.cause == "local_capacity":
                     if local_capacity is not None and local_capacity(deployment_id):
-                        return RecoveryDecision(deployment_id, "recovered_preferred_route", True)
+                        return RecoveryDecision(
+                            deployment_id,
+                            "recovered_preferred_route",
+                            True,
+                            warm.expires_at - now,
+                        )
                     continue
                 if (
                     snapshot is None
@@ -355,5 +406,14 @@ class SessionRecoveryRegistry:
                         if len(self._consumed) >= self._maximum:
                             break
                         self._consumed[lease.lease_id] = lease.expires_at
-                        return RecoveryDecision(deployment_id, "recovered_preferred_route", True)
-            return RecoveryDecision(retained, "retained_warm_fallback")
+                        return RecoveryDecision(
+                            deployment_id,
+                            "recovered_preferred_route",
+                            True,
+                            warm.expires_at - now,
+                        )
+            return RecoveryDecision(
+                retained,
+                "retained_warm_fallback",
+                warm_remaining_seconds=min(evidence.expires_at, history.retained_until) - now,
+            )

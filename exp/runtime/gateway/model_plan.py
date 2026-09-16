@@ -2,20 +2,30 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from exp.common.models.gateway_catalog import ExactModelPool, NormalizedGatewayCatalog
-from exp.common.models.gateway_chains import ModelExecutionStage, expand_model_chain
-from exp.runtime.gateway.contracts import AuthorizationSnapshot, ExecutionSnapshot
+from exp.common.models.gateway_chains import (
+    GatewayModelChain,
+    ModelExecutionStage,
+    expand_model_chain,
+)
+from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, ExecutionSnapshot
 
 
 def model_execution_snapshot(
     catalog: NormalizedGatewayCatalog,
     authorization: AuthorizationSnapshot,
     root_pool: ExactModelPool,
+    *,
+    chains: Mapping[str, GatewayModelChain] | None = None,
+    pools: Mapping[str, ExactModelPool] | None = None,
 ) -> ExecutionSnapshot:
     """Resolve one authorized catalog graph to a bounded immutable leaf cursor.
 
-    Only conversational surfaces enter explicit model references. Other surfaces
-    keep direct-model behavior and never inherit child pricing or capabilities.
+    Only conversational direct targets enter explicit model references. Project
+    selections and other surfaces stay within their selected exact-model pool.
+    Optional chain and pool indexes must belong to this same frozen catalog view.
     """
     direct = ExecutionSnapshot(
         authorization=authorization,
@@ -26,16 +36,22 @@ def model_execution_snapshot(
         throttle_cache_threshold=root_pool.throttle_cache_threshold,
         throttle_redial=root_pool.throttle_redial,
     )
-    if authorization.surface not in ("chat_completions", "responses", "messages"):
+    if not isinstance(authorization.target, DirectTarget) or authorization.surface not in (
+        "chat_completions",
+        "responses",
+        "messages",
+    ):
         return direct
     chain = next((c for c in catalog.model_chains if c.model_id == root_pool.exact_model_id), None)
     if chain is None:
         return direct
     if chain.pool_id != root_pool.pool_id:
         raise ValueError("authorized chain root does not match its exact pool")
-    chains = catalog.chains_by_model()
+    if chains is None:
+        chains = catalog.chains_by_model()
     expanded = expand_model_chain(root_pool.exact_model_id, chains)
-    pools = {pool.pool_id: pool for pool in catalog.pools}
+    if pools is None:
+        pools = {pool.pool_id: pool for pool in catalog.pools}
     stages = tuple(
         ModelExecutionStage(
             stage_index=index,
@@ -78,6 +94,15 @@ def project_stage_selection(
     indexes: tuple[int, ...],
 ) -> ExecutionSnapshot:
     """Narrow or permute leaves without merging across authored reference boundaries."""
+    if not snapshot.model_stages:
+        if any(not 0 <= index < len(snapshot.deployment_ids) for index in indexes):
+            raise ValueError("execution route depth is outside the authorized plan")
+        return snapshot.model_copy(
+            update={
+                "deployment_ids": tuple(snapshot.deployment_ids[i] for i in indexes),
+                "model_stages": (),
+            }
+        )
     stages: list[ModelExecutionStage] = []
     for index in indexes:
         source = snapshot.stage_for_depth(index)
@@ -104,7 +129,7 @@ def project_stage_selection(
     return snapshot.model_copy(
         update={
             "deployment_ids": tuple(snapshot.deployment_ids[i] for i in indexes),
-            "model_stages": tuple(stages) if snapshot.model_stages else (),
+            "model_stages": tuple(stages),
         }
     )
 

@@ -397,24 +397,8 @@ def _prefer_cache_capable_rungs(
     if _keeps_issuing_rung_first(route):
         return route, resolved_wires
     if route.snapshot.model_stages:
-        order: list[int] = []
-        start = 0
-        for stage in route.snapshot.model_stages:
-            indexes = tuple(range(start, start + len(stage.deployment_ids)))
-            ranked = indexes
-            if stage.failover_mode == "maximize_cache" and request_carries_cache_markers(
-                provider_request
-            ):
-                ranked = tuple(
-                    i for i in indexes if resolved_wires[i][0].dialect == "anthropic_messages"
-                ) + tuple(
-                    i for i in indexes if resolved_wires[i][0].dialect != "anthropic_messages"
-                )
-            order.extend(ranked)
-            start += len(stage.deployment_ids)
-        return reorder_route_deployments(route, tuple(order)), tuple(
-            resolved_wires[i] for i in order
-        )
+        # The stage scheduler ranks markers once, after stage-local affinity.
+        return route, resolved_wires
     if route.snapshot.failover_mode != "maximize_cache":
         return route, resolved_wires
     if len(resolved_wires) < 2 or not request_carries_cache_markers(provider_request):

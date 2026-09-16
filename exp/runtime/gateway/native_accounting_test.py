@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime
+from typing import Literal
 
 import pytest
 
@@ -34,6 +35,7 @@ from exp.runtime.gateway.native_accounting import (
     NativeBridgeError,
 )
 from exp.runtime.gateway.native_execution import InflightRequest, deployment_health_key
+from exp.runtime.gateway.native_recovery_test import RecoveryHostFake
 from exp.runtime.gateway.native_settlement import failure_from_boundary_payload, ledger_failure
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.openai_protocol.errors import (
@@ -528,6 +530,65 @@ def test_sweep_cancels_the_active_attempt_after_the_deadline() -> None:
         }
     ]
     assert registry.entry("request-one") is None
+    assert registry.counters()[1] == 1
+
+
+@pytest.mark.parametrize("fault", ["raise", "provider", "exact_model_id", "organization_id"])
+@pytest.mark.parametrize("swept", [False, True])
+@pytest.mark.parametrize("finalize", [False, True])
+def test_recovery_observer_failure_cannot_block_durable_settlement_cleanup(
+    fault: Literal["raise", "provider", "exact_model_id", "organization_id"],
+    swept: bool,
+    finalize: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Both settlement paths release load and finalize despite unusable host scope."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger, recovery_host=RecoveryHostFake(fault))
+    deployments = _bounded_pair(1)
+    entry = _admit(registry, deployments, request_id="recovery-fault")
+    entry.request = _request().model_copy(
+        update={"provider_prompt_cache_key": "xpl-test-session", "prompt_cache_key": "session"}
+    )
+    started = _start(registry, ordinal=0, request_id=entry.authorization.request_id)
+    settlement = json.dumps(
+        {
+            "request_id": entry.authorization.request_id,
+            "attempt_id": started["attempt_id"],
+            "outcome": "completed",
+            "usage": {"input_tokens": 100, "output_tokens": 5, "cached_input_tokens": 50},
+            "finalize": finalize,
+        }
+    )
+    if swept:
+        ledger.fail_finishes = 1
+        with pytest.raises(NativeBridgeError):
+            registry.settle(settlement)
+        assert entry.pending_settlement is not None
+        registry.sweep_expired()
+        assert entry.pending_settlement is None
+        assert registry.counters()[0] == 1
+    else:
+        assert registry.settle(settlement) == "{}"
+    assert len(ledger.finished) == 1 and ledger.finished[0]["finalize"] is finalize
+    assert registry.loads.inflight(("deployment-a", "b" * 64)) == 0
+    assert registry.accounting_healthy
+    assert not entry.recovery_recorded_attempts
+    assert not registry.recovery._sessions  # noqa: SLF001 - scope faults must write no evidence.
+    assert "synthetic-private-detail" not in caplog.text
+    assert caplog.records and all(record.exc_info is None for record in caplog.records)
+    if finalize:
+        assert registry.entry(entry.authorization.request_id) is None
+    else:
+        assert registry.entry(entry.authorization.request_id) is entry
+        assert entry.active_attempt_id is None
+        registry.abandon(json.dumps({"request_id": entry.authorization.request_id}))
+    # Another expired request still settles on the next sweep after the host fault.
+    other = _admit(registry, deployments, request_id="after-recovery-fault")
+    _start(registry, ordinal=0, request_id=other.authorization.request_id)
+    other.deadline_monotonic = time.monotonic() - 60
+    registry.sweep_expired()
+    assert registry.entry(other.authorization.request_id) is None
     assert registry.counters()[1] == 1
 
 
@@ -1702,6 +1763,66 @@ def _settle_with_usage(
             }
         )
     )
+
+
+@pytest.mark.parametrize("mode", ["maximize_availability", "maximize_cache_affinity"])
+def test_recovery_placement_reason_does_not_replace_throttle_redial_reason(
+    mode: FailoverMode,
+) -> None:
+    """Initial recovery placement and a later physical backoff remain distinguishable."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    deployments = (_deployment("deployment-a", connection_sha256="b" * 64),)
+    entry = _admit(
+        registry,
+        deployments,
+        request_id="request-1",
+        failover_mode=mode,
+        throttle_redial=GatewayThrottleRedialPolicy(
+            max_attempts=1, base_delay_ms=100, max_delay_ms=100
+        ),
+    )
+    entry.recovery_reason = "retained_warm_fallback"
+    first = _start(registry, ordinal=0, request_id="request-1")
+    assert ledger.started[0]["dispatch_reason"] == "retained_warm_fallback"
+    _settle(
+        registry,
+        attempt_id=str(first["attempt_id"]),
+        outcome="failed",
+        finalize=False,
+        failure=_THROTTLE,
+        request_id="request-1",
+    )
+    redial = _start(
+        registry,
+        ordinal=1,
+        current_depth=0,
+        failure=_THROTTLE,
+        throttle_backoff=True,
+        request_id="request-1",
+    )
+    assert redial["route_depth"] == 0
+    assert ledger.started[1]["dispatch_reason"] == "throttle_backoff"
+    assert ledger.started[1]["preferred_deployment_id"] is None
+    registry.abandon(json.dumps({"request_id": "request-1"}))
+
+
+def test_recovery_placement_reason_does_not_replace_forced_overflow() -> None:
+    """A retained route forced past its capacity reports the real admission override."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    deployments = (_bounded_pair(1)[0],)
+    _admit(registry, deployments, request_id="holder")
+    _start(registry, ordinal=0, request_id="holder")
+    entry = _admit(
+        registry, deployments, request_id="overflow", failover_mode="maximize_cache_affinity"
+    )
+    entry.recovery_reason = "retained_warm_fallback"
+    assert _start(registry, ordinal=0, request_id="overflow")["route_depth"] == 0
+    assert ledger.started[-1]["dispatch_reason"] == "saturated_overflow"
+    assert registry.rung_admission_counters() == (1, 1)
+    for request_id in ("holder", "overflow"):
+        registry.abandon(json.dumps({"request_id": request_id}))
 
 
 class TestThrottleCacheThreshold:

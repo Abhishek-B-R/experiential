@@ -18,6 +18,7 @@ waiting on before the first throttle arrives.
 from __future__ import annotations
 
 import logging
+import time
 
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
@@ -70,9 +71,11 @@ def reserve_rung_slot(
         and policy.tokens_per_minute is None
     ):
         return None
-    # Warm standing: the request's affinity fingerprint holds a live sticky
-    # binding on THIS rung, so its provider cache lives here and the
-    # fresh-session early threshold does not apply to it. The early threshold
+    # Scoped routes carry admission-verified warmth for THIS rung. Ordinary
+    # direct affinity routes instead read their live conversation binding. Never
+    # let that unscoped binding stand in for tenant/prefix/credential evidence.
+    # Either warm standing bypasses only the fresh-session early threshold.
+    # The early threshold
     # only exists on affinity pools AND for requests that carry a fingerprint
     # (chat/Responses admission): a surface with no session concept
     # (embeddings, images) must never be classed fresh wholesale.
@@ -87,8 +90,11 @@ def reserve_rung_slot(
     )
     warm_session = True
     if fresh_fraction is not None and entry.affinity_fingerprint is not None:
-        warm_session = sticky.bound_deployment(entry.affinity_fingerprint) == (
-            deployment.deployment_id
+        warm_session = (
+            entry.verified_warm_deployment_id == deployment.deployment_id
+            and time.monotonic() < entry.verified_warm_until_monotonic
+            if entry.recovery_scoped
+            else sticky.bound_deployment(entry.affinity_fingerprint) == deployment.deployment_id
         )
     result = loads.reserve(
         rung_load_key(deployment),
