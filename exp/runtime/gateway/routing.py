@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from concurrent.futures import Future, wait
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
+from typing import Protocol
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, stable_id
 from exp.common.models import ModelRequest
@@ -44,6 +45,18 @@ class GatewayRoutingError(ValueError):
     """An authorized target cannot resolve inside its frozen catalog snapshot."""
 
 
+REASONING_CONTINUATION_ROUTE_REASON = "reasoning_continuation"
+"""Route reason of a request whose active sealed reasoning pins its issuing rung first."""
+
+REASONING_CONTINUATION_FAILOVER_ROUTE_REASON = "reasoning_continuation_failover"
+"""Attempt route reason of a pinned continuation served by a non-issuing rung.
+
+Recorded on every attempt dispatched past the issuing rung: the sealed reasoning
+only that rung's credential could unseal was stripped from the attempt's payload,
+so the ledger shows the request ran without its thinking continuity.
+"""
+
+
 class GatewayRoute(ContractModel):
     """One immutable ordered exact-model route ready for provider execution."""
 
@@ -52,11 +65,80 @@ class GatewayRoute(ContractModel):
     fallback_deployments: tuple[ExactModelDeployment, ...] = ()
     route_reason: str
     fallback_reason: str | None = None
+    reasoning_pinned_deployment_id: str | None = None
+    """The deployment whose credential sealed the request's active reasoning.
+
+    ``None`` on every route without gateway-sealed reasoning. When set, that
+    rung alone can replay the unsealed reasoning; every other rung is a failover
+    fallback that ``requires_reasoning_strip`` and is recorded under
+    ``REASONING_CONTINUATION_FAILOVER_ROUTE_REASON``. Sealed blocks never reach
+    another provider's payload: the strip removes them before the fallback
+    payload is built, and the payload builders still reject a foreign block.
+    """
 
     @property
     def deployments(self) -> tuple[ExactModelDeployment, ...]:
         """Return every certified deployment in deterministic operational order."""
         return (self.deployment, *self.fallback_deployments)
+
+    def requires_reasoning_strip(self, deployment: ExactModelDeployment) -> bool:
+        """Return whether ``deployment`` must dispatch without the pinned sealed reasoning.
+
+        True only on a reasoning-pinned route for a rung other than the issuing
+        one: that rung cannot unseal the reasoning, so the post-user-boundary
+        sealed blocks leave its payload while messages, tool calls, tool
+        results, and visible text all stay. The stated loss is the model's
+        thinking continuity across that tool call and the issuing provider's
+        prompt cache for the turn.
+        """
+        pinned = self.reasoning_pinned_deployment_id
+        return pinned is not None and deployment.deployment_id != pinned
+
+    def attempt_route_reason(self, deployment: ExactModelDeployment) -> str:
+        """Return the route reason the ledger records for an attempt on ``deployment``.
+
+        The route's own reason, except a pinned continuation served by a
+        non-issuing rung, recorded as ``REASONING_CONTINUATION_FAILOVER_ROUTE_REASON``
+        so the ledger shows which attempts ran without thinking continuity.
+        """
+        if self.requires_reasoning_strip(deployment):
+            return REASONING_CONTINUATION_FAILOVER_ROUTE_REASON
+        return self.route_reason
+
+
+class RouteResolver(Protocol):
+    """Structural contract for the gateway's authorized route resolver.
+
+    ``CatalogRouteResolver`` is the engine's implementation; a platform wrapper
+    that composes or delegates to it annotates itself against this Protocol so
+    ``ty`` statically catches a missing or drifted resolution method instead of
+    surfacing it at runtime. It captures ONLY the public resolution seam — the
+    three ways an authorization becomes a frozen :class:`GatewayRoute`; the
+    catalog-swap, metadata, and lifecycle methods are implementation detail and
+    deliberately excluded so a wrapper need not re-expose them.
+    """
+
+    def resolve_direct(self, authorization: AuthorizationSnapshot) -> GatewayRoute:
+        """Resolve one direct-target authorization without event-loop work."""
+        ...
+
+    def resolve_deployment_hint(
+        self,
+        authorization: AuthorizationSnapshot,
+        deployment_id: str,
+    ) -> GatewayRoute:
+        """Resolve one canonical carrier-hint deployment inside current authority."""
+        ...
+
+    def resolve_project_blocking(
+        self,
+        *,
+        authorization: AuthorizationSnapshot,
+        request: GatewayRequest,
+        episode_namespace: tuple[str, str, str, str],
+    ) -> GatewayRoute:
+        """Resolve one project target from a caller thread without an event loop."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -309,7 +391,35 @@ class CatalogRouteResolver:
         authorization: AuthorizationSnapshot,
         deployment_id: str,
     ) -> GatewayRoute:
-        """Resolve one untrusted carrier hint only inside current alias authority."""
+        """Resolve one untrusted carrier hint only inside current alias authority.
+
+        The ``deployment_id`` MUST be a CANONICAL pool member of the authorized
+        alias revision: pool membership is checked against ``pool.deployment_ids``,
+        which names canonicals only, so a BYOK or org-variant deployment id will
+        NOT resolve here. Mapping a variant back to its canonical is the CALLER
+        resolver's responsibility; this method receives an already-canonical id
+        and fails closed on anything the current authority's pools do not name.
+
+        Args:
+            authorization: Frozen authenticated alias revision and target.
+            deployment_id: Canonical deployment id carried on a reasoning
+                continuation, resolved only within the authorized revision.
+
+        Returns:
+            The pool's ordered ladder with the hinted deployment dispatched
+            first and ``reasoning_pinned_deployment_id`` naming it. The pool's
+            remaining certified deployments follow in pool order as failover
+            fallbacks: each ``requires_reasoning_strip`` because only the
+            issuing rung's credential can unseal the request's active reasoning,
+            so a failover-eligible operational failure on the pinned rung
+            (throttle, provider quota, unavailability, transport) continues on
+            them without the sealed blocks instead of surfacing after one
+            attempt. A single-deployment pool yields no fallbacks.
+
+        Raises:
+            GatewayRoutingError: The snapshot is inactive, the id is not an
+                unambiguous canonical pool member, or its identity is invalid.
+        """
         view = self._catalogs.get((authorization.alias_revision_id, authorization.catalog_sha256))
         if view is None:
             raise GatewayRoutingError("authorized catalog snapshot is not active for this revision")
@@ -335,17 +445,31 @@ class CatalogRouteResolver:
         deployment = view.deployments.get(deployment_id)
         if deployment is None or deployment.exact_model_id != pool.exact_model_id:
             raise GatewayRoutingError("reasoning carrier deployment identity is invalid")
+        # The pool's normal ladder minus the issuing rung, in pool order, so a
+        # failover past the pin walks the same rungs a fresh request would.
+        fallbacks: list[ExactModelDeployment] = []
+        for fallback_id in pool.deployment_ids:
+            if fallback_id == deployment_id:
+                continue
+            fallback = view.deployments.get(fallback_id)
+            if fallback is None or fallback.exact_model_id != pool.exact_model_id:
+                raise GatewayRoutingError("frozen pool deployment identity is invalid")
+            fallbacks.append(fallback)
         return GatewayRoute(
             snapshot=ExecutionSnapshot(
                 authorization=authorization,
                 exact_model_id=pool.exact_model_id,
                 pool_id=pool.pool_id,
-                deployment_ids=(deployment_id,),
+                deployment_ids=(deployment_id, *(item.deployment_id for item in fallbacks)),
                 failover_mode=pool.failover_mode,
+                throttle_cache_threshold=pool.throttle_cache_threshold,
+                throttle_redial=pool.throttle_redial,
             ),
             deployment=deployment,
-            route_reason="reasoning_continuation",
+            fallback_deployments=tuple(fallbacks),
+            route_reason=REASONING_CONTINUATION_ROUTE_REASON,
             fallback_reason=None,
+            reasoning_pinned_deployment_id=deployment_id,
         )
 
     def _authorize_project_deployment_hint(
@@ -424,6 +548,8 @@ class CatalogRouteResolver:
                 pool_id=pool.pool_id,
                 deployment_ids=pool.deployment_ids,
                 failover_mode=pool.failover_mode,
+                throttle_cache_threshold=pool.throttle_cache_threshold,
+                throttle_redial=pool.throttle_redial,
             ),
             deployment=deployments[0],
             fallback_deployments=tuple(deployments[1:]),

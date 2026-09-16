@@ -75,10 +75,10 @@ def _deployment(
     """Create one exact singleton deployment with optional known rates."""
     prices = (
         GatewayTokenPrices(
-            input_micro_usd_per_million_tokens=2_000_000,
-            cached_input_micro_usd_per_million_tokens=1_000_000,
-            output_micro_usd_per_million_tokens=4_000_000,
-            reasoning_micro_usd_per_million_tokens=5_000_000,
+            input_nano_usd_per_million_tokens=2_000_000,
+            cached_input_nano_usd_per_million_tokens=1_000_000,
+            output_nano_usd_per_million_tokens=4_000_000,
+            reasoning_nano_usd_per_million_tokens=5_000_000,
         )
         if priced
         else GatewayTokenPrices()
@@ -200,7 +200,7 @@ def test_attempt_usage_and_integer_cost_are_content_free(tmp_path: Path) -> None
     assert len(usage) == 1
     assert usage[0].requests == 1
     assert usage[0].attempts == 1
-    assert usage[0].known_estimated_cost_micro_usd == 3_950
+    assert usage[0].known_estimated_cost_nano_usd == 3_950
     assert usage[0].unknown_cost_attempts == 0
     assert 124 <= usage[0].total_latency_ms <= 126
     assert usage[0].average_latency_ms is not None
@@ -325,7 +325,7 @@ def test_usage_billing_source_buckets_conserve_physical_attempt_totals(tmp_path:
     assert host.attempts == 1
     assert host.input_tokens == 3
     assert host.output_tokens == 2
-    assert host.known_estimated_cost_micro_usd == 14
+    assert host.known_estimated_cost_nano_usd == 14
     assert host.unknown_cost_attempts == 0
     assert [(item.state, item.attempts) for item in host.terminal_counts] == [("completed", 1)]
 
@@ -385,7 +385,7 @@ def test_usage_snapshot_conserves_source_totals_during_concurrent_wal_settlement
             "cached_input_tokens",
             "output_tokens",
             "reasoning_tokens",
-            "known_estimated_cost_micro_usd",
+            "known_estimated_cost_nano_usd",
             "unknown_cost_attempts",
         ):
             assert getattr(identity, field_name) == sum(
@@ -443,7 +443,7 @@ def test_unknown_prices_remain_unknown_instead_of_zero(tmp_path: Path) -> None:
     )
 
     usage = ledger.usage(organization_id="org-one")[0]
-    assert usage.known_estimated_cost_micro_usd == 0
+    assert usage.known_estimated_cost_nano_usd == 0
     assert usage.unknown_cost_attempts == 1
 
 
@@ -480,7 +480,7 @@ def test_cancelled_post_commit_attempt_keeps_observed_billable_usage(tmp_path: P
     )
 
     usage = ledger.usage(organization_id="org-one")[0]
-    assert usage.known_estimated_cost_micro_usd == 280
+    assert usage.known_estimated_cost_nano_usd == 280
     assert usage.terminal_counts[0].attempts == 1
     assert usage.terminal_counts[0].state == "cancelled"
 
@@ -522,6 +522,82 @@ def test_failed_attempt_terminalizes_its_parent_request(tmp_path: Path) -> None:
         connection.close()
     assert request_state == "failed"
     assert attempt_state == "failed"
+
+
+def test_failed_attempt_records_the_sanitized_provider_error_text(tmp_path: Path) -> None:
+    """A provider client-error rejection keeps its sanitized sentence on the row."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("rejected-request"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.INVALID_REQUEST,
+        safe_message="provider rejected the request; verify the request fields",
+        # The sanitized provider sentence: no headers, no request echo, no
+        # credentials (the Rust upstream already enforced that shape).
+        provider_detail="max_tokens must be greater than thinking budget_tokens.",
+    )
+
+    ledger.finish_attempt(attempt_id=attempt_id, terminal_event=None, failure=failure)
+
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        failure_class, failure_message = connection.execute(
+            "SELECT failure_class, failure_message FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert failure_class == "invalid_request"
+    assert failure_message == "max_tokens must be greater than thinking budget_tokens."
+
+
+def test_failed_attempt_without_provider_detail_leaves_the_message_null(tmp_path: Path) -> None:
+    """A failure carrying no provider explanation records a NULL message."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("bare-failure"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=None,
+        failure=GatewayFailure(
+            failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
+            safe_message="provider service failed",
+        ),
+    )
+
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        failure_message = connection.execute(
+            "SELECT failure_message FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert failure_message is None
 
 
 def test_predispatch_failure_terminalizes_real_sqlite_request(tmp_path: Path) -> None:
@@ -1019,16 +1095,16 @@ def _tiered_deployment() -> ExactModelDeployment:
         update={
             "gateway": GatewayDeploymentMetadata(
                 prices=GatewayTokenPrices(
-                    input_micro_usd_per_million_tokens=1_250_000,
-                    cached_input_micro_usd_per_million_tokens=125_000,
-                    output_micro_usd_per_million_tokens=10_000_000,
-                    reasoning_micro_usd_per_million_tokens=10_000_000,
+                    input_nano_usd_per_million_tokens=1_250_000,
+                    cached_input_nano_usd_per_million_tokens=125_000,
+                    output_nano_usd_per_million_tokens=10_000_000,
+                    reasoning_nano_usd_per_million_tokens=10_000_000,
                     long_context=GatewayLongContextTier(
                         input_threshold_tokens=200_000,
-                        input_micro_usd_per_million_tokens=2_500_000,
-                        cached_input_micro_usd_per_million_tokens=250_000,
-                        output_micro_usd_per_million_tokens=15_000_000,
-                        reasoning_micro_usd_per_million_tokens=15_000_000,
+                        input_nano_usd_per_million_tokens=2_500_000,
+                        cached_input_nano_usd_per_million_tokens=250_000,
+                        output_nano_usd_per_million_tokens=15_000_000,
+                        reasoning_nano_usd_per_million_tokens=15_000_000,
                     ),
                 ),
                 pricing_source="operator-authored",
@@ -1050,7 +1126,7 @@ def test_long_context_settlement_reprices_the_whole_request_at_the_threshold(
     every token at the tier rates.
     """
     cases = (
-        # (input_tokens, expected settled micro-USD with 1,000 output tokens)
+        # (input_tokens, expected settled nano-USD with 1,000 output tokens)
         (199_999, (199_999 * 1_250_000 + 1_000 * 10_000_000 + 500_000) // 1_000_000),
         (200_000, (200_000 * 2_500_000 + 1_000 * 15_000_000 + 500_000) // 1_000_000),
         (200_001, (200_001 * 2_500_000 + 1_000 * 15_000_000 + 500_000) // 1_000_000),
@@ -1081,7 +1157,7 @@ def test_long_context_settlement_reprices_the_whole_request_at_the_threshold(
             failure=None,
         )
         usage = ledger.usage(organization_id="org-one")
-        assert usage[0].known_estimated_cost_micro_usd == expected, input_tokens
+        assert usage[0].known_estimated_cost_nano_usd == expected, input_tokens
 
 
 def test_long_context_tier_with_an_unknown_rate_stays_unpriced_above_threshold(
@@ -1095,11 +1171,11 @@ def test_long_context_tier_with_an_unknown_rate_stays_unpriced_above_threshold(
         update={
             "gateway": GatewayDeploymentMetadata(
                 prices=GatewayTokenPrices(
-                    input_micro_usd_per_million_tokens=1_250_000,
-                    output_micro_usd_per_million_tokens=10_000_000,
+                    input_nano_usd_per_million_tokens=1_250_000,
+                    output_nano_usd_per_million_tokens=10_000_000,
                     long_context=GatewayLongContextTier(
                         input_threshold_tokens=200_000,
-                        input_micro_usd_per_million_tokens=2_500_000,
+                        input_nano_usd_per_million_tokens=2_500_000,
                     ),
                 ),
                 pricing_source="operator-authored",
@@ -1129,5 +1205,230 @@ def test_long_context_tier_with_an_unknown_rate_stays_unpriced_above_threshold(
         failure=None,
     )
     usage = ledger.usage(organization_id="org-one")
-    assert usage[0].known_estimated_cost_micro_usd == 0
+    assert usage[0].known_estimated_cost_nano_usd == 0
     assert usage[0].unknown_cost_attempts == 1
+
+
+def _spill_fixture(
+    tmp_path: Path,
+    clock: FakeLedgerClock,
+    *,
+    preferred_priced: bool = True,
+) -> tuple[SQLiteAttemptLedger, ExecutionSnapshot, ExactModelDeployment, ExactModelDeployment]:
+    """Build a two-rung snapshot with the chosen rung behind a bypassed lead."""
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("spill"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    preferred = _deployment(priced=preferred_priced)
+    chosen = preferred.model_copy(
+        update={
+            "deployment_id": "deployment-two",
+            "connection_sha256": "e" * 64,
+            "gateway": GatewayDeploymentMetadata(
+                prices=GatewayTokenPrices(
+                    input_nano_usd_per_million_tokens=100_000,
+                    cached_input_nano_usd_per_million_tokens=50_000,
+                    output_nano_usd_per_million_tokens=200_000,
+                    reasoning_nano_usd_per_million_tokens=200_000,
+                ),
+                pricing_source="operator-authored",
+            ),
+        }
+    )
+    snapshot = ExecutionSnapshot(
+        authorization=authorization,
+        exact_model_id="exact-one",
+        pool_id="pool-one",
+        deployment_ids=("deployment-one", "deployment-two"),
+    )
+    return ledger, snapshot, chosen, preferred
+
+
+def _attempt_row(tmp_path: Path, attempt_id: str) -> sqlite3.Row:
+    """Read one persisted attempt row for disclosure assertions."""
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            "SELECT * FROM gateway_attempts WHERE attempt_id = ?", (attempt_id,)
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row is not None
+    return row
+
+
+def test_dispatch_disclosure_persists_and_prices_the_counterfactual(tmp_path: Path) -> None:
+    """A spilled attempt keeps the preferred rung's rates and prices the delta."""
+    clock = FakeLedgerClock()
+    ledger, snapshot, chosen, preferred = _spill_fixture(tmp_path, clock)
+    attempt_id = ledger.start_attempt(
+        snapshot=snapshot,
+        deployment=chosen,
+        attempt_ordinal=0,
+        route_depth=1,
+        dispatch_reason="queue_bound",
+        preferred_deployment=preferred,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=3,
+            usage=GatewayUsage(
+                input_tokens=1_000,
+                cached_input_tokens=100,
+                output_tokens=500,
+                reasoning_tokens=50,
+            ),
+        ),
+        failure=None,
+    )
+    row = _attempt_row(tmp_path, attempt_id)
+    assert row["dispatch_reason"] == "queue_bound"
+    assert row["preferred_deployment_id"] == "deployment-one"
+    assert row["preferred_input_rate"] == 2_000_000
+    assert row["preferred_cached_input_rate"] == 1_000_000
+    assert row["preferred_output_rate"] == 4_000_000
+    assert row["preferred_reasoning_rate"] == 5_000_000
+    # The SAME settled usage priced at the preferred base rates: 900 fresh
+    # input + 100 cached + 450 fresh output + 50 reasoning tokens.
+    assert row["counterfactual_cost_nano_usd"] == 3_950
+    assert row["estimated_cost_nano_usd"] == 195
+
+
+def test_finish_attempt_persists_harvested_rate_limit_observations(tmp_path: Path) -> None:
+    """The provider's rate-limit headers land as nullable integer columns."""
+    clock = FakeLedgerClock()
+    ledger, snapshot, chosen, _preferred = _spill_fixture(tmp_path, clock)
+    attempt_id = ledger.start_attempt(
+        snapshot=snapshot,
+        deployment=chosen,
+        attempt_ordinal=0,
+        route_depth=1,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=1,
+            usage=GatewayUsage(input_tokens=10, output_tokens=5),
+        ),
+        failure=None,
+        finalize_request=False,
+        retry_after_seconds=30,
+        ratelimit_limit_requests=10_000,
+        ratelimit_remaining_requests=9_999,
+        ratelimit_limit_tokens=180_000_000,
+        ratelimit_remaining_tokens=179_000_000,
+    )
+    row = _attempt_row(tmp_path, attempt_id)
+    assert row["retry_after_seconds"] == 30
+    assert row["ratelimit_limit_requests"] == 10_000
+    assert row["ratelimit_remaining_requests"] == 9_999
+    assert row["ratelimit_limit_tokens"] == 180_000_000
+    assert row["ratelimit_remaining_tokens"] == 179_000_000
+
+    # A settlement without observations keeps every column NULL.
+    second = ledger.start_attempt(
+        snapshot=snapshot,
+        deployment=chosen,
+        attempt_ordinal=1,
+        route_depth=1,
+    )
+    ledger.finish_attempt(
+        attempt_id=second,
+        terminal_event=GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),
+        failure=None,
+    )
+    bare = _attempt_row(tmp_path, second)
+    assert bare["retry_after_seconds"] is None
+    assert bare["ratelimit_limit_requests"] is None
+    assert bare["ratelimit_remaining_tokens"] is None
+
+
+def test_counterfactual_stays_null_when_a_preferred_rate_is_unknown(tmp_path: Path) -> None:
+    """An unpriced preferred rung never guesses a counterfactual cost."""
+    clock = FakeLedgerClock()
+    ledger, snapshot, chosen, preferred = _spill_fixture(tmp_path, clock, preferred_priced=False)
+    attempt_id = ledger.start_attempt(
+        snapshot=snapshot,
+        deployment=chosen,
+        attempt_ordinal=0,
+        route_depth=1,
+        dispatch_reason="fair_share_shed",
+        preferred_deployment=preferred,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=1,
+            usage=GatewayUsage(input_tokens=10, output_tokens=5),
+        ),
+        failure=None,
+    )
+    row = _attempt_row(tmp_path, attempt_id)
+    assert row["dispatch_reason"] == "fair_share_shed"
+    assert row["counterfactual_cost_nano_usd"] is None
+
+
+def test_undisclosed_attempts_keep_null_disclosure_columns(tmp_path: Path) -> None:
+    """A flag-off attempt writes exactly the rows it wrote before this feature."""
+    clock = FakeLedgerClock()
+    ledger, snapshot, chosen, _preferred = _spill_fixture(tmp_path, clock)
+    attempt_id = ledger.start_attempt(
+        snapshot=snapshot,
+        deployment=chosen,
+        attempt_ordinal=0,
+        route_depth=1,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=1,
+            usage=GatewayUsage(input_tokens=10, output_tokens=5),
+        ),
+        failure=None,
+    )
+    row = _attempt_row(tmp_path, attempt_id)
+    assert row["dispatch_reason"] is None
+    assert row["preferred_deployment_id"] is None
+    assert row["preferred_input_rate"] is None
+    assert row["counterfactual_cost_nano_usd"] is None
+
+
+def test_preferred_rung_disclosure_requires_divergence(tmp_path: Path) -> None:
+    """Passing the chosen rung as its own preferred rung is a contract error."""
+    clock = FakeLedgerClock()
+    ledger, snapshot, chosen, _preferred = _spill_fixture(tmp_path, clock)
+    with pytest.raises(GatewayLedgerError, match="divergent"):
+        ledger.start_attempt(
+            snapshot=snapshot,
+            deployment=chosen,
+            attempt_ordinal=0,
+            route_depth=1,
+            dispatch_reason="queue_bound",
+            preferred_deployment=chosen,
+        )
+
+
+def test_dispatch_reason_must_be_display_safe(tmp_path: Path) -> None:
+    """Control characters in the disclosure code are rejected like route codes."""
+    clock = FakeLedgerClock()
+    ledger, snapshot, chosen, preferred = _spill_fixture(tmp_path, clock)
+    with pytest.raises(GatewayLedgerError, match="display-safe"):
+        ledger.start_attempt(
+            snapshot=snapshot,
+            deployment=chosen,
+            attempt_ordinal=0,
+            route_depth=1,
+            dispatch_reason="queue\nbound",
+            preferred_deployment=preferred,
+        )

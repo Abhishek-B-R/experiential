@@ -13,10 +13,14 @@ from typing import Literal
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
+from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.models.providers.audios import gemini_audio_part
 from exp.runtime.models.providers.base import DEFAULT_MAXIMUM_OUTPUT_TOKENS
 from exp.runtime.models.providers.documents import gemini_document_part
 from exp.runtime.models.providers.images import gemini_image_part
+from exp.runtime.models.providers.instruction_turns import (
+    fold_instruction_turns_after_the_leading_run,
+)
 from exp.runtime.models.providers.reasoning_compat import gemini_thinking_level
 from exp.runtime.models.providers.videos import gemini_video_part
 
@@ -85,13 +89,19 @@ def gemini_generate_request(
     system_parts: list[JsonObject] = []
     contents: list[JsonObject] = []
     tool_names: dict[str, str] = {}
-    for message in request.messages:
+    # systemInstruction has no position inside contents, so an instruction
+    # after conversation start rides as user text where the caller put it
+    # (consecutive user contents are accepted on this wire); only the leading
+    # run is hoisted.
+    for message in fold_instruction_turns_after_the_leading_run(request.messages):
         if message.role == "system":
             if message.content is None:
                 raise ValueError("system messages need text content")
             system_parts.append({"text": message.content})
             continue
         contents.append(_gemini_content(message, tool_names))
+    if json_object_output:
+        system_parts.append({"text": JSON_OBJECT_SYSTEM_INSTRUCTION})
     payload: JsonObject = {"contents": contents}
     if system_parts:
         payload["systemInstruction"] = {"parts": system_parts}

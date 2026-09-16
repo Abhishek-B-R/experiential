@@ -34,9 +34,8 @@ from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
     authority_error,
-    gateway_updating_failure,
-    record_dead_admission_rungs,
 )
+from exp.runtime.gateway.native_admission import record_dead_admission_rungs
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
 from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_embeddings_body
 from exp.runtime.gateway.native_execution import (
@@ -48,6 +47,7 @@ from exp.runtime.gateway.native_execution import (
     dispatchable_route_profiles,
     select_route_deployments,
 )
+from exp.runtime.gateway.native_settlement import gateway_updating_failure
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers import require_gateway_provider
 from exp.runtime.models.providers.openai_compatible import openai_embedding_request

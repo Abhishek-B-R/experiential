@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use super::{malformed, parse_object, refusal_failure, Normalizer};
+use super::{malformed, parse_object, Normalizer};
 use crate::errors::{Failure, FailureClass};
 use crate::events::{gemini_usage, require_string, Event, ToolAccumulator};
 
@@ -11,16 +11,59 @@ impl Normalizer {
     /// are skipped, whole function calls expand to start/arguments/completed,
     /// and the terminal candidate flushes the latest usage before its finish
     /// reason maps to the shared completion, incomplete, refusal, or
-    /// provider-internal outcome.
+    /// provider-internal outcome. A prompt-level block (`promptFeedback.
+    /// blockReason`, delivered with no candidates at all) is the same
+    /// content-free refusal a candidate-level safety finish produces.
     pub(super) fn feed_gemini(
         &mut self,
         frame: &crate::sse::SseEvent,
     ) -> Result<Vec<Event>, Failure> {
         let payload = parse_object(&frame.data)?;
+        if let Some(error) = payload.get("error").filter(|value| !value.is_null()) {
+            // Google's error envelope ({"error":{"code":503,"status":"UNAVAILABLE"}})
+            // arrives as a candidate-less frame; without this branch it reads
+            // as a usage-only trailer and the stream ends malformed (or, after
+            // prior output, as a synthesized completion of a failed answer).
+            // It is the provider declaring failure, so it takes the shared
+            // retry-then-failover classification the other dialects give it,
+            // with its status and message riding as the bounded ledger detail.
+            let (code, message) = match error.as_object() {
+                Some(error) => (
+                    error.get("status").and_then(Value::as_str),
+                    error.get("message").and_then(Value::as_str),
+                ),
+                None => (None, None),
+            };
+            return Ok(vec![Event::Failed(self.provider_stream_failure(
+                "gemini_generate_content",
+                code,
+                message,
+            ))]);
+        }
         if let Some(raw_usage) = payload.get("usageMetadata") {
             if !raw_usage.is_null() {
                 self.usage = Some(gemini_usage(raw_usage).map_err(|message| malformed(&message))?);
             }
+        }
+        if gemini_prompt_blocked(&payload)? {
+            // A candidate-less frame naming `promptFeedback.blockReason` is the
+            // provider's verdict on the PROMPT, not a usage-only trailer: no
+            // candidate follows and no finishReason will name the outcome.
+            // It is the same content-free refusal a candidate-level SAFETY
+            // finish is, so it terminates the stream as one (no retry, no
+            // failover: every lane blocks the same prompt), after the usage
+            // Google reported for the prompt it counted.
+            let mut events = Vec::new();
+            if let Some(usage) = self.usage.take() {
+                events.push(Event::Usage(usage));
+            }
+            // The block reason names the category the same way a candidate
+            // finishReason does.
+            let reason = gemini_block_reason(&payload).unwrap_or_default();
+            events.push(Event::Failed(Failure::refusal(
+                crate::stream_errors::refusal_reason(Some(&reason), None),
+            )));
+            return Ok(events);
         }
         let candidates = match payload.get("candidates") {
             // A usage-only trailer frame legitimately carries no candidates at
@@ -93,9 +136,14 @@ impl Normalizer {
             "STOP" | "FINISH_REASON_UNSPECIFIED" => events.push(Event::Completed),
             "MAX_TOKENS" => events.push(Event::Incomplete),
             // The python mapper's refusal signal table: safety, copyright,
-            // and sensitive-information stops are content-free refusals.
-            "SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "RECITATION" | "SPII" => {
-                events.push(Event::Failed(refusal_failure()));
+            // and sensitive-information stops are content-free refusals. The
+            // finish token names the category (RECITATION, SPII, SAFETY), so
+            // the caller sees which policy declined without any provider prose.
+            "SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "RECITATION" | "SPII"
+            | "IMAGE_SAFETY" => {
+                events.push(Event::Failed(Failure::refusal(
+                    crate::stream_errors::refusal_reason(Some(&finish_reason), None),
+                )));
             }
             _ => {
                 events.push(Event::Failed(Failure::new(
@@ -137,6 +185,8 @@ impl Normalizer {
                 index,
                 call_id,
                 name,
+                namespace: None,
+                caller: None,
             },
             Event::ToolArgumentsDelta {
                 index,
@@ -148,6 +198,36 @@ impl Normalizer {
             },
         ])
     }
+}
+
+/// Whether `promptFeedback` reports a prompt-level block: any `blockReason`
+/// other than the enum's unspecified default means Google refused the prompt
+/// before generating. An absent or null `promptFeedback`, or one that only
+/// carries `safetyRatings`, is not a block.
+fn gemini_prompt_blocked(payload: &serde_json::Map<String, Value>) -> Result<bool, Failure> {
+    let feedback = match payload.get("promptFeedback") {
+        None | Some(Value::Null) => return Ok(false),
+        Some(value) => value
+            .as_object()
+            .ok_or_else(|| malformed("Gemini promptFeedback must be an object"))?,
+    };
+    match feedback.get("blockReason") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(reason)) => Ok(reason != "BLOCK_REASON_UNSPECIFIED"),
+        Some(_) => Err(malformed("Gemini promptFeedback.blockReason must be text")),
+    }
+}
+
+/// The `promptFeedback.blockReason` token, if the frame carries one. Only
+/// called after `gemini_prompt_blocked` confirmed a present, meaningful
+/// reason, so a malformed shape has already been rejected.
+fn gemini_block_reason(payload: &serde_json::Map<String, Value>) -> Option<String> {
+    payload
+        .get("promptFeedback")
+        .and_then(Value::as_object)
+        .and_then(|feedback| feedback.get("blockReason"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -323,13 +403,19 @@ mod gemini_tests {
     }
 
     #[test]
-    fn gemini_safety_finish_maps_to_a_content_free_refusal() {
-        for reason in [
-            "SAFETY",
-            "PROHIBITED_CONTENT",
-            "BLOCKLIST",
-            "RECITATION",
-            "SPII",
+    fn gemini_safety_finish_maps_to_a_categorized_refusal() {
+        // Each finish token names the bounded category the caller sees, with
+        // the fixed phrase in the message and never any provider prose.
+        for (reason, category, phrase) in [
+            ("SAFETY", "content_policy", "content policy"),
+            ("PROHIBITED_CONTENT", "content_policy", "content policy"),
+            ("BLOCKLIST", "content_policy", "content policy"),
+            (
+                "RECITATION",
+                "recitation",
+                "recitation of copyrighted material",
+            ),
+            ("SPII", "data_inspection", "data inspection"),
         ] {
             let chunks = [sse(&json!({"candidates": [{"finishReason": reason}]}))];
             let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
@@ -340,10 +426,191 @@ mod gemini_tests {
                 vec![json!({
                     "kind": "failed",
                     "failure_class": "refusal",
-                    "safe_message": "provider refused the request",
-                })]
+                    "safe_message": format!("provider refused the request: {phrase}"),
+                    "refusal_reason": category,
+                })],
+                "{reason}"
             );
         }
+    }
+
+    #[test]
+    fn gemini_prompt_block_is_a_content_free_refusal_with_its_usage() {
+        // The production shape (2026-09-04, gemini-3.7-flash and 3.8-flash
+        // via streamGenerateContent?alt=sse): one frame, no candidates, the
+        // block named on promptFeedback, and usageMetadata counting the
+        // prompt Google processed. It must terminate the stream as a refusal
+        // (400, no retry, no failover), never as a malformed stream end.
+        for (reason, category, message) in [
+            (
+                "SAFETY",
+                "content_policy",
+                "provider refused the request: content policy",
+            ),
+            (
+                "PROHIBITED_CONTENT",
+                "content_policy",
+                "provider refused the request: content policy",
+            ),
+            (
+                "BLOCKLIST",
+                "content_policy",
+                "provider refused the request: content policy",
+            ),
+            // A block reason the vocabulary does not know is an unnamed refusal.
+            ("OTHER", "unspecified", "provider refused the request"),
+            (
+                "IMAGE_SAFETY",
+                "content_policy",
+                "provider refused the request: content policy",
+            ),
+        ] {
+            let chunks = [sse(&json!({
+                "promptFeedback": {
+                    "blockReason": reason,
+                    "safetyRatings": [
+                        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "probability": "HIGH"}
+                    ],
+                },
+                "usageMetadata": {"promptTokenCount": 42, "totalTokenCount": 42},
+            }))];
+            let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+            let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+            assert!(
+                failure.is_none(),
+                "{reason}: a prompt block is a terminal, not a failure"
+            );
+            assert_eq!(
+                events,
+                vec![
+                    json!({
+                        "kind": "usage",
+                        "input_tokens": 42,
+                        "output_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "reasoning_tokens": null,
+                    }),
+                    json!({
+                        "kind": "failed",
+                        "failure_class": "refusal",
+                        "safe_message": message,
+                        "refusal_reason": category,
+                    }),
+                ],
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_prompt_block_without_usage_is_still_a_refusal() {
+        let chunks = [sse(&json!({"promptFeedback": {"blockReason": "SAFETY"}}))];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert!(failure.is_none());
+        assert_eq!(
+            events,
+            vec![json!({
+                "kind": "failed",
+                "failure_class": "refusal",
+                "safe_message": "provider refused the request: content policy",
+                "refusal_reason": "content_policy",
+            })]
+        );
+        // A refusal is the model's verdict on the prompt: neither redialed on
+        // the same deployment nor failed over to a sibling lane.
+        let refusal = Failure::refusal(crate::errors::RefusalReason::ContentPolicy);
+        assert!(!refusal.retryable_same_deployment);
+        assert!(!refusal.failover_eligible);
+    }
+
+    #[test]
+    fn gemini_unspecified_block_reason_and_ratings_only_feedback_are_not_blocks() {
+        // Ordinary answers carry promptFeedback.safetyRatings (and some carry
+        // the enum default) alongside real candidates; those must keep
+        // flowing as content.
+        for feedback in [
+            json!({"safetyRatings": [{"category": "HARM_CATEGORY_HATE_SPEECH", "probability": "NEGLIGIBLE"}]}),
+            json!({"blockReason": "BLOCK_REASON_UNSPECIFIED"}),
+        ] {
+            let chunks = [
+                sse(&json!({
+                    "promptFeedback": feedback,
+                    "candidates": [{"content": {"parts": [{"text": "fine"}]}}],
+                })),
+                sse(&json!({"candidates": [{"finishReason": "STOP"}]})),
+            ];
+            let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+            let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+            assert!(failure.is_none());
+            assert_eq!(
+                events,
+                vec![
+                    json!({"kind": "text_delta", "text": "fine"}),
+                    json!({"kind": "completed"}),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_error_envelope_is_classified_by_what_google_said() {
+        // Google's own error envelope on the stream (verified shape for a
+        // 503 UNAVAILABLE "overloaded"): a provider-declared failure. It is
+        // classified by its content like every other dialect's: an overloaded
+        // model is a THROTTLE (fail over, advertise Retry-After; redialing the
+        // same saturated rung buys nothing), never a malformed stream end, and
+        // never a completion when output preceded it.
+        let envelope = json!({
+            "error": {
+                "code": 503,
+                "message": "The model is overloaded. Please try again later.",
+                "status": "UNAVAILABLE",
+            }
+        });
+        let failed = json!({
+            "kind": "failed",
+            "failure_class": "throttled",
+            "safe_message": "provider throttled the request; retry after the delay in the Retry-After header",
+        });
+        let alone = [sse(&envelope)];
+        let refs: Vec<&[u8]> = alone.iter().map(Vec::as_slice).collect();
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert!(failure.is_none());
+        assert_eq!(events, vec![failed.clone()]);
+        let after_output = [
+            sse(&json!({"candidates": [{"content": {"parts": [{"text": "partial"}]}}]})),
+            sse(&envelope),
+        ];
+        let refs: Vec<&[u8]> = after_output.iter().map(Vec::as_slice).collect();
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert!(failure.is_none());
+        assert_eq!(
+            events,
+            vec![json!({"kind": "text_delta", "text": "partial"}), failed]
+        );
+        // A genuine provider fault keeps the retry-then-failover shape.
+        let internal = json!({
+            "error": {"code": 500, "message": "Internal error encountered.", "status": "INTERNAL"}
+        });
+        let refs = [sse(&internal)];
+        let refs: Vec<&[u8]> = refs.iter().map(Vec::as_slice).collect();
+        let (events, _failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert_eq!(
+            events,
+            vec![json!({
+                "kind": "failed",
+                "failure_class": "provider_internal",
+                "safe_message": "provider stream failed",
+            })]
+        );
+        let classified = crate::stream_errors::stream_failure(
+            crate::stream_errors::StreamErrorKind::ProviderInternal,
+            None,
+        );
+        assert_eq!(classified.failure_class, FailureClass::ProviderInternal);
+        assert!(classified.retryable_same_deployment);
+        assert!(classified.failover_eligible);
     }
 
     #[test]

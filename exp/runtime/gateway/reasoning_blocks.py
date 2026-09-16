@@ -76,11 +76,28 @@ class SealedReasoningContentBlock(ContractModel):
     deployment_hint: str = Field(min_length=1, max_length=256)
 
 
+class ExposedReasoningContentBlock(ContractModel):
+    """Caller-replayed plaintext reasoning for an exposure-gated rung.
+
+    A rung stamped ``reasoning_output_exposed`` (Tencent Hunyuan, DeepSeek)
+    accepts caller-owned ``reasoning_content`` on assistant history, including
+    tool-call turns. Preserve an explicitly empty string: providers can require
+    the field's presence even when that turn performed no reasoning. Missing
+    or null fields produce no block, and unsupported rungs omit exposed blocks
+    with a disclosure. Gateway-issued sealed carriers retain their separate
+    authenticated contract.
+    """
+
+    kind: Literal["exposed_reasoning_content"] = "exposed_reasoning_content"
+    content: str = Field(max_length=8 * 1024 * 1024)
+
+
 ProviderReasoningBlock = Annotated[
     ThinkingBlock
     | RedactedThinkingBlock
     | EncryptedReasoningBlock
     | OpaqueReasoningContentBlock
-    | SealedReasoningContentBlock,
+    | SealedReasoningContentBlock
+    | ExposedReasoningContentBlock,
     Field(discriminator="kind"),
 ]

@@ -90,6 +90,7 @@ _SAMPLING_AT_NONE_MODELS = frozenset(
         "supports_structured_output",
     ),
     [
+        ("gpt-6-astra", 1_050_000, 128_000, 10.0, 50.0, 1.0, 12.5, True),
         ("gpt-5.6-sol", 1_050_000, 128_000, 5.0, 30.0, 0.5, 6.25, True),
         ("gpt-5.6-terra", 1_050_000, 128_000, 2.0, 12.0, 0.2, 2.5, True),
         ("gpt-5.6-luna", 1_050_000, 128_000, 0.2, 1.2, 0.02, 0.25, True),
@@ -330,6 +331,14 @@ def test_anthropic_point_releases_inherit_generation_controls_never_prices() -> 
     # Real two-segment model ids never fall through to a bogus generation.
     haiku = known_model_metadata("anthropic", "claude-haiku-4-5")
     assert haiku is not None and haiku.input_cost_per_million_tokens_usd == 1.0
+    # Budgeted-enabled reasoning: haiku reasons (its thinking config is
+    # honored) without the adaptive effort ladder, and it keeps ordinary
+    # sampling behind the srn hatch rather than a temperature pin.
+    assert haiku.supports_reasoning is True
+    assert haiku.supports_reasoning_effort is False
+    assert haiku.sampling_requires_reasoning_none is True
+    assert haiku.supports_temperature is True
+    assert haiku.supports_top_k is True
 
 
 # The exact /v1/models listing served to a plain key, captured 2026-09-01

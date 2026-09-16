@@ -94,11 +94,12 @@ required price or limit remains unknown.
 | `supports_structured_output` | boolean | The alias accepts structured output |
 | `maximum_output_tokens` | positive integer | Declared output ceiling |
 | `context_window_tokens` | positive integer | Declared context window, only when the host publishes one |
-| `pricing.input_micro_usd_per_million_tokens` | integer `>= 0` | Configured input price in micro-USD per million tokens |
-| `pricing.output_micro_usd_per_million_tokens` | integer `>= 0` | Configured output price in micro-USD per million tokens |
-| `pricing.cached_input_micro_usd_per_million_tokens` | integer `>= 0` | Configured cached-input price in micro-USD per million tokens |
+| `pricing.input_nano_usd_per_million_tokens` | integer `>= 0` | Configured input price in nano-USD per million tokens |
+| `pricing.output_nano_usd_per_million_tokens` | integer `>= 0` | Configured output price in nano-USD per million tokens |
+| `pricing.cached_input_nano_usd_per_million_tokens` | integer `>= 0` | Configured cached-input price in nano-USD per million tokens |
 
-Micro-USD prices convert to catalog USD-per-million-token prices by dividing by `1_000_000`.
+Nano-USD prices convert to catalog USD-per-million-token prices by dividing by `1_000_000_000`
+(one nano-USD is a billionth of a dollar; `1_250_000_000` is $1.25 per million tokens).
 When a trusted third-party compatible host publishes these fields, completion, tool,
 structured-output, and input/output price declarations can assign world-model and judge roles
 without a questionnaire. Router-candidate setup still requires a published or
@@ -209,10 +210,27 @@ JSON itself never travels on the wire, and the endpoint host is pinned to HTTPS
 Requests use the same `generateContent` wire protocol as the Gemini provider on
 `publishers/google/models/` routes.
 
+The model id spelling picks the wire. A bare id (`gemini-2.5-pro`) or a Google resource path
+(`publishers/google/models/gemini-2.5-pro`) is a Google-published model on the Gemini wire. A
+`<publisher>/<model>` id (`deepseek-ai/deepseek-v3.2-maas`, `xai/grok-4.20-reasoning`,
+`qwen/qwen3-coder-480b-a35b-instruct-maas`) is a Model Garden model served as a managed API
+(MaaS), which Vertex serves only over its OpenAI-compatible route
+`{base_url}/endpoints/openapi/chat/completions` (dialect `openai_compatible`, the same
+Chat Completions request and stream handling as `openai-compatible`), still under the OAuth
+bearer. Most MaaS models are addressed through the `global` location
+(`https://aiplatform.googleapis.com/v1/projects/PROJECT/locations/global`); a listing-style
+`publishers/<publisher>/models/<model>` spelling is collapsed onto the `<publisher>/<model>`
+form the route accepts. Google's own managed endpoints share the Gemini resource path in
+the listing (`publishers/google/models/gemma-4-26b-a4b-it-maas`) and are told apart by
+Vertex's `-maas` endpoint suffix, so both that spelling and `google/gemma-4-26b-a4b-it-maas`
+take the MaaS route.
+
 Vertex is catalog-and-API configuration only: the interactive `exp config providers` picker
 does not offer it. Like Azure and Bedrock, provider names do not imply protocol support or
 prices, so every Vertex alias declares explicit capabilities. Embeddings are not supported on
-Vertex connections; use a `gemini` connection for Gemini embeddings.
+the Gemini-wire Vertex aliases; use a `gemini` connection for Gemini embeddings. MaaS aliases
+expose the compatible embeddings route (`endpoints/openapi/embeddings`) when their
+capabilities declare `supports_embeddings`.
 
 ```toml
 [connections.vertex]
@@ -237,3 +255,35 @@ a secret value. A missing Bedrock region lists the AWS resolution order. Azure e
 mismatches name `AZURE_OPENAI_ENDPOINT`, not the key. A malformed user-data credential file
 fails closed and tells the operator to move or delete it, then run `exp config providers`.
 Malformed provider responses fail closed and do not write partial catalog or evidence artifacts.
+
+## Novita error classification (2026-09-16)
+
+Novita is an OpenAI-compatible reseller whose gpt-5.6 lanes front per-region
+Azure OpenAI deployments. Three of its error shapes needed engine rules beyond
+the shared envelope reader (`crate::error_envelope`), all pinned in
+`upstream_reseller_tests.rs`:
+
+- **A 4xx that says the ACCOUNT cannot pay is `provider_quota`.** A drained
+  prepaid balance answers `400 "Insufficient quota available for instant
+  inference"`; a status-only read filed it as the caller's `invalid_request`.
+  A pre-stream 4xx whose code is a quota token or whose sentence carries
+  unambiguous funding wording (`rejected_by_account_quota`: insufficient
+  quota/balance/credits/funds, not enough balance, exceeded your current
+  quota — no bare "billing") takes the quota class, fails over, and keeps the
+  sentence ledger-only.
+- **A relay decode failure is unwrapped.** Novita's Responses relay sometimes
+  cannot decode the UPSTREAM error it received (`failed to decode error
+  response: json: cannot unmarshal number into Go struct field
+  ResponseError.error.code of type string, raw: {…}`) and answers its own 400
+  with the upstream document embedded after `raw: `. Pre-stream and in-stream
+  the engine reads that document (`relayed_decode_failure`; a zero code is
+  "no code", a truncated document still yields its message), classifies by
+  the UPSTREAM code and sentence (a relayed 429 throttles and fails over; a
+  relayed caller error keeps this status's caller class), and relays the
+  upstream sentence ("Exceeded maximum number of images (50) allowed in the
+  request.") instead of the decoder's noise.
+- **`reason` tokens classify** (`INVALID_REQUEST_BODY` generic,
+  `MODEL_NOT_FOUND` → lane policy, `NOT_ENOUGH_BALANCE` under 403 →
+  `provider_quota`, `RATE_LIMIT_EXCEEDED` / `TOKEN_LIMIT_EXCEEDED` throttle,
+  `FAILED_TO_AUTH` / `ACCESS_DENY` authenticate), see the architecture
+  reference.

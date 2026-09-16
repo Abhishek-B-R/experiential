@@ -25,7 +25,10 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
 )
-from exp.runtime.gateway.reasoning_carrier import parse_reasoning_content_carrier
+from exp.runtime.gateway.reasoning_carrier import (
+    parse_reasoning_content_carrier,
+    scheme_for_carrier,
+)
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
@@ -296,12 +299,16 @@ def remember_turn(
         call_id = call["call_id"]
         name = call["name"]
         raw_arguments = call["arguments"]
+        namespace = call.get("namespace")
+        caller = call.get("caller")
         if (
             not isinstance(call_id, str)
             or not call_id
             or not isinstance(name, str)
             or not name
             or not isinstance(raw_arguments, str)
+            or not (namespace is None or (isinstance(namespace, str) and namespace))
+            or not (caller is None or isinstance(caller, dict))
         ):
             raise ValueError("Responses retained tool call fields are invalid")
         if call.get("custom") is True:
@@ -314,6 +321,10 @@ def remember_turn(
                 "name": name,
                 "input": raw_arguments,
             }
+            if namespace is not None:
+                native_item["namespace"] = namespace
+            if caller is not None:
+                native_item["caller"] = caller
             if provider_item_id is not None:
                 native_item["id"] = provider_item_id
             status_value = call.get("status")
@@ -337,6 +348,8 @@ def remember_turn(
                 if provider_output_index is not None
                 else None
             ),
+            provider_namespace=namespace,
+            provider_caller=caller,
         )
         if provider_output_index is None:
             unindexed_calls.append(parsed_call)
@@ -375,12 +388,46 @@ def remember_turn(
                 ),
             )
         )
+    raw_hosted = data.get("hosted_items", [])
+    if not isinstance(raw_hosted, list):
+        raise ValueError("Responses hosted items must be an array")
+    for item in raw_hosted:
+        if not isinstance(item, dict):
+            raise ValueError("Responses hosted item must be an object")
+        output_index = item.get("output_index")
+        hosted_item = item.get("item")
+        if (
+            not isinstance(output_index, int)
+            or isinstance(output_index, bool)
+            or output_index < 0
+            or output_index in indexes
+            or not isinstance(hosted_item, dict)
+            or not isinstance(hosted_item.get("type"), str)
+            or not hosted_item["type"]
+        ):
+            raise ValueError("Responses hosted item identity is invalid")
+        indexes.add(output_index)
+        # A hosted tool item replays as the verbatim native item at its exact
+        # provider output position; only a native Responses rung can serve it.
+        indexed_natives.append(
+            (
+                output_index,
+                GatewayMessage(role="assistant", provider_native_item=hosted_item),
+            )
+        )
     raw_carrier = data.get("reasoning_content_carrier")
     sealed_carrier = None
     if raw_carrier is not None:
         if not isinstance(raw_carrier, str):
             raise ValueError("Responses reasoning carrier must be text")
-        sealed_carrier = parse_reasoning_content_carrier(raw_carrier)
+        # The carrier's own opaque prefix names the provider scheme it was
+        # sealed under; parsing under a fixed default rejected every Hunyuan
+        # carrier as "not a bounded gateway carrier" AFTER the attempt had
+        # settled and charged (Responses + tools on the Tencent lanes, 2026-09-15).
+        scheme = scheme_for_carrier(raw_carrier)
+        if scheme is None:
+            raise ValueError("reasoning_content is not a bounded gateway carrier")
+        sealed_carrier = parse_reasoning_content_carrier(raw_carrier, scheme=scheme)
     indexed_output = bool(encrypted or indexed_calls or message_outputs or indexed_natives)
     if sealed_carrier is not None and indexed_output:
         raise ValueError("Responses reasoning carrier cannot mix with provider-indexed output")

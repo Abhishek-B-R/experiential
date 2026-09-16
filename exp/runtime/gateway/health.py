@@ -27,6 +27,14 @@ _OPERATIONAL_FAILURES = {
     GatewayFailureClass.PROVIDER_INTERNAL,
 }
 
+# Clamp on a provider-stated Retry-After when it sizes a throttle window. The
+# floor keeps a degenerate "0"/"1" from thrashing the rung; the ceiling keeps
+# one absurd header from suppressing a lane for days while still letting a
+# daily-quota reset (hours) mark the rung dead-for-hours so the waterfall
+# skips it for the whole window.
+RETRY_AFTER_WINDOW_MINIMUM_SECONDS = 5.0
+RETRY_AFTER_WINDOW_MAXIMUM_SECONDS = 6.0 * 3_600.0
+
 
 @dataclass
 class _DeploymentHealth:
@@ -143,6 +151,27 @@ class DeploymentHealthRegistry:
             state = self._states.setdefault(key, _DeploymentHealth())
             return state.throttle_until <= now
 
+    def claim_throttle_redial(self, key: DeploymentHealthKey) -> bool:
+        """Admit one post-backoff redial of a rung inside its own throttle window.
+
+        The throttle window is the fleet-shared "leave this rung alone"
+        signal for OTHER requests; the request that was throttled and has
+        already waited the pool's backoff is the one deliberately probing the
+        rung back, so its redial passes the window. An open circuit (some
+        other failure class marked the rung dead meanwhile) still refuses,
+        because a dead rung has no cache worth the wait.
+
+        Args:
+            key: Catalog, deployment, and connection identity tuple.
+
+        Returns:
+            Whether the redial may dispatch this deployment now.
+        """
+        now = self._clock()
+        with self._lock:
+            state = self._states.setdefault(key, _DeploymentHealth())
+            return state.open_until <= now
+
     def dispatch_opened(self, key: DeploymentHealthKey) -> None:
         """Restore admission once one provider dispatch opens successfully.
 
@@ -188,11 +217,17 @@ class DeploymentHealthRegistry:
             if failure.failure_class == GatewayFailureClass.THROTTLED:
                 state.throttle_until = max(
                     state.throttle_until,
-                    now + self._throttle_seconds,
+                    now + self._throttle_window_seconds(failure),
                 )
                 return
             if failure.failure_class == GatewayFailureClass.REFUSAL:
                 state.refusal_count += 1
+                return
+            if failure.failure_class == GatewayFailureClass.EMPTY_COMPLETION:
+                # The model answered the content with nothing: the caller's
+                # conversation, not rung deadness. One stuck Claude Code
+                # session re-sending the same prompt every minute must not
+                # open the rung for everyone else (2026-09-15, gpt-5.6-luna).
                 return
             if failure.failure_class in _HARD_FAILURES:
                 state.consecutive_failures = self._failure_threshold
@@ -202,6 +237,76 @@ class DeploymentHealthRegistry:
                 state.consecutive_failures += 1
                 if state.consecutive_failures >= self._failure_threshold:
                     state.open_until = now + self._open_seconds
+
+    def _throttle_window_seconds(self, failure: GatewayFailure) -> float:
+        """Size one throttle window from the provider's own stated wait.
+
+        A throttled failure carrying a parsed ``Retry-After`` sizes the window
+        from it, clamped to the bounded range, so a long provider backoff (an
+        exhausted daily quota) actually suppresses the rung for the wait the
+        provider asked for instead of re-attempting every fixed default. An
+        absent or unparseable wait keeps the fixed default window.
+
+        Args:
+            failure: Sanitized throttled failure.
+
+        Returns:
+            The window length in seconds.
+        """
+        if failure.retry_after_seconds is None:
+            return self._throttle_seconds
+        return min(
+            max(float(failure.retry_after_seconds), RETRY_AFTER_WINDOW_MINIMUM_SECONDS),
+            RETRY_AFTER_WINDOW_MAXIMUM_SECONDS,
+        )
+
+    def suppressed(self, key: DeploymentHealthKey) -> bool:
+        """Whether one deployment currently sits inside any suppression window.
+
+        A read-only probe (unlike :meth:`claim` it never reserves a half-open
+        slot), used by sticky-affinity admission to bypass and clear a binding
+        whose rung is throttled or circuit-open right now.
+
+        Args:
+            key: Catalog, deployment, and connection identity tuple.
+
+        Returns:
+            Whether the deployment is throttle- or circuit-suppressed.
+        """
+        now = self._clock()
+        with self._lock:
+            state = self._states.get(key)
+            if state is None:
+                return False
+            return state.throttle_until > now or state.open_until > now
+
+    def throttled_remaining_seconds(self, keys: tuple[DeploymentHealthKey, ...]) -> float | None:
+        """Return the longest remaining throttle window when EVERY key is inside one.
+
+        A route with no claimable deployment and no classified failure of its
+        own can only be throttle-suppressed (forced claims admit any
+        non-throttled circuit), so this names that condition explicitly: the
+        provider asked for backoff, which is caller-facing rate limiting, not
+        platform deadness.
+
+        Args:
+            keys: One health key per ordered route deployment.
+
+        Returns:
+            The longest remaining window in seconds, or ``None`` when the
+            route is empty or any deployment is outside a throttle window.
+        """
+        if not keys:
+            return None
+        now = self._clock()
+        remaining = 0.0
+        with self._lock:
+            for key in keys:
+                state = self._states.get(key)
+                if state is None or state.throttle_until <= now:
+                    return None
+                remaining = max(remaining, state.throttle_until - now)
+        return remaining
 
     def release_probe(self, key: DeploymentHealthKey) -> None:
         """Release a claimed half-open probe that never reached provider dispatch.

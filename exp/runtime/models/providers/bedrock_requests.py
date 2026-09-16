@@ -15,10 +15,14 @@ from typing import cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
+from exp.runtime.models.providers.anthropic_tool_compat import anthropic_input_schema
 from exp.runtime.models.providers.audios import reject_audio_part
 from exp.runtime.models.providers.documents import bedrock_document_block
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.images import bedrock_image_block
+from exp.runtime.models.providers.instruction_turns import (
+    fold_instruction_turns_after_the_leading_run,
+)
 from exp.runtime.models.providers.videos import bedrock_video_block
 
 BEDROCK_MAXIMUM_INLINE_MEDIA_BYTES = 25_000_000
@@ -141,7 +145,11 @@ def converse_body(
             return
         messages.append({"role": role, "content": content})
 
-    for message in request.messages:
+    # Converse's top-level ``system`` has no position inside messages, so an
+    # instruction after conversation start rides as user text where the
+    # caller put it (``push`` merges it into an adjacent user turn); only the
+    # leading run is hoisted.
+    for message in fold_instruction_turns_after_the_leading_run(request.messages):
         if message.role == "system":
             if message.content is None:
                 raise ValueError("system messages need text content")
@@ -154,7 +162,7 @@ def converse_body(
                     {
                         "toolResult": {
                             "toolUseId": message.tool_call_id or "",
-                            "content": [{"text": message.content or ""}],
+                            "content": _tool_result_blocks(message),
                         }
                     }
                 ],
@@ -244,6 +252,26 @@ def _require_inline_media_within_payload(request: ModelRequest, payload: JsonObj
             param="messages",
             code="invalid_parameter",
         )
+
+
+def _tool_result_blocks(message: ModelMessage) -> list[JsonObject]:
+    """Emit one tool result's Converse content blocks in caller order.
+
+    A tool screenshot re-emits as a ``ToolResultContentBlock.image`` beside
+    its text (the union Converse documents for tool results; the model
+    contract restricts tool messages to text and image parts). Empty text
+    parts drop because Converse rejects an empty text block; a text-only
+    result keeps its single text block.
+    """
+    if not message.content_parts:
+        return [{"text": message.content or ""}]
+    blocks: list[JsonObject] = []
+    for part in message.content_parts:
+        if part.kind == "image":
+            blocks.append(bedrock_image_block(part))
+        elif part.kind == "text" and part.text:
+            blocks.append({"text": part.text})
+    return blocks or [{"text": message.content or ""}]
 
 
 def _multimodal_blocks(message: ModelMessage) -> list[JsonObject]:
@@ -346,7 +374,9 @@ def _tool_config(
         tool_spec: JsonObject = {
             "name": tool.name,
             "description": tool.description,
-            "inputSchema": {"json": tool.input_schema},
+            # Converse relays Anthropic's input_schema rules (root object,
+            # no root combinator), so the same reshaping applies here.
+            "inputSchema": {"json": anthropic_input_schema(tool.input_schema)},
         }
         if tool.name in strict_tool_names:
             tool_spec["strict"] = True

@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "exp-gateway-native"
-version = "0.3.29"
+version = "0.3.74"
 dependencies = [
  "axum",
  "base64",
@@ -221,6 +221,7 @@ dependencies = [
  "h2",
  "http",
  "http-body-util",
+ "httpdate",
  "pyo3",
  "reqwest",
  "serde",

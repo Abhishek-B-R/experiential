@@ -64,6 +64,9 @@ CHAT_MANIFEST = CompatibilityManifest(
         _field(
             "chat_template_kwargs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"
         ),
+        # DashScope's top-level spelling of the same switch (Qwen-family clients
+        # send it via extra_body); translated exactly like chat_template_kwargs.
+        _field("enable_thinking", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
         _field("logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
         # Sampling penalties: admitted and adapted per rung — honored where the
@@ -87,13 +90,16 @@ CHAT_MANIFEST = CompatibilityManifest(
         # request). Admit it only once response normalization emits logprobs.
         _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
-        # End-user attribution / cache hints (OpenAI spec). Accepted and recorded
-        # gateway-side, never forwarded to the model: `safety_identifier` is the
-        # current stable end-user identifier, `user` its deprecated predecessor,
-        # `prompt_cache_key` a same-prefix cache-routing hint (not identity).
+        # End-user attribution (OpenAI spec). Accepted and recorded gateway-side,
+        # never forwarded to the model: `safety_identifier` is the current
+        # stable end-user identifier, `user` its deprecated predecessor.
+        # `prompt_cache_key` is a same-prefix cache-routing hint (not identity):
+        # the caller's value never leaves the gateway, but a tenant-namespaced
+        # digest of it (or of the conversation stem) dispatches to rungs whose
+        # provider routes by the field (prompt_cache_affinity.py).
         _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
         _field("user", CompatibilityDisposition.METADATA_ONLY),
-        _field("prompt_cache_key", CompatibilityDisposition.METADATA_ONLY),
+        _field("prompt_cache_key", CompatibilityDisposition.CONDITIONALLY_SUPPORTED),
         # Audio INPUT rides ``messages`` as an ``input_audio`` content part and
         # is admitted per route; ``audio`` and ``modalities`` request audio
         # OUTPUT, which no route serves.
@@ -166,7 +172,7 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         # Chat surface: accepted and recorded gateway-side, never forwarded.
         _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
         _field("user", CompatibilityDisposition.METADATA_ONLY),
-        _field("prompt_cache_key", CompatibilityDisposition.METADATA_ONLY),
+        _field("prompt_cache_key", CompatibilityDisposition.CONDITIONALLY_SUPPORTED),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
@@ -230,8 +236,12 @@ honoring the selector is impossible and accepting it would be silent."""
 
 RESPONSES_INPUT_ITEM_FIELDS_ACCEPTED: dict[str, frozenset[str]] = {
     "message": frozenset({"type", "role", "content", "id", "status", "phase"}),
-    "function_call": frozenset({"type", "call_id", "name", "arguments", "id", "status"}),
-    "function_call_output": frozenset({"type", "call_id", "output", "id", "status"}),
+    "function_call": frozenset(
+        {"type", "call_id", "name", "namespace", "caller", "arguments", "id", "status"}
+    ),
+    "function_call_output": frozenset(
+        {"type", "call_id", "output", "name", "namespace", "caller", "id", "status"}
+    ),
     "reasoning": frozenset({"type", "id", "encrypted_content", "summary", "content", "status"}),
 }
 """Echoable input-item fields the Responses decoder models per item type.
@@ -241,21 +251,24 @@ INPUT, so every field this gateway's own output items carry must decode.
 Codex echoes assistant messages with ``phase`` and reasoning items with an
 explicit ``content: null`` (both captured live 2026-08-29); the message
 ``phase`` is retained for replay identity and the null reasoning content
-is validated and dropped like its populated form.
+is validated and dropped like its populated form. ``namespace`` on a
+``function_call`` (and the ``name``/``namespace`` pair on a
+``function_call_output``) attributes the call to its declaring nested tool
+tree and round-trips verbatim: the provider rejects a namespaced call
+replayed without it ("Missing namespace for function_call ..."), which
+wedges every later turn of the session. ``caller`` is SDK 3.0's opaque
+programmatic tool-calling attribution (``{"type": "program", "id": ...}``);
+its internal shape is an evolving provider surface, so it is validated only
+as an object and round-trips verbatim like ``namespace``.
 """
 
 RESPONSES_INPUT_ITEM_FIELDS_REJECTED: dict[str, frozenset[str]] = {
     "message": frozenset(),
-    "function_call": frozenset({"caller", "namespace"}),
-    "function_call_output": frozenset({"caller", "namespace", "name"}),
+    "function_call": frozenset(),
+    "function_call_output": frozenset(),
     "reasoning": frozenset(),
 }
-"""Echoable input-item fields consciously rejected with a named 400.
-
-``caller``/``namespace`` attribute server-tool invocations this gateway does
-not serve, and a ``name`` on a function output duplicates the call linkage
-already carried by ``call_id``.
-"""
+"""Echoable input-item fields consciously rejected with a named 400."""
 
 
 CHAT_CACHE_CONTROL_PLACEMENTS: dict[str, str] = {

@@ -8,12 +8,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from exp.common.core.artifacts import canonical_json_bytes
 from exp.common.models import ModelCapabilities
 from exp.common.models.catalog import (
+    MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS,
     GatewayDeploymentMetadata,
-    GatewayEquivalenceCertification,
     GatewayTokenPrices,
 )
 from exp.common.models.gateway_catalog import (
@@ -21,13 +22,19 @@ from exp.common.models.gateway_catalog import (
     ExactModelPool,
     NormalizedGatewayCatalog,
 )
-from exp.runtime.gateway.budgets import (
+from exp.common.models.gateway_pools import GatewayEquivalenceCertification
+from exp.runtime.gateway.attempt_tokens import (
     DEFAULT_RESERVATION_OUTPUT_TOKENS,
+    worst_case_attempt_tokens,
+    worst_case_input_tokens,
+)
+from exp.runtime.gateway.budgets import (
+    LONG_CONTEXT_TIER_MARGIN_PERCENT,
     BudgetReservationRejected,
     BudgetScope,
     BudgetScopeKind,
     SQLiteBudgetStore,
-    maximum_attempt_cost_micro_usd,
+    maximum_attempt_cost_nano_usd,
 )
 from exp.runtime.gateway.contracts import (
     DirectTarget,
@@ -41,6 +48,8 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
+from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 
@@ -91,8 +100,8 @@ def _deployment(*, priced: bool = True, deployment_id: str = "primary") -> Exact
     """Return one exact deployment with optional hard-limit pricing."""
     prices = (
         GatewayTokenPrices(
-            input_micro_usd_per_million_tokens=1_000_000,
-            output_micro_usd_per_million_tokens=2_000_000,
+            input_nano_usd_per_million_tokens=1_000_000,
+            output_nano_usd_per_million_tokens=2_000_000,
         )
         if priced
         else GatewayTokenPrices()
@@ -183,34 +192,36 @@ def _accepted(
 
 
 def test_maximum_attempt_cost_is_integer_conservative_and_unknown_prices_fail_closed() -> None:
-    """Reservation pricing uses canonical bytes, output ceiling, and no float money."""
+    """Reservation pricing uses the input estimate, output ceiling, and no float money."""
     request = _request("four bytes")
-    known = maximum_attempt_cost_micro_usd(request, _deployment())
+    known = maximum_attempt_cost_nano_usd(request, _deployment())
 
-    assert known is not None and isinstance(known, int) and known > 32
-    assert maximum_attempt_cost_micro_usd(request, _deployment(priced=False)) is None
-    unrepresentable = _deployment().model_copy(
-        update={
-            "gateway": _deployment().gateway.model_copy(
-                update={
-                    "prices": GatewayTokenPrices(
-                        input_micro_usd_per_million_tokens=10**30,
-                        output_micro_usd_per_million_tokens=10**30,
-                    )
-                }
-            )
-        }
+    assert known is not None and isinstance(known, int) and known > 16
+    # A caller that already holds the input estimate prices identically.
+    assert (
+        maximum_attempt_cost_nano_usd(
+            request, _deployment(), input_tokens=worst_case_input_tokens(request)
+        )
+        == known
     )
-    assert maximum_attempt_cost_micro_usd(request, unrepresentable) is None
+    assert maximum_attempt_cost_nano_usd(request, _deployment(priced=False)) is None
+    # A rate the int8 ledger could not carry through a 1M-context request is
+    # refused at AUTHORING (the price models bound every rate), so no ceiling
+    # can ever be unrepresentable; the guard behind it raises by name.
+    with pytest.raises(ValidationError):
+        GatewayTokenPrices(
+            input_nano_usd_per_million_tokens=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS + 1,
+            output_nano_usd_per_million_tokens=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS + 1,
+        )
     all_prices = _deployment().model_copy(
         update={
             "gateway": _deployment().gateway.model_copy(
                 update={
                     "prices": GatewayTokenPrices(
-                        input_micro_usd_per_million_tokens=1_000_000,
-                        cached_input_micro_usd_per_million_tokens=3_000_000,
-                        output_micro_usd_per_million_tokens=2_000_000,
-                        reasoning_micro_usd_per_million_tokens=4_000_000,
+                        input_nano_usd_per_million_tokens=1_000_000,
+                        cached_input_nano_usd_per_million_tokens=3_000_000,
+                        output_nano_usd_per_million_tokens=2_000_000,
+                        reasoning_nano_usd_per_million_tokens=4_000_000,
                     )
                 }
             )
@@ -218,7 +229,7 @@ def test_maximum_attempt_cost_is_integer_conservative_and_unknown_prices_fail_cl
     )
     assert all_prices.gateway.capabilities.reports_cached_input_tokens is False
     assert all_prices.gateway.capabilities.reports_reasoning_tokens is False
-    all_dimensions = maximum_attempt_cost_micro_usd(request, all_prices)
+    all_dimensions = maximum_attempt_cost_nano_usd(request, all_prices)
     assert all_dimensions is not None and all_dimensions > known
 
 
@@ -234,9 +245,9 @@ def test_missing_output_ceiling_reserves_against_the_default_instead_of_failing_
     request = _request("four bytes").model_copy(update={"maximum_output_tokens": None})
     no_ceiling = _deployment().model_copy(update={"capabilities": ModelCapabilities()})
 
-    default_bound = maximum_attempt_cost_micro_usd(request, no_ceiling)
+    default_bound = maximum_attempt_cost_nano_usd(request, no_ceiling)
     assert default_bound is not None and isinstance(default_bound, int) and default_bound > 0
-    explicit_default = maximum_attempt_cost_micro_usd(
+    explicit_default = maximum_attempt_cost_nano_usd(
         request.model_copy(update={"maximum_output_tokens": DEFAULT_RESERVATION_OUTPUT_TOKENS}),
         no_ceiling,
     )
@@ -247,8 +258,8 @@ def test_missing_output_ceiling_reserves_against_the_default_instead_of_failing_
     small_window = _deployment().model_copy(
         update={"capabilities": ModelCapabilities(context_window_tokens=1_024)}
     )
-    windowed = maximum_attempt_cost_micro_usd(request, small_window)
-    explicit_window = maximum_attempt_cost_micro_usd(
+    windowed = maximum_attempt_cost_nano_usd(request, small_window)
+    explicit_window = maximum_attempt_cost_nano_usd(
         request.model_copy(update={"maximum_output_tokens": 1_024}),
         small_window,
     )
@@ -258,7 +269,7 @@ def test_missing_output_ceiling_reserves_against_the_default_instead_of_failing_
 
     # A missing required price still fails closed regardless of the default.
     assert (
-        maximum_attempt_cost_micro_usd(
+        maximum_attempt_cost_nano_usd(
             request,
             _deployment(priced=False).model_copy(update={"capabilities": ModelCapabilities()}),
         )
@@ -270,24 +281,24 @@ def test_huge_caller_output_ceiling_clamps_to_deployment_instead_of_failing_clos
     """A caller output ceiling above the deployment's own is clamped, not None.
 
     Without the clamp a very large caller ``maximum_output_tokens`` inflates the
-    worst case past ``MAXIMUM_MICRO_USD`` and returns ``None``, which fails a
+    worst case past ``MAXIMUM_NANO_USD`` and returns ``None``, which fails a
     perfectly fundable request closed and mis-terminalizes it as a quota refusal.
     The deployment can never emit more than its own ceiling, so the output term
-    clamps to it: the huge request stays a small bounded int, differing from the
-    at-ceiling request only by the extra JSON bytes of the larger literal.
+    clamps to it: the huge request stays a small bounded int and prices exactly
+    like the at-ceiling request (the literal is not prompt text).
     """
     deployment = _deployment()  # ModelCapabilities(maximum_output_tokens=16)
-    bounded = maximum_attempt_cost_micro_usd(_request("four bytes"), deployment)
-    huge = maximum_attempt_cost_micro_usd(
+    bounded = maximum_attempt_cost_nano_usd(_request("four bytes"), deployment)
+    huge = maximum_attempt_cost_nano_usd(
         _request("four bytes").model_copy(update={"maximum_output_tokens": 10**12}),
         deployment,
     )
 
     assert bounded is not None
     assert huge is not None and isinstance(huge, int)
-    # Output is clamped to the ceiling; only the input-byte count of the larger
-    # literal differs, so the two stay within a handful of micro-USD of each other.
-    assert abs(huge - bounded) < 100
+    # Output is clamped to the ceiling and the literal is not prompt text, so
+    # the two price identically.
+    assert huge == bounded
 
 
 def test_concurrent_identity_reservations_never_exceed_hard_limit(tmp_path: Path) -> None:
@@ -298,7 +309,7 @@ def test_concurrent_identity_reservations_never_exceed_hard_limit(tmp_path: Path
         organization_id="org",
         period="2026-08",
         scope=BudgetScope(kind=BudgetScopeKind.IDENTITY, identity_id="identity"),
-        limit_micro_usd=500,
+        limit_nano_usd=500,
     )
     snapshots = [
         _accepted(store, ledger, clock, key, f"concurrent-{index}")[1] for index in range(10)
@@ -311,7 +322,7 @@ def test_concurrent_identity_reservations_never_exceed_hard_limit(tmp_path: Path
             deployment=_deployment(),
             attempt_ordinal=0,
             route_depth=0,
-            maximum_cost_micro_usd=100,
+            maximum_cost_nano_usd=100,
         )
 
     accepted: list[str] = []
@@ -327,8 +338,8 @@ def test_concurrent_identity_reservations_never_exceed_hard_limit(tmp_path: Path
     assert len(accepted) == 5
     assert rejected == 5
     remaining = budgets.remaining(organization_id="org", period="2026-08")[0]
-    assert remaining.reserved_micro_usd == 500
-    assert remaining.remaining_micro_usd == 0
+    assert remaining.reserved_nano_usd == 500
+    assert remaining.remaining_nano_usd == 0
 
 
 def test_configured_optional_prices_are_reserved_even_when_reporting_hints_are_false(
@@ -342,32 +353,32 @@ def test_configured_optional_prices_are_reserved_even_when_reporting_hints_are_f
             "gateway": _deployment().gateway.model_copy(
                 update={
                     "prices": GatewayTokenPrices(
-                        input_micro_usd_per_million_tokens=1_000_000,
-                        cached_input_micro_usd_per_million_tokens=3_000_000,
-                        output_micro_usd_per_million_tokens=2_000_000,
-                        reasoning_micro_usd_per_million_tokens=4_000_000,
+                        input_nano_usd_per_million_tokens=1_000_000,
+                        cached_input_nano_usd_per_million_tokens=3_000_000,
+                        output_nano_usd_per_million_tokens=2_000_000,
+                        reasoning_nano_usd_per_million_tokens=4_000_000,
                     )
                 }
             )
         }
     )
     request, snapshot = _accepted(store, ledger, clock, key, "all-price-dimensions")
-    maximum = maximum_attempt_cost_micro_usd(request, deployment)
+    maximum = maximum_attempt_cost_nano_usd(request, deployment)
     assert maximum is not None
     budgets.set_limit(
         organization_id="org",
         period="2026-08",
         scope=BudgetScope(kind=BudgetScopeKind.TEAM),
-        limit_micro_usd=maximum,
+        limit_nano_usd=maximum,
     )
     attempt = ledger.start_attempt(
         snapshot=snapshot,
         deployment=deployment,
         attempt_ordinal=0,
         route_depth=0,
-        maximum_cost_micro_usd=maximum,
+        maximum_cost_nano_usd=maximum,
     )
-    input_ceiling = len(canonical_json_bytes(request))
+    input_ceiling = worst_case_input_tokens(request)
     ledger.finish_attempt(
         attempt_id=attempt,
         terminal_event=GatewayEvent(
@@ -384,9 +395,9 @@ def test_configured_optional_prices_are_reserved_even_when_reporting_hints_are_f
     )
 
     remaining = budgets.remaining(organization_id="org", period="2026-08")[0]
-    assert remaining.reserved_micro_usd == 0
-    assert remaining.settled_micro_usd == maximum
-    assert remaining.remaining_micro_usd == 0
+    assert remaining.reserved_nano_usd == 0
+    assert remaining.settled_nano_usd == maximum
+    assert remaining.remaining_nano_usd == 0
 
 
 def test_settlement_counts_failures_retries_and_rollover_without_reset(tmp_path: Path) -> None:
@@ -397,7 +408,7 @@ def test_settlement_counts_failures_retries_and_rollover_without_reset(tmp_path:
         organization_id="org",
         period="2026-08",
         scope=BudgetScope(kind=BudgetScopeKind.TEAM),
-        limit_micro_usd=1_000,
+        limit_nano_usd=1_000,
     )
     _request_one, snapshot_one = _accepted(store, ledger, clock, key, "failed-attempt")
     failed = ledger.start_attempt(
@@ -405,7 +416,7 @@ def test_settlement_counts_failures_retries_and_rollover_without_reset(tmp_path:
         deployment=_deployment(),
         attempt_ordinal=0,
         route_depth=0,
-        maximum_cost_micro_usd=300,
+        maximum_cost_nano_usd=300,
     )
     ledger.finish_attempt(
         attempt_id=failed,
@@ -418,13 +429,13 @@ def test_settlement_counts_failures_retries_and_rollover_without_reset(tmp_path:
 
     # A failure without usage can still be billable, so the maximum reservation remains charged.
     august = budgets.remaining(organization_id="org", period="2026-08")[0]
-    assert august.charged_micro_usd == 300
+    assert august.charged_nano_usd == 300
     clock.advance(timedelta(minutes=2))
     budgets.set_limit(
         organization_id="org",
         period="2026-09",
         scope=BudgetScope(kind=BudgetScopeKind.TEAM),
-        limit_micro_usd=1_000,
+        limit_nano_usd=1_000,
     )
     _request_two, snapshot_two = _accepted(store, ledger, clock, key, "completed-attempt")
     completed = ledger.start_attempt(
@@ -432,7 +443,7 @@ def test_settlement_counts_failures_retries_and_rollover_without_reset(tmp_path:
         deployment=_deployment(),
         attempt_ordinal=0,
         route_depth=0,
-        maximum_cost_micro_usd=300,
+        maximum_cost_nano_usd=300,
     )
     ledger.finish_attempt(
         attempt_id=completed,
@@ -444,11 +455,11 @@ def test_settlement_counts_failures_retries_and_rollover_without_reset(tmp_path:
         failure=None,
     )
 
-    assert budgets.remaining(organization_id="org", period="2026-08")[0].charged_micro_usd == 300
+    assert budgets.remaining(organization_id="org", period="2026-08")[0].charged_nano_usd == 300
     september = budgets.remaining(organization_id="org", period="2026-09")[0]
-    assert september.reserved_micro_usd == 0
-    assert september.settled_micro_usd == 20
-    assert september.remaining_micro_usd == 980
+    assert september.reserved_nano_usd == 0
+    assert september.settled_nano_usd == 20
+    assert september.remaining_nano_usd == 980
 
 
 def test_default_limit_reports_unknown_cost_without_blocking_service(tmp_path: Path) -> None:
@@ -461,7 +472,7 @@ def test_default_limit_reports_unknown_cost_without_blocking_service(tmp_path: P
         deployment=_deployment(priced=False),
         attempt_ordinal=0,
         route_depth=0,
-        maximum_cost_micro_usd=None,
+        maximum_cost_nano_usd=None,
     )
     ledger.finish_attempt(
         attempt_id=attempt,
@@ -475,7 +486,7 @@ def test_default_limit_reports_unknown_cost_without_blocking_service(tmp_path: P
         organization_id="org",
         period="2026-08",
         scope=BudgetScope(kind=BudgetScopeKind.TEAM),
-        limit_micro_usd=1_000,
+        limit_nano_usd=1_000,
     )
     _second_request, second_snapshot = _accepted(store, ledger, clock, key, "unknown-second")
 
@@ -484,13 +495,13 @@ def test_default_limit_reports_unknown_cost_without_blocking_service(tmp_path: P
         deployment=_deployment(),
         attempt_ordinal=0,
         route_depth=0,
-        maximum_cost_micro_usd=100,
+        maximum_cost_nano_usd=100,
     )
 
     assert admitted
     remaining = budgets.remaining(organization_id="org", period="2026-08")[0]
     assert remaining.unknown_cost_attempts == 1
-    assert remaining.remaining_micro_usd == 1_000 - 100
+    assert remaining.remaining_nano_usd == 1_000 - 100
     assert not remaining.exhausted
 
 
@@ -504,7 +515,7 @@ def test_default_limit_admits_unpriced_attempts_and_tracks_token_volume(
         organization_id="org",
         period="2026-08",
         scope=BudgetScope(kind=BudgetScopeKind.TEAM),
-        limit_micro_usd=1_000,
+        limit_nano_usd=1_000,
     )
     _request_value, snapshot = _accepted(store, ledger, clock, key, "unpriced-served")
 
@@ -513,7 +524,7 @@ def test_default_limit_admits_unpriced_attempts_and_tracks_token_volume(
         deployment=_deployment(priced=False),
         attempt_ordinal=0,
         route_depth=0,
-        maximum_cost_micro_usd=None,
+        maximum_cost_nano_usd=None,
     )
     ledger.finish_attempt(
         attempt_id=attempt,
@@ -531,7 +542,7 @@ def test_default_limit_admits_unpriced_attempts_and_tracks_token_volume(
     # Reasoning is a subset of output_tokens, so the volume gauge reports the
     # output total once rather than adding the subset a second time.
     assert remaining.unknown_cost_output_tokens == 16
-    assert remaining.remaining_micro_usd == 1_000
+    assert remaining.remaining_nano_usd == 1_000
     assert not remaining.exhausted
 
 
@@ -545,7 +556,7 @@ def test_strict_limit_fails_closed_on_unknown_cost(tmp_path: Path) -> None:
         organization_id="org",
         period="2026-08",
         scope=BudgetScope(kind=BudgetScopeKind.TEAM),
-        limit_micro_usd=1_000,
+        limit_nano_usd=1_000,
         strict_unknown_cost=True,
     )
     _blocked_request, blocked_snapshot = _accepted(store, ledger, clock, key, "strict-blocked")
@@ -556,12 +567,12 @@ def test_strict_limit_fails_closed_on_unknown_cost(tmp_path: Path) -> None:
             deployment=_deployment(),
             attempt_ordinal=0,
             route_depth=0,
-            maximum_cost_micro_usd=100,
+            maximum_cost_nano_usd=100,
         )
     remaining = budgets.remaining(organization_id="org", period="2026-08")[0]
     assert remaining.budget.strict_unknown_cost
     assert remaining.unknown_cost_attempts == 1
-    assert remaining.remaining_micro_usd == 0
+    assert remaining.remaining_nano_usd == 0
     assert remaining.exhausted
 
 
@@ -573,7 +584,7 @@ def test_strict_limit_rejects_new_unpriced_attempts(tmp_path: Path) -> None:
         organization_id="org",
         period="2026-08",
         scope=BudgetScope(kind=BudgetScopeKind.TEAM),
-        limit_micro_usd=1_000,
+        limit_nano_usd=1_000,
         strict_unknown_cost=True,
     )
     _request_value, snapshot = _accepted(store, ledger, clock, key, "strict-unpriced")
@@ -584,7 +595,7 @@ def test_strict_limit_rejects_new_unpriced_attempts(tmp_path: Path) -> None:
             deployment=_deployment(priced=False),
             attempt_ordinal=0,
             route_depth=0,
-            maximum_cost_micro_usd=None,
+            maximum_cost_nano_usd=None,
         )
 
 
@@ -602,7 +613,7 @@ def _unknown_attempt(
         deployment=_deployment(priced=False),
         attempt_ordinal=0,
         route_depth=0,
-        maximum_cost_micro_usd=None,
+        maximum_cost_nano_usd=None,
     )
     ledger.finish_attempt(
         attempt_id=attempt,
@@ -628,14 +639,14 @@ def test_reconcile_unknown_costs_restores_service_with_exact_attribution(
         organization_id="org",
         period="2026-08",
         scope=scope,
-        limit_micro_usd=1_000,
+        limit_nano_usd=1_000,
         strict_unknown_cost=True,
     )
     budgets.set_limit(
         organization_id="org",
         period="2026-08",
         scope=scope,
-        limit_micro_usd=10_000,
+        limit_nano_usd=10_000,
         replace=True,
         strict_unknown_cost=True,
     )
@@ -646,28 +657,28 @@ def test_reconcile_unknown_costs_restores_service_with_exact_attribution(
             deployment=_deployment(),
             attempt_ordinal=0,
             route_depth=0,
-            maximum_cost_micro_usd=100,
+            maximum_cost_nano_usd=100,
         )
 
     reconciled, remaining = budgets.reconcile_unknown_costs(
         organization_id="org",
         period="2026-08",
         scope=scope,
-        assigned_cost_micro_usd=40,
+        assigned_cost_nano_usd=40,
     )
 
     assert reconciled == 2
     assert remaining.unknown_cost_attempts == 0
-    assert remaining.settled_micro_usd == 80
-    assert remaining.remaining_micro_usd == 10_000 - 80
+    assert remaining.settled_nano_usd == 80
+    assert remaining.remaining_nano_usd == 10_000 - 80
     assert not remaining.exhausted
     with sqlite3.connect(tmp_path / "gateway.db") as connection:
         connection.row_factory = sqlite3.Row
         charges = {
-            str(row["attempt_id"]): int(row["settled_micro_usd"])
+            str(row["attempt_id"]): int(row["settled_nano_usd"])
             for row in connection.execute(
                 """
-                SELECT attempt_id, settled_micro_usd FROM gateway_attempt_budget_charges
+                SELECT attempt_id, settled_nano_usd FROM gateway_attempt_budget_charges
                 WHERE budget_id = ?
                 """,
                 (remaining.budget.budget_id,),
@@ -680,17 +691,17 @@ def test_reconcile_unknown_costs_restores_service_with_exact_attribution(
         deployment=_deployment(),
         attempt_ordinal=0,
         route_depth=0,
-        maximum_cost_micro_usd=100,
+        maximum_cost_nano_usd=100,
     )
     assert admitted
     again, unchanged = budgets.reconcile_unknown_costs(
         organization_id="org",
         period="2026-08",
         scope=scope,
-        assigned_cost_micro_usd=40,
+        assigned_cost_nano_usd=40,
     )
     assert again == 0
-    assert unchanged.settled_micro_usd == 80
+    assert unchanged.settled_nano_usd == 80
 
 
 def test_reconcile_requires_an_existing_limit(tmp_path: Path) -> None:
@@ -703,7 +714,7 @@ def test_reconcile_requires_an_existing_limit(tmp_path: Path) -> None:
             organization_id="org",
             period="2026-08",
             scope=BudgetScope(kind=BudgetScopeKind.TEAM),
-            assigned_cost_micro_usd=1,
+            assigned_cost_nano_usd=1,
         )
 
 
@@ -719,18 +730,18 @@ def test_limit_created_midflight_adopts_and_settles_existing_reservation(
         deployment=_deployment(),
         attempt_ordinal=0,
         route_depth=0,
-        maximum_cost_micro_usd=300,
+        maximum_cost_nano_usd=300,
     )
 
     budgets.set_limit(
         organization_id="org",
         period="2026-08",
         scope=BudgetScope(kind=BudgetScopeKind.TEAM),
-        limit_micro_usd=1_000,
+        limit_nano_usd=1_000,
     )
     active = budgets.remaining(organization_id="org", period="2026-08")[0]
-    assert active.reserved_micro_usd == 300
-    assert active.settled_micro_usd == 0
+    assert active.reserved_nano_usd == 300
+    assert active.settled_nano_usd == 0
 
     terminal = GatewayEvent(
         kind=GatewayEventKind.COMPLETED,
@@ -741,9 +752,9 @@ def test_limit_created_midflight_adopts_and_settles_existing_reservation(
     ledger.finish_attempt(attempt_id=attempt, terminal_event=terminal, failure=None)
 
     settled = budgets.remaining(organization_id="org", period="2026-08")[0]
-    assert settled.reserved_micro_usd == 0
-    assert settled.settled_micro_usd == 20
-    assert settled.remaining_micro_usd == 980
+    assert settled.reserved_nano_usd == 0
+    assert settled.settled_nano_usd == 20
+    assert settled.remaining_nano_usd == 980
 
 
 def test_crash_recovery_retains_reservation_and_idempotent_settlement_charges_once(
@@ -756,7 +767,7 @@ def test_crash_recovery_retains_reservation_and_idempotent_settlement_charges_on
         organization_id="org",
         period="2026-08",
         scope=BudgetScope(kind=BudgetScopeKind.TEAM),
-        limit_micro_usd=500,
+        limit_nano_usd=500,
     )
     _request_one, first_snapshot = _accepted(store, ledger, clock, key, "crash")
     ledger.start_attempt(
@@ -764,13 +775,13 @@ def test_crash_recovery_retains_reservation_and_idempotent_settlement_charges_on
         deployment=_deployment(),
         attempt_ordinal=0,
         route_depth=0,
-        maximum_cost_micro_usd=100,
+        maximum_cost_nano_usd=100,
     )
     clock.advance(timedelta(seconds=31))
     assert ledger.reconcile_crashed_requests(cleanup_grace=timedelta(0)) == (0, 1)
     after_crash = budgets.remaining(organization_id="org", period="2026-08")[0]
-    assert after_crash.reserved_micro_usd == 100
-    assert after_crash.remaining_micro_usd == 400
+    assert after_crash.reserved_nano_usd == 100
+    assert after_crash.remaining_nano_usd == 400
 
     _request_two, second_snapshot = _accepted(store, ledger, clock, key, "settle-once")
     settled = ledger.start_attempt(
@@ -778,7 +789,7 @@ def test_crash_recovery_retains_reservation_and_idempotent_settlement_charges_on
         deployment=_deployment(),
         attempt_ordinal=0,
         route_depth=0,
-        maximum_cost_micro_usd=200,
+        maximum_cost_nano_usd=200,
     )
     terminal = GatewayEvent(
         kind=GatewayEventKind.COMPLETED,
@@ -789,10 +800,10 @@ def test_crash_recovery_retains_reservation_and_idempotent_settlement_charges_on
     ledger.finish_attempt(attempt_id=settled, terminal_event=terminal, failure=None)
 
     remaining = budgets.remaining(organization_id="org", period="2026-08")[0]
-    assert remaining.charged_micro_usd == 120
-    assert remaining.reserved_micro_usd == 100
-    assert remaining.settled_micro_usd == 20
-    assert remaining.remaining_micro_usd == 380
+    assert remaining.charged_nano_usd == 120
+    assert remaining.reserved_nano_usd == 100
+    assert remaining.settled_nano_usd == 20
+    assert remaining.remaining_nano_usd == 380
 
 
 def test_migrated_attempts_receive_explicit_period_and_cost_state(tmp_path: Path) -> None:
@@ -805,14 +816,14 @@ def test_migrated_attempts_receive_explicit_period_and_cost_state(tmp_path: Path
         deployment=_deployment(),
         attempt_ordinal=0,
         route_depth=0,
-        maximum_cost_micro_usd=123,
+        maximum_cost_nano_usd=123,
     )
     connection = sqlite3.connect(ledger.database_path)
     try:
         row = connection.execute(
             """
-            SELECT budget_period_start, budget_reserved_micro_usd,
-                   budget_settled_micro_usd
+            SELECT budget_period_start, budget_reserved_nano_usd,
+                   budget_settled_nano_usd
             FROM gateway_attempts WHERE attempt_id = ?
             """,
             (attempt,),
@@ -838,7 +849,7 @@ def test_pool_and_deployment_budget_scopes_require_real_targets(tmp_path: Path) 
             organization_id="org",
             period="2026-08",
             scope=BudgetScope(kind=BudgetScopeKind.POOL, alias_id="coding", pool_id="ghost"),
-            limit_micro_usd=100,
+            limit_nano_usd=100,
         )
     with pytest.raises(ValueError, match="deployment is not in its pool"):
         budgets.set_limit(
@@ -850,13 +861,13 @@ def test_pool_and_deployment_budget_scopes_require_real_targets(tmp_path: Path) 
                 pool_id="pool",
                 deployment_id="ghost",
             ),
-            limit_micro_usd=100,
+            limit_nano_usd=100,
         )
     changed, pool_limit = budgets.set_limit(
         organization_id="org",
         period="2026-08",
         scope=BudgetScope(kind=BudgetScopeKind.POOL, alias_id="coding", pool_id="pool"),
-        limit_micro_usd=100,
+        limit_nano_usd=100,
     )
     assert changed and pool_limit.scope.pool_id == "pool"
     changed, deployment_limit = budgets.set_limit(
@@ -868,7 +879,7 @@ def test_pool_and_deployment_budget_scopes_require_real_targets(tmp_path: Path) 
             pool_id="pool",
             deployment_id="secondary",
         ),
-        limit_micro_usd=100,
+        limit_nano_usd=100,
     )
     assert changed and deployment_limit.scope.deployment_id == "secondary"
 
@@ -893,7 +904,7 @@ def test_retargeted_alias_rejects_previous_pool_scope(tmp_path: Path) -> None:
             organization_id="org",
             period="2026-08",
             scope=BudgetScope(kind=BudgetScopeKind.POOL, alias_id="coding", pool_id="pool"),
-            limit_micro_usd=100,
+            limit_nano_usd=100,
         )
 
 
@@ -923,7 +934,7 @@ def test_deployment_budget_scope_fails_closed_on_tampered_snapshot(tmp_path: Pat
                 pool_id="pool",
                 deployment_id="primary",
             ),
-            limit_micro_usd=100,
+            limit_nano_usd=100,
         )
 
 
@@ -942,17 +953,18 @@ def test_deployment_budget_scope_fails_closed_on_unreadable_snapshot(tmp_path: P
                 pool_id="pool",
                 deployment_id="primary",
             ),
-            limit_micro_usd=100,
+            limit_nano_usd=100,
         )
 
 
 def test_reservation_prices_the_long_context_tier_conservatively() -> None:
-    """The byte bound decides tier exposure fail-safe.
+    """The input estimate decides tier exposure with a documented margin.
 
-    Canonical bytes never undercount tokens, so a request whose bytes stay
-    below the threshold reserves at base rates, while a byte bound at or
-    past the threshold must survive the whole-request premium schedule; a
-    tier missing a required rate unprices the route entirely.
+    The estimate is realistic with headroom, not a bound, so the tier is
+    treated as reachable from ``LONG_CONTEXT_TIER_MARGIN_PERCENT`` below its
+    threshold: inside that band the whole-request premium schedule prices the
+    reservation, below it base rates reserve, and a reachable tier missing a
+    required rate unprices the route entirely.
     """
     from exp.common.models.catalog import GatewayLongContextTier
 
@@ -963,8 +975,8 @@ def test_reservation_prices_the_long_context_tier_conservatively() -> None:
                 "gateway": base.gateway.model_copy(
                     update={
                         "prices": GatewayTokenPrices(
-                            input_micro_usd_per_million_tokens=1_000_000,
-                            output_micro_usd_per_million_tokens=2_000_000,
+                            input_nano_usd_per_million_tokens=1_000_000,
+                            output_nano_usd_per_million_tokens=2_000_000,
                             long_context=tier,
                         )
                     }
@@ -972,40 +984,52 @@ def test_reservation_prices_the_long_context_tier_conservatively() -> None:
             }
         )
 
+    request = _request("x " * 400)
+    input_tokens = worst_case_input_tokens(request)
+    assert input_tokens >= 64
     tier = GatewayLongContextTier(
         input_threshold_tokens=64,
-        input_micro_usd_per_million_tokens=3_000_000,
-        output_micro_usd_per_million_tokens=5_000_000,
+        input_nano_usd_per_million_tokens=3_000_000,
+        output_nano_usd_per_million_tokens=5_000_000,
     )
-    request = _request("x" * 400)
-    input_bytes = len(canonical_json_bytes(request))
-    assert input_bytes >= 64
 
-    flat = maximum_attempt_cost_micro_usd(request, tiered(None))
-    premium = maximum_attempt_cost_micro_usd(request, tiered(tier))
+    flat = maximum_attempt_cost_nano_usd(request, tiered(None))
+    premium = maximum_attempt_cost_nano_usd(request, tiered(tier))
     assert flat is not None and premium is not None
     # 16 output tokens from the deployment ceiling; the premium worst case
     # prices both directions at the tier's higher rates.
-    assert flat == (input_bytes * 1_000_000 + 16 * 2_000_000 + 999_999) // 1_000_000
-    assert premium == (input_bytes * 3_000_000 + 16 * 5_000_000 + 999_999) // 1_000_000
+    assert flat == (input_tokens * 1_000_000 + 16 * 2_000_000 + 999_999) // 1_000_000
+    assert premium == (input_tokens * 3_000_000 + 16 * 5_000_000 + 999_999) // 1_000_000
 
-    # Below the threshold the tier cannot trigger, so base rates reserve.
-    unreachable = tier.model_copy(update={"input_threshold_tokens": input_bytes + 1})
-    assert maximum_attempt_cost_micro_usd(request, tiered(unreachable)) == flat
+    # Just past the estimate the tier is still reachable: the margin band
+    # reserves at premium rates rather than trusting the estimate exactly.
+    within_margin = tier.model_copy(update={"input_threshold_tokens": input_tokens + 1})
+    assert maximum_attempt_cost_nano_usd(request, tiered(within_margin)) == premium
+    band_edge = (input_tokens * 100) // (100 - LONG_CONTEXT_TIER_MARGIN_PERCENT)
+    assert (
+        maximum_attempt_cost_nano_usd(
+            request, tiered(tier.model_copy(update={"input_threshold_tokens": band_edge}))
+        )
+        == premium
+    )
+
+    # Past the margin the tier cannot trigger, so base rates reserve.
+    unreachable = tier.model_copy(update={"input_threshold_tokens": band_edge + 1})
+    assert maximum_attempt_cost_nano_usd(request, tiered(unreachable)) == flat
 
     # A reachable tier with an unknown required rate fails closed.
     unpriced = GatewayLongContextTier(
         input_threshold_tokens=64,
-        input_micro_usd_per_million_tokens=3_000_000,
+        input_nano_usd_per_million_tokens=3_000_000,
     )
-    assert maximum_attempt_cost_micro_usd(request, tiered(unpriced)) is None
+    assert maximum_attempt_cost_nano_usd(request, tiered(unpriced)) is None
 
 
 def test_reservation_counts_excluded_provider_carriers_toward_the_tier_bound() -> None:
     """Serialization-excluded carriers cannot dodge the premium reservation.
 
     Replayed encrypted reasoning is provider-read input excluded from the
-    request's plain serialization; without its envelope bytes a
+    request's plain serialization; without it in the estimate a
     carrier-heavy request could reserve at base rates and settle at the
     premium schedule, overdrawing a hard budget.
     """
@@ -1014,8 +1038,8 @@ def test_reservation_counts_excluded_provider_carriers_toward_the_tier_bound() -
 
     tier = GatewayLongContextTier(
         input_threshold_tokens=2_048,
-        input_micro_usd_per_million_tokens=3_000_000,
-        output_micro_usd_per_million_tokens=5_000_000,
+        input_nano_usd_per_million_tokens=3_000_000,
+        output_nano_usd_per_million_tokens=5_000_000,
     )
     base = _deployment()
     tiered = base.model_copy(
@@ -1023,40 +1047,75 @@ def test_reservation_counts_excluded_provider_carriers_toward_the_tier_bound() -
             "gateway": base.gateway.model_copy(
                 update={
                     "prices": GatewayTokenPrices(
-                        input_micro_usd_per_million_tokens=1_000_000,
-                        output_micro_usd_per_million_tokens=2_000_000,
+                        input_nano_usd_per_million_tokens=1_000_000,
+                        output_nano_usd_per_million_tokens=2_000_000,
                         long_context=tier,
                     )
                 }
             )
         }
     )
-    carried = GatewayRequest(
+    visible = GatewayRequest(
         surface=GatewayApiSurface.RESPONSES,
-        messages=(
-            GatewayMessage(
-                role="assistant",
-                content="tiny",
-                provider_reasoning=(
-                    EncryptedReasoningBlock(
-                        id="rs_carrier",
-                        encrypted_content="A" * 4_096,
-                        output_index=0,
-                    ),
-                ),
-            ),
-        ),
+        messages=(GatewayMessage(role="assistant", content="tiny"),),
         maximum_output_tokens=16,
     )
-    from exp.runtime.gateway.replay_identity import provider_replay_authority
-
-    visible_bytes = len(canonical_json_bytes(carried))
-    assert visible_bytes < 2_048
-    envelope = provider_replay_authority(carried)
-    assert envelope is not None
-    bound = visible_bytes + len(canonical_json_bytes(envelope))
+    carried = visible.model_copy(
+        update={
+            "messages": (
+                visible.messages[0].model_copy(
+                    update={
+                        "provider_reasoning": (
+                            EncryptedReasoningBlock(
+                                id="rs_carrier",
+                                # Sixteen kilobytes of opaque carrier: far past the
+                                # threshold by decoded length, invisible to the
+                                # plain serialization.
+                                encrypted_content="A" * 16_384,
+                                output_index=0,
+                            ),
+                        )
+                    }
+                ),
+            )
+        }
+    )
+    assert worst_case_input_tokens(visible) < 2_048
+    bound = worst_case_input_tokens(carried)
     assert bound >= 2_048
-    # The premium worst case governs because the carrier bytes cross the
+    assert (
+        maximum_attempt_cost_nano_usd(visible, tiered)
+        == (worst_case_input_tokens(visible) * 1_000_000 + 16 * 2_000_000 + 999_999) // 1_000_000
+    )
+    # The premium worst case governs because the carrier crosses the
     # threshold even though the visible serialization stays below it.
     expected = (bound * 3_000_000 + 16 * 5_000_000 + 999_999) // 1_000_000
-    assert maximum_attempt_cost_micro_usd(carried, tiered) == expected
+    assert maximum_attempt_cost_nano_usd(carried, tiered) == expected
+
+
+def test_worst_case_attempt_tokens_matches_over_the_serving_request_union() -> None:
+    """The promo token reservation is match-aware: completions reserve estimated
+    input and clamped output; embeddings and image requests reserve their
+    estimated input and zero completion output."""
+    deployment = _deployment()
+
+    completion_in, completion_out = worst_case_attempt_tokens(_request("four bytes"), deployment)
+    assert completion_in > 0
+    # 16 is the fixture request's maximum_output_tokens, at/under the deployment ceiling.
+    assert completion_out == 16
+
+    embeddings = EmbeddingsRequest(inputs=("hello", "world"))
+    emb_in, emb_out = worst_case_attempt_tokens(embeddings, deployment)
+    assert emb_in == worst_case_input_tokens(embeddings) and emb_in > 0
+    assert emb_out == 0
+    # The embeddings money ceiling prices the same estimate at the input rate.
+    input_rate = deployment.gateway.prices.input_nano_usd_per_million_tokens
+    assert input_rate is not None
+    assert maximum_attempt_cost_nano_usd(embeddings, deployment) == (
+        (emb_in * input_rate + 999_999) // 1_000_000
+    )
+
+    images = ImagesRequest(prompt="a cat")
+    img_in, img_out = worst_case_attempt_tokens(images, deployment)
+    assert img_in == worst_case_input_tokens(images) and img_in > 0
+    assert img_out == 0

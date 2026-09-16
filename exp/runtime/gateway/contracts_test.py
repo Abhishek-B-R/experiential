@@ -7,7 +7,7 @@ from typing import Literal
 import pytest
 from pydantic import ValidationError
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.models.model import ToolCall
 from exp.runtime.gateway.compatibility import (
     CompatibilityDisposition,
@@ -29,6 +29,7 @@ from exp.runtime.gateway.contracts import (
     ProjectTarget,
     StructuredTextFormat,
 )
+from exp.runtime.gateway.replay_identity import canonical_request_sha256
 
 
 def test_gateway_request_preserves_developer_and_raw_tool_history() -> None:
@@ -119,6 +120,33 @@ def test_targets_and_compatibility_manifest_are_closed_and_deterministic() -> No
             surface=GatewayApiSurface.CHAT_COMPLETIONS,
             fields=(manifest.fields[0], manifest.fields[0]),
         )
+
+
+def test_authorization_snapshot_carries_the_trusted_client_ip() -> None:
+    """The optional trusted-hop client IP round-trips and defaults to None."""
+    without_ip = AuthorizationSnapshot(
+        request_id="request-1",
+        organization_id="organization-1",
+        identity_id="identity-1",
+        virtual_key_id="key-1",
+        alias="coding",
+        alias_revision_id="alias-revision-1",
+        target=ProjectTarget(
+            project_ref="support-agent",
+            activation_ref="activation-1",
+            catalog_sha256="a" * 64,
+        ),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        catalog_sha256="a" * 64,
+        canonical_request_sha256="b" * 64,
+        deadline_monotonic=10.0,
+    )
+    assert without_ip.client_ip is None
+
+    with_ip = without_ip.model_copy(update={"client_ip": "198.51.100.9"})
+    assert with_ip.client_ip == "198.51.100.9"
+    restored = AuthorizationSnapshot.model_validate_json(with_ip.model_dump_json())
+    assert restored.client_ip == "198.51.100.9"
 
 
 def test_project_authorization_precedes_route_bound_execution() -> None:
@@ -976,9 +1004,6 @@ def test_service_tier_is_serialization_inert_but_binds_replay_identity() -> None
 
 def test_json_object_output_is_serialization_inert_but_binds_replay_identity() -> None:
     """Mode-free Chat digests are untouched; an enabled JSON mode is its own operation."""
-    from exp.common.core.artifacts import sha256_json
-    from exp.runtime.gateway.replay_identity import canonical_request_sha256
-
     messages = (GatewayMessage(role="user", content="hi"),)
     bare = GatewayRequest(surface=GatewayApiSurface.CHAT_COMPLETIONS, messages=messages)
     json_mode = GatewayRequest(
@@ -1041,4 +1066,115 @@ def test_tool_messages_carry_text_and_image_parts_only() -> None:
                 TextContentPart(text="hi"),
                 ImageContentPart(media_type="image/png", data="aGk="),
             ),
+        )
+
+
+def test_replay_identity_binds_the_function_call_namespace() -> None:
+    """A replayed item differing only by namespace is a different request.
+
+    Namespace-free requests keep their exact pre-existing digest because the
+    field joins the replay envelope only when present.
+    """
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
+
+    def request(*, namespace: str | None) -> GatewayRequest:
+        return GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(
+                GatewayMessage(
+                    role="assistant",
+                    tool_calls=(
+                        ToolCall(
+                            call_id="call-1",
+                            name="spawn_agent",
+                            provider_output_index=0,
+                            provider_namespace=namespace,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    namespaced = request(namespace="collaboration")
+    assert canonical_request_sha256(namespaced) == canonical_request_sha256(
+        request(namespace="collaboration")
+    )
+    assert canonical_request_sha256(namespaced) != canonical_request_sha256(
+        request(namespace="agents")
+    )
+    assert canonical_request_sha256(namespaced) != canonical_request_sha256(request(namespace=None))
+
+
+def test_replay_identity_binds_tool_output_attribution() -> None:
+    """A function_call_output name/namespace pair joins replay identity."""
+    from exp.common.core.artifacts import sha256_json
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
+
+    def request(*, namespace: str | None) -> GatewayRequest:
+        return GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(
+                GatewayMessage(
+                    role="tool",
+                    content="spawned",
+                    tool_call_id="call-1",
+                    provider_tool_name="spawn_agent" if namespace is not None else None,
+                    provider_tool_namespace=namespace,
+                ),
+            ),
+        )
+
+    plain = request(namespace=None)
+    assert canonical_request_sha256(plain) == sha256_json(plain)
+    assert canonical_request_sha256(request(namespace="collaboration")) != canonical_request_sha256(
+        plain
+    )
+
+
+def test_replay_identity_binds_the_function_call_caller() -> None:
+    """A retained SDK 3.0 caller joins replay identity only when present."""
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
+
+    def request(*, caller: JsonObject | None) -> GatewayRequest:
+        return GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(
+                GatewayMessage(
+                    role="assistant",
+                    tool_calls=(
+                        ToolCall(
+                            call_id="call-1",
+                            name="lookup",
+                            provider_output_index=0,
+                            provider_caller=caller,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    program: JsonObject = {"type": "program", "caller_id": "call_prog"}
+    direct: JsonObject = {"type": "direct"}
+    attributed = request(caller=program)
+    assert canonical_request_sha256(attributed) == canonical_request_sha256(request(caller=program))
+    assert canonical_request_sha256(attributed) != canonical_request_sha256(request(caller=direct))
+    assert canonical_request_sha256(attributed) != canonical_request_sha256(request(caller=None))
+
+
+def test_a_tool_result_caller_is_valid_only_on_tool_messages() -> None:
+    """The output-side attribution carrier keeps the tool-role contract."""
+    import pytest as _pytest
+
+    message = GatewayMessage(
+        role="tool",
+        content="ok",
+        tool_call_id="call-1",
+        provider_tool_caller={"type": "direct"},
+    )
+    assert message.provider_tool_caller == {"type": "direct"}
+    with _pytest.raises(ValueError, match="attribution"):
+        GatewayMessage(
+            role="assistant",
+            content="ok",
+            provider_tool_caller={"type": "direct"},
         )

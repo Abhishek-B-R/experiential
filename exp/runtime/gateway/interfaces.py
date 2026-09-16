@@ -40,11 +40,15 @@ class GatewayControlStore(Protocol):
         deadline_monotonic: float,
         app_referer: str | None = None,
         app_title: str | None = None,
+        client_ip: str | None = None,
     ) -> AuthorizationSnapshot:
         """Authenticate, authorize, and freeze authority before route selection.
 
         ``app_referer`` and ``app_title`` carry the caller's OpenRouter-style app identity
         (the ``HTTP-Referer`` and ``X-Title`` request headers) for content-free attribution.
+        ``client_ip`` is the caller IP from the TRUSTED proxy hop (``X-Real-IP``, else the
+        rightmost ``X-Forwarded-For`` entry), frozen onto the snapshot for the hosted
+        authority's per-key IP allow/deny enforcement; ``None`` when unavailable.
         """
         ...
 
@@ -84,9 +88,13 @@ class AttemptLedger(Protocol):
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
-        maximum_cost_micro_usd: int | None = None,
+        maximum_cost_nano_usd: int | None = None,
+        reserved_input_tokens: int | None = None,
+        reserved_output_tokens: int | None = None,
         route_reason: str | None = None,
         fallback_reason: str | None = None,
+        dispatch_reason: str | None = None,
+        preferred_deployment: ExactModelDeployment | None = None,
     ) -> AttemptId:
         """Atomically reserve cost and persist one attempt before provider dispatch."""
         ...

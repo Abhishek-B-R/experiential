@@ -19,10 +19,12 @@ from exp.common.models.content import (
     MAXIMUM_DOCUMENT_NAME_CHARACTERS,
     MAXIMUM_IMAGE_BASE64_BYTES,
     MAXIMUM_VIDEO_BASE64_BYTES,
+    ImageMediaType,
 )
-from exp.common.models.model import ReasoningEffort
+from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort
 from exp.runtime.gateway.reasoning_carrier import MAXIMUM_REASONING_CARRIER_BYTES
 from exp.runtime.openai_protocol.cache_control import EphemeralCacheControl
+from exp.runtime.openai_protocol.reasoning_replay import ReasoningDetail
 
 
 class _WireModel(BaseModel):
@@ -38,15 +40,30 @@ _EchoedItemStatus = Literal["in_progress", "completed", "incomplete"]
 class _TextPart(_WireModel):
     """One supported text-only content part.
 
-    Echoed ``output_text`` parts carry empty ``annotations`` and ``logprobs``
-    arrays (this gateway emits them and callers resend prior output verbatim
-    on continuations); only a populated value is rejected as unsupported.
+    Echoed ``output_text`` parts carry ``annotations`` and ``logprobs``
+    arrays: this gateway emits them and callers resend prior output verbatim
+    on continuations. Hosted web-search answers carry populated annotation
+    objects (URL citations), which are validated shallowly and dropped on
+    replay: the provider derives nothing from echoed display metadata, and
+    the cited text itself rides ``text``. A populated ``logprobs`` echo stays
+    rejected because this gateway never emits one.
     """
 
     type: Literal["text", "input_text", "output_text"]
     text: str
-    annotations: tuple[()] | None = None
+    annotations: tuple[JsonObject, ...] | None = None
     logprobs: tuple[()] | None = None
+
+    @field_validator("annotations")
+    @classmethod
+    def _require_typed_annotations(
+        cls, value: tuple[JsonObject, ...] | None
+    ) -> tuple[JsonObject, ...] | None:
+        """Require each echoed annotation to be a typed object."""
+        for annotation in value or ():
+            if not isinstance(annotation.get("type"), str) or not annotation["type"]:
+                raise ValueError("each annotation must carry a non-empty type")
+        return value
 
 
 _ImageDetail = Literal["auto", "low", "high"]
@@ -57,10 +74,16 @@ _MAXIMUM_IMAGE_URL_CHARACTERS = MAXIMUM_IMAGE_BASE64_BYTES + 128
 
 
 class _ChatImageUrl(_WireModel):
-    """Chat Completions image reference: a remote URL or a base64 data URL."""
+    """Chat Completions image reference: a remote URL or a base64 data URL.
+
+    Copilot includes ``media_type`` as a MIME hint for uploaded images. It
+    is validated and discarded: the URL or its embedded data-URL media type
+    defines the image, so the hint never rewrites content or replay identity.
+    """
 
     url: str = Field(min_length=1, max_length=_MAXIMUM_IMAGE_URL_CHARACTERS)
     detail: _ImageDetail | None = None
+    media_type: ImageMediaType | None = None
 
 
 class _ChatImagePart(_WireModel):
@@ -72,6 +95,17 @@ class _ChatImagePart(_WireModel):
 
 _MAXIMUM_FILE_ID_CHARACTERS = 512
 """Longest OpenAI Files handle accepted on the wire."""
+
+
+_MAXIMUM_DESCRIPTION_CHARACTERS = 65_536
+"""Tool, function, and structured-format description bound, both surfaces.
+
+Matches the Messages surface and the canonical GatewayToolDefinition bound.
+The provider itself accepts far larger values (probed live 2026-09-05,
+api.openai.com: 8,292, 30,000, and 66,000-character descriptions all
+serve), and real agent toolsets exceeded the earlier 8,192 bound (prod
+report: an 8,292-character tool description 400d every agentic turn). The
+request-body size cap remains the effective total limit."""
 
 
 class _ResponsesImagePart(_WireModel):
@@ -227,10 +261,19 @@ class _AssistantToolCall(_WireModel):
     carried for the one wire that can honor it.
     """
 
-    id: str = Field(min_length=1, max_length=256)
+    id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
     type: Literal["function"] = "function"
     function: _FunctionCall
     cache_control: EphemeralCacheControl | None = None
+    index: int | None = Field(default=None, ge=0)
+    """Streaming delta ordinal, validated and dropped.
+
+    Accumulators that assemble an assistant message from ``tool_calls``
+    stream deltas keep the delta's ``index`` on the finished call and replay
+    it with the message; OpenAI ignores it on a request (2,069 rejections
+    across 99 organizations in the 7 days to 2026-09-15). It orders nothing
+    here: the array position already does.
+    """
 
 
 class _Message(_WireModel):
@@ -241,20 +284,55 @@ class _Message(_WireModel):
     keys even when they are empty. Callers echo those messages back verbatim
     on tool-call continuations, so the empty forms are accepted here; only a
     populated value is rejected as unsupported.
+
+    LiteLLM's ``Message.model_dump()`` adds ``provider_specific_fields``,
+    ``thinking_blocks``, ``reasoning_items``, and ``images`` to every
+    assistant message, and agent loops built on it (a Terminus-2 port that
+    keeps the LiteLLM message object) echo the whole dump back each turn.
+    ``provider_specific_fields`` is accepted with any object value and never
+    forwarded (a populated one is disclosed as dropped: it is LiteLLM's own
+    bookkeeping, not model input); the other three are accepted only empty,
+    exactly like the SDK keys above.
     """
 
     role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | tuple[_ContentPart, ...] | None = None
     tool_calls: tuple[_AssistantToolCall, ...] | None = None
-    tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
+    tool_call_id: str | None = Field(
+        default=None, min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS
+    )
+    name: str | None = Field(default=None, min_length=1, max_length=256)
+    """Tool function name on a ``role: "tool"`` message.
+
+    The legacy ``role: "function"`` attribution many agent frameworks
+    (hermes-agent among them) still send on every tool result; the provider
+    serves it (probed live 2026-09-05, api.openai.com), and the field is
+    baked into caller history, so rejecting it wedges whole sessions. It
+    round-trips verbatim on OpenAI-family wires and drops with disclosure
+    elsewhere. Other roles keep the named rejection.
+    """
     refusal: None = None
     annotations: tuple[()] | None = None
     audio: None = None
     function_call: None = None
+    provider_specific_fields: JsonObject | None = None
+    thinking_blocks: tuple[()] | None = None
+    reasoning_items: tuple[()] | None = None
+    images: tuple[()] | None = None
     reasoning_content: str | None = Field(
         default=None,
         max_length=MAXIMUM_REASONING_CARRIER_BYTES,
     )
+    reasoning: str | None = Field(default=None, max_length=MAXIMUM_REASONING_CARRIER_BYTES)
+    """OpenRouter's plaintext reasoning on a replayed assistant turn.
+
+    OpenRouter returns the model's reasoning as ``message.reasoning`` and
+    documents passing it back on the next turn; the gateway folds it onto
+    the same plaintext replay path as ``reasoning_content``
+    (:mod:`exp.runtime.openai_protocol.reasoning_replay`).
+    """
+    reasoning_details: tuple[ReasoningDetail, ...] | None = None
+    """OpenRouter's structured reasoning blocks on a replayed assistant turn."""
 
     @property
     def image_capable_parts(self) -> tuple[_ContentPart, ...]:
@@ -269,20 +347,44 @@ class _Message(_WireModel):
     @model_validator(mode="after")
     def _require_role_fields(self) -> _Message:
         """Require tool linkage and assistant calls on their legal roles."""
-        if self.role == "assistant" and self.content is None and not self.history_tool_calls:
-            raise ValueError("assistant messages need content or tool calls")
+        if (
+            self.role == "assistant"
+            and self.content is None
+            and not self.history_tool_calls
+            and self.reasoning_content is None
+            and self.reasoning is None
+            and not self.reasoning_details
+        ):
+            # A reasoning-only assistant turn is a shape the gateway itself
+            # returns (an exposed rung's length-cut thinking turn: content null,
+            # plaintext reasoning_content) and the provider accepts back.
+            raise ValueError("assistant messages need content, tool calls, or reasoning_content")
         if self.role == "tool" and self.tool_call_id is None:
             raise ValueError("tool messages require tool_call_id")
         if self.role != "tool" and self.tool_call_id is not None:
             raise ValueError("tool_call_id is valid only for tool messages")
+        if self.role != "tool" and self.name is not None:
+            raise ValueError("name is valid only for tool messages")
         if self.role != "assistant" and self.history_tool_calls:
             raise ValueError("tool_calls are valid only for assistant messages")
-        if self.role != "assistant" and self.reasoning_content is not None:
-            raise ValueError("reasoning_content is valid only for assistant messages")
-        if self.role != "user" and any(
-            not isinstance(part, _TextPart) for part in self.image_capable_parts
+        if self.role != "assistant" and (
+            self.reasoning_content is not None
+            or self.reasoning is not None
+            or self.reasoning_details is not None
         ):
-            raise ValueError("image, video, and audio parts are valid only for user messages")
+            raise ValueError(
+                "reasoning_content, reasoning, and reasoning_details are valid only "
+                "for assistant messages"
+            )
+        # Tool results carry images (agents report screenshots there); other roles stay text-only.
+        media = {type(part) for part in self.image_capable_parts} - {_TextPart}
+        if media and self.role not in ("user", "tool"):
+            raise ValueError(
+                "image, video, and audio parts are valid only for user messages "
+                "(a tool message may carry image parts beside its text)"
+            )
+        if self.role == "tool" and media - {_ChatImagePart, _ResponsesImagePart}:
+            raise ValueError("tool messages carry only text and image parts")
         call_ids = tuple(call.id for call in self.history_tool_calls)
         if len(call_ids) != len(set(call_ids)):
             raise ValueError("assistant tool call IDs must be unique")
@@ -318,7 +420,7 @@ class _FunctionDefinition(_WireModel):
     """One function schema offered through Chat Completions."""
 
     name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=8_192)
+    description: str | None = Field(default=None, max_length=_MAXIMUM_DESCRIPTION_CHARACTERS)
     parameters: JsonObject = Field(default_factory=dict)
     strict: bool = False
 
@@ -334,7 +436,7 @@ class _StructuredSchema(_WireModel):
     """Named strict JSON Schema in a Chat response format."""
 
     name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=8_192)
+    description: str | None = Field(default=None, max_length=_MAXIMUM_DESCRIPTION_CHARACTERS)
     schema_: JsonObject = Field(alias="schema")
     strict: bool = True
 
@@ -365,22 +467,42 @@ class _ChatStreamOptions(_WireModel):
 
 
 class _ChatReasoning(_WireModel):
-    """Nested ``reasoning`` object on a Chat request (the Responses shape some
-    clients also send on /v1/chat/completions). Translated to the canonical flat
-    ``reasoning_effort``; only ``effort`` is accepted here."""
+    """Nested ``reasoning`` object on a Chat request.
+
+    The Responses-style ``effort`` some clients send on /v1/chat/completions,
+    plus OpenRouter's unified reasoning object (``enabled``, ``max_tokens``,
+    ``exclude``; docs "Reasoning Tokens", read 2026-09-15). All are translated
+    to the canonical reasoning control at decode; ``effort`` and ``max_tokens``
+    are mutually exclusive there as on OpenRouter.
+    """
 
     effort: ReasoningEffort | None = None
+    enabled: bool | None = None
+    max_tokens: int | None = Field(default=None, gt=0)
+    exclude: bool | None = None
+
+    @model_validator(mode="after")
+    def _require_one_depth_control(self) -> _ChatReasoning:
+        """Reject an effort tier beside a token budget (OpenRouter's own rule)."""
+        if self.effort is not None and self.max_tokens is not None:
+            raise ValueError("reasoning.effort and reasoning.max_tokens are mutually exclusive")
+        return self
 
 
 class _ThinkingConfig(_WireModel):
-    """Anthropic-style ``thinking`` enable/disable config on a Chat request.
+    """Anthropic-style ``thinking`` config on a Chat request.
 
-    Translated to the canonical reasoning control: ``enabled`` turns thinking on
-    at the model's default effort, ``disabled`` maps to ``reasoning_effort=none``.
-    ``budget_tokens`` has no canonical equivalent and is disclosed as not carried.
+    Translated to the canonical reasoning control: ``enabled`` and ``adaptive``
+    turn thinking on at the model's default effort (``adaptive`` is the only
+    on-mode Anthropic's 4.6+ generation accepts, and the value Anthropic SDKs
+    and Claude-configured clients send on every model), ``disabled`` maps to
+    ``reasoning_effort=none``. ``budget_tokens`` has no canonical equivalent
+    and is disclosed as not carried. 3,935 Chat requests over 7 days (19
+    organizations, Claude and MiniMax routes alike) were refused at decode for
+    sending ``adaptive`` before it was admitted here (2026-09-15).
     """
 
-    type: Literal["enabled", "disabled"]
+    type: Literal["enabled", "disabled", "adaptive"]
     budget_tokens: int | None = Field(default=None, ge=0)
 
 
@@ -454,6 +576,11 @@ class _ChatRequest(_WireModel):
     reasoning: _ChatReasoning | None = None
     thinking: _ThinkingConfig | None = None
     chat_template_kwargs: _ChatTemplateKwargs | None = None
+    enable_thinking: bool | None = None
+    """DashScope's top-level enable-thinking switch (``extra_body``), translated
+    like the vLLM ``chat_template_kwargs`` spelling: Qwen-family clients send it
+    on every request (4,658 rejections across 110 organizations in the 7 days
+    to 2026-09-15)."""
     response_format: _ChatResponseFormat | None = None
     stream: bool = False
     stream_options: _ChatStreamOptions | None = None
@@ -475,71 +602,12 @@ class _ChatRequest(_WireModel):
         return self
 
 
-class _EmbeddingsRequest(_WireModel):
-    """Closed gateway embeddings request profile.
-
-    ``input`` narrows the official OpenAI union to text only: the token-array
-    forms (``list[int]`` / ``list[list[int]]``) pass official validation but
-    are rejected here with a field-specific 400, since this surface serves
-    visible text, not pre-tokenized ids.
-    """
-
-    model: str = Field(min_length=1, max_length=256)
-    input: str | tuple[str, ...]
-    dimensions: int | None = Field(default=None, gt=0)
-    encoding_format: Literal["float", "base64"] | None = None
-    user: str | None = Field(default=None, max_length=1024)
-
-    @field_validator("input")
-    @classmethod
-    def _require_nonempty_input(cls, value: str | tuple[str, ...]) -> str | tuple[str, ...]:
-        """Reject empty text, an empty array, or empty array members."""
-        if isinstance(value, str):
-            if not value:
-                raise ValueError("input must not be an empty string")
-            return value
-        if not value:
-            raise ValueError("input must not be an empty array")
-        if any(not text for text in value):
-            raise ValueError("input array must not contain empty strings")
-        return value
-
-
-class _ImagesRequest(_WireModel):
-    """Closed gateway image-generation request profile (OpenAI Images API)."""
-
-    model: str = Field(min_length=1, max_length=256)
-    prompt: str = Field(min_length=1, max_length=32_000)
-    n: int | None = Field(default=None, ge=1, le=10)
-    size: (
-        Literal[
-            "auto",
-            "256x256",
-            "512x512",
-            "1024x1024",
-            "1536x1024",
-            "1024x1536",
-            "1792x1024",
-            "1024x1792",
-        ]
-        | None
-    ) = None
-    quality: Literal["standard", "hd", "low", "medium", "high", "auto"] | None = None
-    background: Literal["transparent", "opaque", "auto"] | None = None
-    output_format: Literal["png", "jpeg", "webp"] | None = None
-    output_compression: int | None = Field(default=None, ge=0, le=100)
-    moderation: Literal["low", "auto"] | None = None
-    response_format: Literal["url", "b64_json"] | None = None
-    style: Literal["vivid", "natural"] | None = None
-    user: str | None = Field(default=None, max_length=1024)
-
-
 class _ResponseTool(_WireModel):
     """Responses API function tool declaration."""
 
     type: Literal["function"] = "function"
     name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=8_192)
+    description: str | None = Field(default=None, max_length=_MAXIMUM_DESCRIPTION_CHARACTERS)
     parameters: JsonObject = Field(default_factory=dict)
     strict: bool | None = None
 
@@ -573,15 +641,27 @@ class _ResponseFunctionCall(_WireModel):
     """Completed Responses function call included as assistant history.
 
     ``id`` and ``status`` arrive on verbatim echoes of prior output items
-    and are accepted and dropped; ``call_id`` is the linkage that matters.
+    and are retained for exact replay; ``call_id`` is the linkage that
+    matters. ``namespace`` attributes the call to the nested tool tree that
+    declared it (the ``namespace`` declarations carried by
+    ``GatewayProviderNativeTool``) and must round-trip verbatim: the
+    provider rejects a namespaced call replayed without it ("Missing
+    namespace for function_call .... Round-trip the model's function_call
+    item with its namespace field included."), which wedges every later
+    turn of the session because the item is baked into history.
     """
 
     type: Literal["function_call"]
     id: str | None = Field(default=None, min_length=1, max_length=256)
-    call_id: str = Field(min_length=1, max_length=256)
+    call_id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
     name: str = Field(min_length=1, max_length=256)
+    namespace: str | None = Field(default=None, min_length=1, max_length=256)
+    caller: JsonObject | None = None
+    """Opaque SDK 3.0 programmatic tool-calling attribution (for example
+    ``{"type": "program", "id": ...}``); an evolving provider surface, so it
+    is validated only as an object and round-trips verbatim like
+    ``namespace``."""
     arguments: str = Field(max_length=4_000_000)
-    id: str | None = Field(default=None, min_length=1, max_length=256)
     status: _EchoedItemStatus | None = None
 
 
@@ -590,11 +670,26 @@ class _ResponseFunctionOutput(_WireModel):
 
     ``id`` and ``status`` arrive when a stored turn's input items are
     re-listed and echoed; accepted and dropped like the other echo markers.
+    ``name`` and ``namespace`` attribute the result to a namespaced tool
+    (Codex serializes both on outputs of namespaced calls) and round-trip
+    verbatim like the sibling ``function_call`` namespace.
+
+    ``output`` is the SDK union: plain text, or an ordered list of content
+    parts for tools that return images beside text. The decoder maps a part
+    list onto the canonical tool message's content parts (text and image
+    only, the tool-message contract); any other part kind is rejected by
+    name rather than dropped.
     """
 
     type: Literal["function_call_output"]
-    call_id: str = Field(min_length=1, max_length=256)
-    output: str
+    call_id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
+    name: str | None = Field(default=None, min_length=1, max_length=256)
+    namespace: str | None = Field(default=None, min_length=1, max_length=256)
+    caller: JsonObject | None = None
+    """Opaque SDK 3.0 attribution of this result to the program that invoked
+    the call; validated only as an object and round-tripped verbatim like the
+    sibling ``function_call`` caller."""
+    output: str | tuple[_ContentPart, ...]
     id: str | None = Field(default=None, min_length=1, max_length=256)
     status: _EchoedItemStatus | None = None
 
@@ -623,11 +718,21 @@ class _ResponseReasoningItem(_WireModel):
     reasoning output items with an explicit ``content: null`` (captured
     live 2026-08-29); the provider accepts that null while rejecting a
     null ``summary``, so exactly ``content`` is nullable here.
+
+    ``encrypted_content`` itself is OPTIONAL, as the SDK marks it: a
+    ``store: true`` flow replays reasoning by item id alone and the
+    provider resolves it from stored state. An id-only item is carried
+    verbatim to homogeneous native Responses routes (the only wire that
+    can resolve the id) and the provider judges resolvability with its own
+    error — the hosted-item posture. Verified live 2026-09-05
+    (api.openai.com, gpt-5.1): a stored response's reasoning item replayed
+    by id with no encrypted_content completed with 200 under BOTH
+    ``store: true`` and ``store: false``.
     """
 
     type: Literal["reasoning"]
     id: str = Field(min_length=1, max_length=256)
-    encrypted_content: str = Field(min_length=1)
+    encrypted_content: str | None = Field(default=None, min_length=1)
     summary: tuple[_ReasoningSummaryPart, ...] = ()
     content: tuple[_ReasoningTextPart, ...] | None = None
     status: _EchoedItemStatus | None = None
@@ -638,7 +743,7 @@ class _ResponseFormat(_WireModel):
 
     type: Literal["text", "json_schema"]
     name: str | None = Field(default=None, min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=8_192)
+    description: str | None = Field(default=None, max_length=_MAXIMUM_DESCRIPTION_CHARACTERS)
     schema_: JsonObject | None = Field(default=None, alias="schema")
     strict: bool = True
 
@@ -689,23 +794,37 @@ class _AdditionalToolsItem(_WireModel):
     has no cross-wire representation, so validation is deliberately shallow
     and the raw item forwards byte-for-byte on native Responses rungs only
     (captured live from Codex 0.151.0 and accepted by the provider with a
-    plain API key, 2026-08-29).
+    plain API key, 2026-08-29). ``tools`` may be EMPTY: Codex's Apps
+    integration ships the item with ``tools: []`` when the connected app
+    exposes no tools (observed 2026-09-07 after an app reconnect), and the
+    provider accepts that shape; requiring one entry turned every such turn
+    into a 400 that no other wire produces.
     """
 
     type: Literal["additional_tools"]
     id: str | None = Field(default=None, min_length=1, max_length=256)
     role: str | None = Field(default=None, max_length=64)
-    tools: tuple[JsonValue, ...] = Field(min_length=1)
+    tools: tuple[JsonValue, ...]
 
 
 class _CustomToolCall(_WireModel):
-    """One freeform (custom) tool call echoed as assistant history."""
+    """One freeform (custom) tool call echoed as assistant history.
+
+    ``namespace`` attributes the call to its declaring nested tool tree and
+    forwards verbatim with the rest of the raw item (the whole item replays
+    byte-for-byte on native Responses rungs), mirroring the typed
+    ``function_call`` namespace round trip.
+    """
 
     type: Literal["custom_tool_call"]
     id: str | None = Field(default=None, min_length=1, max_length=256)
     status: _EchoedItemStatus | None = None
-    call_id: str = Field(min_length=1, max_length=256)
+    call_id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
     name: str = Field(min_length=1, max_length=256)
+    namespace: str | None = Field(default=None, min_length=1, max_length=256)
+    caller: JsonObject | None = None
+    """Opaque SDK 3.0 programmatic tool-calling attribution, forwarded
+    verbatim with the rest of the raw item like ``namespace``."""
     input: str = Field(max_length=4_000_000)
 
 
@@ -715,8 +834,81 @@ class _CustomToolCallOutput(_WireModel):
     type: Literal["custom_tool_call_output"]
     id: str | None = Field(default=None, min_length=1, max_length=256)
     status: _EchoedItemStatus | None = None
-    call_id: str = Field(min_length=1, max_length=256)
+    call_id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
     output: JsonValue
+
+
+HOSTED_TOOL_ITEM_TYPES_ASSISTANT = frozenset(
+    {
+        "web_search_call",
+        "file_search_call",
+        "code_interpreter_call",
+        "computer_call",
+        "image_generation_call",
+        "local_shell_call",
+        "shell_call",
+        "apply_patch_call",
+        "mcp_call",
+        "mcp_list_tools",
+        "mcp_approval_request",
+        "tool_search_call",
+        "tool_search_output",
+        "program",
+        "program_output",
+        "compaction",
+    }
+)
+"""Provider-authored hosted-tool and opaque conversation output items."""
+
+HOSTED_TOOL_ITEM_TYPES_TOOL = frozenset(
+    {
+        "computer_call_output",
+        "local_shell_call_output",
+        "shell_call_output",
+        "apply_patch_call_output",
+        "mcp_approval_response",
+    }
+)
+"""Caller-authored results answering a hosted or locally executed call."""
+
+
+class _HostedToolItemEcho(BaseModel):
+    """One hosted-tool Responses item echoed as input history.
+
+    Hosted tools (web search, MCP, code interpreter, ...) execute at the
+    provider, whose item vocabulary exists on no other wire, so validation is
+    deliberately shallow (mirroring ``_AdditionalToolsItem``) and the raw
+    caller item forwards byte-for-byte on native Responses rungs only; every
+    other rung rejects it by name. The type set is the documented output-item
+    union beyond the typed models above (openai-python 3.x, 2026-09-04).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal[
+        "web_search_call",
+        "file_search_call",
+        "code_interpreter_call",
+        "computer_call",
+        "computer_call_output",
+        "image_generation_call",
+        "local_shell_call",
+        "local_shell_call_output",
+        "shell_call",
+        "shell_call_output",
+        "apply_patch_call",
+        "apply_patch_call_output",
+        "mcp_call",
+        "mcp_list_tools",
+        "mcp_approval_request",
+        "mcp_approval_response",
+        "tool_search_call",
+        "tool_search_output",
+        "program",
+        "program_output",
+        "compaction",
+    ]
+    id: str | None = Field(default=None, min_length=1, max_length=256)
 
 
 _ResponsesOutputItem = Annotated[
@@ -725,7 +917,8 @@ _ResponsesOutputItem = Annotated[
     | _ResponseReasoningItem
     | _AdditionalToolsItem
     | _CustomToolCall
-    | _CustomToolCallOutput,
+    | _CustomToolCallOutput
+    | _HostedToolItemEcho,
     Field(discriminator="type"),
 ]
 _ResponsesInputItem = _ResponseMessage | _ResponsesOutputItem

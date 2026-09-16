@@ -58,6 +58,7 @@ impl EmbeddingsAdmission {
             maximum_total_attempts: self.maximum_total_attempts.max(1),
             maximum_same_deployment_attempts: self.maximum_same_deployment_attempts.max(1),
             refusal_failover: false,
+            throttle_redial: None,
         }
     }
 }
