@@ -216,7 +216,7 @@ def test_activation_and_recovery_preserve_apple_metadata(state: helper.HostsStat
         ],
         check=True,
     )
-    os.chflags(hosts, stat.UF_NODUMP)
+    subprocess.run(["/bin/chflags", "nodump", str(hosts)], check=True)
     subprocess.run(["/bin/chmod", "+a", "everyone allow read", str(hosts)], check=True)
 
     def acl() -> list[bytes]:
@@ -233,18 +233,25 @@ def test_activation_and_recovery_preserve_apple_metadata(state: helper.HostsStat
         )
         return result.stdout.rstrip(b"\n")
 
+    def flags() -> int:
+        """Read macOS file flags without exposing platform-specific Python types to Linux."""
+        result = subprocess.run(
+            ["/usr/bin/stat", "-f", "%f", str(hosts)], capture_output=True, check=True
+        )
+        return int(result.stdout)
+
     original_acl = acl()
     assert original_acl
     before = hosts.read_bytes()
     with state.locked():
         state.activate(DOMAINS)
         assert attribute() == b"managed-device-metadata"
-        assert hosts.stat().st_flags & stat.UF_NODUMP
+        assert flags() & stat.UF_NODUMP
         assert acl() == original_acl
         assert state.recover()
         assert hosts.read_bytes() == before
         assert attribute() == b"managed-device-metadata"
-        assert hosts.stat().st_flags & stat.UF_NODUMP
+        assert flags() & stat.UF_NODUMP
         assert acl() == original_acl
 
 
