@@ -216,7 +216,7 @@ def test_activation_and_recovery_preserve_apple_metadata(state: helper.HostsStat
         ],
         check=True,
     )
-    subprocess.run(["/bin/chflags", "nodump", str(hosts)], check=True)
+    subprocess.run(["/usr/bin/chflags", "nodump", str(hosts)], check=True)
     subprocess.run(["/bin/chmod", "+a", "everyone allow read", str(hosts)], check=True)
 
     def acl() -> list[bytes]:
