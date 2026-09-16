@@ -706,19 +706,6 @@ under a 250 ms budget so throttle failover stays near-immediate: OpenAI's `insuf
 which window closed); the public throttle error is unchanged. A frame with a non-array `choices` stays
 malformed and its reason names the frame's sorted key names (never a value).
 
-**A 4xx that says the ACCOUNT cannot pay is `provider_quota`, and a relay's decode-failure sentence is unwrapped.**
-Novita answers a drained prepaid balance as `400 "Insufficient quota available for instant inference"`; a status-only
-read filed it as the caller's `invalid_request`. A pre-stream 4xx whose code is a quota token or whose sentence carries
-unambiguous funding wording (`rejected_by_account_quota`: insufficient quota/balance/credits/funds, not enough balance,
-exceeded your current quota — no bare "billing") now takes the quota class, fails over, and keeps the sentence
-ledger-only. Separately, Novita's Responses relay sometimes cannot decode the UPSTREAM error it received ("failed to
-decode error response: json: cannot unmarshal number into Go struct field ResponseError.error.code of type string,
-raw: {…}") and answers its own 400 with the upstream document embedded after `raw: `; pre-stream and in-stream alike
-the engine reads that document (`relayed_decode_failure`, a zero code is "no code", a truncated document still yields
-its message), classifies by the UPSTREAM code and sentence (a relayed 429 throttles and fails over; a relayed caller
-error keeps this status's caller class), and relays the upstream sentence — "Exceeded maximum number of images (50)
-allowed in the request." — instead of the decoder's noise.
-
 **Sampling controls a route cannot carry are dropped with disclosure, not refused.** A
 `temperature` or `top_p` sent to a route where some rung's provider rejects the field outright (a
 reasoning model such as GPT-6 Astra) is dropped and disclosed (`temperature->dropped(unsupported_by_provider)`)
