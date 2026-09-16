@@ -15,6 +15,7 @@ from typing import cast
 from exp.common.core.artifacts import JsonObject, stable_id
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
     GatewayFailure,
@@ -165,11 +166,14 @@ def ledger_failure(failure: GatewayFailure) -> GatewayFailure:
 
 def terminal_from_settlement(
     data: JsonObject,
+    *,
+    surface: GatewayApiSurface | None = None,
 ) -> tuple[GatewayEvent, GatewayFailure | None]:
     """Build a durable terminal event from one native settlement payload.
 
     Args:
         data: Parsed outcome, usage, tool names, and optional failure.
+        surface: Frozen request surface for internal decision rejection evidence.
 
     Returns:
         The normalized terminal event and optional failure.
@@ -219,6 +223,13 @@ def terminal_from_settlement(
         sequence_number=0,
         usage=_credible_usage(kind, usage),
         failure=failure if kind == GatewayEventKind.FAILED else None,
+        decision_provider_rejected=(
+            surface is GatewayApiSurface.DECISIONS
+            and kind is GatewayEventKind.FAILED
+            and usage is None
+            and data.get("opened") is False
+            and data.get("decision_provider_rejected") is True
+        ),
     )
     return terminal, failure
 

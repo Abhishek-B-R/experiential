@@ -101,6 +101,12 @@ class GatewayEvent(ContractModel):
     tool_call: ToolCall | None = None
     usage: GatewayUsage | None = None
     failure: GatewayFailure | None = None
+    decision_provider_rejected: bool = Field(default=False, exclude=True, strict=True)
+    """Internal decision settlement evidence that an HTTP rejection preceded execution.
+
+    False leaves unmetered decision work financially unresolved. This is not
+    provider token usage and never joins serialized events or replay identity.
+    """
 
     @model_validator(mode="after")
     def _require_event_payload(self) -> GatewayEvent:

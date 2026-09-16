@@ -8,6 +8,7 @@ from pydantic import Field, field_validator
 
 from exp.common.core.artifacts import ContractModel
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
+from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.ledger_valuation import require_representable_nano_usd
 
@@ -63,7 +64,7 @@ class EmbeddingsRequest(ContractModel):
         return value
 
 
-ServingRequest = GatewayRequest | EmbeddingsRequest | ImagesRequest
+ServingRequest = GatewayRequest | EmbeddingsRequest | ImagesRequest | DecisionRequest
 """One admitted serving request across every public surface.
 
 The money, auth, and accounting seams widen from ``GatewayRequest`` to this
