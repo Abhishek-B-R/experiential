@@ -138,6 +138,8 @@ class ClaasWorldModel:
         if len(sources) != len(grounding) or set(sources) != set(expected):
             raise ValueError("world-model grounding must match the scenario's exact source IDs")
         for identity, source in sources.items():
+            if source.provenance.source_kind != "traffic":
+                raise ValueError("world-model grounding requires observed traffic sources")
             if source.scope != scenario.scope or sha256_json(source) != expected[identity]:
                 raise ValueError(
                     "world-model grounding scope or digest differs from scenario evidence"

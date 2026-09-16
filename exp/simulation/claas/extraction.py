@@ -184,14 +184,16 @@ def tool_results(experience: Experience) -> tuple[ObservedToolResult, ...]:
                 structured = json.loads(content)
             except ValueError:
                 structured = None
-        if isinstance(structured, dict):
+        if status is None and isinstance(structured, dict):
             flag = structured.get("is_error")
             if type(flag) is bool:
                 status = flag
-            elif structured.get("error") is not None:
-                status = True
             elif structured.get("status") == "success":
                 status = False
+            elif structured.get("status") == "error":
+                status = True
+            elif structured.get("error"):
+                status = True
         results.append(
             ObservedToolResult(
                 call_id=call_id,

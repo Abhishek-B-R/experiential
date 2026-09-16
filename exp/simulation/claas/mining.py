@@ -60,6 +60,10 @@ def mine_experiences(
         ValueError: Sources are duplicated, malformed, too large, or have broken episode links.
     """
     bounds = limits or MiningLimits()
+    if any(item.provenance.source_kind != "traffic" for item in experiences):
+        raise ValueError(
+            "mining requires observed traffic; synthetic or unverified imports are not evidence"
+        )
     if len(experiences) > bounds.maximum_experiences:
         raise ValueError("mining experience limit exceeded; select a smaller source batch")
     if sum(len(canonical_json_bytes(item)) for item in experiences) > bounds.maximum_source_bytes:
@@ -211,7 +215,11 @@ def _terminal_signals(experience: Experience) -> tuple[ExperienceSignal, ...]:
     if experience.protocol == "responses":
         status = response.get("status")
         if status == "incomplete":
-            kind, reason = "truncation", "Provider marked the response incomplete."
+            details = response.get("incomplete_details")
+            if isinstance(details, dict) and details.get("reason") == "max_output_tokens":
+                kind, reason = "truncation", "Provider exhausted its output-token limit."
+            else:
+                reason = "Provider marked the response incomplete without output-token exhaustion."
         elif status in ("failed", "cancelled"):
             reason = "Provider ended the response with an explicit failure or cancellation."
         elif status == "completed" and response.get("output") == []:

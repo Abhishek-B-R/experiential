@@ -158,7 +158,11 @@ def test_responses_parent_chain_and_early_termination() -> None:
             "episode_id": None,
             "parent_response_id": first.response_id,
             "request": {"input": "Continue."},
-            "response": {"status": "incomplete", "output": []},
+            "response": {
+                "status": "incomplete",
+                "output": [],
+                "incomplete_details": {"reason": "max_output_tokens"},
+            },
         }
     )
     result = mine_experiences((second, first), partition="held_out")
@@ -215,3 +219,54 @@ def test_string_protocol_collections_are_rejected(field: str) -> None:
     source = source.model_copy(update={"request": {**source.request, field: "malformed"}})
     with pytest.raises(ValueError, match="collection"):
         mine_experiences((source,), partition="fit")
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"error":false}',
+        '{"error":""}',
+        '{"error":null}',
+        '{"status":"success","error":"diagnostic"}',
+    ],
+)
+def test_false_error_fields_do_not_create_failure_signals(content: str) -> None:
+    """A conventional empty error field does not imply tool failure."""
+    source = make_experience(result_call="a", result_content=content)
+    assert mine_experiences((source,), partition="fit")[0].signals == ()
+
+
+@pytest.mark.parametrize("source_kind", ["simulation", "import"])
+def test_unobserved_sources_cannot_masquerade_as_traffic(source_kind: str) -> None:
+    """Model-generated scenarios are distinct from observed source evidence."""
+    source = make_experience()
+    source = Experience.model_validate(
+        {
+            **source.model_dump(),
+            "provenance": {
+                **source.provenance.model_dump(),
+                "source_kind": source_kind,
+            },
+        }
+    )
+    with pytest.raises(ValueError, match="observed traffic"):
+        mine_experiences((source,), partition="fit")
+
+
+@pytest.mark.parametrize("reason", ["content_filter", "provider_error", None])
+def test_responses_incomplete_only_means_truncation_for_token_exhaustion(
+    reason: str | None,
+) -> None:
+    """Safety and unknown stops stay early terminations, never output-length evidence."""
+    source = make_experience().model_copy(
+        update={
+            "protocol": "responses",
+            "request": {"input": "Check this claim."},
+            "response": {
+                "status": "incomplete",
+                "output": [],
+                "incomplete_details": {"reason": reason},
+            },
+        }
+    )
+    assert mine_experiences((source,), partition="fit")[0].signals[0].kind == "early_termination"
