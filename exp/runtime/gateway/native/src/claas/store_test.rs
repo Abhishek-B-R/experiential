@@ -82,3 +82,57 @@ fn disabled_capture_never_creates_a_database() {
     assert!(CaptureStore::open(config).unwrap().is_none());
     assert!(!path.exists());
 }
+
+#[test]
+fn conflicting_alias_policies_are_rejected_before_any_pruning() {
+    let first = policy();
+    let mut second = first.clone();
+    second.retention_seconds = 1;
+    let config = CaptureConfiguration {
+        database_path: std::env::temp_dir()
+            .join("claas-conflict.db")
+            .to_string_lossy()
+            .into(),
+        bindings: vec![
+            Binding {
+                alias: "a".into(),
+                policy: first,
+            },
+            Binding {
+                alias: "b".into(),
+                policy: second,
+            },
+        ],
+        queue_capacity: 1,
+    };
+    assert!(validate(&config).is_err());
+}
+
+#[test]
+fn graceful_shutdown_never_waits_for_a_stuck_writer() {
+    let (release, wait) = mpsc::channel::<()>();
+    let (finished, done) = mpsc::channel::<()>();
+    let worker = std::thread::spawn(move || {
+        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        finished.send(()).unwrap();
+    });
+    let store = CaptureStore {
+        config: CaptureConfiguration {
+            database_path: std::env::temp_dir()
+                .join("unused.db")
+                .to_string_lossy()
+                .into(),
+            bindings: vec![],
+            queue_capacity: 1,
+        },
+        sender: Mutex::new(None),
+        worker: Mutex::new(Some(worker)),
+        skipped: Arc::new(AtomicU64::new(0)),
+        shutdown_deadline: Arc::new(Mutex::new(None)),
+    };
+    let start = Instant::now();
+    assert!(!store.close_until(start + Duration::from_millis(10)));
+    assert!(start.elapsed() < Duration::from_millis(500));
+    release.send(()).unwrap();
+    done.recv_timeout(Duration::from_secs(1)).unwrap();
+}

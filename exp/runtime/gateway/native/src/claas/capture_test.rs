@@ -54,7 +54,7 @@ fn authenticated_identity_controls_capture_and_transport_metadata_is_excluded() 
         "request_id":"request", "alias":"model", "alias_revision_id":"alias-v1",
         "stream":false, "include_usage":false, "exact_model_id":"model-v1",
         "route_reason":"direct", "route":[], "maximum_total_attempts":1,
-        "maximum_same_deployment_attempts":1, "caller_scope":"organization:other-user"
+        "maximum_same_deployment_attempts":1, "caller_scope":"organization:other-user", "caller_identity_id":"other-user"
     }))
     .unwrap();
     let raw = json!({"messages":[{"role":"user","content":"task"}],
@@ -64,7 +64,8 @@ fn authenticated_identity_controls_capture_and_transport_metadata_is_excluded() 
     assert!(
         CaptureSession::begin(&Some(store.clone()), &admission, &raw, "chat_completions").is_none()
     );
-    admission.caller_scope = Some("organization:user".into());
+    admission.caller_scope = Some("organization:with:colons:user".into());
+    admission.caller_identity_id = Some("user".into());
     let captured =
         CaptureSession::begin(&Some(store.clone()), &admission, &raw, "chat_completions").unwrap();
     assert_eq!(

@@ -676,6 +676,7 @@ class NativeControlPlane(
             "refusal_failover": authorization.refusal_failover,
             "output_guardrail": bool(policy is not None and policy.output_checks),
             "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
+            "caller_identity_id": authorization.identity_id,
         }
         if route.snapshot.throttle_redial is not None:
             # The pool's frozen backoff-and-redial schedule; absent (not null) on
