@@ -1,5 +1,6 @@
 """Application configuration boundaries and immutable adapter identities."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -78,6 +79,24 @@ def test_configuration_rejects_wrong_embedded_scope(tmp_path: Path) -> None:
     path.write_text(_config(ClaasScope(user_id="other", application_id="claims")).model_dump_json())
     with pytest.raises(ValueError, match="another application"):
         load_configuration(tmp_path, config.scope)
+
+
+def test_configuration_rejects_stale_schema_without_replacing_state(tmp_path: Path) -> None:
+    """Require fresh application state instead of reopening or replacing an older contract."""
+    config = _config()
+    path = save_configuration(tmp_path, config)
+    persisted = json.loads(path.read_text())
+    assert persisted["schema_version"] == 3
+    persisted["schema_version"] = 2
+    path.write_text(json.dumps(persisted))
+    stale_bytes = path.read_bytes()
+
+    with pytest.raises(ValueError, match="schema version 3; initialize a fresh application"):
+        load_configuration(tmp_path, config.scope)
+    with pytest.raises(ValueError, match="initialize a fresh application"):
+        save_configuration(tmp_path, config, replace=True)
+
+    assert path.read_bytes() == stale_bytes
 
 
 @pytest.mark.parametrize("value", [float("inf"), float("nan"), 0.0, -1.0])

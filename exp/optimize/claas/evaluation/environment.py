@@ -96,7 +96,11 @@ class EnvironmentEvaluator:
         )
 
     async def evaluate(self, task: Scenario, policy: EvaluationPolicy) -> PolicyTaskEvaluation:
-        """Own reset, stepping, and cleanup while preserving explicit incomplete outcomes."""
+        """Retain execution and cleanup failures without scoring incomplete lifecycle evidence.
+
+        Cleanup failure preserves collected steps and the first execution failure.
+        Only exception types enter evidence; caller cancellation still propagates.
+        """
         if task.environment_id != self.environment.environment_id:
             raise ValueError("evaluation scenario selects a different environment")
         revision = policy.policy_revision
@@ -105,6 +109,8 @@ class EnvironmentEvaluator:
         messages = task.messages
         reason: Literal["terminal", "step_limit", "failed"] = "failed"
         failure: str | None = None
+        cleanup_failure: str | None = None
+        evidence: JsonObject = {}
         try:
             for index in range(self.maximum_steps):
                 if policy.policy_revision != revision:
@@ -129,7 +135,20 @@ class EnvironmentEvaluator:
         except Exception as error:  # noqa: BLE001 - preserve failed task denominator
             failure = type(error).__name__
         finally:
-            evidence = await asyncio.wait_for(session.close(reason), timeout=self.timeout)
+            try:
+                evidence = await asyncio.wait_for(session.close(reason), timeout=self.timeout)
+            except Exception as error:  # noqa: BLE001 - preserve execution and cancellation
+                cleanup_failure = type(error).__name__
+        if cleanup_failure is not None:
+            evidence = {
+                "close_complete": False,
+                "cleanup_failure_type": cleanup_failure,
+                "execution_end_reason": reason,
+            }
+            if failure is not None:
+                evidence["execution_failure_type"] = failure
+            reason = "failed"
+            failure = failure or cleanup_failure
         episode = EnvironmentEpisode(
             scenario=task, steps=tuple(steps), end_reason=reason, evidence=evidence
         )

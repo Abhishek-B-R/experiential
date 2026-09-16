@@ -281,8 +281,16 @@ async def run_cycle(
             await serving.wake()
             report = await evaluate_policies(
                 manifest,
-                current=RevisionPolicy(serving, baseline.active),
-                candidate=RevisionPolicy(serving, candidate),
+                current=RevisionPolicy(
+                    serving,
+                    baseline.active,
+                    maximum_response_tokens=config.limits.maximum_response_tokens,
+                ),
+                candidate=RevisionPolicy(
+                    serving,
+                    candidate,
+                    maximum_response_tokens=config.limits.maximum_response_tokens,
+                ),
                 evaluator=evaluator,
             )
             write_text_atomic(run_directory / "report.json", report.model_dump_json() + "\n")
@@ -315,13 +323,7 @@ async def run_cycle(
         except BaseException as error:
             restored = False
             try:
-                await admission.pause_and_drain()
-                await serving.pause_and_drain()
-                current = registry.read()
-                checkpoint_for_revision(directory, current.active, spec)
-                await serving.wake()
-                await serving.load_revision(current.active)
-                await _resume(serving, admission, current)
+                await _restore_active(directory, registry, spec, serving, admission)
                 restored = True
             finally:
                 state = state.model_copy(
@@ -352,16 +354,36 @@ async def rollback(
             raise ValueError("no previous adapter is available for rollback")
         spec = training_spec(config)
         checkpoint_for_revision(directory, baseline.previous, spec)
-        await admission.pause_and_drain()
         try:
+            await admission.pause_and_drain()
             await serving.pause_and_drain()
             await serving.wake()
             await serving.load_revision(baseline.previous)
             current = registry.rollback(expected_generation=baseline.generation)
             await _resume(serving, admission, current)
             return current
+        except BaseException:
+            await _restore_active(directory, registry, spec, serving, admission)
+            raise
         finally:
             await admission.close()
+
+
+async def _restore_active(
+    directory: Path,
+    registry: AdapterRegistry,
+    spec: ClaasTrainingSpec,
+    serving: ServingController,
+    admission: AdmissionController,
+) -> None:
+    """Recover the durable active revision after a failed or uncertain state transition."""
+    await admission.pause_and_drain()
+    await serving.pause_and_drain()
+    current = registry.read()
+    checkpoint_for_revision(directory, current.active, spec)
+    await serving.wake()
+    await serving.load_revision(current.active)
+    await _resume(serving, admission, current)
 
 
 async def _resume(

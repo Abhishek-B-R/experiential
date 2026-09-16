@@ -34,7 +34,7 @@ from exp.optimize.claas.training_contracts import (
     next_policy_revision,
     validate_training_batch,
 )
-from exp.runtime.claas.registry import AdapterRegistry, ServingRevision
+from exp.runtime.claas.registry import AdapterRegistry, RegistryState, ServingRevision
 from exp.runtime.claas.serving.contracts import PolicySample
 
 
@@ -71,6 +71,7 @@ class Serving:
         self.admission, self.loaded = admission, base
         self.asleep = False
         self.sampled: list[str] = []
+        self.response_limits: list[int | None] = []
         self.improve = True
 
     async def pause_and_drain(self) -> None:
@@ -104,11 +105,14 @@ class Serving:
         messages: tuple[ModelMessage, ...],
         tools: tuple[ToolSchema, ...],
         request_id: str,
+        *,
+        max_tokens: int | None = None,
     ) -> PolicySample:
         """Issue lookup then a revision-controlled answer without private feedback access."""
         assert self.admission.paused and not self.asleep
         assert all("private feedback" not in (message.content or "") for message in messages)
         self.sampled.append(self.loaded.policy_revision)
+        self.response_limits.append(max_tokens)
         action = (
             AssistantAction(
                 content="4"
@@ -360,10 +364,21 @@ class ReceiptSession:
 
 
 async def drive_cycle(
-    directory: Path, *, fail: bool = False, improve: bool = True
+    directory: Path,
+    *,
+    fail: bool = False,
+    improve: bool = True,
+    maximum_response_tokens: int = 2048,
 ) -> tuple[CycleState, Serving, Admission, LookupEnvironment, list[ReceiptBackend]]:
     """Drive the actual generic cycle using explicitly injected deterministic adapters."""
     settings = config()
+    settings = settings.model_copy(
+        update={
+            "limits": settings.limits.model_copy(
+                update={"maximum_response_tokens": maximum_response_tokens}
+            )
+        }
+    )
     admission = Admission()
     serving = Serving(admission, base_revision(settings))
     serving.improve = improve
@@ -412,6 +427,90 @@ def test_authored_environment_drives_generic_cycle_and_rollback(tmp_path: Path) 
         rollback(directory=tmp_path, config=config(), serving=serving, admission=admission)
     )
     assert restored.active == base_revision(config())
+
+
+def test_configured_response_limit_reaches_practice_and_both_evaluation_policies(
+    tmp_path: Path,
+) -> None:
+    """A non-default cap is attached to every sampled action through the actual cycle."""
+    _, serving, _, _, _ = asyncio.run(drive_cycle(tmp_path, maximum_response_tokens=256))
+    assert len(serving.response_limits) == 6
+    assert serving.response_limits == [256] * 6
+    assert len(set(serving.sampled)) == 2
+
+
+@pytest.mark.parametrize("failure_point", ["before_commit", "after_commit", "publish"])
+def test_failed_rollback_recovers_the_durable_active_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_point: str
+) -> None:
+    """Failed and uncertain pointer writes recover registry truth before reopening traffic."""
+    _, serving, admission, _, _ = asyncio.run(drive_cycle(tmp_path))
+    registry = AdapterRegistry(tmp_path / "registry.json", config().scope)
+    before = registry.read()
+    original_rollback = AdapterRegistry.rollback
+    original_resume = admission.resume
+    failed = False
+    admission.closed = False
+
+    def rollback_pointer(store: AdapterRegistry, *, expected_generation: int) -> RegistryState:
+        """Fail before or after the real durable registry transaction."""
+        assert serving.loaded == before.previous
+        if failure_point == "before_commit":
+            raise OSError("fixture rollback write failed")
+        result = original_rollback(store, expected_generation=expected_generation)
+        if failure_point == "after_commit":
+            raise OSError("fixture rollback acknowledgment lost")
+        return result
+
+    async def publish(*, expected_registry_generation: int, expected_policy_revision: str) -> None:
+        """Reject the first rollback publication, then permit verified recovery."""
+        nonlocal failed
+        if failure_point == "publish" and not failed:
+            failed = True
+            raise OSError("fixture admission publication failed")
+        await original_resume(
+            expected_registry_generation=expected_registry_generation,
+            expected_policy_revision=expected_policy_revision,
+        )
+
+    monkeypatch.setattr(AdapterRegistry, "rollback", rollback_pointer)
+    monkeypatch.setattr(admission, "resume", publish)
+    with pytest.raises(OSError, match="fixture"):
+        asyncio.run(
+            rollback(directory=tmp_path, config=config(), serving=serving, admission=admission)
+        )
+    durable = registry.read()
+    expected = before.active if failure_point == "before_commit" else before.previous
+    assert serving.loaded == durable.active == expected
+    assert admission.published[-1] == (durable.generation, durable.active.policy_revision)
+    assert not admission.paused and admission.closed
+
+
+def test_failed_rollback_recovery_keeps_admission_paused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server that cannot reload registry truth never publishes readiness."""
+    _, serving, admission, _, _ = asyncio.run(drive_cycle(tmp_path))
+    registry = AdapterRegistry(tmp_path / "registry.json", config().scope)
+    before = registry.read()
+    publications = tuple(admission.published)
+    attempted: list[ServingRevision] = []
+    admission.closed = False
+
+    async def unavailable(revision: ServingRevision) -> None:
+        """Fail both the requested previous revision and the recovery load."""
+        attempted.append(revision)
+        raise OSError("fixture serving unavailable")
+
+    monkeypatch.setattr(serving, "load_revision", unavailable)
+    with pytest.raises(OSError, match="serving unavailable"):
+        asyncio.run(
+            rollback(directory=tmp_path, config=config(), serving=serving, admission=admission)
+        )
+    assert attempted == [before.previous, before.active]
+    assert registry.read() == before
+    assert tuple(admission.published) == publications
+    assert admission.paused and admission.closed
 
 
 def test_rejection_resumes_active_revision_and_preserves_checkpoint(tmp_path: Path) -> None:
