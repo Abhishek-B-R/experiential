@@ -65,6 +65,15 @@ from exp.runtime.gateway.stream_contracts import (
 from exp.runtime.gateway.stream_contracts import (
     GatewayUsage as GatewayUsage,
 )
+from exp.runtime.gateway.tool_contracts import (
+    GatewayNamedToolChoice as GatewayNamedToolChoice,
+)
+from exp.runtime.gateway.tool_contracts import (
+    GatewayProviderNativeTool as GatewayProviderNativeTool,
+)
+from exp.runtime.gateway.tool_contracts import (
+    GatewayToolDefinition as GatewayToolDefinition,
+)
 
 GatewayAliasName = ArtifactId
 OrganizationId = ArtifactId
@@ -106,59 +115,6 @@ class GatewayApiSurface(StrEnum):
     IMAGES = "images"
 
 
-class GatewayToolDefinition(ContractModel):
-    """One caller-defined function tool with its exact JSON Schema declaration.
-
-    The description bound is deliberately generous: both providers accept
-    40k-character tool descriptions live (verified 2026-08-30), and real
-    Claude Code toolsets exceeded the earlier 8k bound. The request-body
-    size cap remains the effective total limit.
-    """
-
-    name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=65_536)
-    parameters: JsonObject
-    strict: bool = False
-    cache_control: JsonObject | None = Field(default=None, exclude=True)
-    """Validated caller prompt-caching hint attached to this tool definition,
-    forwarded onto the native Anthropic tool block and dropped with
-    disclosure on other wires. Like ``ToolCall.cache_control``, a cache hint
-    changes cost, not semantics: it joins neither serialization nor replay
-    identity."""
-    eager_input_streaming: bool | None = Field(default=None, exclude=True)
-    """Verbatim Anthropic fine-grained tool-input streaming selector, sent
-    conditionally by Claude Code and accepted bare by the provider (verified
-    live 2026-08-30, no beta header). Excluded from serialization (tool
-    digests predate it); a present value joins replay identity through
-    :func:`canonical_request_sha256`, like every carrier below."""
-    defer_loading: bool | None = Field(default=None, exclude=True)
-    """Verbatim Anthropic tool-search deferred-loading selector; the provider
-    owns the cross-tool validity rules (verified live 2026-08-30: ``false``
-    is a no-op and an all-deferred toolset is the provider's own 400)."""
-    allowed_callers: tuple[str, ...] | None = Field(default=None, exclude=True)
-    """Verbatim Anthropic programmatic-tool-calling caller allowlist,
-    accepted bare by the provider even without a companion server tool
-    (verified live 2026-08-30), which stays the combination authority."""
-    input_examples: tuple[JsonObject, ...] | None = Field(default=None, exclude=True)
-    """Verbatim Anthropic example tool inputs.
-
-    Accepted bare by the provider (verified live 2026-08-30). Examples add
-    provider-visible prompt content, so a present value is excluded from
-    serialization and joins replay identity through
-    :func:`canonical_request_sha256`; reservation counts its bytes with the
-    rest of the replay envelope.
-    """
-
-    def has_anthropic_tool_carriers(self) -> bool:
-        """Whether any Anthropic-native tool carrier is present on this tool."""
-        return (
-            self.eager_input_streaming is not None
-            or self.defer_loading is not None
-            or self.allowed_callers is not None
-            or self.input_examples is not None
-        )
-
-
 class StructuredTextFormat(ContractModel):
     """A strict structured-text output schema requested by the caller."""
 
@@ -166,28 +122,6 @@ class StructuredTextFormat(ContractModel):
     description: str | None = Field(default=None, max_length=65_536)
     json_schema: JsonObject
     strict: bool = True
-
-
-class GatewayProviderNativeTool(ContractModel):
-    """One verbatim non-function OpenAI Responses tool declaration.
-
-    Codex ships ``custom`` (freeform grammar), ``namespace`` (nested tool tree),
-    ``web_search``, and ``tool_search`` declarations whose shapes exist on no
-    other wire; each is validated shallowly at decode and re-emitted byte-for-byte
-    on native Responses rungs only, with the provider owning the declaration's
-    internal shape (each type captured live from Codex 0.151.0 and accepted with
-    a plain API key, 2026-09-01). ``index`` is the declaration's position in the
-    caller's ``tools`` array so re-emission preserves the caller's interleaving.
-    """
-
-    index: int = Field(ge=0)
-    tool: JsonObject
-
-
-class GatewayNamedToolChoice(ContractModel):
-    """A request to require one named caller-defined function."""
-
-    name: str = Field(min_length=1, max_length=256)
 
 
 class GatewayMessage(ContractModel):
@@ -501,6 +435,15 @@ class GatewayRequest(ContractModel):
     tool_choice: Literal["auto", "none", "required"] | GatewayNamedToolChoice | None = None
     parallel_tool_calls: bool | None = None
     structured_text: StructuredTextFormat | None = None
+    json_object_output: bool = Field(default=False, exclude=True)
+    """Caller ``response_format: {"type": "json_object"}`` from the Chat surface.
+
+    A schema-free "answer with one JSON object" mode, distinct from
+    ``structured_text``: no schema exists to enforce, so each wire dialect
+    honors it its own way (a native JSON mode where the provider has one, a
+    system instruction otherwise). Mutually exclusive with ``structured_text``.
+    Serialized only in replay identity when enabled.
+    """
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens_parameter: (
         Literal["max_tokens", "max_completion_tokens", "max_output_tokens"] | None
@@ -627,7 +570,11 @@ class GatewayRequest(ContractModel):
     :func:`canonical_request_sha256`.
     """
     text_verbosity: Literal["low", "medium", "high"] | None = None
-    """Caller ``text.verbosity`` selector from the Responses surface."""
+    """Caller output-length hint: Responses ``text.verbosity`` or Chat ``verbosity``.
+
+    One canonical carrier for both spellings; the surface decides which public
+    path a drop disclosure names.
+    """
     client_metadata: JsonObject | None = Field(default=None, exclude=True)
     """Verbatim caller ``client_metadata`` from the Responses surface.
 
@@ -835,6 +782,10 @@ class GatewayRequest(ContractModel):
             raise ValueError("required gateway tool choice needs at least one tool")
         if self.include_usage and not self.stream:
             raise ValueError("include_usage is valid only for streaming requests")
+        if self.json_object_output and self.structured_text is not None:
+            raise ValueError("json_object_output and structured_text are mutually exclusive")
+        if self.json_object_output and self.surface != GatewayApiSurface.CHAT_COMPLETIONS:
+            raise ValueError("json_object_output is valid only for Chat Completions requests")
         parts = (part for message in self.messages for part in message.content_parts)
         require_attachment_ceilings(parts)
         if len({handle.provider for handle in self.media_handles}) > 1:
@@ -854,8 +805,11 @@ class GatewayRequest(ContractModel):
             raise ValueError("provider_thinking_config is valid only for Messages requests")
         if self.provider_output_config is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_output_config is valid only for Messages requests")
-        if self.text_verbosity is not None and self.surface != GatewayApiSurface.RESPONSES:
-            raise ValueError("text_verbosity is valid only for Responses requests")
+        if self.text_verbosity is not None and self.surface not in {
+            GatewayApiSurface.RESPONSES,
+            GatewayApiSurface.CHAT_COMPLETIONS,
+        }:
+            raise ValueError("text_verbosity is valid only for Responses and Chat requests")
         if self.client_metadata is not None and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("client_metadata is valid only for Responses requests")
         if self.context_management is not None and self.surface != GatewayApiSurface.MESSAGES:

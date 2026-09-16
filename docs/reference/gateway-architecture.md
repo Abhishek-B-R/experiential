@@ -40,13 +40,10 @@ It serves:
 this same gateway application. It does not create a router HTTP server. Gateway startup and readiness
 perform no provider request. Only an authorized model request may cross the provider boundary.
 
-Tool-call identifiers on Chat Completions and Responses are opaque strings of 1 to
-65,536 characters. Replay the complete returned identifier in both the assistant call
-and its tool result, including any signature suffix. The gateway preserves the identifier
-verbatim on OpenAI-compatible Chat routes; it does not decode or strip provider signatures.
-Output guardrail byte limits count the complete serialized completion, including
-tool IDs, tool names, arguments, and JSON framing.
-Provider-specific wire restrictions still apply when routing to a different API dialect.
+Chat Completions and Responses tool-call IDs are opaque strings of 1 to 65,536 characters.
+Replay each complete ID, including any signature suffix, in both the assistant call and tool result.
+OpenAI-compatible Chat routes preserve IDs verbatim; other API dialects may restrict their wire shape.
+Output guardrail byte limits count the full serialized completion, including tool IDs, names, arguments, and JSON framing.
 
 Streamed function-call arguments must assemble to one JSON object. On OpenAI-compatible
 Chat streams the gateway stops relaying argument deltas at the byte that closes that object:
@@ -322,7 +319,10 @@ A caller `anthropic-beta` header forwards through an exact token allowlist (nota
 `context-1m-2025-08-07`, which activates the provider's 1M context window; without it the
 provider serves 200K); non-allowlisted tokens drop with a per-token
 `anthropic-beta.<token>` disclosure, never a rejection and never a blind forward. On the Responses surface, `client_metadata` and `text.verbosity` forward on native rungs
-and drop with disclosure elsewhere; Codex-native input items (`additional_tools` tool namespaces,
+and drop with disclosure elsewhere. Chat `verbosity` accepts `low`, `medium`, or `high` as the
+same hint: forwarded as `text.verbosity` on native Responses routes and omitted with a
+`verbosity` disclosure on other routes. Invalid values remain named parameter errors.
+Codex-native input items (`additional_tools` tool namespaces,
 `custom_tool_call`/`custom_tool_call_output` freeform history) and non-function top-level tool
 declarations (`custom` freeform-grammar tools, `namespace` tool trees, `web_search`,
 `tool_search`) carry byte-for-byte at their caller positions and require a homogeneous native
@@ -842,24 +842,19 @@ reasoning on is dropped and disclosed as `temperature->dropped(set_reasoning_eff
 than rejected — the model accepts sampling, just not at that effort, so the request serves and the
 caller is told how to keep the value (set `reasoning_effort=none`); a route that never declares the
 control at all (Anthropic constrained `[1,1]` sampling) still hard-rejects it, since there is
-nothing to honor at any effort. `top_k` follows the same honor-or-narrow shape: selection prefers a
-rung that carries it, and a committed route with no supporting rung (an Azure `openai_deployments`
-DeepSeek rung rejects it upstream) drops it with `top_k->dropped(unsupported_by_provider)` rather
-than rejecting, since a rung's default sampling still returns a valid answer. `frequency_penalty`
-and `presence_penalty` are admitted at the ingress and adapted the same way: honored (emitted) where
-every rung supports them (the per-rung `supports_frequency_penalty`/`supports_presence_penalty`
-capability truth), dropped as `frequency_penalty->dropped(unsupported_by_provider)` where a rung does
-not — a soft preference whose absence still returns a valid answer. `top_logprobs` stays rejected
-(not admitted): the gateway response contract does not project logprob arrays yet, so it cannot be
-honored on any rung and silently dropping a probability request is never acceptable — the reject is
-the honest terminal until output normalization emits logprobs. A caller
-`response_format: {type: "json_object"}` is TRANSLATED, not dropped: it is admitted at the Chat
-ingress and rewritten to a permissive non-strict `json_schema` (`{"type":"object"}`, "any JSON
-object") — the serving lanes emit only `json_schema`, so this preserves the caller's JSON intent on
-every rung (dropping it would hand prose to a caller who asked for JSON) — and disclosed as
-`response_format->translated(json_object)`; a non-strict schema is left open (never force-closed to
-`additionalProperties:false`), so its "any object" meaning is not inverted on a schema-closing
-(Anthropic) rung. A caller `service_tier` on the OpenAI-family surfaces forwards verbatim
+nothing to honor at any effort. `top_k` prefers a carrying rung; when no rung supports it,
+admission drops it with `top_k->dropped(unsupported_by_provider)` because defaults still serve.
+`frequency_penalty` and `presence_penalty` follow their per-rung capability truth and otherwise
+drop with `<parameter>->dropped(unsupported_by_provider)`. These are soft preferences.
+`top_logprobs` remains a named rejection until the response contract can project logprob arrays.
+A caller
+`response_format: {type: "json_object"}` requests schema-free JSON output. OpenAI-compatible
+rungs use native JSON mode, Responses rungs use `text.format: {type: "json_object"}`, and
+Gemini uses `responseMimeType: "application/json"` without a schema. Anthropic/Bedrock use a
+best-effort system instruction, disclosed as `response_format->instruction(json_object)`.
+Every wire receives a counted JSON-object instruction; native format fields are retained.
+No empty schema is synthesized. Use `json_schema` when a supported route must enforce a shape.
+A caller `service_tier` on the OpenAI-family surfaces forwards verbatim
 only on rungs dispatching tenant-owned (BYOK) credentials, where the caller pays the provider
 directly; host-funded rungs never emit it (the tier changes provider pricing while the gateway
 bills catalog rates) and a route with no eligible rung drops it with disclosure. Anthropic's own
