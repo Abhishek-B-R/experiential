@@ -17,5 +17,11 @@ def test_claas_authority_uses_authenticated_identity(tmp_path: Path) -> None:
         control.claas_authority(json.dumps({"raw_key": raw_key, "user_id": "forged"}))
     )
     assert result == {"user_id": expected}
+    granted_alias = control._components.store.granted_aliases(raw_key=raw_key)[0]
+    for alias, allowed in ((granted_alias, True), ("not-granted", False)):
+        authority = json.loads(
+            control.claas_authority(json.dumps({"raw_key": raw_key, "alias": alias}))
+        )
+        assert authority == {"user_id": expected, "alias_granted": allowed}
     with pytest.raises(NativeBridgeError):
         control.claas_authority(json.dumps({"raw_key": "invalid"}))

@@ -293,6 +293,121 @@ def test_failed_drain_leaves_paused_and_controller_can_recover(tmp_path: Path) -
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("release_before_timeout", [False, True])
+def test_cancelled_native_drain_preserves_cancellation_and_releases_ownership(
+    tmp_path: Path, release_before_timeout: bool
+) -> None:
+    """Cancellation survives native timeout or late success without leaking either lock."""
+    binding, _ = _binding(tmp_path, "http://127.0.0.1:8001")
+    lease = GatewayAdmissionLease(binding)
+    lease.initialize()
+    held = exp_gateway_native.claas_acquire_exclusive(str(binding.admission_lock_path), 0.1)
+
+    async def run() -> None:
+        """Cancel during actual lock contention, then prove another controller can recover."""
+        draining = asyncio.create_task(lease.pause_and_drain(timeout_seconds=0.2))
+        for _ in range(100):
+            if lease._controller is not None:
+                break
+            await asyncio.sleep(0.001)
+        assert lease._controller is not None
+        draining.cancel()
+        await asyncio.sleep(0.01)
+        draining.cancel()
+        if release_before_timeout:
+            held.release()
+        with pytest.raises(asyncio.CancelledError):
+            await draining
+        assert GatewayServingState.model_validate_json(binding.state_path.read_bytes()).paused
+        held.release()
+        replacement = GatewayAdmissionLease(binding)
+        await replacement.pause_and_drain(timeout_seconds=0.2)
+        await replacement.resume(expected_registry_generation=0, expected_policy_revision="base")
+        await replacement.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        held.release()
+
+
+@pytest.mark.parametrize(
+    "surface", ["chat/completions", "responses", "messages", "messages/count_tokens"]
+)
+def test_revoked_alias_grant_cannot_observe_serving_readiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+) -> None:
+    """Real native requests return identical authorization errors while ready or paused."""
+    monkeypatch.setenv("LOOPBACK_PROVIDER_KEY", "fixture-only-key")
+    manager, raw_key = _configure_gateway(tmp_path, base_url="http://127.0.0.1:8001/v1")
+    binding, _ = _binding(tmp_path, "http://127.0.0.1:8001")
+    configuration = save_gateway_serving_binding(tmp_path, binding)
+    components = load_gateway_components(tmp_path)
+    port = _unused_port()
+    shutdown = exp_gateway_native.shutdown_handle()
+    failures: list[BaseException] = []
+
+    def run_gateway() -> None:
+        """Serve the actual Rust authorization/readiness path without an upstream provider."""
+        try:
+            serve_native_gateway(
+                NativeControlPlane(components),
+                host="127.0.0.1",
+                port=port,
+                serving=configuration,
+                shutdown=shutdown,
+            )
+        except BaseException as error:  # noqa: BLE001 - propagate thread failures below.
+            failures.append(error)
+
+    gateway_thread = threading.Thread(target=run_gateway, daemon=True)
+    gateway_thread.start()
+
+    def request(replay: bool) -> httpx.Response:
+        """Exercise both new and replay-keyed requests through the chosen API surface."""
+        body = {
+            "model": "coding",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+        if surface == "responses":
+            body = {"model": "coding", "max_output_tokens": 64, "input": "hello"}
+        headers = {"Authorization": f"Bearer {raw_key}"}
+        if surface.startswith("messages"):
+            headers["x-api-key"] = raw_key
+            headers["anthropic-version"] = "2023-06-01"
+        if replay:
+            headers["Idempotency-Key"] = "revoked-grant"
+        return httpx.post(
+            f"http://127.0.0.1:{port}/v1/{surface}", json=body, headers=headers, timeout=5
+        )
+
+    async def compare() -> None:
+        """Observe the same no-grant response before and after the controller resumes."""
+        paused = [await asyncio.to_thread(request, replay) for replay in (False, True)]
+        lease = GatewayAdmissionLease(binding)
+        await lease.pause_and_drain()
+        await lease.resume(expected_registry_generation=0, expected_policy_revision="base")
+        await lease.close()
+        ready = [await asyncio.to_thread(request, replay) for replay in (False, True)]
+        for before, after in zip(paused, ready, strict=True):
+            expected_status = 404 if surface == "messages/count_tokens" else 403
+            assert before.status_code == after.status_code == expected_status
+            assert before.json() == after.json()
+            assert "paused" not in before.text
+
+    try:
+        _wait_ready(port, gateway_thread)
+        assert manager.remove_grant(identity_id="default", alias_id="coding")
+        asyncio.run(compare())
+    finally:
+        shutdown.request_shutdown()
+        gateway_thread.join(timeout=10)
+        components.write_ledger.close()
+    assert not failures
+    assert not gateway_thread.is_alive()
+
+
 @pytest.mark.parametrize(
     "url",
     [

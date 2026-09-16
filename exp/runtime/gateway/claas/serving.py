@@ -197,8 +197,15 @@ class GatewayAdmissionLease:
         try:
             return cast(_NativeLease, await asyncio.shield(acquiring))
         except asyncio.CancelledError:
-            lease = cast(_NativeLease, await acquiring)
-            lease.release()
+            completion = asyncio.gather(acquiring, return_exceptions=True)
+            while not completion.done():
+                try:
+                    await asyncio.shield(completion)
+                except asyncio.CancelledError:
+                    continue
+            result = completion.result()[0]
+            if not isinstance(result, BaseException):
+                cast(_NativeLease, result).release()
             raise
 
     async def resume(

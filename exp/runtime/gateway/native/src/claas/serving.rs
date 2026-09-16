@@ -353,7 +353,7 @@ fn bind(
     Ok(Some(RequestLease(Arc::new(file))))
 }
 
-/// Reject paused configured aliases before keyed replay or new durable admission.
+/// Reject paused authorized aliases before keyed replay or new durable admission.
 pub(crate) async fn authenticate(
     state: &crate::server::AppState,
     raw_key: &str,
@@ -371,8 +371,17 @@ pub(crate) async fn authenticate(
     if !config.bindings.iter().any(|binding| binding.alias == alias) {
         return Ok(());
     }
-    let authority = state.bridge.call("claas_authority", argument).await?;
+    let authority = state
+        .bridge
+        .call(
+            "claas_authority",
+            json!({"raw_key": raw_key, "alias": alias}).to_string(),
+        )
+        .await?;
     let identity: Value = serde_json::from_str(&authority).map_err(|_| unavailable())?;
+    if identity.get("alias_granted").and_then(Value::as_bool) != Some(true) {
+        return Ok(());
+    }
     let user = identity
         .get("user_id")
         .and_then(Value::as_str)
