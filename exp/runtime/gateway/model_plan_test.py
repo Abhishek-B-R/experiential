@@ -9,11 +9,31 @@ from exp.common.models.gateway_catalog import ExactModelPool, NormalizedGatewayC
 from exp.common.models.gateway_chains import ModelStagePolicy
 from exp.common.models.gateway_chains_test import chain
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
-from exp.runtime.gateway.contracts import DirectTarget, GatewayApiSurface
+from exp.runtime.gateway.contracts import (
+    DirectTarget,
+    GatewayApiSurface,
+    GatewayFailure,
+    GatewayFailureClass,
+    GatewayMessage,
+    GatewayRequest,
+)
+from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.model_plan import model_execution_snapshot, project_stage_selection
-from exp.runtime.gateway.native_execution import reorder_route_deployments
+from exp.runtime.gateway.native_execution import (
+    MAXIMUM_TOTAL_ATTEMPTS,
+    InflightRequest,
+    deployment_health_key,
+    deployment_wire_entry,
+    reorder_route_deployments,
+)
 from exp.runtime.gateway.native_execution_test import _route
+from exp.runtime.gateway.native_rung_policy import (
+    failed_dispatch_candidate,
+    throttle_redial_budgets,
+)
 from exp.runtime.gateway.routing import CatalogRouteResolver
+from exp.runtime.gateway.rung_admission import RungLoadRegistry
+from exp.runtime.models.providers.base import GatewayWireProfile
 
 
 def catalog() -> NormalizedGatewayCatalog:
@@ -74,11 +94,6 @@ def test_singleton_chain_policy_overrides_pool_type_defaults(threshold: float | 
 
 def test_root_child_redial_schedules_are_frozen_and_stage_local() -> None:
     """Root and child redials survive snapshot, budgets, wire projection and digesting."""
-    from exp.runtime.gateway.native_execution import deployment_wire_entry
-    from exp.runtime.gateway.native_rung_policy import throttle_redial_budgets
-    from exp.runtime.gateway.rung_admission import RungLoadRegistry
-    from exp.runtime.models.providers.base import GatewayWireProfile
-
     normalized = catalog()
     root_redial = GatewayThrottleRedialPolicy(max_attempts=1, base_delay_ms=10, max_delay_ms=100)
     child_redial = GatewayThrottleRedialPolicy(max_attempts=4, base_delay_ms=50, max_delay_ms=900)
@@ -119,6 +134,99 @@ def test_root_child_redial_schedules_are_frozen_and_stage_local() -> None:
         throttle_redial_budget=4,
     )
     assert wire["throttle_redial"] == child_redial.model_dump(mode="json")
+
+
+def test_stage_retry_floors_and_shared_attempt_cap() -> None:
+    """Sticky, pinned and final floors use their own stage schedule and one global cap."""
+    normalized = catalog()
+    root_redial = GatewayThrottleRedialPolicy(max_attempts=1, base_delay_ms=10, max_delay_ms=100)
+    child_redial = GatewayThrottleRedialPolicy(max_attempts=4, base_delay_ms=50, max_delay_ms=900)
+    chains = tuple(
+        c.model_copy(
+            update={
+                "policy": ModelStagePolicy(
+                    failover_mode="maximize_cache",
+                    throttle_cache_threshold=0.5,
+                    throttle_redial=root_redial if c.model_id == "a" else child_redial,
+                )
+            }
+        )
+        for c in normalized.model_chains
+    )
+    normalized = normalized.model_copy(update={"model_chains": chains})
+    auth = _route().snapshot.authorization.model_copy(
+        update={
+            "catalog_sha256": normalized.identity_sha256(),
+            "target": DirectTarget(pool_id="pool-a"),
+        }
+    )
+    route = CatalogRouteResolver(
+        {(auth.alias_revision_id, auth.catalog_sha256): normalized}
+    ).resolve_direct(auth)
+    loads = RungLoadRegistry()
+    assert throttle_redial_budgets(loads, route, auth.organization_id) == (0, 0, 1)
+    assert throttle_redial_budgets(
+        loads, route, auth.organization_id, sticky_deployment_id="b1"
+    ) == (0, 4, 1)
+    pinned = route.model_copy(update={"reasoning_pinned_deployment_id": "b1"})
+    assert throttle_redial_budgets(loads, pinned, auth.organization_id) == (0, 4, 1)
+    request = GatewayRequest(
+        surface=auth.surface, messages=(GatewayMessage(role="user", content="hello"),)
+    )
+    entry = InflightRequest(authorization=auth, route=route, request=request, deadline_monotonic=10)
+    assert entry.throttle_redial_budgets == (1, 4, 1)
+    entry.total_attempts = MAXIMUM_TOTAL_ATTEMPTS
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.THROTTLED, safe_message="limited", failover_eligible=True
+    )
+    candidate, _ = failed_dispatch_candidate(
+        health=DeploymentHealthRegistry(),
+        loads=loads,
+        keys=tuple(deployment_health_key(auth, d) for d in route.deployments),
+        entry=entry,
+        failure=failure,
+        current_depth=1,
+        throttle_backoff=True,
+    )
+    assert candidate is None
+
+
+def test_frozen_stage_policy_survives_another_catalog_generation() -> None:
+    """A newer child policy cannot change a previously accepted route's pool or schedule."""
+    old = catalog()
+    child_policy = ModelStagePolicy(
+        failover_mode="maximize_availability", throttle_cache_threshold=None
+    )
+    child = old.model_chains[1].model_copy(update={"revision": "new-child", "policy": child_policy})
+    new = old.model_copy(update={"model_chains": (old.model_chains[0], child)})
+    old_auth = _route().snapshot.authorization.model_copy(
+        update={"catalog_sha256": old.identity_sha256(), "target": DirectTarget(pool_id="pool-a")}
+    )
+    new_auth = old_auth.model_copy(
+        update={"alias_revision_id": "new-revision", "catalog_sha256": new.identity_sha256()}
+    )
+    resolver = CatalogRouteResolver(
+        {
+            (old_auth.alias_revision_id, old_auth.catalog_sha256): old,
+            (new_auth.alias_revision_id, new_auth.catalog_sha256): new,
+        }
+    )
+    assert (
+        resolver.resolve_direct(new_auth).snapshot.stage_for_depth(1).failover_mode
+        == "maximize_availability"
+    )
+    old_stage = resolver.resolve_direct(old_auth).snapshot.stage_for_depth(1)
+    assert (
+        old_stage.exact_model_id,
+        old_stage.pool_id,
+        old_stage.failover_mode,
+        old_stage.throttle_cache_threshold,
+    ) == (
+        "b",
+        "pool-b",
+        "maximize_cache_affinity",
+        0.8,
+    )
 
 
 def test_snapshot_policy_and_sticky_suffix_keep_root_identity() -> None:

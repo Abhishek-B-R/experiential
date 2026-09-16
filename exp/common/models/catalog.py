@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import tomllib
 from pathlib import Path
-from typing import Annotated, Literal, cast
+from typing import Annotated, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 import tomli_w
@@ -39,7 +39,10 @@ from exp.common.models.model import (
     ModelSnapshot,
     ReasoningEffort,
 )
-from exp.common.models.nano_usd_upgrade import upgrade_model_catalog_document
+from exp.common.models.nano_usd_upgrade import (
+    upgrade_legacy_billing_source,
+    upgrade_model_catalog_document,
+)
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AZURE_API_VERSION = re.compile(r"^(?:v1|\d{4}-\d{2}-\d{2}(?:-preview)?)$")
@@ -137,6 +140,47 @@ def _normalize_connection_base_url(connection: ConnectionConfig) -> str | None:
     return normalized
 
 
+def require_bedrock_connection_shape(
+    *,
+    bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None,
+    api_key_env: str | None,
+    aws_access_key_id_env: str | None,
+    base_url: str | None,
+    api_version: str | None,
+) -> None:
+    """Reject a Bedrock connection whose credential and endpoint fields are inconsistent.
+
+    Args:
+        bedrock_auth_mode: Explicit auth mode, or ``None`` to infer it from the env names.
+        api_key_env: Environment variable naming the API key or secret access key.
+        aws_access_key_id_env: Environment variable naming the access key id.
+        base_url: Custom endpoint, which Bedrock never accepts.
+        api_version: Azure-only API version, which Bedrock never accepts.
+
+    Raises:
+        ValueError: The field combination cannot describe one Bedrock credential source.
+    """
+    if bedrock_auth_mode == "api_key":
+        if api_key_env is None or aws_access_key_id_env is not None:
+            raise ValueError(
+                "bedrock api_key auth requires api_key_env and forbids aws_access_key_id_env"
+            )
+    elif bedrock_auth_mode == "access_key_pair":
+        if api_key_env is None or aws_access_key_id_env is None:
+            raise ValueError(
+                "bedrock access_key_pair auth requires both credential environment names"
+            )
+    elif (api_key_env is None) != (aws_access_key_id_env is None):
+        raise ValueError(
+            "bedrock explicit access-key auth requires both api_key_env naming the "
+            "secret access key and aws_access_key_id_env naming the access key id"
+        )
+    if base_url is not None:
+        raise ValueError("bedrock does not accept base_url")
+    if api_version is not None:
+        raise ValueError("api_version is only accepted for provider='azure'")
+
+
 class ModelCatalogError(ValueError):
     """A local model catalog was malformed or named a credential value."""
 
@@ -223,26 +267,13 @@ class ConnectionConfig(ContractModel):
             if self.region is not None:
                 raise ValueError("region is only accepted for provider='bedrock'")
         elif self.provider == "bedrock":
-            if self.bedrock_auth_mode == "api_key":
-                if self.api_key_env is None or self.aws_access_key_id_env is not None:
-                    raise ValueError(
-                        "bedrock api_key auth requires api_key_env and forbids "
-                        "aws_access_key_id_env"
-                    )
-            elif self.bedrock_auth_mode == "access_key_pair":
-                if self.api_key_env is None or self.aws_access_key_id_env is None:
-                    raise ValueError(
-                        "bedrock access_key_pair auth requires both credential environment names"
-                    )
-            elif (self.api_key_env is None) != (self.aws_access_key_id_env is None):
-                raise ValueError(
-                    "bedrock explicit access-key auth requires both api_key_env naming the "
-                    "secret access key and aws_access_key_id_env naming the access key id"
-                )
-            if self.base_url is not None:
-                raise ValueError("bedrock does not accept base_url")
-            if self.api_version is not None:
-                raise ValueError("api_version is only accepted for provider='azure'")
+            require_bedrock_connection_shape(
+                bedrock_auth_mode=self.bedrock_auth_mode,
+                api_key_env=self.api_key_env,
+                aws_access_key_id_env=self.aws_access_key_id_env,
+                base_url=self.base_url,
+                api_version=self.api_version,
+            )
             if self.region is not None and not _AWS_REGION_NAME.fullmatch(self.region):
                 raise ValueError("bedrock region must be an AWS region name")
         elif self.provider == "vertex":
@@ -458,6 +489,9 @@ class GatewayDeploymentCapabilities(ContractModel):
     field). A concrete value lets admission reject an over-limit list locally with a
     named parameter error instead of forwarding it and surfacing the provider's
     opaque 4xx (e.g. Gemini caps ``stopSequences`` at 5)."""
+    minimum_output_tokens: int | None = Field(default=None, ge=1)
+    """Provider output-token floor (sonar/fugu via OpenRouter, grok-4.6 on Bedrock: 16); a
+    smaller caller ceiling is floored to it with disclosure on every surface (see the profile)."""
     supported_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
     """Exact caller values this deployment can preserve without normalization.
 
@@ -812,7 +846,7 @@ class ModelCatalog(ContractModel):
     safe by construction; a revision that REINTERPRETS existing fields must not
     reuse this channel — it needs a new field name or a fleet-first tolerance
     release. Version 1 stays rejected here: it is only readable through
-    ``_migrate_legacy_model_catalog`` on the TOML load path.
+    ``upgrade_legacy_billing_source`` on the TOML load path.
     """
     connections: dict[str, ConnectionConfig]
     models: dict[str, ModelRecord]
@@ -936,56 +970,10 @@ def load_model_catalog(path: Path) -> ModelCatalog:
         raise ModelCatalogError(f"model catalog is invalid TOML: {path}") from exc
     try:
         return ModelCatalog.model_validate(
-            upgrade_model_catalog_document(_migrate_legacy_model_catalog(raw_catalog))
+            upgrade_model_catalog_document(upgrade_legacy_billing_source(raw_catalog))
         )
     except ValueError as exc:
         raise ModelCatalogError(f"model catalog is invalid: {exc}") from exc
-
-
-def _migrate_legacy_model_catalog(raw_catalog: JsonObject) -> JsonObject:
-    """Upgrade only schema-v1 local catalogs with conservative customer-owned billing.
-
-    Args:
-        raw_catalog: Parsed secret-free TOML payload.
-
-    Returns:
-        A schema-v2 payload. Current schema records are returned unchanged so a missing
-        ``billing_source`` remains a validation error.
-    """
-    raw_version = raw_catalog.get("schema_version", 1)
-    if type(raw_version) is not int or raw_version != 1:
-        return raw_catalog
-    payload = cast(JsonObject, dict(raw_catalog))
-    models = raw_catalog.get("models")
-    if isinstance(models, dict):
-        migrated_models: JsonObject = {}
-        for alias, value in models.items():
-            if isinstance(value, dict):
-                record = cast(JsonObject, dict(value))
-                if "billing_source" in record:
-                    raise ValueError(
-                        "schema-v1 model record must not declare current billing_source"
-                    )
-                record["billing_source"] = BillingSource.CUSTOMER_MANAGED.value
-                provenance = record.get("sft_provenance")
-                if isinstance(provenance, dict):
-                    migrated_provenance = cast(JsonObject, dict(provenance))
-                    base_model = provenance.get("base_model")
-                    if isinstance(base_model, dict):
-                        migrated_base = cast(JsonObject, dict(base_model))
-                        if "billing_source" in migrated_base:
-                            raise ValueError(
-                                "schema-v1 SFT base model must not declare current billing_source"
-                            )
-                        migrated_base["billing_source"] = BillingSource.CUSTOMER_MANAGED.value
-                        migrated_provenance["base_model"] = migrated_base
-                    record["sft_provenance"] = migrated_provenance
-                migrated_models[str(alias)] = record
-            else:
-                migrated_models[str(alias)] = value
-        payload["models"] = migrated_models
-    payload["schema_version"] = 2
-    return payload
 
 
 def write_model_catalog(path: Path, catalog: ModelCatalog) -> None:

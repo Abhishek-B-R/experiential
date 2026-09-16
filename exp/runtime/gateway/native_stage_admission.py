@@ -52,6 +52,11 @@ def stage_affinity_ordered_rungs(
             request_id=authorization.request_id,
         ),
     )
+    if route.reasoning_pinned_deployment_id is not None and any(
+        deployment.deployment_id == route.reasoning_pinned_deployment_id
+        for deployment in route.deployments
+    ):
+        return route, wires, AffinityPlacement(fingerprint=fingerprint)
     order: list[int] = []
     offset = 0
     stages = route.snapshot.model_stages or (route.snapshot.stage_for_depth(0),)

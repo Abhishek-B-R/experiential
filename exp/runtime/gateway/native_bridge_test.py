@@ -58,6 +58,10 @@ from exp.runtime.gateway.native_bridge_errors import capability_param as _public
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.instruction_turns import (
+    HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE,
+    SYSTEM_FOLD_DISCLOSURE,
+)
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
@@ -488,6 +492,9 @@ def test_fireworks_carrier_round_trip_rejects_tamper_and_credential_rotation(
     messages = cast("list[JsonObject]", payload["messages"])
     assert continued["route_reason"] == "reasoning_continuation"
     assert messages[1]["reasoning_content"] == hidden
+    # The data plane's per-caller repair memory keys on this, never on the raw key.
+    organization, identity = str(continued["caller_scope"]).split(":", maxsplit=1)
+    assert organization and identity == "default"
 
     transplanted = json.loads(continuation_body)
     transplanted["messages"][0]["content"] = "Use this carrier under a different prompt"
@@ -1304,6 +1311,70 @@ def test_bridge_error_payload_is_openai_shaped() -> None:
     }
 
 
+def test_admit_stamps_the_callers_output_cap(tmp_path: Path) -> None:
+    """A capped request carries its normalized cap on the admission.
+
+    The data plane reads it to tell a budget the provider's hidden reasoning
+    exhausted (a `stop` with no output and no usage on a capped request, the
+    Meta muse-spark shape) from a provider that delivered nothing at all.
+    """
+    control, raw_key = _control_plane(tmp_path)
+    assert control.authenticate(json.dumps({"raw_key": raw_key})) == "{}"
+
+    body = json.dumps(
+        {
+            "model": "coding",
+            "max_completion_tokens": 40,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    )
+    admission = _admit_started(control, raw_key, body)
+    assert admission["maximum_output_tokens"] == 40
+
+
+def test_admit_marks_an_image_output_lane_on_the_wire(tmp_path: Path) -> None:
+    """A lane the platform marks `emits_images` rides the wire as `image_output`.
+
+    The data plane answers an empty completion on such a rung at once
+    (no redial, no ladder): the chat normalizers carry no image event, so an
+    image generation always ends output-less and a redial would bill the
+    house a second whole image (2026-09-15, gpt-5.4-image-2). The flag is
+    read from `emits_images`, never from `supports_image_generation`: that
+    claim admits /v1/images, and reusing it opened OpenRouter chat lanes to
+    image generations the same day.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path, capabilities=ModelCapabilities(emits_images=True)
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+        )
+    )
+    assert control.authenticate(json.dumps({"raw_key": raw_key})) == "{}"
+    admission = _admit_started(control, raw_key, _chat_body())
+    assert admission["image_output"] is True
+
+    text_control, text_key = _control_plane(tmp_path / "text")
+    assert text_control.authenticate(json.dumps({"raw_key": text_key})) == "{}"
+    text_admission = _admit_started(text_control, text_key, _chat_body())
+    assert text_admission["image_output"] is False
+
+    # The Images-API claim alone does NOT mark the chat wire.
+    images_root = tmp_path / "images"
+    _manager, images_key = _configured_gateway(
+        images_root, capabilities=ModelCapabilities(supports_image_generation=True)
+    )
+    images_control = NativeControlPlane(
+        load_gateway_components(
+            images_root, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+        )
+    )
+    assert images_control.authenticate(json.dumps({"raw_key": images_key})) == "{}"
+    images_admission = _admit_started(images_control, images_key, _chat_body())
+    assert images_admission["image_output"] is False
+
+
 def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:
     """Admission decodes the raw body, returns the shared upstream payload, and
     settlement lands in the usage report."""
@@ -1326,6 +1397,8 @@ def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:
     assert admission["route_reason"] == "direct"
     assert admission["stream"] is False
     assert admission["include_usage"] is False
+    # An uncapped request stamps no cap: the admission stays byte-identical.
+    assert "maximum_output_tokens" not in admission
 
     decoded = decode_chat(json.loads(_chat_body()))
     provider_request = decoded.request.model_copy(update={"stream": True, "include_usage": True})
@@ -6261,3 +6334,184 @@ def test_admission_carries_the_throttle_redial_schedule_and_per_rung_eligibility
     route = gated["route"]
     assert isinstance(route, list)
     assert [wire["throttle_redial_budget"] for wire in route] == [0, 3]
+
+
+def test_leading_only_rung_folds_mid_conversation_system_turns_on_chat_and_messages(
+    tmp_path: Path,
+) -> None:
+    """A vLLM rung serving the Qwen3.6+ template gets exactly one, leading, system turn.
+
+    The official template raises ``System message must be at the beginning.``
+    for any other placement; Claude Code injects a system turn after the first
+    user turn and after every tool_result. On a rung declaring
+    ``system_messages_leading_only`` the wire payload carries those as user
+    text, disclosed in ``ignored_parameters``, on the Chat surface (system at
+    index 3) and on the Messages surface (an in-list system turn after the
+    tool_result) alike.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://gateway.xplabs.ai/qwen/v1",
+        capabilities=ModelCapabilities(supports_tools=True, system_messages_leading_only=True),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "shared-secret"})
+    )
+    chat = _admit(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "coding",
+                "messages": [
+                    {"role": "system", "content": "You are Claude Code."},
+                    {"role": "user", "content": "Diagnose the regression."},
+                    {"role": "assistant", "content": "Reading the failing test first."},
+                    {"role": "system", "content": "# Environment\nPlatform: linux"},
+                    {"role": "user", "content": "Go ahead."},
+                ],
+            }
+        ),
+    )
+    chat_messages = _payload_messages(chat)
+    assert [message["role"] for message in chat_messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "user",
+    ]
+    assert chat_messages[3]["content"] == "# Environment\nPlatform: linux"
+    assert SYSTEM_FOLD_DISCLOSURE in cast(list[str], chat["ignored_parameters"])
+
+    messages = _admit(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "coding",
+                "max_tokens": 64,
+                "system": "You are Claude Code.",
+                "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+                "messages": [
+                    {"role": "user", "content": "Diagnose the regression."},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "toolu_01", "name": "Read", "input": {}}
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "toolu_01", "content": "ok"}
+                        ],
+                    },
+                    {"role": "system", "content": "<total_tokens>1</total_tokens>"},
+                ],
+            }
+        ),
+        surface="messages",
+    )
+    messages_payload = _payload_messages(messages)
+    assert [message["role"] for message in messages_payload] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "user",
+    ]
+    assert messages_payload[4]["content"] == "<total_tokens>1</total_tokens>"
+    assert SYSTEM_FOLD_DISCLOSURE in cast(list[str], messages["ignored_parameters"])
+
+
+def test_gemini_rung_folds_a_mid_conversation_system_turn_instead_of_refusing(
+    tmp_path: Path,
+) -> None:
+    """Claude Code's Chat-wire shape against a Gemini alias is served, not refused.
+
+    A system turn after conversation start used to fail the whole route at
+    shaping ("A system message after conversation start is not supported by
+    this model route"; 1,747 requests in the seven days to 2026-09-15). On the
+    hoisting wire the leading run still rides systemInstruction, the later
+    instruction rides as user text at its position, and admission discloses
+    the fold.
+    """
+    from exp.common.models import GatewayTokenPrices
+    from exp.runtime.gateway.catalog_authority import (
+        ConnectionConfig,
+        upsert_connection,
+        upsert_singleton_deployment,
+    )
+
+    manager, raw_key = _configured_gateway(tmp_path)
+    upsert_connection(
+        tmp_path,
+        name="gemini-main",
+        connection=ConnectionConfig(provider="gemini", api_key_env="GEMINI_TEST_KEY"),
+        replace=False,
+    )
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="gem",
+        connection_name="gemini-main",
+        provider_model="gemini-2.5-pro",
+        exact_model_id="gemini-revision-exact",
+        revision=None,
+        capabilities=ModelCapabilities(),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="gem",
+        alias_name="gem",
+        revision_id="revision-gem",
+        pool_id="gem",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="gem")
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={
+                "TEST_PROVIDER_KEY": "provider-secret-canary",
+                "GEMINI_TEST_KEY": "gemini-secret-canary",
+            },
+        )
+    )
+    admission = _admit(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "gem",
+                "messages": [
+                    {"role": "system", "content": "You are Claude Code."},
+                    {"role": "user", "content": "Diagnose the regression."},
+                    {"role": "system", "content": "# Environment\nPlatform: linux"},
+                    {"role": "assistant", "content": "Reading the failing test first."},
+                    {"role": "user", "content": "Go ahead."},
+                ],
+            }
+        ),
+    )
+    route = admission["route"]
+    assert isinstance(route, list)
+    wire = route[0]
+    assert isinstance(wire, dict)
+    assert wire["dialect"] == "gemini_generate_content"
+    payload = wire["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert payload["systemInstruction"] == {"parts": [{"text": "You are Claude Code."}]}
+    assert payload["contents"] == [
+        {
+            "role": "user",
+            "parts": [{"text": "Diagnose the regression.\n\n# Environment\nPlatform: linux"}],
+        },
+        {"role": "model", "parts": [{"text": "Reading the failing test first."}]},
+        {"role": "user", "parts": [{"text": "Go ahead."}]},
+    ]
+    assert HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE in cast(list[str], admission["ignored_parameters"])

@@ -105,6 +105,7 @@ from exp.runtime.gateway.native_reasoning import (
     strip_stale_reasoning_history,
     unseal_reasoning_history,
 )
+from exp.runtime.gateway.native_replay import replay_scope_payload
 from exp.runtime.gateway.native_responses import (
     ContinuationContext,
     continuation_route_binding,
@@ -136,11 +137,7 @@ from exp.runtime.openai_protocol.errors import (
     public_failure_error,
 )
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
-from exp.runtime.openai_protocol.state import (
-    BoundedContinuationStore,
-    ProtocolNamespace,
-    replay_key,
-)
+from exp.runtime.openai_protocol.state import BoundedContinuationStore
 
 _logger = logging.getLogger(__name__)
 
@@ -678,17 +675,20 @@ class NativeControlPlane(
             "maximum_same_deployment_attempts": MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
             "refusal_failover": authorization.refusal_failover,
             "output_guardrail": bool(policy is not None and policy.output_checks),
+            "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
         }
         if route.snapshot.throttle_redial is not None:
-            # The pool's frozen backoff-and-redial schedule; absent (not
-            # null) on pools that keep throttles failover-only, so an
-            # unauthored pool's admission is byte-identical.
+            # The pool's frozen backoff-and-redial schedule; absent (not null) on
+            # pools that keep throttles failover-only: their admission is byte-identical.
             response["throttle_redial"] = route.snapshot.throttle_redial.model_dump(mode="json")
         if request.surface == GatewayApiSurface.MESSAGES:
             # Display-only: what `message_start` shows as input when the
             # upstream reports nothing before its final chunk. The ledger
             # never reads it; settlement keeps the provider's meters.
             response["input_token_estimate"] = counted_input_tokens(public_request)
+        if public_request.maximum_output_tokens is not None:
+            # The caller's cap: classifies an output-less, usage-less `stop` (capped -> length).
+            response["maximum_output_tokens"] = public_request.maximum_output_tokens
         if request.surface == GatewayApiSurface.RESPONSES:
             response["surface"] = "responses"
             response["envelope"] = responses_envelope(public_request)
@@ -888,34 +888,7 @@ class NativeControlPlane(
                 return _escalation(str(exc))
             except Exception:  # noqa: BLE001 - the owner's admission records this failure.
                 pass
-        key = replay_key(
-            namespace=ProtocolNamespace(
-                organization_id=authorization.organization_id,
-                identity_id=authorization.identity_id,
-                alias_revision_id=authorization.alias_revision_id,
-            ),
-            surface=request.surface,
-            caller_operation=caller_operation,
-            canonical_request_sha256=authorization.canonical_request_sha256,
-        )
-        if key is None:  # pragma: no cover - caller_operation is checked above.
-            raise NativeBridgeError(
-                OpenAIProtocolError(
-                    status_code=500,
-                    code="internal_error",
-                    message="The gateway request failed.",
-                    error_type="api_error",
-                )
-            )
-        scope: JsonObject = {
-            "organization_id": key.namespace.organization_id,
-            "identity_id": key.namespace.identity_id,
-            "alias_revision_id": key.namespace.alias_revision_id,
-            "surface": key.surface.value,
-            "caller_operation_sha256": key.caller_operation_sha256,
-            "canonical_request_sha256": key.canonical_request_sha256,
-        }
-        return json.dumps(scope, separators=(",", ":"))
+        return replay_scope_payload(authorization, request)
 
     def remember(self, argument: str) -> str:
         """Retain one finished Responses continuation within strict bounds.

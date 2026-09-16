@@ -377,3 +377,90 @@ def test_deepseek_origin_folds_too_and_other_rungs_keep_the_trailing_system_turn
         "user",
         "system",
     ]
+
+
+def _claude_code_tool_loop_shape() -> GatewayRequest:
+    """Claude Code one tool loop later: Environment prompt mid-turn, reminder after the result."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="system", content="You are Claude Code."),
+            GatewayMessage(role="user", content="Diagnose the regression."),
+            GatewayMessage(role="system", content="# Environment\nPlatform: linux"),
+            GatewayMessage(
+                role="assistant",
+                content=None,
+                tool_calls=(ToolCall(call_id="call-1", name="Read", arguments={"path": "a"}),),
+            ),
+            GatewayMessage(role="tool", content="ok", tool_call_id="call-1"),
+            GatewayMessage(role="system", content="<total_tokens>1</total_tokens>"),
+        ),
+        tools=(
+            GatewayToolDefinition(
+                name="Read", description="Read a file.", parameters={"type": "object"}
+            ),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+
+
+def test_leading_only_rungs_fold_every_instruction_turn_past_the_first() -> None:
+    """The Qwen3.6+ template 400s any non-first system turn; a declared rung sees none.
+
+    The Environment prompt joins the preceding user turn and the post-tool
+    reminder is re-roled as a user turn in place (the template accepts
+    consecutive user turns), so the provider reads every instruction where the
+    caller put it. The buffered and streaming builders share the rule.
+    """
+    payload = openai_compatible_stream_payload(
+        "qwen3.8-27b", _claude_code_tool_loop_shape(), system_messages_leading_only=True
+    )
+    messages = cast(list[JsonObject], payload["messages"])
+    assert [message["role"] for message in messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "user",
+    ]
+    assert messages[0]["content"] == "You are Claude Code."
+    assert messages[1]["content"] == "Diagnose the regression.\n\n# Environment\nPlatform: linux"
+    assert messages[4]["content"] == "<total_tokens>1</total_tokens>"
+
+
+def test_undeclared_rungs_keep_their_mid_conversation_system_turns() -> None:
+    """Without the declaration no message is rewritten, on any origin."""
+    payload = openai_compatible_stream_payload("qwen3.8-27b", _claude_code_tool_loop_shape())
+    roles = [m["role"] for m in cast(list[JsonObject], payload["messages"])]
+    assert roles == ["system", "user", "system", "assistant", "tool", "system"]
+
+
+def test_responses_wire_emits_instruction_only_requests_as_input_items() -> None:
+    """A request that is only instructions still sends a non-empty ``input``.
+
+    The provider refuses an empty ``input`` ("One of 'input' or
+    'previous_response_id' ... must be provided") but serves the same
+    instructions as input items (probed live 2026-09-15, api.openai.com);
+    845 Responses attempts for one organization were billed as provider
+    rejections in three days for exactly this shape.
+    """
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="system", content="You are terse."),
+            GatewayMessage(role="developer", content="Answer in French."),
+        ),
+        stream=True,
+    )
+    payload = openai_responses_stream_payload("gpt-5.4", request, supports_temperature=True)
+    assert payload["input"] == [
+        {"role": "system", "content": "You are terse."},
+        {"role": "developer", "content": "Answer in French."},
+    ]
+    assert "instructions" not in payload
+    # With a conversation present, leading instructions keep riding the field.
+    conversational = openai_responses_stream_payload(
+        "gpt-5.4", _developer_conversation(), supports_temperature=True
+    )
+    assert conversational["instructions"] == "Follow policy."

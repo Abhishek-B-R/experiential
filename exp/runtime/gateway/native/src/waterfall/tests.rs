@@ -18,6 +18,7 @@ fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         reasoning_output_exposed: false,
         stop_sequences: Vec::new(),
         serialize_tool_calls: false,
+        image_output: false,
         model_id: String::new(),
         billing_customer_managed: false,
         idempotency_key: "op".to_string(),
@@ -49,6 +50,31 @@ fn first_byte_allowance_scales_with_input_and_honors_overrides() {
     // A zero slope pins the flat bound regardless of input size.
     let pinned = first_byte_allowance(&wire(None, Some(0.0)), default_base, 240.0, 9e9);
     assert!((pinned.as_secs_f64() - 15.0).abs() < 1e-6);
+}
+
+#[test]
+fn open_phase_bound_ignores_the_per_chunk_timeout() {
+    // A deployment authored with a 120 s first-byte allowance on a 60 s
+    // per-chunk wire waits the full 120 s for headers; only the request
+    // deadline can cut it shorter.
+    let allowance = first_byte_allowance(
+        &wire(Some(120.0), Some(0.0)),
+        Duration::from_secs(15),
+        240.0,
+        0.0,
+    );
+    assert!((allowance.as_secs_f64() - 120.0).abs() < 1e-6);
+    assert_eq!(
+        open_phase_bound(Duration::from_secs(600), allowance),
+        Duration::from_secs(120)
+    );
+    assert_eq!(
+        open_phase_bound(Duration::from_secs(45), allowance),
+        Duration::from_secs(45)
+    );
+    // The default allowance stays the fail-fast bound for a small prompt.
+    let small = first_byte_allowance(&wire(None, None), Duration::from_secs(15), 240.0, 1_000.0);
+    assert!(open_phase_bound(Duration::from_secs(600), small) < Duration::from_secs(16));
 }
 
 fn policy(refusal_failover: bool) -> RoutePolicy {
@@ -195,4 +221,103 @@ fn failover_only_classes_skip_the_redial_and_advance() {
         &throttled,
         false,
     ));
+}
+
+fn usage(output_tokens: Option<u64>, reasoning_tokens: Option<u64>) -> Usage {
+    Usage {
+        input_tokens: Some(9),
+        output_tokens,
+        cached_input_tokens: None,
+        cache_creation_input_tokens: None,
+        reasoning_tokens,
+    }
+}
+
+#[test]
+fn a_billed_stop_with_no_output_is_an_empty_completion() {
+    // The live OpenRouter DeepSeek shape: reasoning billed, nothing sent.
+    assert!(billed_empty_completion(
+        &Event::Completed,
+        Some(&usage(Some(147), Some(148)))
+    ));
+    // One EOS token and nothing else is still a paid-for empty answer.
+    assert!(billed_empty_completion(
+        &Event::Completed,
+        Some(&usage(Some(1), Some(0)))
+    ));
+    // A wire that reports thinking outside the output leg still counts it.
+    assert!(billed_empty_completion(
+        &Event::Completed,
+        Some(&usage(Some(0), Some(30)))
+    ));
+    let failure = Failure::empty_completion();
+    // The model's answer was nothing: its own class (never the health
+    // circuit's operational set), a 400 the SDKs do not auto-retry, and the
+    // pre-commit redial + ladder kept.
+    assert_eq!(failure.failure_class, FailureClass::EmptyCompletion);
+    assert!(failure.retryable_same_deployment && failure.failover_eligible);
+    let public = failure.public_error();
+    assert_eq!(public.status_code, 400);
+    assert_eq!(public.code, "empty_completion");
+    assert_eq!(public.error_type, "invalid_request_error");
+    assert_eq!(FailureClass::EmptyCompletion.as_str(), "empty_completion");
+}
+
+#[test]
+fn honest_output_less_endings_are_not_empty_completions() {
+    // A zero-token stop is the provider saying nothing, not billing for it.
+    assert!(!billed_empty_completion(
+        &Event::Completed,
+        Some(&usage(Some(0), None))
+    ));
+    // No usage report proves nothing was spent.
+    assert!(!billed_empty_completion(&Event::Completed, None));
+    // Truncation, a stop sequence, and a paused turn keep their own shapes.
+    let billed = usage(Some(16), None);
+    assert!(!billed_empty_completion(&Event::Incomplete, Some(&billed)));
+    assert!(!billed_empty_completion(
+        &Event::StoppedAtSequence("END".to_string()),
+        Some(&billed)
+    ));
+    assert!(!billed_empty_completion(&Event::PausedTurn, Some(&billed)));
+}
+
+#[test]
+fn a_stop_with_no_usage_report_and_no_output_is_an_unreported_empty_completion() {
+    // The live Meta muse-spark shape: empty stop, no usage frame at all.
+    assert!(unreported_empty_completion(&Event::Completed, None));
+    // A report of zero tokens is the provider accounting for "nothing".
+    assert!(!unreported_empty_completion(
+        &Event::Completed,
+        Some(&usage(Some(0), None))
+    ));
+    // A billed stop is the billed twin's case, never this one.
+    assert!(!unreported_empty_completion(
+        &Event::Completed,
+        Some(&usage(Some(12), None))
+    ));
+    // Truncation, a stop sequence and a paused turn keep their own shapes.
+    assert!(!unreported_empty_completion(&Event::Incomplete, None));
+    assert!(!unreported_empty_completion(
+        &Event::StoppedAtSequence("END".to_string()),
+        None
+    ));
+    assert!(!unreported_empty_completion(&Event::PausedTurn, None));
+}
+
+#[test]
+fn an_image_output_rung_answers_its_empty_completion_without_redial_or_ladder() {
+    // The chat normalizers carry no image event, so an image generation is
+    // always an empty completion: a redial would bill the house a second
+    // whole image for the same nothing.
+    let mut image = wire(None, None);
+    image.image_output = true;
+    let failure = empty_completion_failure(&image);
+    assert_eq!(failure.failure_class, FailureClass::EmptyCompletion);
+    assert!(!failure.retryable_same_deployment && !failure.failover_eligible);
+    // Every other rung keeps the redial and the ladder: the empty answer is
+    // not deterministic there.
+    let text = wire(None, None);
+    let failure = empty_completion_failure(&text);
+    assert!(failure.retryable_same_deployment && failure.failover_eligible);
 }

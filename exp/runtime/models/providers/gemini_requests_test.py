@@ -200,3 +200,36 @@ def test_gemini_generate_request_inlines_documents_in_caller_order() -> None:
             ],
         }
     ]
+
+
+def test_gemini_folds_a_mid_conversation_system_turn_into_user_text_in_place() -> None:
+    """systemInstruction hoists only the leading run; a later instruction keeps its position.
+
+    Claude Code on the Chat wire injects a system turn after the first user
+    turn and after every tool result; the gateway used to refuse the whole
+    route for it. The text now rides as user content where the caller put it.
+    """
+    payload = gemini_generate_request(
+        "gemini-2.5-pro",
+        ModelRequest(
+            messages=(
+                ModelMessage(role="system", content="be terse"),
+                ModelMessage(role="system", content="answer in English"),
+                ModelMessage(role="user", content="hi"),
+                ModelMessage(role="system", content="# Environment\nPlatform: linux"),
+                ModelMessage(role="assistant", content="hello"),
+                ModelMessage(role="system", content="<total_tokens>1</total_tokens>"),
+                ModelMessage(role="user", content="go"),
+            ),
+            tools=(),
+        ),
+    )
+    assert payload["systemInstruction"] == {
+        "parts": [{"text": "be terse"}, {"text": "answer in English"}]
+    }
+    assert payload["contents"] == [
+        {"role": "user", "parts": [{"text": "hi\n\n# Environment\nPlatform: linux"}]},
+        {"role": "model", "parts": [{"text": "hello"}]},
+        {"role": "user", "parts": [{"text": "<total_tokens>1</total_tokens>"}]},
+        {"role": "user", "parts": [{"text": "go"}]},
+    ]

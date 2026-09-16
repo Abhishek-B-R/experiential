@@ -34,6 +34,7 @@ from exp.runtime.models.providers.errors import (
     ProviderParameterError,
 )
 from exp.runtime.models.providers.generation_parameter_validation import (
+    lane_default_reasoning_effort,
     profile_reasoning_efforts,
 )
 from exp.runtime.models.providers.generation_route_compat import (
@@ -324,17 +325,11 @@ def _requested_thinking_tier(
     budget = config.get("budget_tokens")
     if isinstance(budget, int) and not isinstance(budget, bool):
         return thinking_config_reasoning_effort(config), "budget_tokens"
-    for profile in profiles:
-        default = profile.reasoning_effort
-        if (
-            default is not None
-            and default in REASONING_EFFORTS
-            and default != "none"
-            and default in profile_reasoning_efforts(profile)
-        ):
-            # Membership in REASONING_EFFORTS is the runtime check the cast
-            # relies on; the profile field is a plain string.
-            return cast("ReasoningEffort", default), "lane_default"
+    default = lane_default_reasoning_effort(profiles)
+    if default is not None:
+        # Membership in REASONING_EFFORTS is checked by the resolver; the
+        # profile field is a plain string, hence the cast.
+        return cast("ReasoningEffort", default), "lane_default"
     return "medium", "gateway_default"
 
 

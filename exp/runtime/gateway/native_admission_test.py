@@ -352,6 +352,42 @@ def test_oversized_inline_media_skips_the_bedrock_rung() -> None:
     assert errors[0].param == "messages"
 
 
+def test_unrepresentable_assistant_turn_is_a_messages_rejection_not_an_internal_error() -> None:
+    """An assistant turn with empty text and no tool call is refused on ``messages``.
+
+    The Converse payload builder cannot encode such a turn and reports it as a
+    response-contract violation; admission must surface that as a
+    field-specific parameter rejection so the caller receives a 400 instead of
+    the request escaping as an internal admission failure.
+    """
+    streaming = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    deployments = (_deployment("ministral", provider="bedrock", gateway=streaming),)
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    client = cast(NativeWireClient, object())
+    wires = (
+        (GatewayWireProfile(dialect="bedrock_converse_stream", url="https://bedrock.test"), client),
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="hello"),
+            GatewayMessage(role="assistant", content=""),
+            GatewayMessage(role="user", content="again"),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    indexes, errors = protocol_compatible_indexes(route, wires, request, public_stream=False)
+    assert indexes == ()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ProviderParameterError)
+    assert errors[0].param == "messages"
+    assert errors[0].code == "invalid_parameter"
+    assert "assistant messages need text or a tool call" in str(errors[0])
+
+
 def test_media_handle_requests_land_only_on_the_uploading_providers_rung() -> None:
     """A waterfall skips undeclared and foreign-provider rungs for a handle.
 
@@ -839,6 +875,76 @@ def test_tool_result_image_degrades_with_disclosure_on_a_non_vision_route(stream
     assert accounting.recorded == 1
 
 
+@pytest.mark.parametrize("stream", [True, False])
+def test_a_chat_tool_screenshot_is_admitted_and_folded_on_a_vision_chat_route(stream: bool) -> None:
+    """The Copilot/Codex repro (an ``image_url`` part inside a ``role: "tool"``
+    message on /v1/chat/completions) decodes, admits on an image-capable Chat
+    rung with the image intact, and the route discloses the user-turn fold
+    the Chat payload applies; nothing is coerced."""
+    from exp.runtime.models.providers.dialect_dispatch import (
+        TOOL_RESULT_IMAGE_FOLD_DISCLOSURE,
+    )
+    from exp.runtime.openai_protocol.requests import decode_chat
+
+    body: JsonObject = {
+        "model": "coding",
+        "stream": stream,
+        "messages": [
+            {"role": "user", "content": "take a screenshot"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "screenshot", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": [
+                    {"type": "text", "text": "Screenshot taken:"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{_TOOL_IMAGE_PNG}"},
+                    },
+                ],
+            },
+        ],
+    }
+    request = decode_chat(body).request.model_copy(update={"include_usage": True})
+    vision = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+            supports_image_input=True,
+        )
+    )
+    deployments = (_deployment("luna", provider="azure_openai", gateway=vision),)
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    client = cast(NativeWireClient, object())
+    wires = ((GatewayWireProfile(dialect="openai_compatible", url="https://chat.test"), client),)
+    accounting = _AdmissionCoercionCounter()
+
+    _narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+
+    tool_message = provider.messages[-1]
+    assert tool_message.role == "tool"
+    assert [part.kind for part in tool_message.content_parts] == ["text", "image"]
+    assert tool_message.images[0].data == _TOOL_IMAGE_PNG
+    assert TOOL_RESULT_IMAGE_FOLD_DISCLOSURE in public.ignored_parameters
+    assert accounting.recorded == 0
+
+
 def test_a_thinking_config_translates_through_admission_on_an_openai_route() -> None:
     """The full admit loop serves a thinking config on an all-OpenAI route.
 
@@ -1304,6 +1410,71 @@ def test_an_open_strict_schema_is_closed_for_the_anthropic_rung_with_disclosure(
     assert provider.tools[0].parameters == {**open_schema, "additionalProperties": False}
     assert public.ignored_parameters == ("tools.parameters.additionalProperties->false",)
     assert accounting.recorded == 1
+
+
+def test_a_rung_whose_window_cannot_hold_prompt_plus_budget_is_skipped_with_its_wire() -> None:
+    """Narrowing runs first and keeps route and wires aligned: the small rung is gone from both."""
+    deployments = (
+        _deployment("shim", gateway=_TOOL_CAPABLE).model_copy(
+            update={"capabilities": ModelCapabilities(context_window_tokens=1_000)}
+        ),
+        _deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE).model_copy(
+            update={"capabilities": ModelCapabilities(context_window_tokens=2_000)}
+        ),
+    )
+    route = _mixed_route("maximize_availability", deployments)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="x" * (600 * MAXIMUM_BYTES_PER_TOKEN)),),
+        maximum_output_tokens=500,
+        maximum_output_tokens_parameter="max_tokens",
+    )
+    wires = _wires()
+    narrowed, wires_out, _public, _provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert narrowed.snapshot.deployment_ids == ("native",)
+    assert narrowed.deployment.deployment_id == "native"
+    assert wires_out == wires[1:]
+
+
+def test_the_shaped_output_budget_is_checked_against_each_rungs_window() -> None:
+    """Anthropic requires max_tokens: the route-wide 4,096 default the shaping adds must fit.
+
+    The caller sent no max_tokens, so the decoded request reserves nothing and
+    both rungs pass the first check; the shaped provider request carries the
+    Anthropic default (4,096), which the 1,000-token rung cannot hold beside a
+    600-token prompt, so it is skipped on the second pass and only the
+    8,000-token rung dispatches.
+    """
+    deployments = (
+        _deployment("shim", gateway=_TOOL_CAPABLE).model_copy(
+            update={"capabilities": ModelCapabilities(context_window_tokens=1_000)}
+        ),
+        _deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE).model_copy(
+            update={"capabilities": ModelCapabilities(context_window_tokens=8_000)}
+        ),
+    )
+    route = _mixed_route("maximize_availability", deployments)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="x" * (600 * MAXIMUM_BYTES_PER_TOKEN)),),
+    )
+    wires = _wires()
+    narrowed, wires_out, _public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert provider.maximum_output_tokens == 4_096
+    assert narrowed.snapshot.deployment_ids == ("native",)
+    assert wires_out == wires[1:]
 
 
 def test_a_prompt_certain_to_overflow_the_route_is_refused_before_shaping() -> None:

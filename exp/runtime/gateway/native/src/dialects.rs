@@ -11,7 +11,10 @@ mod anthropic;
 mod bedrock;
 mod deferred_tools;
 mod relay_finish;
-pub(in crate::dialects) use relay_finish::finish_open_tools_relay;
+mod stream_end;
+pub(in crate::dialects) use relay_finish::{
+    complete_streamed_tool_or_drop_cut, drop_cut_call, finish_open_tools_relay,
+};
 mod gemini;
 mod openai;
 
@@ -213,12 +216,28 @@ impl Normalizer {
         message: Option<&str>,
     ) -> Failure {
         let words: Vec<&str> = self.request_words.iter().map(String::as_str).collect();
+        // A relay's decode-failure sentence embeds the upstream error it could
+        // not parse: classify and relay THAT (see rejection_shapes).
+        let unwrapped = message.and_then(crate::rejection_shapes::relayed_decode_failure);
+        let (code, message): (Option<&str>, Option<&str>) = match &unwrapped {
+            Some((upstream_code, upstream_sentence)) => (
+                upstream_code.as_deref().or(code),
+                Some(upstream_sentence.as_str()),
+            ),
+            None => (code, message),
+        };
         let detail = provider_error_detail(code, message, &words);
         if let Some(detail) = &detail {
             log_provider_declared_failure(dialect, detail);
         }
         let kind = crate::stream_errors::classify_stream_error(code, message);
+        // A Responses relay that refuses replayed encrypted reasoning INSIDE
+        // the stream (200, then `response.failed`) carries the same repair
+        // mark as the pre-stream 4xx, so the waterfall can strip and re-dial.
+        let encrypted_reasoning_rejected = dialect == "openai_responses"
+            && crate::rejection_shapes::refuses_encrypted_reasoning(code, message);
         crate::stream_errors::stream_failure(kind, detail)
+            .with_encrypted_reasoning_rejected(encrypted_reasoning_rejected)
     }
 }
 
@@ -266,6 +285,9 @@ fn complete_streamed_tool(
     tool: &mut ToolAccumulator,
     events: &mut Vec<Event>,
 ) -> Result<(), Failure> {
+    if relay_finish::drop_phantom_tool(tool) {
+        return Ok(());
+    }
     tool.completed = true;
     // Only JSON function calls need the empty-object seed; custom (freeform)
     // input is legitimately empty text.
@@ -293,7 +315,7 @@ fn complete_streamed_tool(
         let bytes = tool.raw_arguments.len() + tool.withheld_tail.len();
         let line = serde_json::json!({
             "event": "malformed_tool_arguments",
-            "name": tool.name,
+            "name": bounded_wire_token(&tool.name),
             "bytes": bytes,
             "reason": message,
         });
@@ -406,6 +428,9 @@ pub struct Normalizer {
     // `messageStop` both follow the block): a budget truncation drops the
     // call and ends Incomplete; any other ending surfaces this failure.
     deferred_tool_failure: Option<Failure>,
+    // A call the provider cut mid-fragment was dropped under an ending that
+    // did not declare truncation; the terminal then settles Incomplete.
+    dropped_cut_call: bool,
 }
 
 impl Normalizer {
@@ -440,6 +465,7 @@ impl Normalizer {
             reasoning_content_route_sha256,
             request_words: Vec::new(),
             deferred_tool_failure: None,
+            dropped_cut_call: false,
         }
     }
 
@@ -547,28 +573,6 @@ impl Normalizer {
         ))
     }
 
-    /// Synthesize the terminal events for a stream that closed cleanly without
-    /// an explicit terminal frame.
-    ///
-    /// Gemini legitimately ends some streams right after its last content frame
-    /// without a `finishReason` frame. When content was already emitted, fold
-    /// the last-seen usage and complete normally instead of rejecting a real
-    /// answer as malformed; a stream that produced no content at all stays
-    /// terminal-less so `stream_ended` (or the relay) still fails it closed.
-    /// Returns no events when a terminal already ended the stream.
-    pub fn on_stream_end(&mut self) -> Vec<Event> {
-        if self.terminal || self.dialect != Dialect::GeminiGenerateContent || !self.emitted_output {
-            return Vec::new();
-        }
-        let mut events = Vec::new();
-        if let Some(usage) = self.usage.take() {
-            events.push(Event::Usage(usage));
-        }
-        events.push(Event::Completed);
-        self.terminal = true;
-        events
-    }
-
     /// Recover a Gemini stream that emitted content and then terminated
     /// *abnormally* — a broken transport read, a malformed frame, or a decoder
     /// error — rather than closing cleanly. `on_stream_end` covers the clean
@@ -604,7 +608,8 @@ impl Normalizer {
                 FailureClass::Transport,
                 "provider transport failed; retry the request",
             )
-            .with_retry(true, true));
+            .with_retry(true, true)
+            .with_provider_detail(failure.provider_detail));
         }
         let mut events = Vec::new();
         if let Some(usage) = self.usage.take() {
@@ -676,7 +681,10 @@ pub fn drain_stream_fixture(dialect: Dialect, chunks: &[Vec<u8>]) -> (Vec<Value>
     }
     // A clean stream close after content, with no terminal frame, completes
     // normally (mirroring the relay's EOF handling) instead of failing closed.
-    let synthesized = normalizer.on_stream_end();
+    let synthesized = match normalizer.on_stream_end() {
+        Ok(events) => events,
+        Err(failure) => return recover_or_report(&mut normalizer, simplified, failure),
+    };
     if !synthesized.is_empty() {
         simplified.extend(synthesized.iter().map(simplified_event));
         return (simplified, None);
@@ -707,103 +715,8 @@ fn recover_or_report(
 }
 
 #[cfg(test)]
-mod recover_abnormal_end_tests {
-    use super::*;
-
-    fn feed_text(normalizer: &mut Normalizer, text: &str) {
-        let frame = SseEvent {
-            event: None,
-            data: serde_json::json!({
-                "candidates": [{"content": {"parts": [{"text": text}]}}]
-            })
-            .to_string(),
-        };
-        let events = normalizer.feed(&frame).expect("content frame normalizes");
-        assert!(events.iter().any(Event::is_output_token));
-    }
-
-    fn incoming() -> Failure {
-        Failure::new(FailureClass::MalformedResponse, "boom").with_retry(false, true)
-    }
-
-    #[test]
-    fn gemini_after_content_recovers_incomplete_and_folds_usage() {
-        let mut normalizer = Normalizer::new(Dialect::GeminiGenerateContent);
-        feed_text(&mut normalizer, "hi");
-        normalizer.usage = Some(Usage {
-            input_tokens: Some(5),
-            output_tokens: Some(2),
-            ..Usage::default()
-        });
-        let recovered = normalizer
-            .recover_abnormal_end(incoming())
-            .expect("a partial answer recovers instead of failing");
-        assert!(matches!(recovered.first(), Some(Event::Usage(_))));
-        assert!(matches!(recovered.last(), Some(Event::Incomplete)));
-        assert!(normalizer.saw_terminal());
-    }
-
-    #[test]
-    fn an_output_overflow_is_never_recovered_even_after_content() {
-        // The retained-output ceiling is a deliberate gateway limit: a Gemini
-        // stream that emitted content and then overflowed must still surface
-        // `provider_output_too_large`, not be delivered and billed as a partial.
-        let mut normalizer = Normalizer::new(Dialect::GeminiGenerateContent);
-        feed_text(&mut normalizer, "hi");
-        let overflow = Failure::new(FailureClass::ProviderInternal, OUTPUT_OVERFLOW_MESSAGE);
-        let failure = normalizer
-            .recover_abnormal_end(overflow)
-            .expect_err("an overflow is not an abnormal end to salvage");
-        assert_eq!(failure.safe_message, OUTPUT_OVERFLOW_MESSAGE);
-        assert_eq!(failure.failure_class, FailureClass::ProviderInternal);
-        assert!(!normalizer.saw_terminal());
-    }
-
-    #[test]
-    fn gemini_before_content_reclassifies_to_retryable_transport() {
-        let mut normalizer = Normalizer::new(Dialect::GeminiGenerateContent);
-        let failure = normalizer
-            .recover_abnormal_end(incoming())
-            .expect_err("nothing to salvage before content");
-        assert_eq!(failure.failure_class, FailureClass::Transport);
-        assert!(failure.retryable_same_deployment);
-        assert!(failure.failover_eligible);
-        assert!(!normalizer.saw_terminal());
-    }
-
-    #[test]
-    fn non_gemini_keeps_the_original_failure_even_after_content() {
-        // Recovery is scoped to Gemini; an OpenAI-compatible stream that emitted
-        // content and then broke keeps its original malformed classification.
-        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
-        let frame = SseEvent {
-            event: None,
-            data: serde_json::json!({"choices": [{"delta": {"content": "hi"}}]}).to_string(),
-        };
-        normalizer.feed(&frame).expect("content normalizes");
-        let failure = normalizer
-            .recover_abnormal_end(incoming())
-            .expect_err("non-gemini keeps the original failure");
-        assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
-        assert!(!normalizer.saw_terminal());
-    }
-
-    #[test]
-    fn an_already_terminal_stream_keeps_the_original_failure() {
-        let mut normalizer = Normalizer::new(Dialect::GeminiGenerateContent);
-        feed_text(&mut normalizer, "hi");
-        let terminal = SseEvent {
-            event: None,
-            data: serde_json::json!({"candidates": [{"finishReason": "STOP"}]}).to_string(),
-        };
-        normalizer.feed(&terminal).expect("terminal normalizes");
-        assert!(normalizer.saw_terminal());
-        let failure = normalizer
-            .recover_abnormal_end(incoming())
-            .expect_err("a terminated stream does not re-recover");
-        assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
-    }
-}
+#[path = "dialects/recover_abnormal_end_tests.rs"]
+mod recover_abnormal_end_tests;
 
 #[cfg(test)]
 mod stream_error_detail_tests {

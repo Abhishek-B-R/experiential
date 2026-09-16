@@ -44,7 +44,7 @@ from exp.runtime.gateway.native_recovery import record_departure, record_session
 from exp.runtime.gateway.native_rung_policy import (
     failed_dispatch_candidate,
     reserve_rung_slot,
-    shed_keeps_pin,
+    shed_keeps_rung,
 )
 from exp.runtime.gateway.native_settlement import (
     all_routes_throttled_failure,
@@ -182,14 +182,14 @@ class NativeAttemptAccounting:
         self._rung_rate_limit_sheds = 0
         self._rung_fresh_session_spills = 0
         # Cache-stakes throttle dispositions on pools authoring a
-        # throttle_cache_threshold: throttles surfaced (warm cache met the
-        # threshold; no further attempt row, so this is the only worker-side
-        # trace) and throttles that actually failed over cold (fallback reserved),
-        # plus post-backoff redials of a throttled rung on pools authoring a
-        # throttle_redial schedule (redial reserved on the same rung).
+        # throttle_cache_threshold (surfaced: no further attempt row, so the
+        # only worker-side trace; failed over cold: fallback reserved), plus
+        # post-backoff redials on pools authoring a throttle_redial schedule
+        # and the redials force-admitted past the warm rung's own rate shed.
         self._throttles_surfaced = 0
         self._throttles_failed_over = 0
         self._throttle_backoff_redials = 0
+        self._throttle_backoff_forced = 0
         # Reconcile retained writes and abandoned requests even without new traffic.
         self._sweeper = threading.Thread(
             target=self._sweep_loop,
@@ -267,13 +267,14 @@ class NativeAttemptAccounting:
         with self._lock:
             return (self._rung_rate_limit_sheds, self._rung_fresh_session_spills)
 
-    def throttle_cache_counters(self) -> tuple[int, int, int]:
-        """Return ``(surfaced, failed_over, backoff_redials)`` throttle counts for metrics."""
+    def throttle_cache_counters(self) -> tuple[int, int, int, int]:
+        """Return ``(surfaced, failed_over, backoff_redials, backoff_forced)`` for metrics."""
         with self._lock:
             return (
                 self._throttles_surfaced,
                 self._throttles_failed_over,
                 self._throttle_backoff_redials,
+                self._throttle_backoff_forced,
             )
 
     def _count_throttle_disposition(self, disposition: ThrottleDisposition) -> None:
@@ -285,10 +286,6 @@ class NativeAttemptAccounting:
                 self._throttle_backoff_redials += 1
             else:
                 self._throttles_failed_over += 1
-
-    def mark_unhealthy(self) -> None:
-        """Latch an unhealthy state after a lost terminal accounting write."""
-        self._accounting_healthy = False
 
     def counters(self) -> tuple[int, int, int]:
         """Return sweep recoveries and registry size for the metrics snapshot."""
@@ -395,17 +392,12 @@ class NativeAttemptAccounting:
         failure = failure_from_boundary_payload(data.get("failure"))
         current_depth = data.get("current_depth")
         # Rung dispatch policies shed a claimed rung SIDEWAYS to the next
-        # claimable one instead of queueing on it (spill in seconds, never a
-        # deadline death). Each shed is remembered so the dispatched attempt
-        # can disclose the bypassed preferred rung, and so a ladder exhausted
-        # ONLY by policy sheds can force-admit past the bound rather than
-        # manufacture a failure unbounded admission would not have had.
+        # claimable one instead of queueing on it. Each shed is remembered so
+        # the dispatched attempt can disclose the bypassed rung, and so a ladder
+        # exhausted ONLY by sheds can force-admit past the bound, never fail.
         policy_sheds: list[tuple[int, str]] = []
         disposition: ThrottleDisposition | None = None
-        # The rung a post-backoff redial re-dials; the disclosure names it
-        # only when that exact rung is the one reserved (a shed there moves
-        # the candidate on and the redial story ends with the shed).
-        redial_depth: int | None = None
+        redial_depth: int | None = None  # The rung a post-backoff redial re-dials.
         if failure is not None and isinstance(current_depth, int):
             candidate, disposition = failed_dispatch_candidate(
                 health=self._health,
@@ -474,8 +466,9 @@ class NativeAttemptAccounting:
                 )
                 policy_sheds.append((candidate, ticket.reason))
                 self._health.release_probe(keys[candidate])
-                # The issuing rung of a reasoning continuation is force-admitted, never spilled.
-                forced_overflow = last_failure is None and shed_keeps_pin(route, candidate)
+                forced_overflow = shed_keeps_rung(
+                    route, candidate, redial_depth, last_failure, ticket.reason
+                )
                 if not forced_overflow:
                     candidate = claim_route_from(self._health, keys, candidate + 1)
                 continue
@@ -527,6 +520,9 @@ class NativeAttemptAccounting:
                     if candidate == len(route.deployments) - 1
                     else all_routes_unavailable_failure()
                 )
+                if candidate == redial_depth:
+                    # The forced admission belonged to the redialed rung alone.
+                    forced_overflow = False
                 candidate = claim_route_from(self._health, keys, candidate + 1)
                 continue
             except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
@@ -551,17 +547,17 @@ class NativeAttemptAccounting:
                 raise error from exc
             if ticket is not None:
                 self._loads.bind(ticket, attempt_id)
-            if forced_overflow:
-                with self._lock:
-                    self._rung_saturated_overflows += 1
             if disposition == THROTTLE_FAILOVER_COLD:
-                # Real only now: a cold decision whose ladder then exhausts
-                # ends as a plain exhausted throttle, counted as neither.
+                # Real only now: an exhausted ladder is a plain exhausted throttle.
                 self._count_throttle_disposition(disposition)
             elif throttle_backoff:
                 self._count_throttle_disposition(THROTTLE_BACKOFF)
             self._bind_sticky_dispatch(entry, deployment)
             with self._lock:
+                if forced_overflow and not throttle_backoff:
+                    self._rung_saturated_overflows += 1
+                elif forced_overflow:
+                    self._throttle_backoff_forced += 1
                 entry.attempt_counts[candidate] += 1
                 if throttle_backoff:
                     entry.throttle_redials[candidate] += 1
