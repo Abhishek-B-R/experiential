@@ -345,3 +345,55 @@ def test_loaded_report_rejects_score_tampering_and_wrong_judge_identity() -> Non
     forged = PairedEvaluationReport.model_validate(raw)
     with pytest.raises(ValueError, match="different model snapshot"):
         verify_evaluation_report(forged, manifest)
+
+
+@pytest.mark.parametrize("field", ["rubric", "visible_trajectory", "task_id"])
+def test_saved_judge_request_must_match_replayed_frozen_episode(field: str) -> None:
+    """Consistent score text cannot authorize a judge request for a different trajectory."""
+    from exp.optimize.claas.evaluation import PairedEvaluationReport, verify_evaluation_report
+
+    manifest, world, judge = evaluation_fixture()
+    report = asyncio.run(
+        evaluate_policies(
+            manifest,
+            current=Policy("current"),
+            candidate=Policy("candidate"),
+            world=world,
+            judge=judge,
+        )
+    )
+    verify_evaluation_report(report, manifest)
+    raw = json.loads(report.model_dump_json())
+    outcome = raw["pairs"][0]["candidate"]
+    payload = json.loads(outcome["judge_request"]["messages"][-1]["content"])
+    payload[field] = [] if field == "visible_trajectory" else "altered"
+    outcome["judge_request"]["messages"][-1]["content"] = json.dumps(payload, sort_keys=True)
+    loaded = PairedEvaluationReport.model_validate(raw)
+    with pytest.raises(ValueError, match="frozen task and replayed episode"):
+        verify_evaluation_report(loaded, manifest)
+
+
+def test_independently_retained_report_digest_rejects_rewritten_judge_response() -> None:
+    """An authoritative digest binds unsigned recordings when loading outside the run store."""
+    from exp.common.core.artifacts import sha256_json
+    from exp.optimize.claas.evaluation import PairedEvaluationReport, verify_evaluation_report
+
+    manifest, world, judge = evaluation_fixture()
+    report = asyncio.run(
+        evaluate_policies(
+            manifest,
+            current=Policy("current"),
+            candidate=Policy("candidate"),
+            world=world,
+            judge=judge,
+        )
+    )
+    digest = sha256_json(report)
+    verify_evaluation_report(report, manifest, expected_report_sha256=digest)
+    raw = json.loads(report.model_dump_json())
+    outcome = raw["pairs"][0]["candidate"]
+    outcome["judgment"]["score"] = 1.0
+    outcome["judge_response"]["output"]["content"] = json.dumps(outcome["judgment"])
+    loaded = PairedEvaluationReport.model_validate(raw)
+    with pytest.raises(ValueError, match="independently retained digest"):
+        verify_evaluation_report(loaded, manifest, expected_report_sha256=digest)

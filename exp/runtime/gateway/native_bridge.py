@@ -5,13 +5,10 @@ normalization, and SSE encoding. Shared Python contracts own decoding,
 authorization, payload construction, continuation state, and durable ledger
 transactions. Every boundary call takes and returns one JSON string.
 
-Admission returns the full ordered certified route (one wire configuration
-per deployment) plus the frozen retry-policy facts, accepting the request
-without starting any attempt. The data plane then reserves each physical
-dispatch through ``start_attempt`` immediately before network work and lands
-each attempt's durable terminal through ``settle`` (finalizing the request
-only on the terminal attempt); candidate selection stays here: the frozen
-waterfall policy, health circuits, and budget skipping.
+Admission returns the certified route and frozen retry policy without starting an attempt.
+The data plane reserves each dispatch through ``start_attempt`` and records its durable
+terminal through ``settle``. Candidate selection, health circuits, and budget skipping
+stay in the control plane.
 
 Boundary errors raise :class:`NativeBridgeError`, whose ``public_error_json``
 attribute carries the sanitized OpenAI-shaped error the data plane returns to
@@ -676,6 +673,7 @@ class NativeControlPlane(
             "refusal_failover": authorization.refusal_failover,
             "output_guardrail": bool(policy is not None and policy.output_checks),
             "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
+            "caller_identity_id": authorization.identity_id,
         }
         if route.snapshot.throttle_redial is not None:
             # The pool's frozen backoff-and-redial schedule; absent (not null) on
