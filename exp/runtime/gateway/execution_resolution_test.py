@@ -114,6 +114,27 @@ def test_profile_ranges_intersect_with_the_catalog_contract() -> None:
     assert resolved.model_id == "provider-model"
 
 
+def test_profile_resolution_carries_the_declared_output_floor() -> None:
+    """The catalog's ``minimum_output_tokens`` lane fact reaches the wire
+    profile untouched (a client profile cannot know it: one relay wire serves
+    floored and unfloored models), and an undeclared lane carries none."""
+    profile = GatewayWireProfile(
+        dialect="openai_compatible", url="https://example.test/v1/chat/completions"
+    )
+    capabilities = ModelCapabilities()
+
+    floored = _resolved_wire_profile(
+        _deployment(capabilities, GatewayDeploymentCapabilities(minimum_output_tokens=16)),
+        _resolved(_NativeClient(profile), capabilities),
+    )
+    assert floored.minimum_output_tokens == 16
+
+    undeclared = _resolved_wire_profile(
+        _deployment(capabilities), _resolved(_NativeClient(profile), capabilities)
+    )
+    assert undeclared.minimum_output_tokens is None
+
+
 def test_profile_resolution_applies_exact_gateway_reasoning_values() -> None:
     """Deployment metadata replaces a family guess with provider-published values."""
     capabilities = ModelCapabilities(

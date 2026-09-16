@@ -27,6 +27,7 @@ from exp.runtime.gateway.native_execution import (
     deployment_wire_entry,
     dispatch_disclosure,
     next_route_candidate,
+    reorder_route_deployments,
     select_route_deployments,
     throttle_disposition,
 )
@@ -100,6 +101,31 @@ def _failover_only() -> GatewayFailure:
         safe_message="provider throttled the request",
         failover_eligible=True,
     )
+
+
+def test_route_narrowing_and_reordering_keep_the_reasoning_pin() -> None:
+    """A narrowed or reordered pinned route still knows which rung sealed the reasoning.
+
+    The pin survives dead-rung narrowing and affinity reordering so every
+    surviving non-issuing rung still requires the strip and is still recorded
+    as ``reasoning_continuation_failover``, even when narrowing removed the
+    issuing rung itself.
+    """
+    pinned = _route().model_copy(
+        update={
+            "route_reason": "reasoning_continuation",
+            "reasoning_pinned_deployment_id": "one",
+        }
+    )
+    narrowed = select_route_deployments(pinned, (1, 2))
+    assert narrowed.reasoning_pinned_deployment_id == "one"
+    assert all(narrowed.requires_reasoning_strip(item) for item in narrowed.deployments)
+    assert narrowed.attempt_route_reason(narrowed.deployment) == "reasoning_continuation_failover"
+    reordered = reorder_route_deployments(pinned, (2, 0, 1))
+    assert reordered.reasoning_pinned_deployment_id == "one"
+    assert reordered.requires_reasoning_strip(reordered.deployment) is True
+    assert reordered.requires_reasoning_strip(reordered.deployments[1]) is False
+    assert reordered.attempt_route_reason(reordered.deployments[1]) == "reasoning_continuation"
 
 
 def test_select_route_deployments_rebinds_the_execution_snapshot() -> None:
@@ -997,6 +1023,17 @@ def test_dispatch_disclosure_names_a_backoff_redial_on_every_pool() -> None:
         "affinity",
         None,
     )
+    # A redial the rung's own policy shed and the accounting force-admitted
+    # stays throttle_backoff: neither the shed reason nor saturated_overflow
+    # may relabel the attempt the caller waited the backoff for.
+    for pool in (route, affinity):
+        assert dispatch_disclosure(
+            pool,
+            0,
+            policy_sheds=[(0, "rate_limit")],
+            forced_overflow=True,
+            throttle_backoff=True,
+        ) == (THROTTLE_BACKOFF, None)
 
 
 def test_wire_entry_carries_the_throttle_redial_budget() -> None:

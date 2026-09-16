@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
@@ -15,6 +14,8 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.models.providers.dialect_dispatch import (
     CACHE_CONTROL_NOT_FORWARDED_SUFFIX,
     THINKING_HISTORY_DROP_DISCLOSURE,
+    TOOL_RESULT_IMAGE_FOLD_DIALECTS,
+    TOOL_RESULT_IMAGE_FOLD_DISCLOSURE,
 )
 from exp.runtime.models.providers.dialect_dispatch import (
     SERVICE_TIER_DIALECTS as SERVICE_TIER_DIALECTS,
@@ -44,9 +45,9 @@ from exp.runtime.models.providers.fireworks import (
 from exp.runtime.models.providers.generation_parameter_validation import (
     anthropic_reasoning_disengaged,
     disclose_anthropic_tool_schemas,
-    mid_conversation_system_present,
     require_assistant_prefill_supported,
     require_tool_names_supported,
+    resolve_level_less_enable,
     serves_reasoning_summary,
 )
 from exp.runtime.models.providers.generation_parameter_validation import (
@@ -58,6 +59,7 @@ from exp.runtime.models.providers.generation_parameter_validation import (
 from exp.runtime.models.providers.generation_parameter_validation import (
     require_route_numeric_parameter as _require_route_numeric_parameter,
 )
+from exp.runtime.models.providers.instruction_turns import disclose_system_fold
 from exp.runtime.models.providers.messages_payloads import (
     anthropic_messages_stream_payload as anthropic_messages_stream_payload,
 )
@@ -87,8 +89,6 @@ from exp.runtime.models.providers.server_tools import (
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
 
-_logger = logging.getLogger(__name__)
-
 _ANTHROPIC_REQUIRED_MAX_TOKENS_DEFAULT = 4096
 
 TOOL_ERROR_FOLD_DISCLOSURE = "messages.content.is_error->content"
@@ -108,9 +108,6 @@ The provider rejects lower values by name ("Expected a value >= 16"), while
 the Anthropic surface legally carries ``max_tokens`` down to 1, so
 Messages-surface requests below the floor are raised to it with disclosure.
 """
-
-GATEWAY_GENERATION_PARAMETER_CONTRACT_VERSION = 2
-"""Version of the route admission and provider wire-translation contract."""
 
 _STRICT_STRUCTURED_OUTPUT_DIALECTS = frozenset(
     {"anthropic_messages", "gemini_generate_content", "bedrock_converse_stream"}
@@ -179,37 +176,60 @@ def route_generation_parameter_requests(
                 param=param,
                 code="invalid_parameter",
             )
-        if (
-            request.maximum_output_tokens < OPENAI_MINIMUM_OUTPUT_TOKENS
-            and (
-                request.surface == GatewayApiSurface.MESSAGES
-                and any(
-                    profile.dialect in {"openai_responses", "openai_compatible"}
-                    for profile in profiles
-                )
-                # A Chat value keeps native semantics on a chat wire (some
-                # compatible providers accept an output ceiling of 1); only
-                # the TRANSLATED Responses wire imposes OpenAI's minimum, so
-                # the floor covers exactly the routes that translate.
-                or request.surface == GatewayApiSurface.CHAT_COMPLETIONS
-                and any(profile.dialect == "openai_responses" for profile in profiles)
+        # Two floors, one rewrite. The OpenAI wire floor is a TRANSLATION
+        # fact: Anthropic and Chat Completions accept output ceilings down to
+        # 1 (Claude Code probes with exactly that after a /model switch) while
+        # OpenAI rejects max_output_tokens below 16, so a Messages or Chat
+        # value translated onto an OpenAI Responses rung rides the provider
+        # floor with disclosure instead of surfacing a provider 400 the
+        # caller cannot act on (2026-09-05 stragglers). A Chat value keeps
+        # native semantics on a chat wire (some compatible providers accept
+        # an output ceiling of 1); only the TRANSLATED Responses wire imposes
+        # OpenAI's minimum. A native Responses caller keeps the named
+        # admission rejection below: sub-16 is invalid on its own surface.
+        translated_onto_openai_wire = (
+            request.surface == GatewayApiSurface.MESSAGES
+            and any(
+                profile.dialect in {"openai_responses", "openai_compatible"} for profile in profiles
             )
+        ) or (
+            request.surface == GatewayApiSurface.CHAT_COMPLETIONS
+            and any(profile.dialect == "openai_responses" for profile in profiles)
+        )
+        # The declared floor is a LANE fact the catalog stamps per rung
+        # (``GatewayWireProfile.minimum_output_tokens``): a provider that
+        # refuses small ceilings on a wire that natively carries them
+        # (Perplexity sonar and Sakana fugu via OpenRouter, grok-4.6 on
+        # Bedrock: "max_tokens must be at least 16"). It floors on EVERY
+        # surface, because the refusal is the provider's, not the wire's.
+        # The route floors to the LARGEST minimum any rung declares, so no
+        # rung of the waterfall dispatches a value it would refuse. A native
+        # Responses request on an all-Responses route is the one exception:
+        # sub-16 is invalid on its own surface and keeps the named admission
+        # rejection below, whatever a rung declares.
+        native_responses_route = request.surface == GatewayApiSurface.RESPONSES and all(
+            profile.dialect == "openai_responses" for profile in profiles
+        )
+        output_floor = max(
+            (
+                OPENAI_MINIMUM_OUTPUT_TOKENS if translated_onto_openai_wire else 0,
+                *(
+                    profile.minimum_output_tokens
+                    for profile in profiles
+                    if profile.minimum_output_tokens is not None and not native_responses_route
+                ),
+            )
+        )
+        if (
+            request.maximum_output_tokens < output_floor
             # The floored value must stay within every rung's declared output
             # ceiling; a route capped below the floor keeps the caller value
             # and the provider's own rejection.
-            and (not route_limits or min(route_limits) >= OPENAI_MINIMUM_OUTPUT_TOKENS)
+            and (not route_limits or min(route_limits) >= output_floor)
         ):
-            # Anthropic and Chat Completions accept output ceilings down to
-            # 1 (Claude Code probes with exactly that after a /model switch)
-            # while OpenAI rejects max_output_tokens below 16, so a Messages
-            # or Chat value translated onto an OpenAI Responses rung rides
-            # the provider floor with disclosure instead of surfacing a
-            # provider 400 the caller cannot act on (2026-09-05 stragglers).
-            # A native Responses caller keeps the named admission rejection
-            # below: sub-16 is invalid on its own surface.
-            provider_updates["maximum_output_tokens"] = OPENAI_MINIMUM_OUTPUT_TOKENS
+            provider_updates["maximum_output_tokens"] = output_floor
             parameter = request.maximum_output_tokens_parameter or "max_tokens"
-            path = f"{parameter}->{OPENAI_MINIMUM_OUTPUT_TOKENS}"
+            path = f"{parameter}->{output_floor}"
             if path not in ignored:
                 ignored.append(path)
     elif any(profile.dialect == "anthropic_messages" for profile in profiles):
@@ -338,33 +358,15 @@ def route_generation_parameter_requests(
     ):
         ignore("presence_penalty", "presence_penalty->dropped(unsupported_by_provider)")
     if request.thinking_default_enable and request.reasoning_effort is None:
-        # A level-less "enable thinking" (from a translated thinking:{enabled} or
-        # chat_template_kwargs:{enable_thinking:true}) resolves to the model's own
-        # default effort here, at the serving route: a route-wide required default
-        # when portable, else the LOWEST portable non-none tier (default-not-high
-        # avoids surprising cost). A route that supports no reasoning effort cannot
-        # enable thinking, so it surfaces rather than silently not thinking.
-        portable = set(REASONING_EFFORTS)
-        for profile in profiles:
-            portable.intersection_update(_profile_reasoning_efforts(profile))
-        portable_non_none = tuple(e for e in REASONING_EFFORTS if e in portable and e != "none")
-        if not portable_non_none:
-            raise ProviderParameterError(
-                message=(
-                    "This model route cannot enable thinking: it supports no reasoning "
-                    "effort. Remove the enable-thinking field or choose a reasoning model."
-                ),
-                param=effort_path,
-                code="unsupported_parameter",
-            )
-        required_defaults = {
-            profile.reasoning_effort
-            for profile in profiles
-            if profile.reasoning_effort_required and profile.reasoning_effort in portable_non_none
-        }
-        provider_updates["reasoning_effort"] = (
-            next(iter(required_defaults)) if len(required_defaults) == 1 else portable_non_none[0]
-        )
+        # A level-less "enable thinking" (a translated thinking:{enabled|adaptive},
+        # chat_template_kwargs / enable_thinking, reasoning:{enabled}) resolves
+        # to the route's default depth here (generation_parameter_validation).
+        resolved_default = resolve_level_less_enable(profiles, effort_path=effort_path)
+        if resolved_default is None:
+            provider_updates["thinking_default_enable"] = False
+            ignored.append(f"{effort_path}->ignored(model_always_reasons)")
+        else:
+            provider_updates["reasoning_effort"] = resolved_default
     if request.reasoning_effort is not None:
         portable_efforts = set(REASONING_EFFORTS)
         for profile in profiles:
@@ -442,25 +444,20 @@ def route_generation_parameter_requests(
             code="unsupported_parameter",
         )
 
-    # Two wires define an image carrier inside a tool result: Anthropic
-    # (tool_result image blocks) and native Responses (the SDK
-    # function_call_output part list). A homogeneous route on either keeps
-    # the images; a route with any rung that has no carrier degrades them to
-    # positional placeholder text with disclosure instead of rejecting: the
-    # block is baked into the caller's history, so a rejection wedges the
-    # whole session, and a silent drop at encoding would misstate what the
-    # model saw. A non-vision rung on a keeping route still rejects at
-    # preflight and the route-wide coercion applies the same disclosed
-    # degrade.
-    if any(message.role == "tool" and message.images for message in request.messages) and not (
-        all(profile.dialect == "anthropic_messages" for profile in profiles)
-        or all(profile.dialect == "openai_responses" for profile in profiles)
+    # Every dialect carries a tool-result image: natively inside the tool
+    # result on Anthropic (tool_result image blocks), native Responses (the SDK
+    # function_call_output part list) and Bedrock (toolResult image blocks),
+    # and folded into a user turn that follows the tool run on Chat
+    # Completions and Gemini, whose tool results are text-only. The fold is
+    # disclosed once per route; a rung with no image input at all still
+    # rejects at preflight and the route-wide coercion applies the disclosed
+    # placeholder degrade (the block is baked into the caller's history, so a
+    # rejection would wedge the whole session).
+    if any(message.role == "tool" and message.images for message in request.messages) and any(
+        profile.dialect in TOOL_RESULT_IMAGE_FOLD_DIALECTS for profile in profiles
     ):
-        stripped = strip_tool_result_images(request.messages)
-        if stripped is not None:
-            provider_updates["messages"] = stripped
-            if TOOL_RESULT_IMAGE_DROP_DISCLOSURE not in ignored:
-                ignored.append(TOOL_RESULT_IMAGE_DROP_DISCLOSURE)
+        if TOOL_RESULT_IMAGE_FOLD_DISCLOSURE not in ignored:
+            ignored.append(TOOL_RESULT_IMAGE_FOLD_DISCLOSURE)
 
     # Only the Anthropic wire has a tool-result error flag. Every other wire
     # folds the flag into the result text at encoding (a fixed prefix, see
@@ -830,20 +827,7 @@ def route_generation_parameter_requests(
     require_assistant_prefill_supported(profiles, request)
     require_tool_names_supported(profiles, request)
     disclose_anthropic_tool_schemas(profiles, request, ignored)
-    # A mid-conversation system turn narrows out instruction-hoisting wires.
-    if mid_conversation_system_present(request) and any(
-        profile.dialect in {"gemini_generate_content", "bedrock_converse_stream"}
-        for profile in profiles
-    ):
-        raise ProviderParameterError(
-            message=(
-                "A system message after conversation start is not supported by this "
-                "model route. Move the instruction to the leading system prompt or "
-                "choose a different model."
-            ),
-            param="messages",
-            code="unsupported_parameter",
-        )
+    disclose_system_fold(profiles, request, ignored)
 
     encrypted_reasoning_present = any(
         block.kind == "encrypted_reasoning"

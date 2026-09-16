@@ -823,6 +823,17 @@ def test_astra_responses_capability_slots_default_off() -> None:
     assert caps.model_dump(mode="json", by_alias=True, exclude_defaults=True) == {}
 
 
+def test_minimum_output_tokens_is_a_defaulted_positive_lane_fact() -> None:
+    """The provider output floor defaults off (identity-invisible, no schema
+    bump), is declared per deployment, and must be a positive count."""
+    caps = GatewayDeploymentCapabilities()
+    assert caps.minimum_output_tokens is None
+    assert caps.model_dump(mode="json", by_alias=True, exclude_defaults=True) == {}
+    assert GatewayDeploymentCapabilities(minimum_output_tokens=16).minimum_output_tokens == 16
+    with pytest.raises(ValidationError):
+        GatewayDeploymentCapabilities(minimum_output_tokens=0)
+
+
 def test_for_service_tier_reprices_whole_request_for_flex_and_priority() -> None:
     """A requested flex/priority card replaces the base schedule whole-request;
     other tiers (and no card) leave the base schedule unchanged."""

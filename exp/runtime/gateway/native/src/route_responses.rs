@@ -16,8 +16,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::admission::{
-    acquire_permit, apply_output_guardrail, commit_dependent, commit_independent, new_guard,
-    wire_drift_response, Admission,
+    acquire_permit, apply_output_guardrail, new_guard, served_headers, wire_drift_response,
+    Admission,
 };
 use crate::encode::{compact_json, reasoning_carrier_candidate};
 use crate::encode_responses::{
@@ -201,6 +201,7 @@ pub(crate) async fn responses(
         http: &state.http,
         request_id: &admission.request_id,
         raw_key: &raw_key,
+        caller_scope: admission.caller_scope.as_deref(),
         route: &admission.route,
         policy: admission.policy(),
         deadline,
@@ -217,6 +218,7 @@ pub(crate) async fn responses(
             &ResponsesRetention::default(),
             None,
         )),
+        output_token_cap: admission.maximum_output_tokens,
     };
     let won = acquire_attempt(&context, &mut guard).await;
 
@@ -293,6 +295,7 @@ async fn settled_responses_response(
     mut lease: Option<OwnerLease>,
     client_request_id: Option<String>,
 ) -> Response {
+    let served = settled.served();
     let mut events = settled.events;
     let refusal_completed = complete_visible_refusal(&mut events);
     let failed = refusal_completed.is_none() && matches!(events.last(), Some(Event::Failed(_)));
@@ -304,8 +307,7 @@ async fn settled_responses_response(
             return error_response(&collection_public_error(&failure.clone().boundary()));
         }
     }
-    let mut headers = commit_independent(admission, client_request_id.as_deref());
-    headers.extend(commit_dependent(admission, settled.depth));
+    let headers = served_headers(admission, client_request_id.as_deref(), served);
     if admission.stream {
         let body = match encode_responses_sse(admission, created_at, &events, None) {
             Ok(body) => body,
@@ -375,7 +377,7 @@ async fn respond_from_responses_events(
     state: &AppState,
     admission: Admission,
     mut guard: AttemptGuard,
-    depth: usize,
+    served: crate::waterfall::Served,
     mut events: Vec<Event>,
     usage: Option<Usage>,
     tool_names: Vec<String>,
@@ -384,6 +386,7 @@ async fn respond_from_responses_events(
     client_request_id: Option<String>,
     stream_body: bool,
 ) -> Response {
+    let depth = served.depth;
     let refusal_completed = complete_visible_refusal(&mut events);
     let reasoning_content_carrier =
         match seal_reasoning_events(&guard.bridge, &admission.request_id, depth, &events).await {
@@ -503,8 +506,7 @@ async fn respond_from_responses_events(
         }
         return error_response(&PublicError::internal());
     }
-    let mut headers = commit_independent(&admission, client_request_id.as_deref());
-    headers.extend(commit_dependent(&admission, depth));
+    let headers = served_headers(&admission, client_request_id.as_deref(), served);
     if stream_body {
         let body = match encode_responses_sse(
             &admission,
@@ -590,7 +592,7 @@ async fn completed_responses(
         state,
         admission,
         guard,
-        committed.depth,
+        committed.served(),
         events,
         committed.usage,
         committed.tool_names,
@@ -691,7 +693,7 @@ async fn guarded_responses(
         &state,
         admission,
         guard,
-        committed.depth,
+        committed.served(),
         events,
         committed.usage,
         committed.tool_names,
@@ -716,8 +718,7 @@ async fn stream_responses(
     client_request_id: Option<String>,
 ) -> Response {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-    let mut header_pairs = commit_independent(&admission, client_request_id.as_deref());
-    header_pairs.extend(commit_dependent(&admission, committed.depth));
+    let header_pairs = served_headers(&admission, client_request_id.as_deref(), committed.served());
     let request_id = admission.request_id.clone();
     let alias = admission.alias.clone();
     let envelope = admission.envelope.clone().unwrap_or_default();

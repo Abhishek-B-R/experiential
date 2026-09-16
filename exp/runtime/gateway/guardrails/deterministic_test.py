@@ -310,3 +310,13 @@ def test_an_unguarded_policy_has_no_plan() -> None:
     assert policy is not None
     detectors = compile_native_detectors(engine.deterministic_specifications)
     assert native_output_plan(policy, detectors) is None
+
+
+@pytest.mark.parametrize("pattern", ["[a&&b]", "[a~~b]", "[a[b]", "[a-z&&b]"])
+def test_native_character_classes_preserve_re2_literal_members(pattern: str) -> None:
+    """Rust set operators must not narrow the authored RE2 match set."""
+    classifier = RegexClassifier(RegexAdapterDocument(adapter_id="classes", patterns=(pattern,)))
+    detector = compile_native_detectors({"classes": classifier.native_specification()})["classes"]
+    for subject in ("a", "b", "&", "~", "[", "abc", "z", "secret & token"):
+        flagged, expected = classifier._redact(subject)
+        assert detector.redact(subject) == (expected if flagged else None)

@@ -127,6 +127,20 @@ pub fn to_rust_syntax(pattern: &str) -> Result<String, &'static str> {
                     return Err("unterminated posix class");
                 }
             }
+            '[' if in_class => {
+                // RE2 treats a nested opening bracket as a literal member.
+                // Rust instead opens a nested class with different membership.
+                out.push_str(r"\[");
+            }
+            '&' | '~' if in_class => {
+                // Rust reserves doubled members for intersection and symmetric
+                // difference. RE2 treats each member literally.
+                out.push('\\');
+                out.push(current);
+            }
+            '-' if in_class && chars.peek() == Some(&'-') => {
+                return Err("ambiguous class subtraction syntax");
+            }
             ']' if in_class => {
                 // A `]` in the first content position is a literal member in
                 // RE2; the Rust parser requires it escaped.

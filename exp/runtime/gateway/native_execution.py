@@ -307,6 +307,11 @@ def dispatch_disclosure(
     bypassed rung itself (the counterfactual the bypass is measured against).
     A post-backoff redial of a throttled rung is ``throttle_backoff`` on every
     pool: the chosen rung is the preferred rung, so no counterfactual is named.
+    That holds when the redialed rung's own dispatch policy shed the redial
+    and the accounting force-admitted it there anyway: the shed is remembered
+    in ``policy_sheds`` and counted, but ``throttle_backoff`` wins over
+    ``saturated_overflow`` and over the shed reason, because the caller waited
+    the backoff for exactly this rung and the attempt row must say so.
 
     Args:
         route: Frozen ordered route for this request.
@@ -740,6 +745,7 @@ def select_route_deployments(
         fallback_deployments=selected[1:],
         route_reason=route.route_reason,
         fallback_reason=route.fallback_reason,
+        reasoning_pinned_deployment_id=route.reasoning_pinned_deployment_id,
     )
 
 
@@ -797,6 +803,7 @@ def reorder_route_deployments(
         fallback_deployments=selected[1:],
         route_reason=route.route_reason,
         fallback_reason=route.fallback_reason,
+        reasoning_pinned_deployment_id=route.reasoning_pinned_deployment_id,
     )
 
 
@@ -867,6 +874,16 @@ def deployment_wire_entry(
         # whose payload already carries the caller's stop field.
         "stop_sequences": list(stop_sequences),
         "serialize_tool_calls": serialize_tool_calls,
+        # An image-emitting lane (the platform projects `emits_images` from the
+        # model's output modalities): the data plane answers an empty
+        # completion there at once instead of redialing a second whole image.
+        # Deliberately NOT `supports_image_generation`: that claim admits
+        # /v1/images, and every OpenAI-compatible profile carries an
+        # images_url, so reusing it opened OpenRouter chat lanes to image
+        # generations (2026-09-15).
+        "image_output": (
+            deployment.capabilities is not None and deployment.capabilities.emits_images
+        ),
         # How many times a throttle here is re-dialed with backoff before
         # failover (the pool's schedule scaled by this request's cache at
         # stake); zero keeps the historical failover-only throttle.

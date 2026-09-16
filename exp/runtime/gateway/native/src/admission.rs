@@ -11,16 +11,18 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::encode_responses::ResponsesEnvelope;
+use crate::errors::empty_completion_headers;
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::Event;
 use crate::guardrails;
 use crate::guardrails::plan::OutputPlan;
 use crate::metrics::METRICS;
+use crate::replay_repair::replay_repair_headers;
 use crate::respond::error_response;
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
 use crate::throttle_backoff::ThrottleRedial;
-use crate::waterfall::{DeploymentWire, RoutePolicy};
+use crate::waterfall::{DeploymentWire, RoutePolicy, Served};
 
 /// The wire configuration returned by one successful admission: the full
 /// ordered certified route (one wire configuration per deployment, each with
@@ -69,6 +71,21 @@ pub(crate) struct Admission {
     /// reports nothing before its final chunk; display-only, never settled.
     #[serde(default)]
     pub input_token_estimate: Option<u64>,
+    /// The caller's own output cap (`max_tokens`, `max_completion_tokens`
+    /// or `max_output_tokens`, normalized by the control plane), absent when
+    /// the request is uncapped. The waterfall reads it to classify a `stop`
+    /// that carried no output and no usage report: on a capped request that
+    /// is a budget the provider's hidden reasoning exhausted (an honest
+    /// `length`), never a completed empty answer.
+    #[serde(default)]
+    pub maximum_output_tokens: Option<u64>,
+    /// The caller's stable identity (organization and identity ids), the
+    /// scope of the data plane's per-caller replay-repair memory. The
+    /// request's own bearer cannot serve: in a hosted worker it is the
+    /// front's ephemeral exchanged token, different on every request.
+    /// Absent from an older control plane, which disables that memory.
+    #[serde(default)]
+    pub caller_scope: Option<String>,
 }
 
 impl Admission {
@@ -146,6 +163,20 @@ pub(crate) fn commit_dependent(admission: &Admission, depth: usize) -> Vec<(Stri
             admission.route_reason.clone(),
         ),
     ]
+}
+
+/// Every header one served attempt carries: the request identity, the rung
+/// that served, and any data-plane repair of the replayed input.
+pub(crate) fn served_headers(
+    admission: &Admission,
+    client_request_id: Option<&str>,
+    served: Served,
+) -> Vec<(String, String)> {
+    let mut headers = commit_independent(admission, client_request_id);
+    headers.extend(commit_dependent(admission, served.depth));
+    headers.extend(replay_repair_headers(served.encrypted_reasoning_stripped));
+    headers.extend(empty_completion_headers(served.empty_completion));
+    headers
 }
 
 /// Build one request guard bound to this server's settlement bookkeeping.
