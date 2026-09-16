@@ -408,3 +408,28 @@ fn a_frames_hostile_key_names_are_masked_in_the_malformed_reason() {
     assert!(!failure.safe_message.contains('\n'));
     assert!(!failure.safe_message.contains('\u{1b}'));
 }
+
+#[test]
+fn an_in_stream_relay_decode_failure_relays_the_upstream_error() {
+    // The same relay sentence declared inside a stream frame: the upstream
+    // document's class and sentence decide.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    let frame = json!({"error": {"code": 0, "type": "invalid_request_error", "message":
+        "failed to decode error response: json: cannot unmarshal number into Go struct field \
+         ResponseError.error.code of type string, raw: {\"error\":{\"code\":429,\"message\":\
+         \"Rate limit exceeded, please retry later.\"}} trace_id: 92913336280c9c28f727ac9bfefbd89c"}});
+    let events = normalizer
+        .feed(&SseEvent {
+            event: None,
+            data: frame.to_string(),
+        })
+        .expect("a declared failure is an event");
+    let [Event::Failed(failure)] = events.as_slice() else {
+        panic!("expected one Failed event, got {events:?}");
+    };
+    assert_eq!(failure.failure_class, FailureClass::Throttled);
+    assert!(failure
+        .provider_detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("Rate limit exceeded, please retry later.")));
+}

@@ -216,12 +216,28 @@ impl Normalizer {
         message: Option<&str>,
     ) -> Failure {
         let words: Vec<&str> = self.request_words.iter().map(String::as_str).collect();
+        // A relay's decode-failure sentence embeds the upstream error it could
+        // not parse: classify and relay THAT (see rejection_shapes).
+        let unwrapped = message.and_then(crate::rejection_shapes::relayed_decode_failure);
+        let (code, message): (Option<&str>, Option<&str>) = match &unwrapped {
+            Some((upstream_code, upstream_sentence)) => (
+                upstream_code.as_deref().or(code),
+                Some(upstream_sentence.as_str()),
+            ),
+            None => (code, message),
+        };
         let detail = provider_error_detail(code, message, &words);
         if let Some(detail) = &detail {
             log_provider_declared_failure(dialect, detail);
         }
         let kind = crate::stream_errors::classify_stream_error(code, message);
+        // A Responses relay that refuses replayed encrypted reasoning INSIDE
+        // the stream (200, then `response.failed`) carries the same repair
+        // mark as the pre-stream 4xx, so the waterfall can strip and re-dial.
+        let encrypted_reasoning_rejected = dialect == "openai_responses"
+            && crate::rejection_shapes::refuses_encrypted_reasoning(code, message);
         crate::stream_errors::stream_failure(kind, detail)
+            .with_encrypted_reasoning_rejected(encrypted_reasoning_rejected)
     }
 }
 

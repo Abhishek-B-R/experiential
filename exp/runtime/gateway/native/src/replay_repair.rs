@@ -324,15 +324,25 @@ pub fn without_encrypted_reasoning_where(
 /// `begin` applies what is already known: the payload this request stripped
 /// on an earlier dial of the rung (`repaired`), else the payloads the worker
 /// remembers as refused for this caller. `repair_after` decides one reactive
-/// re-dial when the provider still refuses, and `opened` counts and logs the
-/// repair once the dial that carried it has opened.
+/// re-dial when the provider still refuses, `dial_opened` notes a dial the
+/// provider answered, and the drop emits the attempt's one record once its
+/// fate is decided.
 pub(crate) struct AttemptRepair<'a> {
     wire: &'a DeploymentWire,
     scope: Option<&'a str>,
+    request_id: &'a str,
     repaired: &'a mut Option<Value>,
     stripped: bool,
     proactive: bool,
     reactive: bool,
+    /// Whether the most recent dial of this attempt opened (a 2xx). A repair
+    /// clears it until the re-dial opens, so the one record this attempt
+    /// emits on drop describes the dial that actually carried the repair.
+    last_dial_opened: bool,
+    /// Payloads stripped from memory before the first dial, and after a
+    /// refusal, so the operator line tells a mixed attempt from a miss.
+    proactive_strips: usize,
+    reactive_strips: usize,
 }
 
 impl<'a> AttemptRepair<'a> {
@@ -341,14 +351,19 @@ impl<'a> AttemptRepair<'a> {
         wire: &'a DeploymentWire,
         scope: Option<&'a str>,
         repaired: &'a mut Option<Value>,
+        request_id: &'a str,
     ) -> Self {
         let mut repair = Self {
             wire,
             scope,
+            request_id,
             repaired,
             stripped: false,
             proactive: false,
             reactive: false,
+            last_dial_opened: false,
+            proactive_strips: 0,
+            reactive_strips: 0,
         };
         if repair.repaired.is_some() {
             repair.stripped = true;
@@ -357,6 +372,8 @@ impl<'a> AttemptRepair<'a> {
             if let Some(stripped) =
                 without_encrypted_reasoning_where(&wire.upstream_payload, remembered)
             {
+                repair.proactive_strips = encrypted_payloads(&wire.upstream_payload).len()
+                    - encrypted_payloads(&stripped).len();
                 *repair.repaired = Some(stripped);
                 repair.stripped = true;
                 repair.proactive = true;
@@ -402,36 +419,55 @@ impl<'a> AttemptRepair<'a> {
         let Some(stripped) = without_encrypted_reasoning(self.payload()) else {
             return false;
         };
-        let present = encrypted_payloads(self.payload());
-        let hint = failure
-            .provider_detail
-            .as_deref()
-            .and_then(refused_payload_hint);
-        let quoted: Vec<&str> = match &hint {
-            Some(hint) => present
-                .iter()
-                .copied()
-                .filter(|content| matches_hint(content, hint))
-                .collect(),
-            None => Vec::new(),
+        let (present_count, digests) = {
+            let present = encrypted_payloads(self.payload());
+            let hint = failure
+                .provider_detail
+                .as_deref()
+                .and_then(refused_payload_hint);
+            let quoted: Vec<&str> = match &hint {
+                Some(hint) => present
+                    .iter()
+                    .copied()
+                    .filter(|content| matches_hint(content, hint))
+                    .collect(),
+                None => Vec::new(),
+            };
+            let refused = if quoted.is_empty() { &present } else { &quoted };
+            let digests: Vec<[u8; 32]> = match self.scope {
+                Some(scope) => refused
+                    .iter()
+                    .map(|content| payload_digest(scope, content))
+                    .collect(),
+                None => Vec::new(),
+            };
+            (present.len(), digests)
         };
-        let refused = if quoted.is_empty() { present } else { quoted };
-        if let Some(scope) = self.scope {
-            MEMORY.remember(
-                refused
-                    .into_iter()
-                    .map(|content| payload_digest(scope, content)),
-            );
+        if !digests.is_empty() {
+            MEMORY.remember(digests);
         }
+        self.reactive_strips = present_count;
         *self.repaired = Some(stripped);
         self.stripped = true;
         self.reactive = true;
+        self.last_dial_opened = false;
         true
     }
 
-    /// Count and log the repair once the dial carrying it has opened.
-    pub(crate) fn opened(&self, request_id: &str) {
-        if !self.stripped {
+    /// Note that the current dial opened (the provider answered 2xx).
+    pub(crate) fn dial_opened(&mut self) {
+        self.last_dial_opened = true;
+    }
+}
+
+impl Drop for AttemptRepair<'_> {
+    /// Emit ONE record per attempt, once its fate is decided: counted and
+    /// logged only when a repaired dial actually opened, so a refused re-dial
+    /// is a failure, not a repair, and a mixed attempt (remembered payloads
+    /// stripped, then a new one refused and repaired) is one reactive record
+    /// carrying both strip counts rather than two records.
+    fn drop(&mut self) {
+        if !self.stripped || !self.last_dial_opened {
             return;
         }
         // A same-request re-dial that reuses the rung's stripped payload
@@ -449,7 +485,9 @@ impl<'a> AttemptRepair<'a> {
         let line = json!({
             "event": "encrypted_reasoning_stripped",
             "mode": mode,
-            "request_id": request_id,
+            "proactive_strips": self.proactive_strips,
+            "reactive_strips": self.reactive_strips,
+            "request_id": self.request_id,
             "provider": self.wire.provider,
             "deployment_id": self.wire.deployment_id,
         });
