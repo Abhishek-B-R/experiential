@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import datetime
 
-from pydantic import AwareDatetime, Field, JsonValue, model_validator
+from pydantic import AwareDatetime, JsonValue, model_validator
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
@@ -32,7 +32,7 @@ class HumanScore(ContractModel):
     rollout_id: ArtifactId
     lineage_id: ArtifactId
     dimension_id: ArtifactId
-    score: int = Field(ge=0)
+    score: int
     created_at: AwareDatetime
     supersedes_label_id: ArtifactId | None = None
 
