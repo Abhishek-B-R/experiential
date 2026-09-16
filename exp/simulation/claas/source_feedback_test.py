@@ -183,3 +183,35 @@ def test_cross_scope_feedback_rejects_even_when_target_is_unmatched() -> None:
     scenario = mine_experiences((source,), partition="fit")[0].scenario
     with pytest.raises(ValueError, match="another user"):
         validate_source_feedback(scenario, (source,), (SourceFeedback(record=record),))
+
+
+def test_high_feedback_volume_selects_a_bounded_recent_practice_window() -> None:
+    """A valid 256-record buffer can open practice while preserving the latest 128 labels."""
+    source = make_experience()
+    records = tuple(response_feedback(identity=f"feedback-{index}") for index in range(256))
+    selected = select_source_feedback((source,), records, ())
+    assert tuple(item.record for item in selected) == records[-128:]
+    scenario = mine_experiences((source,), partition="fit")[0].scenario
+    client = RecordingClient(final_transition)
+    world = ClaasWorldModel(
+        client=client,
+        model=model_snapshot(),
+        limits=limits(),
+        source_disclosure=SourceDisclosure(scope=source.scope, model=model_snapshot()),
+    )
+    with world.open(scenario, grounding=(source,), source_feedback=selected) as session:
+        assert session.end().source_feedback == selected
+    assert not client.requests
+
+
+def test_bounded_selection_still_rejects_invalid_records_outside_the_window() -> None:
+    """Truncating valid labels cannot hide a cross-scope or duplicate earlier record."""
+    source = make_experience()
+    records = tuple(response_feedback(identity=f"feedback-{index}") for index in range(129))
+    foreign = records[0].model_copy(
+        update={"scope": source.scope.model_copy(update={"user_id": "another-user"})}
+    )
+    with pytest.raises(ValueError, match="another user"):
+        select_source_feedback((source,), (foreign, *records[1:]), ())
+    with pytest.raises(ValueError, match="unique"):
+        select_source_feedback((source,), (*records, records[0]), ())
