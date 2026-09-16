@@ -46,7 +46,7 @@ class CapturePolicy(ContractModel):
 class ExperienceProvenance(ContractModel):
     """The generating model and source evidence, without provider credentials."""
 
-    source_kind: Literal["traffic", "simulation", "import"]
+    source_kind: Literal["traffic", "simulation", "environment", "import"]
     source_id: Identifier
     model_id: Identifier
     model_revision: Identifier | None = None

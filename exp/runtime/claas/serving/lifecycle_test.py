@@ -207,3 +207,56 @@ def test_sleep_and_controller_restart_reload_adapter_bytes() -> None:
                 await fresh.resume()
 
     asyncio.run(run())
+
+
+def test_feedback_tokenization_requires_paused_revision_and_holds_drain_lease() -> None:
+    """Feedback counting cannot race sleep or reload, and cancellation releases its lease."""
+
+    async def run() -> None:
+        """Hold a tokenizer response while control attempts to drain the loaded revision."""
+        server = ControlServer()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def handle(request: httpx.Request) -> httpx.Response:
+            """Hold only raw teacher tokenization and delegate ordinary control operations."""
+            if request.url.path == "/tokenize":
+                assert _JSON.validate_json(request.content) == {
+                    "model": serving_model_name(revision()),
+                    "prompt": "teacher feedback",
+                    "add_special_tokens": False,
+                }
+                entered.set()
+                await release.wait()
+                return httpx.Response(200, json={"tokens": [7], "count": 1, "max_model_len": 4096})
+            return await server.handle(request)
+
+        async with httpx.AsyncClient(
+            base_url="http://owned", transport=httpx.MockTransport(handle)
+        ) as client:
+            lifecycle = VllmServingLifecycle(
+                client=client, base=revision(), decoder=TextCompletionDecoder()
+            )
+            with pytest.raises(ServingPausedError):
+                await lifecycle.tokenize_training_text("teacher feedback")
+            await lifecycle.wake()
+            await lifecycle.load_revision(revision())
+            await lifecycle.resume()
+            with pytest.raises(ServingPausedError):
+                await lifecycle.tokenize_training_text("teacher feedback")
+            await lifecycle.pause_and_drain()
+            tokenizing = asyncio.create_task(lifecycle.tokenize_training_text("teacher feedback"))
+            await entered.wait()
+            with pytest.raises(ServingPausedError, match="pause and drain"):
+                await lifecycle.sleep()
+            draining = asyncio.create_task(lifecycle.pause_and_drain())
+            await asyncio.sleep(0.01)
+            assert not draining.done()
+            tokenizing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await tokenizing
+            await draining
+            release.set()
+            assert await lifecycle.tokenize_training_text("teacher feedback") == (7,)
+            await lifecycle.sleep()
+
+    asyncio.run(run())

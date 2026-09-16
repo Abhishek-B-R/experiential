@@ -219,14 +219,7 @@ class VllmServingLifecycle:
         evaluation: bool,
     ) -> PolicySample:
         """Pin one revision until its complete sampling operation leaves the drain set."""
-        async with self._control:
-            async with self._condition:
-                if not self._awake or self._revision is None or (self._admitting == evaluation):
-                    raise ServingPausedError(
-                        "application is paused or not in the requested evaluation mode"
-                    )
-                revision = self._revision
-                self._active += 1
+        revision = await self._begin_request(evaluation=evaluation)
         try:
             sampler = VllmPolicySampler(
                 client=self._client,
@@ -236,6 +229,40 @@ class VllmServingLifecycle:
             )
             return await sampler.sample(messages, tools, request_id)
         finally:
+            await self._finish_request()
+
+    async def tokenize_training_text(self, text: str) -> tuple[int, ...]:
+        """Tokenize only new teacher feedback while paused, awake, and revision-bound.
+
+        The same drain lease as evaluation prevents sleep or adapter replacement
+        until tokenization completes. Original rollout token IDs remain untouched.
+        """
+        revision = await self._begin_request(evaluation=True)
+        try:
+            sampler = VllmPolicySampler(
+                client=self._client,
+                revision=revision,
+                decoder=self._decoder,
+                max_tokens=self._max_tokens,
+            )
+            return await sampler.tokenize_training_text(text)
+        finally:
+            await self._finish_request()
+
+    async def _begin_request(self, *, evaluation: bool) -> ServingRevision:
+        """Enter the drain set under the control lock and pin the loaded revision."""
+        async with self._control:
             async with self._condition:
-                self._active -= 1
-                self._condition.notify_all()
+                if not self._awake or self._revision is None or (self._admitting == evaluation):
+                    raise ServingPausedError(
+                        "application is paused or not in the requested evaluation mode"
+                    )
+                revision = self._revision
+                self._active += 1
+                return revision
+
+    async def _finish_request(self) -> None:
+        """Release one sampling or tokenization lease, including failure and cancellation."""
+        async with self._condition:
+            self._active -= 1
+            self._condition.notify_all()

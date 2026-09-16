@@ -138,6 +138,30 @@ class VllmPolicySampler:
         """Return the frozen policy label without consulting a mutable registry."""
         return self._revision.policy_revision
 
+    async def tokenize_training_text(self, text: str) -> tuple[int, ...]:
+        """Count newly supplied teacher text with the bound tokenizer and no special tokens.
+
+        This method never reconstructs original rollout evidence. Its returned
+        IDs belong only to the additional text supplied by the training caller.
+        """
+        if not text:
+            return ()
+        if len(text.encode("utf-8")) > 1_048_576:
+            raise ValueError("teacher feedback exceeds the one MiB tokenization request limit")
+        response = await self._client.post(
+            "/tokenize",
+            json={
+                "model": serving_model_name(self.revision),
+                "prompt": text,
+                "add_special_tokens": False,
+            },
+        )
+        response.raise_for_status()
+        result = _Tokenized.model_validate_json(response.content)
+        if result.count != len(result.tokens) or result.count > result.max_model_len:
+            raise ValueError("teacher feedback token receipt is inconsistent or exceeds context")
+        return result.tokens
+
     async def sample(
         self, messages: tuple[ModelMessage, ...], tools: tuple[ToolSchema, ...], request_id: str
     ) -> PolicySample:

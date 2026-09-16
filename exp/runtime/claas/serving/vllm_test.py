@@ -19,7 +19,7 @@ from exp.common.models import ModelMessage
 from exp.common.tasks import ToolSchema
 from exp.runtime.claas.registry import ServingRevision
 from exp.runtime.claas.serving.decoding import HermesCompletionDecoder
-from exp.runtime.claas.serving.vllm import VllmPolicySampler
+from exp.runtime.claas.serving.vllm import VllmPolicySampler, serving_model_name
 
 _JSON = TypeAdapter(JsonObject)
 
@@ -163,5 +163,65 @@ def test_server_evidence_cannot_be_reconstructed(
             )
             with pytest.raises(ValueError):
                 await sampler.sample((ModelMessage(role="user", content="task"),), (), "req")
+
+    asyncio.run(run())
+
+
+def test_training_text_tokenization_uses_raw_prompt_and_no_special_tokens(
+    server: tuple[SamplingServer, str],
+) -> None:
+    """Only the new teacher text crosses tokenization, without any generation request."""
+    state, url = server
+
+    async def run() -> None:
+        """Request exact feedback IDs from the real local tokenizer HTTP endpoint."""
+        async with httpx.AsyncClient(base_url=url) as client:
+            sampler = VllmPolicySampler(
+                client=client, revision=revision(), decoder=HermesCompletionDecoder()
+            )
+            assert await sampler.tokenize_training_text("\nFeedback: check the policy") == (11, 22)
+            assert await sampler.tokenize_training_text("") == ()
+            with pytest.raises(ValueError, match="one MiB"):
+                await sampler.tokenize_training_text("a" * 1_048_577)
+        assert state.requests == [
+            (
+                "/tokenize",
+                {
+                    "model": serving_model_name(revision()),
+                    "prompt": "\nFeedback: check the policy",
+                    "add_special_tokens": False,
+                },
+            )
+        ]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        {"tokens": [True], "count": 1, "max_model_len": 4096},
+        {"tokens": [-1], "count": 1, "max_model_len": 4096},
+        {"tokens": [7], "count": 2, "max_model_len": 4096},
+        {"tokens": [7, 8], "count": 2, "max_model_len": 1},
+    ],
+)
+def test_training_text_rejects_invalid_token_receipts(receipt: JsonObject) -> None:
+    """Strict feedback counts cannot accept boolean, negative, inconsistent, or oversized IDs."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        """Return one deliberately invalid tokenization response."""
+        return httpx.Response(200, json=receipt)
+
+    async def run() -> None:
+        """Validate the server receipt without manufacturing replacement IDs."""
+        async with httpx.AsyncClient(
+            base_url="http://owned", transport=httpx.MockTransport(respond)
+        ) as client:
+            sampler = VllmPolicySampler(
+                client=client, revision=revision(), decoder=HermesCompletionDecoder()
+            )
+            with pytest.raises(ValueError):
+                await sampler.tokenize_training_text("feedback")
 
     asyncio.run(run())

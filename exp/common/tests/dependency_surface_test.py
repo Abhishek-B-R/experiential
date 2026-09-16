@@ -30,11 +30,10 @@ def test_forbidden_provider_imports_are_absent() -> None:
             "exp.common.vendor",
         },
         allowed={
-            # The opt-in training worker is the only local Transformers execution boundary.
+            # The opt-in worker owns model loading and adapter export, including Transformers.
             ("optimize/claas/backends/verl/worker.py", "transformers"),
             ("optimize/claas/backends/verl/engine.py", "transformers.modeling_outputs"),
             ("optimize/claas/backends/verl/inputs.py", "transformers"),
-            ("optimize/claas/backends/verl/engine.py", "transformers"),
             ("runtime/models/providers/bedrock.py", "boto3"),
             ("runtime/models/providers/bedrock.py", "botocore.auth"),
             ("runtime/models/providers/bedrock.py", "botocore.awsrequest"),
@@ -90,3 +89,12 @@ def _banned_imports(
                         continue
                     violations.append(f"{relative}:{line} imports {module}")
     return violations
+
+
+def test_claas_learning_core_does_not_own_scenario_generation() -> None:
+    """Keep arbitrary-environment learning independent from optional simulation workflows."""
+    violations = _banned_imports(
+        EXP_DIR / "optimize" / "claas",
+        {"exp.simulation", "exp.optimize.workflows"},
+    )
+    assert not violations, f"CLaaS core imports an optional scenario workflow: {violations}"

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel
@@ -18,6 +20,7 @@ class VllmServerConfig(ContractModel):
     """
 
     base: ServingRevision
+    decoder: Literal["qwen35", "hermes"] = "qwen35"
     port: int = Field(default=8000, strict=True, ge=1, le=65535)
     max_model_len: int = Field(default=8192, strict=True, ge=2, le=131072)
     max_lora_rank: int = Field(default=16, strict=True, ge=1, le=256)
@@ -34,6 +37,11 @@ class VllmServerConfig(ContractModel):
 
     def command(self) -> tuple[str, ...]:
         """Return shell-free arguments with generation defaults disabled for exact evidence."""
+        parser = (
+            ("--tool-call-parser", "qwen3_coder", "--reasoning-parser", "qwen3")
+            if self.decoder == "qwen35"
+            else ("--tool-call-parser", "hermes")
+        )
         return (
             "vllm",
             "serve",
@@ -58,6 +66,8 @@ class VllmServerConfig(ContractModel):
             str(self.max_model_len),
             "--gpu-memory-utilization",
             str(self.gpu_memory_utilization),
+            "--enable-auto-tool-choice",
+            *parser,
             "--enable-sleep-mode",
             "--enable-lora",
             "--max-loras",

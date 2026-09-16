@@ -12,7 +12,11 @@ import modal
 import pytest
 
 from exp.common.core.artifacts import sha256_json
-from exp.optimize.claas.backends.checkpoints import CheckpointManifest, verify_checkpoint
+from exp.optimize.claas.backends.checkpoints import (
+    CheckpointManifest,
+    hash_file,
+    verify_checkpoint,
+)
 from exp.optimize.claas.backends.checkpoints_test import checkpoint
 from exp.optimize.claas.backends.modal.backend import (
     REMOTE_ROOT,
@@ -65,10 +69,26 @@ class _Volume:
         self.read_file = _FileReader(root)
 
 
-def test_download_verifies_manifest_and_preserves_immutable_scope(tmp_path: Path) -> None:
+@pytest.mark.parametrize("serving_export", [False, True])
+def test_download_verifies_manifest_and_preserves_immutable_scope(
+    tmp_path: Path, serving_export: bool
+) -> None:
     """A remote receipt becomes local activation evidence only after every digest passes."""
     source = tmp_path / "remote"
     receipt = checkpoint(source)
+    if serving_export:
+        manifest = verify_checkpoint(receipt, spec())
+        files = dict(manifest.files)
+        for name in ("adapter_config.json", "adapter_model.safetensors"):
+            target = source / "serving" / name
+            target.parent.mkdir(exist_ok=True)
+            target.write_bytes(b"inert-serving-payload")
+            files[f"serving/{name}"] = hash_file(target)
+        manifest = manifest.model_copy(
+            update={"serving_adapter_directory": "serving", "files": files}
+        )
+        (source / "manifest.json").write_text(manifest.model_dump_json())
+        receipt = receipt.model_copy(update={"manifest_sha256": sha256_json(manifest)})
     scope_id = sha256_json(
         {"scope": spec().scope.model_dump(mode="json"), "adapter_id": spec().adapter_id}
     )
@@ -82,7 +102,13 @@ def test_download_verifies_manifest_and_preserves_immutable_scope(tmp_path: Path
         local = await _download_checkpoint(
             cast(modal.Volume, _Volume(source)), remote, spec(), tmp_path / "local", 1_000_000
         )
-        assert verify_checkpoint(local, spec()).step == 1
+        verified = verify_checkpoint(local, spec())
+        assert verified.step == 1
+        assert verified.serving_adapter_directory == ("serving" if serving_export else "student")
+        if serving_export:
+            assert (Path(local.path) / "serving/adapter_model.safetensors").read_bytes() == (
+                b"inert-serving-payload"
+            )
         assert Path(local.path).is_dir()
         assert local.path.startswith(str(tmp_path / "local" / scope_id))
         (source / "verl/actor/optim_world_size_1_rank_0.pt").write_bytes(b"corrupt")
