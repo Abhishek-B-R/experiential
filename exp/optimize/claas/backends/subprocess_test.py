@@ -58,6 +58,18 @@ def test_no_implicit_gpu_selection(tmp_path: Path, device: str) -> None:
         )
 
 
+def test_real_worker_entrypoint_exposes_job_arguments() -> None:
+    """Resolve the worker module without starting training or loading model weights."""
+    result = subprocess.run(
+        [sys.executable, "-m", "exp.optimize.claas.backends.verl.worker", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--job JOB --result RESULT" in result.stdout
+
+
 def test_real_worker_entrypoint_fails_closed_without_cuda(tmp_path: Path) -> None:
     """Actually dispatch the optional worker on CPU and refuse a success receipt."""
 
