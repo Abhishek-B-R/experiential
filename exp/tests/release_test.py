@@ -3044,6 +3044,25 @@ def test_package_workflow_installs_the_exact_certified_openai_sdk() -> None:
     assert 'dist/*.whl "openai==3.0.0"' in workflow
 
 
+def test_gate_excludes_only_named_provider_calls_not_live_substrings() -> None:
+    """Ordinary live-state and delivery tests must remain in the non-provider gate."""
+    repository = Path(__file__).resolve().parent.parent.parent
+    workflow = (repository / ".github" / "workflows" / "gate.yml").read_text(encoding="utf-8")
+    assert '-k "not live"' not in workflow
+    expected = (
+        "exp/cli/tests/terminal_tasks_live_pipeline_test.py::test_live_openai_pipeline_covers_every_locked_cli_path",
+        "exp/runtime/gateway/batch/tests/live_test.py::test_live_anthropic_messages_batch",
+        "exp/runtime/gateway/batch/tests/live_test.py::test_live_openai_chat_batch",
+        "exp/runtime/gateway/batch/tests/live_test.py::test_live_openrouter_chat_batch",
+        "exp/runtime/models/providers/openai_compatible_test.py::test_embed_raw_against_live_openai",
+    )
+    for node_id in expected:
+        assert f"--deselect={node_id}" in workflow
+        file_name, test_name = node_id.split("::")
+        assert f"def {test_name}(" in (repository / file_name).read_text(encoding="utf-8")
+    assert "--deselect=exp/runtime/gateway/native_stage_admission_test.py" not in workflow
+
+
 def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
     """Prove the installed release happy path with deterministic loopback providers.
 

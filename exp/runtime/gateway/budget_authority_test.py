@@ -9,8 +9,7 @@ import pytest
 
 from exp.common.core.artifacts import canonical_json_bytes
 from exp.common.models.gateway_catalog import CatalogSnapshotDigestError, NormalizedGatewayCatalog
-from exp.runtime.gateway import budget_authority
-from exp.runtime.gateway import budgets as budgets_module
+from exp.runtime.gateway import budget_authority as budgets_module
 from exp.runtime.gateway.budget_authority import (
     MAXIMUM_BUDGET_SNAPSHOT_BYTES,
     read_budget_snapshot,
@@ -42,9 +41,9 @@ def test_retarget_during_snapshot_read_refuses_budget_write(
     _activate_chain(store, tmp_path)
     original = budgets_module.read_budget_snapshot
 
-    def retarget(path: Path, ref: str, digest: str) -> NormalizedGatewayCatalog:
+    def retarget(path: Path, ref: str, digest: str, maximum_bytes: int) -> NormalizedGatewayCatalog:
         """Move active authority while the preflight reads its original frozen file."""
-        catalog = original(path, ref, digest)
+        catalog = original(path, ref, digest, maximum_bytes)
         _activate_chain(store, tmp_path, revision_id="changed", pool_id="child-pool")
         return catalog
 
@@ -66,6 +65,8 @@ def test_snapshot_file_boundary(tmp_path: Path, kind: str) -> None:
     if kind == "symlink":
         path.symlink_to(tmp_path / "elsewhere")
     elif kind == "fifo":
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("FIFO file type is POSIX-only; Windows rejects device paths separately")
         os.mkfifo(path)
     elif kind == "oversize":
         with path.open("wb") as stream:
@@ -85,16 +86,18 @@ def test_snapshot_bound_accepts_exact_limit_and_rejects_digest_mismatch(
     catalog = _chain_catalog()
     payload = canonical_json_bytes(catalog.model_dump(mode="json"))
     (tmp_path / "snapshot").write_bytes(payload)
-    monkeypatch.setattr(budget_authority, "MAXIMUM_BUDGET_SNAPSHOT_BYTES", len(payload))
     assert (
-        read_budget_snapshot(tmp_path / "gateway.db", "snapshot", catalog.identity_sha256())
+        read_budget_snapshot(
+            tmp_path / "gateway.db", "snapshot", catalog.identity_sha256(), len(payload)
+        )
         == catalog
     )
     with pytest.raises(CatalogSnapshotDigestError):
-        read_budget_snapshot(tmp_path / "gateway.db", "snapshot", "f" * 64)
-    monkeypatch.setattr(budget_authority, "MAXIMUM_BUDGET_SNAPSHOT_BYTES", len(payload) - 1)
-    with pytest.raises(ValueError, match="exceeds"):
-        read_budget_snapshot(tmp_path / "gateway.db", "snapshot", catalog.identity_sha256())
+        read_budget_snapshot(tmp_path / "gateway.db", "snapshot", "f" * 64, len(payload))
+    with pytest.raises(ValueError, match="resource budget"):
+        read_budget_snapshot(
+            tmp_path / "gateway.db", "snapshot", catalog.identity_sha256(), len(payload) - 1
+        )
 
 
 def test_snapshot_directory_symlink_and_directory_file_are_refused(tmp_path: Path) -> None:
@@ -107,10 +110,11 @@ def test_snapshot_directory_symlink_and_directory_file_are_refused(tmp_path: Pat
         read_budget_snapshot(tmp_path / "gateway.db", "real", "f" * 64)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses the kernel32 handle backend")
 def test_snapshot_loader_fails_explicitly_without_safe_handle_support(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Unsupported systems never fall back to following potentially unsafe paths."""
     monkeypatch.delattr(os, "O_NOFOLLOW")
-    with pytest.raises(ValueError, match="requires.*no-follow"):
+    with pytest.raises(ValueError, match="unsupported on this operating system"):
         read_budget_snapshot(tmp_path / "gateway.db", "snapshot", "f" * 64)

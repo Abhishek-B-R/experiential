@@ -79,16 +79,37 @@ jobs:
         run: uv run ty check
       - name: Tinker SDK adapter tests
         run: >-
-          uv run pytest -q -k "not live"
+          uv run pytest -q
           exp/optimize/model/sft/tinker_test.py
       - name: non-live tests
         run: >-
-          uv run pytest -n 4 --dist worksteal -q -k "not live"
+          uv run pytest -n 4 --dist worksteal -q
           exp
+          --deselect=exp/cli/tests/terminal_tasks_live_pipeline_test.py::test_live_openai_pipeline_covers_every_locked_cli_path
+          --deselect=exp/runtime/gateway/batch/tests/live_test.py::test_live_anthropic_messages_batch
+          --deselect=exp/runtime/gateway/batch/tests/live_test.py::test_live_openai_chat_batch
+          --deselect=exp/runtime/gateway/batch/tests/live_test.py::test_live_openrouter_chat_batch
+          --deselect=exp/runtime/models/providers/openai_compatible_test.py::test_embed_raw_against_live_openai
           --ignore=exp/optimize/model/sft/tinker_test.py
           --ignore=exp/optimize/router/tests/composition_evidence_test.py
           --ignore=exp/simulation/tests/comparison_evidence_test.py
           --deselect=exp/tests/release_test.py::test_installed_wheel_no_spend_release_evidence
+
+  windows-budget-authority:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the project and its dev extras
+        run: uv sync --extra dev
+      - name: Verify real Windows snapshot and budget authority
+        run: >-
+          uv run pytest -q -rs
+          exp/runtime/gateway/snapshot_file_test.py
+          exp/runtime/gateway/snapshot_file_windows_test.py
+          exp/common/config/settings_test.py
+          exp/cli/gateway/budget_test.py
 
   w16-darwin-evidence:
     runs-on: macos-latest

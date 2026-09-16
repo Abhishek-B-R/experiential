@@ -12,6 +12,7 @@ from typing import Literal, assert_never
 
 from pydantic import Field, model_validator
 
+from exp.common.config.settings import GatewayResourceSettings
 from exp.common.core.artifacts import ContractModel, stable_id
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
@@ -19,8 +20,7 @@ from exp.runtime.gateway.auth import utc_text
 from exp.runtime.gateway.budget_authority import (
     BudgetAliasRevision,
     active_budget_revision,
-    read_budget_snapshot,
-    require_reachable_budget_target,
+    validate_budget_revision,
 )
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.embeddings_contracts import (
@@ -177,11 +177,17 @@ class SQLiteBudgetStore:
         *,
         clock: GatewayClock | None = None,
         busy_timeout_ms: int = 5_000,
+        snapshot_max_bytes: int | None = None,
     ) -> None:
-        """Bind one initialized gateway database and injectable UTC clock."""
+        """Bind storage, time, and an optional authoring-only snapshot resource budget."""
         self.database_path = database_path
         self._clock = SystemGatewayClock() if clock is None else clock
         self._busy_timeout_ms = busy_timeout_ms
+        self._snapshot_max_bytes = (
+            GatewayResourceSettings()
+            if snapshot_max_bytes is None
+            else GatewayResourceSettings(budget_snapshot_max_bytes=snapshot_max_bytes)
+        ).budget_snapshot_max_bytes
         initialize_database(database_path, busy_timeout_ms=busy_timeout_ms)
 
     def set_limit(
@@ -473,18 +479,13 @@ class SQLiteBudgetStore:
             return None
         with self._connect() as connection:
             revision = active_budget_revision(connection, organization_id, scope.alias_id)
-        if revision.pool_id == scope.pool_id and scope.deployment_id is None:
-            return revision
-        try:
-            catalog = read_budget_snapshot(
-                self.database_path, revision.snapshot_ref, revision.catalog_sha256
-            )
-        except OSError as exc:
-            raise ValueError("budget scope catalog snapshot is unreadable") from exc
-        require_reachable_budget_target(
-            catalog, revision.pool_id, scope.pool_id, scope.deployment_id
+        return validate_budget_revision(
+            self.database_path,
+            revision,
+            scope.pool_id,
+            scope.deployment_id,
+            self._snapshot_max_bytes,
         )
-        return revision
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:

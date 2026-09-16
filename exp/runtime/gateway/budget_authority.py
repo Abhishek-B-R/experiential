@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-import os
 import sqlite3
-import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from exp.common.config.settings import GatewayResourceSettings
 from exp.common.models.gateway_catalog import (
     NormalizedGatewayCatalog,
     read_pinned_normalized_snapshot,
 )
 from exp.common.models.gateway_chains import expand_model_chain
+from exp.runtime.gateway.snapshot_file import read_snapshot_bytes
 
-MAXIMUM_BUDGET_SNAPSHOT_BYTES = 64 * 1024 * 1024
+MAXIMUM_BUDGET_SNAPSHOT_BYTES = GatewayResourceSettings().budget_snapshot_max_bytes
 
 
 @dataclass(frozen=True)
@@ -50,52 +50,34 @@ def active_budget_revision(
 
 
 def read_budget_snapshot(
-    database_path: Path, snapshot_ref: str, digest: str
+    database_path: Path,
+    snapshot_ref: str,
+    digest: str,
+    maximum_bytes: int = MAXIMUM_BUDGET_SNAPSHOT_BYTES,
 ) -> NormalizedGatewayCatalog:
-    """Read a bounded regular snapshot without following any symlink path component."""
-    if os.open not in os.supports_dir_fd or any(
-        not hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")
-    ):
-        raise ValueError(
-            "budget snapshot authoring requires directory-relative no-follow file support; "
-            "use a supported local host to configure deployment or child budgets"
-        )
-    relative = Path(snapshot_ref)
-    if (
-        relative.is_absolute()
-        or not relative.parts
-        or any(part in (".", "..") for part in relative.parts)
-    ):
-        raise ValueError("budget catalog snapshot reference escapes gateway state")
-    directory = os.open(database_path.parent.resolve(), os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        for part in relative.parts[:-1]:
-            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
-            os.close(directory)
-            directory = child
-        descriptor = os.open(
-            relative.parts[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory
-        )
-        with os.fdopen(descriptor, "rb") as stream:
-            info = os.fstat(stream.fileno())
-            if not stat.S_ISREG(info.st_mode):
-                raise ValueError("budget catalog snapshot must be a regular file")
-            if info.st_size > MAXIMUM_BUDGET_SNAPSHOT_BYTES:
-                raise ValueError(
-                    "budget catalog snapshot exceeds 64 MiB; "
-                    "reduce the catalog before authoring its budget"
-                )
-            payload = stream.read(MAXIMUM_BUDGET_SNAPSHOT_BYTES + 1)
-            final = os.fstat(stream.fileno())
-            if (
-                len(payload) != info.st_size
-                or final.st_mtime_ns != info.st_mtime_ns
-                or final.st_size != info.st_size
-            ):
-                raise ValueError("budget catalog snapshot changed or was truncated during read")
-    finally:
-        os.close(directory)
+    """Read a safe regular snapshot within the operator's authoring resource budget."""
+    payload = read_snapshot_bytes(database_path.parent, snapshot_ref, maximum_bytes)
     return read_pinned_normalized_snapshot(payload, digest)
+
+
+def validate_budget_revision(
+    database_path: Path,
+    revision: BudgetAliasRevision,
+    pool_id: str,
+    deployment_id: str | None,
+    maximum_bytes: int,
+) -> BudgetAliasRevision:
+    """Validate a previously read alias revision outside its later write transaction."""
+    if revision.pool_id == pool_id and deployment_id is None:
+        return revision
+    try:
+        catalog = read_budget_snapshot(
+            database_path, revision.snapshot_ref, revision.catalog_sha256, maximum_bytes
+        )
+    except OSError as exc:
+        raise ValueError("budget scope catalog snapshot is unreadable") from exc
+    require_reachable_budget_target(catalog, revision.pool_id, pool_id, deployment_id)
+    return revision
 
 
 def require_reachable_budget_target(

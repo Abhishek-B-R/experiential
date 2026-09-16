@@ -86,6 +86,42 @@ def _configured(root: Path) -> GatewayManagement:
     return manager
 
 
+def test_budget_set_uses_existing_project_snapshot_resource_setting(tmp_path: Path) -> None:
+    """The CLI remedy changes the actual store limit without altering budget semantics."""
+    manager = _configured(tmp_path)
+    size = (manager.state_dir / "snapshot-one").stat().st_size
+    arguments = [
+        "config",
+        "gateway",
+        "budget",
+        "set",
+        "--period",
+        "2026-08",
+        "--scope",
+        "deployment",
+        "--alias",
+        "coding",
+        "--pool",
+        "pool-one",
+        "--deployment",
+        "azure-primary",
+        "--limit-nano-usd",
+        "100",
+        "--root",
+        str(tmp_path),
+        "--non-interactive",
+        "--json",
+    ]
+    settings = tmp_path / "settings.toml"
+    settings.write_text(f"[gateway]\nbudget_snapshot_max_bytes = {size - 1}\n")
+    blocked = CliRunner().invoke(app, arguments)
+    assert blocked.exit_code != 0 and "budget_snapshot_max_bytes" in blocked.output
+    settings.write_text(f"[gateway]\nbudget_snapshot_max_bytes = {size}\n")
+    allowed = CliRunner().invoke(app, arguments)
+    assert allowed.exit_code == 0, allowed.output
+    assert json.loads(allowed.stdout)["data"]["scope"]["deployment_id"] == "azure-primary"
+
+
 def test_noninteractive_budget_management_reports_integer_remaining(tmp_path: Path) -> None:
     """Automation can configure overlapping limits and read stable JSON receipts."""
     _configured(tmp_path)
