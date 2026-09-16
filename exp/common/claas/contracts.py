@@ -70,6 +70,9 @@ class ExactTokenEvidence(ContractModel):
     policy_revision: Identifier
     tokenizer_id: Identifier
     tokenizer_revision: Identifier
+    sampling_temperature: float = Field(strict=True, gt=0, allow_inf_nan=False)
+    sampling_top_p: float = Field(strict=True, gt=0, le=1, allow_inf_nan=False)
+    sampling_top_k: Annotated[int, Field(strict=True, ge=1)] | None
     prompt_token_ids: tuple[TokenId, ...] = Field(min_length=1)
     response_token_ids: tuple[TokenId, ...] = Field(min_length=1)
     response_logprobs: tuple[Annotated[float, Field(strict=True)], ...] = Field(min_length=1)
