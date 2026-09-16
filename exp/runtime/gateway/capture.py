@@ -464,24 +464,25 @@ class ResponseCaptureRegistry:
         )
         now = self._clock()
         with self._lock:
+            expired = self._expire(now)
             entry = self._entries.pop(request_id, None)
-            if entry is not None:
-                return entry[0]
-            self._expire_parked(now)
-            previous = self._parked.pop(request_id, None)
-            if previous is not None:
-                self._parked_bytes -= previous.size_bytes
-            self._parked[request_id] = ParkedResponse(
-                frames=tuple(frames), truncated=truncated, size_bytes=size, parked_at=now
-            )
-            self._parked_bytes += size
-            while self._parked and (
-                self._parked_bytes > self._parked_bytes_cap
-                or len(self._parked) > self._parked_capacity
-            ):
-                _, evicted = self._parked.popitem(last=False)
-                self._parked_bytes -= evicted.size_bytes
-        return None
+            if entry is None:
+                self._expire_parked(now)
+                previous = self._parked.pop(request_id, None)
+                if previous is not None:
+                    self._parked_bytes -= previous.size_bytes
+                self._parked[request_id] = ParkedResponse(
+                    frames=tuple(frames), truncated=truncated, size_bytes=size, parked_at=now
+                )
+                self._parked_bytes += size
+                while self._parked and (
+                    self._parked_bytes > self._parked_bytes_cap
+                    or len(self._parked) > self._parked_capacity
+                ):
+                    _, evicted = self._parked.popitem(last=False)
+                    self._parked_bytes -= evicted.size_bytes
+        _log_expired(expired)
+        return None if entry is None else entry[0]
 
     def _expire_parked(self, now: float) -> None:
         """Drop parked frames older than the parked TTL (called under the lock)."""

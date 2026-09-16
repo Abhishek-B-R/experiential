@@ -190,6 +190,19 @@ def test_disconnect_and_settlement_orders_preserve_identical_frames(settle_first
     assert handoff.claim("r") is None
 
 
+def test_delayed_disconnect_cannot_claim_expired_response_permission() -> None:
+    """Disconnect and ordinary completion enforce the same permission lifetime."""
+    now = [0.0]
+    registry = ResponseCaptureRegistry(ttl_seconds=1.0, clock=lambda: now[0])
+    writer = _Writer()
+    handoff = ResponseCaptureHandoff(registry, writer)
+    registry.record(request_id="r", org_id="o")
+    now[0] = 2.0
+    handoff.park("r", [b'{"delta":"late"}'], truncated=False)
+    assert writer.payloads == []
+    assert handoff.claim("r") is None
+
+
 def test_unregistered_response_is_never_authorized_and_forget_releases_claim() -> None:
     """The host alone authorizes capture; a replay or unknown request grants nothing."""
     registry = ResponseCaptureRegistry()
