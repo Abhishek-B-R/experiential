@@ -568,11 +568,17 @@ async fn run_attempt(
             };
         }
     };
-    // The connection's raw timeout bounds each chunk read, exactly like the
-    // python streaming path. The open phase is additionally bounded by the
-    // fail-fast time-to-first-byte window (fresh per attempt) so a dead lane
-    // that never answers is abandoned in seconds, not after the full
-    // per-deployment timeout.
+    // The connection's raw timeout paces each BODY chunk read, exactly like
+    // the python streaming path. The open (request/response-header) phase is
+    // bounded by the fail-fast time-to-first-byte window alone (fresh per
+    // attempt) and the request deadline: a dead lane that never answers is
+    // abandoned in seconds, and a deployment whose authored first-byte
+    // allowance exceeds the per-chunk timeout (a 120 s header hold on a
+    // reasoning lane that thinks before its first header) is honored rather
+    // than silently cut at the per-chunk 60 s. Before 0.3.74 the open bound
+    // also took the per-chunk timeout, so every authored allowance above it
+    // was a no-op: 251 of 251 header timeouts on lanes carrying 90 s and
+    // 120 s allowances cut at exactly 60 s (production, 2026-09-16).
     let phase_timeout = Duration::from_secs_f64(wire.timeout_seconds.max(0.001));
     let first_byte_allowance_for = || {
         first_byte_allowance(
@@ -602,9 +608,7 @@ async fn run_attempt(
     // reservation settles every token this attempt was charged for.
     let mut carried_usage: Option<Usage> = None;
     'dial: loop {
-        let open_bound = remaining(ctx.deadline)
-            .min(phase_timeout)
-            .min(remaining(first_byte_deadline));
+        let open_bound = open_phase_bound(remaining(ctx.deadline), remaining(first_byte_deadline));
         let response = match open_stream(
             ctx.http,
             &wire.url,
@@ -929,7 +933,7 @@ async fn settle_output_less(
 }
 
 mod wire;
-pub(crate) use wire::first_byte_allowance;
+pub(crate) use wire::{first_byte_allowance, open_phase_bound};
 pub use wire::{DeploymentWire, RoutePolicy, WaterfallContext};
 
 mod empty;
