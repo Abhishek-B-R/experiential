@@ -8,6 +8,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol, cast
 
 from exp.runtime.claas.capture import CaptureConfiguration
+from exp.runtime.gateway.claas.serving import GatewayServingConfiguration
 
 if TYPE_CHECKING:
     from exp_gateway_native import ShutdownHandle
@@ -41,6 +42,7 @@ def serve_native_gateway(
     native_usage_enabled: bool = True,
     capture: CaptureConfiguration | None = None,
     ghost: bool = False,
+    serving: GatewayServingConfiguration | None = None,
     shutdown: ShutdownHandle | None = None,
     on_listening: Callable[[], None] | None = None,
 ) -> None:
@@ -72,6 +74,7 @@ def serve_native_gateway(
             usage.
         capture: Explicit local application content-capture bindings, disabled by default.
         ghost: Disable all content capture even when bindings are supplied.
+        serving: Explicit private vLLM serving and cross-process admission bindings.
         shutdown: Optional embedder-owned stop handle from
             ``exp_gateway_native.shutdown_handle()``. A host serving on a
             background thread calls ``request_shutdown()`` to stop the plane
@@ -104,6 +107,7 @@ def serve_native_gateway(
         ),
         "native_usage_enabled": native_usage_enabled,
         "ghost": ghost,
+        "serving": None if serving is None else serving.model_dump(mode="json"),
         "capture": None if ghost or capture is None else capture.model_dump(mode="json"),
     }
     try:

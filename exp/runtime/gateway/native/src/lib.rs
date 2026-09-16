@@ -681,6 +681,11 @@ fn error_payload(error: &errors::PublicError) -> String {
 #[pymodule]
 fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ShutdownHandle>()?;
+    module.add_class::<claas::serving::ExclusiveLease>()?;
+    module.add_function(wrap_pyfunction!(
+        claas::serving::claas_acquire_exclusive,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(shutdown_handle, module)?)?;
     module.add_function(wrap_pyfunction!(serve, module)?)?;
     module.add_function(wrap_pyfunction!(metrics_snapshot_json, module)?)?;

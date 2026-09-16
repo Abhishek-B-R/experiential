@@ -222,6 +222,7 @@ fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) -> Deployme
         url: url.to_string(),
         headers: HashMap::new(),
         model_id: "gpt-test".to_string(),
+        model_revision: None,
         billing_customer_managed: false,
         timeout_seconds: 10.0,
         upstream_payload: json!({

@@ -57,8 +57,7 @@ pub(crate) async fn responses(
         Ok(key) => key,
         Err(error) => return error_response(&error),
     };
-    let authenticate = compact_json(&json!({"raw_key": raw_key}));
-    if let Err(error) = state.bridge.call("authenticate", authenticate).await {
+    if let Err(error) = crate::claas::serving::authenticate(&state, &raw_key, &body).await {
         return error_response(&error);
     }
 
@@ -151,7 +150,7 @@ pub(crate) async fn responses(
         }
         return error_response(&escalation_error());
     }
-    let admission: Admission = match serde_json::from_value(admission_value.clone()) {
+    let mut admission: Admission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,
         Err(_) => {
             if let Some(mut owner) = lease.take() {
@@ -161,6 +160,16 @@ pub(crate) async fn responses(
         }
     };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
+    let serving =
+        match crate::claas::serving::prepare(&state.serving, &mut admission, &mut guard).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                if let Some(mut owner) = lease.take() {
+                    owner.abandon().await;
+                }
+                return error_response(&error);
+            }
+        };
     // The replay key was authorized independently of admission; a revision
     // swap between the two fails closed exactly like the chat surface.
     if lease
@@ -285,7 +294,7 @@ pub(crate) async fn responses(
             }
         }
     };
-    crate::claas::capture_response(capture, response)
+    crate::claas::serving::hold(serving, crate::claas::capture_response(capture, response))
 }
 
 /// Answer one Responses attempt that the waterfall already settled: a

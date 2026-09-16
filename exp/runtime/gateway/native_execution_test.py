@@ -660,6 +660,24 @@ def test_cache_marker_predicate_sees_every_marker_carrier() -> None:
     assert request_carries_cache_markers(request(messages=(marked_call,)))
 
 
+@pytest.mark.parametrize("revision", [None, "a" * 40])
+def test_wire_entry_carries_declared_provider_revision(revision: str | None) -> None:
+    """The native boundary preserves the frozen provider revision independently of catalog IDs."""
+    route = _route()
+    deployment = route.deployment.model_copy(
+        update={"revision": revision, "provider_model": "Qwen/Qwen3.5-4B"}
+    )
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="http://127.0.0.1:8001/v1/chat/completions",
+        model_id="Qwen/Qwen3.5-4B",
+    )
+    entry = deployment_wire_entry(route, deployment, profile, {"model": profile.model_id})
+    assert entry["model_id"] == "Qwen/Qwen3.5-4B"
+    assert entry["model_revision"] == revision
+    assert entry["model_id"] != route.snapshot.exact_model_id
+
+
 def test_wire_entry_carries_emulated_stop_sequences_for_the_data_plane() -> None:
     """A Responses rung's entry names the caller's exact stop sequences; others carry none."""
     route = _route()

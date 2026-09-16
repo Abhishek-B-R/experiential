@@ -26,6 +26,17 @@ class _ControlPlane(Protocol):
     def readiness(self, argument: str) -> str: ...
     def close_thread_resources(self, argument: str) -> str: ...
 
+class ExclusiveLease:
+    """Cross-process exclusive admission lock held by a CLaaS controller."""
+
+    def release(self) -> None:
+        """Release the OS lock without replacing its coordination inode."""
+        ...
+
+def claas_acquire_exclusive(path: str, timeout_seconds: float) -> ExclusiveLease:
+    """Acquire the gateway's native exclusive lock with a bounded wait."""
+    ...
+
 class ShutdownHandle:
     """Embedder-owned stop signal for one `serve` call."""
 

@@ -176,6 +176,9 @@ pub struct AttemptGuard {
     /// outcome. An attempt that failed at open instead carries them on its
     /// `Failure`, which settlement hoists into the same payload field.
     rate_limit_headers: Option<serde_json::Map<String, Value>>,
+    /// A disconnected response body may close before its detached upstream task.
+    /// Keep admission drained until that task and its provider relay are dropped.
+    _serving_lease: Option<crate::claas::serving::RequestLease>,
 }
 
 /// Holds one unit of the shutdown drain counter for a detached stream task,
@@ -222,7 +225,16 @@ impl AttemptGuard {
             started,
             first_token_at: None,
             rate_limit_headers: None,
+            _serving_lease: None,
         }
+    }
+
+    /// Keep the private serving lease alive through detached stream task teardown.
+    pub(crate) fn retain_serving_lease(
+        &mut self,
+        lease: Option<crate::claas::serving::RequestLease>,
+    ) {
+        self._serving_lease = lease;
     }
 
     /// Bind one freshly reserved attempt as the active settlement target.

@@ -103,8 +103,7 @@ pub(crate) async fn messages_count_tokens(
         Ok(key) => key,
         Err(error) => return messages_error_response(&error),
     };
-    let authenticate = compact_json(&json!({"raw_key": raw_key}));
-    if let Err(error) = state.bridge.call("authenticate", authenticate).await {
+    if let Err(error) = crate::claas::serving::authenticate(&state, &raw_key, &body).await {
         return messages_error_response(&error);
     }
     let body_text = match String::from_utf8(body.to_vec()) {
@@ -144,8 +143,7 @@ pub(crate) async fn messages(
         Ok(key) => key,
         Err(error) => return messages_error_response(&error),
     };
-    let authenticate = compact_json(&json!({"raw_key": raw_key}));
-    if let Err(error) = state.bridge.call("authenticate", authenticate).await {
+    if let Err(error) = crate::claas::serving::authenticate(&state, &raw_key, &body).await {
         return messages_error_response(&error);
     }
 
@@ -182,7 +180,7 @@ pub(crate) async fn messages(
         // servability, so an escalation disposition fails closed here.
         return messages_error_response(&escalation_error());
     }
-    let admission: Admission = match serde_json::from_value(admission_value.clone()) {
+    let mut admission: Admission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,
         Err(_) => {
             // The request is durably accepted; abandon it before failing so
@@ -191,6 +189,11 @@ pub(crate) async fn messages(
         }
     };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
+    let serving =
+        match crate::claas::serving::prepare(&state.serving, &mut admission, &mut guard).await {
+            Ok(lease) => lease,
+            Err(error) => return messages_error_response(&error),
+        };
 
     let permit = match acquire_permit(&state, &mut guard, deadline).await {
         Ok(permit) => permit,
@@ -218,7 +221,7 @@ pub(crate) async fn messages(
     };
     let won = acquire_attempt(&context, &mut guard).await;
 
-    match won {
+    let response = match won {
         Won::Failed(error) => messages_error_response(&error),
         Won::Settled(settled) => settled_messages_response(&admission, settled).await,
         Won::Committed(committed) => {
@@ -231,7 +234,8 @@ pub(crate) async fn messages(
                 completed_messages(admission, guard, committed, deadline, permit).await
             }
         }
-    }
+    };
+    crate::claas::serving::hold(serving, response)
 }
 
 /// Abandon a durably accepted request whose admission reply failed to parse,

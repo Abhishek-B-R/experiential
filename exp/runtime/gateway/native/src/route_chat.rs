@@ -54,8 +54,7 @@ pub(crate) async fn chat(
         Ok(key) => key,
         Err(error) => return error_response(&error),
     };
-    let authenticate = compact_json(&json!({"raw_key": raw_key}));
-    if let Err(error) = state.bridge.call("authenticate", authenticate).await {
+    if let Err(error) = crate::claas::serving::authenticate(&state, &raw_key, &body).await {
         return error_response(&error);
     }
 
@@ -86,8 +85,7 @@ pub(crate) async fn chat(
         };
         if let Some(reason) = scope_value.get("escalate") {
             METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
-            // No replay claim exists; startup validation guarantees native
-            // servability, so an escalation disposition fails closed here.
+            // Startup validation guarantees native servability; escalation fails closed.
             return error_response(&escalation_error());
         }
         let key: ReplayKey = match serde_json::from_value(scope_value) {
@@ -98,8 +96,7 @@ pub(crate) async fn chat(
             Err(error) => return error_response(&error),
             Ok(Claim::Replay(cached)) => return cached_response(&cached),
             Ok(Claim::Join(joiner)) => {
-                // Joining never touches the ledger or budget: only the owner
-                // accounts for the single provider call.
+                // Only the owner accounts for this provider call.
                 return match joiner.result().await {
                     Ok(cached) => cached_response(&cached),
                     Err(error) => error_response(&error),
@@ -119,8 +116,7 @@ pub(crate) async fn chat(
     let admission_text = match state.bridge.call("admit", admit_argument).await {
         Ok(text) => text,
         Err(error) => {
-            // A failed keyed admission abandons ownership so waiting
-            // duplicates fail closed instead of hanging.
+            // Failed admission releases replay ownership for waiting duplicates.
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;
             }
@@ -133,18 +129,16 @@ pub(crate) async fn chat(
     };
     if let Some(reason) = admission_value.get("escalate") {
         METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
-        // No ledger row exists; startup validation guarantees native
-        // servability, so an escalation disposition fails closed here.
+        // An escalation before durable acceptance fails closed.
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
         }
         return error_response(&escalation_error());
     }
-    let admission: Admission = match serde_json::from_value(admission_value.clone()) {
+    let mut admission: Admission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,
         Err(_) => {
-            // The request is durably accepted; abandon it before failing so
-            // wire-contract drift cannot leak an open request row.
+            // Abandon accepted work so wire drift cannot leak accounting.
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;
             }
@@ -152,11 +146,17 @@ pub(crate) async fn chat(
         }
     };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
-    // The replay key was authorized independently of admission. If an alias
-    // activation landed between the two, the admitted work belongs to a newer
-    // revision than the claimed replay scope, so the request fails closed:
-    // executing without ownership would let a concurrent duplicate own the
-    // new revision's key and run the same keyed operation a second time.
+    let serving =
+        match crate::claas::serving::prepare(&state.serving, &mut admission, &mut guard).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                if let Some(mut owner) = lease.take() {
+                    owner.abandon().await;
+                }
+                return error_response(&error);
+            }
+        };
+    // A changed revision invalidates prior replay ownership before execution.
     if lease
         .as_ref()
         .is_some_and(|owner| owner.alias_revision_id() != admission.alias_revision_id)
@@ -203,8 +203,7 @@ pub(crate) async fn chat(
         time_to_first_byte: state.time_to_first_byte,
         time_to_first_byte_slope_seconds_per_million_input_tokens: state
             .time_to_first_byte_slope_seconds_per_million_input_tokens,
-        // Bytes over four approximates input tokens; a timeout heuristic
-        // only, never a billing quantity.
+        // Input-token timeout heuristic, never billing quantity.
         approximate_input_tokens: (body_text.len() as f64) / 4.0,
         output_less_retention: None,
         output_token_cap: admission.maximum_output_tokens,
@@ -273,7 +272,7 @@ pub(crate) async fn chat(
             }
         }
     };
-    crate::claas::capture_response(capture, response)
+    crate::claas::serving::hold(serving, crate::claas::capture_response(capture, response))
 }
 
 /// Answer one attempt that the waterfall already settled: a successful

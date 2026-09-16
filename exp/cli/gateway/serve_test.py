@@ -5,13 +5,14 @@ from __future__ import annotations
 import io
 import json
 import re
+import subprocess
+import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest import mock
 
 import pytest
 import typer
@@ -378,20 +379,27 @@ def test_emit_unavailable_aliases_warns_with_alias_and_reason(
 
 
 def test_missing_extension_is_an_actionable_error(tmp_path: Path) -> None:
-    """A launch without the built extension names the exact build step."""
-    import importlib.util
-
-    real_find_spec = importlib.util.find_spec
-
-    def missing_extension(name: str, package: str | None = None) -> object | None:
-        if name == "exp_gateway_native":
-            return None
-        return real_find_spec(name, package)
-
-    with mock.patch.object(importlib.util, "find_spec", side_effect=missing_extension):
-        result = CliRunner().invoke(app, ["--root", str(tmp_path)])
-    assert result.exit_code == 2
-    assert "exp_gateway_native" in result.output
+    """A fresh CLI import and launch preserve the diagnostic when native loading is blocked."""
+    code = """
+import sys
+sys.modules["exp_gateway_native"] = None
+from click import unstyle
+from typer.testing import CliRunner
+from exp.cli.app import app
+result = CliRunner().invoke(app, ["--root", sys.argv[1]])
+assert result.exit_code == 2, result.output
+assert "exp_gateway_native" in result.output
+assert "just native" in " ".join(unstyle(result.output).replace("│", " ").split())
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[3],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_engine_flag_is_gone(tmp_path: Path) -> None:

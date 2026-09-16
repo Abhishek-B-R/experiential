@@ -68,6 +68,8 @@ pub struct ServeConfig {
     pub capture: Option<crate::claas::CaptureConfiguration>,
     #[serde(default)]
     pub ghost: bool,
+    #[serde(default)]
+    pub serving: Option<crate::claas::serving::Configuration>,
 }
 
 fn default_graceful_timeout_seconds() -> f64 {
@@ -123,6 +125,7 @@ pub(crate) struct AppState {
     /// python engine's `BoundedReplayStore`.
     pub(crate) replays: Arc<ReplayStore>,
     pub(crate) capture: Option<Arc<crate::claas::CaptureStore>>,
+    pub(crate) serving: Option<crate::claas::serving::Configuration>,
 }
 
 /// Run the data plane until shutdown; returns after graceful stop.
@@ -162,6 +165,7 @@ pub async fn run(
         handled_requests: handled_requests.clone(),
         replays: Arc::new(ReplayStore::new()),
         capture: capture.clone(),
+        serving: config.serving,
     };
     tokio::spawn(crate::memory::reclaim_when_idle(
         state.permits.clone(),

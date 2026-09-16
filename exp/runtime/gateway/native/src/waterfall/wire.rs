@@ -26,6 +26,9 @@ pub struct DeploymentWire {
     /// word the stream-error detail screen must not redact.
     #[serde(default)]
     pub model_id: String,
+    /// Optional immutable provider model revision declared by the frozen catalog.
+    #[serde(default)]
+    pub model_revision: Option<String>,
     /// Whether this rung dispatches on the customer's own (BYOK) credential.
     /// A rejected credential or exhausted account on such a rung is the
     /// customer's configuration, surfaced as their 400, never operator

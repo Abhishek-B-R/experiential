@@ -12,6 +12,7 @@ from rich.text import Text
 
 from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.cli.shared.theme import EXP_THEME
+from exp.runtime.claas.capture import load_capture_configuration
 from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -220,6 +221,7 @@ def _run_gateway(
     from exp.cli.gateway.compatibility import prepare_project_gateway
     from exp.cli.gateway.setup import interactive_gateway_setup
     from exp.optimize.router.activation import verify_automatic_router_policy
+    from exp.runtime.gateway.claas.serving import load_gateway_serving_configuration
     from exp.runtime.gateway.guardrails.config import load_guardrail_engine
     from exp.runtime.gateway.lifecycle import (
         gateway_instance_lock,
@@ -334,6 +336,9 @@ def _run_gateway(
                         max_active_requests=max_active_requests,
                         graceful_timeout_seconds=graceful_timeout,
                         on_listening=announce_ready,
+                        capture=None if ghost else load_capture_configuration(root),
+                        serving=load_gateway_serving_configuration(root),
+                        ghost=ghost,
                     )
                 except NativeGatewayServerError as exc:
                     raise typer.BadParameter(str(exc)) from exc

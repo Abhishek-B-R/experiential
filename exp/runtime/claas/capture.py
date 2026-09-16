@@ -9,6 +9,8 @@ from pydantic import Field, model_validator
 from exp.common.claas import CapturePolicy
 from exp.common.claas.contracts import Identifier
 from exp.common.core.artifacts import ContractModel
+from exp.common.core.files import write_text_atomic
+from exp.common.core.locks import file_write_lock
 
 
 class CaptureBinding(ContractModel):
@@ -45,3 +47,46 @@ class CaptureConfiguration(ContractModel):
             if previous != binding.policy:
                 raise ValueError("aliases for the same application must share one capture policy")
         return self
+
+
+def load_capture_configuration(root: Path) -> CaptureConfiguration | None:
+    """Read opt-in bindings for the next gateway startup; missing means disabled."""
+    path = root / "gateway" / "claas.json"
+    if not path.exists():
+        return None
+    return CaptureConfiguration.model_validate_json(path.read_bytes())
+
+
+def save_capture_binding(root: Path, binding: CaptureBinding) -> CaptureConfiguration:
+    """Explicitly configure one alias and a consistent policy for its whole application.
+
+    Existing bindings for other users or applications survive the atomic update.
+    An alias already assigned to another application is rejected, so this
+    operation cannot silently redirect existing learning traffic.
+    """
+
+    path = root / "gateway" / "claas.json"
+    with file_write_lock(path, what="CLaaS capture configuration"):
+        previous = load_capture_configuration(root)
+        bindings: list[CaptureBinding] = []
+        for item in previous.bindings if previous else ():
+            if (
+                item.alias == binding.alias
+                and item.policy.scope.user_id == binding.policy.scope.user_id
+            ):
+                if item.policy.scope != binding.policy.scope:
+                    raise ValueError("this user's alias is already bound to another application")
+                continue
+            if item.policy.scope == binding.policy.scope:
+                item = CaptureBinding(alias=item.alias, policy=binding.policy)
+            bindings.append(item)
+        bindings.append(binding)
+        content_root = root.resolve() / "claas"
+        content_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        config = CaptureConfiguration(
+            database_path=previous.database_path if previous else content_root / "traffic.sqlite",
+            bindings=tuple(bindings),
+            queue_capacity=previous.queue_capacity if previous else 256,
+        )
+        write_text_atomic(path, config.model_dump_json(indent=2) + "\n")
+        return config

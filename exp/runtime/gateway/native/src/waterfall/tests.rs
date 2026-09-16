@@ -19,6 +19,7 @@ fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         serialize_tool_calls: false,
         image_output: false,
         model_id: String::new(),
+        model_revision: None,
         billing_customer_managed: false,
         idempotency_key: "op".to_string(),
         time_to_first_byte_base_seconds: base,

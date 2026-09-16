@@ -3,6 +3,7 @@
 pub(crate) mod feedback;
 mod feedback_contracts;
 mod feedback_store;
+pub(crate) mod serving;
 mod store;
 mod stream;
 
@@ -12,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::body::{Body, HttpBody};
 use axum::response::Response;
 use futures_util::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -20,7 +21,7 @@ use crate::admission::Admission;
 
 pub(crate) use store::CaptureStore;
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Scope {
     pub user_id: String,

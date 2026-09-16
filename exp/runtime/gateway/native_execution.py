@@ -859,6 +859,7 @@ def deployment_wire_entry(
         "url": profile.url,
         "headers": dict(profile.headers) if headers is None else dict(headers),
         "model_id": profile.model_id,
+        "model_revision": deployment.revision,
         # A customer-managed (BYOK) rung: a rejected credential or exhausted
         # provider account there is the customer's own configuration, so the
         # data plane surfaces it as their 400 instead of operator deadness.
