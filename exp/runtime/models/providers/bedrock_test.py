@@ -359,6 +359,7 @@ def test_catalog_requires_a_complete_bedrock_access_key_pair_and_resolves_ambien
     async def complete_through_bounded_lane() -> str | None:
         """Exercise the catalog-exposed bounded async completion contract."""
         assert isinstance(resolved.client, BoundedBedrockClient)
+        assert resolved.client.model_snapshot == resolved.snapshot
         async_response = await resolved.client.complete_async(
             _request(),
             deadline=RequestDeadline.after(1),

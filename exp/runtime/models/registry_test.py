@@ -10,6 +10,7 @@ from exp.common.core.artifacts import sha256_json
 from exp.common.models import (
     AssistantAction,
     BillingSource,
+    BoundModelClient,
     ConnectionConfig,
     ModelCapabilities,
     ModelCatalog,
@@ -381,7 +382,10 @@ def test_resolution_threads_catalog_served_model_pin_to_every_http_provider(
         transport_factory=ScriptedJsonTransport,
     )
 
-    assert pinned.resolve("fixture-model").served_model_id == "fixture-model-served"
+    resolved = pinned.resolve("fixture-model")
+    assert resolved.served_model_id == "fixture-model-served"
+    assert isinstance(resolved.client, BoundModelClient)
+    assert resolved.client.model_snapshot == resolved.snapshot
     assert unpinned.resolve("fixture-model").served_model_id is None
 
 
@@ -493,6 +497,8 @@ def test_tinker_resolution_uses_runtime_owned_default_construction(
 
     resolved = catalog.resolve("fixture-model")
 
+    assert isinstance(resolved.client, BoundModelClient)
+    assert resolved.client.model_snapshot == resolved.snapshot
     assert constructed == [("fixture-model", "fixture-tinker-key")]
     assert resolved.embedding_client is None
     assert (

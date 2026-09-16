@@ -14,6 +14,7 @@ from exp.common.claas import ClaasScope, Experience
 from exp.common.core.artifacts import ContractModel, JsonObject, canonical_json_bytes, sha256_json
 from exp.common.models import (
     AssistantAction,
+    BoundModelClient,
     ModelClient,
     ModelMessage,
     ModelRequest,
@@ -46,12 +47,14 @@ class WorldModelLimits(ContractModel):
 
     The caller supplies a conservative maximum call cost that includes all provider retries.
     Reservations are charged before dispatch and retained after errors or unreported usage.
+    The materialized response limit validates decoded evidence; transport transfer and buffering
+    limits remain the configured provider client's responsibility.
     """
 
     maximum_steps: int = Field(default=16, ge=1, le=256, strict=True)
     maximum_model_calls: int = Field(default=64, ge=1, le=100_000, strict=True)
     maximum_request_bytes: int = Field(default=262_144, ge=1, strict=True)
-    maximum_response_bytes: int = Field(default=262_144, ge=1, strict=True)
+    maximum_materialized_response_bytes: int = Field(default=262_144, ge=1, strict=True)
     maximum_output_tokens: int = Field(default=4096, ge=1, le=65_536, strict=True)
     maximum_total_cost_usd: float = Field(gt=0, allow_inf_nan=False)
     maximum_call_cost_usd: float = Field(gt=0, allow_inf_nan=False)
@@ -97,6 +100,8 @@ class ClaasWorldModel:
         source_disclosure: SourceDisclosure | None = None,
     ) -> None:
         """Bind the configured provider identity and shared call/cost ceilings."""
+        if not isinstance(client, BoundModelClient) or client.model_snapshot != model:
+            raise ValueError("world-model client must be bound to the configured recipient")
         self.client = client
         self.model = model
         self.limits = limits
@@ -127,12 +132,7 @@ class ClaasWorldModel:
             raise ValueError(
                 "synthetic practice requires fit evidence; reserve held-out tasks for evaluation"
             )
-        if (
-            self.source_disclosure is None
-            or self.source_disclosure.scope != scenario.scope
-            or self.source_disclosure.model != self.model
-        ):
-            raise ValueError("source disclosure must authorize this scope and exact world model")
+        self.authorize_source(scenario.scope)
         sources = {item.experience_id: item for item in grounding}
         expected = {item.experience_id: item.experience_sha256 for item in scenario.sources}
         if len(sources) != len(grounding) or set(sources) != set(expected):
@@ -171,6 +171,16 @@ class ClaasWorldModel:
     ) -> ClaasWorldSession:
         """Open a context-managed session with local, idempotent cleanup."""
         return self.reset(scenario, grounding=grounding)
+
+    def authorize_source(self, scope: ClaasScope) -> None:
+        """Check both the grant and actual configured recipient before disclosure."""
+        if (
+            self.source_disclosure != SourceDisclosure(scope=scope, model=self.model)
+            or self.client.model_snapshot != self.model
+        ):
+            raise ValueError(
+                "source disclosure must authorize this scope and exact world model recipient"
+            )
 
     def _reserve(self) -> None:
         """Charge one worst-case call before dispatch, including possible retry costs."""
@@ -271,6 +281,7 @@ class ClaasWorldSession(AbstractContextManager["ClaasWorldSession"]):
             raise WorldModelLimitError(
                 "world-model request byte limit reached; reduce grounding or steps"
             )
+        self._world.authorize_source(self.scenario.scope)
         self._world._reserve()
         response = self._world.client.complete(request)
         cost = response.economics.cost_usd
@@ -281,7 +292,7 @@ class ClaasWorldSession(AbstractContextManager["ClaasWorldSession"]):
             )
         if response.model != self._world.model:
             raise ValueError("world-model response identity differs from the configured model")
-        if len(canonical_json_bytes(response)) > limits.maximum_response_bytes:
+        if len(canonical_json_bytes(response)) > limits.maximum_materialized_response_bytes:
             raise WorldModelLimitError("world-model response exceeds its byte limit")
         if response.finish_reason == ModelFinishReason.LENGTH:
             raise ValueError(

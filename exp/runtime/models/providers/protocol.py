@@ -6,7 +6,13 @@ import asyncio
 from collections.abc import Mapping
 from typing import Protocol, runtime_checkable
 
-from exp.common.models import ModelCapabilities, ModelClient, ModelRequest, ModelResponse
+from exp.common.models import (
+    ModelCapabilities,
+    ModelClient,
+    ModelRequest,
+    ModelResponse,
+    ModelSnapshot,
+)
 from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
 from exp.runtime.models.providers.async_transport import (
@@ -52,6 +58,14 @@ class SyncModelClientAdapter:
             raise ValueError("timeout_seconds must be positive")
         self._client = client
         self._timeout_seconds = timeout_seconds
+
+    @property
+    def model_snapshot(self) -> ModelSnapshot:
+        """Expose the wrapped recipient only when the underlying client declares it."""
+        snapshot = getattr(self._client, "model_snapshot", None)
+        if not isinstance(snapshot, ModelSnapshot):
+            raise ValueError("wrapped model client does not expose a bound recipient")
+        return snapshot
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Run one async completion for a caller that is not on an event loop.
@@ -102,6 +116,14 @@ class BoundedSyncModelClientAdapter:
             raise ValueError("maximum_outstanding_calls must be at least one")
         self._client = client
         self._permits = asyncio.Semaphore(maximum_outstanding_calls)
+
+    @property
+    def model_snapshot(self) -> ModelSnapshot:
+        """Expose the wrapped recipient only when the underlying client declares it."""
+        snapshot = getattr(self._client, "model_snapshot", None)
+        if not isinstance(snapshot, ModelSnapshot):
+            raise ValueError("wrapped model client does not expose a bound recipient")
+        return snapshot
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Preserve the existing synchronous completion contract for optimizer callers.

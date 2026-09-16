@@ -452,6 +452,11 @@ class ProviderHttpClient(abc.ABC):
         self._retry_policy = retry_policy
         self._timeout_seconds = timeout_seconds
 
+    @property
+    def model_snapshot(self) -> ModelSnapshot:
+        """Expose the configured recipient without performing provider I/O."""
+        return self._model
+
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Complete one non-streaming request through the provider's completion route.
 

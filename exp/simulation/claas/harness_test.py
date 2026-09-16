@@ -47,6 +47,7 @@ class RecordingClient:
     def __init__(self, respond: Callable[[ModelRequest], JsonObject]) -> None:
         """Bind deterministic test responses and retain every dispatched request."""
         self.respond = respond
+        self.model_snapshot = model_snapshot()
         self.requests: list[ModelRequest] = []
 
     def complete(self, request: ModelRequest) -> ModelResponse:
@@ -244,3 +245,37 @@ def test_source_disclosure_requires_exact_scope_and_model(authorization: str) ->
         world.reset(scenario, grounding=(source,))
     assert not client.requests
     assert world.reserved_calls == 0
+
+
+def test_mismatched_client_recipient_is_rejected_before_source_disclosure() -> None:
+    """A declared snapshot cannot authorize a differently configured client."""
+    source = make_experience()
+    client = RecordingClient(final_transition)
+    client.model_snapshot = model_snapshot().model_copy(update={"model_id": "unapproved-recipient"})
+    with pytest.raises(ValueError, match="bound.*recipient"):
+        ClaasWorldModel(
+            client=client,
+            model=model_snapshot(),
+            limits=limits(),
+            source_disclosure=SourceDisclosure(scope=source.scope, model=model_snapshot()),
+        )
+    assert not client.requests
+
+
+def test_recipient_drift_after_reset_cannot_disclose_sources() -> None:
+    """Recheck recipient identity at dispatch, not only when a session is created."""
+    source = make_experience()
+    client = RecordingClient(final_transition)
+    world = ClaasWorldModel(
+        client=client,
+        model=model_snapshot(),
+        limits=limits(),
+        source_disclosure=SourceDisclosure(scope=source.scope, model=model_snapshot()),
+    )
+    session = world.open(
+        mine_experiences((source,), partition="fit")[0].scenario, grounding=(source,)
+    )
+    client.model_snapshot = model_snapshot().model_copy(update={"connection_sha256": "c" * 64})
+    with pytest.raises(ValueError, match="recipient"):
+        session.step(AssistantAction(content="Done."))
+    assert not client.requests and world.reserved_calls == 0

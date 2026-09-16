@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
-from exp.common.models.model import Embedding, ModelRequest, ModelResponse
+from exp.common.models.model import Embedding, ModelRequest, ModelResponse, ModelSnapshot
 
 
 @runtime_checkable
@@ -21,6 +21,16 @@ class ModelClient(Protocol):
         Returns:
             Output, resolved model identity, and observed operation economics.
         """
+
+
+@runtime_checkable
+class BoundModelClient(ModelClient, Protocol):
+    """A completion client exposing its configured recipient before source disclosure."""
+
+    @property
+    def model_snapshot(self) -> ModelSnapshot:
+        """Return the exact model and connection used by subsequent completions."""
+        ...
 
 
 @runtime_checkable

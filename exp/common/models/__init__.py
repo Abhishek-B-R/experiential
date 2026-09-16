@@ -14,7 +14,12 @@ from exp.common.models.catalog import (
     load_model_catalog,
     write_model_catalog,
 )
-from exp.common.models.client import EmbeddingClient, IdempotentModelClient, ModelClient
+from exp.common.models.client import (
+    BoundModelClient,
+    EmbeddingClient,
+    IdempotentModelClient,
+    ModelClient,
+)
 from exp.common.models.connection_authoring import (
     ProviderConnectionAuthoringError,
     configure_provider_connections,
@@ -117,6 +122,7 @@ from exp.common.models.structured import structured_json_text
 __all__ = [
     "AssistantAction",
     "BillingSource",
+    "BoundModelClient",
     "CandidateTokenPrice",
     "ChatMaxTokensField",
     "CompletionCostReservation",
