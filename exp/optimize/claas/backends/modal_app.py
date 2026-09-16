@@ -50,7 +50,10 @@ def create_modal_app(*, config: ModalExecutionConfig, image: modal.Image) -> mod
         backend = SubprocessVerlBackend(
             python_executable=Path(sys.executable),
             checkpoint_root=Path(REMOTE_ROOT),
-            cuda_visible_device=os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+            # The deployment requests exactly one GPU. Modal may expose that
+            # device without setting CUDA_VISIBLE_DEVICES, so select its local
+            # ordinal explicitly while preserving a supplied device binding.
+            cuda_visible_device=os.environ.get("CUDA_VISIBLE_DEVICES", "0"),
             timeout_seconds=config.timeout_seconds,
             lineage_id=job.lineage_id,
         )
