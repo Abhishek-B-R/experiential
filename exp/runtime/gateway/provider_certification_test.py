@@ -85,7 +85,7 @@ def test_typesafe_certification_names_native_decisions_without_claiming_chat() -
     for cell in cells.values():
         assert cell.provider_api_surface == "POST /v1/systemone JSON"
         assert cell.gateway_api_surfaces == ("decisions",)
-        assert cell.client_sdk == "httpx (raw HTTP; no decision SDK)"
+        assert cell.client_sdk == "reqwest (native HTTP; no decision SDK)"
         assert cell.evaluated_at == datetime(2026, 9, 16, tzinfo=UTC)
         assert cell.evidence == ("exp/runtime/gateway/tests/native_decisions_test.py",)
         assert cell.limitation

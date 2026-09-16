@@ -3007,6 +3007,9 @@ def test_tty_child_supports_descriptors_above_select_limit(
         tmp_path: Isolated child working directory.
         monkeypatch: Fixture replacing only pseudo-terminal descriptor allocation.
     """
+    if sys.platform == "win32":
+        pytest.skip("High-numbered pseudo-terminal descriptors require POSIX.")
+
     import fcntl
     import resource
 
