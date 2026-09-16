@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol
@@ -105,16 +105,6 @@ class PracticeReceipt(ContractModel):
     episode: EnvironmentEpisode
     samples: tuple[PolicySample, ...]
     experiences: tuple[Experience, ...]
-
-
-async def run_owned[T](operation: Callable[[], T]) -> T:
-    """Own a blocking provider call through cancellation and its configured deadline."""
-    task = asyncio.create_task(asyncio.to_thread(operation))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        await task
-        raise
 
 
 async def collect_practice(
@@ -249,7 +239,7 @@ async def collect_practice(
                     if execution_error is not None:
                         evidence["execution_failure_type"] = type(execution_error).__name__
                     reason = "failed"
-                    if execution_error is None:
+                    if isinstance(error, asyncio.CancelledError) or execution_error is None:
                         raise
                 finally:
                     receipt = PracticeReceipt(

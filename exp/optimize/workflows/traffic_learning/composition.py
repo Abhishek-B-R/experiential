@@ -12,13 +12,14 @@ from exp.common.claas.feedback import FeedbackRecord, FinalizedEpisode
 from exp.optimize.claas.configuration import LocalClaasConfig
 from exp.optimize.claas.lifecycle.cycle import AdmissionController, CycleState, run_cycle
 from exp.optimize.claas.lifecycle.inputs import PreparedCycle
-from exp.optimize.claas.lifecycle.rollouts import ServingController, run_owned
+from exp.optimize.claas.lifecycle.rollouts import ServingController
 from exp.optimize.claas.training_contracts import ClaasTrainingBackend
 from exp.optimize.workflows.traffic_learning.adapters import (
     TrafficEnvironment,
     TrafficEvaluator,
     scenario_input,
 )
+from exp.optimize.workflows.traffic_learning.calls import run_owned
 from exp.optimize.workflows.traffic_learning.configuration import TrafficWorkflowConfig
 from exp.optimize.workflows.traffic_learning.sources.preparation import prepare_evidence
 from exp.optimize.workflows.traffic_learning.sources.retention import prune_evidence
