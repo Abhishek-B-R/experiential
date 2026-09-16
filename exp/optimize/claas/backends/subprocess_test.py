@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from exp.optimize.claas.backends.subprocess import SubprocessVerlBackend
+from exp.optimize.claas.backends.subprocess import (
+    SubprocessVerlBackend,
+    _worker_diagnostic,
+    _worker_environment,
+)
 from exp.optimize.claas.training_contracts import ClaasTrainingError
 from exp.optimize.claas.training_contracts_test import job, spec
 
@@ -119,7 +123,6 @@ def test_close_during_process_creation_waits_for_owned_worker_cleanup(
 
 def test_failure_diagnostic_retains_bounded_tail(tmp_path: Path) -> None:
     """A useful terminal exception survives temporary worker-log cleanup."""
-    from exp.optimize.claas.backends.subprocess import _worker_diagnostic
 
     log = tmp_path / "worker.log"
     log.write_bytes(b"earlier-output" * 10000 + b"\nCUDA out of memory\n")
@@ -130,7 +133,6 @@ def test_failure_diagnostic_retains_bounded_tail(tmp_path: Path) -> None:
 
 def test_worker_environment_drops_unrelated_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     """The optional ML process receives only its explicit model token and runtime settings."""
-    from exp.optimize.claas.backends.subprocess import _worker_environment
 
     monkeypatch.setenv("OPENAI_API_KEY", "gateway-secret-canary")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "cloud-secret-canary")

@@ -1,5 +1,6 @@
 """Checkpoint publication fault tests; inert writers are not training evidence."""
 
+import shutil
 from pathlib import Path
 from typing import cast
 
@@ -20,7 +21,6 @@ class InertCheckpointWriter:
 
     def save_checkpoint(self, local_path: str, *, global_step: int) -> None:
         """Copy the actor or teacher native-layout fixture selected by the caller."""
-        import shutil
 
         del global_step
         target = Path(local_path)
@@ -32,7 +32,6 @@ def test_missing_native_state_never_publishes_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A writer that omits optimizer state fails verification before the atomic rename."""
-    import shutil
 
     fixture = tmp_path / "fixture"
     checkpoint(fixture)
@@ -57,7 +56,6 @@ def test_flush_failure_never_publishes_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A durable-write failure leaves neither a completed manifest nor temporary state."""
-    import shutil
 
     fixture = tmp_path / "fixture"
     checkpoint(fixture)
