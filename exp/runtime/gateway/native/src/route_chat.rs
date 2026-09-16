@@ -15,8 +15,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::admission::{
-    acquire_permit, apply_output_guardrail, commit_dependent, commit_independent, new_guard,
-    wire_drift_response, Admission,
+    acquire_permit, apply_output_guardrail, new_guard, served_headers, wire_drift_response,
+    Admission,
 };
 use crate::encode::{
     compact_json, completed_chat_body_with_carrier, completed_chat_body_with_ignored,
@@ -34,7 +34,7 @@ use crate::respond::{
     latin1_header, outward_event, read_body, send_bounded, settle_stream_end, sse_body_response,
 };
 use crate::server::AppState;
-use crate::settlement::AttemptGuard;
+use crate::settlement::{settle_guarded_failure, AttemptGuard};
 use crate::waterfall::{acquire_attempt, CommittedAttempt, SettledAttempt, WaterfallContext, Won};
 
 pub(crate) async fn chat(
@@ -204,6 +204,7 @@ pub(crate) async fn chat(
         http: &state.http,
         request_id: &admission.request_id,
         raw_key: &raw_key,
+        caller_scope: admission.caller_scope.as_deref(),
         route: &admission.route,
         policy: admission.policy(),
         deadline,
@@ -214,6 +215,7 @@ pub(crate) async fn chat(
         // only, never a billing quantity.
         approximate_input_tokens: (body_text.len() as f64) / 4.0,
         output_less_retention: None,
+        output_token_cap: admission.maximum_output_tokens,
     };
     let won = acquire_attempt(&context, &mut guard).await;
 
@@ -235,8 +237,9 @@ pub(crate) async fn chat(
         Won::Committed(committed) => {
             let committed = *committed;
             let incremental = admission.stream_incremental(committed.depth);
-            if admission.output_guardrail.enforces() && !incremental {
+            if admission.buffers_output() && !incremental {
                 guarded_chat_response(
+                    state,
                     admission,
                     guard,
                     committed,
@@ -287,6 +290,7 @@ async fn settled_chat_response(
     mut lease: Option<OwnerLease>,
     client_request_id: Option<String>,
 ) -> Response {
+    let served = settled.served();
     let mut events = settled.events;
     let refusal_completed = complete_visible_refusal(&mut events);
     if refusal_completed.is_none() {
@@ -300,8 +304,7 @@ async fn settled_chat_response(
                     Ok(body) => body,
                     Err(error) => return error_response(&error),
                 };
-                let mut headers = commit_independent(admission, client_request_id.as_deref());
-                headers.extend(commit_dependent(admission, settled.depth));
+                let headers = served_headers(admission, client_request_id.as_deref(), served);
                 if let Some(mut owner) = lease.take() {
                     owner.abandon().await;
                 }
@@ -313,8 +316,7 @@ async fn settled_chat_response(
             return error_response(&error);
         }
     }
-    let mut headers = commit_independent(admission, client_request_id.as_deref());
-    headers.extend(commit_dependent(admission, settled.depth));
+    let headers = served_headers(admission, client_request_id.as_deref(), served);
     if admission.stream {
         let body = match encode_chat_sse(admission, created_at, &events, None, false) {
             Ok(body) => body,
@@ -477,7 +479,7 @@ pub(crate) async fn seal_reasoning_candidate(
 async fn respond_from_chat_events(
     admission: Admission,
     mut guard: AttemptGuard,
-    depth: usize,
+    served: crate::waterfall::Served,
     mut events: Vec<Event>,
     usage: Option<Usage>,
     tool_names: Vec<String>,
@@ -486,6 +488,7 @@ async fn respond_from_chat_events(
     client_request_id: Option<String>,
     stream_body: bool,
 ) -> Response {
+    let depth = served.depth;
     let refusal_completed = complete_visible_refusal(&mut events);
     let carrier = if refusal_completed.is_some() {
         None
@@ -587,8 +590,7 @@ async fn respond_from_chat_events(
         }
         return error_response(&PublicError::internal());
     }
-    let mut headers = commit_independent(&admission, client_request_id.as_deref());
-    headers.extend(commit_dependent(&admission, depth));
+    let headers = served_headers(&admission, client_request_id.as_deref(), served);
     if stream_body {
         let body = match encode_chat_sse(
             &admission,
@@ -675,7 +677,7 @@ async fn completed_response(
     respond_from_chat_events(
         admission,
         guard,
-        committed.depth,
+        committed.served(),
         events,
         committed.usage,
         committed.tool_names,
@@ -689,6 +691,7 @@ async fn completed_response(
 
 #[allow(clippy::too_many_arguments)]
 async fn guarded_chat_response(
+    state: AppState,
     admission: Admission,
     mut guard: AttemptGuard,
     mut committed: CommittedAttempt,
@@ -709,36 +712,14 @@ async fn guarded_chat_response(
         Err(failure) => {
             let failure = failure.boundary();
             let error = collection_public_error(&failure);
-            guard
-                .settle(
-                    "failed",
-                    committed.usage.as_ref(),
-                    &committed.tool_names,
-                    Some(&failure),
-                    true,
-                )
-                .await;
-            if let Some(mut owner) = lease.take() {
-                owner.abandon().await;
-            }
+            settle_guarded_failure(&mut guard, &mut committed, &mut lease, &failure).await;
             return error_response(&error);
         }
     };
-    let events = match apply_output_guardrail(&admission, &guard.bridge, collected).await {
+    let events = match apply_output_guardrail(&state, &admission, collected, deadline).await {
         Ok(events) => events,
         Err(failure) => {
-            guard
-                .settle(
-                    "failed",
-                    committed.usage.as_ref(),
-                    &committed.tool_names,
-                    Some(&failure),
-                    true,
-                )
-                .await;
-            if let Some(mut owner) = lease.take() {
-                owner.abandon().await;
-            }
+            settle_guarded_failure(&mut guard, &mut committed, &mut lease, &failure).await;
             return error_response(&failure.public_error());
         }
     };
@@ -746,7 +727,7 @@ async fn guarded_chat_response(
     respond_from_chat_events(
         admission,
         guard,
-        committed.depth,
+        committed.served(),
         events,
         committed.usage,
         committed.tool_names,
@@ -771,8 +752,7 @@ async fn stream_response(
     incremental_guardrail: bool,
 ) -> Response {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-    let mut header_pairs = commit_independent(&admission, client_request_id.as_deref());
-    header_pairs.extend(commit_dependent(&admission, committed.depth));
+    let header_pairs = served_headers(&admission, client_request_id.as_deref(), committed.served());
     let include_usage = admission.include_usage;
     let request_id = admission.request_id.clone();
     let alias = admission.alias.clone();

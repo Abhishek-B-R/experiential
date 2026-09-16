@@ -91,15 +91,30 @@ fn plane() -> Py<PyAny> {
 
 /// One scripted provider answer for one connection.
 #[derive(Clone)]
-enum Answer {
+pub(super) enum Answer {
     /// A 429 with the optional stated wait.
     Throttle(Option<u32>),
+    /// A 400 carrying this exact JSON body.
+    Rejected(&'static str),
     /// A 200 event stream carrying these SSE frames, then `[DONE]`.
     Stream(&'static [&'static str]),
+    /// A 200 native Responses event stream carrying these SSE frames and
+    /// then a `response.completed` terminal (the Responses wire has no
+    /// `[DONE]`).
+    ResponsesStream(&'static [&'static str]),
+    /// A 200 native Responses event stream whose only frame is this
+    /// `response.failed` terminal (how OpenRouter's Responses relay reports
+    /// an upstream 400).
+    ResponsesFailed(&'static str),
 }
 
 fn render(answer: &Answer) -> String {
     match answer {
+        Answer::Rejected(body) => format!(
+            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len(),
+        ),
         Answer::Throttle(retry_after) => {
             let body = "{\"error\":{\"message\":\"We're currently processing too many requests - \
                         please try again later\",\"type\":\"server_error\",\"code\":null}}";
@@ -112,14 +127,29 @@ fn render(answer: &Answer) -> String {
                 body.len(),
             )
         }
-        Answer::Stream(frames) => {
+        Answer::ResponsesFailed(frame) => {
+            let body = format!("data: {frame}\n\n");
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+        }
+        Answer::Stream(frames) | Answer::ResponsesStream(frames) => {
             let mut body = String::new();
             for frame in frames.iter() {
                 body.push_str("data: ");
                 body.push_str(frame);
                 body.push_str("\n\n");
             }
-            body.push_str("data: [DONE]\n\n");
+            match answer {
+                Answer::ResponsesStream(_) => {
+                    body.push_str("data: ");
+                    body.push_str(RESPONSES_COMPLETED_FRAME);
+                    body.push_str("\n\n");
+                }
+                _ => body.push_str("data: [DONE]\n\n"),
+            }
             format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
                  content-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -130,25 +160,58 @@ fn render(answer: &Answer) -> String {
 }
 
 /// One scripted rung: answers its connections in script order and records
-/// when each was accepted.
-struct Rung {
-    url: String,
-    accepted: Arc<Mutex<Vec<Instant>>>,
+/// when each was accepted and the request body it carried.
+pub(super) struct Rung {
+    pub(super) url: String,
+    pub(super) accepted: Arc<Mutex<Vec<Instant>>>,
+    pub(super) bodies: Arc<Mutex<Vec<String>>>,
 }
 
-async fn spawn_rung(script: Vec<Answer>) -> Rung {
+/// Read one whole HTTP/1.1 request (headers, then `content-length` bytes of
+/// body) and return the body text.
+async fn read_request_body(socket: &mut tokio::net::TcpStream) -> String {
+    let mut received: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 16_384];
+    loop {
+        let header_end = received
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|at| at + 4);
+        if let Some(header_end) = header_end {
+            let headers = String::from_utf8_lossy(&received[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if received.len() >= header_end + content_length {
+                return String::from_utf8_lossy(&received[header_end..header_end + content_length])
+                    .into_owned();
+            }
+        }
+        let read = socket.read(&mut chunk).await.unwrap_or(0);
+        if read == 0 {
+            return String::new();
+        }
+        received.extend_from_slice(&chunk[..read]);
+    }
+}
+
+pub(super) async fn spawn_rung(script: Vec<Answer>) -> Rung {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let address = listener.local_addr().expect("address");
     let accepted = Arc::new(Mutex::new(Vec::new()));
+    let bodies = Arc::new(Mutex::new(Vec::new()));
     let recorder = accepted.clone();
+    let body_recorder = bodies.clone();
     tokio::spawn(async move {
         for answer in script {
             let (mut socket, _) = listener.accept().await.expect("accept");
             recorder.lock().expect("lock").push(Instant::now());
-            let mut buffer = [0u8; 16_384];
-            let _ = socket.read(&mut buffer).await;
+            let body = read_request_body(&mut socket).await;
+            body_recorder.lock().expect("lock").push(body);
             socket
                 .write_all(render(&answer).as_bytes())
                 .await
@@ -159,10 +222,11 @@ async fn spawn_rung(script: Vec<Answer>) -> Rung {
     Rung {
         url: format!("http://{address}/v1/chat/completions"),
         accepted,
+        bodies,
     }
 }
 
-fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) -> DeploymentWire {
+pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) -> DeploymentWire {
     DeploymentWire {
         provider: "openai".to_string(),
         deployment_id: deployment_id.to_string(),
@@ -183,6 +247,7 @@ fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) -> Deployme
         reasoning_output_exposed: false,
         stop_sequences: Vec::new(),
         serialize_tool_calls: false,
+        image_output: false,
         idempotency_key: format!("op-{deployment_id}"),
         time_to_first_byte_base_seconds: None,
         time_to_first_byte_seconds_per_million_input_tokens: None,
@@ -190,7 +255,73 @@ fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) -> Deployme
     }
 }
 
-const SCHEDULE: ThrottleRedial = ThrottleRedial {
+/// One native Responses rung whose replayed input carries these reasoning
+/// payloads (sealed elsewhere, as far as the scripted rung is concerned)
+/// beside the caller's visible turns. Every test names its own payloads: the
+/// per-worker repair memory is process-global, so a payload one test's
+/// refusal remembers would be stripped proactively in another.
+pub(super) fn responses_wire(deployment_id: &str, url: &str, encrypted: &[&str]) -> DeploymentWire {
+    // The Codex shape: the call replays with the provider id of its turn.
+    let mut input = vec![
+        json!({"role": "user", "content": "plan the change"}),
+        json!({"type": "function_call", "id": "fc_turn_1", "call_id": "call_1", "name": "exec", "arguments": "{}"}),
+        json!({"type": "function_call_output", "call_id": "call_1", "output": "ok"}),
+        json!({"role": "user", "content": "now apply it"}),
+    ];
+    for (offset, content) in encrypted.iter().enumerate() {
+        input.insert(
+            1 + offset,
+            json!({"type": "reasoning", "summary": [], "encrypted_content": content}),
+        );
+    }
+    DeploymentWire {
+        dialect: "openai_responses".to_string(),
+        url: url.replace("/v1/chat/completions", "/v1/responses"),
+        upstream_payload: json!({
+            "model": "gpt-test",
+            "input": input,
+            "store": false,
+            "stream": true,
+            "include": ["reasoning.encrypted_content"],
+        }),
+        ..wire(deployment_id, url, 0)
+    }
+}
+
+/// OpenAI's verdict on a replayed reasoning payload it cannot decrypt, as
+/// answered live to a customer's stateless Responses turn (2026-09-15).
+pub(super) const INVALID_ENCRYPTED_CONTENT_BODY: &str = concat!(
+    "{\"error\":{\"message\":\"The encrypted content rsn_...hA== could not be verified. ",
+    "Reason: Encrypted content could not be decrypted or parsed.\",",
+    "\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_encrypted_content\"}}"
+);
+
+/// OpenRouter's Responses relay failing the stream on a replayed payload its
+/// account cannot decrypt (live, gpt-5.6-sol, 2026-09-16 00:25Z): a 200, then
+/// this terminal under OpenAI's `invalid_prompt`.
+pub(super) const RESPONSES_FAILED_ENCRYPTED_FRAME: &str = concat!(
+    "{\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",",
+    "\"usage\":{\"input_tokens\":30,\"output_tokens\":0,\"total_tokens\":30},\"error\":",
+    "{\"code\":\"invalid_prompt\",\"message\":\"The encrypted content rsn_...hA== could not be verified. ",
+    "Reason: Encrypted content could not be decrypted or parsed.\"}}}"
+);
+
+pub(super) const RESPONSES_FAILED_OTHER_FRAME: &str = concat!(
+    "{\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":",
+    "{\"code\":\"invalid_prompt\",\"message\":\"Invalid prompt: we've limited access to this content.\"}}}"
+);
+
+const RESPONSES_COMPLETED_FRAME: &str = concat!(
+    "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",",
+    "\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"total_tokens\":15}}}"
+);
+
+pub(super) const RESPONSES_TEXT_FRAME: &str = concat!(
+    "{\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",",
+    "\"output_index\":0,\"content_index\":0,\"delta\":\"applied\"}"
+);
+
+pub(super) const SCHEDULE: ThrottleRedial = ThrottleRedial {
     max_attempts: 2,
     base_delay_ms: 100,
     max_delay_ms: 2_000,
@@ -201,21 +332,43 @@ const THROTTLE_FRAME: &str = "{\"error\":{\"code\":\"rate_limit_exceeded\",\
                               \"message\":\"Rate limit reached\"}}";
 
 /// Everything one ladder run needs, kept alive together.
-struct Harness {
+pub(super) struct Harness {
     bridge: Arc<Bridge>,
     http: reqwest::Client,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             bridge: Arc::new(Bridge::new(plane(), 2).expect("bridge starts")),
             http: build_client(Duration::from_secs(2)).expect("client"),
         }
     }
 
-    async fn run(
+    pub(super) async fn run(
         &self,
+        route: &[DeploymentWire],
+        throttle_redial: Option<ThrottleRedial>,
+        deadline: Duration,
+    ) -> (Won, AttemptGuard) {
+        self.run_as(
+            "key",
+            Some("org:key-holder"),
+            route,
+            throttle_redial,
+            deadline,
+        )
+        .await
+    }
+
+    /// Run with the bearer the data plane sees and the caller identity
+    /// admission names. In a hosted worker the two differ: the in-pod front
+    /// exchanges the caller's key for an ephemeral per-request token, so
+    /// `raw_key` changes on every turn while `caller_scope` does not.
+    pub(super) async fn run_as(
+        &self,
+        raw_key: &str,
+        caller_scope: Option<&str>,
         route: &[DeploymentWire],
         throttle_redial: Option<ThrottleRedial>,
         deadline: Duration,
@@ -230,7 +383,8 @@ impl Harness {
             bridge: &self.bridge,
             http: &self.http,
             request_id: "request-throttle",
-            raw_key: "key",
+            raw_key,
+            caller_scope,
             route,
             policy: RoutePolicy {
                 maximum_total_attempts: 8,
@@ -243,12 +397,13 @@ impl Harness {
             time_to_first_byte_slope_seconds_per_million_input_tokens: 0.0,
             approximate_input_tokens: 10.0,
             output_less_retention: None,
+            output_token_cap: None,
         };
         let won = acquire_attempt(&context, &mut guard).await;
         (won, guard)
     }
 
-    async fn story(&self) -> Value {
+    pub(super) async fn story(&self) -> Value {
         let text = self
             .bridge
             .call("dump", "{}".to_string())
@@ -258,7 +413,7 @@ impl Harness {
     }
 }
 
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
+pub(super) fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -272,7 +427,7 @@ fn gaps(rung: &Rung) -> Vec<Duration> {
     accepted.windows(2).map(|pair| pair[1] - pair[0]).collect()
 }
 
-async fn finish(mut guard: AttemptGuard, won: Won) -> Won {
+pub(super) async fn finish(mut guard: AttemptGuard, won: Won) -> Won {
     if let Won::Committed(_) = &won {
         guard.settle("completed", None, &[], None, true).await;
     }

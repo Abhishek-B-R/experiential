@@ -17,12 +17,12 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::admission::{
-    acquire_permit, apply_output_guardrail, commit_dependent, commit_independent, new_guard,
-    Admission,
+    acquire_permit, apply_output_guardrail, new_guard, served_headers, Admission,
 };
 use crate::encode::compact_json;
 use crate::encode_messages::{
-    anthropic_error_body, completed_messages_body_with_reasoning, MessagesSseEncoder,
+    anthropic_error_body, completed_messages_body_with_reasoning, AggregatedMessage,
+    MessagesSseEncoder,
 };
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
@@ -37,7 +37,10 @@ use crate::respond::{
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
-use crate::waterfall::{acquire_attempt, CommittedAttempt, SettledAttempt, WaterfallContext, Won};
+use crate::waterfall::{
+    acquire_attempt, billed_empty_completion, unreported_empty_completion, CommittedAttempt,
+    Served, SettledAttempt, WaterfallContext, Won,
+};
 
 /// Anthropic-enveloped variant of `error_response` for the Messages surface,
 /// mirroring `anthropic_error_response` in the python engine.
@@ -202,6 +205,7 @@ pub(crate) async fn messages(
         http: &state.http,
         request_id: &admission.request_id,
         raw_key: &raw_key,
+        caller_scope: admission.caller_scope.as_deref(),
         route: &admission.route,
         policy: admission.policy(),
         deadline,
@@ -212,6 +216,7 @@ pub(crate) async fn messages(
         // only, never a billing quantity.
         approximate_input_tokens: (body_text.len() as f64) / 4.0,
         output_less_retention: None,
+        output_token_cap: admission.maximum_output_tokens,
     };
     let won = acquire_attempt(&context, &mut guard).await;
 
@@ -221,8 +226,8 @@ pub(crate) async fn messages(
         Won::Committed(committed) => {
             let committed = *committed;
             let incremental = admission.stream_incremental(committed.depth);
-            if admission.output_guardrail.enforces() && !incremental {
-                guarded_messages(admission, guard, committed, deadline, permit).await
+            if admission.buffers_output() && !incremental {
+                guarded_messages(state, admission, guard, committed, deadline, permit).await
             } else if admission.stream {
                 stream_messages(admission, guard, committed, deadline, permit, incremental).await
             } else {
@@ -261,6 +266,7 @@ async fn messages_wire_drift_response(
 /// terminal with no semantic output, or an exhausted ladder flushing its
 /// bounded withheld refusal output ahead of the failing terminal.
 async fn settled_messages_response(admission: &Admission, settled: SettledAttempt) -> Response {
+    let served = settled.served();
     let mut events = settled.events;
     let refusal_completed = complete_visible_refusal(&mut events);
     if refusal_completed.is_none() {
@@ -273,15 +279,13 @@ async fn settled_messages_response(admission: &Admission, settled: SettledAttemp
                     Ok(body) => body,
                     Err(error) => return messages_error_response(&error),
                 };
-                let mut headers = commit_independent(admission, None);
-                headers.extend(commit_dependent(admission, settled.depth));
+                let headers = served_headers(admission, None, served);
                 return sse_body_response(&headers, body);
             }
             return messages_error_response(&error);
         }
     }
-    let mut headers = commit_independent(admission, None);
-    headers.extend(commit_dependent(admission, settled.depth));
+    let headers = served_headers(admission, None, served);
     // A settled attempt carries no semantic output, so no reasoning was
     // issued and nothing needs sealing; exposure only governs display.
     let exposed = admission.reasoning_exposed_at(settled.depth);
@@ -315,12 +319,13 @@ async fn settled_messages_response(admission: &Admission, settled: SettledAttemp
 async fn respond_from_messages_events(
     admission: Admission,
     mut guard: AttemptGuard,
-    depth: usize,
+    served: crate::waterfall::Served,
     mut events: Vec<Event>,
     usage: Option<Usage>,
     tool_names: Vec<String>,
     stream_body: bool,
 ) -> Response {
+    let depth = served.depth;
     let refusal_completed = complete_visible_refusal(&mut events);
     // A tool turn's hidden reasoning leaves only as the sealed carrier, so it
     // is sealed under the gateway authority before the body is assembled,
@@ -381,7 +386,25 @@ async fn respond_from_messages_events(
             .await;
         return messages_error_response(&error);
     }
-    let settled = if let Some(refusal) = &refusal_completed {
+    let empty_completion = refusal_completed.is_none()
+        && aggregated_empty_completion(&events, &aggregated, usage.as_ref());
+    let settled = if empty_completion {
+        // The committed rung closed the turn with nothing this surface can
+        // render (an OpenAI empty message item, hidden reasoning). Post-commit
+        // there is no ladder: the caller receives the empty turn as a typed
+        // 200 under `x-gateway-warning: empty_completion` -- never a 502 the
+        // SDKs auto-retry -- while the ledger records the typed
+        // `empty_completion` failure at $0, exactly like a visible refusal.
+        guard
+            .settle(
+                "failed",
+                aggregated.usage.as_ref().or(usage.as_ref()),
+                &aggregated.tool_names,
+                Some(&Failure::empty_completion()),
+                true,
+            )
+            .await
+    } else if let Some(refusal) = &refusal_completed {
         // The caller saw the refusal output, so the public result completes;
         // the ledger still records the provider's typed refusal.
         guard
@@ -413,8 +436,11 @@ async fn respond_from_messages_events(
         // Success is only reported once the terminal accounting write landed.
         return messages_error_response(&PublicError::internal());
     }
-    let mut headers = commit_independent(&admission, None);
-    headers.extend(commit_dependent(&admission, depth));
+    let served = Served {
+        empty_completion,
+        ..served
+    };
+    let headers = served_headers(&admission, None, served);
     if stream_body {
         let body = match encode_messages_sse(&admission, &events, carrier.as_deref(), exposed) {
             Ok(body) => body,
@@ -423,6 +449,32 @@ async fn respond_from_messages_events(
         return sse_body_response(&headers, body);
     }
     json_response(StatusCode::OK, &aggregated.body, &headers)
+}
+
+/// Whether an aggregated Messages turn is an empty completion: its terminal
+/// is `Completed`, its usage either counts output or was never reported, and
+/// no content block survived aggregation (every committed event was one this
+/// surface drops).
+fn aggregated_empty_completion(
+    events: &[Event],
+    aggregated: &AggregatedMessage,
+    usage: Option<&Usage>,
+) -> bool {
+    let Some(terminal) = events.iter().rev().find(|event| event.is_terminal()) else {
+        return false;
+    };
+    let content_empty = aggregated
+        .body
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty);
+    let usage = aggregated.usage.as_ref().or(usage);
+    // Post-commit there is no cap to read against: a committed turn that
+    // rendered no block is a failed attempt whether the provider billed it or
+    // sent no usage frame at all; only a report of zero tokens is honest.
+    content_empty
+        && (billed_empty_completion(terminal, usage)
+            || unreported_empty_completion(terminal, usage))
 }
 
 fn encode_messages_sse(
@@ -486,7 +538,7 @@ async fn completed_messages(
     respond_from_messages_events(
         admission,
         guard,
-        committed.depth,
+        committed.served(),
         events,
         committed.usage,
         committed.tool_names,
@@ -496,6 +548,7 @@ async fn completed_messages(
 }
 
 async fn guarded_messages(
+    state: AppState,
     admission: Admission,
     mut guard: AttemptGuard,
     mut committed: CommittedAttempt,
@@ -525,7 +578,7 @@ async fn guarded_messages(
             return messages_error_response(&error);
         }
     };
-    let events = match apply_output_guardrail(&admission, &guard.bridge, collected).await {
+    let events = match apply_output_guardrail(&state, &admission, collected, deadline).await {
         Ok(events) => events,
         Err(failure) => {
             guard
@@ -544,7 +597,7 @@ async fn guarded_messages(
     respond_from_messages_events(
         admission,
         guard,
-        committed.depth,
+        committed.served(),
         events,
         committed.usage,
         committed.tool_names,
@@ -562,11 +615,7 @@ async fn stream_messages(
     incremental_guardrail: bool,
 ) -> Response {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-    let header_pairs = {
-        let mut headers = commit_independent(&admission, None);
-        headers.extend(commit_dependent(&admission, committed.depth));
-        headers
-    };
+    let header_pairs = served_headers(&admission, None, committed.served());
     let request_id = admission.request_id.clone();
     let alias = admission.alias.clone();
     let ignored_parameters = admission.ignored_parameters.clone();
@@ -587,6 +636,7 @@ async fn stream_messages(
         // Deterministic output redaction as bytes flow: only the trailing
         // window the detector cannot yet decide about is withheld.
         let mut redactor = incremental_guardrail.then(|| StreamRedactor::new(&request_id));
+        let mut empty_completion = false;
 
         macro_rules! fail_stream {
             ($failure:expr) => {{
@@ -686,11 +736,37 @@ async fn stream_messages(
                         Ok(None) => {}
                         Err(failure) => fail_stream!(failure),
                     }
+                    if !encoder.has_content_blocks()
+                        && (billed_empty_completion(&event, usage.as_ref())
+                            || unreported_empty_completion(&event, usage.as_ref()))
+                    {
+                        // The deployment committed on events this surface
+                        // cannot render (an OpenAI empty message item, hidden
+                        // reasoning on an unexposed rung). Post-commit there
+                        // is no ladder and the headers are already on the
+                        // wire, so the terminal frames (`end_turn`, no
+                        // blocks) are the caller's typed answer -- never an
+                        // `error` event the SDKs auto-retry -- while the
+                        // ledger records the typed `empty_completion` failure.
+                        empty_completion = true;
+                    }
                 }
                 terminal = Some(event.clone());
-                if !settle_stream_end(&mut guard, Some(&event), usage.as_ref(), &tool_names, false)
-                    .await
-                {
+                let settled = if empty_completion {
+                    guard
+                        .settle(
+                            "failed",
+                            usage.as_ref(),
+                            &tool_names,
+                            Some(&Failure::empty_completion()),
+                            true,
+                        )
+                        .await
+                } else {
+                    settle_stream_end(&mut guard, Some(&event), usage.as_ref(), &tool_names, false)
+                        .await
+                };
+                if !settled {
                     return;
                 }
             }

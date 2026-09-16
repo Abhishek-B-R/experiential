@@ -21,8 +21,16 @@ from exp.common.models import (
     GatewayTokenPrices,
     ModelCapabilities,
 )
+from exp.common.models.catalog import (
+    GatewayRungDispatchPolicy,
+    load_model_catalog,
+    write_model_catalog,
+)
 from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
-from exp.runtime.gateway.catalog_authority import upsert_singleton_deployment
+from exp.runtime.gateway.catalog_authority import (
+    snapshot_current_catalog,
+    upsert_singleton_deployment,
+)
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayApiSurface,
@@ -50,6 +58,10 @@ from exp.runtime.gateway.native_bridge_errors import capability_param as _public
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.instruction_turns import (
+    HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE,
+    SYSTEM_FOLD_DISCLOSURE,
+)
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
@@ -480,6 +492,9 @@ def test_fireworks_carrier_round_trip_rejects_tamper_and_credential_rotation(
     messages = cast("list[JsonObject]", payload["messages"])
     assert continued["route_reason"] == "reasoning_continuation"
     assert messages[1]["reasoning_content"] == hidden
+    # The data plane's per-caller repair memory keys on this, never on the raw key.
+    organization, identity = str(continued["caller_scope"]).split(":", maxsplit=1)
+    assert organization and identity == "default"
 
     transplanted = json.loads(continuation_body)
     transplanted["messages"][0]["content"] = "Use this carrier under a different prompt"
@@ -818,7 +833,14 @@ def test_hunyuan_endpoint_without_exposure_capability_strips_reasoning(
 
 
 def test_fireworks_continuation_pins_the_exact_issuing_fallback_rung(tmp_path: Path) -> None:
-    """A fallback-issued carrier replays only to its exact deployment and credential."""
+    """A fallback-issued carrier replays only to its exact deployment and credential.
+
+    The issuing rung leads the continuation's ladder with the unsealed
+    reasoning; the pool's other rung follows as a failover fallback whose
+    frozen payload carries no reasoning at all (it cannot unseal it), so the
+    plaintext is replayed to exactly one deployment while a failure on it can
+    still be served.
+    """
     _manager, raw_key = _configured_pool_gateway(
         tmp_path,
         base_urls=(
@@ -913,8 +935,358 @@ def test_fireworks_continuation_pins_the_exact_issuing_fallback_rung(tmp_path: P
     )
 
     continued_route = cast("list[JsonObject]", continuation["route"])
-    assert [item["deployment_id"] for item in continued_route] == [route[1]["deployment_id"]]
+    assert [item["deployment_id"] for item in continued_route] == [
+        route[1]["deployment_id"],
+        route[0]["deployment_id"],
+    ]
     assert continued_route[0]["model_id"] == "beta-model-exact"
+    assert continuation["route_reason"] == "reasoning_continuation"
+    issuing_payload = cast("JsonObject", continued_route[0]["upstream_payload"])
+    issuing_messages = cast("list[JsonObject]", issuing_payload["messages"])
+    assert issuing_messages[1]["reasoning_content"] == "fallback-private-reasoning"
+    assert issuing_payload["reasoning_history"] == "interleaved"
+    fallback_payload = cast("JsonObject", continued_route[1]["upstream_payload"])
+    fallback_messages = cast("list[JsonObject]", fallback_payload["messages"])
+    assert "reasoning_content" not in json.dumps(fallback_payload)
+    assert "reasoning_history" not in fallback_payload
+    assert fallback_messages[1]["tool_calls"] == issuing_messages[1]["tool_calls"]
+    assert fallback_messages[2] == issuing_messages[2]
+
+
+def _reasoning_failover_pool(
+    root: Path,
+    *,
+    issuing_requests_per_minute: int | None = None,
+) -> tuple[NativeControlPlane, str, str, list[JsonObject]]:
+    """Seal one Hunyuan tool turn on the issuing rung of a two-rung pool.
+
+    The pool's first rung is a Hunyuan carrier route (it seals and unseals
+    the reasoning under its own credential); the second is a plain
+    OpenAI-compatible rung that yields no carrier authority at all. With
+    ``issuing_requests_per_minute`` the issuing rung authors a per-worker
+    request-rate dispatch policy, the way the hosted platform authors the
+    Tencent lane, behind a fresh alias revision.
+
+    Returns:
+        The control plane, raw key, the continuation body carrying the sealed
+        carrier, and the initial admission's wire route.
+    """
+    manager, raw_key = _configured_pool_gateway(
+        root,
+        base_urls=("https://api.hunyuan.cloud.tencent.com/v1", "http://127.0.0.1:10/v1"),
+        model_capabilities=(
+            ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
+            ModelCapabilities(supports_tools=True),
+        ),
+    )
+    if issuing_requests_per_minute is not None:
+        catalog_path = root / "models.toml"
+        catalog = load_model_catalog(catalog_path)
+        models = dict(catalog.models)
+        record = models["alpha"]
+        assert record.gateway is not None
+        models["alpha"] = record.model_copy(
+            update={
+                "gateway": record.gateway.model_copy(
+                    update={
+                        "dispatch": GatewayRungDispatchPolicy(
+                            requests_per_minute=issuing_requests_per_minute
+                        )
+                    }
+                )
+            }
+        )
+        write_model_catalog(catalog_path, catalog.model_copy(update={"models": models}))
+        _catalog, normalized, snapshot = snapshot_current_catalog(root)
+        manager.activate_direct_alias(
+            alias_id="coding",
+            alias_name="coding",
+            revision_id="revision-pool-rated",
+            pool_id="coding",
+            snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+            catalog_sha256=normalized.identity_sha256(),
+        )
+    control = NativeControlPlane(
+        load_gateway_components(root, environment={"TEST_PROVIDER_KEY": "shared-hunyuan-secret"})
+    )
+    initial = _admit_started(control, raw_key, _chat_body())
+    assert initial["route_depth"] == 0
+    route_sha256 = initial["hunyuan_reasoning_route_sha256"]
+    assert isinstance(route_sha256, str)
+    sealed = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "route_depth": 0,
+                    "route_sha256": route_sha256,
+                    "content": "private reasoning only the issuing rung can unseal",
+                    "assistant_content": None,
+                    "tool_calls": [
+                        {"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}
+                    ],
+                }
+            )
+        )
+    )["carrier"]
+    control.settle(
+        json.dumps(
+            {
+                "request_id": initial["request_id"],
+                "attempt_id": initial["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": ["lookup"],
+                "failure": None,
+            }
+        )
+    )
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": sealed,
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+            ],
+        }
+    )
+    return control, raw_key, body, cast("list[JsonObject]", initial["route"])
+
+
+def _attempt_route_reasons(control: NativeControlPlane, request_id: str) -> list[tuple[int, str]]:
+    """Return each reserved attempt's ``(route_depth, route_reason)`` for one request."""
+    ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
+    with sqlite3.connect(ledger.database_path) as connection:
+        rows = connection.execute(
+            "select route_depth, route_reason from gateway_attempts "
+            "where request_id = ? order by attempt_ordinal",
+            (request_id,),
+        ).fetchall()
+    return [(int(depth), str(reason)) for depth, reason in rows]
+
+
+def _attempt_dispatch_reasons(control: NativeControlPlane, request_id: str) -> list[str | None]:
+    """Return each reserved attempt's ``dispatch_reason`` for one request, in order."""
+    ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
+    with sqlite3.connect(ledger.database_path) as connection:
+        rows = connection.execute(
+            "select dispatch_reason from gateway_attempts where request_id = ? "
+            "order by attempt_ordinal",
+            (request_id,),
+        ).fetchall()
+    return [None if reason is None else str(reason) for (reason,) in rows]
+
+
+def test_pinned_continuation_rate_shed_keeps_the_issuing_rung_then_fails_over(
+    tmp_path: Path,
+) -> None:
+    """A rate shed force-admits the pinned rung; only a real failure moves past it.
+
+    The issuing rung authors ``requests_per_minute: 1`` per worker (the
+    Tencent lane's shape) and the initial turn already used the window. The
+    continuation's first dispatch sheds there, yet it is force-admitted on the
+    pinned rung as ``saturated_overflow`` with the unsealed reasoning intact
+    rather than spilled sideways to the stripped fallback: a per-worker rate
+    fact trips under ordinary load and must not cost the turn's thinking. A
+    throttle on that attempt (no redial schedule, so a zero redial budget)
+    then fails over to the fallback, recorded ``reasoning_continuation_failover``
+    with its frozen payload free of any reasoning.
+    """
+    control, raw_key, body, _initial_route = _reasoning_failover_pool(
+        tmp_path, issuing_requests_per_minute=1
+    )
+    continued = _admit(control, raw_key, body)
+    route = cast("list[JsonObject]", continued["route"])
+    assert [wire["deployment_id"] for wire in route] == ["alpha", "beta"]
+    assert route[0]["throttle_redial_budget"] == 0
+    pinned_messages = cast(
+        "list[JsonObject]", cast("JsonObject", route[0]["upstream_payload"])["messages"]
+    )
+    assert (
+        pinned_messages[1]["reasoning_content"]
+        == "private reasoning only the issuing rung can unseal"
+    )
+    assert "reasoning_content" not in json.dumps(route[1]["upstream_payload"])
+
+    first = _start_first(control, continued)
+    assert first["route_depth"] == 0
+    request_id = _admitted_request_id(continued)
+    assert _attempt_dispatch_reasons(control, request_id) == ["saturated_overflow"]
+    assert _attempt_route_reasons(control, request_id) == [(0, "reasoning_continuation")]
+    assert control._accounting.rung_admission_counters() == (1, 1)  # noqa: SLF001
+
+    throttled = {
+        "failure_class": "throttled",
+        "safe_message": "provider throttled the request",
+        "retryable_same_deployment": False,
+        "failover_eligible": True,
+    }
+    control.settle(
+        json.dumps(
+            {
+                "request_id": request_id,
+                "attempt_id": first["attempt_id"],
+                "outcome": "failed",
+                "usage": None,
+                "tool_names": [],
+                "failure": throttled,
+                "finalize": False,
+            }
+        )
+    )
+    second = json.loads(
+        control.start_attempt(
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "attempt_ordinal": 1,
+                    "current_depth": 0,
+                    "failure": throttled,
+                }
+            )
+        )
+    )
+    assert second["route_depth"] == 1
+    assert _attempt_route_reasons(control, request_id) == [
+        (0, "reasoning_continuation"),
+        (1, "reasoning_continuation_failover"),
+    ]
+
+
+def test_pinned_continuation_surfaces_a_caller_error_on_the_issuing_rung(tmp_path: Path) -> None:
+    """A non-operational failure on the pinned rung never fails over past it.
+
+    ``invalid_request`` is not failover-eligible, so the fallback rung the
+    pinned ladder now carries is never claimed: the ladder exhausts with the
+    caller's own error exactly as a one-rung pin did.
+    """
+    control, raw_key, body, _initial_route = _reasoning_failover_pool(tmp_path)
+    continued = _admit(control, raw_key, body)
+    assert [wire["deployment_id"] for wire in cast("list[JsonObject]", continued["route"])] == [
+        "alpha",
+        "beta",
+    ]
+    first = _start_first(control, continued)
+    assert first["route_depth"] == 0
+    failure = {
+        "failure_class": "invalid_request",
+        "safe_message": "the provider rejected the request",
+        "retryable_same_deployment": False,
+        "failover_eligible": False,
+    }
+    control.settle(
+        json.dumps(
+            {
+                "request_id": continued["request_id"],
+                "attempt_id": first["attempt_id"],
+                "outcome": "failed",
+                "usage": None,
+                "tool_names": [],
+                "failure": failure,
+                "finalize": False,
+            }
+        )
+    )
+    exhausted = json.loads(
+        control.start_attempt(
+            json.dumps(
+                {
+                    "request_id": continued["request_id"],
+                    "attempt_ordinal": 1,
+                    "current_depth": 0,
+                    "failure": failure,
+                }
+            )
+        )
+    )
+    assert exhausted["exhausted"] is True
+    assert exhausted["failure"]["failure_class"] == "invalid_request"
+    assert _attempt_route_reasons(control, _admitted_request_id(continued)) == [
+        (0, "reasoning_continuation")
+    ]
+
+
+def test_pinned_continuation_fails_over_past_a_throttled_issuing_rung(tmp_path: Path) -> None:
+    """A throttle on the pinned rung continues on the pool's other rung without the reasoning.
+
+    Production shape (hy4-preview, 2026-09-13): the Tencent house account hit
+    its daily quota and every continuation carrying a Hunyuan carrier died
+    after one throttled attempt because its ladder had one rung. The ladder
+    now carries the pool's remaining rung: its frozen payload keeps the
+    messages, the tool call and the tool result but no sealed reasoning (the
+    plain rung could never unseal it), and the ledger records that attempt as
+    ``reasoning_continuation_failover`` beside the pinned first attempt's
+    ``reasoning_continuation``.
+    """
+    control, raw_key, body, _initial_route = _reasoning_failover_pool(tmp_path)
+    continued = _admit(control, raw_key, body)
+    route = cast("list[JsonObject]", continued["route"])
+    assert continued["route_reason"] == "reasoning_continuation"
+    assert [wire["deployment_id"] for wire in route] == ["alpha", "beta"]
+    pinned_payload = cast("JsonObject", route[0]["upstream_payload"])
+    pinned_messages = cast("list[JsonObject]", pinned_payload["messages"])
+    assert (
+        pinned_messages[1]["reasoning_content"]
+        == "private reasoning only the issuing rung can unseal"
+    )
+    fallback_payload = cast("JsonObject", route[1]["upstream_payload"])
+    fallback_messages = cast("list[JsonObject]", fallback_payload["messages"])
+    assert "reasoning_content" not in json.dumps(fallback_payload)
+    assert "x-experiential-hunyuan-reasoning" not in json.dumps(fallback_payload)
+    assert fallback_messages[1]["tool_calls"] == pinned_messages[1]["tool_calls"]
+    assert fallback_messages[2] == {"role": "tool", "tool_call_id": "call-one", "content": "done"}
+    assert fallback_messages[0] == pinned_messages[0]
+
+    first = _start_first(control, continued)
+    assert first["route_depth"] == 0
+    throttled = {
+        "failure_class": "throttled",
+        "safe_message": "provider throttled the request",
+        "retryable_same_deployment": False,
+        "failover_eligible": True,
+    }
+    control.settle(
+        json.dumps(
+            {
+                "request_id": continued["request_id"],
+                "attempt_id": first["attempt_id"],
+                "outcome": "failed",
+                "usage": None,
+                "tool_names": [],
+                "failure": throttled,
+                "finalize": False,
+            }
+        )
+    )
+    second = json.loads(
+        control.start_attempt(
+            json.dumps(
+                {
+                    "request_id": continued["request_id"],
+                    "attempt_ordinal": 1,
+                    "current_depth": 0,
+                    "failure": throttled,
+                }
+            )
+        )
+    )
+    assert second["route_depth"] == 1
+    assert _attempt_route_reasons(control, _admitted_request_id(continued)) == [
+        (0, "reasoning_continuation"),
+        (1, "reasoning_continuation_failover"),
+    ]
 
 
 def test_bridge_error_payload_is_openai_shaped() -> None:
@@ -939,6 +1311,70 @@ def test_bridge_error_payload_is_openai_shaped() -> None:
     }
 
 
+def test_admit_stamps_the_callers_output_cap(tmp_path: Path) -> None:
+    """A capped request carries its normalized cap on the admission.
+
+    The data plane reads it to tell a budget the provider's hidden reasoning
+    exhausted (a `stop` with no output and no usage on a capped request, the
+    Meta muse-spark shape) from a provider that delivered nothing at all.
+    """
+    control, raw_key = _control_plane(tmp_path)
+    assert control.authenticate(json.dumps({"raw_key": raw_key})) == "{}"
+
+    body = json.dumps(
+        {
+            "model": "coding",
+            "max_completion_tokens": 40,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    )
+    admission = _admit_started(control, raw_key, body)
+    assert admission["maximum_output_tokens"] == 40
+
+
+def test_admit_marks_an_image_output_lane_on_the_wire(tmp_path: Path) -> None:
+    """A lane the platform marks `emits_images` rides the wire as `image_output`.
+
+    The data plane answers an empty completion on such a rung at once
+    (no redial, no ladder): the chat normalizers carry no image event, so an
+    image generation always ends output-less and a redial would bill the
+    house a second whole image (2026-09-15, gpt-5.4-image-2). The flag is
+    read from `emits_images`, never from `supports_image_generation`: that
+    claim admits /v1/images, and reusing it opened OpenRouter chat lanes to
+    image generations the same day.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path, capabilities=ModelCapabilities(emits_images=True)
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+        )
+    )
+    assert control.authenticate(json.dumps({"raw_key": raw_key})) == "{}"
+    admission = _admit_started(control, raw_key, _chat_body())
+    assert admission["image_output"] is True
+
+    text_control, text_key = _control_plane(tmp_path / "text")
+    assert text_control.authenticate(json.dumps({"raw_key": text_key})) == "{}"
+    text_admission = _admit_started(text_control, text_key, _chat_body())
+    assert text_admission["image_output"] is False
+
+    # The Images-API claim alone does NOT mark the chat wire.
+    images_root = tmp_path / "images"
+    _manager, images_key = _configured_gateway(
+        images_root, capabilities=ModelCapabilities(supports_image_generation=True)
+    )
+    images_control = NativeControlPlane(
+        load_gateway_components(
+            images_root, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+        )
+    )
+    assert images_control.authenticate(json.dumps({"raw_key": images_key})) == "{}"
+    images_admission = _admit_started(images_control, images_key, _chat_body())
+    assert images_admission["image_output"] is False
+
+
 def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:
     """Admission decodes the raw body, returns the shared upstream payload, and
     settlement lands in the usage report."""
@@ -961,6 +1397,8 @@ def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:
     assert admission["route_reason"] == "direct"
     assert admission["stream"] is False
     assert admission["include_usage"] is False
+    # An uncapped request stamps no cap: the admission stays byte-identical.
+    assert "maximum_output_tokens" not in admission
 
     decoded = decode_chat(json.loads(_chat_body()))
     provider_request = decoded.request.model_copy(update={"stream": True, "include_usage": True})
@@ -5804,13 +6242,21 @@ def test_count_tokens_estimates_without_accepting_a_request(tmp_path: Path) -> N
     assert json.loads(malformed.value.public_error_json)["status_code"] == 400
 
 
-def _scheduled_pool_control_plane(root: Path) -> tuple[NativeControlPlane, str]:
+def _scheduled_pool_control_plane(
+    root: Path, *, throttle_cache_threshold: float | None = None
+) -> tuple[NativeControlPlane, str]:
     """Load the control plane over a pool authoring a throttle backoff-and-redial schedule.
 
     Seeds the standard certified two-deployment pool, then authors the
     schedule the way the hosted platform does: as catalog data on the pool
-    record behind a fresh alias revision, with no cache-stakes threshold so
-    every rung is worth waiting for.
+    record behind a fresh alias revision. Without a cache-stakes threshold
+    every rung is worth waiting for; with one, the per-rung budget reads the
+    cache at stake.
+
+    Args:
+        root: The gateway root to seed.
+        throttle_cache_threshold: The pool's cache-stakes threshold, or
+            ``None`` to author none.
     """
     from exp.common.models.catalog import load_model_catalog, write_model_catalog
     from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
@@ -5822,6 +6268,7 @@ def _scheduled_pool_control_plane(root: Path) -> tuple[NativeControlPlane, str]:
     pool = catalog.gateway_pools["coding"].model_copy(
         update={
             "failover_mode": "maximize_cache",
+            "throttle_cache_threshold": throttle_cache_threshold,
             "throttle_redial": GatewayThrottleRedialPolicy(
                 max_attempts=3, base_delay_ms=500, max_delay_ms=8_000
             ),
@@ -5855,7 +6302,11 @@ def test_admission_carries_the_throttle_redial_schedule_and_per_rung_eligibility
     every wire entry carries a zero redial budget, so the data plane's throttle handling is
     byte-identical to before. A pool authoring the schedule (and no
     threshold) hands the data plane the exact schedule and gives every rung the
-    schedule's full redial budget.
+    schedule's full redial budget. With a threshold and no settled cache
+    sample on this worker, the first rung fails over cold at once (nothing
+    known to be at stake, a colder rung follows) while the last rung, with no
+    cold alternative after it, still carries the full budget: the throttle
+    surfaces only once the gateway truly cannot serve.
     """
     control, raw_key = _pool_control_plane(tmp_path / "plain")
     plain = _admit(control, raw_key, _chat_body())
@@ -5875,3 +6326,192 @@ def test_admission_carries_the_throttle_redial_schedule_and_per_rung_eligibility
     route = scheduled["route"]
     assert isinstance(route, list)
     assert [wire["throttle_redial_budget"] for wire in route] == [3, 3]
+
+    control, raw_key = _scheduled_pool_control_plane(
+        tmp_path / "gated", throttle_cache_threshold=0.5
+    )
+    gated = _admit(control, raw_key, _chat_body())
+    route = gated["route"]
+    assert isinstance(route, list)
+    assert [wire["throttle_redial_budget"] for wire in route] == [0, 3]
+
+
+def test_leading_only_rung_folds_mid_conversation_system_turns_on_chat_and_messages(
+    tmp_path: Path,
+) -> None:
+    """A vLLM rung serving the Qwen3.6+ template gets exactly one, leading, system turn.
+
+    The official template raises ``System message must be at the beginning.``
+    for any other placement; Claude Code injects a system turn after the first
+    user turn and after every tool_result. On a rung declaring
+    ``system_messages_leading_only`` the wire payload carries those as user
+    text, disclosed in ``ignored_parameters``, on the Chat surface (system at
+    index 3) and on the Messages surface (an in-list system turn after the
+    tool_result) alike.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://gateway.xplabs.ai/qwen/v1",
+        capabilities=ModelCapabilities(supports_tools=True, system_messages_leading_only=True),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "shared-secret"})
+    )
+    chat = _admit(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "coding",
+                "messages": [
+                    {"role": "system", "content": "You are Claude Code."},
+                    {"role": "user", "content": "Diagnose the regression."},
+                    {"role": "assistant", "content": "Reading the failing test first."},
+                    {"role": "system", "content": "# Environment\nPlatform: linux"},
+                    {"role": "user", "content": "Go ahead."},
+                ],
+            }
+        ),
+    )
+    chat_messages = _payload_messages(chat)
+    assert [message["role"] for message in chat_messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "user",
+    ]
+    assert chat_messages[3]["content"] == "# Environment\nPlatform: linux"
+    assert SYSTEM_FOLD_DISCLOSURE in cast(list[str], chat["ignored_parameters"])
+
+    messages = _admit(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "coding",
+                "max_tokens": 64,
+                "system": "You are Claude Code.",
+                "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+                "messages": [
+                    {"role": "user", "content": "Diagnose the regression."},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "toolu_01", "name": "Read", "input": {}}
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "toolu_01", "content": "ok"}
+                        ],
+                    },
+                    {"role": "system", "content": "<total_tokens>1</total_tokens>"},
+                ],
+            }
+        ),
+        surface="messages",
+    )
+    messages_payload = _payload_messages(messages)
+    assert [message["role"] for message in messages_payload] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "user",
+    ]
+    assert messages_payload[4]["content"] == "<total_tokens>1</total_tokens>"
+    assert SYSTEM_FOLD_DISCLOSURE in cast(list[str], messages["ignored_parameters"])
+
+
+def test_gemini_rung_folds_a_mid_conversation_system_turn_instead_of_refusing(
+    tmp_path: Path,
+) -> None:
+    """Claude Code's Chat-wire shape against a Gemini alias is served, not refused.
+
+    A system turn after conversation start used to fail the whole route at
+    shaping ("A system message after conversation start is not supported by
+    this model route"; 1,747 requests in the seven days to 2026-09-15). On the
+    hoisting wire the leading run still rides systemInstruction, the later
+    instruction rides as user text at its position, and admission discloses
+    the fold.
+    """
+    from exp.common.models import GatewayTokenPrices
+    from exp.runtime.gateway.catalog_authority import (
+        ConnectionConfig,
+        upsert_connection,
+        upsert_singleton_deployment,
+    )
+
+    manager, raw_key = _configured_gateway(tmp_path)
+    upsert_connection(
+        tmp_path,
+        name="gemini-main",
+        connection=ConnectionConfig(provider="gemini", api_key_env="GEMINI_TEST_KEY"),
+        replace=False,
+    )
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="gem",
+        connection_name="gemini-main",
+        provider_model="gemini-2.5-pro",
+        exact_model_id="gemini-revision-exact",
+        revision=None,
+        capabilities=ModelCapabilities(),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="gem",
+        alias_name="gem",
+        revision_id="revision-gem",
+        pool_id="gem",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="gem")
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={
+                "TEST_PROVIDER_KEY": "provider-secret-canary",
+                "GEMINI_TEST_KEY": "gemini-secret-canary",
+            },
+        )
+    )
+    admission = _admit(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "gem",
+                "messages": [
+                    {"role": "system", "content": "You are Claude Code."},
+                    {"role": "user", "content": "Diagnose the regression."},
+                    {"role": "system", "content": "# Environment\nPlatform: linux"},
+                    {"role": "assistant", "content": "Reading the failing test first."},
+                    {"role": "user", "content": "Go ahead."},
+                ],
+            }
+        ),
+    )
+    route = admission["route"]
+    assert isinstance(route, list)
+    wire = route[0]
+    assert isinstance(wire, dict)
+    assert wire["dialect"] == "gemini_generate_content"
+    payload = wire["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert payload["systemInstruction"] == {"parts": [{"text": "You are Claude Code."}]}
+    assert payload["contents"] == [
+        {
+            "role": "user",
+            "parts": [{"text": "Diagnose the regression.\n\n# Environment\nPlatform: linux"}],
+        },
+        {"role": "model", "parts": [{"text": "Reading the failing test first."}]},
+        {"role": "user", "parts": [{"text": "Go ahead."}]},
+    ]
+    assert HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE in cast(list[str], admission["ignored_parameters"])

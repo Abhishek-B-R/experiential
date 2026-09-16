@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -34,6 +35,7 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelCapabilities
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
+from exp.runtime.gateway.management import GatewayManagement
 
 pytest.importorskip("exp_gateway_native")
 
@@ -136,6 +138,85 @@ def _terminal_frames(finish_reason: str, *, cached: bool = True) -> bytes:
         (
             _sse_frame({"choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]}),
             _sse_frame({"choices": [], "usage": usage}),
+            b"data: [DONE]\n\n",
+        )
+    )
+
+
+def _reasoning_only_stop_frames() -> bytes:
+    """Encode the live OpenRouter DeepSeek reasoning-only turn (2026-09-12).
+
+    Hidden reasoning streams on OpenRouter's ``reasoning`` delta field, the
+    content stays empty, the choice finishes ``stop``, and usage bills the
+    reasoning as completion tokens. This unexposed rung strips the reasoning,
+    so nothing semantic reaches the caller while the tokens are billed.
+    """
+    return b"".join(
+        (
+            _sse_frame(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "", "reasoning": "Let me"},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            ),
+            _sse_frame(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "", "reasoning": " read the logs first."},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            ),
+            _sse_frame(
+                {"choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}]}
+            ),
+            _sse_frame(
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 9,
+                        "completion_tokens": 147,
+                        "total_tokens": 156,
+                        "prompt_tokens_details": {"cached_tokens": 2},
+                        "completion_tokens_details": {"reasoning_tokens": 148},
+                    },
+                }
+            ),
+            b"data: [DONE]\n\n",
+        )
+    )
+
+
+def _silent_stop_frames() -> bytes:
+    """Encode the live Meta muse-spark budget-exhausted turn (2026-09-15).
+
+    The model reasons privately and the reasoning counts toward ``max_tokens``;
+    when the cap is below that reasoning the wire is a role delta, an empty
+    delta finishing ``stop`` and ``[DONE]`` with NO usage frame at all, so the
+    gateway sees a completed turn with nothing sent and nothing accounted.
+    """
+    return b"".join(
+        (
+            _sse_frame(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": ""},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            ),
+            _sse_frame({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
             b"data: [DONE]\n\n",
         )
     )
@@ -249,6 +330,10 @@ class _SseUpstream(BaseHTTPRequestHandler):
                 self.wfile.write(_terminal_frames("tool_calls"))
             elif prompt == "empty-token":
                 self.wfile.write(_zero_output_terminal_frames("stop"))
+            elif prompt == "reasoning-only-token":
+                self.wfile.write(_reasoning_only_stop_frames())
+            elif prompt == "silent-stop-token":
+                self.wfile.write(_silent_stop_frames())
             elif prompt == "truncated-token":
                 self.wfile.write(_zero_output_terminal_frames("length"))
             elif prompt == "uncached-token":
@@ -1535,6 +1620,271 @@ def test_messages_stream_zero_output_keeps_real_input_tokens(
         "cache_read_input_tokens": 2,
         "output_tokens": 0,
     }
+
+
+def _latest_attempt_states(engine: _ServingEngine) -> list[tuple[int, str, str | None]]:
+    """Read the most recent request's settled attempt rows (ordinal, state, failure class).
+
+    An exhausted ladder answers with the bare Anthropic error envelope and no
+    request-id header, so the request is found as the newest accepted row.
+    """
+    database_path = GatewayManagement(engine.root).database_path
+    deadline = time.monotonic() + 10.0
+    while True:
+        with sqlite3.connect(database_path) as connection:
+            latest = connection.execute(
+                "SELECT request_id FROM gateway_requests ORDER BY accepted_at DESC, rowid DESC"
+                " LIMIT 1"
+            ).fetchone()
+            rows = (
+                connection.execute(
+                    "SELECT attempt_ordinal, state, failure_class FROM gateway_attempts"
+                    " WHERE request_id = ? ORDER BY attempt_ordinal",
+                    (latest[0],),
+                ).fetchall()
+                if latest is not None
+                else []
+            )
+        if rows and all(state not in {"dispatched", "running"} for _, state, _ in rows):
+            break
+        if time.monotonic() > deadline:
+            break
+        time.sleep(0.05)
+    return [(int(ordinal), str(state), failure) for ordinal, state, failure in rows]
+
+
+def test_messages_non_stream_billed_empty_stop_is_a_typed_empty_end_turn(
+    engine: _ServingEngine,
+) -> None:
+    """A ``stop`` that billed reasoning yet rendered no block is a TYPED empty turn.
+
+    Production 2026-09-12 (deepseek-v4-flash via OpenRouter, Claude Code's
+    body): ``message_start`` then ``message_delta`` with ``end_turn``, zero
+    content blocks, and 42 to 750 billed output tokens, settled as a completed
+    success. The single rung here is redialed once (its bounded cap) and both
+    dispatches settle ``failed`` as ``empty_completion`` at $0; a route with a
+    second rung would fail over instead. The ladder exhausted on empty turns
+    answers the caller a 200 ``end_turn`` with no content under
+    ``x-gateway-warning: empty_completion`` -- never a 5xx, which every SDK
+    auto-retries (2026-09-15: one Claude Code session re-sent a 44k-token
+    prompt every minute for an hour against the earlier 502).
+    """
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=_messages_body("reasoning-only-token"),
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["x-gateway-warning"] == "empty_completion"
+    body = response.json()
+    assert body["type"] == "message"
+    assert body["stop_reason"] == "end_turn"
+    assert body["content"] == []
+    assert _latest_attempt_states(engine) == [
+        (0, "failed", "empty_completion"),
+        (1, "failed", "empty_completion"),
+    ]
+
+
+def test_messages_stream_billed_empty_stop_is_a_typed_empty_end_turn_stream(
+    engine: _ServingEngine,
+) -> None:
+    """The streamed request opens only after the ladder settled: a typed empty stream.
+
+    Nothing semantic was ever committed, so the exhausted ladder's settled
+    events encode as one ``message_start`` / ``message_delta end_turn`` /
+    ``message_stop`` stream with no content block and the warning header on
+    the response (a settled stream still builds its headers before its first
+    frame), never an ``error`` event.
+    """
+    with httpx.stream(
+        "POST",
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=_messages_body("reasoning-only-token", stream=True),
+        timeout=30.0,
+    ) as response:
+        status = response.status_code
+        warning = response.headers.get("x-gateway-warning")
+        raw = b"".join(response.iter_bytes()).decode()
+    assert status == 200, raw
+    assert warning == "empty_completion"
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in raw.splitlines()
+        if line.startswith("data: ")
+    ]
+    kinds = [payload["type"] for payload in payloads]
+    assert "message_start" in kinds and "message_stop" in kinds
+    assert "error" not in kinds
+    assert "content_block_start" not in kinds
+    message_delta = next(payload for payload in payloads if payload["type"] == "message_delta")
+    assert message_delta["delta"]["stop_reason"] == "end_turn"
+    assert _latest_attempt_states(engine) == [
+        (0, "failed", "empty_completion"),
+        (1, "failed", "empty_completion"),
+    ]
+
+
+def test_chat_capped_silent_stop_is_a_length_truncation_not_an_empty_completion(
+    engine: _ServingEngine,
+) -> None:
+    """A ``stop`` with no output and no usage on a capped request answers ``length``.
+
+    Production 2026-09-15 (Meta muse-spark under ``max_tokens`` below the
+    model's private reasoning): 200 with ``content: null``, ``finish_reason:
+    stop`` and ``usage: null``, settled ``completed`` -- 895 such answers to
+    ~60 organizations in seven days. The only benign reading of that wire on a
+    capped request is a budget the hidden reasoning exhausted before the
+    first visible token, so the caller now sees the truncation it can act on
+    and the ledger records ``incomplete``.
+    """
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "max_tokens": 40,
+            "messages": [{"role": "user", "content": "silent-stop-token"}],
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["choices"][0]["finish_reason"] == "length"
+    assert body["choices"][0]["message"]["content"] is None
+    assert body["usage"] is None
+    assert _latest_attempt_states(engine) == [(0, "incomplete", None)]
+
+
+def test_chat_capped_silent_stop_stream_ends_with_length(engine: _ServingEngine) -> None:
+    """The streamed capped request finishes ``length`` on its one choice chunk."""
+    with httpx.stream(
+        "POST",
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "max_completion_tokens": 40,
+            "stream": True,
+            "messages": [{"role": "user", "content": "silent-stop-token"}],
+        },
+        timeout=30.0,
+    ) as response:
+        assert response.status_code == 200
+        raw = b"".join(response.iter_bytes()).decode()
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in raw.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    finish_reasons = [
+        choice["finish_reason"]
+        for payload in payloads
+        for choice in payload.get("choices", [])
+        if choice.get("finish_reason") is not None
+    ]
+    assert finish_reasons == ["length"]
+
+
+def test_chat_uncapped_silent_stop_is_a_typed_empty_completion(
+    engine: _ServingEngine,
+) -> None:
+    """Without a cap the same wire is the provider delivering nothing: a typed empty turn.
+
+    No budget could have been exhausted, nothing was sent and nothing was
+    accounted, so the attempt takes the ladder like the billed empty stop:
+    the single rung is redialed once and both dispatches settle ``failed`` as
+    ``empty_completion`` at $0; the exhausted ladder then answers the empty
+    turn as a 200 ``stop`` with null content under the warning header.
+    """
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "messages": [{"role": "user", "content": "silent-stop-token"}]},
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["x-gateway-warning"] == "empty_completion"
+    body = response.json()
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["choices"][0]["message"]["content"] is None
+    assert _latest_attempt_states(engine) == [
+        (0, "failed", "empty_completion"),
+        (1, "failed", "empty_completion"),
+    ]
+
+
+def test_responses_uncapped_silent_stop_is_a_typed_empty_completion(
+    engine: _ServingEngine,
+) -> None:
+    """The Responses surface renders the exhausted empty ladder as a completed empty output."""
+    response = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "input": "silent-stop-token"},
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["x-gateway-warning"] == "empty_completion"
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["output"] == []
+    assert _latest_attempt_states(engine) == [
+        (0, "failed", "empty_completion"),
+        (1, "failed", "empty_completion"),
+    ]
+
+
+def test_capped_length_truncation_carries_no_empty_completion_warning(
+    engine: _ServingEngine,
+) -> None:
+    """An honest budget truncation is not an empty completion: no warning header."""
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "max_tokens": 40,
+            "messages": [{"role": "user", "content": "silent-stop-token"}],
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    assert "x-gateway-warning" not in response.headers
+
+
+def test_responses_capped_silent_stop_is_incomplete_max_output_tokens(
+    engine: _ServingEngine,
+) -> None:
+    """The Responses surface renders the same truncation as ``incomplete``."""
+    response = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "input": "silent-stop-token", "max_output_tokens": 40},
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "incomplete"
+    assert body["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert body["output"] == []
+
+
+def test_messages_silent_stop_is_a_max_tokens_stop(engine: _ServingEngine) -> None:
+    """Messages always carries ``max_tokens``, so the wire is a ``max_tokens`` stop."""
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=_messages_body("silent-stop-token"),
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["stop_reason"] == "max_tokens"
+    assert body["content"] == []
+    assert _latest_attempt_states(engine) == [(0, "incomplete", None)]
 
 
 def test_replayed_thinking_history_serves_with_disclosure_on_a_foreign_route(

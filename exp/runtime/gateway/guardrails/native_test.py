@@ -326,6 +326,7 @@ def test_output_segment_without_an_engine_fails_closed() -> None:
             None,
             None,
             json.dumps({"pending": "text", "final": True, "settled_bytes": 0}),
+            deadline_monotonic=1e12,
         )
     )
     assert decision["action"] == "error"
@@ -374,6 +375,7 @@ def test_output_segment_releases_redacted_text() -> None:
                     "settled_bytes": 0,
                 }
             ),
+            deadline_monotonic=1e12,
         )
     )
     assert decision["action"] == "allow"

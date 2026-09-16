@@ -560,3 +560,19 @@ def test_openrouter_resolution_forwards_the_prompt_cache_key_hint() -> None:
     resolved = catalog.resolve("fixture-model")
     assert isinstance(resolved.client, OpenAICompatibleClient)
     assert resolved.client.gateway_wire_profile().forwards_prompt_cache_key is True
+
+
+def test_resolution_threads_system_messages_leading_only_to_compatible_rungs() -> None:
+    """A flagged openai-compatible rung resolves a profile that folds non-leading system turns."""
+    catalog = RuntimeModelCatalog(
+        _catalog(
+            provider="openai-compatible",
+            base_url="https://gateway.xplabs.ai/qwen/v1",
+            capabilities=ModelCapabilities(system_messages_leading_only=True),
+        ),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    resolved = catalog.resolve("fixture-model")
+    assert isinstance(resolved.client, OpenAICompatibleClient)
+    assert resolved.client.gateway_wire_profile().system_messages_leading_only is True

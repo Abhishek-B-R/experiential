@@ -1356,6 +1356,7 @@ def test_released_segment_is_redacted_and_bounded() -> None:
         pending="write to ada@example.com " + "x" * 600 + " done",
         final=False,
         settled_bytes=0,
+        deadline_monotonic=1e12,
     )
     assert "ada@example.com" not in segment.release
     assert segment.flagged
@@ -1371,6 +1372,7 @@ def test_oversized_stream_fails_closed_and_releases_nothing() -> None:
             pending="x" * 64,
             final=True,
             settled_bytes=0,
+            deadline_monotonic=1e12,
         )
     assert failure.value.failure.safe_details.get("action") == GuardrailAction.ERROR.value
 
@@ -1406,4 +1408,26 @@ def test_adapter_failure_mid_stream_fails_closed() -> None:
             pending="anything",
             final=True,
             settled_bytes=0,
+            deadline_monotonic=1e12,
+        )
+
+
+@pytest.mark.parametrize("deadline", [0.0, 1e12])
+def test_stream_segment_never_releases_after_its_budget(deadline: float) -> None:
+    """Expired admission and an over-budget scan both release no text."""
+    engine, policy = _regex_engine()
+    ticks = iter((0.0, 10.0))
+
+    def clock() -> float:
+        """Advance past the authored check timeout during inspection."""
+        return next(ticks)
+
+    engine._monotonic = clock
+    with pytest.raises(GuardrailRejected):
+        engine.release_output_segment(
+            policy=policy,
+            pending="ada@example.com ",
+            final=True,
+            settled_bytes=0,
+            deadline_monotonic=deadline,
         )

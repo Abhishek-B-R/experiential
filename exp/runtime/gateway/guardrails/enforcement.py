@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
 from exp.runtime.gateway.guardrails.bounded import BoundedInspect, ClassifierTimeoutError
@@ -29,7 +29,7 @@ from exp.runtime.gateway.guardrails.streaming import (
 _logger = logging.getLogger(__name__)
 
 
-def _restored_provider_authority(
+def restored_provider_authority(
     original: Sequence[GatewayMessage],
     replacement: Sequence[GatewayMessage],
 ) -> tuple[GatewayMessage, ...] | None:
@@ -130,6 +130,7 @@ class GuardrailEngine:
         client: InternalClassifierClient,
         monotonic: Callable[[], float],
         inspects: BoundedInspect | None = None,
+        deterministic_specifications: Mapping[str, str] | None = None,
     ) -> None:
         """Bind lookup, the internal client, and the deadline clock.
 
@@ -139,7 +140,15 @@ class GuardrailEngine:
             monotonic: Process-local clock in seconds.
             inspects: Optional async inflight limiter. ``None`` uses the
                 default shared cap.
+            deterministic_specifications: Content-free native rules for the
+                registered deterministic adapters, keyed by adapter. A host
+                that runs the Rust data plane compiles these once and lets
+                matching chains run in plane. Omitting them keeps every
+                chain on this engine.
         """
+        self.deterministic_specifications: Mapping[str, str] = dict(
+            deterministic_specifications or {}
+        )
         self._store = store
         self._client = client
         self._monotonic = monotonic
@@ -290,6 +299,7 @@ class GuardrailEngine:
         pending: str,
         final: bool,
         settled_bytes: int,
+        deadline_monotonic: float,
     ) -> StreamSegment:
         """Redact and release the settled part of one buffered stream tail.
 
@@ -310,6 +320,7 @@ class GuardrailEngine:
             settled_bytes: Provider completion bytes already released from
                 the buffer, counted before redaction so a short replacement
                 cannot shrink the completion against its bound.
+            deadline_monotonic: Request-wide deadline that also bounds this segment.
 
         Returns:
             The redacted release, the tail to keep buffered, and the flag.
@@ -321,13 +332,17 @@ class GuardrailEngine:
         self.output_invocations += 1
         check = policy.output_checks[0] if len(policy.output_checks) == 1 else None
         redactor = None if check is None else self._stream_redactor(check)
-        if check is None or redactor is None:
+        if check is None or check.action is not GuardrailAction.MODIFY or redactor is None:
             self._record(policy, check, GuardrailAction.ERROR, 0.0)
             raise GuardrailRejected(guardrail_failure(action=GuardrailAction.ERROR))
         if settled_bytes + len(pending.encode("utf-8")) > policy.max_response_bytes:
             self._record(policy, check, GuardrailAction.ERROR, 0.0)
             raise GuardrailRejected(guardrail_failure(action=GuardrailAction.ERROR))
         started = self._monotonic()
+        budget = min(check.timeout_ms / 1000.0, deadline_monotonic - started)
+        if budget <= 0:
+            self._record(policy, check, GuardrailAction.ERROR, 0.0)
+            raise GuardrailRejected(guardrail_failure(action=GuardrailAction.ERROR))
         self.classifier_calls += 1
         try:
             segment = release_segment(redactor=redactor, pending=pending, final=final)
@@ -336,8 +351,12 @@ class GuardrailEngine:
             raise GuardrailRejected(
                 guardrail_failure(action=GuardrailAction.ERROR, check_id=check.check_id)
             ) from None
+        elapsed = self._monotonic() - started
+        if elapsed > budget:
+            self._record(policy, check, GuardrailAction.ERROR, elapsed)
+            raise GuardrailRejected(guardrail_failure(action=GuardrailAction.ERROR))
         if segment.flagged:
-            self._record(policy, check, check.action, self._monotonic() - started)
+            self._record(policy, check, check.action, elapsed)
         return segment
 
     def _stream_redactor(self, check: GuardrailCheck) -> StreamingRedactor | None:
@@ -420,7 +439,7 @@ class GuardrailEngine:
                 raise GuardrailRejected(
                     guardrail_failure(action=GuardrailAction.ERROR, check_id=check.check_id)
                 )
-            restored = _restored_provider_authority(
+            restored = restored_provider_authority(
                 request.messages,
                 verdict.replacement_messages,
             )
