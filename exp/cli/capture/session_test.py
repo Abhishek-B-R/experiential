@@ -63,7 +63,12 @@ def test_proxy_failure_restores_networking_and_closes_uploads(
                 ca_directory=tmp_path,
                 uploader=uploader,
                 control=Mock(spec=CaptureRunClient),
-                run=CaptureRun(id=uuid4(), org_id=uuid4()),
+                run=CaptureRun(
+                    id=uuid4(),
+                    org_id=uuid4(),
+                    upload_origin="https://storage.example",
+                    upload_path_prefix="/storage/v1/object/upload/sign/capture/",
+                ),
                 on_started=lambda: events.append("active"),
                 on_progress=lambda stats: None,
                 on_warning=lambda message: None,

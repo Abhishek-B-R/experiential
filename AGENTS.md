@@ -154,6 +154,9 @@ uv run pytest -q
 
 ## Python
 
+- Use Python 3.13+ for whole-repository development and quality gates so Capture's conditional
+  dependencies are installed. Published SDK and offline recovery support remains Python 3.12;
+  CI checks that minimum separately.
 - Every Python file must have a module docstring.
 - Every class, function, and method uses a Google-style docstring, including private helpers,
   nested functions, and test helpers, so each callable states its contract locally. An absolutely

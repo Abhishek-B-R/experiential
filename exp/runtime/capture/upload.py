@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -41,6 +42,8 @@ class CaptureUploader:
         api_key: str,
         spool_dir: Path,
         *,
+        upload_origin: str,
+        upload_path_prefix: str,
         max_body_bytes: int = 8 * 1024 * 1024,
         max_queue_bytes: int = 32 * 1024 * 1024,
         max_spool_bytes: int = 64 * 1024 * 1024,
@@ -54,6 +57,8 @@ class CaptureUploader:
             run_id: Client-generated UUID for this local capture run.
             api_key: Normal Platform API key, retained only in process memory.
             spool_dir: Private origin/org/run directory supplied by orchestration.
+            upload_origin: Storage origin acknowledged by the trusted Platform at run start.
+            upload_path_prefix: Organization-bound signed-upload path pinned at run start.
             max_body_bytes: Maximum decompressed bytes for either model body.
             max_queue_bytes: Maximum raw exchange bytes waiting for the worker.
             max_spool_bytes: Maximum sanitized files across runs in this spool's parent.
@@ -64,6 +69,8 @@ class CaptureUploader:
             raise ValueError("capture upload limits must be positive")
         if spool_dir.name != run_id:
             raise ValueError("capture spool directory must be named for its run UUID")
+        self._upload_origin = _upload_scope(base_url, upload_origin, upload_path_prefix, org_id)
+        self._upload_path_prefix = upload_path_prefix
         self._base = f"{base_url.rstrip('/')}/api/orgs/{org_id}"
         self._api_key = api_key
         self._spool_dir = spool_dir
@@ -289,12 +296,9 @@ class CaptureUploader:
         ingest_id = ticket.get("ingest_id")
         if not isinstance(signed_url, str) or not isinstance(ingest_id, str):
             raise ValueError("capture upload response lacks a ticket")
-        parsed = httpx.URL(signed_url)
-        if parsed.scheme != "https" or parsed.userinfo:
-            raise ValueError("capture upload destination must be credential-free HTTPS")
-        UUID(ingest_id)
+        parsed = self._signed_destination(signed_url, ingest_id)
         uploaded = client.put(
-            signed_url,
+            parsed,
             content=path.read_bytes(),
             headers={"Content-Type": "application/octet-stream"},
         )
@@ -305,6 +309,71 @@ class CaptureUploader:
             headers=headers,
         )
         finalized.raise_for_status()
+
+    def _signed_destination(self, signed_url: str, ingest_id: str) -> httpx.URL:
+        """Reject a later ticket that disagrees with this run's approved storage scope."""
+        try:
+            parsed = httpx.URL(signed_url)
+        except httpx.InvalidURL as error:
+            raise ValueError("capture upload destination is malformed") from error
+        origin = self._upload_origin
+        if (
+            parsed.userinfo
+            or parsed.fragment
+            or (parsed.scheme, parsed.host, parsed.port)
+            != (origin.scheme, origin.host, origin.port)
+        ):
+            raise ValueError("capture upload destination differs from the approved storage origin")
+        if str(UUID(ingest_id)) != ingest_id:
+            raise ValueError("capture upload response has a noncanonical ingest ID")
+        prefix = f"{self._upload_path_prefix}{ingest_id}/"
+        raw_path = parsed.raw_path.partition(b"?")[0].decode("ascii")
+        if not raw_path.startswith(prefix) or not re.fullmatch(
+            r"[A-Za-z0-9_-]{43}", raw_path[len(prefix) :]
+        ):
+            raise ValueError("capture upload destination differs from the approved ingest path")
+        return parsed
+
+
+def _upload_scope(
+    base_url: str, upload_origin: str, upload_path_prefix: str, org_id: str
+) -> httpx.URL:
+    """Validate the run-start storage policy without claiming independent cloud trust."""
+    try:
+        api = httpx.URL(base_url)
+        origin = httpx.URL(upload_origin)
+        destination = httpx.URL(upload_origin.rstrip("/") + upload_path_prefix)
+    except httpx.InvalidURL as error:
+        raise ValueError("capture run returned a malformed storage destination") from error
+    local_http = _loopback_http(api) and _loopback_http(origin)
+    if (
+        (origin.scheme != "https" and not local_http)
+        or not origin.host
+        or origin.userinfo
+        or origin.query
+        or origin.fragment
+        or origin.raw_path != b"/"
+    ):
+        raise ValueError("capture run storage origin must use HTTPS or explicit loopback HTTP")
+    if (
+        not upload_path_prefix.startswith("/")
+        or destination.raw_path.decode("ascii") != upload_path_prefix
+        or destination.query
+        or destination.fragment
+        or not re.search(
+            r"/storage/v1/object/upload/sign/[^/]+/orgs/"
+            + re.escape(org_id)
+            + r"/telemetry-traces/otlp/$",
+            upload_path_prefix,
+        )
+    ):
+        raise ValueError("capture run storage prefix must be a canonical organization upload path")
+    return origin
+
+
+def _loopback_http(url: httpx.URL) -> bool:
+    """Recognize the explicit local-development HTTP origins accepted by capture login."""
+    return url.scheme == "http" and url.host in {"localhost", "127.0.0.1", "::1"}
 
 
 def _uuid(value: str) -> bool:

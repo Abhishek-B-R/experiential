@@ -13,6 +13,15 @@ import pytest
 from exp.runtime.capture.normalization import CapturedExchange, normalize_exchange
 from exp.runtime.capture.upload import CaptureUploader
 
+_UPLOAD_ORIGIN = "https://storage.example"
+_UPLOAD_PREFIX = "/storage/v1/object/upload/sign/artifacts/orgs/org/telemetry-traces/otlp/"
+_UPLOAD_TEMPLATE = f"{_UPLOAD_ORIGIN}{_UPLOAD_PREFIX}{{ingest}}/{{nonce}}?token=signed"
+
+
+def _signed_url(ingest: str) -> str:
+    """Return a synthetic ticket within the run's acknowledged storage scope."""
+    return f"{_UPLOAD_ORIGIN}{_UPLOAD_PREFIX}{ingest}/{'a' * 43}?token=signed"
+
 
 def _exchange() -> CapturedExchange:
     """Return a bounded synthetic request and response for this test."""
@@ -64,7 +73,7 @@ def test_recovery_keeps_original_run_batch_and_never_sends_api_key_to_storage(
                 200,
                 json={
                     "status": "pending",
-                    "signed_url": "https://storage.example/file?token=signed",
+                    "signed_url": _signed_url(ingest),
                     "ingest_id": ingest,
                 },
             )
@@ -77,6 +86,8 @@ def test_recovery_keeps_original_run_batch_and_never_sends_api_key_to_storage(
         run,
         "PLATFORM-KEY",
         tmp_path / run,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
         transport=httpx.MockTransport(handler),
     )
     uploader.start()
@@ -106,6 +117,8 @@ def test_slow_cloud_does_not_block_submission_or_local_shutdown_flush(tmp_path: 
         run,
         "KEY",
         tmp_path / run,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
         transport=httpx.MockTransport(handler),
     )
     uploader.start()
@@ -127,7 +140,14 @@ def test_finite_raw_queue_reports_backpressure_without_starting_worker(tmp_path:
     """Reject queue overflow immediately and expose a dropped-capture counter."""
     run = str(uuid4())
     uploader = CaptureUploader(
-        "https://api.example", "org", run, "KEY", tmp_path / run, max_queue_bytes=1
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        tmp_path / run,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+        max_queue_bytes=1,
     )
     assert not uploader.submit(_exchange())
     assert uploader.stats.dropped_exchanges == 1
@@ -140,6 +160,165 @@ def test_spool_rejects_symbolic_link_ancestors(tmp_path: Path) -> None:
     linked = tmp_path / "linked"
     linked.symlink_to(target)
     run = str(uuid4())
-    uploader = CaptureUploader("https://api.example", "org", run, "KEY", linked / run)
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        linked / run,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+    )
     with pytest.raises(ValueError, match="symbolic"):
         uploader.start()
+
+
+@pytest.mark.parametrize(
+    "destination_template",
+    [
+        _UPLOAD_TEMPLATE.replace("storage.example", "unapproved.example"),
+        _UPLOAD_TEMPLATE.replace("storage.example", "storage.example.attacker.example"),
+        _UPLOAD_TEMPLATE.replace("storage.example", "storage.example:8443"),
+        _UPLOAD_TEMPLATE.replace("https://", "http://"),
+        _UPLOAD_TEMPLATE.replace("https://", "https://user:password@"),
+        _UPLOAD_TEMPLATE.replace("/orgs/org/", "/orgs/other/"),
+        _UPLOAD_TEMPLATE.replace("{ingest}", "00000000-0000-0000-0000-000000000000"),
+        _UPLOAD_TEMPLATE.replace("/{nonce}", "/unexpected/{nonce}"),
+        _UPLOAD_TEMPLATE.replace("/{nonce}", "/%2e%2e/{nonce}"),
+        _UPLOAD_TEMPLATE + "#fragment",
+        "https://[malformed",
+    ],
+)
+def test_misrouted_signed_ticket_never_sends_capture_bytes(
+    tmp_path: Path, destination_template: str
+) -> None:
+    """Reject an unapproved origin or object path before making any signed PUT."""
+    run, ingest = str(uuid4()), str(uuid4())
+    directory = tmp_path / run
+    directory.mkdir()
+    path = directory / f"{uuid4()}.json"
+    path.write_bytes(b'{"synthetic":"capture-content-canary"}')
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return an inconsistent ticket from the otherwise authenticated control API."""
+        requests.append(request)
+        assert request.method == "POST"
+        assert request.url.host == "api.example"
+        assert request.headers["authorization"] == "Bearer PLATFORM-KEY"
+        assert b"capture-content-canary" not in request.content
+        return httpx.Response(
+            200,
+            json={
+                "status": "pending",
+                "ingest_id": ingest,
+                "signed_url": destination_template.format(ingest=ingest, nonce="a" * 43),
+            },
+        )
+
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "PLATFORM-KEY",
+        directory,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+    )
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(ValueError, match="capture upload destination"):
+            uploader._upload(client, path)
+    assert len(requests) == 1
+    assert path.exists()
+
+
+@pytest.mark.parametrize(
+    ("api_origin", "upload_origin", "path_prefix"),
+    [
+        ("https://api.example", "https://storage.example:443", _UPLOAD_PREFIX),
+        ("https://preview.example", "https://storage.example:8443", "/proxy" + _UPLOAD_PREFIX),
+        (
+            "https://preview.example",
+            "https://storage.example",
+            _UPLOAD_PREFIX.replace("artifacts", "artifact%20bucket"),
+        ),
+        ("http://127.0.0.1:8000", "http://localhost:55421", _UPLOAD_PREFIX),
+        ("http://[::1]:8000", "http://[::1]:55421", _UPLOAD_PREFIX),
+    ],
+)
+def test_approved_storage_scope_supports_preview_and_explicit_local_development(
+    tmp_path: Path, api_origin: str, upload_origin: str, path_prefix: str
+) -> None:
+    """Respect explicit deployment origins without sending Platform credentials to Storage."""
+    run, ingest = str(uuid4()), str(uuid4())
+    directory = tmp_path / run
+    directory.mkdir()
+    path = directory / f"{uuid4()}.json"
+    content = b'{"synthetic":"capture-content-canary"}'
+    path.write_bytes(content)
+    requests: list[httpx.Request] = []
+    signed_url = f"{upload_origin}{path_prefix}{ingest}/{'a' * 43}?token=signed"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Accept the approved signed destination and the separate authenticated finalize."""
+        requests.append(request)
+        if request.method == "PUT":
+            assert request.url == httpx.URL(signed_url)
+            assert request.content == content
+            assert "authorization" not in request.headers
+            return httpx.Response(200)
+        assert request.headers["authorization"] == "Bearer PLATFORM-KEY"
+        if request.url.path.endswith("/batches/upload"):
+            return httpx.Response(
+                200, json={"status": "pending", "ingest_id": ingest, "signed_url": signed_url}
+            )
+        assert request.url.path.endswith(f"/{ingest}/finalize")
+        return httpx.Response(202)
+
+    uploader = CaptureUploader(
+        api_origin,
+        "org",
+        run,
+        "PLATFORM-KEY",
+        directory,
+        upload_origin=upload_origin,
+        upload_path_prefix=path_prefix,
+    )
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        uploader._upload(client, path)
+    assert [request.method for request in requests] == ["POST", "PUT", "POST"]
+
+
+@pytest.mark.parametrize(
+    ("api_origin", "upload_origin", "path_prefix"),
+    [
+        ("https://api.example", "http://localhost:55421", _UPLOAD_PREFIX),
+        ("http://127.0.0.1:8000", "http://storage.example", _UPLOAD_PREFIX),
+        ("http://api.example", "http://localhost:55421", _UPLOAD_PREFIX),
+        ("https://api.example", "https://user:password@storage.example", _UPLOAD_PREFIX),
+        ("https://api.example", "https://storage.example?query=true", _UPLOAD_PREFIX),
+        ("https://api.example", "https://storage.example/unexpected", _UPLOAD_PREFIX),
+        (
+            "https://api.example",
+            _UPLOAD_ORIGIN,
+            _UPLOAD_PREFIX.replace("/orgs/org/", "/orgs/other/"),
+        ),
+        ("https://api.example", _UPLOAD_ORIGIN, "/../" + _UPLOAD_PREFIX),
+        ("https://api.example", _UPLOAD_ORIGIN, _UPLOAD_PREFIX + "?query=true"),
+    ],
+)
+def test_invalid_run_storage_policy_is_rejected_before_uploading(
+    tmp_path: Path, api_origin: str, upload_origin: str, path_prefix: str
+) -> None:
+    """Reject credential-bearing, cross-organization, or unapproved cleartext policies."""
+    run = str(uuid4())
+    with pytest.raises(ValueError, match="capture run storage"):
+        CaptureUploader(
+            api_origin,
+            "org",
+            run,
+            "PLATFORM-KEY",
+            tmp_path / run,
+            upload_origin=upload_origin,
+            upload_path_prefix=path_prefix,
+        )

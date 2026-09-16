@@ -18,7 +18,15 @@ def test_mismatched_run_is_rejected() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         """Return a controlled cloud response while recording the request contract."""
         assert request.headers["authorization"] == "Bearer xpl_secret"
-        return httpx.Response(200, json={"id": str(run_id), "org_id": str(uuid4())})
+        return httpx.Response(
+            200,
+            json={
+                "id": str(run_id),
+                "org_id": str(uuid4()),
+                "upload_origin": "https://storage.example",
+                "upload_path_prefix": "/storage/v1/object/upload/sign/capture/",
+            },
+        )
 
     client = CaptureRunClient(
         base_url="https://platform.test",

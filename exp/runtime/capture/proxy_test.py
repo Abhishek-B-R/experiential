@@ -110,6 +110,9 @@ def test_real_tls_sse_passes_unchanged_and_rejects_wrong_upstream_hostname(
         captured: list[CapturedExchange] = []
         projected: list[tuple[int, int]] = []
         run_id, ingest_id = str(uuid4()), str(uuid4())
+        upload_prefix = (
+            "/storage/v1/object/upload/sign/artifacts/orgs/organization/telemetry-traces/otlp/"
+        )
 
         def platform(request: httpx.Request) -> httpx.Response:
             """Emulate signed upload and finalize while validating projected trace evidence."""
@@ -133,7 +136,10 @@ def test_real_tls_sse_passes_unchanged_and_rejects_wrong_upstream_hostname(
                     json={
                         "status": "pending",
                         "ingest_id": ingest_id,
-                        "signed_url": "https://storage.example/trace?token=signed",
+                        "signed_url": (
+                            f"https://storage.example{upload_prefix}{ingest_id}/"
+                            f"{'a' * 43}?token=signed"
+                        ),
                     },
                 )
             assert request.url.path.endswith(f"/{ingest_id}/finalize")
@@ -145,6 +151,8 @@ def test_real_tls_sse_passes_unchanged_and_rejects_wrong_upstream_hostname(
             run_id,
             "PLATFORM-KEY",
             tmp_path / "spool" / run_id,
+            upload_origin="https://storage.example",
+            upload_path_prefix=upload_prefix,
             transport=httpx.MockTransport(platform),
         )
         if valid_hostname:

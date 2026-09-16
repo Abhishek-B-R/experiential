@@ -67,6 +67,9 @@ the same endpoint and organization retries pending files using their original ba
 When capture capacity is exhausted, collection drops copies and reports the count while model
 traffic continues. The CLI distinguishes captured requests, uploaded batches, and pending batches;
 upload acceptance does not imply that cloud projection has finished.
+Each run pins the storage origin and organization path configured by Platform. Upload tickets
+pointing outside that destination are rejected. Platform remains the trusted recipient and
+control plane for captured content.
 
 For an unreleased Platform preview, set both `EXP_GATEWAY_URL` to the preview API `/v1` URL and
 `EXP_PLATFORM_URL` to its web origin before `exp login` and `exp capture`. Saved credentials are

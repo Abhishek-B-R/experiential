@@ -28,6 +28,8 @@ class CaptureRun(BaseModel):
 
     id: UUID
     org_id: UUID
+    upload_origin: str
+    upload_path_prefix: str
 
 
 class CaptureRunClient:

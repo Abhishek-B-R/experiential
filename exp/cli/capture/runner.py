@@ -79,22 +79,24 @@ async def _capture_authenticated(
         )
         data_dir = provider_data_dir() / "capture"
         ca_directory = data_dir / "ca"
-        certificate = prepare_certificate(ca_directory)
-        if not certificate_is_trusted(certificate):
-            console.print("First-time setup: macOS needs to trust your local Capture certificate.")
-            trust_certificate(certificate)
         origin_namespace = hashlib.sha256(credentials.api_url.encode()).hexdigest()[:16]
         uploader = CaptureUploader(
             base_url=credentials.api_url,
             org_id=str(organization.org_id),
             run_id=str(run.id),
             api_key=credentials.api_key,
+            upload_origin=run.upload_origin,
+            upload_path_prefix=run.upload_path_prefix,
             spool_dir=data_dir
             / "spool"
             / origin_namespace
             / str(organization.org_id)
             / str(run.id),
         )
+        certificate = prepare_certificate(ca_directory)
+        if not certificate_is_trusted(certificate):
+            console.print("First-time setup: macOS needs to trust your local Capture certificate.")
+            trust_certificate(certificate)
         console.print(
             "If a client reports a certificate error, stop capture and configure its CA trust."
         )
