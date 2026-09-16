@@ -27,6 +27,7 @@ class ControlServer:
         self.sleeping = False
         self.models = {serving_model_name(revision())}
         self.paths: list[str] = []
+        self.completions: list[JsonObject] = []
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
         self.fail_load = False
@@ -53,6 +54,7 @@ class ControlServer:
         if path == "/tokenize":
             return httpx.Response(200, json={"tokens": [1], "count": 1, "max_model_len": 4096})
         if path == "/v1/completions":
+            self.completions.append(payload)
             self.entered.set()
             await self.release.wait()
             return httpx.Response(
@@ -74,6 +76,33 @@ class ControlServer:
                 },
             )
         return httpx.Response(200, json={})
+
+
+@pytest.mark.parametrize(("requested", "expected"), [(None, 256), (7, 7), (4000, 256)])
+def test_evaluation_response_cap_reaches_http_payload(requested: int | None, expected: int) -> None:
+    """The HTTP generation cap honors a smaller caller budget and the server ceiling."""
+
+    async def run() -> None:
+        """Load a private revision and inspect its actual completion request body."""
+        server = ControlServer()
+        server.release.set()
+        async with httpx.AsyncClient(
+            base_url="http://owned", transport=httpx.MockTransport(server.handle)
+        ) as client:
+            lifecycle = VllmServingLifecycle(
+                client=client, base=revision(), decoder=TextCompletionDecoder(), max_tokens=256
+            )
+            await lifecycle.wake()
+            await lifecycle.load_revision(revision())
+            await lifecycle.sample_for_evaluation(
+                (ModelMessage(role="user", content="task"),), (), "eval", max_tokens=requested
+            )
+            assert server.completions[0]["max_tokens"] == expected
+            with pytest.raises(ValueError, match="max_tokens"):
+                await lifecycle.sample_for_evaluation((), (), "invalid", max_tokens=0)
+            assert len(server.completions) == 1
+
+    asyncio.run(run())
 
 
 def test_drain_precedes_sleep_and_evaluation_stays_private() -> None:
