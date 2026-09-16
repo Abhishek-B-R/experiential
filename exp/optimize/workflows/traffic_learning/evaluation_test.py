@@ -2,13 +2,23 @@
 
 import asyncio
 import json
+from threading import Event
 
 import pytest
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.models import AssistantAction, ModelMessage, ModelRequest, ToolCall
 from exp.common.tasks import ToolSchema
-from exp.optimize.claas.evaluation import EvaluationManifest, evaluate_policies, freeze_evaluation
+from exp.optimize.workflows.traffic_learning.evaluation import (
+    EvaluationManifest,
+    PairedEvaluationReport,
+    _run_blocking,
+    evaluate_policies,
+    freeze_evaluation,
+    verify_evaluation_report,
+)
+from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
+from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.simulation.claas.harness import ClaasWorldModel, SourceDisclosure
 from exp.simulation.claas.harness_test import RecordingClient, limits, model_snapshot
 from exp.simulation.claas.partition import split_experiences
@@ -172,9 +182,6 @@ def test_evaluation_missing_judge_disclosure_fails_before_policy_execution() -> 
 
 def test_cancellation_joins_an_already_dispatched_provider_call() -> None:
     """Evaluation cannot close while its owned synchronous provider work is still running."""
-    from threading import Event
-
-    from exp.optimize.claas.evaluation import _run_blocking
 
     started, release, finished = Event(), Event(), Event()
 
@@ -213,7 +220,6 @@ def test_manifest_rejects_overlapping_source_groups() -> None:
 
 def test_incomplete_saved_report_cannot_publish_a_subset_score() -> None:
     """Removing a completed pair cannot turn incomplete prescribed coverage into a score."""
-    from exp.optimize.claas.evaluation import PairedEvaluationReport, verify_evaluation_report
 
     manifest, world, judge = evaluation_fixture()
     report = asyncio.run(
@@ -238,8 +244,6 @@ def test_incomplete_saved_report_cannot_publish_a_subset_score() -> None:
 
 def test_multiturn_evaluation_uses_real_http_client_off_the_policy_loop() -> None:
     """Exercise provider serialization and sync/async transport adaptation without network I/O."""
-    from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
-    from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 
     snapshot = model_snapshot().model_copy(update={"provider": "openai-compatible"})
     split = split_experiences(source_batch(), seed="s", held_out_fraction=0.5)
@@ -324,7 +328,6 @@ def test_multiturn_evaluation_uses_real_http_client_off_the_policy_loop() -> Non
 
 def test_loaded_report_rejects_score_tampering_and_wrong_judge_identity() -> None:
     """A score must derive from retained provider evidence for the frozen judge model."""
-    from exp.optimize.claas.evaluation import PairedEvaluationReport, verify_evaluation_report
 
     manifest, world, judge = evaluation_fixture()
     report = asyncio.run(
@@ -350,7 +353,6 @@ def test_loaded_report_rejects_score_tampering_and_wrong_judge_identity() -> Non
 @pytest.mark.parametrize("field", ["rubric", "visible_trajectory", "task_id"])
 def test_saved_judge_request_must_match_replayed_frozen_episode(field: str) -> None:
     """Consistent score text cannot authorize a judge request for a different trajectory."""
-    from exp.optimize.claas.evaluation import PairedEvaluationReport, verify_evaluation_report
 
     manifest, world, judge = evaluation_fixture()
     report = asyncio.run(
@@ -375,8 +377,6 @@ def test_saved_judge_request_must_match_replayed_frozen_episode(field: str) -> N
 
 def test_independently_retained_report_digest_rejects_rewritten_judge_response() -> None:
     """An authoritative digest binds unsigned recordings when loading outside the run store."""
-    from exp.common.core.artifacts import sha256_json
-    from exp.optimize.claas.evaluation import PairedEvaluationReport, verify_evaluation_report
 
     manifest, world, judge = evaluation_fixture()
     report = asyncio.run(
