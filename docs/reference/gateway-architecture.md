@@ -40,13 +40,10 @@ It serves:
 this same gateway application. It does not create a router HTTP server. Gateway startup and readiness
 perform no provider request. Only an authorized model request may cross the provider boundary.
 
-Tool-call identifiers on Chat Completions and Responses are opaque strings of 1 to
-65,536 characters. Replay the complete returned identifier in both the assistant call
-and its tool result, including any signature suffix. The gateway preserves the identifier
-verbatim on OpenAI-compatible Chat routes; it does not decode or strip provider signatures.
-Output guardrail byte limits count the complete serialized completion, including
-tool IDs, tool names, arguments, and JSON framing.
-Provider-specific wire restrictions still apply when routing to a different API dialect.
+Chat Completions and Responses tool-call IDs are opaque strings of 1 to 65,536 characters.
+Replay each complete ID, including any signature suffix, in both the assistant call and tool result.
+OpenAI-compatible Chat routes preserve IDs verbatim; other API dialects may restrict their wire shape.
+Output guardrail byte limits count the full serialized completion, including tool IDs, names, arguments, and JSON framing.
 
 Streamed function-call arguments must assemble to one JSON object. On OpenAI-compatible
 Chat streams the gateway stops relaying argument deltas at the byte that closes that object:
@@ -845,12 +842,17 @@ reasoning on is dropped and disclosed as `temperature->dropped(set_reasoning_eff
 than rejected — the model accepts sampling, just not at that effort, so the request serves and the
 caller is told how to keep the value (set `reasoning_effort=none`); a route that never declares the
 control at all (Anthropic constrained `[1,1]` sampling) still hard-rejects it, since there is
-nothing to honor at any effort. `top_k` prefers a carrying rung; when no rung supports it,
-admission drops it with `top_k->dropped(unsupported_by_provider)` because defaults still serve.
-`frequency_penalty` and `presence_penalty` follow their per-rung capability truth and otherwise
-drop with `<parameter>->dropped(unsupported_by_provider)`. These are soft preferences.
-`top_logprobs` remains a named rejection until the response contract can project logprob arrays.
-A caller
+nothing to honor at any effort. `top_k` follows the same honor-or-narrow shape: selection prefers a
+rung that carries it, and a committed route with no supporting rung (an Azure `openai_deployments`
+DeepSeek rung rejects it upstream) drops it with `top_k->dropped(unsupported_by_provider)` rather
+than rejecting, since a rung's default sampling still returns a valid answer. `frequency_penalty`
+and `presence_penalty` are admitted at the ingress and adapted the same way: honored (emitted) where
+every rung supports them (the per-rung `supports_frequency_penalty`/`supports_presence_penalty`
+capability truth), dropped as `frequency_penalty->dropped(unsupported_by_provider)` where a rung does
+not — a soft preference whose absence still returns a valid answer. `top_logprobs` stays rejected
+(not admitted): the gateway response contract does not project logprob arrays yet, so it cannot be
+honored on any rung and silently dropping a probability request is never acceptable — the reject is
+the honest terminal until output normalization emits logprobs. A caller
 `response_format: {type: "json_object"}` is TRANSLATED, not dropped: it is admitted at the Chat
 ingress and rewritten to a permissive non-strict `json_schema` (`{"type":"object"}`, "any JSON
 object") — the serving lanes emit only `json_schema`, so this preserves the caller's JSON intent on
