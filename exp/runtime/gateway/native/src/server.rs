@@ -173,6 +173,11 @@ pub async fn run(
         .route("/v1/models", get(models))
         .route("/v1/models/{model_id}", get(model_detail))
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/claas/feedback", post(crate::claas::feedback::feedback))
+        .route(
+            "/v1/claas/episodes/finalize",
+            post(crate::claas::feedback::finalize),
+        )
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/images/generations", post(images))
         .route("/v1/responses", post(responses).get(responses_ws))
