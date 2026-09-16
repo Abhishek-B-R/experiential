@@ -93,6 +93,11 @@ def _with_cache_affinity(
     )
 
 
+def _output_floors(resolved_wires: _ResolvedWires) -> tuple[int | None, ...]:
+    """Each rung's declared output-token floor, aligned with the route."""
+    return tuple(profile.minimum_output_tokens for profile, _client in resolved_wires)
+
+
 def admitted_route_requests(
     route: GatewayRoute,
     resolved_wires: _ResolvedWires,
@@ -144,7 +149,9 @@ def admitted_route_requests(
     # provider call (the provider would only 400 it back, after a round trip,
     # with an opaque message); the request falls to a rung that can hold it
     # and is refused only when none can.
-    window_indexes = context_window_compatible_indexes(route, request)
+    window_indexes = context_window_compatible_indexes(
+        route, request, output_floors=_output_floors(resolved_wires)
+    )
     if len(window_indexes) != len(route.deployments):
         route = select_route_deployments(route, window_indexes)
         resolved_wires = tuple(resolved_wires[index] for index in window_indexes)
@@ -223,6 +230,21 @@ def admitted_route_requests(
         tuple(profile for profile, _client in resolved_wires),
         admitted_request,
     )
+    # Shaping can RAISE the output budget past what the caller asked (the
+    # Anthropic required default when max_tokens is unset, the OpenAI-wire
+    # minimum, a rung's declared floor), so the window check runs again on the
+    # shaped budget: a rung it pushed over its window is skipped here, and the
+    # survivors are re-shaped so a floor a dropped rung imposed is not carried.
+    shaped_indexes = context_window_compatible_indexes(
+        route, provider_request, output_floors=_output_floors(resolved_wires)
+    )
+    if len(shaped_indexes) != len(route.deployments):
+        route = select_route_deployments(route, shaped_indexes)
+        resolved_wires = tuple(resolved_wires[index] for index in shaped_indexes)
+        public_request, provider_request = route_generation_parameter_requests(
+            tuple(profile for profile, _client in resolved_wires),
+            admitted_request,
+        )
     provider_request = provider_request.model_copy(update={"stream": True, "include_usage": True})
     protocol_indexes, protocol_errors = protocol_compatible_indexes(
         route,

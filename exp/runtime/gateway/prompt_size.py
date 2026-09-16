@@ -22,6 +22,7 @@ own rules and is left to the provider.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from exp.common.models.content import TextContentPart
@@ -96,15 +97,26 @@ def minimum_prompt_tokens(request: GatewayRequest) -> int:
 
 
 def context_window_compatible_indexes(
-    route: GatewayRoute, request: GatewayRequest
+    route: GatewayRoute,
+    request: GatewayRequest,
+    *,
+    output_floors: Sequence[int | None] = (),
 ) -> tuple[int, ...]:
     """Return the rungs whose declared context window can hold this request.
 
     A rung is compatible when it declares no window (permissive: the provider's
     own count decides) or when its window holds the prompt's lower-bound token
-    count PLUS the caller's requested output budget (``max_tokens`` and its
-    spellings; nothing is reserved when the caller left it unset, because the
-    provider then sizes the output to the room it has). Per-rung windows
+    count PLUS the output budget the rung will actually be sent: the caller's
+    requested ``max_tokens`` (any spelling) raised to the rung's own declared
+    output floor (``output_floors``, aligned with ``route.deployments``; a
+    provider that refuses ceilings under 16 is sent 16 however small the
+    caller's value). Nothing is reserved when the caller left the budget unset
+    and no floor applies, because the provider then sizes the output to the
+    room it has. Admission runs this twice: once on the decoded request, and
+    again on the SHAPED provider request, whose ``maximum_output_tokens``
+    carries every route-level raise (the Anthropic required default, the
+    OpenAI-wire minimum) so a rung the shaping pushed over its window is still
+    skipped rather than dispatched to fail. Per-rung windows
     differ on one model — the Experiential Cloud qwen3.8-27b box serves
     262,144 tokens while the OpenRouter and Novita rungs serve 1,000,000 — so
     a request the box cannot hold must fall to a rung that can instead of
@@ -120,7 +132,9 @@ def context_window_compatible_indexes(
 
     Args:
         route: Resolved ordered route.
-        request: Canonical request about to be shaped and dispatched.
+        request: Canonical request (decoded, or shaped for the provider).
+        output_floors: Per-rung declared output-token floors, aligned with
+            ``route.deployments``; ``None`` or a missing entry means no floor.
 
     Returns:
         Strictly increasing indexes into ``route.deployments``.
@@ -132,19 +146,23 @@ def context_window_compatible_indexes(
     """
     text_bytes = prompt_text_bytes(request)
     minimum = text_bytes // MAXIMUM_BYTES_PER_TOKEN
-    reserve = request.maximum_output_tokens or 0
+    requested = request.maximum_output_tokens or 0
     compatible: list[int] = []
     largest: int | None = None
+    reserve = requested
     for index, deployment in enumerate(route.deployments):
         window = (
             None
             if deployment.capabilities is None
             else deployment.capabilities.context_window_tokens
         )
-        if window is None or minimum + reserve <= window:
+        floor = output_floors[index] if index < len(output_floors) else None
+        rung_reserve = max(requested, floor or 0)
+        if window is None or minimum + rung_reserve <= window:
             compatible.append(index)
         if window is not None and (largest is None or window > largest):
             largest = window
+            reserve = rung_reserve
     if compatible or largest is None:
         return tuple(compatible)
     if minimum > largest:
