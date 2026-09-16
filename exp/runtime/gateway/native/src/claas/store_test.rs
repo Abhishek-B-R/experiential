@@ -136,3 +136,79 @@ fn graceful_shutdown_never_waits_for_a_stuck_writer() {
     release.send(()).unwrap();
     done.recv_timeout(Duration::from_secs(1)).unwrap();
 }
+
+#[test]
+fn capture_and_feedback_share_one_transactional_retention_budget() {
+    use crate::claas::feedback_contracts::{FeedbackError, FeedbackRequest};
+    use crate::claas::feedback_store::put_feedback;
+    let path = std::env::temp_dir().join(format!(
+        "claas-shared-budget-{}-{}.db",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut connection = open_database(&path).unwrap();
+    let mut app = policy();
+    app.maximum_experiences = 3;
+    let capture = |id: &str| Pending {
+        payload: json!({"scope":{"user_id":"user","application_id":"app"},"response_id":id})
+            .to_string(),
+        ..pending(id, app.clone())
+    };
+    let feedback = |id: &str| FeedbackRequest {
+        application_id: "app".into(),
+        feedback_id: format!("fb-{id}"),
+        response_id: Some(id.into()),
+        episode_id: None,
+        text: Some("Correct the address.".into()),
+        reward: None,
+        success: None,
+    };
+    persist(&mut connection, capture("one")).unwrap();
+    put_feedback(&path, &app.scope, &app, feedback("one"), now()).unwrap();
+    persist(&mut connection, capture("two")).unwrap();
+    assert_eq!(
+        put_feedback(&path, &app.scope, &app, feedback("two"), now()),
+        Err(FeedbackError::Capacity)
+    );
+    persist(&mut connection, capture("three")).unwrap();
+    put_feedback(&path, &app.scope, &app, feedback("three"), now()).unwrap();
+    let usage = |connection: &Connection| {
+        connection.query_row(
+        "SELECT COUNT(*),SUM(payload_bytes) FROM (
+          SELECT payload_bytes FROM claas_experiences UNION ALL SELECT payload_bytes FROM claas_feedback
+          UNION ALL SELECT payload_bytes FROM claas_episodes)",[],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?))).unwrap()
+    };
+    assert_eq!(usage(&connection).0, 3);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM claas_feedback WHERE response_id='one'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    // A reduced byte ceiling must include already-retained feedback, even when that
+    // feedback alone is larger than the new ceiling. Capture eviction removes its dependents.
+    app.maximum_storage_bytes = 10;
+    prune(&connection, &app, now()).unwrap();
+    let remaining: i64 = connection
+        .query_row("SELECT COUNT(*) FROM claas_experiences", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(remaining, 0);
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM claas_feedback", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    drop(connection);
+    std::fs::remove_file(path).unwrap();
+}

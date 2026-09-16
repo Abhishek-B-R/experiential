@@ -292,7 +292,8 @@ fn reserve_capacity(
 ) -> Result<(), FeedbackError> {
     let (records, bytes): (i64, i64) = connection.query_row(
         "SELECT COUNT(*),COALESCE(SUM(payload_bytes),0) FROM (
-           SELECT payload_bytes FROM claas_feedback WHERE user_id=?1 AND application_id=?2
+           SELECT payload_bytes FROM claas_experiences WHERE user_id=?1 AND application_id=?2
+           UNION ALL SELECT payload_bytes FROM claas_feedback WHERE user_id=?1 AND application_id=?2
            UNION ALL SELECT payload_bytes FROM claas_episodes WHERE user_id=?1 AND application_id=?2)",
         params![scope.user_id, scope.application_id], |row| Ok((row.get(0)?,row.get(1)?)),
     ).map_err(storage)?;
