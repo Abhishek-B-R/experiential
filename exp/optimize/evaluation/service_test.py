@@ -9,6 +9,7 @@ import pytest
 
 from exp.common.evaluations.model_report import ModelEvaluationReport
 from exp.common.judging import HumanScoreReview, JudgeCalibrationService, PromptDefinition
+from exp.common.models import ModelRequest, ModelResponse, ModelSnapshot
 from exp.common.project import ProjectConfig, ProjectStore
 from exp.common.tasks import load_task_set
 from exp.optimize.evaluation.contracts import EvaluationBudget, EvaluationServices, EvaluationSetup
@@ -21,14 +22,38 @@ from exp.optimize.router.composition_test import (
     _bind_completed_build,
     _CapExhaustedSimulatorFactory,
     _compact_normalized_traces,
-    _Judge,
+    _completion_reservation,
     _ReservedSetupSupplier,
     _ReviewSupplier,
     _SetupSupplier,
     _SimulatorFactory,
     _snapshot,
+    _TargetedTransportFailureClient,
+)
+from exp.optimize.router.composition_test import (
+    _Judge as _RouterTestJudge,
 )
 from exp.optimize.router.evaluation.build import reconstruct_completed_project_build
+from exp.runtime.models.providers.errors import ProviderTransportError
+
+
+class _Judge(_RouterTestJudge):
+    """Expose the configured test model before any simulation or judgment dispatch."""
+
+    model: ModelSnapshot = _snapshot("judge-model")
+
+
+class _UnavailableClient(_TargetedTransportFailureClient):
+    """Record an admitted provider call that fails without returning usage evidence."""
+
+    def __init__(self) -> None:
+        """Retain requests without any scripted successful responses."""
+        super().__init__([], "unused")
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        """Fail after dispatch, leaving the real simulator to reserve unknown spend."""
+        self.requests.append(request)
+        raise ProviderTransportError("connection reset by provider")
 
 
 def _prepared(root: Path, *, multiple: bool = False) -> tuple[ProjectStore, EvaluationSetup]:
@@ -160,6 +185,68 @@ def test_too_few_judgments_fail_before_any_model_or_simulation_dispatch(tmp_path
     assert judge.calls == 0
     assert not simulator.log
     assert project.artifacts.list_ids() == before
+
+
+def test_wrong_judge_fails_before_writes_or_dispatch_on_every_retry(tmp_path: Path) -> None:
+    """A mismatched runtime cannot repeatedly spend money before detecting model drift."""
+    project, setup = _prepared(tmp_path)
+    simulator = _SimulatorFactory()
+    judge = _Judge()
+    judge.model = _snapshot("wrong-model")
+    before = project.artifacts.list_ids()
+    for _ in range(2):
+        with pytest.raises(ValueError, match="persisted judge model"):
+            evaluate_models(
+                project,
+                setup,
+                services=EvaluationServices(simulator, judge),
+                budget=EvaluationBudget(maximum_cost_usd=10, maximum_judgments=100),
+                created_at=_TIME,
+                code_revision="test-revision",
+            )
+    assert judge.calls == 0
+    assert not simulator.log
+    assert project.artifacts.list_ids() == before
+
+
+def test_exactly_exhausted_failure_report_replays_without_paid_judging(tmp_path: Path) -> None:
+    """An unknown-spend terminal failure can consume the full cap and still be reported."""
+    project, setup = _prepared(tmp_path, multiple=True)
+    setup = setup.model_copy(update={"maximum_concurrency": 1})
+    simulator = _CapExhaustedSimulatorFactory("unused")
+    simulator.candidate = _UnavailableClient()
+    simulator.failing = _UnavailableClient()
+    judge = _Judge()
+    services = EvaluationServices(simulator, judge)
+    budget = EvaluationBudget(
+        maximum_cost_usd=_completion_reservation("candidate-a").expected_maximum_call_cost_usd(),
+        maximum_judgments=100,
+    )
+    first = evaluate_models(
+        project,
+        setup,
+        services=services,
+        budget=budget,
+        created_at=_TIME,
+        code_revision="test-revision",
+    )
+    assert first.cost_usd == budget.maximum_cost_usd
+    assert first.report.compared_cells == 0
+    assert first.report.excluded_cells > 0
+    assert first.report.frontier_aliases == ()
+    assert judge.calls == 0
+    calls = len(simulator.log)
+    replay = evaluate_models(
+        project,
+        setup,
+        services=services,
+        budget=budget,
+        created_at=_TIME,
+        code_revision="test-revision",
+    )
+    assert replay == first
+    assert len(simulator.log) == calls
+    assert judge.calls == 0
 
 
 @pytest.mark.parametrize("fail_one", [False, True])

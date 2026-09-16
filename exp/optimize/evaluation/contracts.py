@@ -10,7 +10,7 @@ from pydantic import Field
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactId, ArtifactInput, ContractModel
 from exp.common.evaluations import EvaluationProtocol, ObservedProductionCell
 from exp.common.judging import Judge
-from exp.common.models import RoutedCandidateSnapshot
+from exp.common.models import ModelSnapshot, RoutedCandidateSnapshot
 from exp.optimize.evaluation.simulation import SimulatorFactory
 from exp.simulation.specs import WorldModelSettings
 
@@ -73,5 +73,13 @@ class EvaluationServices:
     """Injected model-backed services; evaluation orchestration remains Experiential-owned."""
 
     simulator_factory: SimulatorFactory
-    judge: Judge
+    judge: EvaluationRuntimeJudge
     plan_inputs: tuple[ArtifactInput, ...] = ()
+
+
+class EvaluationRuntimeJudge(Judge, Protocol):
+    """Judge whose configured provider identity can be checked before any paid work."""
+
+    @property
+    def model(self) -> ModelSnapshot:
+        """Return the exact model bound by the runtime's reservation-enforcing client."""

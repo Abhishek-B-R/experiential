@@ -91,6 +91,8 @@ def evaluate_models(
     )
     if calibration.status != setup.judgment_status or calibration.rubric_id != protocol.rubric_id:
         raise ValueError("evaluation judge status or rubric differs from persisted evidence")
+    if services.judge.model != calibration.judge_model:
+        raise ValueError("configured evaluation judge differs from the persisted judge model")
     verify_router_evaluation_setup(
         completed=completed,
         fit_rag_input=setup.fit_rag_input,
@@ -142,8 +144,8 @@ def evaluate_models(
     simulation_cost = verified_simulation_spend(
         project, simulated, setup.simulation_completion_input
     )
-    if simulation_cost >= budget.maximum_cost_usd:
-        raise ValueError("simulation exhausted the authorized budget before judging")
+    if simulation_cost > budget.maximum_cost_usd:
+        raise ValueError("simulation exceeded the authorized budget before judging")
     report(progress, "judging")
     evidence, _, judge_cost = complete_cell_evidence(
         project,
