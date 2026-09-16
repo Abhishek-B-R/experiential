@@ -38,6 +38,8 @@ sft = ["tinker>=0.23,<0.24", "tinker-cookbook>=0.4.3,<0.5"]
 # Explicit Python 3.12/3.13 worker dependency; veRL pins tensordict without cp314 wheels.
 # Ordinary gateway installs never import or install this stack.
 claas-verl = ["verl==0.9.0", "peft>=0.18,<0.19", "torch>=2.9,<2.14", "safetensors>=0.6,<0.9"]
+# Explicit cloud execution adapter; importing the gateway does not load Modal.
+claas-modal = ["modal>=1.5,<2"]
 dev = [
     "pytest>=8.0",
     "pytest-xdist>=3.8",
@@ -50,6 +52,7 @@ dev = [
     "experiential[sft]",
     # CPU optimizer/SDPO tests exercise the real optional backend without downloading weights.
     "experiential[claas-verl]",
+    "experiential[claas-modal]",
     # Builds the optional Rust gateway data-plane extension (exp_gateway_native).
     "maturin>=1.7,<2",
     # WebSocket client for the Responses-over-WebSocket gateway e2e tests.
