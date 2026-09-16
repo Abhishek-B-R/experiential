@@ -234,3 +234,89 @@ def test_incomplete_saved_report_cannot_publish_a_subset_score() -> None:
     partial = PairedEvaluationReport.model_validate(changed)
     with pytest.raises(ValueError, match="authoritative"):
         verify_evaluation_report(partial, manifest)
+
+
+def test_multiturn_evaluation_uses_real_http_client_off_the_policy_loop() -> None:
+    """Exercise provider serialization and sync/async transport adaptation without network I/O."""
+    from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
+    from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
+
+    snapshot = model_snapshot().model_copy(update={"provider": "openai-compatible"})
+    split = split_experiences(source_batch(), seed="s", held_out_fraction=0.5)
+    manifest = freeze_evaluation(split, world_model=snapshot, judge_model=snapshot)
+    assert len(manifest.tasks) == 1
+
+    def response(payload: JsonObject) -> JsonHttpResponse:
+        """Encode a structured world/judge response in the actual provider wire shape."""
+        return JsonHttpResponse(
+            status_code=200,
+            body={
+                "model": snapshot.model_id,
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": json.dumps(payload)},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 16, "total_tokens": 24},
+            },
+        )
+
+    observation: JsonObject = {
+        "observations": [{"call_id": "lookup-1", "content": "Claim pending.", "is_error": False}],
+        "user_message": None,
+        "terminal": False,
+        "feedback": "PRIVATE FEEDBACK",
+        "reward": 0.5,
+    }
+    terminal: JsonObject = {
+        "observations": [],
+        "user_message": None,
+        "terminal": True,
+        "feedback": "PRIVATE FEEDBACK",
+        "reward": 0.5,
+    }
+    world_transport = ScriptedJsonTransport([response(observation), response(terminal)] * 2)
+    judge_transport = ScriptedJsonTransport(
+        [
+            response({"score": 0.0, "feedback": "Current policy score."}),
+            response({"score": 0.5, "feedback": "Candidate policy score."}),
+        ]
+    )
+    disclosure = SourceDisclosure(scope=split.scope, model=snapshot)
+    bounds = limits(maximum_steps=3, maximum_model_calls=8, maximum_total_cost_usd=1.0)
+    world = ClaasWorldModel(
+        client=OpenAICompatibleClient(
+            model=snapshot,
+            api_key="fixture",
+            base_url="https://fixture.invalid/v1",
+            transport=world_transport,
+        ),
+        model=snapshot,
+        limits=bounds,
+        source_disclosure=disclosure,
+        purpose="evaluation",
+    )
+    judge = ClaasBoundedProvider(
+        client=OpenAICompatibleClient(
+            model=snapshot,
+            api_key="fixture",
+            base_url="https://fixture.invalid/v1",
+            transport=judge_transport,
+        ),
+        model=snapshot,
+        limits=bounds,
+        source_disclosure=disclosure,
+    )
+    report = asyncio.run(
+        evaluate_policies(
+            manifest,
+            current=Policy("current"),
+            candidate=Policy("candidate"),
+            world=world,
+            judge=judge,
+        )
+    )
+    assert report.paired_mean_delta == 0.5
+    assert len(world_transport.requests) == 4 and len(judge_transport.requests) == 2
+    assert all(request.url.endswith("/chat/completions") for request in world_transport.requests)
