@@ -45,7 +45,7 @@ class _FileReader:
 
     async def aio(self, path: str) -> AsyncIterator[bytes]:
         """Yield chunks from the requested manifest-listed relative file."""
-        relative = Path(*Path(path).parts[2:])
+        relative = Path(*Path(path).parts[3:])
         content = (self.root / relative).read_bytes()
         yield content[:10]
         yield content[10:]
@@ -66,8 +66,9 @@ def test_download_verifies_manifest_and_preserves_immutable_scope(tmp_path: Path
     scope_id = sha256_json(
         {"scope": spec().scope.model_dump(mode="json"), "adapter_id": spec().adapter_id}
     )
+    lineage = sha256_json({"lineage_id": "main"})
     remote = receipt.model_copy(
-        update={"path": f"{REMOTE_ROOT}/{scope_id}/{receipt.policy_revision}"}
+        update={"path": f"{REMOTE_ROOT}/{scope_id}/{lineage}/{receipt.policy_revision}"}
     )
 
     async def run() -> None:

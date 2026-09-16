@@ -122,10 +122,13 @@ class TrainingJob(ContractModel):
     batch: TrainingBatch
     checkpoint_root: str = Field(min_length=1)
     resume_checkpoint: TrainingCheckpoint | None = None
+    lineage_id: Identifier = "main"
 
     @model_validator(mode="after")
     def _validate_job(self) -> TrainingJob:
         """Validate all provider-independent invariants before creating compute."""
+        if not self.lineage_id.strip():
+            raise ValueError("lineage_id must not be blank")
         validate_training_batch(self.spec, self.batch, self.resume_checkpoint)
         if not Path(self.checkpoint_root).is_absolute():
             raise ValueError("checkpoint_root must be an absolute durable directory")
@@ -230,5 +233,9 @@ def validate_training_batch(
 def next_policy_revision(job: TrainingJob) -> str:
     """Bind a resulting revision to the exact spec, previous state, and consumed batch."""
     return "claas-" + sha256_json(
-        {"spec": job.spec.model_dump(mode="json"), "batch": job.batch.model_dump(mode="json")}
+        {
+            "spec": job.spec.model_dump(mode="json"),
+            "batch": job.batch.model_dump(mode="json"),
+            "lineage_id": job.lineage_id,
+        }
     )
