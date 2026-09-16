@@ -182,6 +182,10 @@ class HostsState:
             or info.st_mode & disallowed
         ):
             raise CaptureSystemError("Capture system files have unsafe ownership or permissions.")
+        if sys.platform == "darwin" and info.st_flags & (
+            stat.UF_IMMUTABLE | stat.SF_IMMUTABLE | stat.UF_APPEND | stat.SF_APPEND
+        ):
+            raise CaptureSystemError("Capture system files must not be immutable or append-only.")
         return info
 
     def _ensure_state(self) -> None:

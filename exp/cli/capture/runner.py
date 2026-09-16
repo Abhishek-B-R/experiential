@@ -74,9 +74,7 @@ async def _capture_authenticated(
         console.print(f"Organization: {organization.org_name}", markup=False)
         console.print(f"Provider domains: {', '.join(domains)}", markup=False)
         console.print("Captures model prompts, responses, and tool content from these domains.")
-        console.print(
-            "macOS administrator authorization is needed for first-time trust and routing."
-        )
+        console.print("macOS administrator authorization is needed for temporary routing.")
         data_dir = provider_data_dir() / "capture"
         ca_directory = data_dir / "ca"
         origin_namespace = hashlib.sha256(credentials.api_url.encode()).hexdigest()[:16]
@@ -94,9 +92,9 @@ async def _capture_authenticated(
             / str(run.id),
         )
         certificate = prepare_certificate(ca_directory)
-        if not certificate_is_trusted(certificate):
-            console.print("First-time setup: macOS needs to trust your local Capture certificate.")
-            trust_certificate(certificate)
+        if not certificate_is_trusted(certificate, domains=domains):
+            console.print("First-time setup: trust Capture's certificate for your macOS user.")
+            trust_certificate(certificate, domains=domains)
         console.print(
             "If a client reports a certificate error, stop capture and configure its CA trust."
         )

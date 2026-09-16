@@ -255,6 +255,25 @@ def test_activation_and_recovery_preserve_apple_metadata(state: helper.HostsStat
         assert acl() == original_acl
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="Immutable file flags are macOS metadata")
+@pytest.mark.parametrize("enabled, disabled", [("uchg", "nouchg"), ("uappnd", "nouappnd")])
+def test_immutable_and_append_only_hosts_rejected_before_transaction(
+    state: helper.HostsState, enabled: str, disabled: str
+) -> None:
+    """Unsupported flags cannot create an undeletable temporary root-owned snapshot."""
+    hosts = state.paths.hosts
+    original = hosts.read_bytes()
+    subprocess.run(["/usr/bin/chflags", enabled, str(hosts)], check=True)
+    try:
+        with state.locked(), pytest.raises(helper.CaptureSystemError, match="immutable or append"):
+            state.activate(DOMAINS)
+        assert hosts.read_bytes() == original
+        assert not (state.paths.state / "journal.json").exists()
+        assert not list(hosts.parent.glob(".hosts.exp-capture-*"))
+    finally:
+        subprocess.run(["/usr/bin/chflags", disabled, str(hosts)], check=True)
+
+
 def test_helper_cli_has_no_filesystem_override() -> None:
     """Even a privileged caller cannot inject arbitrary paths through helper flags."""
     with pytest.raises(SystemExit) as raised:

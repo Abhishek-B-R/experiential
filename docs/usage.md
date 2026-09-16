@@ -41,14 +41,18 @@ traces; authentication and unrelated web requests are forwarded without retainin
 Captured traces include prompts, responses, and tool content. Credential headers are never
 copied into uploaded traces. This is separate from anonymous aggregate product telemetry.
 
-The first run creates a private local certificate authority and requests macOS trust. A client
+The first run creates a private local certificate authority and requests trust for the current
+macOS user, scoped to the selected provider hostnames in native macOS trust settings. Clients
+that import CA certificates into their own TLS stacks may not preserve those hostname restrictions;
+the local signing key remains sensitive even when capture is stopped. A client
 with its own trust store may need that public CA certificate configured explicitly; certificate
 pinning is not bypassed. The certificate is under the `capture/ca` directory of the same user-data
 directory that owns the saved login. On macOS this defaults to
 `~/Library/Application Support/exp/capture/ca/mitmproxy-ca-cert.pem`. Never share the adjacent
 `mitmproxy-ca.pem`, which contains the private signing key.
 
-An administrator prompt authorizes only the temporary networking helper and certificate trust.
+An administrator prompt authorizes the temporary networking helper. Certificate trust is stored
+for the current macOS user, without installing a system-wide root.
 Run the CLI as your normal user, not `sudo exp capture`. The helper journals its own marked
 hosts entries and relays loopback port 443 to the unprivileged proxy. Ctrl+C removes the overrides
 before the proxy exits. The helper also restores networking if the foreground process disappears.

@@ -18,6 +18,7 @@ dependencies = [
     # The capture engine needs Python 3.13+ because mitmproxy on 3.12 conflicts with
     # Pydantic's typing-extensions floor. Other commands remain available on 3.12.
     "mitmproxy>=12.2.3,<13; python_version >= '3.13'",
+    "cryptography>=42,<49; python_version >= '3.13'",
     "dnspython>=2.6,<3",
     "brotli>=1.2,<2; python_version >= '3.13'",
     "zstandard>=0.23,<1; python_version >= '3.13'",

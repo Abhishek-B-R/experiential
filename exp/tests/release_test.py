@@ -50,7 +50,7 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
         "typer",
     }
 )
-REQUIRED_CAPTURE_REQUIREMENTS = frozenset({"brotli", "mitmproxy", "zstandard"})
+REQUIRED_CAPTURE_REQUIREMENTS = frozenset({"brotli", "cryptography", "mitmproxy", "zstandard"})
 REQUIRED_WHEEL_MODULES = frozenset(
     {
         "exp/cli/gateway/app.py",
