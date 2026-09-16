@@ -155,3 +155,7 @@ quality measurement can call the separate `build_fidelity_evaluation_plan` and
 `build_fidelity_report` APIs; those results never enter router fitting or activation. Fidelity
 reports contain measurements only, never an approval or denial. See the
 [router contracts](reference/router_optimization_config.md).
+# Local gateway traffic
+
+See [local traffic capture](reference/local_gateway_traffic.md) for default-on,
+identity-scoped collection and `exp build --source gateway --identity ID`.

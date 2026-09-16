@@ -89,6 +89,9 @@ pub(crate) struct Admission {
     /// Exact key-derived identity, carried separately because IDs may contain colons.
     #[serde(default)]
     pub caller_identity_id: Option<String>,
+    /// Post-guardrail, expanded evidence supplied only by an opted-in control plane.
+    #[serde(default)]
+    pub capture_context: Option<Value>,
 }
 
 /// How one admission's output chain is enforced on the data plane.

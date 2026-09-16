@@ -102,6 +102,13 @@ impl CaptureSession {
                     | "stream"
             )
         });
+        if let Some(context) = &admission.capture_context {
+            object.insert("exp_context".into(), context.clone());
+        }
+        if serde_json::to_vec(&request).ok()?.len() > policy.maximum_experience_bytes {
+            store.skip();
+            return None;
+        }
         Some(Self {
             store: store.clone(),
             policy: policy.clone(),

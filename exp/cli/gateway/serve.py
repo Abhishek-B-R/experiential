@@ -12,6 +12,7 @@ from rich.text import Text
 
 from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.cli.shared.theme import EXP_THEME
+from exp.runtime.gateway.local_capture import local_capture_configuration
 from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -47,10 +48,7 @@ def run(
     ghost: bool = typer.Option(
         False,
         "--ghost",
-        help=(
-            "Compatibility flag: project journals stay disabled while gateway accounting "
-            "remains on."
-        ),
+        help="Disable traffic content capture. Content-free gateway accounting remains on.",
     ),
     non_interactive: bool = typer.Option(
         False,
@@ -83,7 +81,7 @@ def run(
         root: Local artifact and model-catalog root.
         policy: Exact policy for an ambiguous project.
         port: Local loopback TCP port.
-        ghost: Compatibility marker for project traffic, which always uses gateway accounting.
+        ghost: Disable content capture while preserving content-free accounting.
         non_interactive: Whether first-run gateway prompts are forbidden.
         json_output: Whether startup output is one versioned JSON receipt.
         check: Whether to validate gateway readiness without binding.
@@ -127,7 +125,7 @@ def start_gateway(
         root: Local artifact and model-catalog root.
         policy: Exact policy for an ambiguous project.
         port: Local loopback TCP port.
-        ghost: Compatibility marker for project traffic, which always uses gateway accounting.
+        ghost: Disable content capture while preserving content-free accounting.
         non_interactive: Whether first-run gateway prompts are forbidden.
         json_output: Whether startup output is one versioned JSON receipt.
         check: Whether to validate gateway readiness without binding.
@@ -138,8 +136,8 @@ def start_gateway(
         typer.BadParameter: The selected project form or activation is invalid,
             or the native gateway extension is not installed.
     """
-    if (policy is not None or ghost) and project is None:
-        raise typer.BadParameter("--policy and --ghost require --project")
+    if policy is not None and project is None:
+        raise typer.BadParameter("--policy requires --project")
     blocker = _native_engine_blocker()
     if blocker is not None:
         raise typer.BadParameter(blocker)
@@ -201,7 +199,7 @@ def _run_gateway(
         root: Local artifact and model-catalog root.
         policy: Exact policy for an ambiguous project.
         port: Local loopback TCP port.
-        ghost: Compatibility marker for project traffic, which always uses gateway accounting.
+        ghost: Disable content capture while preserving content-free accounting.
         non_interactive: Whether first-run gateway prompts are forbidden.
         json_output: Whether startup output is one versioned JSON receipt.
         check: Whether to validate gateway readiness without binding.
@@ -277,10 +275,12 @@ def _run_gateway(
                 # host ever starts.
                 exp_gateway_native = importlib.import_module("exp_gateway_native")
                 guardrails = load_guardrail_engine(root)
+                capture = local_capture_configuration(root, ghost=ghost)
                 control_plane = NativeControlPlane(
                     components,
                     data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
                     guardrails=guardrails,
+                    capture_context=capture is not None,
                 )
                 receipt = {
                     "schema_version": 1,
@@ -291,6 +291,8 @@ def _run_gateway(
                     "reconciled_expired_requests": control_plane.reconciled_expired_requests,
                     "reconciled_unknown_attempts": control_plane.reconciled_unknown_attempts,
                     "launch_mode": "gateway" if compatibility is None else "project_alias",
+                    "traffic_capture": "enabled" if capture is not None else "disabled",
+                    "traffic_database": None if capture is None else str(capture.database_path),
                     "unavailable_aliases": _unavailable_alias_entries(
                         components.unavailable_aliases
                     ),
@@ -334,6 +336,8 @@ def _run_gateway(
                         max_active_requests=max_active_requests,
                         graceful_timeout_seconds=graceful_timeout,
                         on_listening=announce_ready,
+                        capture=capture,
+                        ghost=ghost,
                     )
                 except NativeGatewayServerError as exc:
                     raise typer.BadParameter(str(exc)) from exc
@@ -541,6 +545,12 @@ def _emit_gateway_ready(
     _console.print(
         f"[green]✓ Gateway ready[/green] http://{_LOOPBACK_HOST}:{port}/v1",
         markup=True,
+    )
+    _console.print(
+        "Traffic content capture disabled."
+        if ghost
+        else "Local traffic content capture enabled. Use --ghost to disable.",
+        markup=False,
     )
     if compatibility is not None:
         from exp.cli.gateway.compatibility import ProjectGatewayCompatibility

@@ -28,6 +28,7 @@ from collections.abc import Callable
 
 from exp.common.core.artifacts import JsonObject, sha256_bytes
 from exp.runtime.gateway.attempt_tokens import counted_input_tokens
+from exp.runtime.gateway.capture_context import capture_request_context
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -159,12 +160,7 @@ class NativeControlPlane(
     NativeImagesMixin,
     NativeObservabilityMixin,
 ):
-    """Authority and accounting callbacks for the native data plane.
-
-    Rust worker threads share the group-commit writer and the locked in-flight
-    registry. Opportunistic sweeps bound abandoned reservations to the request
-    deadline plus the sweep grace.
-    """
+    """Authority callbacks sharing a locked, deadline-swept accounting registry."""
 
     def __init__(
         self,
@@ -179,6 +175,7 @@ class NativeControlPlane(
         cache_sample_gate: Callable[[str], bool] | None = None,
         native_route_eligible: Callable[[GatewayRoute, GatewayRequest], bool] | None = None,
         guardrails: GuardrailEngine | None = None,
+        capture_context: bool = False,
     ) -> None:
         """Bind loaded gateway components for serving.
 
@@ -200,10 +197,12 @@ class NativeControlPlane(
                 admits every sample; a raising gate skips the sample.
             native_route_eligible: Optional hosted policy for complete native semantics.
             guardrails: Optional identity-scoped engine. ``None`` leaves traffic unguarded.
+            capture_context: Include bounded effective request evidence for local capture.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
+        self._capture_context = capture_context
         # The optional batch lane: hosts without it leave every batch route
         # answering the uniform not-enabled error below.
         self._batches = getattr(components, "batches", None)
@@ -682,11 +681,12 @@ class NativeControlPlane(
             "caller_identity_id": authorization.identity_id,
         }
         if route.snapshot.throttle_redial is not None:
-            # The pool's frozen backoff-and-redial schedule; absent (not null) on
-            # pools that keep throttles failover-only: their admission is byte-identical.
+            # The pool's frozen backoff-and-redial schedule; absent on default pools.
             response["throttle_redial"] = route.snapshot.throttle_redial.model_dump(mode="json")
         if plan is not None:
             response["guardrail_output_plan"] = plan
+        if self._capture_context:
+            response["capture_context"] = capture_request_context(retention_request)
         if request.surface == GatewayApiSurface.MESSAGES:
             # Display-only: what `message_start` shows as input when the
             # upstream reports nothing before its final chunk. The ledger
