@@ -229,7 +229,9 @@ pub(crate) async fn responses(
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or(0);
 
-    match won {
+    let capture =
+        crate::claas::CaptureSession::begin(&state.capture, &admission, &body_text, "responses");
+    let response = match won {
         Won::Failed(error) => {
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;
@@ -285,7 +287,8 @@ pub(crate) async fn responses(
                 .await
             }
         }
-    }
+    };
+    crate::claas::capture_response(capture, response)
 }
 
 /// Answer one Responses attempt that the waterfall already settled: a

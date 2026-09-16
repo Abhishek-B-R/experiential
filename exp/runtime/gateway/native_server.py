@@ -7,6 +7,7 @@ import json
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol, cast
 
+from exp.runtime.claas.capture import CaptureConfiguration
 from exp.runtime.gateway.guardrails.deterministic import NativeDetector
 
 if TYPE_CHECKING:
@@ -44,6 +45,8 @@ def serve_native_gateway(
     time_to_first_byte_seconds: float = 15.0,
     time_to_first_byte_seconds_per_million_input_tokens: float = 240.0,
     native_usage_enabled: bool = True,
+    capture: CaptureConfiguration | None = None,
+    ghost: bool = False,
     shutdown: ShutdownHandle | None = None,
     on_listening: Callable[[], None] | None = None,
 ) -> None:
@@ -73,6 +76,8 @@ def serve_native_gateway(
         native_usage_enabled: Whether Rust owns ``/usage.json``. Hosted,
             multi-tenant callers should disable it so their own surface owns
             usage.
+        capture: Explicit local application content-capture bindings, disabled by default.
+        ghost: Disable all content capture even when bindings are supplied.
         shutdown: Optional embedder-owned stop handle from
             ``exp_gateway_native.shutdown_handle()``. A host serving on a
             background thread calls ``request_shutdown()`` to stop the plane
@@ -104,6 +109,8 @@ def serve_native_gateway(
             time_to_first_byte_seconds_per_million_input_tokens
         ),
         "native_usage_enabled": native_usage_enabled,
+        "ghost": ghost,
+        "capture": None if ghost or capture is None else capture.model_dump(mode="json"),
     }
     try:
         native.serve(
