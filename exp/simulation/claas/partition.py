@@ -113,6 +113,26 @@ def split_experiences(
     )
 
 
+def exclude_response_groups(
+    experiences: Sequence[Experience], response_ids: frozenset[str]
+) -> tuple[Experience, ...]:
+    """Exclude every explicitly linked group touching a reserved response.
+
+    Apply this before source partitioning. A benchmark response's parent, episode
+    peers, and declared source ancestry cannot become practice through a later link.
+    """
+    if not experiences or not response_ids:
+        return tuple(experiences)
+    reserved = {item.experience_id for item in experiences if item.response_id in response_ids}
+    excluded = {
+        identity
+        for group in _source_groups(experiences)
+        if reserved.intersection(group.experience_ids)
+        for identity in group.experience_ids
+    }
+    return tuple(item for item in experiences if item.experience_id not in excluded)
+
+
 def _source_groups(experiences: Sequence[Experience]) -> tuple[SourceGroup, ...]:
     """Union explicit relationships while rejecting missing or synthetic provenance."""
     by_id = {item.experience_id: item for item in experiences}

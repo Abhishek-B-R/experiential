@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
-from exp.common.claas import ClaasScope
+from exp.common.claas import ClaasScope, FeedbackRecord, FinalizedEpisode
 from exp.common.core.artifacts import ContractModel, Sha256
 from exp.common.models import ModelMessage, ModelRequest, ModelResponse
 from exp.common.tasks import ToolSchema
@@ -100,6 +100,13 @@ class WorldStep(ContractModel):
     provenance: Literal["synthetic"] = "synthetic"
 
 
+class SourceFeedback(ContractModel):
+    """Private caller feedback about an observed response or explicitly finalized episode."""
+
+    record: FeedbackRecord
+    finalized_episode: FinalizedEpisode | None = None
+
+
 class WorldEpisode(ContractModel):
     """A bounded practice episode, without claims about real task success."""
 
@@ -107,3 +114,11 @@ class WorldEpisode(ContractModel):
     steps: tuple[WorldStep, ...]
     end_reason: Literal["world_terminal", "caller_ended", "limit", "error"]
     outcome: Literal["unverified"] = "unverified"
+    source_feedback: tuple[SourceFeedback, ...] = Field(default=(), max_length=128)
+
+    @model_validator(mode="after")
+    def _isolate_source_feedback(self) -> WorldEpisode:
+        """Historical training feedback cannot enter held-out episode evidence."""
+        if self.scenario.partition != "fit" and self.source_feedback:
+            raise ValueError("source feedback is private practice evidence, not held-out input")
+        return self
