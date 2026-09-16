@@ -9,7 +9,7 @@ code lives under `exp/`; benchmark data arrives as a dependency (see rule 6).
 Managed with `uv`; lint/format with `ruff`; type-check with `ty`.
 
 ```bash
-uv sync --extra dev
+uv sync --extra dev --python 3.13
 uv run ruff check .
 uv run ruff format --check .
 uv run ty check

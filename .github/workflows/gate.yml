@@ -23,7 +23,7 @@ jobs:
         with:
           workspaces: exp/runtime/gateway/native
       - name: Install the project and its dev extras
-        run: uv sync --extra dev
+        run: uv sync --extra dev --python 3.13
       - name: Crate changes require a crate version bump
         if: github.event_name == 'pull_request'
         env:
@@ -97,7 +97,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Install the project and its dev extras
-        run: uv sync --extra dev
+        run: uv sync --extra dev --python 3.13
       - name: W16 router and bounded local-process evidence
         env:
           EXP_RELEASE_REVISION: ${{ github.sha }}
