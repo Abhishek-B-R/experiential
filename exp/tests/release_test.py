@@ -14,7 +14,9 @@ import sys
 import tarfile
 import termios
 import time
+import tomllib
 import zipfile
+from email.parser import Parser
 from pathlib import Path, PurePosixPath
 from typing import cast
 
@@ -22,18 +24,31 @@ from click import unstyle
 
 if os.environ.get("EXP_INSTALLED_RELEASE_EVIDENCE") != "1":
     import pytest
+    from packaging.markers import Marker
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
 
 BUILT_DIST_ENV = "EXP_BUILT_DIST_DIR"
-FORBIDDEN_REQUIREMENT = re.compile(
-    r"(?mi)^Requires-Dist:\s*(?:anthropic|environment-capture|gepa|mlx-lm|"
-    r"opentelemetry-proto|scikit-learn|transformers)(?:\s|[<>=;~!])"
+FORBIDDEN_CORE_REQUIREMENTS = frozenset(
+    {
+        "anthropic",
+        "environment-capture",
+        "gepa",
+        "mlx-lm",
+        "opentelemetry-proto",
+        "scikit-learn",
+        "transformers",
+    }
 )
 REQUIRED_CORE_REQUIREMENTS = frozenset(
     {
         "boto3",
         "botocore",
         "click",
+        "exp-gateway-native",
         "filelock",
+        "google-auth",
+        "google-re2",
         "httpx",
         "numpy",
         "openai",
@@ -177,15 +192,79 @@ def _sdist_metadata(archive: tarfile.TarFile) -> str:
 
 
 def _core_requirement_names(metadata: str) -> frozenset[str]:
-    """Return normalized non-extra dependency names from package metadata."""
+    """Parse unconditional requirements and reject unsanctioned optional contracts.
+
+    The release has unconditional core requirements and exact dev/sft markers.
+    Compound or platform markers require an explicit contract change, rather
+    than being evaluated on this host and hiding another platform's dependency.
+    """
+    optional = {
+        "dev": {
+            "anthropic",
+            "maturin",
+            "pytest",
+            "pytest-xdist",
+            "ruff",
+            "tinker",
+            "tinker-cookbook",
+            "ty",
+            "websockets",
+        },
+        "sft": {"tinker", "tinker-cookbook"},
+    }
     names: set[str] = set()
-    for line in metadata.splitlines():
-        if not line.startswith("Requires-Dist:") or "; extra ==" in line:
+    headers = Parser().parsestr(metadata, headersonly=True)
+    for value in headers.get_all("Requires-Dist", []):
+        requirement = Requirement(value)
+        name = canonicalize_name(requirement.name)
+        if requirement.marker is None:
+            names.add(name)
             continue
-        requirement = line.removeprefix("Requires-Dist:").strip()
-        name = re.split(r"[<>=;~!\s]", requirement, maxsplit=1)[0].casefold()
-        names.add(name)
+        matches = [
+            extra for extra in optional if requirement.marker == Marker(f'extra == "{extra}"')
+        ]
+        assert len(matches) == 1, f"unsupported release dependency marker: {requirement}"
+        assert name in optional[matches[0]], f"unexpected optional dependency: {requirement}"
     return frozenset(names)
+
+
+def _assert_release_archive_metadata(metadata: str) -> None:
+    """Require current source identity and the independent dependency contract."""
+    repository = Path(__file__).resolve().parent.parent.parent
+    project = tomllib.loads((repository / "pyproject.toml").read_text())["project"]
+    headers = Parser().parsestr(metadata, headersonly=True)
+    assert headers["Name"] == project["name"]
+    assert headers["Version"] == project["version"]
+    _assert_release_requirements(metadata)
+
+
+def _assert_release_requirements(metadata: str) -> None:
+    """Require the independently declared core dependency contract."""
+    core = _core_requirement_names(metadata)
+    assert not core & FORBIDDEN_CORE_REQUIREMENTS
+    assert core == REQUIRED_CORE_REQUIREMENTS
+
+
+def test_release_requirement_contract_distinguishes_sanctioned_dev_extra() -> None:
+    """Allow the SDK drift-check extra without allowing it into runtime installs."""
+    core = "\n".join(f"Requires-Dist: {name}" for name in REQUIRED_CORE_REQUIREMENTS)
+    _assert_release_requirements(core + '\nRequires-Dist: anthropic>=1.2; extra == "dev"')
+    _assert_release_requirements(core + "\nRequires-Dist: anthropic>=1.2; extra == 'dev'")
+    for requirement in (
+        "anthropic>=1.2",
+        'anthropic>=1.2; extra == "sft"',
+        'anthropic>=1.2; extra == "unknown"',
+        'anthropic>=1.2; extra == "dev" or sys_platform == "win32"',
+        'anthropic>=1.2; extra == "dev" and python_version >= "3.12"',
+        'anthropic>=1.2; sys_platform == "win32"',
+        'transformers>=4; extra == "dev"',
+        'httpx>=0.27; extra == "dev"',
+        'unknown-library; extra == "dev"',
+    ):
+        with pytest.raises(AssertionError):
+            _assert_release_requirements(core + f"\nRequires-Dist: {requirement}")
+    with pytest.raises(AssertionError):
+        _assert_release_requirements(core.replace("Requires-Dist: google-re2", ""))
 
 
 def _assert_current_archive_members(
@@ -227,6 +306,7 @@ def _tracked_sdist_members() -> frozenset[str]:
             "git",
             "ls-files",
             ".gitignore",
+            "LICENSE",
             "README.md",
             "assets",
             "docs/reference/gateway-architecture.md",
@@ -3171,8 +3251,7 @@ def test_built_archives_match_current_package_contract() -> None:
             if not name.startswith("exp/") and ".dist-info/" not in name
         )
         assert not outside_package, f"wheel carries members outside the package: {outside_package}"
-        assert FORBIDDEN_REQUIREMENT.search(metadata) is None
-        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
+        _assert_release_archive_metadata(metadata)
 
     with tarfile.open(sdists[0], mode="r:gz") as sdist:
         names = tuple(
@@ -3183,8 +3262,7 @@ def test_built_archives_match_current_package_contract() -> None:
         assert frozenset(name for name in names if name and not name.endswith("/")) == (
             _tracked_sdist_members() | {"PKG-INFO"}
         )
-        assert FORBIDDEN_REQUIREMENT.search(metadata) is None
-        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
+        _assert_release_archive_metadata(metadata)
 
 
 def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:

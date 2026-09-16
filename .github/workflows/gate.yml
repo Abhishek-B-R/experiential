@@ -81,7 +81,11 @@ jobs:
         run: >-
           uv run pytest -q
           exp/optimize/model/sft/tinker_test.py
+      - name: Build release archives for contract checks
+        run: uv build --package experiential --no-sources
       - name: non-live tests
+        env:
+          EXP_BUILT_DIST_DIR: ${{ github.workspace }}/dist
         run: >-
           uv run pytest -n 4 --dist worksteal -q
           exp
@@ -105,11 +109,30 @@ jobs:
         run: uv sync --extra dev
       - name: Verify real Windows snapshot and budget authority
         run: >-
-          uv run pytest -q -rs
+          uv run pytest -q -rs --junitxml=windows-budget-authority.xml
           exp/runtime/gateway/snapshot_file_test.py
           exp/runtime/gateway/snapshot_file_windows_test.py
           exp/common/config/settings_test.py
           exp/cli/gateway/budget_test.py
+      - name: Require executed Windows kernel and budget cases
+        shell: bash
+        run: |
+          uv run python - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          cases = ET.parse("windows-budget-authority.xml").findall(".//testcase")
+          kernel = [case for case in cases if "snapshot_file_windows_test" in case.get("classname", "")]
+          assert len(kernel) >= 14, f"expected all Windows kernel cases, got {len(kernel)}"
+          required = {
+              "test_real_root_and_descendant_authoring_and_resource_override",
+              "test_budget_set_uses_existing_project_snapshot_resource_setting",
+              "test_noninteractive_budget_management_reports_integer_remaining",
+          }
+          authoring = [case for case in cases if case.get("name") in required]
+          assert {case.get("name") for case in authoring} == required
+          for case in kernel + authoring:
+              assert not any(case.find(tag) is not None for tag in ("skipped", "failure", "error")), case.attrib
+          PY
 
   w16-darwin-evidence:
     runs-on: macos-latest
