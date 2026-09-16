@@ -1,6 +1,10 @@
-"""Real CPU LoRA optimizer, EMA, exact-token, checkpoint, and GPU-boundary tests."""
+"""Upstream worker configuration contracts and explicit opt-in CUDA training proof.
 
-import copy
+CPU tests do not claim to execute veRL's CUDA-only FSDP optimizer. The separate
+GPU test runs real worker initialization, updates, native resume and PEFT export.
+"""
+
+import os
 from pathlib import Path
 from typing import cast
 
@@ -10,13 +14,23 @@ from safetensors.torch import load_file
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
-from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
+from transformers import (
+    GPT2Config,
+    GPT2LMHeadModel,
+    PreTrainedTokenizerFast,
+    Qwen3_5Config,
+    Qwen3_5ForConditionalGeneration,
+)
+from verl.workers.engine import BaseEngine, FSDPEngineWithLMHead
 
 from exp.optimize.claas.backends.checkpoints import verify_checkpoint
+from exp.optimize.claas.backends.verl_engine import ClaasFeedbackEngine
 from exp.optimize.claas.backends.verl_worker import (
-    _teacher_context,
+    _validate_lineage,
+    _validate_model_reference,
     require_worker_runtime,
-    train_loaded_model,
+    train_local_snapshots,
+    worker_config,
 )
 from exp.optimize.claas.training_contracts import ClaasTrainingError, TrainingBatch, TrainingJob
 from exp.optimize.claas.training_contracts_test import example, job
@@ -26,18 +40,16 @@ def tokenizer() -> PreTrainedTokenizerFast:
     """Create a local eight-token tokenizer that cannot download model assets."""
     backend = Tokenizer(
         WordLevel(
-            {"[UNK]": 0, "a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6, "g": 7}, unk_token="[UNK]"
+            {"[UNK]": 0, "a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6, "g": 7},
+            unk_token="[UNK]",
         )
     )
     backend.pre_tokenizer = Whitespace()
     return PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
 
 
-def test_real_sdpo_update_resume_and_ema_checkpoint(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Backprop changes student LoRA weights and preserves teacher/optimizer on resume."""
-    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+def tiny_snapshot(path: Path) -> Path:
+    """Save deterministic tiny full-model and tokenizer fixtures without a download."""
     torch.manual_seed(1)
     config = GPT2Config.from_dict(
         {
@@ -48,51 +60,38 @@ def test_real_sdpo_update_resume_and_ema_checkpoint(
             "n_head": 2,
             "bos_token_id": 1,
             "eos_token_id": 7,
+            "attn_pdrop": 0.0,
+            "embd_pdrop": 0.0,
+            "resid_pdrop": 0.0,
         }
     )
-    base = GPT2LMHeadModel(config)
-    initial = copy.deepcopy(base)
-    first_job = job(tmp_path)
-    result = train_loaded_model(first_job, base, tokenizer(), torch.device("cpu"))
-    assert result.checkpoint.step == 1
-    assert result.metrics["gradient_norm"] > 0
-    verify_checkpoint(result.checkpoint, first_job.spec)
-    student = load_file(str(Path(result.checkpoint.path) / "student/adapter_model.safetensors"))
-    teacher = load_file(str(Path(result.checkpoint.path) / "teacher/adapter_model.safetensors"))
-    b_name = next(name for name in student if "lora_B" in name)
-    assert student[b_name].abs().sum() > 0
-    torch.testing.assert_close(
-        teacher[b_name], student[b_name] * first_job.spec.teacher_update_rate
-    )
-    second_batch = TrainingBatch(
-        batch_id="batch-2",
-        expected_policy_revision=result.checkpoint.policy_revision,
-        examples=(example(policy=result.checkpoint.policy_revision),),
-    )
-    second_job = TrainingJob(
-        spec=first_job.spec,
-        batch=second_batch,
-        checkpoint_root=str(tmp_path),
-        resume_checkpoint=result.checkpoint,
-    )
-    second = train_loaded_model(second_job, initial, tokenizer(), torch.device("cpu"))
-    assert second.checkpoint.step == 2
-    verify_checkpoint(second.checkpoint, first_job.spec)
-    state = torch.load(Path(second.checkpoint.path) / "optimizer.pt", weights_only=True)
-    assert all(float(cast(torch.Tensor, value["step"])) == 2 for value in state["state"].values())
-    with pytest.raises(ClaasTrainingError, match="already has a checkpoint"):
-        train_loaded_model(second_job, copy.deepcopy(initial), tokenizer(), torch.device("cpu"))
+    GPT2LMHeadModel(config).save_pretrained(path)
+    tokenizer().save_pretrained(path)
+    return path
 
 
-def test_feedback_context_keeps_original_token_ids() -> None:
-    """Feedback tokenization appends context and leaves sampled IDs unchanged."""
-    item = example()
-    context = _teacher_context(item, tokenizer(), 128)
-    assert context is not None and context[:2] == (1, 2)
-    assert item.experience.exact_tokens is not None
-    assert item.experience.exact_tokens.response_token_ids == (3, 4)
-    with pytest.raises(ValueError, match="shorten feedback"):
-        _teacher_context(item, tokenizer(), 4)
+def test_worker_config_selects_native_model_optimizer_and_checkpoint_ownership(
+    tmp_path: Path,
+) -> None:
+    """Exercise actual upstream typed configuration and inherited execution methods."""
+    snapshot = tiny_snapshot(tmp_path / "base")
+    training = job(tmp_path / "results")
+    actor = worker_config(training, snapshot, snapshot, teacher=False)
+    teacher = worker_config(training, snapshot, snapshot, teacher=True)
+    assert actor.model_config.local_path == str(snapshot)
+    assert actor.model_config.lora_rank == training.spec.lora_rank
+    assert actor.optimizer_config.lr == training.spec.learning_rate
+    assert actor.checkpoint_config.save_contents == ["model", "optimizer", "extra"]
+    assert actor.checkpoint_config.load_contents == ["model", "optimizer", "extra"]
+    assert actor.checkpoint_config.save_lora_only
+    assert teacher.engine_config.forward_only
+    assert teacher.checkpoint_config.save_contents == ["model"]
+    assert ClaasFeedbackEngine.initialize is FSDPEngineWithLMHead.initialize
+    assert ClaasFeedbackEngine.train_batch is BaseEngine.train_batch
+    assert ClaasFeedbackEngine.forward_backward_batch is FSDPEngineWithLMHead.forward_backward_batch
+    assert ClaasFeedbackEngine.optimizer_step is FSDPEngineWithLMHead.optimizer_step
+    assert ClaasFeedbackEngine.save_checkpoint is FSDPEngineWithLMHead.save_checkpoint
+    assert ClaasFeedbackEngine.load_checkpoint is FSDPEngineWithLMHead.load_checkpoint
 
 
 def test_gpu_placement_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -111,8 +110,6 @@ def test_gpu_placement_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_mutable_local_model_references_are_not_treated_as_pinned(tmp_path: Path) -> None:
     """A revision string cannot freeze model or tokenizer files in a mutable directory."""
-    from exp.optimize.claas.backends.verl_worker import _validate_model_reference
-
     with pytest.raises(ValueError, match="not revision-bound"):
         _validate_model_reference(str(tmp_path), "a" * 40)
     with pytest.raises(ValueError, match="immutable"):
@@ -120,63 +117,121 @@ def test_mutable_local_model_references_are_not_treated_as_pinned(tmp_path: Path
     _validate_model_reference("owner/model", "a" * 40)
 
 
-def test_checkpoint_flush_failure_cannot_publish_a_completion(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A disk flush failure leaves no complete directory that could be acknowledged."""
-    import os
+def test_duplicate_checkpoint_rejected_before_worker_launch(tmp_path: Path) -> None:
+    """An existing complete update cannot be replayed into its immutable directory."""
+    destination = tmp_path / "complete"
+    destination.mkdir()
+    with pytest.raises(ClaasTrainingError, match="already has a checkpoint"):
+        _validate_lineage(job(tmp_path), tmp_path, destination)
 
-    def fail_flush(_fd: int) -> None:
-        """Simulate failure before the atomic checkpoint publication boundary."""
-        raise OSError("checkpoint device failed")
 
-    config = GPT2Config.from_dict(
-        {"vocab_size": 8, "n_positions": 128, "n_embd": 16, "n_layer": 1, "n_head": 2}
+@pytest.mark.skipif(
+    os.environ.get("CLAAS_RUN_CUDA_INTEGRATION") != "1" or not torch.cuda.is_available(),
+    reason="requires explicit CLAAS_RUN_CUDA_INTEGRATION=1 and an authorized CUDA GPU",
+)
+def test_cuda_upstream_verl_update_native_resume_and_export(tmp_path: Path) -> None:
+    """Run unmocked veRL optimizer updates and prove its native Adam state resumes."""
+    snapshot = tiny_snapshot(tmp_path / "base")
+    first_job = job(tmp_path / "results")
+    first = train_local_snapshots(first_job, snapshot, snapshot)
+    manifest = verify_checkpoint(first.checkpoint, first_job.spec)
+    assert manifest.training_backend == "verl-fsdp-0.9.0"
+    assert first.metrics["grad_norm"] > 0
+    root = Path(first.checkpoint.path)
+    student = load_file(str(root / "student/adapter_model.safetensors"))
+    teacher = load_file(str(root / "teacher/adapter_model.safetensors"))
+    b_name = next(name for name in student if "lora_B" in name)
+    assert student[b_name].abs().sum() > 0
+    torch.testing.assert_close(
+        teacher[b_name].float(),
+        student[b_name].float() * first_job.spec.teacher_update_rate,
+        atol=1e-5,
+        rtol=0.02,
     )
-    monkeypatch.setattr(os, "fsync", fail_flush)
-    with pytest.raises(OSError, match="checkpoint device failed"):
-        train_loaded_model(job(tmp_path), GPT2LMHeadModel(config), tokenizer(), torch.device("cpu"))
-    assert not list(tmp_path.rglob("claas-*/manifest.json"))
-    assert not list(tmp_path.rglob(".checkpoint-*"))
-
-
-def test_rejected_candidate_can_resume_baseline_only_in_explicit_new_lineage(
-    tmp_path: Path,
-) -> None:
-    """A new cycle can branch from active state without weakening stale checks within a cycle."""
-    from exp.optimize.claas.training_contracts import next_policy_revision
-
-    config = GPT2Config.from_dict(
-        {"vocab_size": 8, "n_positions": 128, "n_embd": 16, "n_layer": 1, "n_head": 2}
-    )
-    initial = GPT2LMHeadModel(config)
-    first_job = job(tmp_path)
-    baseline = train_loaded_model(
-        first_job, copy.deepcopy(initial), tokenizer(), torch.device("cpu")
-    )
-    batch = TrainingBatch(
-        batch_id="candidate",
-        expected_policy_revision=baseline.checkpoint.policy_revision,
-        examples=(example(policy=baseline.checkpoint.policy_revision),),
-    )
-    candidate_job = TrainingJob(
+    second_job = TrainingJob(
         spec=first_job.spec,
-        batch=batch,
-        checkpoint_root=str(tmp_path),
-        resume_checkpoint=baseline.checkpoint,
+        checkpoint_root=first_job.checkpoint_root,
+        resume_checkpoint=first.checkpoint,
+        batch=TrainingBatch(
+            batch_id="batch-2",
+            expected_policy_revision=first.checkpoint.policy_revision,
+            examples=(example(policy=first.checkpoint.policy_revision),),
+        ),
     )
-    candidate = train_loaded_model(
-        candidate_job, copy.deepcopy(initial), tokenizer(), torch.device("cpu")
+    second = train_local_snapshots(second_job, snapshot, snapshot)
+    assert second.checkpoint.step == 2
+    state = torch.load(
+        Path(second.checkpoint.path) / "verl/actor/optim_world_size_1_rank_0.pt",
+        weights_only=True,
     )
-    retry_batch = batch.model_copy(update={"batch_id": "retry-after-rejection"})
-    stale = candidate_job.model_copy(update={"batch": retry_batch})
-    with pytest.raises(ClaasTrainingError, match="newer state"):
-        train_loaded_model(stale, copy.deepcopy(initial), tokenizer(), torch.device("cpu"))
-    next_cycle = stale.model_copy(update={"lineage_id": "cycle-after-rejection"})
-    assert next_policy_revision(stale) != next_policy_revision(next_cycle)
-    resumed = train_loaded_model(
-        next_cycle, copy.deepcopy(initial), tokenizer(), torch.device("cpu")
+    assert all(float(cast(torch.Tensor, value["step"])) == 2 for value in state["state"].values())
+    assert (
+        verify_checkpoint(second.checkpoint, first_job.spec).serving_adapter_directory == "student"
     )
-    assert resumed.checkpoint.step == candidate.checkpoint.step == 2
-    assert resumed.checkpoint.policy_history[1] == baseline.checkpoint.policy_revision
-    assert Path(resumed.checkpoint.path).parent != Path(candidate.checkpoint.path).parent
+
+
+def tiny_qwen() -> Qwen3_5ForConditionalGeneration:
+    """Create the actual hybrid text architecture plus tiny unused vision weights locally."""
+    config = Qwen3_5Config.from_dict(
+        {
+            "text_config": {
+                "vocab_size": 8,
+                "hidden_size": 32,
+                "intermediate_size": 48,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "max_position_embeddings": 128,
+                "tie_word_embeddings": True,
+                "linear_conv_kernel_dim": 4,
+                "linear_key_head_dim": 8,
+                "linear_value_head_dim": 8,
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 2,
+                "layer_types": ["linear_attention", "full_attention"],
+                "rope_parameters": {
+                    "rope_type": "default",
+                    "rope_theta": 10000,
+                    "partial_rotary_factor": 0.5,
+                    "mrope_section": [1, 1, 2],
+                },
+            },
+            "vision_config": {
+                "depth": 1,
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_heads": 2,
+                "out_hidden_size": 32,
+                "num_position_embeddings": 16,
+                "patch_size": 2,
+                "spatial_merge_size": 1,
+                "temporal_patch_size": 1,
+            },
+            "tie_word_embeddings": True,
+        }
+    )
+    config._attn_implementation = "eager"
+    return Qwen3_5ForConditionalGeneration(config)
+
+
+def test_upstream_lora_construction_preserves_original_qwen_wrapper_names(tmp_path: Path) -> None:
+    """Run upstream LoRA construction on CPU without claiming a CUDA optimizer update."""
+    model = tiny_qwen()
+    snapshot = tmp_path / "qwen"
+    model.save_pretrained(snapshot)
+    tokenizer().save_pretrained(snapshot)
+    training = job(tmp_path / "results")
+    training = training.model_copy(
+        update={"spec": training.spec.model_copy(update={"target_modules": ("q_proj", "v_proj")})}
+    )
+    config = worker_config(training, snapshot, snapshot, teacher=False)
+    engine = object.__new__(ClaasFeedbackEngine)
+    engine.model_config = config.model_config
+    adapted = engine._build_lora_module(model)
+    exported = tmp_path / "adapter"
+    adapted.save_pretrained(exported, safe_serialization=True)
+    weights = load_file(str(exported / "adapter_model.safetensors"))
+    assert weights
+    assert all(name.startswith("base_model.model.model.language_model.") for name in weights)
+    assert all("lora_" in name for name in weights)

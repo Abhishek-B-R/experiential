@@ -17,13 +17,20 @@ def checkpoint(root: Path) -> TrainingCheckpoint:
         "student/adapter_model.safetensors",
         "teacher/adapter_config.json",
         "teacher/adapter_model.safetensors",
-        "optimizer.pt",
+        "verl/actor/model_world_size_1_rank_0.pt",
+        "verl/actor/optim_world_size_1_rank_0.pt",
+        "verl/actor/extra_state_world_size_1_rank_0.pt",
+        "verl/actor/fsdp_config.json",
+        "verl/teacher/model_world_size_1_rank_0.pt",
+        "verl/teacher/fsdp_config.json",
     )
     for name in paths:
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"inert-test-payload")
     manifest = CheckpointManifest(
+        schema_version=2,
+        training_backend="verl-fsdp-0.9.0",
         spec=spec(),
         policy_revision="policy-1",
         parent_policy_revision="policy-0",
@@ -49,9 +56,21 @@ def test_verifies_before_loading_and_rejects_changed_payload(tmp_path: Path) -> 
     """A valid manifest does not authorize a subsequently changed optimizer pickle."""
     receipt = checkpoint(tmp_path)
     assert verify_checkpoint(receipt, spec()).step == 1
-    (tmp_path / "optimizer.pt").write_bytes(b"changed")
+    (tmp_path / "verl/actor/optim_world_size_1_rank_0.pt").write_bytes(b"changed")
     with pytest.raises(ValueError, match="missing or changed"):
         verify_checkpoint(receipt, spec())
+
+
+def test_checkpoint_requires_selected_serving_adapter_payloads(tmp_path: Path) -> None:
+    """A valid student checkpoint cannot claim a separate serving export that is absent."""
+    receipt = checkpoint(tmp_path)
+    manifest = verify_checkpoint(receipt, spec())
+    assert manifest.serving_adapter_directory == "student"
+    missing_serving = manifest.model_copy(update={"serving_adapter_directory": "serving"})
+    (tmp_path / "manifest.json").write_text(missing_serving.model_dump_json())
+    changed = receipt.model_copy(update={"manifest_sha256": sha256_json(missing_serving)})
+    with pytest.raises(ValueError, match="lacks.*serving"):
+        verify_checkpoint(changed, spec())
 
 
 def test_rejects_unbound_ancestry_and_extra_payload(tmp_path: Path) -> None:
@@ -74,8 +93,10 @@ def test_private_snapshot_keeps_verified_bytes_after_source_replacement(tmp_path
     with checkpoint_snapshot(receipt, spec()) as staged:
         assert staged is not None
         staged_root = Path(staged.path)
-        (tmp_path / "optimizer.pt").write_bytes(b"replacement")
-        assert (staged_root / "optimizer.pt").read_bytes() == b"inert-test-payload"
+        (tmp_path / "verl/actor/optim_world_size_1_rank_0.pt").write_bytes(b"replacement")
+        assert (
+            staged_root / "verl/actor/optim_world_size_1_rank_0.pt"
+        ).read_bytes() == b"inert-test-payload"
         verify_checkpoint(staged, spec())
     assert not staged_root.exists()
 
@@ -138,3 +159,19 @@ def test_result_verification_rejects_manifest_for_another_update(
     )
     with pytest.raises(ValueError, match="submitted update"):
         verify_training_result(submitted, result)
+
+
+def test_custom_optimizer_checkpoint_cannot_masquerade_as_native_verl(tmp_path: Path) -> None:
+    """A legacy manifest or standalone optimizer payload cannot satisfy native resume."""
+    import json
+
+    from pydantic import ValidationError
+
+    receipt = checkpoint(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    raw = json.loads(manifest_path.read_text())
+    del raw["schema_version"]
+    del raw["training_backend"]
+    manifest_path.write_text(json.dumps(raw))
+    with pytest.raises(ValidationError, match="schema_version"):
+        verify_checkpoint(receipt, spec())

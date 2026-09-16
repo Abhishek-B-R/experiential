@@ -740,13 +740,17 @@ dependencies = [
 
 [package.optional-dependencies]
 claas-verl = [
+    { name = "fastapi" },
     { name = "peft" },
     { name = "safetensors" },
     { name = "torch" },
+    { name = "transformers" },
+    { name = "uvicorn" },
     { name = "verl" },
 ]
 dev = [
     { name = "anthropic" },
+    { name = "fastapi" },
     { name = "maturin" },
     { name = "peft" },
     { name = "pytest" },
@@ -756,7 +760,9 @@ dev = [
     { name = "tinker" },
     { name = "tinker-cookbook" },
     { name = "torch" },
+    { name = "transformers" },
     { name = "ty" },
+    { name = "uvicorn" },
     { name = "verl" },
     { name = "websockets" },
 ]
@@ -774,6 +780,7 @@ requires-dist = [
     { name = "exp-gateway-native", directory = "exp/runtime/gateway/native" },
     { name = "experiential", extras = ["claas-verl"], marker = "extra == 'dev'" },
     { name = "experiential", extras = ["sft"], marker = "extra == 'dev'" },
+    { name = "fastapi", marker = "extra == 'claas-verl'", specifier = ">=0.115,<1" },
     { name = "filelock", specifier = ">=3.12" },
     { name = "google-auth", specifier = ">=2.35,<3" },
     { name = "google-re2", specifier = ">=1.1,<2" },
@@ -794,12 +801,30 @@ requires-dist = [
     { name = "tinker-cookbook", marker = "extra == 'sft'", specifier = ">=0.4.3,<0.5" },
     { name = "tomli-w", specifier = ">=1.0" },
     { name = "torch", marker = "extra == 'claas-verl'", specifier = ">=2.9,<2.14" },
+    { name = "transformers", marker = "extra == 'claas-verl'", specifier = ">=5.5.4,<5.6" },
     { name = "ty", marker = "extra == 'dev'", specifier = ">=0.0.1a1" },
     { name = "typer", specifier = ">=0.16" },
+    { name = "uvicorn", marker = "extra == 'claas-verl'", specifier = ">=0.30,<1" },
     { name = "verl", marker = "extra == 'claas-verl'", specifier = "==0.9.0" },
     { name = "websockets", marker = "extra == 'dev'", specifier = ">=14,<16" },
 ]
 provides-extras = ["sft", "claas-verl", "dev"]
+
+[[package]]
+name = "fastapi"
+version = "0.141.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "annotated-doc" },
+    { name = "pydantic" },
+    { name = "starlette" },
+    { name = "typing-extensions" },
+    { name = "typing-inspection" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8a/02/91e3416a8fdd715abb903a952a6bec7cdd8d14eed55d415fc8595524c319/fastapi-0.141.1.tar.gz", hash = "sha256:e8822fc40db1e1858054d7a949a888695bc9bdce70139178e33bd2871a453ca1", size = 425799, upload-time = "2026-07-29T17:18:05.568Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cb/03/10388a42375ee7e4ac9b94eb2c5c569c8b5795e377e701c9ac3ad63de890/fastapi-0.141.1-py3-none-any.whl", hash = "sha256:bfb91aa2d334c61cb35ba9a116fc123b3d3df31640b801cf57a7a78ec3f603b3", size = 131954, upload-time = "2026-07-29T17:18:04.364Z" },
+]
 
 [[package]]
 name = "filelock"
@@ -3279,6 +3304,19 @@ wheels = [
 ]
 
 [[package]]
+name = "starlette"
+version = "1.6.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b5/b4/205b0d5241d934e8add0c38aa924c4f9fb7330834ff11e5444db964ec3f9/starlette-1.6.0.tar.gz", hash = "sha256:d4e3ac5e546444960c710297a3c9fc3f7ebae1b7e963f3d36173b49da535be9b", size = 2716969, upload-time = "2026-08-08T18:27:57.512Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c8/cb/6a6a47d5b464bd08695d254f3da6e7986cc70c9fa5d778eda57538edfe56/starlette-1.6.0-py3-none-any.whl", hash = "sha256:a86dd39d14bb45f85a3d18525215a9ef0cfd1f192ac793220e72598c90335f0c", size = 75969, upload-time = "2026-08-08T18:27:56.196Z" },
+]
+
+[[package]]
 name = "sympy"
 version = "1.14.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3677,6 +3715,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/53/0c/06f8b233b8fd13b9e5ee11424ef85419ba0d8ba0b3138bf360be2ff56953/urllib3-2.7.0.tar.gz", hash = "sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c", size = 433602, upload-time = "2026-05-07T16:13:18.596Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7f/3e/5db95bcf282c52709639744ca2a8b149baccf648e39c8cc87553df9eae0c/urllib3-2.7.0-py3-none-any.whl", hash = "sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897", size = 131087, upload-time = "2026-05-07T16:13:17.151Z" },
+]
+
+[[package]]
+name = "uvicorn"
+version = "0.53.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "h11" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5d/ad/04bbb797c84fc1f26cb171f7394716f4865ffb8d8c5e1eef42565c2dfa6b/uvicorn-0.53.0.tar.gz", hash = "sha256:a9356f0cb89b3b8621529c5d5eebd69bfe154f4c3f68b4cf2de47e45fa855c2e", size = 110881, upload-time = "2026-09-14T07:44:23.815Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/76/18/0eea75741ee812e9f598b687619ce2454f6c3a1c5cd21ea990ec6bd26f45/uvicorn-0.53.0-py3-none-any.whl", hash = "sha256:e8dca71ec86dce5f04e333f0d56cdedf942446e6643b9cea1af0d6d3a02cb03e", size = 87081, upload-time = "2026-09-14T07:44:22.179Z" },
 ]
 
 [[package]]

@@ -79,6 +79,15 @@ class TrainingExample(ContractModel):
         return self
 
 
+def teacher_feedback_text(feedback: str) -> str:
+    """Format only newly supplied teacher context, without rewriting original rollout tokens."""
+    return (
+        "\n\nFeedback from a previous attempt:\n"
+        + feedback
+        + "\n\nUsing this feedback, produce the best response to the original request.\n"
+    )
+
+
 class TrainingBatch(ContractModel):
     """One optimizer update bound to the currently served policy revision."""
 
