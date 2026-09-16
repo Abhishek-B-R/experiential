@@ -842,17 +842,12 @@ reasoning on is dropped and disclosed as `temperature->dropped(set_reasoning_eff
 than rejected — the model accepts sampling, just not at that effort, so the request serves and the
 caller is told how to keep the value (set `reasoning_effort=none`); a route that never declares the
 control at all (Anthropic constrained `[1,1]` sampling) still hard-rejects it, since there is
-nothing to honor at any effort. `top_k` follows the same honor-or-narrow shape: selection prefers a
-rung that carries it, and a committed route with no supporting rung (an Azure `openai_deployments`
-DeepSeek rung rejects it upstream) drops it with `top_k->dropped(unsupported_by_provider)` rather
-than rejecting, since a rung's default sampling still returns a valid answer. `frequency_penalty`
-and `presence_penalty` are admitted at the ingress and adapted the same way: honored (emitted) where
-every rung supports them (the per-rung `supports_frequency_penalty`/`supports_presence_penalty`
-capability truth), dropped as `frequency_penalty->dropped(unsupported_by_provider)` where a rung does
-not — a soft preference whose absence still returns a valid answer. `top_logprobs` stays rejected
-(not admitted): the gateway response contract does not project logprob arrays yet, so it cannot be
-honored on any rung and silently dropping a probability request is never acceptable — the reject is
-the honest terminal until output normalization emits logprobs. A caller
+nothing to honor at any effort. `top_k` prefers a carrying rung; when no rung supports it,
+admission drops it with `top_k->dropped(unsupported_by_provider)` because defaults still serve.
+`frequency_penalty` and `presence_penalty` follow their per-rung capability truth and otherwise
+drop with `<parameter>->dropped(unsupported_by_provider)`. These are soft preferences.
+`top_logprobs` remains a named rejection until the response contract can project logprob arrays.
+A caller
 `response_format: {type: "json_object"}` requests schema-free JSON output. OpenAI-compatible
 rungs use native JSON mode, Responses rungs use `text.format: {type: "json_object"}`, and
 Gemini uses `responseMimeType: "application/json"` without a schema. Anthropic/Bedrock use a
