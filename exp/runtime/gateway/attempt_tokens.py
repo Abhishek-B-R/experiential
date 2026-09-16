@@ -31,6 +31,7 @@ from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
+from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.gateway.replay_identity import provider_replay_authority
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 
@@ -187,6 +188,11 @@ def _count_completion_prompt(request: GatewayRequest, counter: _PromptCounter) -
         if tool.description is not None:
             counter.text(tool.description)
         counter.json(tool.parameters)
+    if request.json_object_output:
+        # Every wire receives the object instruction, including native JSON
+        # modes whose provider requires JSON to be named in the input.
+        counter.fixed(MESSAGE_FRAMING_TOKENS)
+        counter.text(JSON_OBJECT_SYSTEM_INSTRUCTION)
     if request.structured_text is not None:
         counter.text(request.structured_text.name)
         if request.structured_text.description is not None:

@@ -7,7 +7,7 @@ from typing import Literal
 import pytest
 from pydantic import ValidationError
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.models.model import ToolCall
 from exp.runtime.gateway.compatibility import (
     CompatibilityDisposition,
@@ -27,7 +27,9 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
     ProjectTarget,
+    StructuredTextFormat,
 )
+from exp.runtime.gateway.replay_identity import canonical_request_sha256
 
 
 def test_gateway_request_preserves_developer_and_raw_tool_history() -> None:
@@ -1014,6 +1016,35 @@ def test_service_tier_is_serialization_inert_but_binds_replay_identity() -> None
             surface=GatewayApiSurface.MESSAGES,
             messages=messages,
             service_tier="flex",
+        )
+
+
+def test_json_object_output_is_serialization_inert_but_binds_replay_identity() -> None:
+    """Mode-free Chat digests are untouched; an enabled JSON mode is its own operation."""
+    messages = (GatewayMessage(role="user", content="hi"),)
+    bare = GatewayRequest(surface=GatewayApiSurface.CHAT_COMPLETIONS, messages=messages)
+    json_mode = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=messages,
+        json_object_output=True,
+    )
+    assert "json_object_output" not in bare.model_dump(mode="json")
+    assert json_mode.model_dump(mode="json") == bare.model_dump(mode="json")
+    assert sha256_json(json_mode) == sha256_json(bare)
+    assert canonical_request_sha256(bare) == sha256_json(bare)
+    assert canonical_request_sha256(json_mode) != canonical_request_sha256(bare)
+    with pytest.raises(ValidationError, match="mutually exclusive"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=messages,
+            json_object_output=True,
+            structured_text=StructuredTextFormat(name="out", json_schema={"type": "object"}),
+        )
+    with pytest.raises(ValidationError, match="valid only for Chat Completions"):
+        GatewayRequest(
+            surface=GatewayApiSurface.MESSAGES,
+            messages=messages,
+            json_object_output=True,
         )
 
 

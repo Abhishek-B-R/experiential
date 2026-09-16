@@ -842,24 +842,19 @@ reasoning on is dropped and disclosed as `temperature->dropped(set_reasoning_eff
 than rejected — the model accepts sampling, just not at that effort, so the request serves and the
 caller is told how to keep the value (set `reasoning_effort=none`); a route that never declares the
 control at all (Anthropic constrained `[1,1]` sampling) still hard-rejects it, since there is
-nothing to honor at any effort. `top_k` follows the same honor-or-narrow shape: selection prefers a
-rung that carries it, and a committed route with no supporting rung (an Azure `openai_deployments`
-DeepSeek rung rejects it upstream) drops it with `top_k->dropped(unsupported_by_provider)` rather
-than rejecting, since a rung's default sampling still returns a valid answer. `frequency_penalty`
-and `presence_penalty` are admitted at the ingress and adapted the same way: honored (emitted) where
-every rung supports them (the per-rung `supports_frequency_penalty`/`supports_presence_penalty`
-capability truth), dropped as `frequency_penalty->dropped(unsupported_by_provider)` where a rung does
-not — a soft preference whose absence still returns a valid answer. `top_logprobs` stays rejected
-(not admitted): the gateway response contract does not project logprob arrays yet, so it cannot be
-honored on any rung and silently dropping a probability request is never acceptable — the reject is
-the honest terminal until output normalization emits logprobs. A caller
-`response_format: {type: "json_object"}` is TRANSLATED, not dropped: it is admitted at the Chat
-ingress and rewritten to a permissive non-strict `json_schema` (`{"type":"object"}`, "any JSON
-object") — the serving lanes emit only `json_schema`, so this preserves the caller's JSON intent on
-every rung (dropping it would hand prose to a caller who asked for JSON) — and disclosed as
-`response_format->translated(json_object)`; a non-strict schema is left open (never force-closed to
-`additionalProperties:false`), so its "any object" meaning is not inverted on a schema-closing
-(Anthropic) rung. A caller `service_tier` on the OpenAI-family surfaces forwards verbatim
+nothing to honor at any effort. `top_k` prefers a carrying rung; when no rung supports it,
+admission drops it with `top_k->dropped(unsupported_by_provider)` because defaults still serve.
+`frequency_penalty` and `presence_penalty` follow their per-rung capability truth and otherwise
+drop with `<parameter>->dropped(unsupported_by_provider)`. These are soft preferences.
+`top_logprobs` remains a named rejection until the response contract can project logprob arrays.
+A caller
+`response_format: {type: "json_object"}` requests schema-free JSON output. OpenAI-compatible
+rungs use native JSON mode, Responses rungs use `text.format: {type: "json_object"}`, and
+Gemini uses `responseMimeType: "application/json"` without a schema. Anthropic/Bedrock use a
+best-effort system instruction, disclosed as `response_format->instruction(json_object)`.
+Every wire receives a counted JSON-object instruction; native format fields are retained.
+No empty schema is synthesized. Use `json_schema` when a supported route must enforce a shape.
+A caller `service_tier` on the OpenAI-family surfaces forwards verbatim
 only on rungs dispatching tenant-owned (BYOK) credentials, where the caller pays the provider
 directly; host-funded rungs never emit it (the tier changes provider pricing while the gateway
 bills catalog rates) and a route with no eligible rung drops it with disclosure. Anthropic's own

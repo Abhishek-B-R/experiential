@@ -66,7 +66,7 @@ from exp.runtime.openai_protocol.responses_probe import (
     require_responses_text_spelling,
 )
 from exp.runtime.openai_protocol.structured_text import (
-    JSON_OBJECT_TRANSLATION_DISCLOSURE,
+    chat_json_object_output,
     chat_structured_text,
     responses_structured_text,
 )
@@ -240,11 +240,6 @@ def decode_chat(
         else request.stop
     )
     thinking = translate_enable_thinking(request)
-    json_object_disclosure = (
-        (JSON_OBJECT_TRANSLATION_DISCLOSURE,)
-        if request.response_format is not None and request.response_format.type == "json_object"
-        else ()
-    )
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.CHAT_COMPLETIONS,
@@ -253,9 +248,9 @@ def decode_chat(
             tool_choice=_chat_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=chat_structured_text(request.response_format),
+            json_object_output=chat_json_object_output(request.response_format),
             ignored_parameters=(
                 *alias_disclosures,
-                *json_object_disclosure,
                 *thinking.disclosures,
                 *_replayed_reasoning_disclosures(request.messages),
             ),

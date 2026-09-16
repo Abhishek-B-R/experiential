@@ -44,6 +44,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
+from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.gateway.reasoning_blocks import EncryptedReasoningBlock
 from exp.runtime.gateway.replay_identity import provider_replay_authority
 from exp.runtime.gateway.reservation_tokenizer import RESERVATION_ENCODING, reservation_encoder
@@ -765,3 +766,17 @@ def test_messages_estimate_counts_system_every_turn_and_the_tools() -> None:
     # reservation BPE); twelve tools plus the fixed tool-use preamble.
     assert full - without_system > 1_200, (full, without_system)
     assert full - without_tools > TOOLS_PRESENT_TOKENS + 12 * 30, (full, without_tools)
+
+
+def test_json_object_estimate_covers_the_provider_instruction() -> None:
+    """JSON mode reserves the full system instruction sent to every provider."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="Give one value."),),
+    )
+    json_request = request.model_copy(update={"json_object_output": True})
+    instruction_tokens = len(reservation_encoder().encode(JSON_OBJECT_SYSTEM_INSTRUCTION))
+
+    assert counted_input_tokens(json_request) - counted_input_tokens(request) >= (
+        MESSAGE_FRAMING_TOKENS + instruction_tokens
+    )
