@@ -113,3 +113,31 @@ def test_close_during_process_creation_waits_for_owned_worker_cleanup(
         assert all(process.returncode is not None for process in processes)
 
     asyncio.run(run())
+
+
+def test_failure_diagnostic_retains_bounded_tail(tmp_path: Path) -> None:
+    """A useful terminal exception survives temporary worker-log cleanup."""
+    from exp.optimize.claas.backends.subprocess import _worker_diagnostic
+
+    log = tmp_path / "worker.log"
+    log.write_bytes(b"earlier-output" * 10000 + b"\nCUDA out of memory\n")
+    diagnostic = _worker_diagnostic(log)
+    assert diagnostic.endswith("CUDA out of memory\n")
+    assert len(diagnostic.encode()) <= 8192
+
+
+def test_worker_environment_drops_unrelated_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The optional ML process receives only its explicit model token and runtime settings."""
+    from exp.optimize.claas.backends.subprocess import _worker_environment
+
+    monkeypatch.setenv("OPENAI_API_KEY", "gateway-secret-canary")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "cloud-secret-canary")
+    monkeypatch.setenv("HF_TOKEN", "implicit-token-canary")
+    monkeypatch.setenv("VERL_USE_EXTERNAL_MODULES", "unapproved.module")
+    environment = _worker_environment("0", None)
+    assert "OPENAI_API_KEY" not in environment
+    assert "AWS_SECRET_ACCESS_KEY" not in environment
+    assert "HF_TOKEN" not in environment
+    assert "VERL_USE_EXTERNAL_MODULES" not in environment
+    assert environment["HF_HUB_DISABLE_IMPLICIT_TOKEN"] == "1"
+    assert _worker_environment("0", "explicit-worker-token")["HF_TOKEN"] == "explicit-worker-token"

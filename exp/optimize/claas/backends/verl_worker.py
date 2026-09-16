@@ -37,8 +37,15 @@ from transformers import (
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from exp.common.core.artifacts import sha256_json
+from exp.common.core.files import fsync_directory_best_effort
 from exp.optimize.claas.algorithms.sdpo import feedback_objective
-from exp.optimize.claas.backends.checkpoints import CheckpointManifest, hash_file, verify_checkpoint
+from exp.optimize.claas.backends.checkpoints import (
+    CheckpointManifest,
+    checkpoint_snapshot,
+    hash_file,
+    verify_checkpoint,
+    verify_training_result,
+)
 from exp.optimize.claas.training_contracts import (
     ClaasTrainingError,
     TrainingCheckpoint,
@@ -67,11 +74,10 @@ def require_worker_runtime() -> None:
 
 
 def _validate_model_reference(identifier: str, revision: str) -> None:
-    """Require pinned Hugging Face commits or an explicit existing local model path."""
-    if Path(identifier).is_absolute():
-        if not Path(identifier).is_dir():
-            raise ValueError("local model or tokenizer directory does not exist")
-    elif re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+    """Require immutable remote revisions until local base-content digests are supported."""
+    if Path(identifier).is_absolute() or Path(identifier).exists():
+        raise ValueError("mutable local model/tokenizer directories are not revision-bound")
+    if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
         raise ValueError(
             "remote model and tokenizer revisions must be immutable 40-character commits"
         )
@@ -92,7 +98,10 @@ def execute_training_job(job: TrainingJob) -> TrainingResult:
         verify_checkpoint(job.resume_checkpoint, job.spec)
     torch.manual_seed(job.spec.seed)
     tokenizer = AutoTokenizer.from_pretrained(
-        job.spec.tokenizer_id, revision=job.spec.tokenizer_revision, trust_remote_code=False
+        job.spec.tokenizer_id,
+        revision=job.spec.tokenizer_revision,
+        trust_remote_code=False,
+        token=os.environ.get("HF_TOKEN"),
     )
     if not isinstance(tokenizer, PreTrainedTokenizerBase):
         raise ValueError("model tokenizer must implement the Hugging Face text tokenizer contract")
@@ -100,6 +109,7 @@ def execute_training_job(job: TrainingJob) -> TrainingResult:
         job.spec.base_model,
         revision=job.spec.model_revision,
         trust_remote_code=False,
+        token=os.environ.get("HF_TOKEN"),
         dtype=torch.bfloat16,
         attn_implementation="eager",
     )
@@ -195,11 +205,25 @@ def train_loaded_model(
     This seam performs the same forward, backward, optimizer, EMA, and checkpoint
     operations as the CUDA entrypoint. It does not download or select compute.
     """
-    if job.resume_checkpoint:
-        verify_checkpoint(job.resume_checkpoint, job.spec)
+    with checkpoint_snapshot(job.resume_checkpoint, job.spec) as resume:
+        staged_job = job.model_copy(update={"resume_checkpoint": resume})
+        return _train_verified_model(staged_job, base, tokenizer, device)
+
+
+def _train_verified_model(
+    job: TrainingJob,
+    base: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    device: torch.device,
+) -> TrainingResult:
+    """Consume private verified resume files while holding the application update lock."""
     root = Path(job.checkpoint_root).resolve()
-    adapter_root = root / sha256_json(
-        {"scope": job.spec.scope.model_dump(mode="json"), "adapter_id": job.spec.adapter_id}
+    adapter_root = (
+        root
+        / sha256_json(
+            {"scope": job.spec.scope.model_dump(mode="json"), "adapter_id": job.spec.adapter_id}
+        )
+        / sha256_json({"lineage_id": job.lineage_id})
     )
     adapter_root.mkdir(parents=True, exist_ok=True)
     with FileLock(adapter_root / ".training.lock", timeout=0):
@@ -338,9 +362,22 @@ def _save_result(
                 item.experience.experience_id for item in job.batch.examples
             ),
             files=files,
+            lineage_id=job.lineage_id,
         )
         (temporary / "manifest.json").write_text(manifest.model_dump_json(indent=2))
+        for path in temporary.rglob("*"):
+            if path.is_file():
+                with path.open("rb") as handle:
+                    os.fsync(handle.fileno())
+        for directory in sorted(
+            (path for path in temporary.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        ):
+            fsync_directory_best_effort(directory)
+        fsync_directory_best_effort(temporary)
         temporary.rename(destination)
+        fsync_directory_best_effort(destination.parent)
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
@@ -354,11 +391,13 @@ def _save_result(
         manifest_sha256=sha256_json(manifest),
     )
     verify_checkpoint(checkpoint, job.spec)
-    return TrainingResult(
+    result = TrainingResult(
         checkpoint=checkpoint,
         metrics=metrics,
         consumed_experience_ids=manifest.consumed_experience_ids,
     )
+    verify_training_result(job, result)
+    return result
 
 
 def main() -> None:

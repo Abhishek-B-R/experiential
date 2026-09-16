@@ -47,6 +47,10 @@ def feedback_objective(
         raise ValueError("student logits must align with every original response token")
     if rollout_logprobs.shape != response_tokens.shape or batch_response_tokens < 1:
         raise ValueError("rollout probabilities and normalization must cover the original response")
+    if spec.objective == "hybrid" and (teacher_logits is None or scalar_reward is None):
+        raise ValueError(
+            "hybrid requires both feedback-conditioned teacher logits and scalar reward"
+        )
     student_lp = F.log_softmax(student_logits.float(), dim=-1)
     chosen_lp = student_lp.gather(-1, response_tokens.unsqueeze(-1)).squeeze(-1).unsqueeze(0)
     old_lp = rollout_logprobs.float().unsqueeze(0)

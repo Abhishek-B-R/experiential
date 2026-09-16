@@ -64,3 +64,77 @@ def test_rejects_unbound_ancestry_and_extra_payload(tmp_path: Path) -> None:
     (tmp_path / "extra.pt").write_bytes(b"untracked")
     with pytest.raises(ValueError, match="outside"):
         verify_checkpoint(receipt, spec())
+
+
+def test_private_snapshot_keeps_verified_bytes_after_source_replacement(tmp_path: Path) -> None:
+    """Concurrent source writes after staging cannot change the paths used by loaders."""
+    from exp.optimize.claas.backends.checkpoints import checkpoint_snapshot
+
+    receipt = checkpoint(tmp_path)
+    with checkpoint_snapshot(receipt, spec()) as staged:
+        assert staged is not None
+        staged_root = Path(staged.path)
+        (tmp_path / "optimizer.pt").write_bytes(b"replacement")
+        assert (staged_root / "optimizer.pt").read_bytes() == b"inert-test-payload"
+        verify_checkpoint(staged, spec())
+    assert not staged_root.exists()
+
+
+def test_snapshot_rejects_content_changed_during_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Changing source bytes between verification and copy cannot become resumable state."""
+    import shutil
+
+    from exp.optimize.claas.backends.checkpoints import checkpoint_snapshot
+
+    receipt = checkpoint(tmp_path)
+    original = shutil.copyfile
+
+    def changed_copy(source: Path, target: Path) -> Path:
+        """Replace a payload immediately before its staging read."""
+        source.write_bytes(b"changed-during-copy")
+        return original(source, target)
+
+    monkeypatch.setattr(shutil, "copyfile", changed_copy)
+    with (
+        pytest.raises(ValueError, match="changed while staging"),
+        checkpoint_snapshot(receipt, spec()),
+    ):
+        pytest.fail("unverified state must never reach a loader")
+
+
+@pytest.mark.parametrize("field", ["batch_id", "parent_policy_revision", "consumed_experience_ids"])
+def test_result_verification_rejects_manifest_for_another_update(
+    tmp_path: Path, field: str
+) -> None:
+    """Valid file hashes and plausible outer receipt labels cannot hide a different batch."""
+    from exp.optimize.claas.backends.checkpoints import verify_training_result
+    from exp.optimize.claas.training_contracts import TrainingResult, next_policy_revision
+    from exp.optimize.claas.training_contracts_test import job
+
+    submitted = job(tmp_path)
+    receipt = checkpoint(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest = CheckpointManifest.model_validate_json(manifest_path.read_text()).model_copy(
+        update={
+            "policy_revision": next_policy_revision(submitted),
+            "policy_history": (next_policy_revision(submitted), "policy-0"),
+        }
+    )
+    manifest = manifest.model_copy(
+        update={field: ("foreign",) if field == "consumed_experience_ids" else "foreign"}
+    )
+    manifest_path.write_text(manifest.model_dump_json())
+    receipt = receipt.model_copy(
+        update={
+            "manifest_sha256": sha256_json(manifest),
+            "policy_revision": manifest.policy_revision,
+            "policy_history": manifest.policy_history,
+        }
+    )
+    result = TrainingResult(
+        checkpoint=receipt, consumed_experience_ids=("experience-1",), metrics={}
+    )
+    with pytest.raises(ValueError, match="submitted update"):
+        verify_training_result(submitted, result)
