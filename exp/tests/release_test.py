@@ -189,7 +189,14 @@ def _sdist_metadata(archive: tarfile.TarFile) -> str:
 
 
 def _metadata_requirements(metadata: str) -> tuple[tuple[str, str], ...]:
-    """Return normalized dependency names and markers from metadata headers only."""
+    """Return normalized dependency names and markers from metadata headers only.
+
+    Args:
+        metadata: Complete wheel METADATA or sdist PKG-INFO text.
+
+    Returns:
+        Dependency names paired with their environment-marker text.
+    """
     requirements: list[tuple[str, str]] = []
     headers = Parser().parsestr(metadata, headersonly=True)
     for requirement in headers.get_all("Requires-Dist", []):
@@ -201,7 +208,14 @@ def _metadata_requirements(metadata: str) -> tuple[tuple[str, str], ...]:
 
 
 def _assert_allowed_requirements(metadata: str) -> None:
-    """Reject forbidden dependencies, permitting Anthropic solely in the dev extra."""
+    """Reject forbidden dependencies, permitting Anthropic solely in the dev extra.
+
+    Args:
+        metadata: Complete wheel METADATA or sdist PKG-INFO text.
+
+    Raises:
+        AssertionError: A forbidden dependency appears outside the sole dev SDK exception.
+    """
     for name, marker in _metadata_requirements(metadata):
         allowed_dev_sdk = name == "anthropic" and re.fullmatch(r"extra\s*==\s*(['\"])dev\1", marker)
         assert name not in FORBIDDEN_REQUIREMENTS or allowed_dev_sdk, (
@@ -210,11 +224,18 @@ def _assert_allowed_requirements(metadata: str) -> None:
 
 
 def _core_requirement_names(metadata: str) -> frozenset[str]:
-    """Return normalized non-extra dependency names from package metadata."""
+    """Return dependencies unless gated solely by one named extra equality.
+
+    Args:
+        metadata: Complete wheel METADATA or sdist PKG-INFO text.
+
+    Returns:
+        Normalized names, conservatively retaining mixed or runtime-capable markers.
+    """
     return frozenset(
         name
         for name, marker in _metadata_requirements(metadata)
-        if not re.search(r"\bextra\s*==", marker)
+        if not re.fullmatch(r"extra\s*==\s*(['\"])[A-Za-z0-9][A-Za-z0-9._-]*\1", marker)
     )
 
 
@@ -3190,6 +3211,24 @@ def test_release_requirement_headers_ignore_description_body() -> None:
     )
     _assert_allowed_requirements(metadata)
     assert _core_requirement_names(metadata) == {"google-auth", "click"}
+
+
+def test_release_core_requirements_retain_runtime_capable_extra_markers() -> None:
+    """Runtime-active OR and empty-extra markers cannot hide a new core dependency."""
+    core_headers = "\n".join(f"Requires-Dist: {name}" for name in REQUIRED_CORE_REQUIREMENTS)
+    for marker in (
+        'extra == "dev" or python_version >= "3.12"',
+        'python_version >= "3.12" or extra == "dev"',
+        'extra == ""',
+        'extra != "dev"',
+    ):
+        metadata = f"{core_headers}\nRequires-Dist: unexpected-runtime-package; {marker}\n\n"
+        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS | {
+            "unexpected-runtime-package"
+        }
+    for marker in ('extra == "dev"', "extra == 'sft'"):
+        metadata = f"{core_headers}\nRequires-Dist: optional-package; {marker}\n\n"
+        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
 
 
 def test_built_archives_match_current_package_contract() -> None:
