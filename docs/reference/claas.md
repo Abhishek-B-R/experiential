@@ -90,7 +90,9 @@ The source's bounded context is persisted and hash-bound to the cycle report bef
 ## Local setup and optional traffic workflow
 
 `exp optimize claas init APPLICATION` configures pinned base/tokenizer revisions, LoRA settings,
-finite cycle limits, and the compute selection. Its generic `config.json` requires no provider
+finite cycle limits, and the compute selection. Configuration schema 3 is required; unsupported
+state is rejected before source selection. Create a fresh application directory and retain the
+unsupported state separately for reconciliation. The generic `config.json` requires no provider
 alias. Supplying both `--world-model` and `--judge` additionally selects the traffic workflow and
 writes `traffic-workflow.json`. That workflow composes source selection, failure mining, scenario
 synthesis, a world-model harness, and provider-backed evaluation outside the learning core.
