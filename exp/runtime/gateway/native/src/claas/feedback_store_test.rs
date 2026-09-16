@@ -21,7 +21,7 @@ impl Fixture {
         connection
             .execute_batch(
                 "CREATE TABLE claas_experiences (
-            user_id TEXT,application_id TEXT,response_id TEXT,expires_at INTEGER,payload TEXT);",
+            user_id TEXT,application_id TEXT,response_id TEXT,expires_at INTEGER,payload TEXT,payload_bytes INTEGER);",
             )
             .unwrap();
         initialize(&connection).unwrap();
@@ -46,8 +46,8 @@ impl Fixture {
         Connection::open(&self.path)
             .unwrap()
             .execute(
-                "INSERT INTO claas_experiences VALUES ('user','app',?1,100,?2)",
-                params![id, payload.to_string()],
+                "INSERT INTO claas_experiences VALUES ('user','app',?1,100,?2,?3)",
+                params![id, payload.to_string(), payload.to_string().len() as i64],
             )
             .unwrap();
     }
@@ -215,7 +215,7 @@ fn eviction_and_expiration_remove_all_dependent_feedback_and_members() {
 fn capacity_and_storage_failure_never_acknowledge_or_erase_prior_feedback() {
     let mut fixture = Fixture::new();
     fixture.capture("one", None);
-    fixture.policy.maximum_experiences = 1;
+    fixture.policy.maximum_experiences = 2;
     fixture.feedback(feedback()).unwrap();
     let mut second = feedback();
     second.feedback_id = "second".into();
@@ -271,4 +271,25 @@ fn scalar_and_binary_are_strict_and_missing_does_not_become_zero() {
     request.success = Some(false);
     assert!(request.validate().is_ok());
     assert!(request.reward.is_none());
+}
+
+#[test]
+fn feedback_byte_limit_counts_capture_payloads() {
+    let original = Fixture::new();
+    original.capture("one", None);
+    let record = original.feedback(feedback()).unwrap()["record"].clone();
+    let record_bytes = serde_json::to_string(&record).unwrap().len();
+    let mut fixture = Fixture::new();
+    fixture.capture("one", None);
+    let captured: usize = Connection::open(&fixture.path)
+        .unwrap()
+        .query_row("SELECT payload_bytes FROM claas_experiences", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap() as usize;
+    fixture.policy.maximum_storage_bytes = record_bytes + captured - 1;
+    fixture.policy.maximum_experience_bytes = fixture.policy.maximum_storage_bytes;
+    assert_eq!(fixture.feedback(feedback()), Err(FeedbackError::Capacity));
+    fixture.policy.maximum_storage_bytes += 1;
+    assert!(fixture.feedback(feedback()).is_ok());
 }

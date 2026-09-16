@@ -7,7 +7,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde_json::Value;
 
 use super::{CaptureConfiguration, Policy};
@@ -293,6 +293,20 @@ fn persist(connection: &mut Connection, item: Pending) -> rusqlite::Result<()> {
 }
 
 fn prune(connection: &Connection, policy: &Policy, timestamp: u64) -> rusqlite::Result<()> {
+    if connection.is_autocommit() {
+        let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
+        prune_retained(&transaction, policy, timestamp)?;
+        transaction.commit()
+    } else {
+        prune_retained(connection, policy, timestamp)
+    }
+}
+
+fn prune_retained(
+    connection: &Connection,
+    policy: &Policy,
+    timestamp: u64,
+) -> rusqlite::Result<()> {
     connection.execute(
         "DELETE FROM claas_experiences WHERE user_id=?1 AND application_id=?2 AND expires_at<=?3",
         params![
@@ -301,6 +315,21 @@ fn prune(connection: &Connection, policy: &Policy, timestamp: u64) -> rusqlite::
             timestamp as i64
         ],
     )?;
+    super::feedback_store::prune(connection, timestamp)
+        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let (metadata_records, metadata_bytes): (i64, i64) = connection.query_row(
+        "SELECT COUNT(*),COALESCE(SUM(payload_bytes),0) FROM (
+           SELECT payload_bytes FROM claas_feedback WHERE user_id=?1 AND application_id=?2
+           UNION ALL SELECT payload_bytes FROM claas_episodes WHERE user_id=?1 AND application_id=?2)",
+        params![policy.scope.user_id, policy.scope.application_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let capture_records = (policy.maximum_experiences as i64)
+        .saturating_sub(metadata_records)
+        .max(0);
+    let capture_bytes = (policy.maximum_storage_bytes as i64)
+        .saturating_sub(metadata_bytes)
+        .max(0);
     connection.execute(
         "DELETE FROM claas_experiences WHERE sequence IN (
            SELECT sequence FROM (
@@ -311,8 +340,8 @@ fn prune(connection: &Connection, policy: &Policy, timestamp: u64) -> rusqlite::
         params![
             policy.scope.user_id,
             policy.scope.application_id,
-            policy.maximum_experiences as i64,
-            policy.maximum_storage_bytes as i64
+            capture_records,
+            capture_bytes
         ],
     )?;
     super::feedback_store::prune(connection, timestamp)
