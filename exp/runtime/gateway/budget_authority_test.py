@@ -19,6 +19,51 @@ from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind
 from exp.runtime.gateway.budgets_test import _activate_chain, _authority, _chain_catalog, _Clock
 
 
+def test_pinned_graph_file_resource_override_and_reachable_authority(tmp_path: Path) -> None:
+    """Read a real bounded graph and validate root/child targets without opening private state."""
+    catalog = _chain_catalog()
+    payload = canonical_json_bytes(catalog.model_dump(mode="json"))
+    (tmp_path / "snapshot").write_bytes(payload)
+    database_path = tmp_path / "gateway.db"
+    with pytest.raises(ValueError, match="budget_snapshot_max_bytes"):
+        read_budget_snapshot(database_path, "snapshot", catalog.identity_sha256(), len(payload) - 1)
+    loaded = read_budget_snapshot(
+        database_path, "snapshot", catalog.identity_sha256(), len(payload)
+    )
+    assert loaded == catalog
+    for pool_id, deployment_id in (
+        ("pool", None),
+        ("pool", "primary"),
+        ("pool", "secondary"),
+        ("child-pool", None),
+        ("child-pool", "child"),
+    ):
+        require_reachable_budget_target(loaded, "pool", pool_id, deployment_id)
+    assert loaded.model_chains[0].revision == "chain-one"
+    assert not database_path.exists()
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["snapshot"]
+
+
+@pytest.mark.parametrize("case", ["foreign-pool", "foreign-leaf", "unavailable", "root-mismatch"])
+def test_pinned_graph_file_refuses_unauthorized_targets(tmp_path: Path, case: str) -> None:
+    """Real digest-pinned files do not authorize foreign leaves or unavailable graph roots."""
+    catalog = _chain_catalog()
+    if case == "unavailable":
+        catalog = catalog.model_copy(
+            update={
+                "model_chains": (catalog.model_chains[0].model_copy(update={"available": False}),)
+            }
+        )
+    (tmp_path / "snapshot").write_bytes(canonical_json_bytes(catalog.model_dump(mode="json")))
+    loaded = read_budget_snapshot(tmp_path / "gateway.db", "snapshot", catalog.identity_sha256())
+    root = "missing-pool" if case == "root-mismatch" else "pool"
+    pool = "foreign-pool" if case == "foreign-pool" else "child-pool"
+    deployment = "primary" if case == "foreign-leaf" else "child"
+    with pytest.raises(ValueError, match="not reachable|root pool is missing"):
+        require_reachable_budget_target(loaded, root, pool, deployment)
+    assert not (tmp_path / "gateway.db").exists()
+
+
 def test_child_authority_checks_only_reachable_pool_leaves() -> None:
     """A pool member omitted from the authored graph is not a new budget target."""
     catalog = _chain_catalog()

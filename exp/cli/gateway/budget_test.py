@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import click
+import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
@@ -30,6 +31,18 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.management import GatewayManagement
+
+
+def test_budget_command_help_needs_no_private_gateway_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real CLI imports and renders budget help without creating SQLite or pepper files."""
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(app, ["config", "gateway", "budget", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "set" in result.output
+    assert "reconcile" in result.output
+    assert tuple(tmp_path.iterdir()) == ()
 
 
 def _snapshot_catalog() -> NormalizedGatewayCatalog:

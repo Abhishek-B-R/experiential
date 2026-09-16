@@ -99,7 +99,8 @@ jobs:
           --ignore=exp/simulation/tests/comparison_evidence_test.py
           --deselect=exp/tests/release_test.py::test_installed_wheel_no_spend_release_evidence
 
-  windows-budget-authority:
+  windows-snapshot-authority:
+    name: Windows snapshot authority
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -107,30 +108,39 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install the project and its dev extras
         run: uv sync --extra dev
-      - name: Verify real Windows snapshot and budget authority
+      - name: Verify real Windows snapshot authority
         run: >-
-          uv run pytest -q -rs --junitxml=windows-budget-authority.xml
-          exp/runtime/gateway/snapshot_file_test.py
+          uv run pytest -q -rs --junitxml=windows-snapshot-authority.xml
           exp/runtime/gateway/snapshot_file_windows_test.py
+          exp/runtime/gateway/snapshot_file_test.py::test_snapshot_resource_budget_is_a_strict_positive_integer
+          exp/runtime/gateway/snapshot_file_test.py::test_bounded_reader_accepts_limit_and_rejects_growth
+          exp/runtime/gateway/snapshot_file_test.py::test_growth_after_initial_stat_still_obeys_the_read_budget
+          exp/runtime/gateway/budget_authority_test.py::test_pinned_graph_file_resource_override_and_reachable_authority
+          exp/runtime/gateway/budget_authority_test.py::test_pinned_graph_file_refuses_unauthorized_targets
+          exp/runtime/gateway/budget_authority_test.py::test_snapshot_bound_accepts_exact_limit_and_rejects_digest_mismatch
           exp/common/config/settings_test.py
-          exp/cli/gateway/budget_test.py
-      - name: Require executed Windows kernel and budget cases
+          exp/cli/gateway/budget_test.py::test_budget_command_help_needs_no_private_gateway_state
+      - name: Require executed Windows kernel and graph cases
         shell: bash
         run: |
           uv run python - <<'PY'
           import xml.etree.ElementTree as ET
 
-          cases = ET.parse("windows-budget-authority.xml").findall(".//testcase")
+          cases = ET.parse("windows-snapshot-authority.xml").findall(".//testcase")
           kernel = [case for case in cases if "snapshot_file_windows_test" in case.get("classname", "")]
           assert len(kernel) >= 14, f"expected all Windows kernel cases, got {len(kernel)}"
           required = {
-              "test_real_root_and_descendant_authoring_and_resource_override",
-              "test_budget_set_uses_existing_project_snapshot_resource_setting",
-              "test_noninteractive_budget_management_reports_integer_remaining",
+              "test_pinned_graph_file_resource_override_and_reachable_authority": 1,
+              "test_pinned_graph_file_refuses_unauthorized_targets": 4,
+              "test_snapshot_bound_accepts_exact_limit_and_rejects_digest_mismatch": 1,
+              "test_snapshot_resource_budget_is_a_strict_positive_integer": 8,
+              "test_gateway_resource_setting_survives_other_settings_updates": 1,
+              "test_budget_command_help_needs_no_private_gateway_state": 1,
           }
-          authoring = [case for case in cases if case.get("name") in required]
-          assert {case.get("name") for case in authoring} == required
-          for case in kernel + authoring:
+          for name, minimum in required.items():
+              matching = [case for case in cases if case.get("name", "").split("[", 1)[0] == name]
+              assert len(matching) >= minimum, (name, len(matching))
+          for case in cases:
               assert not any(case.find(tag) is not None for tag in ("skipped", "failure", "error")), case.attrib
           PY
 

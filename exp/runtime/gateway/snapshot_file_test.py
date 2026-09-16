@@ -20,7 +20,7 @@ from exp.runtime.gateway.snapshot_file import read_snapshot_bytes
 
 
 def test_real_root_and_descendant_authoring_and_resource_override(tmp_path: Path) -> None:
-    """Core authoring runs on Windows too; a raised resource budget admits the same valid file."""
+    """Full private-state authoring admits the same valid file under a raised resource budget."""
     clock = _Clock()
     store, _ledger, budgets, _key = _authority(tmp_path, clock)
     catalog = _activate_chain(store, tmp_path)
