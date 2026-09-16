@@ -443,6 +443,7 @@ def test_dialectless_provider_alias_is_excluded_not_a_startup_blocker(
     from exp.runtime.models.providers.gemini import GeminiClient
 
     def _no_native_dialect(self: GeminiClient) -> object:
+        """Simulate a provider that cannot supply native gateway wire metadata."""
         del self
         raise ProviderCapabilityError(capability="native_data_plane")
 
@@ -612,6 +613,7 @@ def test_cache_marker_predicate_sees_every_marker_carrier() -> None:
     from exp.runtime.gateway.native_execution import request_carries_cache_markers
 
     def request(**updates: object) -> GatewayRequest:
+        """Build one message request with the selected cache-marker carriers."""
         base = GatewayRequest(
             surface=GatewayApiSurface.MESSAGES,
             messages=(GatewayMessage(role="user", content="hi"),),

@@ -97,7 +97,9 @@ def _replay_episode(
             scope=episode.scenario.scope, model=episode.steps[0].response.model
         ),
     )
-    with world.open(episode.scenario, grounding=grounding) as session:
+    with world.open(
+        episode.scenario, grounding=grounding, source_feedback=episode.source_feedback
+    ) as session:
         for step in episode.steps:
             content = step.request.messages[-1].content
             if content is None:
