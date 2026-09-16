@@ -166,7 +166,7 @@ class TrainingSession(Protocol):
 
 
 class ClaasTrainingBackend(Protocol):
-    """Execution-only adapter; algorithms and persistence stay in CLaaS."""
+    """Bind portable CLaaS jobs to a trainer that owns updates and native state."""
 
     async def open(
         self, spec: ClaasTrainingSpec, resume: TrainingCheckpoint | None = None

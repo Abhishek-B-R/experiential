@@ -6,8 +6,8 @@ from typing import cast
 import pytest
 from verl.workers.engine_workers import TrainingWorker
 
-from exp.optimize.claas.backends import verl_state
 from exp.optimize.claas.backends.checkpoints_test import checkpoint
+from exp.optimize.claas.backends.verl import state
 from exp.optimize.claas.training_contracts_test import job
 
 
@@ -43,9 +43,9 @@ def test_missing_native_state_never_publishes_completion(
         """Write PEFT-shaped inert bytes solely to reach the publication check."""
         shutil.copytree(fixture / target.name, target)
 
-    monkeypatch.setattr(verl_state, "_export_adapter", export_inert)
+    monkeypatch.setattr(state, "_export_adapter", export_inert)
     with pytest.raises(ValueError, match="native veRL"):
-        verl_state.publish_checkpoint(
+        state.publish_checkpoint(
             job(tmp_path), writer, writer, {"loss": 0.0}, tmp_path / "candidate"
         )
     assert not (tmp_path / "candidate").exists()
@@ -71,10 +71,10 @@ def test_flush_failure_never_publishes_completion(
         """Simulate an unavailable checkpoint device before publication."""
         raise OSError("checkpoint device failed")
 
-    monkeypatch.setattr(verl_state, "_export_adapter", export_inert)
-    monkeypatch.setattr(verl_state.os, "fsync", fail_flush)
+    monkeypatch.setattr(state, "_export_adapter", export_inert)
+    monkeypatch.setattr(state.os, "fsync", fail_flush)
     with pytest.raises(OSError, match="checkpoint device failed"):
-        verl_state.publish_checkpoint(
+        state.publish_checkpoint(
             job(tmp_path), writer, writer, {"loss": 0.0}, tmp_path / "candidate"
         )
     assert not (tmp_path / "candidate").exists()

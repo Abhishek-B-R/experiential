@@ -83,10 +83,12 @@ def test_close_during_process_creation_waits_for_owned_worker_cleanup(
     original_spawn = asyncio.create_subprocess_exec
 
     async def run() -> None:
+        """Exercise concurrent training startup and session cleanup."""
         started, release = asyncio.Event(), asyncio.Event()
         processes: list[asyncio.subprocess.Process] = []
 
         async def delayed_spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+            """Hold process creation until the test permits ownership transfer."""
             del args, kwargs
             process = await original_spawn(sys.executable, "-c", "import time; time.sleep(60)")
             processes.append(process)

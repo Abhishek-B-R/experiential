@@ -123,7 +123,7 @@ class _SubprocessSession:
                     process = await asyncio.create_subprocess_exec(
                         str(self._backend._python),
                         "-m",
-                        "exp.optimize.claas.backends.verl_worker",
+                        "exp.optimize.claas.backends.verl.worker",
                         "--job",
                         str(job_path),
                         "--result",
