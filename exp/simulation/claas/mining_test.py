@@ -167,3 +167,51 @@ def test_responses_parent_chain_and_early_termination() -> None:
     assert [signal.kind for signal in result[0].signals] == ["early_termination", "truncation"]
     with pytest.raises(ValueError, match="missing its parent"):
         mine_experiences((second,), partition="fit")
+
+
+def test_standalone_request_history_mines_loops_without_cross_request_joins() -> None:
+    """A final captured request contains enough explicit history to locate a loop."""
+    source = make_experience().model_copy(update={"episode_id": None})
+    messages = [{"role": "user", "content": "Look up my claim."}]
+    for identity in ("a", "b", "c"):
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": identity,
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": '{"claim_id":"c1"}'},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": identity,
+                    "content": '{"is_error":false,"balance":3}',
+                },
+            ]
+        )
+    source = Experience.model_validate(
+        {
+            **source.model_dump(),
+            "request": {
+                **source.request,
+                "messages": messages,
+            },
+        }
+    )
+    mined = mine_experiences((source,), partition="fit")[0]
+    assert [signal.kind for signal in mined.signals] == ["repeated_action"]
+    assert len(mined.scenario.messages) == 1
+    assert all(ref.pointer.startswith("/request/") for ref in mined.signals[0].evidence)
+
+
+@pytest.mark.parametrize("field", ["tools", "messages"])
+def test_string_protocol_collections_are_rejected(field: str) -> None:
+    """Only Responses input permits the string shorthand; tools are always objects."""
+    source = make_experience()
+    source = source.model_copy(update={"request": {**source.request, field: "malformed"}})
+    with pytest.raises(ValueError, match="collection"):
+        mine_experiences((source,), partition="fit")

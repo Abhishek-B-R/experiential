@@ -128,11 +128,45 @@ def tool_actions(experience: Experience) -> tuple[tuple[ToolCall, EvidenceRefere
     return tuple(result)
 
 
+def request_tool_actions(experience: Experience) -> tuple[tuple[ToolCall, EvidenceReference], ...]:
+    """Read actions already present in one request's explicit conversation history.
+
+    This supports standalone captured requests without joining their transcript
+    prefixes to another exchange. Repeated history is deduplicated by call ID
+    and exact action in the miner.
+    """
+    key = "messages" if experience.protocol == "chat_completions" else "input"
+    raw = experience.request.get(key)
+    if experience.protocol == "responses" and isinstance(raw, str):
+        return ()
+    result: list[tuple[ToolCall, EvidenceReference]] = []
+    for index, item in enumerate(_objects(raw)):
+        if experience.protocol == "responses" and item.get("type") == "function_call":
+            result.append(
+                (_call(item, "call_id"), reference(experience, f"/request/{key}/{index}"))
+            )
+        elif item.get("role") == "assistant":
+            for call_index, call in enumerate(_objects(item.get("tool_calls"))):
+                function = call.get("function")
+                if not isinstance(function, dict):
+                    raise ValueError("captured history tool call has no function")
+                result.append(
+                    (
+                        _call({**function, "id": call.get("id")}, "id"),
+                        reference(experience, f"/request/{key}/{index}/tool_calls/{call_index}"),
+                    )
+                )
+    return tuple(result)
+
+
 def tool_results(experience: Experience) -> tuple[ObservedToolResult, ...]:
     """Extract tool results without interpreting arbitrary error-looking prose."""
     key = "messages" if experience.protocol == "chat_completions" else "input"
     results: list[ObservedToolResult] = []
-    for index, item in enumerate(_objects(experience.request.get(key))):
+    raw = experience.request.get(key)
+    if experience.protocol == "responses" and isinstance(raw, str):
+        return ()
+    for index, item in enumerate(_objects(raw)):
         is_chat = item.get("role") == "tool"
         is_responses = item.get("type") == "function_call_output"
         if not is_chat and not is_responses:
@@ -171,7 +205,7 @@ def tool_results(experience: Experience) -> tuple[ObservedToolResult, ...]:
 
 def _objects(value: JsonValue | None) -> tuple[JsonObject, ...]:
     """Read a protocol list without silently dropping malformed members."""
-    if value is None or isinstance(value, str):
+    if value is None:
         return ()
     if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
         raise ValueError("captured protocol collection must contain only JSON objects")

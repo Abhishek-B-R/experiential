@@ -13,6 +13,7 @@ from exp.simulation.claas.contracts import (
 from exp.simulation.claas.harness import (
     ClaasWorldModel,
     ClaasWorldSession,
+    SourceDisclosure,
     WorldModelLimitError,
     WorldModelLimits,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "MinedScenario",
     "MiningLimits",
     "ReplayModelClient",
+    "SourceDisclosure",
     "SyntheticObservation",
     "WorldEpisode",
     "WorldModelLimitError",

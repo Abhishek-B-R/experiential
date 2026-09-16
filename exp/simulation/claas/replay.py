@@ -9,7 +9,7 @@ from exp.common.claas import Experience
 from exp.common.core.artifacts import sha256_json
 from exp.common.models import AssistantAction, ModelRequest, ModelResponse
 from exp.simulation.claas.contracts import WorldEpisode, WorldStep
-from exp.simulation.claas.harness import ClaasWorldModel, WorldModelLimits
+from exp.simulation.claas.harness import ClaasWorldModel, SourceDisclosure, WorldModelLimits
 
 
 class ReplayModelClient:
@@ -53,7 +53,14 @@ def replay_episode(
     if not episode.steps or episode.end_reason not in ("world_terminal", "caller_ended"):
         raise ValueError("episode replay requires recorded steps and a completed lifecycle")
     client = ReplayModelClient(episode.steps)
-    world = ClaasWorldModel(client=client, model=episode.steps[0].response.model, limits=limits)
+    world = ClaasWorldModel(
+        client=client,
+        model=episode.steps[0].response.model,
+        limits=limits,
+        source_disclosure=SourceDisclosure(
+            scope=episode.scenario.scope, model=episode.steps[0].response.model
+        ),
+    )
     with world.open(episode.scenario, grounding=grounding) as session:
         for step in episode.steps:
             content = step.request.messages[-1].content

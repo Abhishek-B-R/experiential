@@ -20,6 +20,7 @@ from exp.common.models import (
 )
 from exp.simulation.claas import (
     ClaasWorldModel,
+    SourceDisclosure,
     WorldModelLimitError,
     WorldModelLimits,
     mine_experiences,
@@ -106,7 +107,12 @@ def test_tool_episode_replays_exactly_and_never_exposes_private_feedback() -> No
     source = make_experience()
     scenario = mine_experiences((source,), partition="fit")[0].scenario
     client = RecordingClient(tool_transition)
-    world = ClaasWorldModel(client=client, model=model_snapshot(), limits=limits())
+    world = ClaasWorldModel(
+        source_disclosure=SourceDisclosure(scope=source.scope, model=model_snapshot()),
+        client=client,
+        model=model_snapshot(),
+        limits=limits(),
+    )
     with world.open(scenario, grounding=(source,)) as session:
         first = session.step(lookup_action())
         assert first.provenance == "synthetic"
@@ -132,6 +138,7 @@ def test_reset_never_replenishes_shared_provider_budget() -> None:
     scenario = mine_experiences((source,), partition="fit")[0].scenario
     client = RecordingClient(final_transition)
     world = ClaasWorldModel(
+        source_disclosure=SourceDisclosure(scope=source.scope, model=model_snapshot()),
         client=client,
         model=model_snapshot(),
         limits=limits(maximum_model_calls=1),
@@ -165,7 +172,10 @@ def test_world_output_is_strict_and_invalid_calls_keep_their_reservation(
     source = make_experience()
     scenario = mine_experiences((source,), partition="fit")[0].scenario
     world = ClaasWorldModel(
-        client=RecordingClient(respond), model=model_snapshot(), limits=limits()
+        source_disclosure=SourceDisclosure(scope=source.scope, model=model_snapshot()),
+        client=RecordingClient(respond),
+        model=model_snapshot(),
+        limits=limits(),
     )
     session = world.reset(scenario, grounding=(source,))
     with pytest.raises(ValueError):
@@ -179,7 +189,12 @@ def test_grounding_drift_and_heldout_seeds_fail_before_provider_dispatch() -> No
     """Only the exact scenario sources and fit partition can ground synthetic practice."""
     source = make_experience()
     client = RecordingClient(final_transition)
-    world = ClaasWorldModel(client=client, model=model_snapshot(), limits=limits())
+    world = ClaasWorldModel(
+        source_disclosure=SourceDisclosure(scope=source.scope, model=model_snapshot()),
+        client=client,
+        model=model_snapshot(),
+        limits=limits(),
+    )
     scenario = mine_experiences((source,), partition="fit")[0].scenario
     altered = source.model_copy(update={"response": {"changed": True}})
     with pytest.raises(ValueError, match="digest"):
@@ -196,9 +211,36 @@ def test_request_size_limit_is_enforced_before_spend() -> None:
     scenario = mine_experiences((source,), partition="fit")[0].scenario
     client = RecordingClient(final_transition)
     world = ClaasWorldModel(
-        client=client, model=model_snapshot(), limits=limits(maximum_request_bytes=1)
+        source_disclosure=SourceDisclosure(scope=source.scope, model=model_snapshot()),
+        client=client,
+        model=model_snapshot(),
+        limits=limits(maximum_request_bytes=1),
     )
     with pytest.raises(WorldModelLimitError, match="byte limit"):
         world.reset(scenario, grounding=(source,)).step(AssistantAction(content="Done."))
+    assert not client.requests
+    assert world.reserved_calls == 0
+
+
+@pytest.mark.parametrize("authorization", ["absent", "wrong_scope", "wrong_model"])
+def test_source_disclosure_requires_exact_scope_and_model(authorization: str) -> None:
+    """Capturing traffic never implicitly grants a newly selected provider access."""
+    source = make_experience()
+    scenario = mine_experiences((source,), partition="fit")[0].scenario
+    client = RecordingClient(final_transition)
+    disclosure = None
+    if authorization != "absent":
+        scope = source.scope
+        model = model_snapshot()
+        if authorization == "wrong_scope":
+            scope = scope.model_copy(update={"user_id": "other-user"})
+        else:
+            model = model.model_copy(update={"provider": "other-provider"})
+        disclosure = SourceDisclosure(scope=scope, model=model)
+    world = ClaasWorldModel(
+        client=client, model=model_snapshot(), limits=limits(), source_disclosure=disclosure
+    )
+    with pytest.raises(ValueError, match="source disclosure"):
+        world.reset(scenario, grounding=(source,))
     assert not client.requests
     assert world.reserved_calls == 0

@@ -20,6 +20,7 @@ from exp.simulation.claas.contracts import (
 from exp.simulation.claas.extraction import (
     initial_messages,
     reference,
+    request_tool_actions,
     tool_actions,
     tool_results,
     tool_schemas,
@@ -142,6 +143,12 @@ def _mine_group(group: Sequence[Experience], limits: MiningLimits) -> tuple[Expe
     repeated_key: str | None = None
     repeated_refs: list[EvidenceReference] = []
     for experience in group:
+        for action, evidence in request_tool_actions(experience):
+            previous = actions.get(action.call_id)
+            if previous is not None and previous[0] != action:
+                raise ValueError("captured history has conflicting tool-call IDs")
+            if previous is None:
+                actions[action.call_id] = (action, evidence)
         for result in tool_results(experience):
             digest = sha256_json({"content": result.content, "is_error": result.is_error})
             prior = seen_results.get(result.call_id)
