@@ -4,7 +4,6 @@ The native engine (`exp_gateway_native`) owns sockets, upstream streaming,
 normalization, and SSE encoding. Shared Python contracts own decoding,
 authorization, payload construction, continuation state, and durable ledger
 transactions. Every boundary call takes and returns one JSON string.
-
 Admission returns the full ordered certified route (one wire configuration
 per deployment) plus the frozen retry-policy facts, accepting the request
 without starting any attempt. The data plane then reserves each physical
@@ -12,7 +11,6 @@ dispatch through ``start_attempt`` immediately before network work and lands
 each attempt's durable terminal through ``settle`` (finalizing the request
 only on the terminal attempt); candidate selection stays here: the frozen
 waterfall policy, health circuits, and budget skipping.
-
 Boundary errors raise :class:`NativeBridgeError`, whose ``public_error_json``
 attribute carries the sanitized OpenAI-shaped error the data plane returns to
 the caller through the shared boundary mapping. Requests the native path
@@ -88,6 +86,7 @@ from exp.runtime.gateway.native_continuation import (
     select_bound_continuation_route as _select_bound_continuation_route,
 )
 from exp.runtime.gateway.native_count_tokens import NativeCountTokensMixin
+from exp.runtime.gateway.native_decisions import NativeDecisionsMixin
 from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_body
 from exp.runtime.gateway.native_dispatch import dispatch_signature_headers
 from exp.runtime.gateway.native_embeddings import NativeEmbeddingsMixin
@@ -156,6 +155,7 @@ _REQUEST_TIMEOUT_SECONDS = 120.0
 class NativeControlPlane(
     NativeBatchRelayMixin,
     NativeCountTokensMixin,
+    NativeDecisionsMixin,
     NativeEmbeddingsMixin,
     NativeImagesMixin,
     NativeObservabilityMixin,

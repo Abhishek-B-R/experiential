@@ -16,7 +16,7 @@ from exp.runtime.gateway.sqlite.nano_usd_migration import (
     migrate_money_to_nano_usd,
 )
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 
 class GatewaySchemaError(RuntimeError):
@@ -578,12 +578,8 @@ _GATEWAY_REQUESTS_V10_SQL = """CREATE TABLE gateway_requests (
     ) STRICT"""
 
 _MIGRATION_10 = (
-    # SQLite cannot alter a CHECK constraint in place, and gateway_requests is
-    # the foreign-key parent of gateway_attempts, so the copy-and-rename
-    # rebuild used by migration 6 would trip immediate foreign keys inside
-    # this exclusive transaction. A CHECK-only change does not affect the
-    # on-disk record format, so the documented lightweight procedure rewrites
-    # the stored schema text in place instead.
+    # A CHECK-only schema rewrite preserves row layout and avoids rebuilding
+    # gateway_requests while gateway_attempts holds immediate foreign keys.
     "PRAGMA writable_schema = ON",
     (
         "UPDATE sqlite_master SET sql = '"
@@ -744,6 +740,15 @@ _MIGRATIONS: dict[int, tuple[MigrationStep, ...]] = {
     18: _MIGRATION_18,
     19: _MIGRATION_19,
     20: (migrate_money_to_nano_usd,),
+    21: (
+        "PRAGMA writable_schema = ON",
+        "UPDATE sqlite_master SET sql = replace(sql, "
+        "'''embeddings'', ''images'')', '''embeddings'', ''images'', ''decisions'')') "
+        "WHERE type = 'table' AND name = 'gateway_requests'",
+        "PRAGMA writable_schema = RESET",
+        "CREATE TABLE gateway_schema_refresh_v21 (noop INTEGER) STRICT",
+        "DROP TABLE gateway_schema_refresh_v21",
+    ),
 }
 
 

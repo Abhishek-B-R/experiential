@@ -22,6 +22,7 @@ from exp.common.models.gateway_catalog import (
 from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
 from exp.runtime.gateway.auth import utc_text
 from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.gateway.embeddings_contracts import (
     EmbeddingsRequest,
     ServingRequest,
@@ -577,23 +578,23 @@ def maximum_attempt_cost_nano_usd(
                 input_rate=deployment.gateway.prices.input_nano_usd_per_million_tokens,
                 output_rate=deployment.gateway.prices.output_nano_usd_per_million_tokens,
             )
-        case GatewayRequest():
-            return _completion_attempt_cost_nano_usd(request, deployment, input_tokens)
+        case GatewayRequest() | DecisionRequest():
+            return _token_attempt_cost_nano_usd(request, deployment, input_tokens)
         case _:  # pragma: no cover - exhaustive over the ServingRequest union.
             assert_never(request)
 
 
-def _completion_attempt_cost_nano_usd(
-    request: GatewayRequest,
+def _token_attempt_cost_nano_usd(
+    request: GatewayRequest | DecisionRequest,
     deployment: ExactModelDeployment,
     input_tokens: int,
 ) -> int | None:
-    """Return a conservative nano-USD ceiling for one chat/responses call.
+    """Price one completion or decision with its surface-specific token reservation.
 
-    The input estimate carries its own headroom; the output ceiling is the
-    caller's, else the frozen deployment limit, else a reservation-only default
-    bounded by the context window. Cached and reasoning tokens are subsets of the
-    totals, so the worst case charges the higher rate for the whole leg.
+    Completion output uses the caller or deployment limit, else a bounded default.
+    Decisions use their per-question allowances without a completion output clamp.
+    Cached and reasoning tokens are subsets of the totals, so the worst case
+    charges the higher rate for the whole leg.
     """
     output_tokens = worst_case_output_tokens(request, deployment)
     prices = deployment.gateway.prices

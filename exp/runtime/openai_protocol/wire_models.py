@@ -444,9 +444,8 @@ class _StructuredSchema(_WireModel):
 class _ChatResponseFormat(_WireModel):
     """Supported Chat text, JSON-object, or strict structured-text format.
 
-    ``json_object`` is admitted so the gateway can translate it to a permissive
-    ``json_schema`` and serve the caller's "give me JSON" intent on every rung
-    (the serving lanes emit only ``json_schema``); it carries no ``json_schema``
+    ``json_object`` is the schema-free JSON mode; each wire dialect honors it
+    natively or through an injected instruction. It carries no ``json_schema``
     details, exactly like ``text``.
     """
 
@@ -592,6 +591,12 @@ class _ChatRequest(_WireModel):
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None
     """Provider processing tier, forwarded only on BYOK OpenAI-family rungs."""
+    verbosity: Literal["low", "medium", "high"] | None = None
+    """Output-length hint (GPT-5 family), the Chat spelling of Responses ``text.verbosity``.
+
+    Forwarded on native Responses rungs and dropped with disclosure elsewhere;
+    the value itself stays validated so a typo is still a named 400.
+    """
 
     @model_validator(mode="after")
     def _require_coherent_options(self) -> _ChatRequest:

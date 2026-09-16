@@ -103,6 +103,7 @@ class GatewayApiSurface(StrEnum):
     MESSAGES = "messages"
     EMBEDDINGS = "embeddings"
     IMAGES = "images"
+    DECISIONS = "decisions"
 
 
 class GatewayToolDefinition(ContractModel):
@@ -500,6 +501,15 @@ class GatewayRequest(ContractModel):
     tool_choice: Literal["auto", "none", "required"] | GatewayNamedToolChoice | None = None
     parallel_tool_calls: bool | None = None
     structured_text: StructuredTextFormat | None = None
+    json_object_output: bool = Field(default=False, exclude=True)
+    """Caller ``response_format: {"type": "json_object"}`` from the Chat surface.
+
+    A schema-free "answer with one JSON object" mode, distinct from
+    ``structured_text``: no schema exists to enforce, so each wire dialect
+    honors it its own way (a native JSON mode where the provider has one, a
+    system instruction otherwise). Mutually exclusive with ``structured_text``.
+    Serialized only in replay identity when enabled.
+    """
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens_parameter: (
         Literal["max_tokens", "max_completion_tokens", "max_output_tokens"] | None
@@ -626,7 +636,11 @@ class GatewayRequest(ContractModel):
     :func:`canonical_request_sha256`.
     """
     text_verbosity: Literal["low", "medium", "high"] | None = None
-    """Caller ``text.verbosity`` selector from the Responses surface."""
+    """Caller output-length hint: Responses ``text.verbosity`` or Chat ``verbosity``.
+
+    One canonical carrier for both spellings; the surface decides which public
+    path a drop disclosure names.
+    """
     client_metadata: JsonObject | None = Field(default=None, exclude=True)
     """Verbatim caller ``client_metadata`` from the Responses surface.
 
@@ -834,6 +848,10 @@ class GatewayRequest(ContractModel):
             raise ValueError("required gateway tool choice needs at least one tool")
         if self.include_usage and not self.stream:
             raise ValueError("include_usage is valid only for streaming requests")
+        if self.json_object_output and self.structured_text is not None:
+            raise ValueError("json_object_output and structured_text are mutually exclusive")
+        if self.json_object_output and self.surface != GatewayApiSurface.CHAT_COMPLETIONS:
+            raise ValueError("json_object_output is valid only for Chat Completions requests")
         parts = (part for message in self.messages for part in message.content_parts)
         require_attachment_ceilings(parts)
         if len({handle.provider for handle in self.media_handles}) > 1:
@@ -853,8 +871,11 @@ class GatewayRequest(ContractModel):
             raise ValueError("provider_thinking_config is valid only for Messages requests")
         if self.provider_output_config is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_output_config is valid only for Messages requests")
-        if self.text_verbosity is not None and self.surface != GatewayApiSurface.RESPONSES:
-            raise ValueError("text_verbosity is valid only for Responses requests")
+        if self.text_verbosity is not None and self.surface not in {
+            GatewayApiSurface.RESPONSES,
+            GatewayApiSurface.CHAT_COMPLETIONS,
+        }:
+            raise ValueError("text_verbosity is valid only for Responses and Chat requests")
         if self.client_metadata is not None and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("client_metadata is valid only for Responses requests")
         if self.context_management is not None and self.surface != GatewayApiSurface.MESSAGES:

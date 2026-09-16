@@ -2,6 +2,59 @@
 
 use super::*;
 
+#[tokio::test]
+async fn decision_wire_omits_all_idempotency_keys_without_changing_chat_headers() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for dialect in [Dialect::TypesafeSystemone, Dialect::OpenAiCompatible] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let received = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                let n = socket.read(&mut chunk).await.expect("read");
+                assert!(n > 0, "complete request headers required");
+                request.extend_from_slice(&chunk[..n]);
+                assert!(request.len() < 8192);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+                .await
+                .expect("write");
+            String::from_utf8(request).expect("HTTP headers")
+        });
+        let client = build_client(Duration::from_secs(2)).expect("client");
+        open_stream(
+            &client,
+            &format!("http://{addr}/v1/systemone"),
+            &HashMap::from([
+                ("iDeMpOtEnCy-KeY".into(), "configured-key".into()),
+                ("Authorization".into(), "Bearer test-key".into()),
+            ]),
+            "synthesized-key",
+            &serde_json::json!({"model": "jev-latest"}),
+            None,
+            Duration::from_secs(2),
+            dialect,
+        )
+        .await
+        .expect("success");
+        let headers = received.await.expect("server task").to_ascii_lowercase();
+        assert!(headers.contains("authorization: bearer test-key\r\n"));
+        assert!(!headers.contains("configured-key"));
+        match dialect {
+            Dialect::TypesafeSystemone => assert!(!headers.contains("idempotency-key")),
+            _ => assert!(headers.contains("idempotency-key: synthesized-key\r\n")),
+        }
+    }
+}
+
 #[test]
 fn transport_failure_flags_mirror_the_python_taxonomy() {
     // (status, retryable_same_deployment, failover_eligible)

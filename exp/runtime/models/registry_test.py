@@ -31,6 +31,7 @@ from exp.runtime.models.providers.tinker_sampling import (
     TinkerSampler,
 )
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
+from exp.runtime.models.providers.typesafe import TYPESAFE_BASE_URL, TypeSafeClient
 from exp.runtime.models.registry import ModelConnectionError, RuntimeModelCatalog
 
 _DEFAULT_CAPABILITIES = ModelCapabilities(
@@ -88,6 +89,51 @@ def _catalog(
         },
         roles=ModelRoles(candidates=("fixture-model",), incumbent="fixture-model"),
     )
+
+
+def test_typesafe_resolves_native_client_without_changing_capability_identity() -> None:
+    """The registry adds a decision client, not conversational or embedding support."""
+    declared = ModelCapabilities(supports_completions=False, supports_embeddings=False)
+    runtime = RuntimeModelCatalog(
+        _catalog(provider="typesafe", capabilities=declared),
+        environment={"FIXTURE_API_KEY": "provider-secret-canary"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    resolved = runtime.resolve("fixture-model")
+    assert isinstance(resolved.client, TypeSafeClient)
+    assert resolved.client.gateway_wire_profile().url == f"{TYPESAFE_BASE_URL}/systemone"
+    assert resolved.embedding_client is None
+    assert resolved.capabilities == declared
+    assert resolved.snapshot.capabilities_sha256 == declared.identity_sha256()
+    assert "provider-secret-canary" not in repr(resolved)
+
+
+def test_typesafe_preserves_fixed_origin_policy_and_trusted_https_override() -> None:
+    """Custom endpoints stay denied unless the existing explicit trust opt-in is present."""
+    with pytest.raises(ValueError, match="built-in official endpoint"):
+        _catalog(provider="typesafe", base_url="https://example.test/v1")
+    with pytest.raises(ValueError, match="https base_url"):
+        ConnectionConfig(
+            provider="typesafe",
+            base_url="http://127.0.0.1:9/v1",
+            api_key_env="FIXTURE_API_KEY",
+            trusted_custom_origin=True,
+        )
+    catalog = _catalog(provider="typesafe")
+    connection = ConnectionConfig(
+        provider="typesafe",
+        base_url="https://example.test/v1",
+        api_key_env="FIXTURE_API_KEY",
+        trusted_custom_origin=True,
+    )
+    runtime = RuntimeModelCatalog(
+        catalog.model_copy(update={"connections": {"primary": connection}}),
+        environment={"FIXTURE_API_KEY": "provider-secret-canary"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    client = runtime.resolve("fixture-model").client
+    assert isinstance(client, TypeSafeClient)
+    assert client.gateway_wire_profile().url == "https://example.test/v1/systemone"
 
 
 def test_snapshot_is_credential_free_and_records_capability_digest() -> None:
