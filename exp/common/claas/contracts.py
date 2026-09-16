@@ -21,7 +21,12 @@ class ClaasScope(ContractModel):
 
 
 class CapturePolicy(ContractModel):
-    """Explicit content-capture consent and finite retention for one application."""
+    """Explicit content-capture consent and finite retention for one application.
+
+    Storage bytes bound retained serialized payloads; SQLite indexes and its write
+    journal add overhead. Retention is enforced while the capture writer runs,
+    and readers exclude expired records even when the writer is stopped.
+    """
 
     scope: ClaasScope
     enabled: bool = False

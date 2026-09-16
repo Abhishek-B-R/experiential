@@ -64,6 +64,10 @@ pub struct ServeConfig {
     pub native_usage_enabled: bool,
     #[serde(default = "default_graceful_timeout_seconds")]
     pub graceful_timeout_seconds: f64,
+    #[serde(default)]
+    pub capture: Option<crate::claas::CaptureConfiguration>,
+    #[serde(default)]
+    pub ghost: bool,
 }
 
 fn default_graceful_timeout_seconds() -> f64 {
@@ -118,6 +122,7 @@ pub(crate) struct AppState {
     /// Bounded in-process keyed-response replay, the native mirror of the
     /// python engine's `BoundedReplayStore`.
     pub(crate) replays: Arc<ReplayStore>,
+    pub(crate) capture: Option<Arc<crate::claas::CaptureStore>>,
 }
 
 /// Run the data plane until shutdown; returns after graceful stop.
@@ -135,6 +140,15 @@ pub async fn run(
     let pending_settlements = Arc::new(AtomicUsize::new(0));
     let max_active_requests = config.max_active_requests.max(1);
     let handled_requests = Arc::new(AtomicUsize::new(0));
+    let capture = if config.ghost {
+        None
+    } else {
+        config
+            .capture
+            .map(crate::claas::CaptureStore::open)
+            .transpose()?
+            .flatten()
+    };
     let state = AppState {
         bridge,
         http,
@@ -147,6 +161,7 @@ pub async fn run(
         pending_settlements: pending_settlements.clone(),
         handled_requests: handled_requests.clone(),
         replays: Arc::new(ReplayStore::new()),
+        capture: capture.clone(),
     };
     tokio::spawn(crate::memory::reclaim_when_idle(
         state.permits.clone(),
@@ -211,6 +226,9 @@ pub async fn run(
     let drain_deadline = Instant::now() + graceful;
     while pending_settlements.load(Ordering::SeqCst) > 0 && Instant::now() < drain_deadline {
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    if let Some(capture) = capture {
+        capture.close();
     }
     outcome
 }
@@ -334,7 +352,13 @@ async fn usage_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
 async fn metrics_json(State(state): State<AppState>) -> Response {
     match state.bridge.call("metrics_json", "{}".to_string()).await {
         Ok(text) => match serde_json::from_str::<Value>(&text) {
-            Ok(payload) => json_response(StatusCode::OK, &payload, &[]),
+            Ok(mut payload) => {
+                payload["claas_capture_skipped"] = json!(state
+                    .capture
+                    .as_ref()
+                    .map_or(0, |store| store.skipped_count()));
+                json_response(StatusCode::OK, &payload, &[])
+            }
             Err(_) => error_response(&PublicError::internal()),
         },
         Err(error) => error_response(&error),
