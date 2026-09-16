@@ -41,6 +41,8 @@ An absent or empty `model_chains` field preserves the pre-chain schema-4 identit
 
 Hosts must prevent publication or activation of populated chains until every eligible reader and writer supports the chain contract. That requires an enforced fleet/build capability check, not a schema-number comparison or an operator's assumption. Keep chain semantics inactive while old, unknown, or unstamped workers can receive the snapshot, and establish a rollback floor before activation. Publishing the engine package alone does not satisfy this deployment condition.
 
+The compiled extension exposes `exp_gateway_native.MODEL_STAGE_CONTRACT_VERSION` as integer `1`. Contract 1 means the native data plane consumes each deployment's actual canonical model identity and stage-local throttle-redial schedule. It does not certify host authorization, funding, or recovery behavior. A host must also verify Python's model-chain contract. Missing, non-integer, or unknown native markers cannot be replaced with a package-version comparison: a higher-numbered build can still lack the required wire handling. Python refuses staged admission without this exact native marker; routes without model stages do not require it.
+
 ## Verification boundary
 
 Pure tests cover graph expansion, immutable stage projections, policy budgets, expiry, and evidence scope. Native loopback tests exercise all three conversational APIs in streaming and non-streaming forms, checking requested alias, actual-model header, exact attempt order, and closed accounting. These controlled tests do not establish real-provider cache hits, billing invoices, or deployed platform compatibility. Those require tests of the actual released engine, platform, schema, and configuration together.

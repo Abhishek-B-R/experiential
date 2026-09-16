@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import time
 
 from exp.runtime.gateway.affinity import (
@@ -22,10 +23,29 @@ from exp.runtime.gateway.native_recovery import recovery_prefix_digest
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.recovery import SessionCacheKey
 from exp.runtime.gateway.recovery_binding import validated_recovery_binding
-from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.sticky_affinity import AffinityPlacement
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.protocol import NativeWireClient
+
+
+def require_native_model_stage_contract(route: GatewayRoute) -> None:
+    """Refuse staged admission when the loaded data plane cannot consume its wire contract.
+
+    Routes without model stages need no marker or extension import. Resolve the
+    loaded extension only at this feature boundary, as native serving does.
+    Missing or unknown markers never fall back to a package version or generic
+    export check, which cannot prove stage support.
+    """
+    if not route.snapshot.model_stages:
+        return
+    native = importlib.import_module("exp_gateway_native")
+    contract = getattr(native, "MODEL_STAGE_CONTRACT_VERSION", None)
+    if type(contract) is not int or contract != 1:
+        raise GatewayRoutingError(
+            "ordered model stages require native MODEL_STAGE_CONTRACT_VERSION=1; "
+            "install the coordinated stage-capable native package before activating chains"
+        )
 
 
 def stage_affinity_ordered_rungs(

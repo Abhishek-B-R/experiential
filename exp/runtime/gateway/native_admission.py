@@ -35,7 +35,10 @@ from exp.runtime.gateway.native_execution import (
 )
 from exp.runtime.gateway.native_reasoning import rung_provider_request
 from exp.runtime.gateway.native_responses import ContinuationContext
-from exp.runtime.gateway.native_stage_admission import stage_affinity_ordered_rungs
+from exp.runtime.gateway.native_stage_admission import (
+    require_native_model_stage_contract,
+    stage_affinity_ordered_rungs,
+)
 from exp.runtime.gateway.prompt_cache_affinity import provider_prompt_cache_key
 from exp.runtime.gateway.prompt_size import context_window_compatible_indexes
 from exp.runtime.gateway.recovery_binding import bind_recovery_profiles
@@ -137,6 +140,7 @@ def admitted_route_requests(
         GatewayRoutingError: No rung is protocol-compatible and none named a
             rejection.
     """
+    require_native_model_stage_contract(route)
     # flex/priority are the tiers we price as an OPT-IN pass-through, so they
     # fail CLOSED before any reservation when no rung can BILL the requested one:
     # a BYOK rung forwards any tier (customer pays the provider directly, no

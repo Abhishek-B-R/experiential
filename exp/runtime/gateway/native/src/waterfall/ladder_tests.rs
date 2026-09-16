@@ -437,6 +437,27 @@ pub(super) async fn finish(mut guard: AttemptGuard, won: Won) -> Won {
 }
 
 #[test]
+fn stage_local_redial_schedule_is_consumed_without_a_root_schedule() {
+    block_on(async {
+        let harness = Harness::new();
+        let rung = spawn_rung(vec![Answer::Throttle(None), Answer::Stream(&[TEXT_FRAME])]).await;
+        let mut stage = wire("child", &rung.url, 1);
+        stage.exact_model_id = "child-model".to_string();
+        stage.throttle_redial = Some(SCHEDULE);
+        let (won, guard) = harness.run(&[stage], None, Duration::from_secs(10)).await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("stage-local redial must serve without a root schedule");
+        };
+        assert_eq!(committed.depth, 0);
+        let story = harness.story().await;
+        let starts = story["starts"].as_array().expect("starts");
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[1]["throttle_backoff"], true);
+        assert_eq!(gaps(&rung).len(), 1);
+    });
+}
+
+#[test]
 fn a_throttled_rung_is_redialed_after_backoff_and_then_serves() {
     block_on(async {
         let harness = Harness::new();

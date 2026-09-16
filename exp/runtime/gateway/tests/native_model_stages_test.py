@@ -14,6 +14,7 @@ from collections.abc import Iterator
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+import exp_gateway_native
 import httpx
 import pytest
 
@@ -32,6 +33,13 @@ from exp.runtime.gateway.tests.native_waterfall_test import (
     _SecondaryUpstream,
     _ServingEngine,
 )
+
+
+def test_installed_native_exports_ordered_stage_contract() -> None:
+    """Read the compiled extension's feature marker, independently of package version labels."""
+    marker = getattr(exp_gateway_native, "MODEL_STAGE_CONTRACT_VERSION", None)
+    assert type(marker) is int
+    assert marker == 1
 
 
 @pytest.fixture(name="engine")

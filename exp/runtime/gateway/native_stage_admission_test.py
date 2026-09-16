@@ -3,6 +3,7 @@
 import json
 import time
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Literal
 from uuid import NAMESPACE_URL, uuid5
 
@@ -24,6 +25,7 @@ from exp.runtime.gateway.native_accounting_test import _RecordingLedger
 from exp.runtime.gateway.native_admission import (
     _affinity_ordered_rungs,
     _prefer_cache_capable_rungs,
+    admitted_route_requests,
 )
 from exp.runtime.gateway.native_admission_test import _affinity_fixture, _marked_request
 from exp.runtime.gateway.native_execution import (
@@ -44,11 +46,69 @@ from exp.runtime.gateway.recovery import (
     SessionRecoveryRegistry,
 )
 from exp.runtime.gateway.recovery_test import Clock
-from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.sticky_affinity import AffinityPlacement
 from exp.runtime.models.credentials import DispatchCredentialReceipt
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.protocol import NativeWireClient
+
+
+@pytest.mark.parametrize("marker", [None, False, True, 0, 2, "1", 1.0])
+def test_native_stage_contract_rejects_missing_or_unknown_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    marker: int | str | float | None,
+) -> None:
+    """Newer version labels and generic exports cannot stand in for the compiled contract."""
+    native = SimpleNamespace(__version__="99.0", serve=lambda: None)
+    if marker is not None:
+        native.MODEL_STAGE_CONTRACT_VERSION = marker
+    monkeypatch.setattr(native_stage_admission.importlib, "import_module", lambda _: native)
+    route = _route()
+    normalized = catalog()
+    staged = route.model_copy(
+        update={
+            "snapshot": model_execution_snapshot(
+                normalized, route.snapshot.authorization, normalized.pools[0]
+            )
+        }
+    )
+    ledger = _RecordingLedger()
+    accounting = NativeAttemptAccounting(ledger)
+    request = GatewayRequest(
+        surface=route.snapshot.authorization.surface,
+        messages=(GatewayMessage(role="user", content="hello"),),
+    )
+    with pytest.raises(GatewayRoutingError, match="MODEL_STAGE_CONTRACT_VERSION=1"):
+        admitted_route_requests(
+            staged,
+            (),
+            request,
+            accounting=accounting,
+            authorization=staged.snapshot.authorization,
+        )
+    assert not ledger.started
+    native_stage_admission.require_native_model_stage_contract(route)
+
+
+def test_native_stage_contract_accepts_only_compiled_version_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The supported integer marker admits stage payloads without a package-version guess."""
+    monkeypatch.setattr(
+        native_stage_admission.importlib,
+        "import_module",
+        lambda _: SimpleNamespace(MODEL_STAGE_CONTRACT_VERSION=1, __version__="0.0.0"),
+    )
+    route = _route()
+    normalized = catalog()
+    staged = route.model_copy(
+        update={
+            "snapshot": model_execution_snapshot(
+                normalized, route.snapshot.authorization, normalized.pools[0]
+            )
+        }
+    )
+    native_stage_admission.require_native_model_stage_contract(staged)
 
 
 @dataclass
