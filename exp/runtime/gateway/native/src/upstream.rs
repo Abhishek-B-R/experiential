@@ -9,9 +9,9 @@ use crate::dialects::Dialect;
 use crate::errors::{Failure, FailureClass};
 use crate::param_attribution::{
     bounded_masked_line, content_filtered_completion, generic_error_code,
-    rejected_by_lane_limitation, rejected_by_routing_gate, rejected_caller_reference_not_found,
-    rejected_code, rejected_detail, rejected_encrypted_reasoning, rejected_model_not_found,
-    rejected_parameter, sanitized_detail,
+    rejected_by_account_quota, rejected_by_lane_limitation, rejected_by_routing_gate,
+    rejected_caller_reference_not_found, rejected_code, rejected_detail,
+    rejected_encrypted_reasoning, rejected_model_not_found, rejected_parameter, sanitized_detail,
 };
 use crate::rate_limit_headers::{harvest_rate_limit_headers, retry_after_seconds};
 
@@ -373,6 +373,25 @@ pub async fn open_stream(
             // request fields" for the caller and the ledger alike. A generic
             // family type or bare status adds nothing and is not relayed.
             .or_else(|| code.clone().filter(|token| !generic_error_code(token)));
+        // A client-error status whose CODE or SENTENCE says the provider
+        // ACCOUNT cannot pay (Novita `400 "Insufficient quota available for
+        // instant inference"` on a drained prepaid balance) is the house
+        // account's funding state, never the caller's request: it takes the
+        // quota class the exhaustion sweep and pool rotation read, fails over,
+        // and keeps the sentence ledger-only like every operator-facing class.
+        if crate::stream_errors::is_quota_code(code.as_deref())
+            || body
+                .as_deref()
+                .is_some_and(|body| rejected_by_account_quota(dialect, body))
+        {
+            let ledger_detail = detail.as_deref().map_or_else(
+                || status_detail(status),
+                |text| format!("{}: {text}", status_detail(status)),
+            );
+            return Err(transport_failure(Some(402))
+                .with_provider_detail(Some(ledger_detail))
+                .with_rate_limit_facts(rate_limit.clone(), retry_after));
+        }
         // A content-filter CODE under a 4xx is the model's verdict on the
         // content (Azure and Gemini answer 400 for it), not a request-shape
         // error: file and answer it as a refusal naming its bounded category,

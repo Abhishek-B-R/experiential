@@ -186,3 +186,49 @@ async fn a_429_whose_body_stalls_never_outlives_the_header_phase_budget() {
     assert!(failure.failover_eligible);
     assert_eq!(failure.provider_detail.as_deref(), Some("http 429"));
 }
+
+#[tokio::test]
+async fn a_resellers_400_naming_an_exhausted_account_is_provider_quota() {
+    // Live Novita sentence (gpt-5.6-sol, 2026-09-16 05:28Z) under HTTP 400 in
+    // the flat `{code:0, message, type}` envelope: the account's prepaid
+    // balance is gone. A status-only read filed it as the caller's 400.
+    let failure = open_against_body(
+        "400 Bad Request",
+        "{\"code\":0,\"message\":\"Insufficient quota available for instant inference. \
+         trace_id: 92913336280c9c28f727ac9bfefbd89c\",\"type\":\"invalid_request_error\"}",
+        "pa/gpt-5.6-sol",
+    )
+    .await;
+    assert_eq!(failure.failure_class, FailureClass::ProviderQuota);
+    assert!(
+        failure.failover_eligible,
+        "another rung must serve the request"
+    );
+    assert!(!failure.retryable_same_deployment);
+    let detail = failure.provider_detail.as_deref().expect("ledger detail");
+    assert!(
+        detail.starts_with("http 400: Insufficient quota available for instant inference"),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains("92913336280c9c28f727ac9bfefbd89c"),
+        "the trace id is masked: {detail}"
+    );
+    assert!(
+        !failure
+            .public_error()
+            .message
+            .contains("Insufficient quota"),
+        "an account-state failure never relays its sentence to the caller"
+    );
+    // An ordinary caller sentence that merely mentions a quota WORD elsewhere
+    // does not qualify: only the funding phrases do.
+    let caller = open_against_body(
+        "400 Bad Request",
+        "{\"error\":{\"message\":\"max_tokens must be less than or equal to 131072\",\
+         \"type\":\"invalid_request_error\"}}",
+        "m",
+    )
+    .await;
+    assert_eq!(caller.failure_class, FailureClass::InvalidRequest);
+}

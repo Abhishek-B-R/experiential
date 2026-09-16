@@ -41,6 +41,39 @@ pub fn rejected_by_lane_limitation(dialect: Dialect, body: &str) -> bool {
     })
 }
 
+/// Sentences a provider answers under a client-error status when the
+/// ACCOUNT, not the request, is what it refuses: the house credential is out
+/// of prepaid balance or quota. Novita answers `400 "Insufficient quota
+/// available for instant inference. trace_id: …"` on a drained account
+/// (gpt-5.6-sol, 2026-09-16 05:28Z), which a status-only read filed as the
+/// caller's `invalid_request`: no failover, no exhaustion-sweep signal, a
+/// customer 400 for the operator's balance. Narrower than the in-stream
+/// `QUOTA_PHRASES` on purpose (no bare "billing"): a pre-stream 4xx sentence
+/// decides a class the ladder acts on, so only unambiguous funding wording
+/// qualifies.
+const ACCOUNT_QUOTA_PHRASES: &[&str] = &[
+    "insufficient quota",
+    "insufficient balance",
+    "insufficient credits",
+    "insufficient funds",
+    "not enough balance",
+    "exceeded your current quota",
+];
+
+/// Whether a 4xx body's error SENTENCE says the provider ACCOUNT cannot pay
+/// (see [`ACCOUNT_QUOTA_PHRASES`]). Only the dialect's message field is read.
+pub fn rejected_by_account_quota(dialect: Dialect, body: &str) -> bool {
+    let Some(value) = parse_error_document(body) else {
+        return false;
+    };
+    error_message_field(dialect, &value).is_some_and(|message| {
+        let lowered = message.to_ascii_lowercase();
+        ACCOUNT_QUOTA_PHRASES
+            .iter()
+            .any(|phrase| lowered.contains(phrase))
+    })
+}
+
 /// Whether a 403 body is an aggregator ROUTING verdict rather than a
 /// credential one. OpenRouter runs its routing funnel only AFTER the key has
 /// authenticated, and reports the funnel it walked (`metadata.routing_funnel`)
