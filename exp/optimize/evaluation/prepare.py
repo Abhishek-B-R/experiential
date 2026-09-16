@@ -71,6 +71,7 @@ class PreparedModelEvaluation(ContractModel):
     judge_request: CompletionCostReservation
     embedder_alias: str = Field(min_length=1)
     agent_factory_sha256: Sha256
+    redacted_field_names: tuple[str, ...]
     cost: EvaluationCostPlan
 
 
@@ -331,5 +332,6 @@ def prepare_model_evaluation(
         judge_request=judge_request,
         embedder_alias=embedder_alias,
         agent_factory_sha256=agent_digest,
+        redacted_field_names=config.redacted_field_names,
         cost=cost,
     )

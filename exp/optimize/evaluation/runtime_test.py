@@ -80,7 +80,7 @@ def test_consent_and_full_credit_ceiling_precede_credentials_and_writes(
     assert before == (project.artifacts.list_ids(), state.credential_resolutions)
 
 
-@pytest.mark.parametrize("drift", ["quote", "agent", "worker"])
+@pytest.mark.parametrize("drift", ["quote", "agent", "redaction", "worker"])
 def test_runtime_refuses_changed_accepted_inputs_before_provider_dispatch(
     tmp_path: Path,
     drift: str,
@@ -97,6 +97,8 @@ def test_runtime_refuses_changed_accepted_inputs_before_provider_dispatch(
         )
     elif drift == "agent":
         prepared = prepared.model_copy(update={"agent_factory_sha256": "a" * 64})
+    elif drift == "redaction":
+        prepared = prepared.model_copy(update={"redacted_field_names": ("private-value",)})
     else:
         selected = catalog.models["candidate-b"]
         catalog = catalog.model_copy(

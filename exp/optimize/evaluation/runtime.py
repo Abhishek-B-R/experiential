@@ -89,10 +89,14 @@ def run_prepared_model_evaluation(
         raise ValueError("authorized evaluation budget cannot cover the complete reserved quote")
     config = project.load_project()
     prompt = config.system.system_prompt if config.system else None
-    if prepared.agent_factory_sha256 != agent_factory_sha256(
-        config.agent,
-        maximum_model_calls=setup.maximum_steps,
-        system_prompt=prompt,
+    if (
+        prepared.agent_factory_sha256
+        != agent_factory_sha256(
+            config.agent,
+            maximum_model_calls=setup.maximum_steps,
+            system_prompt=prompt,
+        )
+        or prepared.redacted_field_names != config.redacted_field_names
     ):
         raise ValueError("evaluation agent configuration changed; prepare again")
     if not provider_spend_consented:
@@ -197,7 +201,7 @@ def run_prepared_model_evaluation(
             grounded_world_models={world.alias: grounded},
             agent_factory=factory,
             completion_contract_input=completion_input,
-            redacted_field_names=config.redacted_field_names,
+            redacted_field_names=prepared.redacted_field_names,
             progress=progress,
         )
 
@@ -220,11 +224,27 @@ def _persist_runtime_contract(
     code_revision: str,
 ) -> ArtifactInput:
     """Include every runtime semantic pin in replay identity before the first dispatch."""
+    completed = completed_project_build(project)
+    setup = prepared.setup
+    assert setup.simulation_completion_input is not None
+    calibration = artifact_input(
+        project.artifacts.read(setup.simulation_protocol.judge_calibration_id).manifest
+    )
+    pricing = artifact_input(project.artifacts.read(setup.pricing_snapshot_id).manifest)
     contract = EvaluationRuntimeContract(
         schema_version=1,
         created_at=created_at,
         code_revision=code_revision,
-        inputs=sorted_unique_inputs(prepared.judge_setup),
+        inputs=sorted_unique_inputs(
+            prepared.judge_setup,
+            completed.trace_dataset,
+            completed.task_set,
+            completed.fit_rag,
+            completed.world_model,
+            setup.simulation_completion_input,
+            calibration,
+            pricing,
+        ),
         contract_id=stable_id(
             "evaluation-runtime",
             {
