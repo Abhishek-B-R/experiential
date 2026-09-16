@@ -607,6 +607,7 @@ def complete_cell_evidence(
     judge_spend_usd = math.fsum(
         _known_judgment_spend(judgment) for judgment in judgments_by_rollout.values()
     )
+    excluded_costs: list[float] = []
 
     def _report_judgments() -> None:
         """Report judgment progress after appending one evidence row."""
@@ -662,6 +663,7 @@ def complete_cell_evidence(
         if consumed > maximum_judgments:
             raise RouterCompositionError("judgment dispatch budget exhausted")
         if judgment is None and exclusion is not None:
+            excluded_costs.append(exclusion.conservative_cost_usd)
             judge_spend_usd = math.fsum((judge_spend_usd, exclusion.conservative_cost_usd))
             evidence.append(_unjudged_cell_evidence(cell, protocol, rollout))
             _report_judgments()
@@ -722,6 +724,7 @@ def complete_cell_evidence(
                     conservative_cost_usd=exhausted_cost_usd,
                 )
                 judge_spend_usd = math.fsum((judge_spend_usd, exhausted_cost_usd))
+                excluded_costs.append(exhausted_cost_usd)
                 evidence.append(_unjudged_cell_evidence(cell, protocol, rollout))
                 _report_judgments()
                 continue
@@ -738,7 +741,12 @@ def complete_cell_evidence(
             )
         )
         _report_judgments()
-    return tuple(evidence), consumed, judge_spend_usd
+    # Sum the same complete ledger on first execution and replay, rather than returning
+    # different rounding from iterative versus batch accumulation.
+    reconciled = math.fsum(
+        [*(_known_judgment_spend(item) for item in judgments_by_rollout.values()), *excluded_costs]
+    )
+    return tuple(evidence), consumed, reconciled
 
 
 def _record_judgment_exclusion(

@@ -42,6 +42,12 @@ if TYPE_CHECKING:
     from exp.optimize.evaluation.planning import (
         estimate_model_evaluation as estimate_model_evaluation,
     )
+    from exp.optimize.evaluation.prepare import ModelEvaluationOptions as ModelEvaluationOptions
+    from exp.optimize.evaluation.prepare import PreparedModelEvaluation as PreparedModelEvaluation
+    from exp.optimize.evaluation.prepare import prepare_model_evaluation as prepare_model_evaluation
+    from exp.optimize.evaluation.runtime import (
+        run_prepared_model_evaluation as run_prepared_model_evaluation,
+    )
     from exp.optimize.evaluation.service import ModelEvaluationResult as ModelEvaluationResult
     from exp.optimize.evaluation.service import evaluate_models as evaluate_models
     from exp.optimize.router.activation import load_project_router as load_project_router
@@ -159,6 +165,10 @@ _EXPORT_MODULES = {
     "EvaluationSetup": "exp.optimize.evaluation.contracts",
     "EvaluationCostPlan": "exp.optimize.evaluation.planning",
     "estimate_model_evaluation": "exp.optimize.evaluation.planning",
+    "ModelEvaluationOptions": "exp.optimize.evaluation.prepare",
+    "PreparedModelEvaluation": "exp.optimize.evaluation.prepare",
+    "prepare_model_evaluation": "exp.optimize.evaluation.prepare",
+    "run_prepared_model_evaluation": "exp.optimize.evaluation.runtime",
     "ModelEvaluationResult": "exp.optimize.evaluation.service",
     "evaluate_models": "exp.optimize.evaluation.service",
     "BillingSource": "exp.common.models",
