@@ -234,3 +234,166 @@ def test_incomplete_saved_report_cannot_publish_a_subset_score() -> None:
     partial = PairedEvaluationReport.model_validate(changed)
     with pytest.raises(ValueError, match="authoritative"):
         verify_evaluation_report(partial, manifest)
+
+
+def test_multiturn_evaluation_uses_real_http_client_off_the_policy_loop() -> None:
+    """Exercise provider serialization and sync/async transport adaptation without network I/O."""
+    from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
+    from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
+
+    snapshot = model_snapshot().model_copy(update={"provider": "openai-compatible"})
+    split = split_experiences(source_batch(), seed="s", held_out_fraction=0.5)
+    manifest = freeze_evaluation(split, world_model=snapshot, judge_model=snapshot)
+    assert len(manifest.tasks) == 1
+
+    def response(payload: JsonObject) -> JsonHttpResponse:
+        """Encode a structured world/judge response in the actual provider wire shape."""
+        return JsonHttpResponse(
+            status_code=200,
+            body={
+                "model": snapshot.model_id,
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": json.dumps(payload)},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 16, "total_tokens": 24},
+            },
+        )
+
+    observation: JsonObject = {
+        "observations": [{"call_id": "lookup-1", "content": "Claim pending.", "is_error": False}],
+        "user_message": None,
+        "terminal": False,
+        "feedback": "PRIVATE FEEDBACK",
+        "reward": 0.5,
+    }
+    terminal: JsonObject = {
+        "observations": [],
+        "user_message": None,
+        "terminal": True,
+        "feedback": "PRIVATE FEEDBACK",
+        "reward": 0.5,
+    }
+    world_transport = ScriptedJsonTransport([response(observation), response(terminal)] * 2)
+    judge_transport = ScriptedJsonTransport(
+        [
+            response({"score": 0.0, "feedback": "Current policy score."}),
+            response({"score": 0.5, "feedback": "Candidate policy score."}),
+        ]
+    )
+    disclosure = SourceDisclosure(scope=split.scope, model=snapshot)
+    bounds = limits(maximum_steps=3, maximum_model_calls=8, maximum_total_cost_usd=1.0)
+    world = ClaasWorldModel(
+        client=OpenAICompatibleClient(
+            model=snapshot,
+            api_key="fixture",
+            base_url="https://fixture.invalid/v1",
+            transport=world_transport,
+        ),
+        model=snapshot,
+        limits=bounds,
+        source_disclosure=disclosure,
+        purpose="evaluation",
+    )
+    judge = ClaasBoundedProvider(
+        client=OpenAICompatibleClient(
+            model=snapshot,
+            api_key="fixture",
+            base_url="https://fixture.invalid/v1",
+            transport=judge_transport,
+        ),
+        model=snapshot,
+        limits=bounds,
+        source_disclosure=disclosure,
+    )
+    report = asyncio.run(
+        evaluate_policies(
+            manifest,
+            current=Policy("current"),
+            candidate=Policy("candidate"),
+            world=world,
+            judge=judge,
+        )
+    )
+    assert report.paired_mean_delta == 0.5
+    assert len(world_transport.requests) == 4 and len(judge_transport.requests) == 2
+    assert all(request.url.endswith("/chat/completions") for request in world_transport.requests)
+
+
+def test_loaded_report_rejects_score_tampering_and_wrong_judge_identity() -> None:
+    """A score must derive from retained provider evidence for the frozen judge model."""
+    from exp.optimize.claas.evaluation import PairedEvaluationReport, verify_evaluation_report
+
+    manifest, world, judge = evaluation_fixture()
+    report = asyncio.run(
+        evaluate_policies(
+            manifest,
+            current=Policy("current"),
+            candidate=Policy("candidate"),
+            world=world,
+            judge=judge,
+        )
+    )
+    raw = json.loads(report.model_dump_json())
+    raw["pairs"][0]["candidate"]["judgment"]["score"] = 1.0
+    with pytest.raises(ValueError, match="recorded judge response"):
+        PairedEvaluationReport.model_validate(raw)
+    raw = json.loads(report.model_dump_json())
+    raw["pairs"][0]["candidate"]["judge_response"]["model"]["model_id"] = "other-judge"
+    forged = PairedEvaluationReport.model_validate(raw)
+    with pytest.raises(ValueError, match="different model snapshot"):
+        verify_evaluation_report(forged, manifest)
+
+
+@pytest.mark.parametrize("field", ["rubric", "visible_trajectory", "task_id"])
+def test_saved_judge_request_must_match_replayed_frozen_episode(field: str) -> None:
+    """Consistent score text cannot authorize a judge request for a different trajectory."""
+    from exp.optimize.claas.evaluation import PairedEvaluationReport, verify_evaluation_report
+
+    manifest, world, judge = evaluation_fixture()
+    report = asyncio.run(
+        evaluate_policies(
+            manifest,
+            current=Policy("current"),
+            candidate=Policy("candidate"),
+            world=world,
+            judge=judge,
+        )
+    )
+    verify_evaluation_report(report, manifest)
+    raw = json.loads(report.model_dump_json())
+    outcome = raw["pairs"][0]["candidate"]
+    payload = json.loads(outcome["judge_request"]["messages"][-1]["content"])
+    payload[field] = [] if field == "visible_trajectory" else "altered"
+    outcome["judge_request"]["messages"][-1]["content"] = json.dumps(payload, sort_keys=True)
+    loaded = PairedEvaluationReport.model_validate(raw)
+    with pytest.raises(ValueError, match="frozen task and replayed episode"):
+        verify_evaluation_report(loaded, manifest)
+
+
+def test_independently_retained_report_digest_rejects_rewritten_judge_response() -> None:
+    """An authoritative digest binds unsigned recordings when loading outside the run store."""
+    from exp.common.core.artifacts import sha256_json
+    from exp.optimize.claas.evaluation import PairedEvaluationReport, verify_evaluation_report
+
+    manifest, world, judge = evaluation_fixture()
+    report = asyncio.run(
+        evaluate_policies(
+            manifest,
+            current=Policy("current"),
+            candidate=Policy("candidate"),
+            world=world,
+            judge=judge,
+        )
+    )
+    digest = sha256_json(report)
+    verify_evaluation_report(report, manifest, expected_report_sha256=digest)
+    raw = json.loads(report.model_dump_json())
+    outcome = raw["pairs"][0]["candidate"]
+    outcome["judgment"]["score"] = 1.0
+    outcome["judge_response"]["output"]["content"] = json.dumps(outcome["judgment"])
+    loaded = PairedEvaluationReport.model_validate(raw)
+    with pytest.raises(ValueError, match="independently retained digest"):
+        verify_evaluation_report(loaded, manifest, expected_report_sha256=digest)

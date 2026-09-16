@@ -11,9 +11,16 @@ from typing import Literal, Protocol
 from pydantic import Field, model_validator
 
 from exp.common.claas import ClaasScope, Experience
-from exp.common.core.artifacts import ContractModel, Sha256, sha256_json, stable_id
+from exp.common.core.artifacts import (
+    ContractModel,
+    Sha256,
+    canonical_json_bytes,
+    sha256_json,
+    stable_id,
+)
 from exp.common.models import (
     AssistantAction,
+    ModelFinishReason,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -22,10 +29,11 @@ from exp.common.models import (
 )
 from exp.common.tasks import ToolSchema
 from exp.simulation.claas.contracts import ClaasScenario, WorldEpisode
-from exp.simulation.claas.harness import ClaasWorldModel, SourceDisclosure
+from exp.simulation.claas.harness import ClaasWorldModel, SourceDisclosure, WorldModelLimits
 from exp.simulation.claas.mining import MiningLimits, mine_experiences
 from exp.simulation.claas.partition import ClaasSourceSplit, SourceGroup
 from exp.simulation.claas.provider import ClaasBoundedProvider
+from exp.simulation.claas.replay import replay_episode_messages
 
 JUDGE_VERSION = "claas-synthetic-judge-v1"
 _JUDGE_SYSTEM = """Assess a completed simulated tool workflow against its initial request.
@@ -174,6 +182,19 @@ class PolicyTaskEvaluation(ContractModel):
             or self.judge_response is None
         ):
             raise ValueError("scored evaluation requires a terminal episode and judge evidence")
+        if success and self.judge_response is not None:
+            response = self.judge_response
+            if (
+                response.finish_reason != ModelFinishReason.COMPLETED
+                or response.output.tool_calls
+                or response.output.content is None
+            ):
+                raise ValueError("scored evaluation requires a completed structured judge response")
+            recorded = SyntheticJudgment.model_validate_json(
+                structured_json_text(response.output.content)
+            )
+            if recorded != self.judgment:
+                raise ValueError("evaluation judgment differs from its recorded judge response")
         if not success and not self.failure_type:
             raise ValueError("failed evaluation must retain its failure type")
         return self
@@ -383,31 +404,7 @@ async def _evaluate_task(
             stage = "limit"
             raise ValueError("evaluation episode did not finish within its step bound")
         stage = "judge"
-        request = ModelRequest(
-            messages=(
-                ModelMessage(role="system", content=_JUDGE_SYSTEM),
-                ModelMessage(
-                    role="user",
-                    content=json.dumps(
-                        {
-                            "task_id": task.task_id,
-                            "rubric": rubric,
-                            "initial_messages": [
-                                message.model_dump(mode="json")
-                                for message in task.scenario.messages
-                            ],
-                            "tools": [tool.model_dump(mode="json") for tool in task.scenario.tools],
-                            "visible_trajectory": [
-                                message.model_dump(mode="json") for message in session.messages
-                            ],
-                        },
-                        sort_keys=True,
-                    ),
-                ),
-            ),
-            tool_choice="none",
-            maximum_output_tokens=judge.limits.maximum_output_tokens,
-        )
+        request = _judge_request(task, rubric, session.messages, judge.limits.maximum_output_tokens)
         judge_request = request
         response = await _run_blocking(partial(judge.complete, task.scenario.scope, request))
         judge_response = response
@@ -441,6 +438,70 @@ async def _evaluate_task(
             session.end()
 
 
+def _judge_request(
+    task: EvaluationTask,
+    rubric: str,
+    visible_messages: tuple[ModelMessage, ...],
+    maximum_output_tokens: int,
+) -> ModelRequest:
+    """Construct the canonical frozen judge input from validated visible episode state."""
+    return ModelRequest(
+        messages=(
+            ModelMessage(role="system", content=_JUDGE_SYSTEM),
+            ModelMessage(
+                role="user",
+                content=json.dumps(
+                    {
+                        "task_id": task.task_id,
+                        "rubric": rubric,
+                        "initial_messages": [
+                            message.model_dump(mode="json") for message in task.scenario.messages
+                        ],
+                        "tools": [tool.model_dump(mode="json") for tool in task.scenario.tools],
+                        "visible_trajectory": [
+                            message.model_dump(mode="json") for message in visible_messages
+                        ],
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        ),
+        tool_choice="none",
+        maximum_output_tokens=maximum_output_tokens,
+    )
+
+
+def _replay_limits(episode: WorldEpisode) -> WorldModelLimits:
+    """Permit replay of already materialized evidence without claiming original spend bounds."""
+    if not episode.steps:
+        raise ValueError("scored evaluation episode must retain its world steps")
+    output_tokens = episode.steps[0].request.maximum_output_tokens
+    if output_tokens is None:
+        raise ValueError("recorded world request must retain its output bound")
+    maximum_cost = max(
+        (
+            step.response.economics.cost_usd.value
+            if step.response.economics.cost_usd is not None
+            else 0.0
+        )
+        for step in episode.steps
+    )
+    reservation = max(1.0, maximum_cost)
+    return WorldModelLimits(
+        maximum_steps=256,
+        maximum_model_calls=256,
+        maximum_request_bytes=max(
+            len(canonical_json_bytes(step.request)) for step in episode.steps
+        ),
+        maximum_materialized_response_bytes=max(
+            len(canonical_json_bytes(step.response)) for step in episode.steps
+        ),
+        maximum_output_tokens=output_tokens,
+        maximum_call_cost_usd=reservation,
+        maximum_total_cost_usd=reservation * 256,
+    )
+
+
 async def _run_blocking[T](operation: Callable[[], T]) -> T:
     """Keep synchronous clients off-loop and join owned work before cancellation exits.
 
@@ -456,8 +517,20 @@ async def _run_blocking[T](operation: Callable[[], T]) -> T:
         raise
 
 
-def verify_evaluation_report(report: PairedEvaluationReport, manifest: EvaluationManifest) -> None:
-    """Verify a loaded report against the authoritative frozen manifest before use."""
+def verify_evaluation_report(
+    report: PairedEvaluationReport,
+    manifest: EvaluationManifest,
+    *,
+    expected_report_sha256: str | None = None,
+) -> None:
+    """Validate trusted local evidence against its frozen task and optional stored digest.
+
+    These records are unsigned provider recordings. Consistency checks cannot
+    authenticate a fully rewritten artifact supplied by an adversary. Loading
+    outside the trusted run store requires an independently retained report digest.
+    """
+    if expected_report_sha256 is not None and sha256_json(report) != expected_report_sha256:
+        raise ValueError("evaluation report differs from its independently retained digest")
     report = PairedEvaluationReport.model_validate_json(report.model_dump_json())
     manifest = EvaluationManifest.model_validate_json(manifest.model_dump_json())
     if (
@@ -466,3 +539,32 @@ def verify_evaluation_report(report: PairedEvaluationReport, manifest: Evaluatio
         or report.judge_version != manifest.judge_version
     ):
         raise ValueError("paired report differs from the authoritative evaluation manifest")
+    tasks = {task.task_id: task for task in manifest.tasks}
+    for pair in report.pairs:
+        task = tasks[pair.task_id]
+        for outcome in (pair.current, pair.candidate):
+            if outcome.episode is not None and outcome.episode.scenario != task.scenario:
+                raise ValueError("reported episode differs from its immutable evaluation task")
+            if (
+                outcome.judge_response is not None
+                and outcome.judge_response.model != manifest.judge_model
+            ):
+                raise ValueError("reported judgment came from a different model snapshot")
+            if outcome.episode is not None and any(
+                step.response.model != manifest.world_model for step in outcome.episode.steps
+            ):
+                raise ValueError("reported episode came from a different world-model snapshot")
+            if outcome.judgment is not None:
+                episode, request = outcome.episode, outcome.judge_request
+                if episode is None or request is None or request.maximum_output_tokens is None:
+                    raise ValueError("scored evaluation is missing complete judge evidence")
+                messages = replay_episode_messages(
+                    episode, grounding=task.grounding, limits=_replay_limits(episode)
+                )
+                expected = _judge_request(
+                    task, manifest.rubric, messages, request.maximum_output_tokens
+                )
+                if request != expected:
+                    raise ValueError(
+                        "judge request differs from the frozen task and replayed episode"
+                    )

@@ -7,7 +7,13 @@ from collections.abc import Sequence
 
 from exp.common.claas import Experience
 from exp.common.core.artifacts import sha256_json
-from exp.common.models import AssistantAction, ModelRequest, ModelResponse, ModelSnapshot
+from exp.common.models import (
+    AssistantAction,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    ModelSnapshot,
+)
 from exp.simulation.claas.contracts import WorldEpisode, WorldStep
 from exp.simulation.claas.harness import ClaasWorldModel, SourceDisclosure, WorldModelLimits
 
@@ -57,6 +63,28 @@ def replay_episode(
     Raises:
         ValueError: Evidence is incomplete, altered, reordered, or incompatible with this harness.
     """
+    replayed, _ = _replay_episode(episode, grounding=grounding, limits=limits)
+    return replayed
+
+
+def replay_episode_messages(
+    episode: WorldEpisode,
+    *,
+    grounding: Sequence[Experience],
+    limits: WorldModelLimits,
+) -> tuple[ModelMessage, ...]:
+    """Reconstruct only policy-visible messages after validating the complete world recording."""
+    _, messages = _replay_episode(episode, grounding=grounding, limits=limits)
+    return messages
+
+
+def _replay_episode(
+    episode: WorldEpisode,
+    *,
+    grounding: Sequence[Experience],
+    limits: WorldModelLimits,
+) -> tuple[WorldEpisode, tuple[ModelMessage, ...]]:
+    """Replay each exact request and return independently reconstructed state and messages."""
     if not episode.steps or episode.end_reason not in ("world_terminal", "caller_ended"):
         raise ValueError("episode replay requires recorded steps and a completed lifecycle")
     client = ReplayModelClient(episode.steps)
@@ -81,4 +109,4 @@ def replay_episode(
         replayed = session.end()
     if replayed != episode:
         raise ValueError("replayed episode differs from its recorded transitions or provenance")
-    return replayed
+    return replayed, session.messages
