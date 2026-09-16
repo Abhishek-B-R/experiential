@@ -37,6 +37,7 @@ from exp.runtime.gateway.execution_resolution import (
 )
 from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
+from exp.runtime.gateway.native_fallback_rules import FallbackRules, eligible_depths
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_settlement import deployment_operation_key
 from exp.runtime.gateway.reasoning_carrier import ReasoningCarrierAuthority
@@ -355,6 +356,7 @@ def claim_route_from(
     health: DeploymentHealthRegistry,
     keys: tuple[DeploymentHealthKey, ...],
     start: int,
+    depths: Sequence[int] | None = None,
 ) -> int | None:
     """Claim the first healthy later route, a bounded probe, or a forced dispatch.
 
@@ -369,19 +371,20 @@ def claim_route_from(
         health: Revision-isolated circuit and throttle registry.
         keys: One health key per ordered route deployment.
         start: First route index eligible for this claim.
+        depths: The route indexes this dial may claim at all (the
+            ``failover_only_on`` eligibility, ``native_fallback_rules``);
+            ``None`` admits every index. Indexes below ``start`` are skipped.
 
     Returns:
         The claimed route index, or ``None`` when nothing is claimable.
     """
-    for route_index in range(start, len(keys)):
-        if health.claim(keys[route_index]):
-            return route_index
-    for route_index in range(start, len(keys)):
-        if health.claim_last_resort(keys[route_index]):
-            return route_index
-    for route_index in range(start, len(keys)):
-        if health.claim_forced(keys[route_index]):
-            return route_index
+    candidates = [
+        index for index in (range(len(keys)) if depths is None else depths) if index >= start
+    ]
+    for claim in (health.claim, health.claim_last_resort, health.claim_forced):
+        for route_index in candidates:
+            if claim(keys[route_index]):
+                return route_index
     return None
 
 
@@ -402,6 +405,7 @@ def next_route_candidate(
     throttle_redial_budget: int = 0,
     maximum_total_attempts: int = MAXIMUM_TOTAL_ATTEMPTS,
     maximum_same_deployment_attempts: int = MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
+    fallback_rules: FallbackRules = (),
 ) -> int | None:
     """Choose a safe retry or later exact deployment without changing logical model.
 
@@ -471,6 +475,10 @@ def next_route_candidate(
         maximum_total_attempts: Hard cap across retries and deployments.
         maximum_same_deployment_attempts: Initial dispatch plus safe retries
             per deployment.
+        fallback_rules: Each depth's ``failover_only_on`` set (``None`` for an
+            unrestricted rung); empty when no rung authored one. A rule rung is
+            claimed only when the failure spells one of its tokens, and then
+            even for a class the route policy would not advance.
 
     Returns:
         The claimed route index, or ``None`` when the ladder is exhausted.
@@ -508,9 +516,14 @@ def next_route_candidate(
         if disposition is None and failover_mode == "maximize_cache" and throttled:
             return None
     refusal_eligible = failure.failure_class == GatewayFailureClass.REFUSAL and refusal_failover
-    if not failure.failover_eligible and not refusal_eligible:
-        return None
-    return claim_route_from(health, keys, current_depth + 1)
+    rules = fallback_rules or (None,) * len(keys)
+    depths = eligible_depths(
+        rules,
+        current_depth + 1,
+        failure,
+        unrestricted=failure.failover_eligible or refusal_eligible,
+    )
+    return claim_route_from(health, keys, current_depth + 1, depths) if depths else None
 
 
 # Resolve-time deadness that a frozen route narrows past at admission instead
@@ -894,6 +907,11 @@ def deployment_wire_entry(
         "time_to_first_byte_base_seconds": capabilities.time_to_first_byte_base_seconds,
         "time_to_first_byte_seconds_per_million_input_tokens": (
             capabilities.time_to_first_byte_seconds_per_million_input_tokens
+        ),
+        # A failover-only rung's tokens (`native_fallback_rules`): the data
+        # plane never counts it as a first-dial or unmatched successor.
+        "failover_only_on": (
+            None if capabilities.failover_only_on is None else list(capabilities.failover_only_on)
         ),
     }
 

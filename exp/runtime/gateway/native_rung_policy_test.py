@@ -16,6 +16,7 @@ from exp.common.models.catalog import (
     ModelRecord,
 )
 from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
+from exp.common.models.failover_tokens import FailoverToken
 from exp.common.models.gateway_catalog import (
     ExactModelDeployment,
     FailoverMode,
@@ -31,6 +32,7 @@ from exp.runtime.gateway.contracts import (
     GatewayFailure,
     GatewayFailureClass,
     GatewayMessage,
+    GatewayRefusalReason,
     GatewayRequest,
 )
 from exp.runtime.gateway.health import DeploymentHealthRegistry
@@ -52,6 +54,7 @@ def _deployment(
     *,
     connection_sha256: str,
     dispatch: GatewayRungDispatchPolicy | None = None,
+    failover_only_on: tuple[FailoverToken, ...] | None = None,
 ) -> ExactModelDeployment:
     """Build one deployment in the shared certified exact-model pool."""
     return ExactModelDeployment(
@@ -64,7 +67,9 @@ def _deployment(
         connection_sha256=connection_sha256,
         capabilities_sha256="d" * 64,
         gateway=GatewayDeploymentMetadata(
-            capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+            capabilities=GatewayDeploymentCapabilities(
+                supports_streaming=True, failover_only_on=failover_only_on
+            ),
             dispatch=dispatch,
         ),
     )
@@ -204,6 +209,33 @@ def test_failed_dispatch_candidate_reads_the_organizations_cache_on_the_failed_r
     plain = _entry(deployments, failover_mode="maximize_cache")
     assert failed_dispatch_candidate(
         health=health, loads=loads, keys=keys, entry=plain, failure=_THROTTLE, current_depth=0
+    ) == (None, None)
+
+
+def test_failed_dispatch_candidate_dials_a_failover_only_rung_on_its_named_failure() -> None:
+    """The rung's own `failover_only_on` set decides, not the alias revision's refusal opt-in."""
+    deployments = (
+        _deployment("deployment-a", connection_sha256="b" * 64),
+        _deployment(
+            "deployment-b", connection_sha256="c" * 64, failover_only_on=("refusal:cyber_policy",)
+        ),
+    )
+    entry = _entry(deployments)
+    health = DeploymentHealthRegistry()
+    keys = tuple(deployment_health_key(entry.authorization, item) for item in deployments)
+    loads = RungLoadRegistry()
+    cyber = GatewayFailure(
+        failure_class=GatewayFailureClass.REFUSAL,
+        safe_message="provider refused the request: cybersecurity policy",
+        refusal_reason=GatewayRefusalReason.CYBER_POLICY,
+    )
+    assert not entry.authorization.refusal_failover
+    assert failed_dispatch_candidate(
+        health=health, loads=loads, keys=keys, entry=entry, failure=cyber, current_depth=0
+    ) == (1, None)
+    # A throttle has no unrestricted rung left to advance to.
+    assert failed_dispatch_candidate(
+        health=health, loads=loads, keys=keys, entry=entry, failure=_THROTTLE, current_depth=0
     ) == (None, None)
 
 

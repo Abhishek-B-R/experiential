@@ -35,6 +35,27 @@ class Plane:
         self.settles = []
         self.counts = [0, 0]
         self.max_redials = 2
+        # Per-depth `failover_only_on` sets (None = unrestricted), mirroring
+        # `native_fallback_rules.eligible_depths`; and a scripted first depth
+        # for the contract-violation test.
+        self.rules = [None, None]
+        self.first_depth = None
+
+    def configure(self, argument):
+        data = json.loads(argument)
+        with self.lock:
+            self.rules = data.get("rules", self.rules)
+            self.first_depth = data.get("first_depth")
+        return "{}"
+
+    def admits(self, depth, failure):
+        rules = self.rules[depth]
+        if rules is None:
+            return failure.get("failover_eligible")
+        token = failure["failure_class"]
+        if token == "refusal":
+            token = "refusal:" + (failure.get("refusal_reason") or "unspecified")
+        return token in rules or (failure["failure_class"] == "refusal" and "refusal" in rules)
 
     def start_attempt(self, argument):
         data = json.loads(argument)
@@ -43,14 +64,18 @@ class Plane:
             depth = data.get("current_depth")
             failure = data.get("failure")
             if depth is None:
-                candidate = 0
+                candidate = (
+                    self.first_depth
+                    if self.first_depth is not None
+                    else next(i for i, rules in enumerate(self.rules) if rules is None)
+                )
             elif (
                 data.get("throttle_backoff")
                 and failure["failure_class"] == "throttled"
                 and self.counts[depth] <= self.max_redials
             ):
                 candidate = depth
-            elif failure.get("failover_eligible") and depth + 1 < len(self.counts):
+            elif depth + 1 < len(self.counts) and self.admits(depth + 1, failure):
                 candidate = depth + 1
             else:
                 return json.dumps({"exhausted": True, "failure": failure})
@@ -252,6 +277,7 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         time_to_first_byte_base_seconds: None,
         time_to_first_byte_seconds_per_million_input_tokens: None,
         throttle_redial_budget,
+        failover_only_on: None,
     }
 }
 
@@ -401,6 +427,15 @@ impl Harness {
         };
         let won = acquire_attempt(&context, &mut guard).await;
         (won, guard)
+    }
+
+    /// Script the control plane's per-depth `failover_only_on` sets (and,
+    /// for the contract-violation test, the depth it answers a first dial).
+    pub(super) async fn configure(&self, configuration: Value) {
+        self.bridge
+            .call("configure", configuration.to_string())
+            .await
+            .expect("configure succeeds");
     }
 
     pub(super) async fn story(&self) -> Value {
@@ -691,5 +726,119 @@ fn a_low_stake_request_gets_fewer_redials_than_a_high_stake_one() {
         };
         assert_eq!(flags(&high), vec![false, true, true, false]);
         assert_eq!(flags(&low), vec![false, true, false]);
+    });
+}
+
+/// OpenAI's cyber-safety verdict as a 400 at open (gpt-6-astra, 2026-09-06).
+const CYBER_POLICY_BODY: &str = concat!(
+    "{\"error\":{\"message\":\"Your request was flagged as potentially violating our ",
+    "usage policy (cyber).\",\"type\":\"invalid_request_error\",\"param\":null,",
+    "\"code\":\"cyber_policy\"}}"
+);
+
+/// A rung that serves only as a failover for these tokens (the customer's own
+/// key enrolled in a trusted-access program, in the reference case).
+fn rule_wire(deployment_id: &str, url: &str, tokens: &[&str]) -> DeploymentWire {
+    DeploymentWire {
+        billing_customer_managed: true,
+        failover_only_on: Some(tokens.iter().map(|token| token.to_string()).collect()),
+        ..wire(deployment_id, url, 0)
+    }
+}
+
+#[test]
+fn a_cyber_refusal_dials_the_rung_that_opted_into_it_without_refusal_failover() {
+    block_on(async {
+        let harness = Harness::new();
+        harness
+            .configure(json!({"rules": [null, ["refusal:cyber_policy"]]}))
+            .await;
+        let rung_a = spawn_rung(vec![Answer::Rejected(CYBER_POLICY_BODY)]).await;
+        let rung_b = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
+        let route = [
+            wire("house", &rung_a.url, 0),
+            rule_wire("byok", &rung_b.url, &["refusal:cyber_policy"]),
+        ];
+        // The harness policy carries `refusal_failover: false`: the rung's
+        // own opt-in, not the alias revision's, is what advances the refusal.
+        let (won, guard) = harness.run(&route, None, Duration::from_secs(60)).await;
+        let won = finish(guard, won).await;
+        let Won::Committed(committed) = won else {
+            panic!("the refused request is served by the opted-in rung");
+        };
+        assert_eq!(committed.depth, 1);
+        drop(committed);
+        assert_eq!(rung_a.accepted.lock().expect("lock").len(), 1);
+        assert_eq!(rung_b.accepted.lock().expect("lock").len(), 1);
+        let story = harness.story().await;
+        let starts = story["starts"].as_array().expect("starts");
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[1]["current_depth"], 0);
+        assert_eq!(starts[1]["failure"]["failure_class"], "refusal");
+        assert_eq!(starts[1]["failure"]["refusal_reason"], "cyber_policy");
+        let settles = story["settles"].as_array().expect("settles");
+        assert_eq!(settles[0]["outcome"], "failed");
+        assert_eq!(settles[0]["finalize"], false);
+        assert_eq!(settles[1]["outcome"], "completed");
+    });
+}
+
+#[test]
+fn a_failover_only_rung_is_skipped_for_failures_its_set_does_not_name() {
+    block_on(async {
+        let harness = Harness::new();
+        harness
+            .configure(json!({"rules": [null, ["refusal:cyber_policy"]]}))
+            .await;
+        let rung_a = spawn_rung(vec![Answer::Throttle(Some(3))]).await;
+        let rung_b = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
+        let route = [
+            wire("house", &rung_a.url, 0),
+            rule_wire("byok", &rung_b.url, &["refusal:cyber_policy"]),
+        ];
+        let (won, _guard) = harness.run(&route, None, Duration::from_secs(60)).await;
+        let Won::Failed(error) = won else {
+            panic!("a throttle has no rung to fail over to: the ladder is exhausted");
+        };
+        assert_eq!(error.status_code, 429);
+        assert!(rung_b.accepted.lock().expect("lock").is_empty());
+        let story = harness.story().await;
+        // The ladder was judged exhausted rust-side: one reservation, one
+        // finalizing settle, and no second `start_attempt`.
+        assert_eq!(story["starts"].as_array().expect("starts").len(), 1);
+        let settles = story["settles"].as_array().expect("settles");
+        assert_eq!(settles.len(), 1);
+        assert_eq!(settles[0]["finalize"], true);
+        assert_eq!(settles[0]["failure"]["failure_class"], "throttled");
+    });
+}
+
+#[test]
+fn a_first_dial_reserved_on_a_failover_only_rung_fails_closed() {
+    block_on(async {
+        let harness = Harness::new();
+        // A control plane that violates the contract by answering the rule
+        // rung for the first dial.
+        harness
+            .configure(json!({"rules": [null, ["refusal:cyber_policy"]], "first_depth": 1}))
+            .await;
+        let rung_a = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
+        let rung_b = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
+        let route = [
+            wire("house", &rung_a.url, 0),
+            rule_wire("byok", &rung_b.url, &["refusal:cyber_policy"]),
+        ];
+        let (won, _guard) = harness.run(&route, None, Duration::from_secs(60)).await;
+        let Won::Failed(error) = won else {
+            panic!("a rule rung reserved for the first dial is a contract failure");
+        };
+        assert_eq!(error.status_code, 500);
+        assert!(rung_a.accepted.lock().expect("lock").is_empty());
+        assert!(rung_b.accepted.lock().expect("lock").is_empty());
+        let story = harness.story().await;
+        let settles = story["settles"].as_array().expect("settles");
+        assert_eq!(settles.len(), 1);
+        assert_eq!(settles[0]["finalize"], true);
+        assert_eq!(settles[0]["failure"]["failure_class"], "internal");
     });
 }

@@ -322,7 +322,7 @@ fn default_single_attempt_policy_never_redials_unknown_idempotency() {
     admitted.maximum_total_attempts = 2;
     assert!(!successor_possible(
         admitted.policy(),
-        1,
+        &[wire(false)],
         Instant::now() + Duration::from_secs(1),
         1,
         1,
@@ -332,7 +332,7 @@ fn default_single_attempt_policy_never_redials_unknown_idempotency() {
     ));
     assert!(successor_possible(
         admitted.policy(),
-        2,
+        &[wire(false), wire(false)],
         Instant::now() + Duration::from_secs(1),
         1,
         1,
@@ -412,7 +412,7 @@ fn uncertain_outcomes_never_advance_even_with_an_unused_second_rung() {
         assert!(!failure.failover_eligible);
         assert!(!successor_possible(
             policy,
-            2,
+            &[wire(false), wire(false)],
             Instant::now() + Duration::from_secs(1),
             1,
             1,
@@ -428,7 +428,7 @@ fn uncertain_outcomes_never_advance_even_with_an_unused_second_rung() {
         assert_eq!(
             successor_possible(
                 policy,
-                2,
+                &[wire(false), wire(false)],
                 Instant::now() + Duration::from_secs(1),
                 1,
                 1,
