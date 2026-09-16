@@ -20,14 +20,14 @@ use crate::admission::Admission;
 
 pub(crate) use store::CaptureStore;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Scope {
     pub user_id: String,
     pub application_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Policy {
     pub scope: Scope,
@@ -74,7 +74,7 @@ impl CaptureSession {
         let store = store.as_ref()?;
         // This scope was derived from the authenticated virtual key, never
         // from caller-supplied application headers or request metadata.
-        let (_, user_id) = admission.caller_scope.as_deref()?.split_once(':')?;
+        let user_id = admission.caller_identity_id.as_deref()?;
         let policy = store.policy(user_id, &admission.alias)?;
         if body.len() > policy.maximum_experience_bytes {
             store.skip();

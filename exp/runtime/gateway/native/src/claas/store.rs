@@ -25,6 +25,7 @@ pub(crate) struct CaptureStore {
     sender: Mutex<Option<mpsc::SyncSender<Pending>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     skipped: Arc<AtomicU64>,
+    shutdown_deadline: Arc<Mutex<Option<Instant>>>,
 }
 
 impl CaptureStore {
@@ -46,11 +47,19 @@ impl CaptureStore {
         let (sender, receiver) = mpsc::sync_channel::<Pending>(config.queue_capacity);
         let skipped = Arc::new(AtomicU64::new(0));
         let failures = skipped.clone();
+        let shutdown_deadline = Arc::new(Mutex::new(None::<Instant>));
+        let worker_deadline = shutdown_deadline.clone();
         let worker = std::thread::Builder::new()
             .name("claas-capture".into())
             .spawn(move || {
                 let mut last_cleanup = Instant::now();
                 loop {
+                    if worker_deadline.lock().map_or(true, |deadline| {
+                        deadline.is_some_and(|at| Instant::now() >= at)
+                    }) {
+                        failures.fetch_add(receiver.try_iter().count() as u64, Ordering::Relaxed);
+                        break;
+                    }
                     if last_cleanup.elapsed() >= Duration::from_secs(1) {
                         for policy in &policies {
                             if prune(&connection, policy, now()).is_err() {
@@ -76,6 +85,7 @@ impl CaptureStore {
             sender: Mutex::new(Some(sender)),
             worker: Mutex::new(Some(worker)),
             skipped,
+            shutdown_deadline,
         })))
     }
 
@@ -151,16 +161,32 @@ impl CaptureStore {
         }
     }
 
-    /// Drain queued writes during graceful shutdown before the local process exits.
-    pub(crate) fn close(&self) {
+    /// Drain only within the server's remaining graceful deadline. Any in-flight
+    /// SQLite operation may finish on its owned thread; no caller waits beyond it.
+    pub(crate) fn close_until(&self, deadline: Instant) -> bool {
+        if let Ok(mut bound) = self.shutdown_deadline.lock() {
+            *bound = Some(deadline);
+        }
         if let Ok(mut sender) = self.sender.lock() {
             sender.take();
         }
         if let Ok(mut worker) = self.worker.lock() {
             if let Some(worker) = worker.take() {
+                while !worker.is_finished() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                if !worker.is_finished() {
+                    return false;
+                }
                 let _ = worker.join();
             }
         }
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close(&self) {
+        assert!(self.close_until(Instant::now() + Duration::from_secs(5)));
     }
 }
 
@@ -183,8 +209,18 @@ fn validate(config: &CaptureConfiguration) -> Result<(), String> {
         return Err(invalid());
     }
     let mut keys = std::collections::HashSet::new();
+    let mut policies = std::collections::HashMap::new();
     for binding in &config.bindings {
         let policy = &binding.policy;
+        if policies
+            .insert(
+                (&policy.scope.user_id, &policy.scope.application_id),
+                policy,
+            )
+            .is_some_and(|previous| previous != policy)
+        {
+            return Err(invalid());
+        }
         if [
             &binding.alias,
             &policy.scope.user_id,
