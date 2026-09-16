@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
@@ -26,15 +26,13 @@ from exp.common.judging import Judge, Judgment
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
 from exp.common.rollouts import RolloutArtifact, StopReason
+from exp.optimize.evaluation.contracts import EvaluationSetup, JudgmentReferences
 from exp.optimize.router.errors import (
     JudgeDispatchExhaustedError,
     JudgeTranscriptAdmissionError,
     RouterCompositionError,
 )
 from exp.simulation.engines.text.resume import reexecutable_dispatch_failure
-
-if TYPE_CHECKING:
-    from exp.optimize.router.composition import RouterEvaluationSetup, RouterReviewProvenance
 
 logger = logging.getLogger(__name__)
 
@@ -490,8 +488,8 @@ def complete_cell_evidence(
     plan_input: ArtifactInput,
     cells: tuple[EvaluationCell, ...],
     simulated_rollout_ids: tuple[str, ...],
-    setup: RouterEvaluationSetup,
-    review: RouterReviewProvenance,
+    setup: EvaluationSetup,
+    review: JudgmentReferences,
     judge: Judge,
     maximum_judgments: int,
     *,
@@ -748,7 +746,7 @@ def _record_judgment_exclusion(
     plan_input: ArtifactInput,
     cell: EvaluationCell,
     rollout_id: str,
-    review: RouterReviewProvenance,
+    review: JudgmentReferences,
     protocol: EvaluationProtocol,
     *,
     reason: JudgmentExclusionReason,
