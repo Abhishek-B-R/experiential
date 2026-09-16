@@ -7,9 +7,9 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
-from exp.common.core.artifacts import ArtifactInput, sha256_json
+from exp.common.core.artifacts import ArtifactInput, ContractModel, Sha256, sha256_json
 from exp.common.models.catalog import (
     BillingSource,
     ConnectionConfig,
@@ -37,6 +37,7 @@ from exp.common.models.gateway_catalog import (
     normalize_gateway_catalog,
     read_pinned_normalized_snapshot,
 )
+from exp.common.models.gateway_chains import GatewayDeploymentRung, GatewayModelChain
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification, GatewayPoolRecord
 from exp.common.models.model import ModelCapabilities, ModelSnapshot
 
@@ -57,6 +58,61 @@ def _minimal_normalized() -> NormalizedGatewayCatalog:
     )
     pool = ExactModelPool(pool_id="dep-1", exact_model_id="exact-1", deployment_ids=("dep-1",))
     return NormalizedGatewayCatalog(deployments=(deployment,), pools=(pool,))
+
+
+class _PreChainSchema4(ContractModel):
+    """Frozen top-level schema-4 reader shape before model-chain execution existed."""
+
+    schema_version: int = Field(default=4, ge=1)
+    deployments: tuple[ExactModelDeployment, ...] = ()
+    pools: tuple[ExactModelPool, ...] = ()
+
+    def identity_sha256(self) -> Sha256:
+        """Reproduce the published schema-4 default-excluding identity contract."""
+        return sha256_json(self.model_dump(mode="json", by_alias=True, exclude_defaults=True))
+
+
+def _read_pre_chain_schema4(data: str, digest: str) -> _PreChainSchema4:
+    """Exercise the pre-chain strict same-version and tolerant foreign-version decision."""
+    parsed, _dropped = load_forward_compatible(_PreChainSchema4, data)
+    if parsed.schema_version == 4 and parsed.identity_sha256() != digest:
+        raise CatalogSnapshotDigestError("catalog snapshot digest does not match pinned authority")
+    return parsed
+
+
+def test_empty_model_chains_remain_compatible_with_pre_chain_schema4() -> None:
+    """Omitted and explicitly empty chain fields preserve old-reader digest identity."""
+    current = _minimal_normalized()
+    for explicit in (False, True):
+        document = current.model_dump(mode="json")
+        if not explicit:
+            document.pop("model_chains")
+        loaded = _read_pre_chain_schema4(json.dumps(document), current.identity_sha256())
+        assert loaded.deployments == current.deployments
+        assert loaded.pools == current.pools
+        assert loaded.identity_sha256() == current.identity_sha256()
+
+
+def test_populated_chain_policy_is_not_silently_dropped_by_same_schema_old_reader() -> None:
+    """New policy requires an upgraded fleet; changing only the stamp would hide its loss."""
+    plain = _minimal_normalized()
+    policy = GatewayModelChain(
+        model_id="exact-1",
+        pool_id="dep-1",
+        revision="explicit-policy",
+        available=False,
+        rungs=(GatewayDeploymentRung(deployment_id="dep-1"),),
+    )
+    current = plain.model_copy(update={"model_chains": (policy,)})
+    with pytest.raises(CatalogSnapshotDigestError):
+        _read_pre_chain_schema4(current.model_dump_json(), current.identity_sha256())
+    # A stamp-only bump would accept a deployment explicitly unavailable under
+    # the authored policy. It cannot be the remedy for new-feature activation.
+    document = current.model_dump(mode="json")
+    document["schema_version"] = 5
+    lost_policy = _read_pre_chain_schema4(json.dumps(document), current.identity_sha256())
+    assert lost_policy.deployments == plain.deployments
+    assert "model_chains" not in type(lost_policy).model_fields
 
 
 def test_load_forward_compatible_drops_unknown_fields_and_reports_them() -> None:

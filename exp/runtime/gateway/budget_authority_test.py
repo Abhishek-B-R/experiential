@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import canonical_json_bytes
+from exp.common.core.artifacts import JsonObject, canonical_json_bytes
 from exp.common.models.gateway_catalog import CatalogSnapshotDigestError, NormalizedGatewayCatalog
 from exp.runtime.gateway import budget_authority as budgets_module
 from exp.runtime.gateway.budget_authority import (
@@ -17,6 +18,114 @@ from exp.runtime.gateway.budget_authority import (
 )
 from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind
 from exp.runtime.gateway.budgets_test import _activate_chain, _authority, _chain_catalog, _Clock
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "foreign-schema",
+        "unknown-root",
+        "unknown-chain",
+        "unknown-pool",
+        "unknown-capability",
+        "unknown-deployment",
+        "unknown-rung",
+        "unknown-policy",
+        "unknown-prices",
+        "revision",
+        "pool",
+        "deployment",
+        "price",
+        "policy",
+    ],
+)
+def test_budget_snapshot_authority_rejects_unverified_semantics(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """Foreign versions and unknown or changed semantics cannot authorize a budget write."""
+    clock = _Clock()
+    store, _ledger, budgets, _key = _authority(tmp_path, clock)
+    catalog = _activate_chain(store, tmp_path)
+    raw: JsonObject = json.loads(catalog.model_dump_json())
+    chains = raw["model_chains"]
+    pools = raw["pools"]
+    deployments = raw["deployments"]
+    assert isinstance(chains, list) and isinstance(chains[0], dict)
+    assert isinstance(pools, list) and isinstance(pools[0], dict)
+    assert isinstance(deployments, list) and isinstance(deployments[0], dict)
+    if mutation == "foreign-schema":
+        raw["schema_version"] = 5
+        chains[0]["revision"] = "unverified"
+    elif mutation == "unknown-root":
+        raw["future_authority"] = {"allow": True}
+    elif mutation == "unknown-chain":
+        chains[0]["future_authority"] = True
+    elif mutation == "unknown-pool":
+        pools[0]["future_authority"] = True
+    elif mutation == "unknown-capability":
+        capabilities = deployments[0]["capabilities"]
+        assert isinstance(capabilities, dict)
+        capabilities["future_authority"] = True
+    elif mutation == "unknown-deployment":
+        deployments[0]["future_authority"] = True
+    elif mutation == "unknown-rung":
+        rungs = chains[0]["rungs"]
+        assert isinstance(rungs, list) and isinstance(rungs[0], dict)
+        rungs[0]["future_authority"] = True
+    elif mutation == "unknown-policy":
+        chains[0]["policy"] = {"future_authority": True}
+    elif mutation == "unknown-prices":
+        gateway = deployments[0]["gateway"]
+        assert isinstance(gateway, dict)
+        prices = gateway["prices"]
+        assert isinstance(prices, dict)
+        prices["future_authority"] = True
+    elif mutation == "revision":
+        chains[0]["revision"] = "changed"
+    elif mutation == "pool":
+        pools[0]["failover_mode"] = "maximize_cache"
+    elif mutation == "deployment":
+        deployments[0]["connection_sha256"] = "f" * 64
+    elif mutation == "price":
+        gateway = deployments[0]["gateway"]
+        assert isinstance(gateway, dict)
+        prices = gateway["prices"]
+        assert isinstance(prices, dict)
+        prices["input_nano_usd_per_million_tokens"] = 99
+    else:
+        chains[0]["policy"] = {"failover_mode": "maximize_cache"}
+    (tmp_path / "chain-snapshot-org").write_bytes(canonical_json_bytes(raw))
+    with pytest.raises(ValueError, match="unsupported|invalid|unknown|digest"):
+        budgets.set_limit(
+            organization_id="org",
+            period="2026-08",
+            scope=BudgetScope(kind=BudgetScopeKind.POOL, alias_id="coding", pool_id="child-pool"),
+            limit_nano_usd=100,
+        )
+    assert budgets.limits(organization_id="org", period="2026-08") == ()
+
+
+@pytest.mark.parametrize("version", [1, 3, 5, 10_001])
+def test_budget_snapshot_rejects_other_schemas_even_with_matching_parsed_identity(
+    tmp_path: Path, version: int
+) -> None:
+    """Budget mutations require a schema this build understands, not a foreign-reader shortcut."""
+    catalog = _chain_catalog().model_copy(update={"schema_version": version})
+    (tmp_path / "snapshot").write_bytes(canonical_json_bytes(catalog.model_dump(mode="json")))
+    with pytest.raises(ValueError, match="schema is unsupported; rebuild and activate"):
+        read_budget_snapshot(tmp_path / "gateway.db", "snapshot", catalog.identity_sha256())
+
+
+def test_budget_snapshot_accepts_supported_schema_with_full_defaults(tmp_path: Path) -> None:
+    """Strict authority uses the published default-excluding identity, not the full byte hash."""
+    catalog = _chain_catalog().model_copy(update={"model_chains": ()})
+    raw = json.loads(catalog.model_dump_json())
+    del raw["model_chains"]
+    (tmp_path / "snapshot").write_bytes(canonical_json_bytes(raw))
+    loaded = read_budget_snapshot(tmp_path / "gateway.db", "snapshot", catalog.identity_sha256())
+    assert loaded == catalog
+    assert loaded.schema_version == 4
 
 
 def test_pinned_graph_file_resource_override_and_reachable_authority(tmp_path: Path) -> None:

@@ -6,10 +6,13 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from exp.common.config.settings import GatewayResourceSettings
 from exp.common.models.gateway_catalog import (
+    SNAPSHOT_SCHEMA_VERSION,
+    CatalogSnapshotDigestError,
     NormalizedGatewayCatalog,
-    read_pinned_normalized_snapshot,
 )
 from exp.common.models.gateway_chains import expand_model_chain
 from exp.runtime.gateway.snapshot_file import read_snapshot_bytes
@@ -55,9 +58,30 @@ def read_budget_snapshot(
     digest: str,
     maximum_bytes: int = MAXIMUM_BUDGET_SNAPSHOT_BYTES,
 ) -> NormalizedGatewayCatalog:
-    """Read a safe regular snapshot within the operator's authoring resource budget."""
+    """Read strictly understood, digest-verified authority within the resource budget.
+
+    Budget writes cannot use serving's tolerant cross-build view: dropping unknown
+    policy fields or bypassing identity checks would change the authorized graph.
+    """
     payload = read_snapshot_bytes(database_path.parent, snapshot_ref, maximum_bytes)
-    return read_pinned_normalized_snapshot(payload, digest)
+    try:
+        catalog = NormalizedGatewayCatalog.model_validate_json(payload, strict=True)
+    except ValidationError as exc:
+        raise ValueError(
+            "budget snapshot has invalid or unknown fields; "
+            "rebuild and activate a supported snapshot"
+        ) from exc
+    if catalog.schema_version != SNAPSHOT_SCHEMA_VERSION:
+        raise ValueError(
+            "budget snapshot schema is unsupported; "
+            "rebuild and activate a snapshot with this engine"
+        )
+    if catalog.identity_sha256() != digest:
+        raise CatalogSnapshotDigestError(
+            "budget snapshot digest does not match pinned authority; "
+            "rebuild and reactivate the alias"
+        )
+    return catalog
 
 
 def validate_budget_revision(
