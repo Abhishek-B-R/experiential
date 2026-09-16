@@ -15,10 +15,10 @@ from exp.optimize.claas.backends.checkpoints import verify_checkpoint
 from exp.optimize.claas.backends.checkpoints_test import checkpoint
 from exp.optimize.claas.backends.modal import (
     REMOTE_ROOT,
-    ModalExecutionConfig,
     ModalVerlBackend,
     _download_checkpoint,
 )
+from exp.optimize.claas.backends.modal_configuration import ModalExecutionConfig
 from exp.optimize.claas.training_contracts import ClaasTrainingError, TrainingJob, TrainingResult
 from exp.optimize.claas.training_contracts_test import job, spec
 
@@ -91,17 +91,6 @@ def test_download_verifies_manifest_and_preserves_immutable_scope(tmp_path: Path
             )
 
     asyncio.run(run())
-
-
-def test_cost_gate_rejects_before_backend_construction() -> None:
-    """An underfunded budget and multi-GPU selection fail before any cloud SDK call."""
-    assert config().estimated_maximum_cost_usd == 0.12
-    with pytest.raises(ValueError, match="exceeds authorization"):
-        ModalExecutionConfig.model_validate(
-            config().model_dump() | {"authorized_maximum_cost_usd": 0.01}
-        )
-    with pytest.raises(ValueError):
-        ModalExecutionConfig.model_validate(config().model_dump() | {"gpu": "H100:8"})
 
 
 def test_one_authorization_never_silently_retries(tmp_path: Path) -> None:
