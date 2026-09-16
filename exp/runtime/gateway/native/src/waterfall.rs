@@ -586,7 +586,7 @@ async fn run_attempt(
     // What is already known repairs the first dial: the payload this request
     // stripped on an earlier dial of the rung, else the payloads this worker
     // remembers the caller's provider refusing.
-    let mut repair = AttemptRepair::begin(wire, ctx.caller_scope, repaired);
+    let mut repair = AttemptRepair::begin(wire, ctx.caller_scope, repaired, ctx.request_id);
     // At most one re-dial per attempt: when the rung refuses a replayed
     // reasoning item's encrypted payload (sealed by another organization or
     // tenant, or never issued by this provider), whether before the stream (a
@@ -596,6 +596,11 @@ async fn run_attempt(
     // surface. A payload with nothing to strip, or a refusal of the stripped
     // payload itself, surfaces.
     let mut redialed = false;
+    // Usage a refused in-stream dial reported (a `response.failed` frame can
+    // carry the tokens the provider billed for the legs it processed) rides
+    // into the re-dial's relay and joins its first usage report, so the
+    // reservation settles every token this attempt was charged for.
+    let mut carried_usage: Option<Usage> = None;
     'dial: loop {
         let open_bound = remaining(ctx.deadline)
             .min(phase_timeout)
@@ -633,9 +638,7 @@ async fn run_attempt(
                 };
             }
         };
-        // Counted and logged only once the dial that carried the repair opened:
-        // a refused re-dial is a failure, not a repair.
-        repair.opened(ctx.request_id);
+        repair.dial_opened();
         let encrypted_reasoning_stripped = repair.stripped();
         guard.mark_opened();
         // The opened response's allowlisted rate-limit headers settle with this
@@ -655,6 +658,7 @@ async fn run_attempt(
             ),
             None => UpstreamRelay::new(response, dialect, first_byte_deadline),
         };
+        relay.set_carried_usage(carried_usage.take());
         relay.set_stop_sequences(wire.stop_sequences.iter().cloned());
         relay.set_serialize_tool_calls(wire.serialize_tool_calls);
         if !wire.model_id.is_empty() {
@@ -665,8 +669,8 @@ async fn run_attempt(
             // so a committed stream's late credential error is the customer's too.
             relay.set_customer_managed_provider(Some(wire.provider.clone()));
         }
-        // Per dial: a refused stream's tracked facts belong to that dial, and
-        // a refused open reports no usage.
+        // Per dial: tracked facts belong to the dial that produced them; a
+        // refused dial's billed usage travels through the relay above.
         let mut usage: Option<Usage> = None;
         let mut tool_names: Vec<String> = Vec::new();
         let mut withheld: Vec<Event> = Vec::new();
@@ -763,6 +767,7 @@ async fn run_attempt(
                         // encrypted reasoning on its first frame: the same repair
                         // as a pre-stream 4xx, nothing outward was committed.
                         redialed = true;
+                        carried_usage = usage.take();
                         first_byte_deadline = Instant::now() + first_byte_allowance_for();
                         continue 'dial;
                     }
@@ -934,5 +939,7 @@ pub(crate) use empty::{
 
 #[cfg(test)]
 mod ladder_tests;
+#[cfg(test)]
+mod repair_ladder_tests;
 #[cfg(test)]
 mod tests;
