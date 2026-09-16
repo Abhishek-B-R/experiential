@@ -70,6 +70,8 @@ def select_source_feedback(
 
     Unmatched responses and incomplete episode memberships are left out. A
     matching captured episode ID alone never replaces the finalization receipt.
+    The last 128 matching labels in supplied buffer order are retained. All input
+    records are validated, including labels outside that bounded selection.
     Scope mismatches and contradictory receipt identities fail explicitly.
     """
     if not grounding:
@@ -107,6 +109,4 @@ def select_source_feedback(
             if finalized.finalized_at > record.created_at:
                 raise ValueError("episode feedback predates its finalization receipt")
         selected.append(SourceFeedback(record=record, finalized_episode=finalized))
-        if len(selected) > 128:
-            raise ValueError("source feedback limit exceeded; select at most 128 records")
-    return tuple(selected)
+    return tuple(selected[-128:])

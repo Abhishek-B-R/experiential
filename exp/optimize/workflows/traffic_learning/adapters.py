@@ -95,8 +95,11 @@ class TrafficSession:
         )
 
     async def close(self, reason: Literal["terminal", "step_limit", "failed"]) -> JsonObject:
-        """Finalize the world receipt regardless of the generic consumer's ending reason."""
-        return {"world_episode": self.session.end().model_dump(mode="json")}
+        """Retain consumer limits and errors without overwriting an already closed world."""
+        world_reason: Literal["caller_ended", "limit", "error"] = (
+            "limit" if reason == "step_limit" else "error" if reason == "failed" else "caller_ended"
+        )
+        return {"world_episode": self.session.end(reason=world_reason).model_dump(mode="json")}
 
 
 class TrafficEvaluator:

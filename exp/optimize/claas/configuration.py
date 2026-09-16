@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 from exp.common.claas.contracts import ClaasScope
 from exp.common.core.artifacts import ContractModel, sha256_json
@@ -39,7 +39,7 @@ class LocalClaasConfig(ContractModel):
     configuration requires no traffic source, world model, or judge provider.
     """
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     scope: ClaasScope
     base_model: str = Field(min_length=1, max_length=512)
     base_model_revision: str = Field(min_length=1, max_length=512)
@@ -89,6 +89,13 @@ def load_configuration(root: Path, scope: ClaasScope) -> LocalClaasConfig:
             f"CLaaS application {scope.application_id!r} is not configured; "
             "run exp optimize claas init first"
         ) from None
+    except ValidationError as error:
+        if any(detail["loc"] == ("schema_version",) for detail in error.errors()):
+            raise ValueError(
+                "CLaaS configuration requires schema version 3; initialize a fresh application "
+                "with a new application ID or an empty artifact root"
+            ) from None
+        raise
     if config.scope != scope:
         raise ValueError(f"CLaaS configuration at {path} belongs to another application")
     return config
