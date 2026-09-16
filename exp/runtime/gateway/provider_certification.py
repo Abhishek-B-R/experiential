@@ -306,7 +306,7 @@ def _decision_provider_cells() -> tuple[ProviderCertificationCell, ...]:
             ProviderCertificationCell(
                 provider="typesafe",
                 provider_api_surface="POST /v1/systemone JSON",
-                client_sdk="httpx (raw HTTP; no decision SDK)",
+                client_sdk="reqwest (native HTTP; no decision SDK)",
                 gateway_api_surfaces=("decisions",),
                 capability=capability,
                 result=result,
