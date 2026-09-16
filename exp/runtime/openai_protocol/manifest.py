@@ -116,10 +116,15 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "prompt_cache_options",
                 "prompt_cache_retention",
                 "seed",
-                "verbosity",
                 "web_search_options",
             )
         ),
+        # OpenAI's GPT-5 family accepts a top-level ``verbosity`` on Chat
+        # Completions (the Responses surface spells it ``text.verbosity``); it
+        # is forwarded on the OpenAI-family rungs that honor it and dropped
+        # with disclosure everywhere else, never rejected (2026-09-16: ~3,000
+        # pre-admission 400s a day across ten organizations sent it).
+        _field("verbosity", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "text_verbosity"),
     ),
 )
 

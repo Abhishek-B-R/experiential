@@ -117,6 +117,20 @@ _NO_PARALLEL_TOOL_CONTROL_DIALECTS = frozenset(
 )
 
 
+def profile_forwards_text_verbosity(profile: GatewayWireProfile) -> bool:
+    """Whether one rung honors the caller's output-verbosity selector.
+
+    The Responses wire carries ``text.verbosity`` natively; on the Chat wire
+    only OpenAI's GPT-5 family accepts a top-level ``verbosity`` (every other
+    OpenAI-compatible origin rejects the unknown field), so a Chat rung
+    qualifies by its exact model id. Any other rung drops the hint with
+    disclosure: verbosity changes output length, never semantics.
+    """
+    if profile.dialect == "openai_responses":
+        return True
+    return profile.dialect == "openai_compatible" and profile.model_id.lower().startswith("gpt-5")
+
+
 def route_generation_parameter_requests(
     profiles: Sequence[GatewayWireProfile],
     request: GatewayRequest,
@@ -550,9 +564,12 @@ def route_generation_parameter_requests(
     ):
         ignore("client_metadata")
     if request.text_verbosity is not None and not all(
-        profile.dialect == "openai_responses" for profile in profiles
+        profile_forwards_text_verbosity(profile) for profile in profiles
     ):
-        ignore("text_verbosity", "text.verbosity")
+        ignore(
+            "text_verbosity",
+            "verbosity" if request.surface.value == "chat_completions" else "text.verbosity",
+        )
 
     # A tool-call cache hint is honored only on the Anthropic wire; any other
     # rung silently cannot cache, so the omission is disclosed, never a

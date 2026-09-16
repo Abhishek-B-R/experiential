@@ -277,6 +277,7 @@ def decode_chat(
             top_logprobs=request.top_logprobs,
             reasoning_effort=thinking.reasoning_effort,
             thinking_default_enable=thinking.thinking_default_enable,
+            text_verbosity=request.verbosity,
             stream=request.stream,
             include_usage=(
                 request.stream_options is not None and request.stream_options.include_usage

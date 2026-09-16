@@ -77,6 +77,7 @@ def test_chat_decoder_preserves_every_supported_semantic_field() -> None:
             "temperature": 0.2,
             "top_p": 1,
             "reasoning_effort": "high",
+            "verbosity": "low",
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -112,6 +113,7 @@ def test_chat_decoder_preserves_every_supported_semantic_field() -> None:
     assert request.temperature == 0.2
     assert request.top_p == 1.0
     assert request.reasoning_effort == "high"
+    assert request.text_verbosity == "low"
     assert request.structured_text is not None and request.structured_text.strict
     assert request.include_usage
     assert request.metadata == {"cohort": "test"}

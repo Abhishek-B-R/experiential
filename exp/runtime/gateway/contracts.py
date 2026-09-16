@@ -853,8 +853,11 @@ class GatewayRequest(ContractModel):
             raise ValueError("provider_thinking_config is valid only for Messages requests")
         if self.provider_output_config is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_output_config is valid only for Messages requests")
-        if self.text_verbosity is not None and self.surface != GatewayApiSurface.RESPONSES:
-            raise ValueError("text_verbosity is valid only for Responses requests")
+        if self.text_verbosity is not None and self.surface not in (
+            GatewayApiSurface.RESPONSES,
+            GatewayApiSurface.CHAT_COMPLETIONS,
+        ):
+            raise ValueError("text_verbosity is valid only for Responses or Chat requests")
         if self.client_metadata is not None and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("client_metadata is valid only for Responses requests")
         if self.context_management is not None and self.surface != GatewayApiSurface.MESSAGES:

@@ -329,6 +329,9 @@ def openai_compatible_stream_payload(
         payload["top_p"] = request.top_p
     if request.top_k is not None and supports_top_k:
         payload["top_k"] = request.top_k
+    if request.text_verbosity is not None:
+        # Survives the route rule only on GPT-5 rungs (profile_forwards_text_verbosity).
+        payload["verbosity"] = request.text_verbosity
     if request.frequency_penalty is not None and supports_frequency_penalty:
         payload["frequency_penalty"] = request.frequency_penalty
     if request.presence_penalty is not None and supports_presence_penalty:

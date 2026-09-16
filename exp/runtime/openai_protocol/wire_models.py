@@ -574,6 +574,8 @@ class _ChatRequest(_WireModel):
     logprobs: bool | None = None
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None
+    verbosity: Literal["low", "medium", "high"] | None = None
+    """OpenAI's GPT-5 output-length selector; the canonical ``text_verbosity``."""
     reasoning: _ChatReasoning | None = None
     thinking: _ThinkingConfig | None = None
     chat_template_kwargs: _ChatTemplateKwargs | None = None
