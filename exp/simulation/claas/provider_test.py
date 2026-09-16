@@ -54,3 +54,22 @@ def test_provider_exception_does_not_refund_its_reservation() -> None:
     with pytest.raises(WorldModelLimitError, match="budget"):
         provider.complete(scope, request)
     assert provider.reserved_calls == len(client.requests) == 1
+
+
+def test_provider_recipient_drift_fails_before_synthesis_or_judgment_dispatch() -> None:
+    """A changed client recipient cannot reuse an earlier scope/model disclosure grant."""
+    scope = make_experience().scope
+    client = RecordingClient(lambda _: {"unused": True})
+    provider = ClaasBoundedProvider(
+        client=client,
+        model=model_snapshot(),
+        limits=limits(),
+        source_disclosure=SourceDisclosure(scope=scope, model=model_snapshot()),
+    )
+    client.model_snapshot = model_snapshot().model_copy(update={"model_id": "different"})
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="source"),), maximum_output_tokens=16
+    )
+    with pytest.raises(ValueError, match="recipient"):
+        provider.complete(scope, request)
+    assert provider.reserved_calls == 0 and not client.requests

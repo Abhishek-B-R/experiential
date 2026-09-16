@@ -46,6 +46,8 @@ class Policy:
 
 def world_reply(request: ModelRequest) -> JsonObject:
     """Simulate a tool result and a subsequent terminal response."""
+    with pytest.raises(RuntimeError, match="no running event loop"):
+        asyncio.get_running_loop()
     payload = json.loads(request.messages[-1].content or "{}")
     calls = payload["latest_action"]["tool_calls"]
     return {
@@ -63,6 +65,8 @@ def world_reply(request: ModelRequest) -> JsonObject:
 def judge_reply(request: ModelRequest) -> JsonObject:
     """Score visible terminal responses while checking private feedback is excluded."""
     assert "PRIVATE TRAINING FEEDBACK" not in request.model_dump_json()
+    with pytest.raises(RuntimeError, match="no running event loop"):
+        asyncio.get_running_loop()
     payload = json.loads(request.messages[-1].content or "{}")
     content = payload["visible_trajectory"][-1]["assistant_action"]["content"]
     return {
@@ -164,3 +168,69 @@ def test_evaluation_missing_judge_disclosure_fails_before_policy_execution() -> 
         )
     assert not current.inputs and not candidate.inputs
     assert world.reserved_calls == judge.reserved_calls == 0
+
+
+def test_cancellation_joins_an_already_dispatched_provider_call() -> None:
+    """Evaluation cannot close while its owned synchronous provider work is still running."""
+    from threading import Event
+
+    from exp.optimize.claas.evaluation import _run_blocking
+
+    started, release, finished = Event(), Event(), Event()
+
+    def operation() -> str:
+        """Hold an in-flight provider operation until the test releases it."""
+        started.set()
+        assert release.wait(timeout=2)
+        finished.set()
+        return "done"
+
+    async def cancel() -> None:
+        """Cancel the caller and prove its dispatch remains owned until completion."""
+        task = asyncio.create_task(_run_blocking(operation))
+        assert await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert finished.is_set()
+
+    asyncio.run(cancel())
+
+
+def test_manifest_rejects_overlapping_source_groups() -> None:
+    """Duplicate membership cannot be hidden by a dictionary's last-value behavior."""
+    manifest, _, _ = evaluation_fixture()
+    changed = manifest.model_dump(mode="json")
+    original = manifest.held_out_groups[0]
+    forged = original.model_copy(update={"group_id": "f" * 64})
+    changed["held_out_groups"] = [forged.model_dump(mode="json"), *changed["held_out_groups"]]
+    with pytest.raises(ValueError, match="disjoint experience"):
+        EvaluationManifest.model_validate(changed)
+
+
+def test_incomplete_saved_report_cannot_publish_a_subset_score() -> None:
+    """Removing a completed pair cannot turn incomplete prescribed coverage into a score."""
+    from exp.optimize.claas.evaluation import PairedEvaluationReport, verify_evaluation_report
+
+    manifest, world, judge = evaluation_fixture()
+    report = asyncio.run(
+        evaluate_policies(
+            manifest,
+            current=Policy("current"),
+            candidate=Policy("candidate"),
+            world=world,
+            judge=judge,
+        )
+    )
+    verify_evaluation_report(report, manifest)
+    changed = report.model_dump(mode="json")
+    changed["pairs"] = changed["pairs"][:-1]
+    with pytest.raises(ValueError, match="every frozen task"):
+        PairedEvaluationReport.model_validate(changed)
+    changed["expected_task_ids"] = changed["expected_task_ids"][:-1]
+    partial = PairedEvaluationReport.model_validate(changed)
+    with pytest.raises(ValueError, match="authoritative"):
+        verify_evaluation_report(partial, manifest)
