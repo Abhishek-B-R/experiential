@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import queue
@@ -9,11 +10,13 @@ import re
 import threading
 import time
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import httpx
 
+from exp.common.core.artifacts import JsonValue
 from exp.runtime.capture.normalization import CapturedExchange, normalize_exchange
 
 logger = logging.getLogger(__name__)
@@ -81,6 +84,7 @@ class CaptureUploader:
         self._queue: queue.Queue[CapturedExchange] = queue.Queue(maxsize=64)
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._abandon = threading.Event()
         self._thread: threading.Thread | None = None
         self._delivery_thread: threading.Thread | None = None
         self._queued_bytes = 0
@@ -88,7 +92,10 @@ class CaptureUploader:
         self._dropped = 0
         self._errors = 0
         self._uploaded = 0
-        self._processing = 0
+        self._pending_exchanges = 0
+        self._durable_temps: set[Path] = set()
+        self._final_stats: UploadStats | None = None
+        self._final_pending_current = 0
         self._retry_at: dict[Path, float] = {}
 
     def start(self) -> None:
@@ -103,6 +110,7 @@ class CaptureUploader:
             if directory.stat().st_uid != os.getuid():
                 raise ValueError("capture spool must belong to the current user")
             directory.chmod(0o700)
+        self._recover_temporary_files()
         self._thread = threading.Thread(target=self._work, name="exp-capture-upload", daemon=True)
         self._thread.start()
         self._delivery_thread = threading.Thread(
@@ -126,22 +134,29 @@ class CaptureUploader:
                 return False
             self._queued_bytes += exchange.byte_count
             self._captured += 1
+            self._pending_exchanges += 1
             return True
 
     @property
     def pending_current_run(self) -> int:
         """Count only this run for its heartbeat, excluding recovered sibling runs."""
+        with self._lock:
+            if self._final_stats is not None:
+                return self._final_pending_current
         files = sum(path.parent == self._spool_dir for path in self._files())
         with self._lock:
-            return self._queue.qsize() + self._processing + files
+            return self._pending_exchanges + files
 
     @property
     def stats(self) -> UploadStats:
         """Read delivery counters without ever exposing model content or credentials."""
+        with self._lock:
+            if self._final_stats is not None:
+                return self._final_stats
         pending_files = len(self._files())
         with self._lock:
             return UploadStats(
-                pending_batches=self._queue.qsize() + self._processing + pending_files,
+                pending_batches=self._pending_exchanges + pending_files,
                 upload_errors=self._errors,
                 dropped_exchanges=self._dropped,
                 captured_exchanges=self._captured,
@@ -153,14 +168,39 @@ class CaptureUploader:
 
         Sanitized files survive cloud failure and are recovered by the next run.
         A daemon worker never delays application exit beyond the requested timeout.
+        Copies unfinished at the deadline are counted as dropped, not durable pending.
         """
+        with self._lock:
+            if self._final_stats is not None:
+                return self._final_stats
         self._stop.set()
         deadline = time.monotonic() + max(timeout, 0.0)
         if self._thread is not None:
             self._thread.join(max(deadline - time.monotonic(), 0.0))
         if self._delivery_thread is not None:
             self._delivery_thread.join(max(deadline - time.monotonic(), 0.0))
-        return self.stats
+        with self._lock:
+            self._abandon.set()
+            self._dropped += self._pending_exchanges
+            self._pending_exchanges = 0
+            self._queued_bytes = 0
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._queue.task_done()
+        files = self._files()
+        with self._lock:
+            self._final_pending_current = sum(path.parent == self._spool_dir for path in files)
+            self._final_stats = UploadStats(
+                pending_batches=len(files),
+                upload_errors=self._errors,
+                dropped_exchanges=self._dropped,
+                captured_exchanges=self._captured,
+                uploaded_batches=self._uploaded,
+            )
+            return self._final_stats
 
     def _work(self) -> None:
         """Drain copied bodies to local storage independently of cloud availability."""
@@ -169,17 +209,16 @@ class CaptureUploader:
                 exchange = self._queue.get(timeout=0.1)
             except queue.Empty:
                 continue
-            with self._lock:
-                self._processing += 1
             try:
-                self._persist(exchange)
+                if not self._abandon.is_set():
+                    self._persist(exchange)
             except (ValueError, OSError, RecursionError, TypeError):
                 with self._lock:
-                    self._dropped += 1
+                    if not self._abandon.is_set():
+                        self._dropped += 1
+                        self._pending_exchanges -= 1
+                        self._queued_bytes -= exchange.byte_count
             finally:
-                with self._lock:
-                    self._queued_bytes -= exchange.byte_count
-                    self._processing -= 1
                 self._queue.task_done()
 
     def _deliver(self) -> None:
@@ -196,6 +235,8 @@ class CaptureUploader:
     def _persist(self, exchange: CapturedExchange) -> None:
         """Write only sanitized OTLP, with finite per-origin/org spool capacity."""
         payload = normalize_exchange(exchange, max_body_bytes=self._max_body_bytes)
+        if self._abandon.is_set():
+            return
         if len(payload) > _MAX_BATCH_BYTES:
             raise ValueError("normalized capture exceeds the cloud batch limit")
         files = self._files()
@@ -216,9 +257,63 @@ class CaptureUploader:
                 output.write(payload)
                 output.flush()
                 os.fsync(output.fileno())
-            temporary.replace(destination)
+            with self._lock:
+                if self._abandon.is_set():
+                    return
+                # The complete sanitized file is durable before publication. A late
+                # rename must not turn a deadline-accounted drop into a queued batch.
+                self._durable_temps.add(temporary)
+                self._pending_exchanges -= 1
+                self._queued_bytes -= exchange.byte_count
+            try:
+                temporary.replace(destination)
+            except OSError:
+                # A complete temp remains eligible for delivery and crash recovery.
+                return
+            with self._lock:
+                self._durable_temps.discard(temporary)
         finally:
-            temporary.unlink(missing_ok=True)
+            with self._lock:
+                durable = temporary in self._durable_temps
+            if not durable:
+                temporary.unlink(missing_ok=True)
+
+    def _recover_temporary_files(self) -> None:
+        """Adopt bounded complete sanitized temps and remove incomplete crash leftovers."""
+        existing = self._files()
+        occupied = sum(path.stat().st_size for path in existing)
+        file_count = len(existing)
+        for path in islice(self._spool_dir.parent.glob("*/*.tmp"), 1024):
+            if (
+                path.parent.is_symlink()
+                or path.is_symlink()
+                or not path.is_file()
+                or not _uuid(path.parent.name)
+                or not _uuid(path.stem)
+            ):
+                continue
+            destination = path.with_suffix(".json")
+            if destination.exists():
+                path.unlink()
+                continue
+            try:
+                size = path.stat().st_size
+                if (
+                    file_count >= 1024
+                    or size > _MAX_BATCH_BYTES
+                    or occupied + size > self._max_spool_bytes
+                ):
+                    raise ValueError("temporary capture exceeds the spool limit")
+                payload = json.loads(path.read_bytes())
+                if not _complete_capture_payload(payload):
+                    raise ValueError("temporary capture is incomplete")
+            except (ValueError, RecursionError):
+                path.unlink(missing_ok=True)
+                self._dropped += 1
+                continue
+            path.replace(destination)
+            occupied += size
+            file_count += 1
 
     def _files(self) -> list[Path]:
         """Find bounded retry files only in UUID-named sibling run directories."""
@@ -230,8 +325,18 @@ class CaptureUploader:
                 if not path.is_symlink() and path.is_file() and _uuid(path.stem):
                     result.append(path)
                     if len(result) >= 1024:
-                        return sorted(result)
-        return sorted(result)
+                        break
+            if len(result) >= 1024:
+                break
+        with self._lock:
+            temporary_files = tuple(self._durable_temps)
+        unique = {(path.parent, path.stem): path for path in result}
+        for temporary in temporary_files:
+            published = temporary.with_suffix(".json")
+            unique[(temporary.parent, temporary.stem)] = (
+                published if published.is_file() else temporary
+            )
+        return sorted(unique.values())
 
     def _deliver_one(self, client: httpx.Client) -> None:
         """Retry one eligible batch while never retaining an unbounded error history."""
@@ -244,16 +349,33 @@ class CaptureUploader:
             if self._retry_at.get(path, 0) > now:
                 continue
             try:
-                self._upload(client, path)
+                if path.suffix == ".tmp":
+                    destination = path.with_suffix(".json")
+                    try:
+                        path.replace(destination)
+                    except FileNotFoundError:
+                        if not destination.is_file():
+                            raise
+                    with self._lock:
+                        self._durable_temps.discard(path)
+                    path = destination
+                accepted = self._upload(client, path)
             except (httpx.HTTPError, ValueError, OSError, KeyError, TypeError):
                 with self._lock:
-                    self._errors += 1
+                    if not self._abandon.is_set():
+                        self._errors += 1
                 self._retry_at[path] = now + 10.0
                 logger.warning("Capture upload deferred; sanitized batch remains queued locally")
             else:
+                if self._abandon.is_set():
+                    return
+                if not accepted:
+                    self._retry_at[path] = now + 10.0
+                    return
                 path.unlink(missing_ok=True)
                 self._retry_at.pop(path, None)
                 with self._lock:
+                    self._durable_temps.discard(path)
                     self._uploaded += 1
                 if path.parent != self._spool_dir:
                     self._finish_recovered_run(client, path.parent)
@@ -271,11 +393,12 @@ class CaptureUploader:
             response.raise_for_status()
         except httpx.HTTPError:
             with self._lock:
-                self._errors += 1
+                if not self._abandon.is_set():
+                    self._errors += 1
             logger.warning("Recovered capture was uploaded; its run status could not be refreshed")
 
-    def _upload(self, client: httpx.Client, path: Path) -> None:
-        """Reserve idempotently, PUT without Platform credentials, then finalize."""
+    def _upload(self, client: httpx.Client, path: Path) -> bool:
+        """Return true only after our own PUT receipt plus finalize, or cloud completion."""
         if path.stat().st_size > self._max_spool_bytes:
             raise ValueError("capture retry file exceeds the spool limit")
         headers = {"Authorization": f"Bearer {self._api_key}"}
@@ -288,13 +411,19 @@ class CaptureUploader:
         ticket = response.json()
         if not isinstance(ticket, dict):
             raise ValueError("capture upload response is not an object")
-        if ticket.get("status") in {"running", "done"}:
-            return
+        ingest_id = ticket.get("ingest_id")
+        if not isinstance(ingest_id, str) or not _uuid(ingest_id):
+            raise ValueError("capture upload response lacks a canonical ingest ID")
+        if ticket.get("status") == "running":
+            # Running alone can mean finalize happened before any bytes reached Storage.
+            # Keep an uncertain retry until the worker acknowledges verified completion.
+            return False
+        if ticket.get("status") == "done":
+            return True
         if ticket.get("status") == "error":
             raise ValueError("capture batch failed cloud validation; retained locally")
         signed_url = ticket.get("signed_url")
-        ingest_id = ticket.get("ingest_id")
-        if not isinstance(signed_url, str) or not isinstance(ingest_id, str):
+        if not isinstance(signed_url, str):
             raise ValueError("capture upload response lacks a ticket")
         parsed = self._signed_destination(signed_url, ingest_id)
         uploaded = client.put(
@@ -309,6 +438,7 @@ class CaptureUploader:
             headers=headers,
         )
         finalized.raise_for_status()
+        return True
 
     def _signed_destination(self, signed_url: str, ingest_id: str) -> httpx.URL:
         """Reject a later ticket that disagrees with this run's approved storage scope."""
@@ -374,6 +504,54 @@ def _upload_scope(
 def _loopback_http(url: httpx.URL) -> bool:
     """Recognize the explicit local-development HTTP origins accepted by capture login."""
     return url.scheme == "http" and url.host in {"localhost", "127.0.0.1", "::1"}
+
+
+def _complete_capture_payload(payload: JsonValue) -> bool:
+    """Recognize the complete single-span envelope emitted by capture normalization."""
+    for key in ("resourceSpans", "scopeSpans", "spans"):
+        if not isinstance(payload, dict):
+            return False
+        children = payload.get(key)
+        if not isinstance(children, list) or len(children) != 1:
+            return False
+        payload = children[0]
+    if not isinstance(payload, dict):
+        return False
+    span = payload
+    attributes = span.get("attributes")
+    if not isinstance(attributes, list):
+        return False
+    keys: set[str] = set()
+    for attribute in attributes:
+        if not isinstance(attribute, dict):
+            return False
+        key, value = attribute.get("key"), attribute.get("value")
+        if not isinstance(key, str) or not isinstance(value, dict) or len(value) != 1:
+            return False
+        scalar = next(iter(value.values()))
+        if not (
+            ("stringValue" in value and isinstance(scalar, str))
+            or ("boolValue" in value and isinstance(scalar, bool))
+            or ("intValue" in value and isinstance(scalar, str) and scalar.lstrip("-").isdigit())
+        ):
+            return False
+        keys.add(key)
+    trace_id, span_id = span.get("traceId"), span.get("spanId")
+    started, ended = span.get("startTimeUnixNano"), span.get("endTimeUnixNano")
+    return (
+        isinstance(trace_id, str)
+        and re.fullmatch(r"[0-9a-f]{32}", trace_id) is not None
+        and isinstance(span_id, str)
+        and re.fullmatch(r"[0-9a-f]{16}", span_id) is not None
+        and isinstance(started, str)
+        and started.isdigit()
+        and isinstance(ended, str)
+        and ended.isdigit()
+        and span.get("name") == "captured model request"
+        and span.get("kind") == 3
+        and span.get("status") in ({"code": 1}, {"code": 2})
+        and {"gen_ai.request.model", "gen_ai.input.messages", "exp.capture.protocol"}.issubset(keys)
+    )
 
 
 def _uuid(value: str) -> bool:

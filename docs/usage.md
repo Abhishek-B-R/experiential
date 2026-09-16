@@ -58,6 +58,8 @@ hosts entries and relays loopback port 443 to the unprivileged proxy. Ctrl+C rem
 before the proxy exits. The helper also restores networking if the foreground process disappears.
 Existing intercepted connections can fail during shutdown, and application DNS caches may require
 an application restart. No system Network Extension or permanent privileged service is installed.
+Capture forwards TCP HTTPS on port 443. Clients using QUIC or HTTP/3 over UDP must fall back to
+TCP HTTPS; UDP traffic is not collected.
 
 If the machine loses power, the helper is killed, or provider requests fail after capture ends,
 run `exp capture reset`. Reset works offline without login, requests administrator authorization

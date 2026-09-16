@@ -1,6 +1,7 @@
 """Capture delivery retries safely while keeping cloud failures off inference."""
 
 import json
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -322,3 +323,255 @@ def test_invalid_run_storage_policy_is_rejected_before_uploading(
             upload_origin=upload_origin,
             upload_path_prefix=path_prefix,
         )
+
+
+@pytest.mark.parametrize("terminal", ["done", "error"])
+def test_running_retry_keeps_local_copy_until_verified_completion(
+    tmp_path: Path, terminal: str
+) -> None:
+    """Running without our own Storage receipt is not proof that bytes reached the cloud."""
+    run, ingest = str(uuid4()), str(uuid4())
+    directory = tmp_path / run
+    directory.mkdir()
+    path = directory / f"{uuid4()}.json"
+    path.write_bytes(normalize_exchange(_exchange(), max_body_bytes=4096))
+    statuses = iter(("running", terminal))
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return processing and terminal receipts without a signed upload destination."""
+        requests.append(request)
+        assert request.method == "POST"
+        assert request.url.path.endswith("/batches/upload")
+        return httpx.Response(200, json={"ingest_id": ingest, "status": next(statuses)})
+
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        directory,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+    )
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        uploader._deliver_one(client)
+        assert path.exists()
+        assert uploader.stats.uploaded_batches == 0
+        assert uploader.stats.upload_errors == 0
+        uploader._retry_at.clear()
+        uploader._deliver_one(client)
+    assert len(requests) == 2
+    assert path.exists() == (terminal == "error")
+    assert uploader.stats.uploaded_batches == int(terminal == "done")
+    assert uploader.stats.upload_errors == int(terminal == "error")
+
+
+def test_shutdown_counts_unfinished_copies_and_freezes_final_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Discard late normalization work while preserving already durable retry files."""
+    run = str(uuid4())
+    directory = tmp_path / run
+    directory.mkdir()
+    existing = directory / f"{uuid4()}.json"
+    existing.write_bytes(normalize_exchange(_exchange(), max_body_bytes=4096))
+    entered, release = threading.Event(), threading.Event()
+
+    def stalled_normalization(exchange: CapturedExchange, *, max_body_bytes: int) -> bytes:
+        """Pause an accepted in-memory copy until after the shutdown deadline."""
+        entered.set()
+        assert release.wait(3)
+        return normalize_exchange(exchange, max_body_bytes=max_body_bytes)
+
+    monkeypatch.setattr("exp.runtime.capture.upload.normalize_exchange", stalled_normalization)
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        directory,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+    )
+    uploader.start()
+    try:
+        assert uploader.submit(_exchange())
+        assert entered.wait(1)
+        assert uploader.submit(_exchange())
+        before = time.monotonic()
+        final = uploader.close(timeout=0.02)
+        assert time.monotonic() - before < 0.5
+        assert final.captured_exchanges == 2
+        assert final.dropped_exchanges == 2
+        assert final.pending_batches == uploader.pending_current_run == 1
+    finally:
+        release.set()
+        assert uploader._thread is not None
+        uploader._thread.join(1)
+    assert not uploader._thread.is_alive()
+    assert uploader.stats == final
+    assert uploader.close() == final
+    assert list(directory.iterdir()) == [existing]
+
+
+@pytest.mark.parametrize("stage", ["fsync", "rename"])
+def test_shutdown_distinguishes_unfinished_write_from_durable_temporary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    """Keep fsynced copies pending across a late rename without miscounting them as drops."""
+    run = str(uuid4())
+    directory = tmp_path / run
+    entered, release = threading.Event(), threading.Event()
+    original_fsync, original_replace = os.fsync, Path.replace
+
+    def stalled_fsync(descriptor: int) -> None:
+        """Pause before the file reaches the durable commit point."""
+        entered.set()
+        assert release.wait(3)
+        original_fsync(descriptor)
+
+    def stalled_replace(path: Path, target: str | Path) -> Path:
+        """Pause after fsync but before publication of the final filename."""
+        entered.set()
+        assert release.wait(3)
+        return original_replace(path, target)
+
+    if stage == "fsync":
+        monkeypatch.setattr("exp.runtime.capture.upload.os.fsync", stalled_fsync)
+    else:
+        monkeypatch.setattr(Path, "replace", stalled_replace)
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        directory,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+    )
+    uploader.start()
+    try:
+        assert uploader.submit(_exchange())
+        assert entered.wait(1)
+        final = uploader.close(timeout=0.02)
+        assert final.dropped_exchanges == int(stage == "fsync")
+        assert final.pending_batches == uploader.pending_current_run == int(stage == "rename")
+    finally:
+        release.set()
+        assert uploader._thread is not None
+        uploader._thread.join(1)
+    assert not uploader._thread.is_alive()
+    assert len(list(directory.glob("*.json"))) == int(stage == "rename")
+    assert not list(directory.glob("*.tmp"))
+    assert uploader.stats == final
+    assert uploader.pending_current_run == final.pending_batches
+
+
+def test_start_recovers_complete_temps_and_removes_bounded_partial_files(tmp_path: Path) -> None:
+    """Recover complete sanitized crash leftovers while incomplete files cannot accumulate."""
+    prior, run = str(uuid4()), str(uuid4())
+    previous = tmp_path / prior
+    previous.mkdir()
+    complete = previous / f"{uuid4()}.tmp"
+    complete.write_bytes(normalize_exchange(_exchange(), max_body_bytes=4096))
+    for content in (b'{"resourceSpans":', b'{"resourceSpans":[]}', b"x" * 5000):
+        (previous / f"{uuid4()}.tmp").write_bytes(content)
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        tmp_path / run,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+        max_spool_bytes=4096,
+    )
+    uploader.start()
+    final = uploader.close(timeout=0.02)
+    assert list(previous.iterdir()) == [complete.with_suffix(".json")]
+    assert final.pending_batches == 1
+    assert final.dropped_exchanges == 3
+    assert uploader.pending_current_run == 0
+
+
+def test_temporary_recovery_respects_combined_batch_count(tmp_path: Path) -> None:
+    """Existing final batches and recovered temps share the same finite file budget."""
+    run = str(uuid4())
+    directory = tmp_path / run
+    directory.mkdir()
+    content = normalize_exchange(_exchange(), max_body_bytes=4096)
+    for _ in range(1024):
+        (directory / f"{uuid4()}.json").write_bytes(content)
+    temporary = directory / f"{uuid4()}.tmp"
+    temporary.write_bytes(content)
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        directory,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+    )
+    uploader._recover_temporary_files()
+    assert not temporary.exists()
+    assert len(list(directory.iterdir())) == 1024
+    assert uploader.stats.pending_batches == 1024
+    assert uploader.stats.dropped_exchanges == 1
+
+
+def test_delivery_of_durable_temp_removes_canonical_copy_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delivery worker can finish publication without leaving a duplicate retry file."""
+    run, ingest = str(uuid4()), str(uuid4())
+    directory = tmp_path / run
+    entered, release = threading.Event(), threading.Event()
+    original_replace = Path.replace
+    methods: list[str] = []
+
+    def stalled_persistence_rename(path: Path, target: str | Path) -> Path:
+        """Pause only the persistence worker while delivery publishes the same temp."""
+        if threading.current_thread().name == "exp-capture-upload":
+            entered.set()
+            assert release.wait(3)
+        return original_replace(path, target)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Acknowledge one immutable upload and its normal finalize receipt."""
+        methods.append(request.method)
+        if request.method == "PUT":
+            assert "authorization" not in request.headers
+            return httpx.Response(200)
+        if request.url.path.endswith("/batches/upload"):
+            return httpx.Response(
+                200,
+                json={"status": "pending", "ingest_id": ingest, "signed_url": _signed_url(ingest)},
+            )
+        return httpx.Response(202)
+
+    monkeypatch.setattr(Path, "replace", stalled_persistence_rename)
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        directory,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+        transport=httpx.MockTransport(handler),
+    )
+    uploader.start()
+    try:
+        assert uploader.submit(_exchange())
+        assert entered.wait(1)
+        _wait(lambda: uploader.stats.uploaded_batches == 1)
+        assert not list(directory.iterdir())
+    finally:
+        release.set()
+        final = uploader.close()
+    assert methods == ["POST", "PUT", "POST"]
+    assert final.uploaded_batches == 1
+    assert final.pending_batches == final.dropped_exchanges == 0
+    assert not list(directory.iterdir())

@@ -135,6 +135,7 @@ async def _capture_authenticated(
             on_progress=progress,
             on_warning=warning,
         )
+        progress(stats)
         live.stop()
         console.print("[green]Capture stopped. Networking restored.[/green]")
         if stats.pending_batches:

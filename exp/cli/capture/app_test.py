@@ -42,12 +42,26 @@ def test_reset_does_not_login_or_start_capture(monkeypatch: pytest.MonkeyPatch) 
     assert "networking restored" in result.output
 
 
-def test_domain_validation_precedes_login(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "domain", ["https://example.com", "127.0.0.1", "api.local", "api.internal", "*.openai.com"]
+)
+def test_domain_validation_precedes_login(monkeypatch: pytest.MonkeyPatch, domain: str) -> None:
     """Invalid domain arguments are rejected before authentication."""
     monkeypatch.setattr(capture_module, "_require_macos", lambda: None)
-    result = CliRunner().invoke(app, ["capture", "--domain", "https://example.com"])
+    result = CliRunner().invoke(app, ["capture", "--domain", domain])
     assert result.exit_code == 2
     assert "exact DNS hostname" in result.output
+
+
+def test_domain_limit_precedes_setup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CLI enforces the helper's finite target limit before starting capture."""
+    monkeypatch.setattr(capture_module, "_require_macos", lambda: None)
+    arguments = ["capture"]
+    for index in range(33):
+        arguments.extend(("--domain", f"provider{index}.example.com"))
+    result = CliRunner().invoke(app, arguments)
+    assert result.exit_code == 2
+    assert "1 to 32" in result.output
 
 
 def test_no_background_management_commands() -> None:

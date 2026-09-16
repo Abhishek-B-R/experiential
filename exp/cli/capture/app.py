@@ -13,6 +13,7 @@ from rich.console import Console
 from exp.cli.shared.options import ROOT_OPTION
 from exp.cli.shared.theme import EXP_THEME
 from exp.runtime.capture.system import reset_capture_system
+from exp.runtime.capture.system_helper import CaptureSystemError, validate_domains
 
 DEFAULT_DOMAINS = ("api.openai.com", "chatgpt.com", "api.anthropic.com")
 DOMAIN_OPTION = typer.Option(
@@ -72,24 +73,13 @@ def _domains(values: list[str] | None) -> tuple[str, ...]:
     domains = tuple(
         dict.fromkeys(value.lower().rstrip(".") for value in (values or DEFAULT_DOMAINS))
     )
-    for domain in domains:
-        labels = domain.split(".")
-        if (
-            len(domain) > 253
-            or len(labels) < 2
-            or not domain.isascii()
-            or any(
-                not label
-                or len(label) > 63
-                or label.startswith("-")
-                or label.endswith("-")
-                or not all(c.isalnum() or c == "-" for c in label)
-                for label in labels
-            )
-        ):
-            raise typer.BadParameter(
-                "--domain must be an exact DNS hostname, without a URL or wildcard."
-            )
+    try:
+        validate_domains(domains)
+    except CaptureSystemError:
+        raise typer.BadParameter(
+            "--domain must select 1 to 32 exact DNS hostnames, "
+            "without URLs, addresses, local aliases, or wildcards."
+        ) from None
     return domains
 
 

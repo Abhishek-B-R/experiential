@@ -199,3 +199,92 @@ def test_provider_stream_errors_are_failed_spans_even_with_http_200() -> None:
     )
     span = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
     assert span["status"]["code"] == 2
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("finish_reason", ["stop", "content_filter"])
+def test_chat_refusals_preserve_text_and_finish_reason_as_failed_spans(
+    streamed: bool, finish_reason: str
+) -> None:
+    """Keep explicit refusal evidence for streamed and ordinary Chat Completions."""
+    message = {"role": "assistant", "content": None, "refusal": "Cannot provide that."}
+    if streamed:
+        events = [
+            {"choices": [{"index": 0, "delta": {"refusal": "Cannot provide "}}]},
+            {"choices": [{"index": 0, "delta": {"refusal": "that."}}]},
+            {"choices": [{"index": 0, "finish_reason": finish_reason}]},
+        ]
+        body = b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events)
+    else:
+        body = json.dumps(
+            {"choices": [{"message": message, "finish_reason": finish_reason}]}
+        ).encode()
+    exchange = _exchange(
+        protocol="chat",
+        response=body,
+        response_content_type="text/event-stream" if streamed else "application/json",
+    )
+    attributes = _attributes(exchange)
+    response = json.loads(str(attributes["exp.capture.response"]))
+    assert response["choices"][0]["message"]["refusal"] == message["refusal"]
+    assert response["choices"][0]["finish_reason"] == finish_reason
+    assert attributes["exp.capture.refused"] is True
+    payload = json.loads(normalize_exchange(exchange, max_body_bytes=4096))
+    assert payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["status"]["code"] == 2
+
+
+def test_chat_content_filter_is_a_refusal_without_text_but_ordinary_text_is_not() -> None:
+    """Use provider refusal fields rather than guessing from model-authored prose."""
+    filtered = _exchange(
+        protocol="chat",
+        response=b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}\n\n',
+        response_content_type="text/event-stream",
+    )
+    assert _attributes(filtered)["exp.capture.refused"] is True
+    ordinary = _exchange(
+        protocol="chat",
+        response=(
+            b'{"choices":[{"message":{"role":"assistant","content":"I refuse"},'
+            b'"finish_reason":"stop"}]}'
+        ),
+    )
+    assert _attributes(ordinary)["exp.capture.refused"] is False
+
+
+@pytest.mark.parametrize("protocol", ["responses", "messages"])
+@pytest.mark.parametrize("streamed", [False, True])
+def test_responses_and_messages_refusals_preserve_provider_evidence(
+    protocol: str, streamed: bool
+) -> None:
+    """Treat explicit Responses refusal blocks and Anthropic refusal stops consistently."""
+    if protocol == "responses":
+        response = {
+            "status": "completed",
+            "output": [{"type": "message", "content": [{"type": "refusal", "refusal": "Cannot."}]}],
+        }
+        events = [{"type": "response.completed", "response": response}]
+    else:
+        response = {"content": [{"type": "text", "text": "Cannot."}], "stop_reason": "refusal"}
+        events = [
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": "Cannot."},
+            },
+            {"type": "message_delta", "delta": {"stop_reason": "refusal"}},
+        ]
+    body = (
+        b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events)
+        if streamed
+        else json.dumps(response).encode()
+    )
+    exchange = _exchange(
+        protocol=protocol,
+        response=body,
+        response_content_type="text/event-stream" if streamed else "application/json",
+    )
+    attributes = _attributes(exchange)
+    assert "Cannot." in str(attributes["gen_ai.output.messages"])
+    assert attributes["exp.capture.refused"] is True
+    payload = json.loads(normalize_exchange(exchange, max_body_bytes=4096))
+    assert payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["status"]["code"] == 2

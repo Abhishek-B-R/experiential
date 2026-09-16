@@ -85,8 +85,10 @@ def normalize_exchange(exchange: CapturedExchange, *, max_body_bytes: int) -> by
             raise
         response_bytes = b""
     response = _response(exchange.protocol, response_bytes, exchange.response_content_type)
+    refused = _refused(exchange.protocol, response)
     failed = (
         exchange.failed
+        or refused
         or exchange.status >= 400
         or bool(response.get("error"))
         or bool(response.get("capture_incomplete"))
@@ -111,6 +113,7 @@ def normalize_exchange(exchange: CapturedExchange, *, max_body_bytes: int) -> by
         "exp.capture.response": response,
         "http.response.status_code": exchange.status,
         "exp.capture.interrupted": exchange.failed,
+        "exp.capture.refused": refused,
     }
     usage = response.get("usage")
     if isinstance(usage, dict):
@@ -270,9 +273,10 @@ def _anthropic_response(events: list[JsonObject]) -> JsonObject:
 
 
 def _chat_response(events: list[JsonObject]) -> JsonObject:
-    """Collect chat-completion text and streamed tool arguments without losing usage."""
+    """Collect text, refusals, finish reasons, tool arguments, and token usage."""
     result: JsonObject = {}
     choices: dict[int, JsonObject] = {}
+    finish_reasons: dict[int, str] = {}
     calls: dict[tuple[int, int], JsonObject] = {}
     for event in events:
         if "error" in event:
@@ -287,12 +291,15 @@ def _chat_response(events: list[JsonObject]) -> JsonObject:
             if not isinstance(choice, dict) or type(index := choice.get("index")) is not int:
                 continue
             message = choices.setdefault(index, {"role": "assistant", "content": ""})
+            if isinstance(reason := choice.get("finish_reason"), str):
+                finish_reasons[index] = reason
             delta = choice.get("delta")
             if not isinstance(delta, dict):
                 continue
-            if isinstance(content := delta.get("content"), str):
-                prior = message.get("content")
-                message["content"] = (prior if isinstance(prior, str) else "") + content
+            for key in ("content", "refusal"):
+                if isinstance(content := delta.get(key), str):
+                    prior = message.get(key)
+                    message[key] = (prior if isinstance(prior, str) else "") + content
             raw_calls = delta.get("tool_calls")
             if isinstance(raw_calls, list):
                 for call in raw_calls:
@@ -315,9 +322,41 @@ def _chat_response(events: list[JsonObject]) -> JsonObject:
         if selected:
             message["tool_calls"] = selected
     result["choices"] = [
-        {"index": index, "message": message} for index, message in sorted(choices.items())
+        {"index": index, "message": message, "finish_reason": finish_reasons.get(index)}
+        for index, message in sorted(choices.items())
     ]
     return result
+
+
+def _refused(protocol: CaptureProtocol, response: JsonObject) -> bool:
+    """Identify explicit provider refusal evidence without guessing from assistant text."""
+    if protocol == "messages":
+        return response.get("stop_reason") == "refusal"
+    if protocol == "responses":
+        output = response.get("output")
+        if not isinstance(output, list):
+            return False
+        for message in output:
+            if not isinstance(message, dict) or not isinstance(
+                content := message.get("content"), list
+            ):
+                continue
+            if any(isinstance(block, dict) and block.get("type") == "refusal" for block in content):
+                return True
+        return False
+    choices = response.get("choices")
+    if not isinstance(choices, list):
+        return False
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        if choice.get("finish_reason") == "content_filter":
+            return True
+        message = choice.get("message")
+        if isinstance(message, dict) and isinstance(refusal := message.get("refusal"), str):
+            if refusal:
+                return True
+    return False
 
 
 def _input_messages(protocol: CaptureProtocol, request: JsonObject) -> list[JsonValue]:
