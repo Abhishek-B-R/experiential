@@ -93,5 +93,6 @@ fn dialect_name(dialect: Dialect) -> &'static str {
         Dialect::OpenAiCompatible => "openai_compatible",
         Dialect::GeminiGenerateContent => "gemini_generate_content",
         Dialect::BedrockConverseStream => "bedrock_converse_stream",
+        Dialect::TypesafeSystemone => "typesafe_systemone",
     }
 }

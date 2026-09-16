@@ -6,7 +6,7 @@ import errno
 import os
 import pty
 import re
-import select
+import selectors
 import shutil
 import signal
 import subprocess
@@ -353,9 +353,11 @@ def _run_tty_child(
     completion_seen = completion_marker is None
     terminal_closed = False
     deadline = time.monotonic() + timeout
+    selector = selectors.DefaultSelector()
     try:
+        selector.register(master, selectors.EVENT_READ)
         while process.poll() is None and time.monotonic() < deadline:
-            readable, _, _ = select.select([master], [], [], 0.1)
+            readable = selector.select(timeout=0.1)
             if readable:
                 try:
                     chunk = os.read(master, 65_536)
@@ -411,7 +413,7 @@ def _run_tty_child(
             raise AssertionError(f"interactive CLI timed out:\n{transcript}")
         if not terminal_closed:
             while True:
-                readable, _, _ = select.select([master], [], [], 0)
+                readable = selector.select(timeout=0)
                 if not readable:
                     break
                 try:
@@ -424,6 +426,7 @@ def _run_tty_child(
                     break
                 transcript += chunk.decode(errors="replace")
     finally:
+        selector.close()
         os.close(master)
     assert process.returncode == 0, transcript
     assert not pending, f"unanswered prompts {pending}:\n{transcript}"
@@ -2993,6 +2996,47 @@ def test_tty_child_exit_survives_terminal_close_races(tmp_path: Path) -> None:
         transcripts = tuple(executor.map(invoke, range(32)))
     assert all("Prompt:" in transcript for transcript in transcripts)
     assert all("COMPLETE" in transcript for transcript in transcripts)
+
+
+def test_tty_child_supports_descriptors_above_select_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drive a real pseudo-terminal whose master is above select's descriptor ceiling.
+
+    Args:
+        tmp_path: Isolated child working directory.
+        monkeypatch: Fixture replacing only pseudo-terminal descriptor allocation.
+    """
+    import fcntl
+    import resource
+
+    soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit != resource.RLIM_INFINITY and soft_limit <= 1024:
+        pytest.skip("The process descriptor limit does not allow a high-numbered terminal.")
+    openpty = pty.openpty
+
+    def high_descriptor_pty() -> tuple[int, int]:
+        """Duplicate the real terminal master above FD_SETSIZE without opening many files."""
+        master, slave = openpty()
+        try:
+            high_master = fcntl.fcntl(master, fcntl.F_DUPFD, 1024)
+        except OSError:
+            os.close(slave)
+            raise
+        finally:
+            os.close(master)
+        return high_master, slave
+
+    monkeypatch.setattr(pty, "openpty", high_descriptor_pty)
+    transcript = _run_tty_child(
+        [sys.executable, "-c", "assert input('Prompt: ') == 'yes'; print('COMPLETE', flush=True)"],
+        cwd=tmp_path,
+        environment=os.environ.copy(),
+        answers=[("Prompt:", "yes")],
+        completion_marker="COMPLETE",
+        timeout=5,
+    )
+    assert "COMPLETE" in transcript
 
 
 def test_gateway_canary_scanner_covers_every_persistent_and_observable_channel(

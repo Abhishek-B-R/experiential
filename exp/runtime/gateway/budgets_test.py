@@ -48,6 +48,12 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.gateway.decisions_contracts import (
+    ChoiceQuestion,
+    DecisionRequest,
+    NoulQuestion,
+    ScoreQuestion,
+)
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
@@ -233,6 +239,77 @@ def test_maximum_attempt_cost_is_integer_conservative_and_unknown_prices_fail_cl
     assert all_dimensions is not None and all_dimensions > known
 
 
+@pytest.mark.parametrize("output_rate", [0, 1_000_037])
+def test_decision_ceiling_prices_both_reservations_with_integer_rounding(output_rate: int) -> None:
+    """Zero output price is known money, not zero observed or reserved output tokens."""
+    request = DecisionRequest(
+        state="你好", questions={"valid": NoulQuestion(instructions="Accept?")}
+    )
+    deployment = _deployment()
+    deployment = deployment.model_copy(
+        update={
+            "gateway": deployment.gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=13,
+                        output_nano_usd_per_million_tokens=output_rate,
+                    )
+                }
+            )
+        }
+    )
+    input_tokens, output_tokens = worst_case_attempt_tokens(request, deployment)
+    assert input_tokens == request.input_token_reservation
+    assert output_tokens == request.output_token_reservation == 2048
+    assert deployment.capabilities is not None
+    assert deployment.capabilities.maximum_output_tokens is not None
+    assert output_tokens > deployment.capabilities.maximum_output_tokens
+    expected = (input_tokens * 13 + output_tokens * output_rate + 999_999) // 1_000_000
+    assert maximum_attempt_cost_nano_usd(request, deployment) == expected
+    assert maximum_attempt_cost_nano_usd(request, deployment, input_tokens=input_tokens) == expected
+    assert maximum_attempt_cost_nano_usd(request, _deployment(priced=False)) is None
+
+
+@pytest.mark.parametrize(
+    "prices",
+    [
+        GatewayTokenPrices(input_nano_usd_per_million_tokens=13),
+        GatewayTokenPrices(output_nano_usd_per_million_tokens=0),
+    ],
+)
+def test_decision_ceiling_requires_both_explicit_prices(prices: GatewayTokenPrices) -> None:
+    """An absent output price cannot be silently treated as a free output leg."""
+    request = DecisionRequest(
+        state="state", questions={"valid": NoulQuestion(instructions="Accept?")}
+    )
+    deployment = _deployment()
+    deployment = deployment.model_copy(
+        update={"gateway": deployment.gateway.model_copy(update={"prices": prices})}
+    )
+    assert maximum_attempt_cost_nano_usd(request, deployment) is None
+
+
+@pytest.mark.parametrize(("choice_count", "score_count"), [(2, 2), (64, 10)])
+def test_decision_output_reservation_sums_each_question_and_criterion(
+    choice_count: int,
+    score_count: int,
+) -> None:
+    """Mixed question batches preserve their full output allowance, not a chat ceiling."""
+    criteria = tuple(f"criterion-{index}" for index in range(choice_count))
+    request = DecisionRequest(
+        state={"record": "你好"},
+        questions={
+            "truth": NoulQuestion(instructions="Is this valid?"),
+            "choice": ChoiceQuestion(instructions="Select", criteria=dict.fromkeys(criteria)),
+            "score": ScoreQuestion(instructions="Rate", criteria=criteria[:score_count]),
+        },
+    )
+    input_tokens, output_tokens = worst_case_attempt_tokens(request, _deployment())
+    assert input_tokens == request.input_token_reservation
+    assert output_tokens == 2048 + 2 * 1024 + 512 * (choice_count + score_count)
+    assert output_tokens == request.output_token_reservation
+
+
 def test_missing_output_ceiling_reserves_against_the_default_instead_of_failing_closed() -> None:
     """A priced route with no output ceiling anywhere stays priceable.
 
@@ -340,6 +417,83 @@ def test_concurrent_identity_reservations_never_exceed_hard_limit(tmp_path: Path
     remaining = budgets.remaining(organization_id="org", period="2026-08")[0]
     assert remaining.reserved_nano_usd == 500
     assert remaining.remaining_nano_usd == 0
+
+
+def test_decision_ledger_settles_zero_output_price_without_discarding_usage(tmp_path: Path) -> None:
+    """SQLite reserves decision money then preserves both observed token counts at settlement."""
+    clock = _Clock()
+    store, ledger, budgets, key = _authority(tmp_path, clock)
+    request = DecisionRequest(
+        state="decision-content-canary", questions={"valid": NoulQuestion(instructions="Accept?")}
+    )
+    authorization = store.authorize_request(
+        raw_key=key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    snapshot = ExecutionSnapshot(
+        authorization=authorization,
+        exact_model_id="exact-one",
+        pool_id="pool",
+        deployment_ids=("primary",),
+    )
+    deployment = _deployment()
+    deployment = deployment.model_copy(
+        update={
+            "gateway": deployment.gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=1_000_000,
+                        output_nano_usd_per_million_tokens=0,
+                    )
+                }
+            )
+        }
+    )
+    maximum = maximum_attempt_cost_nano_usd(request, deployment)
+    assert maximum is not None
+    assert maximum == request.input_token_reservation
+    budgets.set_limit(
+        organization_id="org",
+        period="2026-08",
+        scope=BudgetScope(kind=BudgetScopeKind.TEAM),
+        limit_nano_usd=maximum,
+        strict_unknown_cost=True,
+    )
+    attempt = ledger.start_attempt(
+        snapshot=snapshot,
+        deployment=deployment,
+        attempt_ordinal=0,
+        route_depth=0,
+        maximum_cost_nano_usd=maximum,
+        reserved_input_tokens=request.input_token_reservation,
+        reserved_output_tokens=request.output_token_reservation,
+    )
+    assert (
+        budgets.remaining(organization_id="org", period="2026-08")[0].reserved_nano_usd == maximum
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=0,
+            usage=GatewayUsage(input_tokens=17, output_tokens=5),
+        ),
+        failure=None,
+    )
+    remaining = budgets.remaining(organization_id="org", period="2026-08")[0]
+    assert remaining.reserved_nano_usd == 0
+    assert remaining.settled_nano_usd == 17
+    assert remaining.unknown_cost_attempts == 0
+    with sqlite3.connect(store.database_path) as connection:
+        row = connection.execute(
+            "SELECT input_tokens, output_tokens, budget_settled_nano_usd "
+            "FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt,),
+        ).fetchone()
+        assert row == (17, 5, 17)
 
 
 def test_configured_optional_prices_are_reserved_even_when_reporting_hints_are_false(

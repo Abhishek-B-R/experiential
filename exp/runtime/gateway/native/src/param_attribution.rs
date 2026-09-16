@@ -72,7 +72,7 @@ pub fn rejected_parameter(dialect: Dialect, body: &str) -> Option<String> {
             }
         }
         Dialect::GeminiGenerateContent => gemini_field_violation(&value),
-        Dialect::BedrockConverseStream => None,
+        Dialect::BedrockConverseStream | Dialect::TypesafeSystemone => None,
     }?;
     valid_parameter_path(&candidate).then_some(candidate)
 }
@@ -95,6 +95,8 @@ pub(crate) fn error_message_field(dialect: Dialect, value: &Value) -> Option<&st
         }
         // Bedrock reports a modeling error as a bare top-level `message`.
         Dialect::BedrockConverseStream => value.get("message")?.as_str(),
+        // TypeSafe defines status classes, not a stable public error envelope.
+        Dialect::TypesafeSystemone => None,
     }
 }
 
@@ -104,7 +106,8 @@ fn family_envelope(dialect: Dialect, value: &Value) -> Option<ErrorEnvelope<'_>>
         Dialect::OpenAiResponses | Dialect::OpenAiCompatible => openai_family_envelope(value),
         Dialect::AnthropicMessages
         | Dialect::GeminiGenerateContent
-        | Dialect::BedrockConverseStream => None,
+        | Dialect::BedrockConverseStream
+        | Dialect::TypesafeSystemone => None,
     }
 }
 
@@ -181,7 +184,7 @@ pub fn rejected_detail(dialect: Dialect, body: &str, request_words: &[&str]) -> 
 pub fn rejected_code(dialect: Dialect, body: &str) -> Option<String> {
     let value = parse_error_document(body)?;
     let token = match dialect {
-        Dialect::BedrockConverseStream => return None,
+        Dialect::BedrockConverseStream | Dialect::TypesafeSystemone => return None,
         Dialect::OpenAiResponses | Dialect::OpenAiCompatible => {
             openai_family_envelope(&value)?.code?
         }
@@ -664,7 +667,9 @@ mod tests {
             Dialect::GeminiGenerateContent => {
                 "google.rpc.BadRequest fieldViolations, else leading message path token"
             }
-            Dialect::BedrockConverseStream => "none: no machine-readable parameter contract",
+            Dialect::BedrockConverseStream | Dialect::TypesafeSystemone => {
+                "none: no machine-readable parameter contract"
+            }
         }
     }
 

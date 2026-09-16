@@ -63,9 +63,89 @@ unchanged: it uses the AWS credential chain and has no stored API key.
 | Amazon Bedrock | `bedrock` | AWS credential chain. No `api_key_env` | Optional catalog `region` |
 | Vertex AI | `vertex` | `api_key_env` holding service-account JSON | Project-and-location `base_url` |
 | Tinker sampling | `tinker` | `api_key_env` | Official Tinker origin |
+| TypeSafe SystemOne | `typesafe` | `api_key_env` (suggested `TYPESAFE_API_KEY`) | `https://api.typesafe.ai/v1/systemone`, native decisions only |
 
 Native fixed-origin providers reject a custom `base_url`. Use `openai-compatible` for a trusted
 third-party OpenAI-compatible host.
+
+## TypeSafe SystemOne decisions
+
+Use `provider = "typesafe"` with an explicitly authored catalog connection and deployment.
+The interactive provider picker does not offer TypeSafe. The connection uses the official
+`https://api.typesafe.ai/v1` root and sends its provider credential as a Bearer header to
+`/systemone`; it exposes no chat, Responses, or embeddings endpoint. The public gateway route is
+`POST /v1/systemone`, authenticated with a gateway virtual key, not the provider key.
+
+A deployment must declare `gateway.capabilities.supports_decisions = true`. Its ordinary
+`ModelCapabilities` should declare `supports_completions = false` and
+`supports_embeddings = false`; decision support is gateway metadata, not an addition to the
+frozen model-capability identity. Admission requires a known nonnegative
+`gateway.prices.input_nano_usd_per_million_tokens` and an explicit
+`gateway.prices.output_nano_usd_per_million_tokens = 0`. Unknown prices are not free prices.
+Only direct exact-model pools serve decisions; project-backed aliases are refused.
+
+Send exactly three top-level fields: `model` (the granted public alias), `state`, and `questions`.
+State and each question's instructions may be a string, JSON object, or array. This example uses
+all three question types; replace `systemone` with the decision alias your gateway grants:
+
+```json
+{
+  "model": "systemone",
+  "state": {"payment_received": true, "message": "Please send my invoice."},
+  "questions": {
+    "paid": {"type": "noul", "instructions": "Was payment received?"},
+    "topic": {
+      "type": "choice",
+      "instructions": "Classify the customer's request.",
+      "criteria": {"billing": "Invoices and payments", "other": "Anything else"}
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "Rate the urgency.",
+      "criteria": ["low", "medium", "high"]
+    }
+  }
+}
+```
+
+| Type | Question criteria | Answer fields |
+|---|---|---|
+| `noul` | Optional object with `true` and `false` descriptions | `type`, `noul` (probability from 0 to 1) |
+| `choice` | Object mapping 2 through 64 category names to text, object, or array descriptions, or `null` | `type`, `choice`, `confidence`, `probabilities` keyed by the requested names |
+| `score` | Ordered array of 2 through 10 text, object, or array descriptions | `type`, `score`, `confidence`, `legend`, `probabilities` keyed by zero-based index strings |
+
+The response contains `id`, the requested public `model` alias, `answers` under the original
+question IDs, and `usage.input_tokens` / `usage.output_tokens`. These are structured decision
+values, not assistant text. Probabilities and confidence must be finite values from 0 to 1,
+distributions must sum to 1 within validation tolerance, the selected choice must have the highest
+probability, and a score must match the distribution's weighted zero-based index. Missing answers, mismatched types or criteria, and missing or invalid
+usage fail closed. Only validated answer fields are returned; extra provider metadata is omitted.
+
+Limits are 1 through 32 questions, 1 through 256 UTF-8 bytes per question ID or choice category
+name, and at most 262,144 bytes for both the raw body and the normalized request. Duplicate JSON
+keys, non-finite numbers, unknown fields, chat messages, tools, generation controls, and `stream`
+are rejected before acceptance. Nested data must use valid UTF-8, integers in the inclusive range
+`-2^63` through `2^64 - 1`, and at most 64 JSON levels. These are gateway serialization bounds,
+not TypeSafe token limits. Objects and arrays retain their structure instead of becoming strings. Responses are buffered, never streamed. `Idempotency-Key` is
+ignored: resubmitting the same request is a new operation, not a replay. There is no continuation,
+prompt-based project selection, or chat input/output guardrail processing on this surface.
+
+The gateway reserves a bounded estimate for each dispatch: serialized state is counted for every
+question, question instructions and criteria add to input, and per-question protocol allowances
+cover input and output. This is an accounting estimate, not a provider-enforced token limit;
+no synthetic `max_tokens` field is sent. Settlement uses only TypeSafe's reported token counts,
+including reported output tokens even though their configured price is zero. Unknown outcomes
+retain a content-free unknown-cost attempt record and keep the monetary reservation held, with
+no invented usage, settled charge, or automatic retry. A witnessed provider HTTP rejection
+releases the reservation without inventing zero-token usage. The certified route permits at most
+eight deployments and one dispatch per deployment, with no same-deployment or throttle redials.
+
+For a local SQLite gateway, an operator resolves one terminal decision hold explicitly through
+`SQLiteAttemptLedger.reconcile_decision_liability(attempt_id=..., assigned_cost_nano_usd=...)`
+after checking the provider's outcome. Zero releases the hold; a positive assignment records
+that budget amount while token usage and the provider cost estimate stay unknown. Repeating the
+same assignment is a no-op; a different assignment is refused. Holds survive request completion
+and process restarts until this explicit reconciliation, so unresolved work cannot fund repeats.
 
 ## OpenAI-compatible listing metadata
 

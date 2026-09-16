@@ -38,6 +38,7 @@ pub enum Dialect {
     OpenAiCompatible,
     GeminiGenerateContent,
     BedrockConverseStream,
+    TypesafeSystemone,
 }
 
 impl Dialect {
@@ -48,6 +49,7 @@ impl Dialect {
             "openai_compatible" => Some(Dialect::OpenAiCompatible),
             "gemini_generate_content" => Some(Dialect::GeminiGenerateContent),
             "bedrock_converse_stream" => Some(Dialect::BedrockConverseStream),
+            "typesafe_systemone" => Some(Dialect::TypesafeSystemone),
             _ => None,
         }
     }
@@ -59,12 +61,14 @@ impl Dialect {
 pub enum FrameDecoder {
     Sse(SseDecoder),
     EventStream(EventStreamDecoder),
+    Unsupported,
 }
 
 impl FrameDecoder {
     pub fn new(dialect: Dialect) -> Self {
         match dialect {
             Dialect::BedrockConverseStream => FrameDecoder::EventStream(EventStreamDecoder::new()),
+            Dialect::TypesafeSystemone => FrameDecoder::Unsupported,
             Dialect::OpenAiResponses
             | Dialect::AnthropicMessages
             | Dialect::OpenAiCompatible
@@ -77,6 +81,7 @@ impl FrameDecoder {
         match self {
             FrameDecoder::Sse(decoder) => decoder.feed(chunk),
             FrameDecoder::EventStream(decoder) => decoder.feed(chunk),
+            FrameDecoder::Unsupported => Err("decision models do not stream".to_string()),
         }
     }
 
@@ -85,6 +90,7 @@ impl FrameDecoder {
         match self {
             FrameDecoder::Sse(decoder) => decoder.finish(),
             FrameDecoder::EventStream(decoder) => decoder.finish(),
+            FrameDecoder::Unsupported => Err("decision models do not stream".to_string()),
         }
     }
 }
@@ -631,6 +637,9 @@ impl Normalizer {
             Dialect::OpenAiCompatible => self.feed_openai_compatible(frame),
             Dialect::GeminiGenerateContent => self.feed_gemini(frame),
             Dialect::BedrockConverseStream => self.feed_bedrock(frame),
+            Dialect::TypesafeSystemone => {
+                Err(malformed("decision models do not serve chat streams"))
+            }
         }?;
         if events.iter().any(Event::is_output_token) {
             self.emitted_output = true;

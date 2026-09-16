@@ -123,6 +123,7 @@ class _RecordingLedger:
         """Start with empty write logs and no scripted rejections."""
         self.started: list[JsonObject] = []
         self.finished: list[JsonObject] = []
+        self.terminal_events: list[GatewayEvent | None] = []
         self.rate_limit_settlements: list[JsonObject] = []
         self.finished_requests: list[GatewayFailure] = []
         self.budget_rejections: dict[str, BudgetScopeKind] = {}
@@ -187,7 +188,8 @@ class _RecordingLedger:
         ratelimit_remaining_tokens: int | None = None,
     ) -> None:
         """Record one settled attempt, tracking harvested rate-limit values apart."""
-        del terminal_event, first_token_at
+        del first_token_at
+        self.terminal_events.append(terminal_event)
         if self.fail_finishes > 0:
             self.fail_finishes -= 1
             raise RuntimeError("scripted terminal-write failure")
@@ -247,6 +249,47 @@ def _registry() -> tuple[NativeAttemptAccounting, _RecordingLedger, InflightRequ
     )
     registry.register(entry)
     return registry, ledger, entry
+
+
+@pytest.mark.parametrize(
+    ("surface", "opened", "marker", "has_usage", "expected"),
+    [
+        (GatewayApiSurface.DECISIONS, False, True, False, True),
+        (GatewayApiSurface.DECISIONS, False, False, False, False),
+        (GatewayApiSurface.DECISIONS, False, "true", False, False),
+        (GatewayApiSurface.DECISIONS, True, True, False, False),
+        (GatewayApiSurface.DECISIONS, False, True, True, False),
+        (GatewayApiSurface.CHAT_COMPLETIONS, False, True, False, False),
+        (GatewayApiSurface.RESPONSES, False, True, False, False),
+    ],
+)
+def test_rejection_evidence_reaches_only_unopened_unmetered_decision_failures(
+    surface: GatewayApiSurface,
+    opened: bool,
+    marker: bool | str,
+    has_usage: bool,
+    expected: bool,
+) -> None:
+    """Only explicit native evidence can release a decision's unobserved liability."""
+    registry, ledger, entry = _registry()
+    entry.authorization = entry.authorization.model_copy(update={"surface": surface})
+    registry.settle(
+        json.dumps(
+            {
+                "request_id": entry.authorization.request_id,
+                "attempt_id": "attempt-one",
+                "outcome": "failed",
+                "usage": {"input_tokens": 7, "output_tokens": 3} if has_usage else None,
+                "failure": {"failure_class": "provider_authentication", "safe_message": "rejected"},
+                "opened": opened,
+                "decision_provider_rejected": marker,
+            }
+        )
+    )
+    event = ledger.terminal_events[-1]
+    assert event is not None
+    assert event.decision_provider_rejected is expected
+    assert (event.usage is not None) is has_usage
 
 
 def _start(
