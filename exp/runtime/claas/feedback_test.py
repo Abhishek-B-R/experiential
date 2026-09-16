@@ -2,12 +2,26 @@
 
 import json
 import sqlite3
+import threading
+import time
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+import httpx
 import pytest
 
-from exp.common.claas import ClaasScope
+from exp.common.claas import CapturePolicy, ClaasScope
+from exp.runtime.claas.capture import CaptureBinding, CaptureConfiguration
 from exp.runtime.claas.feedback import FeedbackStore
+from exp.runtime.gateway.lifecycle import load_gateway_components
+from exp.runtime.gateway.native_bridge import NativeControlPlane
+from exp.runtime.gateway.native_server import serve_native_gateway
+from exp.runtime.gateway.tests.launch_test import (
+    _configure_gateway,
+    _LoopbackProvider,
+    _unused_port,
+    _wait_ready,
+)
 
 
 @pytest.fixture
@@ -119,23 +133,6 @@ def test_real_native_feedback_is_durable_scoped_and_replayable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Use local HTTP and SQLite to verify acknowledgement, key authority, and finalization."""
-    import threading
-    import time
-    from http.server import ThreadingHTTPServer
-
-    import httpx
-
-    from exp.common.claas import CapturePolicy
-    from exp.runtime.claas.capture import CaptureBinding, CaptureConfiguration
-    from exp.runtime.gateway.lifecycle import load_gateway_components
-    from exp.runtime.gateway.native_bridge import NativeControlPlane
-    from exp.runtime.gateway.native_server import serve_native_gateway
-    from exp.runtime.gateway.tests.launch_test import (
-        _configure_gateway,
-        _LoopbackProvider,
-        _unused_port,
-        _wait_ready,
-    )
 
     native = pytest.importorskip("exp_gateway_native")
     monkeypatch.setenv("LOOPBACK_PROVIDER_KEY", "provider-secret")

@@ -6,6 +6,7 @@ import json
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
 from threading import Lock
+from types import TracebackType
 from typing import Literal
 
 from pydantic import Field, model_validator
@@ -234,7 +235,7 @@ class ClaasWorldSession(AbstractContextManager["ClaasWorldSession"]):
         self,
         exception_type: type[BaseException] | None,
         exception: BaseException | None,
-        traceback: object | None,
+        traceback: TracebackType | None,
     ) -> bool:
         """Close local state without remote cleanup or suppressing caller failures."""
         del exception_type, exception, traceback
