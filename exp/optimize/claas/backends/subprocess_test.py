@@ -73,3 +73,43 @@ def test_real_worker_entrypoint_fails_closed_without_cuda(tmp_path: Path) -> Non
         await session.close()
 
     asyncio.run(run())
+
+
+def test_close_during_process_creation_waits_for_owned_worker_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing at the spawn await cannot strand a newly created training process."""
+    original_spawn = asyncio.create_subprocess_exec
+
+    async def run() -> None:
+        started, release = asyncio.Event(), asyncio.Event()
+        processes: list[asyncio.subprocess.Process] = []
+
+        async def delayed_spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+            del args, kwargs
+            process = await original_spawn(sys.executable, "-c", "import time; time.sleep(60)")
+            processes.append(process)
+            started.set()
+            await release.wait()
+            return process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+        backend = SubprocessVerlBackend(
+            python_executable=Path(sys.executable),
+            checkpoint_root=tmp_path,
+            cuda_visible_device="0",
+        )
+        session = await backend.open(spec())
+        update = asyncio.create_task(session.train(job(tmp_path).batch))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        cleanup = asyncio.create_task(session.close())
+        await asyncio.sleep(0)
+        assert not cleanup.done()
+        release.set()
+        with pytest.raises(ClaasTrainingError, match="closed during worker startup"):
+            await asyncio.wait_for(update, timeout=5)
+        await asyncio.wait_for(cleanup, timeout=5)
+        assert all(process.returncode is not None for process in processes)
+
+    asyncio.run(run())

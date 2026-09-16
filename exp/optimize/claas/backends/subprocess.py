@@ -128,6 +128,13 @@ class _SubprocessSession:
                         stderr=output,
                     )
                     self._process = process
+                    if self._closed:
+                        self._failed = True
+                        if process.returncode is None:
+                            process.kill()
+                        await process.wait()
+                        self._process = None
+                        raise ClaasTrainingError("session closed during worker startup")
                     try:
                         await asyncio.wait_for(process.wait(), timeout=self._backend._timeout)
                     except (TimeoutError, asyncio.CancelledError):
@@ -180,4 +187,8 @@ class _SubprocessSession:
             self._failed = True
             self._process.kill()
             await self._process.wait()
-        self._process = None
+        # A concurrent train may still be awaiting process creation. It observes
+        # _closed immediately after creation and kills that process before this
+        # lock is released. Returning from close therefore proves no owned worker.
+        async with self._lock:
+            self._process = None
