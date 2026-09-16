@@ -423,17 +423,21 @@ fn uncertain_outcomes_never_advance_even_with_an_unused_second_rung() {
     }
     for status in [401, 403, 404] {
         let failure = route_failure(rejected_http(status), &wire(false), admission().policy(), 1);
-        assert!(failure.failover_eligible);
-        assert!(successor_possible(
-            policy,
-            2,
-            Instant::now() + Duration::from_secs(1),
-            1,
-            1,
-            0,
-            &failure,
-            false
-        ));
+        assert!(failure.decision_provider_rejected);
+        assert_eq!(failure.failover_eligible, status == 401);
+        assert_eq!(
+            successor_possible(
+                policy,
+                2,
+                Instant::now() + Duration::from_secs(1),
+                1,
+                1,
+                0,
+                &failure,
+                false
+            ),
+            status == 401
+        );
     }
 }
 
@@ -444,12 +448,12 @@ fn customer_credential_and_quota_failures_keep_caller_ownership() {
         let failure = route_failure(rejected_http(status), &wire(true), policy, 1);
         assert!(failure.customer_owned);
         assert!(!failure.retryable_same_deployment);
-        // A credential rejection can advance; undocumented account status cannot.
-        assert_eq!(failure.failover_eligible, status != 402);
+        // Only the explicit 401 credential rejection can advance.
+        assert_eq!(failure.failover_eligible, status == 401);
         assert_eq!(failure.clone().boundary().public_error().status_code, 400);
         let house = route_failure(rejected_http(status), &wire(false), policy, 1);
         assert!(!house.customer_owned);
-        assert_eq!(house.failover_eligible, status != 402);
+        assert_eq!(house.failover_eligible, status == 401);
     }
     let failure = route_failure(rejected_http(529), &wire(true), policy, 1);
     assert!(!failure.customer_owned);
@@ -533,9 +537,7 @@ fn settlement_rejection_marker_comes_from_definitive_http_status_only() {
             let failure = rejected_http(status);
             let expected = matches!(status, 400 | 401 | 403 | 404 | 422);
             assert_eq!(failure.decision_provider_rejected, expected);
-            if !expected {
-                assert!(!failure.failover_eligible);
-            }
+            assert_eq!(failure.failover_eligible, status == 401);
             assert!(
                 guard
                     .settle("failed", None, &[], Some(&failure), true)

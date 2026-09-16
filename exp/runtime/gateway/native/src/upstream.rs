@@ -116,13 +116,11 @@ pub fn transport_failure(status: Option<u16>) -> Failure {
 /// Pin TypeSafe rejection evidence to the received status, never an inferred class.
 pub(crate) fn decision_http_failure(mut failure: Failure, status: u16) -> Failure {
     failure.decision_provider_rejected = matches!(status, 400 | 401 | 403 | 404 | 422);
-    // TypeSafe has no idempotency contract. Timeout, overload, and rate-limit
-    // statuses do not guarantee that no work or charge occurred, so only
-    // request, credential, or route rejection can advance.
+    // Zero-work accounting evidence does not itself authorize another call.
+    // Only a rejected credential may try an independently credentialed rung;
+    // every other status ends this request without automatic dispatch.
     failure.retryable_same_deployment = false;
-    if !failure.decision_provider_rejected {
-        failure.failover_eligible = false;
-    }
+    failure.failover_eligible = status == 401;
     failure
 }
 
