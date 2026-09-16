@@ -215,12 +215,14 @@ def validate_training_batch(
                 "exact rollout exceeds max_sequence_tokens; truncation is not supported"
             )
         total_tokens += length
-        if spec.objective == "sdpo" and item.text_feedback is None:
+        if spec.objective in {"sdpo", "hybrid"} and item.text_feedback is None:
             raise ValueError(
-                "SDPO requires text_feedback; select reinforce for scalar-only feedback"
+                "SDPO and hybrid require text_feedback; select reinforce for scalar-only feedback"
             )
-        if spec.objective == "reinforce" and item.scalar_reward is None:
-            raise ValueError("REINFORCE requires scalar_reward; select sdpo for text-only feedback")
+        if spec.objective in {"reinforce", "hybrid"} and item.scalar_reward is None:
+            raise ValueError(
+                "REINFORCE and hybrid require scalar_reward; select sdpo for text-only feedback"
+            )
     if total_tokens > spec.max_batch_tokens:
         raise ValueError("batch exceeds max_batch_tokens; split it before dispatch")
 

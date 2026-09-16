@@ -7,7 +7,7 @@ from exp.optimize.claas.algorithms.sdpo import feedback_objective
 from exp.optimize.claas.training_contracts_test import spec
 
 
-@pytest.mark.parametrize("alpha", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("alpha", [0.0, 0.25, 0.5, 0.75, 1.0])
 def test_full_vocabulary_divergence_and_teacher_stop_gradient(alpha: float) -> None:
     """Match an independent distribution-level oracle and stop teacher gradients."""
     student = torch.tensor([[0.4, 1.0, -0.3], [1.2, 0.0, 0.7]], requires_grad=True)
@@ -69,5 +69,20 @@ def test_full_vocabulary_rejects_mismatched_teacher() -> None:
             rollout_logprobs=torch.tensor([-1.0]),
             scalar_reward=None,
             spec=spec(),
+            batch_response_tokens=1,
+        )
+
+
+@pytest.mark.parametrize("missing", ["teacher", "scalar"])
+def test_hybrid_loss_never_silently_omits_a_component(missing: str) -> None:
+    """Direct objective callers have the same complete-recipe requirement as jobs."""
+    with pytest.raises(ValueError, match="hybrid requires both"):
+        feedback_objective(
+            student_logits=torch.zeros(1, 2, requires_grad=True),
+            teacher_logits=None if missing == "teacher" else torch.ones(1, 2),
+            response_tokens=torch.tensor([0]),
+            rollout_logprobs=torch.tensor([-1.0]),
+            scalar_reward=None if missing == "scalar" else 1.0,
+            spec=spec().model_copy(update={"objective": "hybrid"}),
             batch_response_tokens=1,
         )

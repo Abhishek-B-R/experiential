@@ -113,3 +113,14 @@ def test_close_during_process_creation_waits_for_owned_worker_cleanup(
         assert all(process.returncode is not None for process in processes)
 
     asyncio.run(run())
+
+
+def test_failure_diagnostic_retains_bounded_tail(tmp_path: Path) -> None:
+    """A useful terminal exception survives temporary worker-log cleanup."""
+    from exp.optimize.claas.backends.subprocess import _worker_diagnostic
+
+    log = tmp_path / "worker.log"
+    log.write_bytes(b"earlier-output" * 10000 + b"\nCUDA out of memory\n")
+    diagnostic = _worker_diagnostic(log)
+    assert diagnostic.endswith("CUDA out of memory\n")
+    assert len(diagnostic.encode()) <= 8192

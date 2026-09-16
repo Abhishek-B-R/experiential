@@ -30,6 +30,9 @@ def test_forbidden_provider_imports_are_absent() -> None:
             "exp.common.vendor",
         },
         allowed={
+            # The opt-in training worker is the only local Transformers execution boundary.
+            ("optimize/claas/backends/verl_worker.py", "transformers"),
+            ("optimize/claas/backends/verl_worker.py", "transformers.modeling_outputs"),
             ("runtime/models/providers/bedrock.py", "boto3"),
             ("runtime/models/providers/bedrock.py", "botocore.auth"),
             ("runtime/models/providers/bedrock.py", "botocore.awsrequest"),

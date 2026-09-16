@@ -107,3 +107,34 @@ def test_gpu_placement_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     with pytest.raises(ClaasTrainingError, match="visible CUDA"):
         require_worker_runtime()
+
+
+def test_mutable_local_model_references_are_not_treated_as_pinned(tmp_path: Path) -> None:
+    """A revision string cannot freeze model or tokenizer files in a mutable directory."""
+    from exp.optimize.claas.backends.verl_worker import _validate_model_reference
+
+    with pytest.raises(ValueError, match="not revision-bound"):
+        _validate_model_reference(str(tmp_path), "a" * 40)
+    with pytest.raises(ValueError, match="immutable"):
+        _validate_model_reference("owner/model", "main")
+    _validate_model_reference("owner/model", "a" * 40)
+
+
+def test_checkpoint_flush_failure_cannot_publish_a_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A disk flush failure leaves no complete directory that could be acknowledged."""
+    import os
+
+    def fail_flush(_fd: int) -> None:
+        """Simulate failure before the atomic checkpoint publication boundary."""
+        raise OSError("checkpoint device failed")
+
+    config = GPT2Config.from_dict(
+        {"vocab_size": 8, "n_positions": 128, "n_embd": 16, "n_layer": 1, "n_head": 2}
+    )
+    monkeypatch.setattr(os, "fsync", fail_flush)
+    with pytest.raises(OSError, match="checkpoint device failed"):
+        train_loaded_model(job(tmp_path), GPT2LMHeadModel(config), tokenizer(), torch.device("cpu"))
+    assert not list(tmp_path.glob("*/claas-*/manifest.json"))
+    assert not list(tmp_path.glob("*/.checkpoint-*"))

@@ -145,10 +145,13 @@ class _SubprocessSession:
                         raise
                     if process.returncode != 0:
                         self._failed = True
+                        output.flush()
+                        diagnostic = _worker_diagnostic(root / "worker.log")
                         raise ClaasTrainingError(
                             "veRL worker failed; verify experiential[claas-verl], "
                             "pinned model/tokenizer, "
                             "and one BF16 CUDA device. Do not retry an uncertain optimizer update."
+                            f"\nLast worker output (bounded):\n{diagnostic}"
                         )
                 self._process = None
                 try:
@@ -192,3 +195,11 @@ class _SubprocessSession:
         # lock is released. Returning from close therefore proves no owned worker.
         async with self._lock:
             self._process = None
+
+
+def _worker_diagnostic(path: Path) -> str:
+    """Keep a bounded failure tail in the raised exception after temporary logs are removed."""
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        handle.seek(max(0, handle.tell() - 8192))
+        return handle.read(8192).decode("utf-8", errors="replace")

@@ -64,3 +64,41 @@ def test_rejects_unbound_ancestry_and_extra_payload(tmp_path: Path) -> None:
     (tmp_path / "extra.pt").write_bytes(b"untracked")
     with pytest.raises(ValueError, match="outside"):
         verify_checkpoint(receipt, spec())
+
+
+def test_private_snapshot_keeps_verified_bytes_after_source_replacement(tmp_path: Path) -> None:
+    """Concurrent source writes after staging cannot change the paths used by loaders."""
+    from exp.optimize.claas.backends.checkpoints import checkpoint_snapshot
+
+    receipt = checkpoint(tmp_path)
+    with checkpoint_snapshot(receipt, spec()) as staged:
+        assert staged is not None
+        staged_root = Path(staged.path)
+        (tmp_path / "optimizer.pt").write_bytes(b"replacement")
+        assert (staged_root / "optimizer.pt").read_bytes() == b"inert-test-payload"
+        verify_checkpoint(staged, spec())
+    assert not staged_root.exists()
+
+
+def test_snapshot_rejects_content_changed_during_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Changing source bytes between verification and copy cannot become resumable state."""
+    import shutil
+
+    from exp.optimize.claas.backends.checkpoints import checkpoint_snapshot
+
+    receipt = checkpoint(tmp_path)
+    original = shutil.copyfile
+
+    def changed_copy(source: Path, target: Path) -> Path:
+        """Replace a payload immediately before its staging read."""
+        source.write_bytes(b"changed-during-copy")
+        return original(source, target)
+
+    monkeypatch.setattr(shutil, "copyfile", changed_copy)
+    with (
+        pytest.raises(ValueError, match="changed while staging"),
+        checkpoint_snapshot(receipt, spec()),
+    ):
+        pytest.fail("unverified state must never reach a loader")

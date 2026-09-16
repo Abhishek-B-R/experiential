@@ -126,7 +126,7 @@ def test_objective_selection_is_explicit(tmp_path: Path) -> None:
     """Scalar feedback cannot silently substitute for SDPO."""
     scalar = example().model_copy(update={"text_feedback": None})
     batch = TrainingBatch(batch_id="b", expected_policy_revision="policy-0", examples=(scalar,))
-    with pytest.raises(ValueError, match="SDPO requires"):
+    with pytest.raises(ValueError, match="require text_feedback"):
         TrainingJob(spec=spec(), batch=batch, checkpoint_root=str(tmp_path))
     accepted = TrainingJob(
         spec=spec().model_copy(update={"objective": "reinforce"}),
@@ -188,6 +188,20 @@ def test_rejects_incompatible_sampling_distribution(
             spec=spec(),
             batch=TrainingBatch(
                 batch_id="filtered", expected_policy_revision="policy-0", examples=(changed,)
+            ),
+            checkpoint_root=str(tmp_path),
+        )
+
+
+@pytest.mark.parametrize("missing", ["scalar_reward", "text_feedback"])
+def test_hybrid_requires_both_declared_signals(tmp_path: Path, missing: str) -> None:
+    """A hybrid manifest cannot describe a one-objective update."""
+    item = example().model_copy(update={missing: None})
+    with pytest.raises(ValueError, match="hybrid require"):
+        TrainingJob(
+            spec=spec().model_copy(update={"objective": "hybrid"}),
+            batch=TrainingBatch(
+                batch_id="hybrid", expected_policy_revision="policy-0", examples=(item,)
             ),
             checkpoint_root=str(tmp_path),
         )

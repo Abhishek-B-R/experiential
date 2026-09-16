@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 from pydantic import Field
@@ -79,3 +83,34 @@ def verify_checkpoint(
     if not required.issubset(manifest.files):
         raise ValueError("checkpoint lacks student, teacher, or resumable optimizer state")
     return manifest
+
+
+@contextmanager
+def checkpoint_snapshot(
+    checkpoint: TrainingCheckpoint | None, spec: ClaasTrainingSpec
+) -> Iterator[TrainingCheckpoint | None]:
+    """Bind resume loading to verified bytes copied into a private worker directory.
+
+    A writer may replace the original checkpoint concurrently. Only copies whose
+    content matches the receipt's manifest are exposed to model/optimizer loaders.
+    The private directory is removed after loading and training finish.
+    """
+    if checkpoint is None:
+        yield None
+        return
+    manifest = verify_checkpoint(checkpoint, spec)
+    with tempfile.TemporaryDirectory(prefix="claas-resume-") as directory:
+        root = Path(directory).resolve()
+        for relative, expected in manifest.files.items():
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(Path(checkpoint.path) / relative, target)
+            if hash_file(target) != expected:
+                raise ValueError("checkpoint changed while staging verified resume state")
+            target.chmod(0o400)
+        manifest_path = root / "manifest.json"
+        manifest_path.write_text(manifest.model_dump_json())
+        manifest_path.chmod(0o400)
+        staged = checkpoint.model_copy(update={"path": str(root)})
+        verify_checkpoint(staged, spec)
+        yield staged
