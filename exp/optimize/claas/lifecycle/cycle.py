@@ -61,6 +61,8 @@ class CycleState(ContractModel):
     candidate_revision: str | None = None
     decision: PromotionDecision | None = None
     failure_type: str | None = None
+    cleanup_failure_type: str | None = None
+    recovery_failure_type: str | None = None
     serving_restored: bool = False
     evidence_sha256: str | None = None
 
@@ -223,8 +225,10 @@ async def run_cycle(
             try:
                 _save_state(run_directory, state)
             finally:
-                await admission.close()
+                await _close_admission(admission, error)
             raise
+        cleanup_failure: BaseException | None = None
+        pending_failure: BaseException | None = None
         try:
             await serving.pause_and_drain()
             await serving.wake()
@@ -247,11 +251,23 @@ async def run_cycle(
             _save_state(run_directory, state)
             backend = backend_factory(cycle_id)
             session = await backend.open(spec, resume)
+            training_failure: BaseException | None = None
             try:
                 async with asyncio.timeout(config.limits.maximum_training_seconds):
                     result = await session.train(batch)
+            except BaseException as error:
+                training_failure = error
+                raise
             finally:
-                await session.close()
+                try:
+                    await session.close()
+                except BaseException as error:
+                    cleanup_failure = error
+                    if isinstance(training_failure, asyncio.CancelledError) and isinstance(
+                        error, Exception
+                    ):
+                        raise training_failure from error
+                    raise
             job = TrainingJob(
                 spec=spec,
                 batch=batch,
@@ -321,22 +337,41 @@ async def run_cycle(
             _save_state(run_directory, state)
             return state
         except BaseException as error:
+            pending_failure = error
             restored = False
+            recovery_failure: BaseException | None = None
             try:
-                await _restore_active(directory, registry, spec, serving, admission)
-                restored = True
+                if cleanup_failure is None:
+                    await _restore_active(directory, registry, spec, serving, admission)
+                    restored = True
+            except BaseException as recovery_error:
+                recovery_failure = recovery_error
+                if isinstance(error, asyncio.CancelledError) and isinstance(
+                    recovery_error, Exception
+                ):
+                    raise error from recovery_error
+                pending_failure = recovery_error
+                raise
             finally:
                 state = state.model_copy(
                     update={
                         "stage": "failed",
                         "failure_type": type(error).__name__,
+                        "cleanup_failure_type": (
+                            type(cleanup_failure).__name__ if cleanup_failure is not None else None
+                        ),
+                        "recovery_failure_type": (
+                            type(recovery_failure).__name__
+                            if recovery_failure is not None
+                            else None
+                        ),
                         "serving_restored": restored,
                     }
                 )
                 _save_state(run_directory, state)
             raise
         finally:
-            await admission.close()
+            await _close_admission(admission, pending_failure)
 
 
 async def rollback(
@@ -356,17 +391,41 @@ async def rollback(
         checkpoint_for_revision(directory, baseline.previous, spec)
         try:
             await admission.pause_and_drain()
+        except BaseException as error:
+            await _close_admission(admission, error)
+            raise
+        pending_failure: BaseException | None = None
+        try:
             await serving.pause_and_drain()
             await serving.wake()
             await serving.load_revision(baseline.previous)
             current = registry.rollback(expected_generation=baseline.generation)
             await _resume(serving, admission, current)
             return current
-        except BaseException:
-            await _restore_active(directory, registry, spec, serving, admission)
+        except BaseException as error:
+            pending_failure = error
+            try:
+                await _restore_active(directory, registry, spec, serving, admission)
+            except BaseException as recovery_error:
+                if isinstance(error, asyncio.CancelledError) and isinstance(
+                    recovery_error, Exception
+                ):
+                    raise error from recovery_error
+                pending_failure = recovery_error
+                raise
             raise
         finally:
-            await admission.close()
+            await _close_admission(admission, pending_failure)
+
+
+async def _close_admission(admission: AdmissionController, failure: BaseException | None) -> None:
+    """Release admission without replacing an existing failure with an ordinary close error."""
+    try:
+        await admission.close()
+    except Exception as close_error:
+        if failure is not None:
+            raise failure from close_error
+        raise
 
 
 async def _restore_active(

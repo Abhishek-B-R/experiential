@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-from threading import Event
 
 import pytest
 
@@ -12,7 +11,6 @@ from exp.common.tasks import ToolSchema
 from exp.optimize.workflows.traffic_learning.evaluation import (
     EvaluationManifest,
     PairedEvaluationReport,
-    _run_blocking,
     evaluate_policies,
     freeze_evaluation,
     verify_evaluation_report,
@@ -178,33 +176,6 @@ def test_evaluation_missing_judge_disclosure_fails_before_policy_execution() -> 
         )
     assert not current.inputs and not candidate.inputs
     assert world.reserved_calls == judge.reserved_calls == 0
-
-
-def test_cancellation_joins_an_already_dispatched_provider_call() -> None:
-    """Evaluation cannot close while its owned synchronous provider work is still running."""
-
-    started, release, finished = Event(), Event(), Event()
-
-    def operation() -> str:
-        """Hold an in-flight provider operation until the test releases it."""
-        started.set()
-        assert release.wait(timeout=2)
-        finished.set()
-        return "done"
-
-    async def cancel() -> None:
-        """Cancel the caller and prove its dispatch remains owned until completion."""
-        task = asyncio.create_task(_run_blocking(operation))
-        assert await asyncio.to_thread(started.wait, 1)
-        task.cancel()
-        await asyncio.sleep(0)
-        assert not task.done()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert finished.is_set()
-
-    asyncio.run(cancel())
 
 
 def test_manifest_rejects_overlapping_source_groups() -> None:

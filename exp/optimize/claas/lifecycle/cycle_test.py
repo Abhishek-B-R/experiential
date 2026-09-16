@@ -486,8 +486,74 @@ def test_failed_rollback_recovers_the_durable_active_revision(
     assert not admission.paused and admission.closed
 
 
+@pytest.mark.parametrize("failure", ["timeout", "cancellation"])
+@pytest.mark.parametrize("close_failure", [False, True])
+def test_rollback_initial_drain_failure_never_retries_or_changes_serving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str, close_failure: bool
+) -> None:
+    """Propagate the first drain timeout or cancellation without entering private recovery."""
+    _, serving, admission, _, _ = asyncio.run(drive_cycle(tmp_path))
+    registry = AdapterRegistry(tmp_path / "registry.json", config().scope)
+    before = registry.read()
+    publications = tuple(admission.published)
+    admission.closed = False
+    attempts = 0
+    failures: list[BaseException] = []
+
+    async def run() -> None:
+        """Fail an in-flight public drain before private serving ownership is acquired."""
+        started = asyncio.Event()
+
+        async def drain() -> None:
+            """Expire a real deadline or accept caller cancellation on the first drain."""
+            nonlocal attempts
+            attempts += 1
+            if attempts > 1:
+                raise AssertionError("initial drain failure must not be retried")
+            admission.paused = True
+            started.set()
+            try:
+                async with asyncio.timeout(0.01 if failure == "timeout" else 1):
+                    await asyncio.Event().wait()
+            except BaseException as error:
+                failures.append(error)
+                raise
+
+        async def forbidden_private_drain() -> None:
+            """Reject any private serving transition after an uncompleted public drain."""
+            raise AssertionError("private serving must remain untouched")
+
+        async def failed_close() -> None:
+            """Expose an admission release error without hiding the original drain failure."""
+            admission.closed = True
+            raise OSError("fixture admission close failed")
+
+        monkeypatch.setattr(admission, "pause_and_drain", drain)
+        monkeypatch.setattr(serving, "pause_and_drain", forbidden_private_drain)
+        if close_failure:
+            monkeypatch.setattr(admission, "close", failed_close)
+        task = asyncio.create_task(
+            rollback(directory=tmp_path, config=config(), serving=serving, admission=admission)
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        if failure == "cancellation":
+            task.cancel("caller cancelled rollback")
+        expected = TimeoutError if failure == "timeout" else asyncio.CancelledError
+        with pytest.raises(expected) as raised:
+            await asyncio.wait_for(task, timeout=1)
+        assert raised.value is failures[0]
+
+    asyncio.run(run())
+    assert attempts == 1
+    assert registry.read() == before
+    assert serving.loaded == before.active
+    assert tuple(admission.published) == publications
+    assert admission.closed and admission.paused
+
+
+@pytest.mark.parametrize("failure", [OSError, asyncio.CancelledError])
 def test_failed_rollback_recovery_keeps_admission_paused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: type[BaseException]
 ) -> None:
     """A server that cannot reload registry truth never publishes readiness."""
     _, serving, admission, _, _ = asyncio.run(drive_cycle(tmp_path))
@@ -496,21 +562,112 @@ def test_failed_rollback_recovery_keeps_admission_paused(
     publications = tuple(admission.published)
     attempted: list[ServingRevision] = []
     admission.closed = False
+    original_error = failure("fixture serving unavailable")
 
     async def unavailable(revision: ServingRevision) -> None:
         """Fail both the requested previous revision and the recovery load."""
         attempted.append(revision)
+        if len(attempted) == 1:
+            raise original_error
         raise OSError("fixture serving unavailable")
 
     monkeypatch.setattr(serving, "load_revision", unavailable)
-    with pytest.raises(OSError, match="serving unavailable"):
+    with pytest.raises(failure, match="serving unavailable") as raised:
         asyncio.run(
             rollback(directory=tmp_path, config=config(), serving=serving, admission=admission)
         )
+    if failure is asyncio.CancelledError:
+        assert raised.value is original_error
     assert attempted == [before.previous, before.active]
     assert registry.read() == before
     assert tuple(admission.published) == publications
     assert admission.paused and admission.closed
+
+
+@pytest.mark.parametrize("operation", ["cycle", "rollback"])
+def test_admission_close_does_not_rethrow_the_callers_handled_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    """A successful lifecycle cannot inherit unrelated exception state from its caller."""
+    _, serving, admission, _, _ = asyncio.run(drive_cycle(tmp_path))
+
+    async def failed_close(self: Admission) -> None:
+        """Expose the lifecycle's own release error after a successful operation."""
+        self.closed = True
+        raise OSError("fixture admission release failed")
+
+    async def handled_caller() -> None:
+        """Call the lifecycle while an unrelated exception is already being handled."""
+        try:
+            raise ValueError("unrelated caller failure")
+        except ValueError:
+            if operation == "cycle":
+                await drive_cycle(tmp_path)
+            else:
+                await rollback(
+                    directory=tmp_path, config=config(), serving=serving, admission=admission
+                )
+
+    monkeypatch.setattr(Admission, "close", failed_close)
+    with pytest.raises(OSError, match="admission release failed"):
+        asyncio.run(handled_caller())
+
+
+@pytest.mark.parametrize("phase", ["recovery", "admission_close"])
+def test_new_cancellation_overrides_prior_rollback_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    """A caller cancellation during recovery or release overrides an earlier ordinary failure."""
+    _, serving, admission, _, _ = asyncio.run(drive_cycle(tmp_path))
+    registry = AdapterRegistry(tmp_path / "registry.json", config().scope)
+    before = registry.read()
+    original_load = serving.load_revision
+    original_wake = serving.wake
+    attempted = False
+    admission.closed = False
+
+    async def run() -> None:
+        """Cancel only after the rollback has failed and entered its cleanup phase."""
+        entered = asyncio.Event()
+
+        async def fail_once(revision: ServingRevision) -> None:
+            """Fail the attempted rollback before allowing durable-revision recovery."""
+            nonlocal attempted
+            if not attempted:
+                attempted = True
+                raise ValueError("fixture rollback load failed")
+            await original_load(revision)
+
+        async def recovery_wake() -> None:
+            """Expose a pending recovery after the original ordinary rollback failure."""
+            if attempted and phase == "recovery":
+                entered.set()
+                await asyncio.Future()
+            await original_wake()
+
+        async def close() -> None:
+            """Allow new release cancellation or test preservation over a later close error."""
+            admission.closed = True
+            if phase == "admission_close":
+                entered.set()
+                await asyncio.Future()
+            raise OSError("fixture admission close failed")
+
+        monkeypatch.setattr(serving, "load_revision", fail_once)
+        monkeypatch.setattr(serving, "wake", recovery_wake)
+        monkeypatch.setattr(admission, "close", close)
+        task = asyncio.create_task(
+            rollback(directory=tmp_path, config=config(), serving=serving, admission=admission)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        task.cancel("new caller cancellation")
+        with pytest.raises(asyncio.CancelledError, match="new caller cancellation"):
+            await task
+
+    asyncio.run(run())
+    assert registry.read() == before
+    assert admission.closed
+    assert admission.paused == (phase == "recovery")
 
 
 def test_rejection_resumes_active_revision_and_preserves_checkpoint(tmp_path: Path) -> None:
@@ -657,8 +814,9 @@ def test_initial_drain_failure_is_recorded_without_touching_private_inference(
     assert not serving.sampled and environment.opened == 0
 
 
+@pytest.mark.parametrize("failure", [None, "backend_close", "recovery", "admission_close"])
 def test_training_cancellation_closes_backend_before_active_serving_restoration(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None
 ) -> None:
     """A task cancelled during training closes its session before reopening public traffic."""
 
@@ -671,6 +829,7 @@ def test_training_cancellation_closes_backend_before_active_serving_restoration(
         environment = LookupEnvironment()
         evaluator = EnvironmentEvaluator(environment, ExactAnswerScorer())
         backends: list[ReceiptBackend] = []
+        cancellations: list[asyncio.CancelledError] = []
 
         class WaitingSession(ReceiptSession):
             """Represent owned compute waiting for completion."""
@@ -678,8 +837,18 @@ def test_training_cancellation_closes_backend_before_active_serving_restoration(
             async def train(self, batch: TrainingBatch) -> TrainingResult:
                 """Remain in flight until the caller cancels the cycle."""
                 entered.set()
-                await asyncio.Future()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError as error:
+                    cancellations.append(error)
+                    raise
                 raise AssertionError("unreachable")
+
+            async def close(self) -> None:
+                """Make uncertain backend cleanup observable without releasing compute."""
+                if failure == "backend_close":
+                    raise OSError("fixture backend close failed")
+                await super().close()
 
         class WaitingBackend(ReceiptBackend):
             """Expose a cancellable training operation with observable cleanup."""
@@ -712,11 +881,39 @@ def test_training_cancellation_closes_backend_before_active_serving_restoration(
             )
         )
         await asyncio.wait_for(entered.wait(), timeout=1)
+
+        async def failed_recovery() -> None:
+            """Fail before inference can safely resume after cancellation."""
+            raise OSError("fixture recovery failed")
+
+        async def failed_admission_close() -> None:
+            """Fail final admission release after the active serving revision is restored."""
+            admission.closed = True
+            raise OSError("fixture admission close failed")
+
+        if failure == "recovery":
+            monkeypatch.setattr(serving, "wake", failed_recovery)
+        elif failure == "admission_close":
+            monkeypatch.setattr(admission, "close", failed_admission_close)
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError) as raised:
             await task
-        assert backends[0].closed and not serving.asleep and not admission.paused
+        assert raised.value is cancellations[0]
+        assert backends[0].closed == (failure != "backend_close")
+        restored = failure not in {"backend_close", "recovery"}
+        assert serving.asleep != restored
+        assert admission.paused != restored
+        assert admission.closed
         assert serving.loaded == base_revision(settings)
+        state = CycleState.model_validate_json(
+            next((tmp_path / "cycles").glob("*/state.json")).read_bytes()
+        )
+        assert state.failure_type == "CancelledError"
+        assert state.serving_restored == restored
+        if failure == "backend_close":
+            assert state.cleanup_failure_type == "OSError"
+        if failure == "recovery":
+            assert state.recovery_failure_type == "OSError"
 
     asyncio.run(exercise())
 

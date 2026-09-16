@@ -22,8 +22,8 @@ from exp.optimize.claas.evaluation.paired import (
 from exp.optimize.claas.evaluation.paired import (
     PolicyTaskEvaluation as CoreOutcome,
 )
-from exp.optimize.claas.lifecycle.rollouts import run_owned
 from exp.optimize.workflows.traffic_learning import evaluation as traffic
+from exp.optimize.workflows.traffic_learning.calls import run_owned
 from exp.simulation.claas.contracts import ClaasScenario
 from exp.simulation.claas.harness import ClaasWorldModel, ClaasWorldSession
 from exp.simulation.claas.provider import ClaasBoundedProvider
