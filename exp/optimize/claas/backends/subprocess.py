@@ -8,7 +8,7 @@ import re
 import tempfile
 from pathlib import Path
 
-from exp.optimize.claas.backends.checkpoints import verify_checkpoint
+from exp.optimize.claas.backends.checkpoints import verify_checkpoint, verify_training_result
 from exp.optimize.claas.training_contracts import (
     ClaasTrainingError,
     ClaasTrainingSpec,
@@ -17,7 +17,6 @@ from exp.optimize.claas.training_contracts import (
     TrainingJob,
     TrainingResult,
     TrainingSession,
-    next_policy_revision,
 )
 
 
@@ -41,6 +40,7 @@ class SubprocessVerlBackend:
         checkpoint_root: Path,
         cuda_visible_device: str,
         timeout_seconds: float = 1800,
+        model_access_token: str | None = None,
     ) -> None:
         """Bind exact runtime, durable storage, one device, and finite job timeout."""
         if not python_executable.is_absolute() or not python_executable.is_file():
@@ -55,6 +55,7 @@ class SubprocessVerlBackend:
         self._root = checkpoint_root
         self._device = cuda_visible_device
         self._timeout = timeout_seconds
+        self._model_access_token = model_access_token
 
     async def open(
         self, spec: ClaasTrainingSpec, resume: TrainingCheckpoint | None = None
@@ -110,10 +111,9 @@ class _SubprocessSession:
                 job_path, result_path = root / "job.json", root / "result.json"
                 job_path.write_text(job.model_dump_json())
                 job_path.chmod(0o600)
-                environment = dict(os.environ)
-                environment["CUDA_VISIBLE_DEVICES"] = self._backend._device
-                environment["VERL_USE_EXTERNAL_PLUGINS"] = "none"
-                environment.pop("VERL_USE_EXTERNAL_MODULES", None)
+                environment = _worker_environment(
+                    self._backend._device, self._backend._model_access_token
+                )
                 with (root / "worker.log").open("wb") as output:
                     process = await asyncio.create_subprocess_exec(
                         str(self._backend._python),
@@ -156,18 +156,13 @@ class _SubprocessSession:
                 self._process = None
                 try:
                     result = TrainingResult.model_validate_json(result_path.read_text())
-                    expected_ids = tuple(item.experience.experience_id for item in batch.examples)
                     if (
-                        result.checkpoint.policy_revision != next_policy_revision(job)
-                        or result.consumed_experience_ids != expected_ids
-                        or result.checkpoint.step
-                        != (self._checkpoint.step if self._checkpoint else 0) + 1
-                        or not Path(result.checkpoint.path)
+                        not Path(result.checkpoint.path)
                         .resolve()
                         .is_relative_to(self._backend._root.resolve())
                     ):
                         raise ValueError("worker receipt does not match the submitted batch")
-                    verify_checkpoint(result.checkpoint, self._spec)
+                    verify_training_result(job, result)
                 except (OSError, ValueError):
                     self._failed = True
                     raise
@@ -203,3 +198,36 @@ def _worker_diagnostic(path: Path) -> str:
         handle.seek(0, os.SEEK_END)
         handle.seek(max(0, handle.tell() - 8192))
         return handle.read(8192).decode("utf-8", errors="replace")
+
+
+def _worker_environment(device: str, model_access_token: str | None) -> dict[str, str]:
+    """Forward runtime settings and only an explicitly supplied model credential."""
+    allowed = {
+        "PATH",
+        "HOME",
+        "SYSTEMROOT",
+        "WINDIR",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "LC_ALL",
+        "HF_HOME",
+        "HF_HUB_CACHE",
+        "HF_HUB_OFFLINE",
+        "TRANSFORMERS_OFFLINE",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "TOKENIZERS_PARALLELISM",
+    }
+    environment = {name: value for name, value in os.environ.items() if name in allowed}
+    environment.update(
+        {
+            "CUDA_VISIBLE_DEVICES": device,
+            "VERL_USE_EXTERNAL_PLUGINS": "none",
+            "HF_HUB_DISABLE_IMPLICIT_TOKEN": "1",
+        }
+    )
+    if model_access_token is not None:
+        environment["HF_TOKEN"] = model_access_token
+    return environment

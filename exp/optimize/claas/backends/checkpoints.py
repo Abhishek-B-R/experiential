@@ -12,7 +12,13 @@ from pathlib import Path, PurePosixPath
 from pydantic import Field
 
 from exp.common.core.artifacts import ContractModel, Sha256, sha256_json
-from exp.optimize.claas.training_contracts import ClaasTrainingSpec, TrainingCheckpoint
+from exp.optimize.claas.training_contracts import (
+    ClaasTrainingSpec,
+    TrainingCheckpoint,
+    TrainingJob,
+    TrainingResult,
+    next_policy_revision,
+)
 
 
 class CheckpointManifest(ContractModel):
@@ -114,3 +120,28 @@ def checkpoint_snapshot(
         staged = checkpoint.model_copy(update={"path": str(root)})
         verify_checkpoint(staged, spec)
         yield staged
+
+
+def verify_training_result(job: TrainingJob, result: TrainingResult) -> CheckpointManifest:
+    """Bind a complete checkpoint's manifest and receipt to the exact submitted update."""
+    manifest = verify_checkpoint(result.checkpoint, job.spec)
+    expected_ids = tuple(item.experience.experience_id for item in job.batch.examples)
+    expected_revision = next_policy_revision(job)
+    prior_history = (
+        job.resume_checkpoint.policy_history
+        if job.resume_checkpoint
+        else (job.spec.initial_policy_revision,)
+    )
+    expected_history = (expected_revision, *prior_history)[: job.spec.max_policy_lag + 1]
+    if (
+        result.checkpoint.policy_revision != expected_revision
+        or result.checkpoint.step
+        != (job.resume_checkpoint.step if job.resume_checkpoint else 0) + 1
+        or result.consumed_experience_ids != expected_ids
+        or manifest.consumed_experience_ids != expected_ids
+        or manifest.batch_id != job.batch.batch_id
+        or manifest.parent_policy_revision != job.batch.expected_policy_revision
+        or manifest.policy_history != expected_history
+    ):
+        raise ValueError("checkpoint manifest and worker receipt do not match the submitted update")
+    return manifest

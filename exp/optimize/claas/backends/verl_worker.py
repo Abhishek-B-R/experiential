@@ -44,6 +44,7 @@ from exp.optimize.claas.backends.checkpoints import (
     checkpoint_snapshot,
     hash_file,
     verify_checkpoint,
+    verify_training_result,
 )
 from exp.optimize.claas.training_contracts import (
     ClaasTrainingError,
@@ -97,7 +98,10 @@ def execute_training_job(job: TrainingJob) -> TrainingResult:
         verify_checkpoint(job.resume_checkpoint, job.spec)
     torch.manual_seed(job.spec.seed)
     tokenizer = AutoTokenizer.from_pretrained(
-        job.spec.tokenizer_id, revision=job.spec.tokenizer_revision, trust_remote_code=False
+        job.spec.tokenizer_id,
+        revision=job.spec.tokenizer_revision,
+        trust_remote_code=False,
+        token=os.environ.get("HF_TOKEN"),
     )
     if not isinstance(tokenizer, PreTrainedTokenizerBase):
         raise ValueError("model tokenizer must implement the Hugging Face text tokenizer contract")
@@ -105,6 +109,7 @@ def execute_training_job(job: TrainingJob) -> TrainingResult:
         job.spec.base_model,
         revision=job.spec.model_revision,
         trust_remote_code=False,
+        token=os.environ.get("HF_TOKEN"),
         dtype=torch.bfloat16,
         attn_implementation="eager",
     )
@@ -381,11 +386,13 @@ def _save_result(
         manifest_sha256=sha256_json(manifest),
     )
     verify_checkpoint(checkpoint, job.spec)
-    return TrainingResult(
+    result = TrainingResult(
         checkpoint=checkpoint,
         metrics=metrics,
         consumed_experience_ids=manifest.consumed_experience_ids,
     )
+    verify_training_result(job, result)
+    return result
 
 
 def main() -> None:
