@@ -20,7 +20,7 @@ from exp.optimize.claas.backends.checkpoints import (
     verify_checkpoint,
     verify_training_result,
 )
-from exp.optimize.claas.backends.modal_configuration import ModalExecutionConfig
+from exp.optimize.claas.backends.modal.configuration import ModalExecutionConfig
 from exp.optimize.claas.training_contracts import (
     ClaasTrainingError,
     ClaasTrainingSpec,

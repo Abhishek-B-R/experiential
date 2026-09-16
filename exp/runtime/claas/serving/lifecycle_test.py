@@ -11,10 +11,10 @@ from pydantic import TypeAdapter
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage
-from exp.runtime.claas.decoding import TextCompletionDecoder
-from exp.runtime.claas.lifecycle import ServingPausedError, VllmServingLifecycle
-from exp.runtime.claas.vllm import serving_model_name
-from exp.runtime.claas.vllm_test import revision
+from exp.runtime.claas.serving.decoding import TextCompletionDecoder
+from exp.runtime.claas.serving.lifecycle import ServingPausedError, VllmServingLifecycle
+from exp.runtime.claas.serving.vllm import serving_model_name
+from exp.runtime.claas.serving.vllm_test import revision
 
 _JSON = TypeAdapter(JsonObject)
 

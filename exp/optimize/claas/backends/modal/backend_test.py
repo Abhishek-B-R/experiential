@@ -14,12 +14,12 @@ import pytest
 from exp.common.core.artifacts import sha256_json
 from exp.optimize.claas.backends.checkpoints import CheckpointManifest, verify_checkpoint
 from exp.optimize.claas.backends.checkpoints_test import checkpoint
-from exp.optimize.claas.backends.modal import (
+from exp.optimize.claas.backends.modal.backend import (
     REMOTE_ROOT,
     ModalVerlBackend,
     _download_checkpoint,
 )
-from exp.optimize.claas.backends.modal_configuration import ModalExecutionConfig
+from exp.optimize.claas.backends.modal.configuration import ModalExecutionConfig
 from exp.optimize.claas.training_contracts import (
     ClaasTrainingError,
     TrainingJob,

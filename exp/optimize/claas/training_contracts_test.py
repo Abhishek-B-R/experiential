@@ -12,6 +12,7 @@ from exp.optimize.claas.training_contracts import (
     TrainingExample,
     TrainingJob,
     next_policy_revision,
+    validate_training_batch,
 )
 
 
@@ -146,8 +147,8 @@ def test_revision_binds_scope_recipe_and_exact_action(tmp_path: Path) -> None:
 
 def test_bounded_replay_accepts_only_verified_recent_ancestors(tmp_path: Path) -> None:
     """A saved behavior policy can be reused only within the proven revision window."""
+    # checkpoints_test imports job/spec fixtures from this module, so defer this edge.
     from exp.optimize.claas.backends.checkpoints_test import checkpoint
-    from exp.optimize.claas.training_contracts import validate_training_batch
 
     receipt = checkpoint(tmp_path)
     replay = TrainingBatch(

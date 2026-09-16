@@ -1,7 +1,7 @@
 """Launch configuration binds identity and removes probability-changing defaults."""
 
-from exp.runtime.claas.vllm_server import VllmServerConfig
-from exp.runtime.claas.vllm_test import revision
+from exp.runtime.claas.serving.configuration import VllmServerConfig
+from exp.runtime.claas.serving.vllm_test import revision
 
 
 def test_exact_server_configuration_pins_both_revisions() -> None:

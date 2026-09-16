@@ -12,8 +12,8 @@ from pathlib import Path
 
 import modal
 
-from exp.optimize.claas.backends.modal import REMOTE_ROOT
-from exp.optimize.claas.backends.modal_configuration import ModalExecutionConfig
+from exp.optimize.claas.backends.modal.backend import REMOTE_ROOT
+from exp.optimize.claas.backends.modal.configuration import ModalExecutionConfig
 from exp.optimize.claas.backends.subprocess import SubprocessVerlBackend
 from exp.optimize.claas.training_contracts import TrainingJob
 

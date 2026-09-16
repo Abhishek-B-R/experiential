@@ -9,10 +9,10 @@ from unittest.mock import AsyncMock, MagicMock
 import modal
 import pytest
 
-from exp.optimize.claas.backends import modal_app
-from exp.optimize.claas.backends.modal import REMOTE_ROOT
-from exp.optimize.claas.backends.modal_app import create_modal_app
-from exp.optimize.claas.backends.modal_test import config
+from exp.optimize.claas.backends.modal import app as modal_app
+from exp.optimize.claas.backends.modal.app import create_modal_app
+from exp.optimize.claas.backends.modal.backend import REMOTE_ROOT
+from exp.optimize.claas.backends.modal.backend_test import config
 from exp.optimize.claas.backends.subprocess import SubprocessVerlBackend
 from exp.optimize.claas.training_contracts import (
     ClaasTrainingSpec,
@@ -32,7 +32,7 @@ def test_app_definition_requires_no_cloud_or_gpu_runtime() -> None:
 def test_optional_adapter_does_not_import_training_stack() -> None:
     """Importing the explicit execution adapter does not eagerly load model libraries."""
     source = (
-        "import sys; import exp.optimize.claas.backends.modal_app; "
+        "import sys; import exp.optimize.claas.backends.modal.app; "
         "assert not {'torch', 'ray', 'verl', 'peft'} & set(sys.modules)"
     )
     result = subprocess.run([sys.executable, "-c", source], capture_output=True, timeout=20)

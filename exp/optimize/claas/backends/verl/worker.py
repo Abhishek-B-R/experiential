@@ -41,10 +41,10 @@ from exp.optimize.claas.backends.checkpoints import (
     checkpoint_snapshot,
     verify_checkpoint,
 )
-from exp.optimize.claas.backends.verl_engine import ENGINE_MODEL_TYPE
-from exp.optimize.claas.backends.verl_inputs import build_engine_batch
-from exp.optimize.claas.backends.verl_objective import FeedbackLoss
-from exp.optimize.claas.backends.verl_state import publish_checkpoint, update_teacher
+from exp.optimize.claas.backends.verl.engine import ENGINE_MODEL_TYPE
+from exp.optimize.claas.backends.verl.inputs import build_engine_batch
+from exp.optimize.claas.backends.verl.objective import FeedbackLoss
+from exp.optimize.claas.backends.verl.state import publish_checkpoint, update_teacher
 from exp.optimize.claas.training_contracts import (
     ClaasTrainingError,
     TrainingJob,

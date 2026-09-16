@@ -7,9 +7,9 @@ import torch
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from verl.workers.config import FSDPEngineConfig
 
-from exp.optimize.claas.backends.verl_engine import ClaasFeedbackEngine
-from exp.optimize.claas.backends.verl_inputs import build_engine_batch
-from exp.optimize.claas.backends.verl_worker_test import tokenizer
+from exp.optimize.claas.backends.verl.engine import ClaasFeedbackEngine
+from exp.optimize.claas.backends.verl.inputs import build_engine_batch
+from exp.optimize.claas.backends.verl.worker_test import tokenizer
 from exp.optimize.claas.training_contracts_test import job
 
 
