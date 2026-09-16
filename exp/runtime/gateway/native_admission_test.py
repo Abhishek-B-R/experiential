@@ -1366,6 +1366,71 @@ def test_an_open_strict_schema_is_closed_for_the_anthropic_rung_with_disclosure(
     assert accounting.recorded == 1
 
 
+def test_a_rung_whose_window_cannot_hold_prompt_plus_budget_is_skipped_with_its_wire() -> None:
+    """Narrowing runs first and keeps route and wires aligned: the small rung is gone from both."""
+    deployments = (
+        _deployment("shim", gateway=_TOOL_CAPABLE).model_copy(
+            update={"capabilities": ModelCapabilities(context_window_tokens=1_000)}
+        ),
+        _deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE).model_copy(
+            update={"capabilities": ModelCapabilities(context_window_tokens=2_000)}
+        ),
+    )
+    route = _mixed_route("maximize_availability", deployments)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="x" * (600 * MAXIMUM_BYTES_PER_TOKEN)),),
+        maximum_output_tokens=500,
+        maximum_output_tokens_parameter="max_tokens",
+    )
+    wires = _wires()
+    narrowed, wires_out, _public, _provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert narrowed.snapshot.deployment_ids == ("native",)
+    assert narrowed.deployment.deployment_id == "native"
+    assert wires_out == wires[1:]
+
+
+def test_the_shaped_output_budget_is_checked_against_each_rungs_window() -> None:
+    """Anthropic requires max_tokens: the route-wide 4,096 default the shaping adds must fit.
+
+    The caller sent no max_tokens, so the decoded request reserves nothing and
+    both rungs pass the first check; the shaped provider request carries the
+    Anthropic default (4,096), which the 1,000-token rung cannot hold beside a
+    600-token prompt, so it is skipped on the second pass and only the
+    8,000-token rung dispatches.
+    """
+    deployments = (
+        _deployment("shim", gateway=_TOOL_CAPABLE).model_copy(
+            update={"capabilities": ModelCapabilities(context_window_tokens=1_000)}
+        ),
+        _deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE).model_copy(
+            update={"capabilities": ModelCapabilities(context_window_tokens=8_000)}
+        ),
+    )
+    route = _mixed_route("maximize_availability", deployments)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="x" * (600 * MAXIMUM_BYTES_PER_TOKEN)),),
+    )
+    wires = _wires()
+    narrowed, wires_out, _public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert provider.maximum_output_tokens == 4_096
+    assert narrowed.snapshot.deployment_ids == ("native",)
+    assert wires_out == wires[1:]
+
+
 def test_a_prompt_certain_to_overflow_the_route_is_refused_before_shaping() -> None:
     """The context-window refusal runs first: no rung shaping, no accounting, exact numbers."""
     deployments = (
