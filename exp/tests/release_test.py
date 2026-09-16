@@ -15,6 +15,7 @@ import tarfile
 import termios
 import time
 import zipfile
+from email.parser import Parser
 from pathlib import Path, PurePosixPath
 from typing import cast
 
@@ -24,16 +25,26 @@ if os.environ.get("EXP_INSTALLED_RELEASE_EVIDENCE") != "1":
     import pytest
 
 BUILT_DIST_ENV = "EXP_BUILT_DIST_DIR"
-FORBIDDEN_REQUIREMENT = re.compile(
-    r"(?mi)^Requires-Dist:\s*(?:anthropic|environment-capture|gepa|mlx-lm|"
-    r"opentelemetry-proto|scikit-learn|transformers)(?:\s|[<>=;~!])"
+FORBIDDEN_REQUIREMENTS = frozenset(
+    {
+        "anthropic",
+        "environment-capture",
+        "gepa",
+        "mlx-lm",
+        "opentelemetry-proto",
+        "scikit-learn",
+        "transformers",
+    }
 )
 REQUIRED_CORE_REQUIREMENTS = frozenset(
     {
         "boto3",
         "botocore",
         "click",
+        "exp-gateway-native",
         "filelock",
+        "google-auth",
+        "google-re2",
         "httpx",
         "numpy",
         "openai",
@@ -75,6 +86,7 @@ REQUIRED_WHEEL_MODULES = frozenset(
 )
 REQUIRED_SDIST_MEMBERS = frozenset(
     {
+        "LICENSE",
         "README.md",
         "assets/experiential-workflow.png",
         "docs/reference/gateway-architecture.md",
@@ -176,16 +188,55 @@ def _sdist_metadata(archive: tarfile.TarFile) -> str:
     return extracted.read().decode("utf-8")
 
 
+def _metadata_requirements(metadata: str) -> tuple[tuple[str, str], ...]:
+    """Return normalized dependency names and markers from metadata headers only.
+
+    Args:
+        metadata: Complete wheel METADATA or sdist PKG-INFO text.
+
+    Returns:
+        Dependency names paired with their environment-marker text.
+    """
+    requirements: list[tuple[str, str]] = []
+    headers = Parser().parsestr(metadata, headersonly=True)
+    for requirement in headers.get_all("Requires-Dist", []):
+        name = re.split(r"[<>=;~!\[\s(]", requirement, maxsplit=1)[0]
+        name = re.sub(r"[-_.]+", "-", name).casefold()
+        marker = requirement.partition(";")[2].strip()
+        requirements.append((name, marker))
+    return tuple(requirements)
+
+
+def _assert_allowed_requirements(metadata: str) -> None:
+    """Reject forbidden dependencies, permitting Anthropic solely in the dev extra.
+
+    Args:
+        metadata: Complete wheel METADATA or sdist PKG-INFO text.
+
+    Raises:
+        AssertionError: A forbidden dependency appears outside the sole dev SDK exception.
+    """
+    for name, marker in _metadata_requirements(metadata):
+        allowed_dev_sdk = name == "anthropic" and re.fullmatch(r"extra\s*==\s*(['\"])dev\1", marker)
+        assert name not in FORBIDDEN_REQUIREMENTS or allowed_dev_sdk, (
+            f"forbidden release requirement: {name}; {marker}"
+        )
+
+
 def _core_requirement_names(metadata: str) -> frozenset[str]:
-    """Return normalized non-extra dependency names from package metadata."""
-    names: set[str] = set()
-    for line in metadata.splitlines():
-        if not line.startswith("Requires-Dist:") or "; extra ==" in line:
-            continue
-        requirement = line.removeprefix("Requires-Dist:").strip()
-        name = re.split(r"[<>=;~!\s]", requirement, maxsplit=1)[0].casefold()
-        names.add(name)
-    return frozenset(names)
+    """Return dependencies unless gated solely by one named extra equality.
+
+    Args:
+        metadata: Complete wheel METADATA or sdist PKG-INFO text.
+
+    Returns:
+        Normalized names, conservatively retaining mixed or runtime-capable markers.
+    """
+    return frozenset(
+        name
+        for name, marker in _metadata_requirements(metadata)
+        if not re.fullmatch(r"extra\s*==\s*(['\"])[A-Za-z0-9][A-Za-z0-9._-]*\1", marker)
+    )
 
 
 def _assert_current_archive_members(
@@ -227,6 +278,7 @@ def _tracked_sdist_members() -> frozenset[str]:
             "git",
             "ls-files",
             ".gitignore",
+            "LICENSE",
             "README.md",
             "assets",
             "docs/reference/gateway-architecture.md",
@@ -3167,6 +3219,65 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
     )
 
 
+def test_release_requirements_allow_anthropic_only_in_the_dev_extra() -> None:
+    """Permit the SDK drift check without admitting Anthropic to installed runtime extras."""
+    for marker in ('extra == "dev"', "extra == 'dev'"):
+        _assert_allowed_requirements(f"Requires-Dist: anthropic<2,>=1.2; {marker}\n\n")
+    for marker in (
+        "",
+        'extra == "sft"',
+        'extra == "dev" or extra == "sft"',
+        'extra == "dev" or python_version >= "3.12"',
+        'extra != "dev"',
+    ):
+        metadata = f"Requires-Dist: anthropic<2,>=1.2{'; ' + marker if marker else ''}\n\n"
+        with pytest.raises(AssertionError, match="forbidden release requirement: anthropic"):
+            _assert_allowed_requirements(metadata)
+
+
+def test_release_requirements_keep_other_forbidden_dependencies_out_of_extras() -> None:
+    """The dev SDK exception never admits other removed dependencies or spelling aliases."""
+    for name in FORBIDDEN_REQUIREMENTS - {"anthropic"}:
+        for spelling in (name, name.replace("-", "_").upper()):
+            for marker in ("", '; extra == "dev"', '; extra == "sft"'):
+                metadata = f"Requires-Dist: {spelling}>=1{marker}\n\n"
+                with pytest.raises(AssertionError, match="forbidden release requirement"):
+                    _assert_allowed_requirements(metadata)
+
+
+def test_release_requirement_headers_ignore_description_body() -> None:
+    """Folded headers count as dependencies while README text never changes the contract."""
+    metadata = (
+        "Metadata-Version: 2.5\n"
+        "Requires-Dist: google_auth>=2\n"
+        'Requires-Dist: click>=8; python_version >= "3.12"\n'
+        "Requires-Dist: anthropic<2,>=1.2;\n"
+        ' extra == "dev"\n'
+        "\nRequires-Dist: transformers>=4\n"
+        "Requires-Dist: imaginary-core-package>=1\n"
+    )
+    _assert_allowed_requirements(metadata)
+    assert _core_requirement_names(metadata) == {"google-auth", "click"}
+
+
+def test_release_core_requirements_retain_runtime_capable_extra_markers() -> None:
+    """Runtime-active OR and empty-extra markers cannot hide a new core dependency."""
+    core_headers = "\n".join(f"Requires-Dist: {name}" for name in REQUIRED_CORE_REQUIREMENTS)
+    for marker in (
+        'extra == "dev" or python_version >= "3.12"',
+        'python_version >= "3.12" or extra == "dev"',
+        'extra == ""',
+        'extra != "dev"',
+    ):
+        metadata = f"{core_headers}\nRequires-Dist: unexpected-runtime-package; {marker}\n\n"
+        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS | {
+            "unexpected-runtime-package"
+        }
+    for marker in ('extra == "dev"', "extra == 'sft'"):
+        metadata = f"{core_headers}\nRequires-Dist: optional-package; {marker}\n\n"
+        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
+
+
 def test_built_archives_match_current_package_contract() -> None:
     """Prove fresh wheel and sdist match the current package contract.
 
@@ -3199,7 +3310,7 @@ def test_built_archives_match_current_package_contract() -> None:
             if not name.startswith("exp/") and ".dist-info/" not in name
         )
         assert not outside_package, f"wheel carries members outside the package: {outside_package}"
-        assert FORBIDDEN_REQUIREMENT.search(metadata) is None
+        _assert_allowed_requirements(metadata)
         assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
 
     with tarfile.open(sdists[0], mode="r:gz") as sdist:
@@ -3211,7 +3322,7 @@ def test_built_archives_match_current_package_contract() -> None:
         assert frozenset(name for name in names if name and not name.endswith("/")) == (
             _tracked_sdist_members() | {"PKG-INFO"}
         )
-        assert FORBIDDEN_REQUIREMENT.search(metadata) is None
+        _assert_allowed_requirements(metadata)
         assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
 
 
