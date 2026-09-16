@@ -1,0 +1,166 @@
+"""No-spend Modal authorization, durable checkpoint transfer, and lifecycle tests."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import cast
+
+import modal
+import pytest
+
+from exp.common.core.artifacts import sha256_json
+from exp.optimize.claas.backends.checkpoints import verify_checkpoint
+from exp.optimize.claas.backends.checkpoints_test import checkpoint
+from exp.optimize.claas.backends.modal import (
+    REMOTE_ROOT,
+    ModalExecutionConfig,
+    ModalVerlBackend,
+    _download_checkpoint,
+)
+from exp.optimize.claas.training_contracts import ClaasTrainingError, TrainingJob, TrainingResult
+from exp.optimize.claas.training_contracts_test import job, spec
+
+
+def config() -> ModalExecutionConfig:
+    """Return one explicit 12-cent fixture authorization, with no live rate claim."""
+    return ModalExecutionConfig(
+        app_name="fixture",
+        volume_name="existing-fixture",
+        gpu="A10G",
+        timeout_seconds=60,
+        startup_timeout_seconds=60,
+        maximum_container_rate_usd_per_second=0.001,
+        authorized_maximum_cost_usd=0.12,
+    )
+
+
+class _FileReader:
+    """An SDK-shaped bounded byte source backed by inert local fixture files."""
+
+    def __init__(self, root: Path) -> None:
+        """Bind the remote fixture checkpoint directory."""
+        self.root = root
+
+    async def aio(self, path: str) -> AsyncIterator[bytes]:
+        """Yield chunks from the requested manifest-listed relative file."""
+        relative = Path(*Path(path).parts[2:])
+        content = (self.root / relative).read_bytes()
+        yield content[:10]
+        yield content[10:]
+
+
+class _Volume:
+    """Expose the SDK read_file method without contacting Modal."""
+
+    def __init__(self, root: Path) -> None:
+        """Bind local test payloads."""
+        self.read_file = _FileReader(root)
+
+
+def test_download_verifies_manifest_and_preserves_immutable_scope(tmp_path: Path) -> None:
+    """A remote receipt becomes local activation evidence only after every digest passes."""
+    source = tmp_path / "remote"
+    receipt = checkpoint(source)
+    scope_id = sha256_json(
+        {"scope": spec().scope.model_dump(mode="json"), "adapter_id": spec().adapter_id}
+    )
+    remote = receipt.model_copy(
+        update={"path": f"{REMOTE_ROOT}/{scope_id}/{receipt.policy_revision}"}
+    )
+
+    async def run() -> None:
+        """Transfer a complete inert checkpoint then detect changed source bytes."""
+        local = await _download_checkpoint(
+            cast(modal.Volume, _Volume(source)), remote, spec(), tmp_path / "local", 1_000_000
+        )
+        assert verify_checkpoint(local, spec()).step == 1
+        assert Path(local.path).is_dir()
+        assert local.path.startswith(str(tmp_path / "local" / scope_id))
+        (source / "optimizer.pt").write_bytes(b"corrupt")
+        with pytest.raises(ValueError, match="missing or changed"):
+            await _download_checkpoint(
+                cast(modal.Volume, _Volume(source)), remote, spec(), tmp_path / "second", 1_000_000
+            )
+        assert not (tmp_path / "second" / scope_id / receipt.policy_revision).exists()
+        with pytest.raises(ValueError, match="byte ceiling"):
+            await _download_checkpoint(
+                cast(modal.Volume, _Volume(source)), remote, spec(), tmp_path / "limited", 1
+            )
+
+    asyncio.run(run())
+
+
+def test_cost_gate_rejects_before_backend_construction() -> None:
+    """An underfunded budget and multi-GPU selection fail before any cloud SDK call."""
+    assert config().estimated_maximum_cost_usd == 0.12
+    with pytest.raises(ValueError, match="exceeds authorization"):
+        ModalExecutionConfig.model_validate(
+            config().model_dump() | {"authorized_maximum_cost_usd": 0.01}
+        )
+    with pytest.raises(ValueError):
+        ModalExecutionConfig.model_validate(config().model_dump() | {"gpu": "H100:8"})
+
+
+def test_one_authorization_never_silently_retries(tmp_path: Path) -> None:
+    """An uncertain remote update consumes its reservation and cannot be retried in place."""
+
+    class FailingBackend(ModalVerlBackend):
+        """Simulate uncertainty after the cloud boundary without allocating compute."""
+
+        calls = 0
+
+        async def execute(self, job: TrainingJob) -> TrainingResult:
+            """Record the dispatch and fail before a verifiable receipt arrives."""
+            self.calls += 1
+            raise ClaasTrainingError("uncertain remote completion")
+
+    async def run() -> None:
+        """Validate before dispatch, consume once, and close without retries."""
+        backend = FailingBackend(config=config(), checkpoint_root=tmp_path)
+        session = await backend.open(spec())
+        assert backend.calls == 0
+        bad = job(tmp_path).batch.model_copy(update={"expected_policy_revision": "foreign"})
+        with pytest.raises(ValueError, match="stale"):
+            await session.train(bad)
+        assert backend.calls == 0
+        with pytest.raises(ClaasTrainingError, match="uncertain"):
+            await session.train(job(tmp_path).batch)
+        with pytest.raises(ClaasTrainingError, match="consumed"):
+            await session.train(job(tmp_path).batch)
+        assert backend.calls == 1
+        await session.close()
+
+    asyncio.run(run())
+
+
+def test_close_waits_for_execution_cancellation(tmp_path: Path) -> None:
+    """Concurrent close cannot leave a locally tracked dispatch task running."""
+
+    async def run() -> None:
+        """Hold execution until close cancels it and confirm cleanup ran."""
+        entered, cleanup = asyncio.Event(), asyncio.Event()
+
+        class BlockingBackend(ModalVerlBackend):
+            """Simulate a remote task whose cancellation performs cleanup."""
+
+            async def execute(self, job: TrainingJob) -> TrainingResult:
+                """Wait until cancellation then acknowledge local cleanup."""
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cleanup.set()
+                raise AssertionError("unreachable")
+
+        backend = BlockingBackend(config=config(), checkpoint_root=tmp_path)
+        session = await backend.open(spec())
+        training = asyncio.create_task(session.train(job(tmp_path).batch))
+        await entered.wait()
+        await session.close()
+        assert cleanup.is_set()
+        with pytest.raises(asyncio.CancelledError):
+            await training
+
+    asyncio.run(run())
