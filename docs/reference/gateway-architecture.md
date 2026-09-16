@@ -33,6 +33,9 @@ It serves:
   `supports_image_generation` on an OpenAI-wire connection, billed on the provider's reported
   prompt and image tokens, so a model that answers without token usage is refused as
   unbillable rather than served for free)
+- `POST /v1/systemone` (TypeSafe native decisions: typed `noul`, `choice`, and `score`
+  questions, buffered answers, provider-reported usage, and explicit decision capability and
+  pricing admission; no chat, streaming, continuation, or idempotency replay)
 - `GET /health/live` and `GET /health/ready`
 - `GET /usage` and `GET /usage.json`
 
@@ -40,13 +43,10 @@ It serves:
 this same gateway application. It does not create a router HTTP server. Gateway startup and readiness
 perform no provider request. Only an authorized model request may cross the provider boundary.
 
-Tool-call identifiers on Chat Completions and Responses are opaque strings of 1 to
-65,536 characters. Replay the complete returned identifier in both the assistant call
-and its tool result, including any signature suffix. The gateway preserves the identifier
-verbatim on OpenAI-compatible Chat routes; it does not decode or strip provider signatures.
-Output guardrail byte limits count the complete serialized completion, including
-tool IDs, tool names, arguments, and JSON framing.
-Provider-specific wire restrictions still apply when routing to a different API dialect.
+Chat Completions and Responses tool-call IDs are opaque strings of 1 to 65,536 characters.
+Replay each complete ID, including any signature suffix, in both the assistant call and tool result.
+OpenAI-compatible Chat routes preserve IDs verbatim; other API dialects may restrict their wire shape.
+Output guardrail byte limits count the full serialized completion, including tool IDs, names, arguments, and JSON framing.
 
 Streamed function-call arguments must assemble to one JSON object. On OpenAI-compatible
 Chat streams the gateway stops relaying argument deltas at the byte that closes that object:
@@ -91,36 +91,37 @@ relay that already declared its finish settles by that finish, and every other w
 
 ## The data plane
 
-The gateway has exactly one data plane: a native Rust HTTP server compiled as
-a PyO3 extension (`exp_gateway_native`). Every launch path serves through it,
-and a missing compiled extension fails the launch with the exact build
-command rather than falling back.
+The gateway has one data plane: the native Rust HTTP server in the PyO3 extension
+`exp_gateway_native`. Every launch uses it; a missing extension fails with its build command,
+never a Python fallback. Sockets, upstream dispatch, normalization, and SSE encoding run off the
+GIL. JSON-string callbacks authenticate and admit requests, reserve each physical dispatch through
+`start_attempt`, and settle outcomes. `enforce_output` runs only when admission sets
+`output_guardrail`; unguarded and non-chat decision requests do not call it.
+Python owns surface-specific decoding, authority, exact deployment identity, payload construction,
+and durable SQLite transactions over hot-reloadable authority generations. Chat uses `decode_chat`
+and the `streaming_requests` builders; decisions use `decode_decision_request` and their typed body.
+Wire facts come from each resolved client's `gateway_wire_profile()`. The dialects are
+`openai_responses`, `anthropic_messages`, `openai_compatible` (including Azure and OpenRouter),
+`gemini_generate_content`, `bedrock_converse_stream`, and decision-only `typesafe_systemone`.
+Bedrock uses AWS binary event streams, not SSE. Admission freezes the Converse body; after its
+bounded dispatch permit, the data plane obtains SigV4 headers through Python's `sign_dispatch`
+callback immediately before POSTing those exact bytes. Signing after queue wait avoids stale
+signatures. The bounded immediate open retry reuses that signature; later retries sign afresh.
 
-The native engine owns the public socket and every serving fast path:
-upstream dispatch, provider stream normalization, the certified deployment
-waterfall, and public SSE encoding run off the GIL, with JSON-string
-callbacks into python per request (authenticate, admit, `start_attempt` per
-physical dispatch, settle, and `enforce_output` only when admission sets
-`output_guardrail`). Unguarded traffic never calls that output callback.
-Everything protocol- and authority-shaped stays in python: admission decodes
-the raw body with `decode_chat`, enforces the deployment-identity invariant,
-builds every deployment's upstream payload with the `streaming_requests`
-builders, and writes durable SQLite transactions over hot-reloadable
-authority generations.
-Provider wire facts come from the public `gateway_wire_profile()` on each
-resolved provider client; native dialects are `openai_responses`,
-`anthropic_messages`, `openai_compatible` (which also covers Azure and
-OpenRouter connections), `gemini_generate_content`, and
-`bedrock_converse_stream`, so every granted provider has a native dialect.
-Bedrock streams the AWS binary event-stream framing rather than SSE, and it
-authenticates with per-request SigV4 signatures: admission freezes the exact
-serialized Converse body, and the data plane signs it python-side through the
-`sign_dispatch` callback (credentials never cross the boundary) after its
-bounded dispatch permit and immediately before the provider POST, then sends
-the frozen bytes verbatim. Signing at dispatch time means queue wait can
-never age a signature toward AWS's short clock window; the engine's immediate
-bounded open retry reuses the result within milliseconds, and any later retry
-is a fresh admission and a fresh signature.
+### Native decisions
+
+`POST /v1/systemone` accepts only `model`, `state`, and named `questions`; see
+[TypeSafe SystemOne decisions](providers.md#typesafe-systemone-decisions) for all three typed
+question and answer shapes. Authentication precedes decoding; authorization and durable acceptance
+precede direct-route resolution. Admission requires `deployment.gateway.capabilities.supports_decisions`
+and the `typesafe_systemone` endpoint, plus a known nonnegative input rate and output rate exactly
+zero. Missing capability, a project target, or unsupported pricing fails closed before dispatch.
+The decoder bounds requests to 32 questions, 64 choice or 10 score criteria, and 262,144 bytes.
+Reservations count repeated state and per-question protocol allowances, not the chat tokenizer.
+They are bounded estimates, never provider-enforced token ceilings. Only reported usage settles.
+Only HTTP 400/401/403/404/422 release a known-rejection hold; 401 may use a certified fallback.
+HTTP 402/429/529, ambiguous transport, and malformed answers are terminal unknown outcomes, holds kept.
+At most eight deployments run once each: no redials, chat, streaming, replay, or chat guardrails.
 
 Multi-deployment certified pools execute natively. Admission returns the full
 ordered route plus the frozen retry-policy facts without starting an attempt;
@@ -143,10 +144,8 @@ deployment resolves to a provider client with a native dialect) and fails
 with the offending aliases named otherwise. Shutdown drains admitted work
 within `--graceful-timeout`.
 
-Identity-scoped guardrails are optional and default-off. Policies are keyed by
-organization and identity. See `docs/reference/gateway-guardrails.md` for
-policy lookup, the internal classifier seam, and the input and output
-enforcement order.
+Conversational guardrails are optional and default-off, keyed by organization and identity.
+See `docs/reference/gateway-guardrails.md` for policy lookup, classifiers, and enforcement order.
 
 ## Authority and management
 
@@ -167,11 +166,10 @@ the user-data credential file and are resolved after a non-empty environment ove
 pepper is mode
 `0600` and is not exported.
 
-Every data-plane request is authenticated and authorized before request decoding, routing,
-continuation lookup, or provider work. Authorization freezes organization, identity, API surface,
-alias revision, target, catalog digest, request digest, optional hashed operation identity, and one
-monotonic deadline. Identity disable, key revocation or expiry, grant removal, and alias revision
-changes fail closed.
+Authentication precedes body decoding; authorization precedes routing and provider work. It freezes
+organization, identity, API surface, alias revision, target, catalog and request digests, optional
+hashed operation identity, and a monotonic deadline. Disabled identities, revoked or expired keys,
+removed grants, and alias revision changes fail closed.
 
 ## Catalog, aliases, and exact-model pools
 
@@ -201,7 +199,7 @@ deployment IDs. Each physical provider dispatch gets its own durable attempt row
 network work. Attempt ordinal counts all physical dispatches; route depth identifies the selected
 deployment position.
 
-Provider execution is always internally streaming. Bounded same-deployment retries and ordered
+Conversational provider execution is internally streaming. Bounded same-deployment retries and ordered
 deployment fallback are allowed only for typed precommit failures. The first outward text, refusal,
 or tool-call semantic event commits the deployment, after which the gateway never switches
 providers. Typed refusal fallback is disabled unless the active alias revision explicitly enables
@@ -322,7 +320,10 @@ A caller `anthropic-beta` header forwards through an exact token allowlist (nota
 `context-1m-2025-08-07`, which activates the provider's 1M context window; without it the
 provider serves 200K); non-allowlisted tokens drop with a per-token
 `anthropic-beta.<token>` disclosure, never a rejection and never a blind forward. On the Responses surface, `client_metadata` and `text.verbosity` forward on native rungs
-and drop with disclosure elsewhere; Codex-native input items (`additional_tools` tool namespaces,
+and drop with disclosure elsewhere. Chat `verbosity` accepts `low`, `medium`, or `high` as the
+same hint: forwarded as `text.verbosity` on native Responses routes and omitted with a
+`verbosity` disclosure on other routes. Invalid values remain named parameter errors.
+Codex-native input items (`additional_tools` tool namespaces,
 `custom_tool_call`/`custom_tool_call_output` freeform history) and non-function top-level tool
 declarations (`custom` freeform-grammar tools, `namespace` tool trees, `web_search`,
 `tool_search`) carry byte-for-byte at their caller positions and require a homogeneous native
@@ -360,8 +361,8 @@ cover the local team, one identity, one alias pool, and each provider deployment
 An exhausted deployment allocation removes only that route from the current certified waterfall.
 If no route can fit the shared team, identity, or total pool allocation, the neutral protocol
 returns HTTP 429 with OpenAI `insufficient_quota` semantics before provider work. Any required
-unknown price makes that route ineligible while a hard limit applies. The input half of every
-reservation is a realistic tokenizer estimate, not a byte bound: the prompt text, tool schemas,
+unknown price makes that route ineligible while a hard limit applies. For conversational requests,
+the input reservation is a tokenizer estimate, not a byte bound: prompt text, tool schemas,
 structured-output schema, and replayed provider carriers are counted once with the o200k BPE,
 inline media reserve documented planning constants instead of their base64 length, and the
 total carries fifteen percent headroom plus per-message and per-tool framing. The same number
@@ -842,24 +843,19 @@ reasoning on is dropped and disclosed as `temperature->dropped(set_reasoning_eff
 than rejected — the model accepts sampling, just not at that effort, so the request serves and the
 caller is told how to keep the value (set `reasoning_effort=none`); a route that never declares the
 control at all (Anthropic constrained `[1,1]` sampling) still hard-rejects it, since there is
-nothing to honor at any effort. `top_k` follows the same honor-or-narrow shape: selection prefers a
-rung that carries it, and a committed route with no supporting rung (an Azure `openai_deployments`
-DeepSeek rung rejects it upstream) drops it with `top_k->dropped(unsupported_by_provider)` rather
-than rejecting, since a rung's default sampling still returns a valid answer. `frequency_penalty`
-and `presence_penalty` are admitted at the ingress and adapted the same way: honored (emitted) where
-every rung supports them (the per-rung `supports_frequency_penalty`/`supports_presence_penalty`
-capability truth), dropped as `frequency_penalty->dropped(unsupported_by_provider)` where a rung does
-not — a soft preference whose absence still returns a valid answer. `top_logprobs` stays rejected
-(not admitted): the gateway response contract does not project logprob arrays yet, so it cannot be
-honored on any rung and silently dropping a probability request is never acceptable — the reject is
-the honest terminal until output normalization emits logprobs. A caller
-`response_format: {type: "json_object"}` is TRANSLATED, not dropped: it is admitted at the Chat
-ingress and rewritten to a permissive non-strict `json_schema` (`{"type":"object"}`, "any JSON
-object") — the serving lanes emit only `json_schema`, so this preserves the caller's JSON intent on
-every rung (dropping it would hand prose to a caller who asked for JSON) — and disclosed as
-`response_format->translated(json_object)`; a non-strict schema is left open (never force-closed to
-`additionalProperties:false`), so its "any object" meaning is not inverted on a schema-closing
-(Anthropic) rung. A caller `service_tier` on the OpenAI-family surfaces forwards verbatim
+nothing to honor at any effort. `top_k` prefers a carrying rung; when no rung supports it,
+admission drops it with `top_k->dropped(unsupported_by_provider)` because defaults still serve.
+`frequency_penalty` and `presence_penalty` follow their per-rung capability truth and otherwise
+drop with `<parameter>->dropped(unsupported_by_provider)`. These are soft preferences.
+`top_logprobs` remains a named rejection until the response contract can project logprob arrays.
+A caller
+`response_format: {type: "json_object"}` requests schema-free JSON output. OpenAI-compatible
+rungs use native JSON mode, Responses rungs use `text.format: {type: "json_object"}`, and
+Gemini uses `responseMimeType: "application/json"` without a schema. Anthropic/Bedrock use a
+best-effort system instruction, disclosed as `response_format->instruction(json_object)`.
+Every wire receives a counted JSON-object instruction; native format fields are retained.
+No empty schema is synthesized. Use `json_schema` when a supported route must enforce a shape.
+A caller `service_tier` on the OpenAI-family surfaces forwards verbatim
 only on rungs dispatching tenant-owned (BYOK) credentials, where the caller pays the provider
 directly; host-funded rungs never emit it (the tier changes provider pricing while the gateway
 bills catalog rates) and a route with no eligible rung drops it with disclosure. Anthropic's own
@@ -990,10 +986,9 @@ subprocess-bound loopback gateway, a real loopback upstream, and the official SD
 scanner checks database, WAL, backups when present, catalog snapshots, stdout, stderr, logs, usage
 responses, and error bodies for raw content and secret canaries.
 
-`exp/runtime/gateway/provider_certification.py` is the dated provider capability matrix. Each cell
-names the official client SDK, public gateway surfaces, provider wire surface, fixture result, and
-credential-gated live status. OpenAI and Anthropic have native fixtures; generic OpenAI-compatible,
-Azure, and OpenRouter share compatible-stream coverage; Gemini and Bedrock have native deterministic
-fixtures. Live provider cells remain explicitly `not_run_requires_credentials` until a separately
-authorized run supplies dated evidence. Deterministic fixtures do not imply hosted-provider
-availability, billing, or account-specific behavior.
+`exp/runtime/gateway/provider_certification.py` is the dated provider matrix, including client,
+gateway surface, wire, fixture result, and live status. Its live cells remain
+`not_run_requires_credentials`; fixtures alone prove no hosted availability or account behavior.
+TypeSafe cells name decisions, not chat: real Rust HTTP plus SQLite tests use a loopback provider.
+A direct TypeSafe API smoke with synthetic input exercised all three question types on 2026-09-16.
+That direct success is not hosted-gateway, deployed-fleet, price-invoice, or reliability certification.

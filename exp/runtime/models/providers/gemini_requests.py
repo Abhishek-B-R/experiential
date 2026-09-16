@@ -13,6 +13,7 @@ from typing import Literal
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
+from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.models.providers.audios import gemini_audio_part
 from exp.runtime.models.providers.base import DEFAULT_MAXIMUM_OUTPUT_TOKENS
 from exp.runtime.models.providers.documents import gemini_document_part
@@ -58,6 +59,7 @@ def gemini_generate_request(
     reasoning_effort: str | None = None,
     stop_sequences: tuple[str, ...] = (),
     response_json_schema: JsonObject | None = None,
+    json_object_output: bool = False,
 ) -> JsonObject:
     """Convert a EXP request into Gemini's native generateContent payload.
 
@@ -74,6 +76,8 @@ def gemini_generate_request(
         reasoning_effort: Catalog-pinned reasoning effort used when the request omits one.
         stop_sequences: Exact stop strings admitted for the selected route.
         response_json_schema: Strict JSON schema admitted for structured output.
+        json_object_output: Whether to request schema-free JSON output
+            (``responseMimeType`` only, no ``responseJsonSchema``).
 
     Returns:
         A native payload for the generateContent and streamGenerateContent
@@ -96,6 +100,8 @@ def gemini_generate_request(
             system_parts.append({"text": message.content})
             continue
         contents.append(_gemini_content(message, tool_names))
+    if json_object_output:
+        system_parts.append({"text": JSON_OBJECT_SYSTEM_INSTRUCTION})
     payload: JsonObject = {"contents": contents}
     if system_parts:
         payload["systemInstruction"] = {"parts": system_parts}
@@ -126,6 +132,8 @@ def gemini_generate_request(
     if response_json_schema is not None:
         generation["responseMimeType"] = "application/json"
         generation["responseJsonSchema"] = response_json_schema
+    elif json_object_output:
+        generation["responseMimeType"] = "application/json"
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
     if supports_reasoning and effective_reasoning_effort is not None:
         generation["thinkingConfig"] = {

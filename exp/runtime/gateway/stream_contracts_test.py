@@ -1,6 +1,7 @@
 """Tests for stream outcome contracts."""
 
 import pytest
+from pydantic import ValidationError
 
 from exp.runtime.gateway.stream_contracts import (
     GatewayEvent,
@@ -37,6 +38,25 @@ def test_gateway_failure_carries_an_optional_bounded_refusal_reason() -> None:
         "data_inspection",
         "unspecified",
     }
+
+
+def test_decision_rejection_evidence_is_strict_and_not_serialized() -> None:
+    """Internal settlement evidence defaults safe and never changes public event identity."""
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.THROTTLED, safe_message="provider rejected the request"
+    )
+    event = GatewayEvent(kind=GatewayEventKind.FAILED, sequence_number=0, failure=failure)
+    rejected = GatewayEvent(
+        kind=GatewayEventKind.FAILED,
+        sequence_number=0,
+        failure=failure,
+        decision_provider_rejected=True,
+    )
+    assert event.decision_provider_rejected is False
+    assert rejected.decision_provider_rejected is True
+    assert event.model_dump_json() == rejected.model_dump_json()
+    with pytest.raises(ValidationError):
+        GatewayEvent.model_validate({**event.model_dump(), "decision_provider_rejected": "true"})
 
 
 @pytest.mark.parametrize("length", [257, 65_536])

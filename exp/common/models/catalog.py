@@ -30,6 +30,8 @@ from exp.common.core.artifacts import (
     validate_artifact_id,
 )
 from exp.common.core.files import write_text_atomic
+from exp.common.models.bedrock_connection import require_bedrock_connection_shape
+from exp.common.models.catalog_roles import ModelRoles
 from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
 from exp.common.models.gateway_pools import GatewayPoolRecord
 from exp.common.models.model import (
@@ -44,7 +46,9 @@ _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AZURE_API_VERSION = re.compile(r"^(?:v1|\d{4}-\d{2}-\d{2}(?:-preview)?)$")
 _AWS_REGION_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _VERTEX_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-)?aiplatform\.googleapis\.com")
-_FIXED_ORIGIN_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "openrouter", "tinker"})
+_FIXED_ORIGIN_PROVIDERS = frozenset(
+    {"anthropic", "gemini", "openai", "openrouter", "tinker", "typesafe"}
+)
 _EXPLICIT_CAPABILITY_PROVIDERS = frozenset({"azure", "bedrock", "openai-compatible", "vertex"})
 
 AzureApiSurface = Literal["openai_deployments", "model_inference"]
@@ -134,47 +138,6 @@ def _normalize_connection_base_url(connection: ConnectionConfig) -> str | None:
     ):
         return normalized[: -len(_MODEL_INFERENCE_IDENTITY_SUFFIX)].rstrip("/")
     return normalized
-
-
-def require_bedrock_connection_shape(
-    *,
-    bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None,
-    api_key_env: str | None,
-    aws_access_key_id_env: str | None,
-    base_url: str | None,
-    api_version: str | None,
-) -> None:
-    """Reject a Bedrock connection whose credential and endpoint fields are inconsistent.
-
-    Args:
-        bedrock_auth_mode: Explicit auth mode, or ``None`` to infer it from the env names.
-        api_key_env: Environment variable naming the API key or secret access key.
-        aws_access_key_id_env: Environment variable naming the access key id.
-        base_url: Custom endpoint, which Bedrock never accepts.
-        api_version: Azure-only API version, which Bedrock never accepts.
-
-    Raises:
-        ValueError: The field combination cannot describe one Bedrock credential source.
-    """
-    if bedrock_auth_mode == "api_key":
-        if api_key_env is None or aws_access_key_id_env is not None:
-            raise ValueError(
-                "bedrock api_key auth requires api_key_env and forbids aws_access_key_id_env"
-            )
-    elif bedrock_auth_mode == "access_key_pair":
-        if api_key_env is None or aws_access_key_id_env is None:
-            raise ValueError(
-                "bedrock access_key_pair auth requires both credential environment names"
-            )
-    elif (api_key_env is None) != (aws_access_key_id_env is None):
-        raise ValueError(
-            "bedrock explicit access-key auth requires both api_key_env naming the "
-            "secret access key and aws_access_key_id_env naming the access key id"
-        )
-    if base_url is not None:
-        raise ValueError("bedrock does not accept base_url")
-    if api_version is not None:
-        raise ValueError("api_version is only accepted for provider='azure'")
 
 
 class ModelCatalogError(ValueError):
@@ -405,6 +368,9 @@ class GatewayDeploymentCapabilities(ContractModel):
     in frozen optimizer and runtime identities, while this declaration can evolve with the
     gateway protocol without invalidating existing router artifacts.
     """
+
+    supports_decisions: bool = False
+    """Whether this deployment serves native typed decisions instead of chat."""
 
     supports_developer_messages: bool = False
     supports_streaming: bool = False
@@ -730,54 +696,6 @@ class ModelRecord(ContractModel):
             )
         except SecretBoundaryError as exc:
             raise ValueError("model identity must not contain credential values") from exc
-        return self
-
-
-class ModelRoles(ContractModel):
-    """Project roles that select stable aliases without revealing credentials.
-
-    Each completion role may carry its own reasoning-effort choice, so one alias can use
-    different efforts as world model, judge, or router candidate. An absent role effort means
-    the alias's catalog capability pin applies unchanged.
-    """
-
-    candidates: tuple[str, ...] = ()
-    incumbent: str | None = None
-    world_model: str | None = None
-    judge: str | None = None
-    rubric_proposer: str | None = None
-    embedder: str | None = None
-    teacher: str | None = None
-    world_model_reasoning_effort: ReasoningEffort | None = None
-    judge_reasoning_effort: ReasoningEffort | None = None
-    candidate_reasoning_efforts: dict[str, ReasoningEffort] = Field(default_factory=dict)
-
-    @field_validator("candidates")
-    @classmethod
-    def _require_unique_candidates(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if len(set(value)) != len(value):
-            raise ValueError("candidate aliases must not repeat")
-        return value
-
-    @model_validator(mode="after")
-    def _require_role_bound_reasoning_efforts(self) -> ModelRoles:
-        """Require every role-specific effort to name a currently assigned role alias.
-
-        Returns:
-            The validated roles.
-
-        Raises:
-            ValueError: An effort is declared for an unassigned role or unknown candidate.
-        """
-        if self.world_model_reasoning_effort is not None and self.world_model is None:
-            raise ValueError("world_model_reasoning_effort requires an assigned world_model")
-        if self.judge_reasoning_effort is not None and self.judge is None:
-            raise ValueError("judge_reasoning_effort requires an assigned judge")
-        unknown = sorted(set(self.candidate_reasoning_efforts).difference(self.candidates))
-        if unknown:
-            raise ValueError(
-                "candidate_reasoning_efforts name unassigned candidates: " + ", ".join(unknown)
-            )
         return self
 
 

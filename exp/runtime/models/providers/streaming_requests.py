@@ -112,6 +112,16 @@ Messages-surface requests below the floor are raised to it with disclosure.
 _STRICT_STRUCTURED_OUTPUT_DIALECTS = frozenset(
     {"anthropic_messages", "gemini_generate_content", "bedrock_converse_stream"}
 )
+_JSON_OBJECT_OUTPUT_DIALECTS = frozenset(
+    {
+        "openai_responses",
+        "openai_compatible",
+        "anthropic_messages",
+        "gemini_generate_content",
+        "bedrock_converse_stream",
+    }
+)
+"""Dialects that honor schema-free JSON mode, natively or via a system instruction."""
 _NO_PARALLEL_TOOL_CONTROL_DIALECTS = frozenset(
     {"gemini_generate_content", "bedrock_converse_stream"}
 )
@@ -443,6 +453,25 @@ def route_generation_parameter_requests(
             param=path,
             code="unsupported_parameter",
         )
+    if request.json_object_output and any(
+        profile.dialect not in _JSON_OBJECT_OUTPUT_DIALECTS for profile in profiles
+    ):
+        raise ProviderParameterError(
+            message=(
+                "The parameter 'response_format.type' value 'json_object' is not "
+                "supported by every deployment in this model route. Use "
+                "'json_schema' or choose a different model."
+            ),
+            param="response_format.type",
+            code="unsupported_parameter",
+        )
+
+    if request.json_object_output and any(
+        profile.dialect in {"anthropic_messages", "bedrock_converse_stream"} for profile in profiles
+    ):
+        disclosure = "response_format->instruction(json_object)"
+        if disclosure not in ignored:
+            ignored.append(disclosure)
 
     # Every dialect carries a tool-result image: natively inside the tool
     # result on Anthropic (tool_result image blocks), native Responses (the SDK
@@ -542,17 +571,14 @@ def route_generation_parameter_requests(
         if not (effort_only and request.reasoning_effort is not None):
             ignore("provider_output_config", "output_config")
 
-    # Client telemetry and the verbosity hint are native Responses surface;
-    # elsewhere they are dropped with disclosure (Codex sends both by
-    # default), never a rejection.
-    if request.client_metadata is not None and not all(
-        profile.dialect == "openai_responses" for profile in profiles
-    ):
+    # Native Responses routes carry client metadata and verbosity. Other routes
+    # omit them with disclosures that use the caller's spelling of each field.
+    native_only = all(profile.dialect == "openai_responses" for profile in profiles)
+    if request.client_metadata is not None and not native_only:
         ignore("client_metadata")
-    if request.text_verbosity is not None and not all(
-        profile.dialect == "openai_responses" for profile in profiles
-    ):
-        ignore("text_verbosity", "text.verbosity")
+    if request.text_verbosity is not None and not native_only:
+        chat = request.surface == GatewayApiSurface.CHAT_COMPLETIONS
+        ignore("text_verbosity", "verbosity" if chat else "text.verbosity")
 
     # A tool-call cache hint is honored only on the Anthropic wire; any other
     # rung silently cannot cache, so the omission is disclosed, never a

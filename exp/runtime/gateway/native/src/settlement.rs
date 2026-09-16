@@ -125,6 +125,9 @@ fn settle_argument(
         })),
         "finalize": finalize,
         "opened": opened,
+        // Explicit HTTP-rejection provenance for decisions only. Unknown
+        // outcomes and cancellation never authorize zero-cost accounting.
+        "decision_provider_rejected": failure.is_some_and(|failure| failure.decision_provider_rejected),
         "first_token_at": first_token_at.map(system_time_to_rfc3339),
         // Allowlisted rate-limit headers of the attempt's provider response
         // (successes and failures alike, absent when none were present); the

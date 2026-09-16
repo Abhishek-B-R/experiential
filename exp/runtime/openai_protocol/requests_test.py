@@ -117,9 +117,9 @@ def test_chat_decoder_preserves_every_supported_semantic_field() -> None:
     assert request.metadata == {"cohort": "test"}
 
 
-def test_chat_decoder_translates_json_object_to_a_permissive_schema() -> None:
-    """response_format json_object is admitted and translated to an open, non-strict
-    json_schema so the caller's JSON intent serves on every rung, with disclosure."""
+def test_chat_decoder_carries_json_object_as_its_own_mode() -> None:
+    """response_format json_object rides json_object_output, not a permissive schema,
+    and is not disclosed as a translation."""
     request = decode_chat(
         {
             "model": "coding",
@@ -127,10 +127,9 @@ def test_chat_decoder_translates_json_object_to_a_permissive_schema() -> None:
             "response_format": {"type": "json_object"},
         }
     ).request
-    assert request.structured_text is not None
-    assert request.structured_text.json_schema == {"type": "object"}
-    assert request.structured_text.strict is False
-    assert request.ignored_parameters == ("response_format->translated(json_object)",)
+    assert request.json_object_output is True
+    assert request.structured_text is None
+    assert request.ignored_parameters == ()
 
 
 def test_chat_decoder_admits_sampling_penalties() -> None:
@@ -880,6 +879,39 @@ def test_chat_decoder_rejects_store_true_retention_request() -> None:
         )
     assert captured.value.detail.code == "invalid_parameter"
     assert captured.value.detail.param == "store"
+
+
+def test_chat_decoder_accepts_verbosity_as_the_chat_spelling_of_text_verbosity() -> None:
+    """opencode sends ``verbosity`` on every Chat request (2026-09-10 400s).
+
+    It decodes onto the same canonical carrier as Responses ``text.verbosity``
+    with no disclosure at decode; the route step decides forward-or-drop.
+    """
+    for value in ("low", "medium", "high"):
+        decoded = decode_chat(
+            {
+                "model": "gpt-5.6-luna",
+                "messages": [{"role": "user", "content": "hello"}],
+                "verbosity": value,
+            }
+        )
+        assert decoded.request.text_verbosity == value
+        assert decoded.request.ignored_parameters == ()
+
+
+def test_chat_decoder_rejects_an_unknown_verbosity_value() -> None:
+    """Accepting the field never means accepting any value: a typo is a client bug."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "gpt-5.6-luna",
+                "messages": [{"role": "user", "content": "hello"}],
+                "verbosity": "verbose",
+            }
+        )
+    assert captured.value.status_code == 400
+    assert captured.value.detail.code == "invalid_parameter"
+    assert captured.value.detail.param == "verbosity"
 
 
 def test_chat_decoder_preserves_logprobs_for_route_validation() -> None:

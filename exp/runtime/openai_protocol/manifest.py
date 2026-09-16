@@ -100,6 +100,9 @@ CHAT_MANIFEST = CompatibilityManifest(
         _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
         _field("user", CompatibilityDisposition.METADATA_ONLY),
         _field("prompt_cache_key", CompatibilityDisposition.CONDITIONALLY_SUPPORTED),
+        # Both API surfaces share the native Responses output-length hint;
+        # other routes omit it with disclosure. Values remain validated.
+        _field("verbosity", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "verbosity"),
         # Audio INPUT rides ``messages`` as an ``input_audio`` content part and
         # is admitted per route; ``audio`` and ``modalities`` request audio
         # OUTPUT, which no route serves.
@@ -116,7 +119,6 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "prompt_cache_options",
                 "prompt_cache_retention",
                 "seed",
-                "verbosity",
                 "web_search_options",
             )
         ),

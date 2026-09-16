@@ -159,17 +159,10 @@ class NativeAttemptAccounting:
         self._write_ledger = write_ledger
         self._budget_error_factory = budget_error_factory
         self._cache_sample_gate = cache_sample_gate
-        # The native waterfall's deployment-health circuits, revision-scoped
-        # to the traffic this plane serves.
+        # Revision-scoped deployment health; physical-lane load survives catalog rolls.
         self._health = DeploymentHealthRegistry()
-        # Per-worker in-flight counters and rate windows for rungs that author
-        # a dispatch policy (concurrency bound, rate caps, weighted fair
-        # share); pure in-memory arithmetic, physical-lane scoped so counters
-        # survive catalog rolls.
         self._loads = RungLoadRegistry()
-        # Worker-local conversation-to-rung bindings under
-        # maximize_cache_affinity, so a spilled conversation keeps serving off
-        # the rung holding its warm cache instead of bouncing back.
+        # Cache-affinity spills stay on the rung holding the warmed conversation.
         self._sticky = StickySpillRegistry()
         self._inflight: dict[str, InflightRequest] = {}
         self._lock = threading.Lock()
@@ -668,7 +661,7 @@ class NativeAttemptAccounting:
         attempt_id = str(data["attempt_id"])
         finalize = bool(data.get("finalize", True))
         opened = bool(data.get("opened", False))
-        terminal, failure = terminal_from_settlement(data)
+        terminal, failure = terminal_from_settlement(data, surface=entry.authorization.surface)
         first_token_at = first_token_at_from_settlement(data)
         rate_limit = settlement_rate_limit(data)
         try:
@@ -903,7 +896,9 @@ class NativeAttemptAccounting:
             settlement = entry.pending_settlement
             if settlement is None:
                 continue
-            terminal, failure = terminal_from_settlement(settlement)
+            terminal, failure = terminal_from_settlement(
+                settlement, surface=entry.authorization.surface
+            )
             if self._settle_swept(
                 request_id,
                 entry,
