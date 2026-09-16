@@ -85,7 +85,7 @@ class SourceDisclosure(ContractModel):
 
 
 class ClaasWorldModel:
-    """Create isolated practice sessions using one configured hosted model client.
+    """Create isolated practice or held-out sessions using one configured hosted client.
 
     This is orchestration over ``ModelClient``, not a trainable experience model. Its generated
     rewards remain synthetic. Creating or closing a session performs no provider call.
@@ -98,6 +98,7 @@ class ClaasWorldModel:
         model: ModelSnapshot,
         limits: WorldModelLimits,
         source_disclosure: SourceDisclosure | None = None,
+        purpose: Literal["practice", "evaluation"] = "practice",
     ) -> None:
         """Bind the configured provider identity and shared call/cost ceilings."""
         if not isinstance(client, BoundModelClient) or client.model_snapshot != model:
@@ -106,6 +107,9 @@ class ClaasWorldModel:
         self.model = model
         self.limits = limits
         self.source_disclosure = source_disclosure
+        if purpose not in ("practice", "evaluation"):
+            raise ValueError("world-model purpose must be practice or evaluation")
+        self.purpose = purpose
         self._calls = 0
         self._poisoned = False
         self._lock = Lock()
@@ -119,7 +123,7 @@ class ClaasWorldModel:
     def reset(
         self, scenario: ClaasScenario, *, grounding: Sequence[Experience]
     ) -> ClaasWorldSession:
-        """Create a fresh bounded session from exact fit-only source evidence.
+        """Create a bounded session from exact sources assigned to the configured purpose.
 
         Args:
             scenario: Mined initial policy inputs and immutable source references.
@@ -128,9 +132,11 @@ class ClaasWorldModel:
         Returns:
             An isolated session. Resetting never replenishes the shared provider budget.
         """
-        if scenario.partition != "fit":
+        expected_partition = "fit" if self.purpose == "practice" else "held_out"
+        if scenario.partition != expected_partition:
             raise ValueError(
-                "synthetic practice requires fit evidence; reserve held-out tasks for evaluation"
+                f"{self.purpose} requires {expected_partition} evidence; "
+                "preserve partition isolation"
             )
         self.authorize_source(scenario.scope)
         sources = {item.experience_id: item for item in grounding}

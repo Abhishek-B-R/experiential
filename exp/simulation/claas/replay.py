@@ -64,6 +64,7 @@ def replay_episode(
         client=client,
         model=episode.steps[0].response.model,
         limits=limits,
+        purpose="evaluation" if episode.scenario.partition == "held_out" else "practice",
         source_disclosure=SourceDisclosure(
             scope=episode.scenario.scope, model=episode.steps[0].response.model
         ),
