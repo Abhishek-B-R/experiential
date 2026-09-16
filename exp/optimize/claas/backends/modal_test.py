@@ -6,12 +6,13 @@ import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import cast
+from unittest.mock import AsyncMock, MagicMock
 
 import modal
 import pytest
 
 from exp.common.core.artifacts import sha256_json
-from exp.optimize.claas.backends.checkpoints import verify_checkpoint
+from exp.optimize.claas.backends.checkpoints import CheckpointManifest, verify_checkpoint
 from exp.optimize.claas.backends.checkpoints_test import checkpoint
 from exp.optimize.claas.backends.modal import (
     REMOTE_ROOT,
@@ -19,7 +20,12 @@ from exp.optimize.claas.backends.modal import (
     _download_checkpoint,
 )
 from exp.optimize.claas.backends.modal_configuration import ModalExecutionConfig
-from exp.optimize.claas.training_contracts import ClaasTrainingError, TrainingJob, TrainingResult
+from exp.optimize.claas.training_contracts import (
+    ClaasTrainingError,
+    TrainingJob,
+    TrainingResult,
+    next_policy_revision,
+)
 from exp.optimize.claas.training_contracts_test import job, spec
 
 
@@ -154,3 +160,54 @@ def test_close_waits_for_execution_cancellation(tmp_path: Path) -> None:
             await training
 
     asyncio.run(run())
+
+
+def test_named_lineage_survives_dispatch_download_and_exact_job_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful remote job downloads its own lineage rather than the default lineage."""
+    submitted = job(tmp_path).model_copy(
+        update={"lineage_id": "cycle-claims", "checkpoint_root": REMOTE_ROOT}
+    )
+    source = tmp_path / "remote"
+    receipt = checkpoint(source)
+    policy = next_policy_revision(submitted)
+    ids = tuple(item.experience.experience_id for item in submitted.batch.examples)
+    manifest = CheckpointManifest.model_validate_json((source / "manifest.json").read_bytes())
+    manifest = manifest.model_copy(
+        update={
+            "policy_revision": policy,
+            "policy_history": (policy, submitted.spec.initial_policy_revision),
+            "batch_id": submitted.batch.batch_id,
+            "consumed_experience_ids": ids,
+            "lineage_id": submitted.lineage_id,
+        }
+    )
+    (source / "manifest.json").write_text(manifest.model_dump_json())
+    scope_hash = sha256_json(
+        {"scope": submitted.spec.scope.model_dump(mode="json"), "adapter_id": spec().adapter_id}
+    )
+    lineage_hash = sha256_json({"lineage_id": submitted.lineage_id})
+    receipt = receipt.model_copy(
+        update={
+            "policy_revision": policy,
+            "policy_history": manifest.policy_history,
+            "manifest_sha256": sha256_json(manifest),
+            "path": f"{REMOTE_ROOT}/{scope_hash}/{lineage_hash}/{policy}",
+        }
+    )
+    result = TrainingResult(checkpoint=receipt, consumed_experience_ids=ids, metrics={})
+    call = MagicMock()
+    call.get.aio = AsyncMock(return_value=result.model_dump_json())
+    function = MagicMock()
+    function.with_options.return_value = function
+    function.spawn.aio = AsyncMock(return_value=call)
+    monkeypatch.setattr(modal.Function, "from_name", MagicMock(return_value=function))
+    monkeypatch.setattr(modal.Volume, "from_name", MagicMock(return_value=_Volume(source)))
+    backend = ModalVerlBackend(
+        config=config(), checkpoint_root=tmp_path / "local", lineage_id=submitted.lineage_id
+    )
+    local = asyncio.run(backend.execute(submitted))
+    assert local.checkpoint.path == str(tmp_path / "local" / scope_hash / lineage_hash / policy)
+    assert verify_checkpoint(local.checkpoint, spec()).lineage_id == submitted.lineage_id
+    function.spawn.aio.assert_awaited_once_with(submitted.model_dump_json())

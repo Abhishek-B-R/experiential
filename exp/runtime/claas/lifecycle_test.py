@@ -163,3 +163,47 @@ def test_failed_reload_requires_restoring_known_revision() -> None:
             await lifecycle.resume()
 
     asyncio.run(run())
+
+
+def test_sleep_and_controller_restart_reload_adapter_bytes() -> None:
+    """Sleep unloads LoRA first, and a fresh controller reloads any existing target name."""
+
+    async def run() -> None:
+        """Drive repeated wake/load and a controller restart against one persistent server."""
+        server = ControlServer()
+        candidate = revision().model_copy(
+            update={
+                "policy_revision": "candidate",
+                "adapter_directory": "/adapters/candidate/student",
+                "manifest_sha256": "a" * 64,
+            }
+        )
+        async with httpx.AsyncClient(
+            base_url="http://owned", transport=httpx.MockTransport(server.handle)
+        ) as client:
+            lifecycle = VllmServingLifecycle(
+                client=client, base=revision(), decoder=TextCompletionDecoder()
+            )
+            await lifecycle.wake()
+            await lifecycle.load_revision(candidate)
+            await lifecycle.sleep()
+            assert serving_model_name(candidate) not in server.models
+            assert server.paths.index("/v1/unload_lora_adapter") < server.paths.index("/sleep")
+            await lifecycle.wake()
+            with pytest.raises(ServingPausedError):
+                await lifecycle.resume()
+            await lifecycle.load_revision(candidate)
+            fresh = VllmServingLifecycle(
+                client=client, base=revision(), decoder=TextCompletionDecoder()
+            )
+            await fresh.wake()
+            await fresh.load_revision(candidate)
+            assert server.paths.count("/v1/load_lora_adapter") == 3
+            assert server.paths.count("/v1/unload_lora_adapter") == 2
+            server.models.remove(serving_model_name(revision()))
+            with pytest.raises(ServingPausedError, match="different base"):
+                await fresh.load_revision(candidate)
+            with pytest.raises(ServingPausedError):
+                await fresh.resume()
+
+    asyncio.run(run())

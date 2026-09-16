@@ -7,12 +7,14 @@ one explicit cost authorization before dispatch, with no automatic job retry.
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 from pathlib import Path, PurePosixPath
 
 import modal
 
 from exp.common.core.artifacts import sha256_json
+from exp.common.core.files import fsync_directory_best_effort
 from exp.optimize.claas.backends.checkpoints import (
     CheckpointManifest,
     verify_checkpoint,
@@ -114,7 +116,12 @@ class ModalVerlBackend:
             config.volume_name, environment_name=config.environment_name
         )
         local = await _download_checkpoint(
-            volume, checkpoint, job.spec, self.checkpoint_root, config.maximum_checkpoint_bytes
+            volume,
+            checkpoint,
+            job.spec,
+            self.checkpoint_root,
+            config.maximum_checkpoint_bytes,
+            job.lineage_id,
         )
         local_result = result.model_copy(update={"checkpoint": local})
         verify_training_result(job, local_result)
@@ -181,6 +188,8 @@ async def _download_checkpoint(
                             "Modal checkpoint exceeds the authorized download byte ceiling"
                         )
                     handle.write(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
 
         await download("manifest.json")
         manifest = CheckpointManifest.model_validate_json((root / "manifest.json").read_bytes())
@@ -192,7 +201,15 @@ async def _download_checkpoint(
             await download(relative)
         staged = checkpoint.model_copy(update={"path": str(root)})
         verify_checkpoint(staged, spec)
+        for subdirectory in sorted(
+            (path for path in root.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        ):
+            fsync_directory_best_effort(subdirectory)
+        fsync_directory_best_effort(root)
         root.rename(destination)
+        fsync_directory_best_effort(destination.parent)
     return checkpoint.model_copy(update={"path": str(destination)})
 
 

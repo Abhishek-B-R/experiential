@@ -109,6 +109,13 @@ class VllmServingLifecycle:
         """Offload the unchanged base with sleep level one and verify the receipt."""
         async with self._control:
             self._require_drained()
+            self._revision = None
+            if self._loaded_adapter is not None:
+                response = await self._client.post(
+                    "/v1/unload_lora_adapter", json={"lora_name": self._loaded_adapter}
+                )
+                response.raise_for_status()
+                self._loaded_adapter = None
             self._awake = False
             response = await self._client.post("/sleep", params={"level": 1})
             response.raise_for_status()
@@ -119,6 +126,7 @@ class VllmServingLifecycle:
         """Restore memory without reopening admission or changing the active pointer."""
         async with self._control:
             self._require_drained()
+            self._revision = None
             self._awake = False
             response = await self._client.post("/wake_up")
             response.raise_for_status()
@@ -143,28 +151,44 @@ class VllmServingLifecycle:
                 raise ServingPausedError("wake the server before loading a serving revision")
             model = serving_model_name(revision)
             self._revision = None
-            if self._loaded_adapter is not None and self._loaded_adapter != model:
+            listed = await self._model_names()
+            if serving_model_name(self._base) not in listed:
+                raise ServingPausedError(
+                    "vLLM has a different base route; keep admission paused "
+                    "and restart the bound server"
+                )
+            if self._loaded_adapter is not None and self._loaded_adapter in listed:
                 response = await self._client.post(
                     "/v1/unload_lora_adapter", json={"lora_name": self._loaded_adapter}
                 )
                 response.raise_for_status()
-                self._loaded_adapter = None
-            if revision.adapter_directory is not None and self._loaded_adapter != model:
+                listed.remove(self._loaded_adapter)
+            self._loaded_adapter = None
+            if revision.adapter_directory is not None:
+                # A restarted controller cannot trust that a preexisting name
+                # still points to the selected on-disk artifact. Reload it.
+                if model in listed:
+                    response = await self._client.post(
+                        "/v1/unload_lora_adapter", json={"lora_name": model}
+                    )
+                    response.raise_for_status()
                 response = await self._client.post(
                     "/v1/load_lora_adapter",
                     json={"lora_name": model, "lora_path": revision.adapter_directory},
                 )
                 response.raise_for_status()
                 self._loaded_adapter = model
-            response = await self._client.get("/v1/models")
-            response.raise_for_status()
-            if model not in {
-                item.id for item in _Models.model_validate_json(response.content).data
-            }:
+            if model not in await self._model_names():
                 raise ServingPausedError(
                     "loaded revision is absent from vLLM models; keep admission paused"
                 )
             self._revision = revision
+
+    async def _model_names(self) -> set[str]:
+        """Read actual route names from the configured private server."""
+        response = await self._client.get("/v1/models")
+        response.raise_for_status()
+        return {item.id for item in _Models.model_validate_json(response.content).data}
 
     async def resume(self) -> None:
         """Reopen admission after the caller durably commits its selected revision."""
