@@ -354,9 +354,11 @@ def test_running_retry_keeps_local_copy_until_verified_completion(
         upload_origin=_UPLOAD_ORIGIN,
         upload_path_prefix=_UPLOAD_PREFIX,
     )
+    uploader._recover_temporary_files()
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
         uploader._deliver_one(client)
         assert path.exists()
+        assert uploader.stats.pending_batches == uploader.pending_current_run == 1
         assert uploader.stats.uploaded_batches == 0
         assert uploader.stats.upload_errors == 0
         uploader._retry_at.clear()
@@ -365,6 +367,7 @@ def test_running_retry_keeps_local_copy_until_verified_completion(
     assert path.exists() == (terminal == "error")
     assert uploader.stats.uploaded_batches == int(terminal == "done")
     assert uploader.stats.upload_errors == int(terminal == "error")
+    assert uploader.stats.pending_batches == int(terminal == "error")
 
 
 def test_shutdown_counts_unfinished_copies_and_freezes_final_pending(
@@ -575,3 +578,123 @@ def test_delivery_of_durable_temp_removes_canonical_copy_exactly_once(
     assert final.uploaded_batches == 1
     assert final.pending_batches == final.dropped_exchanges == 0
     assert not list(directory.iterdir())
+
+
+@pytest.mark.parametrize("stage", ["before_unlink", "after_unlink"])
+def test_shutdown_commits_cloud_acceptance_before_cleanup_can_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    """Freeze accurate receipt counters whether local cleanup stalls before or after deletion."""
+    run, ingest = str(uuid4()), str(uuid4())
+    directory = tmp_path / run
+    directory.mkdir()
+    path = directory / f"{uuid4()}.json"
+    path.write_bytes(normalize_exchange(_exchange(), max_body_bytes=4096))
+    entered, release = threading.Event(), threading.Event()
+    original_unlink = Path.unlink
+
+    def stalled_unlink(candidate: Path, missing_ok: bool = False) -> None:
+        """Pause deletion on either side of the filesystem mutation."""
+        if candidate != path:
+            original_unlink(candidate, missing_ok=missing_ok)
+            return
+        if stage == "after_unlink":
+            original_unlink(candidate, missing_ok=missing_ok)
+        entered.set()
+        assert release.wait(3)
+        if stage == "before_unlink":
+            original_unlink(candidate, missing_ok=missing_ok)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return a verified completed batch without issuing another upload."""
+        assert request.url.path.endswith("/batches/upload")
+        return httpx.Response(200, json={"ingest_id": ingest, "status": "done"})
+
+    monkeypatch.setattr(Path, "unlink", stalled_unlink)
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        directory,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+        transport=httpx.MockTransport(handler),
+    )
+    uploader.start()
+    try:
+        assert entered.wait(1)
+        assert uploader.stats.uploaded_batches == 1
+        assert uploader.stats.pending_batches == uploader.pending_current_run == 0
+        before = time.monotonic()
+        final = uploader.close(timeout=0.02)
+        assert time.monotonic() - before < 0.5
+        assert final.uploaded_batches == 1
+        assert final.pending_batches == uploader.pending_current_run == 0
+    finally:
+        release.set()
+        assert uploader._delivery_thread is not None
+        uploader._delivery_thread.join(1)
+        uploader.close()
+    assert not uploader._delivery_thread.is_alive()
+    assert not path.exists()
+    assert uploader.stats == final
+    assert uploader.pending_current_run == 0
+
+
+def test_failed_accepted_cleanup_retains_quota_and_retries_without_reupload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep one accepted cleanup slot while disk quota and subsequent uploads remain bounded."""
+    run, ingest = str(uuid4()), str(uuid4())
+    directory = tmp_path / run
+    directory.mkdir()
+    path = directory / f"{uuid4()}.json"
+    payload = normalize_exchange(_exchange(), max_body_bytes=4096)
+    path.write_bytes(payload)
+    original_unlink = Path.unlink
+    failed = True
+    requests: list[httpx.Request] = []
+
+    def failing_unlink(candidate: Path, missing_ok: bool = False) -> None:
+        """Simulate a persistent local deletion failure for the accepted batch."""
+        if candidate == path and failed:
+            raise PermissionError("synthetic cleanup failure")
+        original_unlink(candidate, missing_ok=missing_ok)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Acknowledge completed cloud validation exactly once."""
+        requests.append(request)
+        return httpx.Response(200, json={"ingest_id": ingest, "status": "done"})
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        directory,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+        max_spool_bytes=len(payload),
+    )
+    uploader._recover_temporary_files()
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        uploader._deliver_one(client)
+        assert path.exists()
+        assert uploader.stats.uploaded_batches == 1
+        assert uploader.stats.pending_batches == uploader.pending_current_run == 0
+        assert uploader.stats.upload_errors == 1
+        with pytest.raises(ValueError, match="spool is full"):
+            uploader._persist(_exchange())
+        uploader._retry_at.clear()
+        uploader._deliver_one(client)
+        assert len(requests) == uploader.stats.uploaded_batches == 1
+        assert uploader.stats.upload_errors == 2
+        failed = False
+        uploader._retry_at.clear()
+        uploader._deliver_one(client)
+    assert not path.exists()
+    assert uploader._accepted_cleanup is None
+    assert len(requests) == uploader.stats.uploaded_batches == 1
+    assert uploader.close().pending_batches == 0

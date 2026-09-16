@@ -94,6 +94,8 @@ class CaptureUploader:
         self._uploaded = 0
         self._pending_exchanges = 0
         self._durable_temps: set[Path] = set()
+        self._pending_paths: set[Path] = set()
+        self._accepted_cleanup: Path | None = None
         self._final_stats: UploadStats | None = None
         self._final_pending_current = 0
         self._retry_at: dict[Path, float] = {}
@@ -143,8 +145,7 @@ class CaptureUploader:
         with self._lock:
             if self._final_stats is not None:
                 return self._final_pending_current
-        files = sum(path.parent == self._spool_dir for path in self._files())
-        with self._lock:
+            files = sum(path.parent == self._spool_dir for path in self._pending_paths)
             return self._pending_exchanges + files
 
     @property
@@ -153,10 +154,8 @@ class CaptureUploader:
         with self._lock:
             if self._final_stats is not None:
                 return self._final_stats
-        pending_files = len(self._files())
-        with self._lock:
             return UploadStats(
-                pending_batches=self._pending_exchanges + pending_files,
+                pending_batches=self._pending_exchanges + len(self._pending_paths),
                 upload_errors=self._errors,
                 dropped_exchanges=self._dropped,
                 captured_exchanges=self._captured,
@@ -190,11 +189,11 @@ class CaptureUploader:
                 except queue.Empty:
                     break
                 self._queue.task_done()
-        files = self._files()
-        with self._lock:
-            self._final_pending_current = sum(path.parent == self._spool_dir for path in files)
+            self._final_pending_current = sum(
+                path.parent == self._spool_dir for path in self._pending_paths
+            )
             self._final_stats = UploadStats(
-                pending_batches=len(files),
+                pending_batches=len(self._pending_paths),
                 upload_errors=self._errors,
                 dropped_exchanges=self._dropped,
                 captured_exchanges=self._captured,
@@ -263,6 +262,7 @@ class CaptureUploader:
                 # The complete sanitized file is durable before publication. A late
                 # rename must not turn a deadline-accounted drop into a queued batch.
                 self._durable_temps.add(temporary)
+                self._pending_paths.add(destination)
                 self._pending_exchanges -= 1
                 self._queued_bytes -= exchange.byte_count
             try:
@@ -314,6 +314,9 @@ class CaptureUploader:
             path.replace(destination)
             occupied += size
             file_count += 1
+        files = self._files()
+        with self._lock:
+            self._pending_paths = {path.with_suffix(".json") for path in files}
 
     def _files(self) -> list[Path]:
         """Find bounded retry files only in UUID-named sibling run directories."""
@@ -341,6 +344,8 @@ class CaptureUploader:
     def _deliver_one(self, client: httpx.Client) -> None:
         """Retry one eligible batch while never retaining an unbounded error history."""
         now = time.monotonic()
+        if self._cleanup_accepted(client, now):
+            return
         files = self._files()
         self._retry_at = {
             path: deadline for path, deadline in self._retry_at.items() if path in files
@@ -367,23 +372,48 @@ class CaptureUploader:
                 self._retry_at[path] = now + 10.0
                 logger.warning("Capture upload deferred; sanitized batch remains queued locally")
             else:
-                if self._abandon.is_set():
-                    return
                 if not accepted:
                     self._retry_at[path] = now + 10.0
                     return
-                path.unlink(missing_ok=True)
-                self._retry_at.pop(path, None)
                 with self._lock:
-                    self._durable_temps.discard(path)
+                    if self._abandon.is_set():
+                        return
+                    # Receipt accounting commits before cleanup can block. Shutdown
+                    # snapshots this state without racing a filesystem enumeration.
+                    self._pending_paths.discard(path)
+                    self._accepted_cleanup = path
                     self._uploaded += 1
-                if path.parent != self._spool_dir:
-                    self._finish_recovered_run(client, path.parent)
+                self._cleanup_accepted(client, now)
             return
+
+    def _cleanup_accepted(self, client: httpx.Client, now: float) -> bool:
+        """Retry one accepted file's deletion before accepting any more cloud receipts."""
+        with self._lock:
+            path = self._accepted_cleanup
+        if path is None:
+            return False
+        if self._retry_at.get(path, 0) > now:
+            return True
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            with self._lock:
+                if not self._abandon.is_set():
+                    self._errors += 1
+            self._retry_at[path] = now + 10.0
+            logger.warning("Capture uploaded; local cleanup deferred within the spool quota")
+        else:
+            self._retry_at.pop(path, None)
+            with self._lock:
+                self._accepted_cleanup = None
+            if path.parent != self._spool_dir and not self._abandon.is_set():
+                self._finish_recovered_run(client, path.parent)
+        return True
 
     def _finish_recovered_run(self, client: httpx.Client, directory: Path) -> None:
         """Refresh an old run's pending count without reopening its capture lifetime."""
-        pending = sum(path.parent == directory for path in self._files())
+        with self._lock:
+            pending = sum(path.parent == directory for path in self._pending_paths)
         try:
             response = client.post(
                 f"{self._base}/capture/runs/{directory.name}/end",
