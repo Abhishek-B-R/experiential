@@ -918,6 +918,42 @@ def test_training_cancellation_closes_backend_before_active_serving_restoration(
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("failure", [ValueError, TimeoutError])
+def test_training_and_backend_cleanup_failures_preserve_both_causes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: type[Exception]
+) -> None:
+    """Retain the original training error and separate cleanup evidence without resuming."""
+    training_error = failure("fixture training failed")
+    sessions: list[ReceiptSession] = []
+
+    async def failed_train(self: ReceiptSession, batch: TrainingBatch) -> TrainingResult:
+        """Fail a real cycle's owned training call with an observable original exception."""
+        sessions.append(self)
+        raise training_error
+
+    async def failed_close(self: ReceiptSession) -> None:
+        """Leave backend ownership uncertain and record a different failure type."""
+        raise OSError("fixture backend close failed")
+
+    monkeypatch.setattr(ReceiptSession, "train", failed_train)
+    monkeypatch.setattr(ReceiptSession, "close", failed_close)
+    with pytest.raises(failure, match="fixture training failed") as raised:
+        asyncio.run(drive_cycle(tmp_path))
+    assert raised.value is training_error
+    state = CycleState.model_validate_json(
+        next((tmp_path / "cycles").glob("*/state.json")).read_bytes()
+    )
+    assert state.failure_type == failure.__name__
+    assert state.cleanup_failure_type == "OSError"
+    assert state.recovery_failure_type is None
+    assert not state.serving_restored
+    assert len(sessions) == 1
+    backend = sessions[0].backend
+    assert not backend.closed
+    assert backend.serving.asleep
+    assert backend.serving.admission.paused and backend.serving.admission.closed
+
+
 def test_late_journal_failure_restores_committed_adapter_under_admission(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
