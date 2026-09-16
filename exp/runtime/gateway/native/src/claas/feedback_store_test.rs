@@ -3,6 +3,8 @@
 use super::super::feedback_contracts::EpisodeStatus;
 use super::*;
 
+static FIXTURE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct Fixture {
     path: std::path::PathBuf,
     policy: Policy,
@@ -10,12 +12,13 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "claas-feedback-{}-{}.db",
+            "claas-feedback-{}-{}-{}.db",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            FIXTURE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let connection = Connection::open(&path).unwrap();
         connection
