@@ -51,6 +51,31 @@ fn first_byte_allowance_scales_with_input_and_honors_overrides() {
     assert!((pinned.as_secs_f64() - 15.0).abs() < 1e-6);
 }
 
+#[test]
+fn open_phase_bound_ignores_the_per_chunk_timeout() {
+    // A deployment authored with a 120 s first-byte allowance on a 60 s
+    // per-chunk wire waits the full 120 s for headers; only the request
+    // deadline can cut it shorter.
+    let allowance = first_byte_allowance(
+        &wire(Some(120.0), Some(0.0)),
+        Duration::from_secs(15),
+        240.0,
+        0.0,
+    );
+    assert!((allowance.as_secs_f64() - 120.0).abs() < 1e-6);
+    assert_eq!(
+        open_phase_bound(Duration::from_secs(600), allowance),
+        Duration::from_secs(120)
+    );
+    assert_eq!(
+        open_phase_bound(Duration::from_secs(45), allowance),
+        Duration::from_secs(45)
+    );
+    // The default allowance stays the fail-fast bound for a small prompt.
+    let small = first_byte_allowance(&wire(None, None), Duration::from_secs(15), 240.0, 1_000.0);
+    assert!(open_phase_bound(Duration::from_secs(600), small) < Duration::from_secs(16));
+}
+
 fn policy(refusal_failover: bool) -> RoutePolicy {
     RoutePolicy {
         maximum_total_attempts: 8,
