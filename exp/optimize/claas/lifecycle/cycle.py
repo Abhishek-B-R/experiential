@@ -263,9 +263,7 @@ async def run_cycle(
                     await session.close()
                 except BaseException as error:
                     cleanup_failure = error
-                    if isinstance(training_failure, asyncio.CancelledError) and isinstance(
-                        error, Exception
-                    ):
+                    if training_failure is not None and isinstance(error, Exception):
                         raise training_failure from error
                     raise
             job = TrainingJob(
