@@ -218,6 +218,11 @@ class TinkerSamplingClient:
         self._model = model
         self._sampler = sampler
 
+    @property
+    def model_snapshot(self) -> ModelSnapshot:
+        """Expose the configured recipient without performing provider I/O."""
+        return self._model
+
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Sample one action and attach local observed latency to the shared response.
 

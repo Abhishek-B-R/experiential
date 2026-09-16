@@ -426,6 +426,11 @@ class BedrockClient:
         self._signing_credentials: _ResolvableCredentials | None = None
         self._lock = threading.Lock()
 
+    @property
+    def model_snapshot(self) -> ModelSnapshot:
+        """Expose the configured recipient without performing provider I/O."""
+        return self._model
+
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Complete one non-streaming request through Bedrock Converse.
 
@@ -682,9 +687,8 @@ class BedrockClient:
 class BoundedBedrockClient(BoundedSyncModelClientAdapter):
     """Gateway compatibility contract for blocking Bedrock SDK calls.
 
-    The wrapper bounds outstanding worker calls and caller wait time. Cancellation is best effort:
-    an active boto call may finish in its worker, but retains its admission permit until it stops.
-    Native Bedrock streaming remains outside this contract.
+    Worker calls and caller waits are bounded. Cancelled boto calls retain their admission permit
+    until they stop. Native Bedrock streaming remains outside this contract.
     """
 
     def __init__(

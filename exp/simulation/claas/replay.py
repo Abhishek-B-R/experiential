@@ -7,7 +7,7 @@ from collections.abc import Sequence
 
 from exp.common.claas import Experience
 from exp.common.core.artifacts import sha256_json
-from exp.common.models import AssistantAction, ModelRequest, ModelResponse
+from exp.common.models import AssistantAction, ModelRequest, ModelResponse, ModelSnapshot
 from exp.simulation.claas.contracts import WorldEpisode, WorldStep
 from exp.simulation.claas.harness import ClaasWorldModel, SourceDisclosure, WorldModelLimits
 
@@ -19,6 +19,13 @@ class ReplayModelClient:
         """Retain an ordered immutable sequence without constructing provider clients."""
         self._steps = tuple(steps)
         self.consumed = 0
+
+    @property
+    def model_snapshot(self) -> ModelSnapshot:
+        """Expose the recorded recipient, without constructing a live provider."""
+        if not self._steps:
+            raise ValueError("replay has no recorded recipient")
+        return self._steps[0].response.model
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Return the next recorded result, rejecting missing or drifted requests."""
