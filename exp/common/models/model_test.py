@@ -107,6 +107,7 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
         "supports_tools": True,
         "supports_embeddings": None,
         "supports_image_generation": None,
+        "emits_images": False,
         "supports_structured_output": False,
         "supports_completions": None,
         "supports_temperature": True,
@@ -483,3 +484,16 @@ def test_system_messages_leading_only_is_a_gateway_flag_outside_the_frozen_ident
         ModelCapabilities(system_messages_leading_only=True).identity_sha256()
         == ModelCapabilities().identity_sha256()
     )
+
+
+def test_emits_images_stays_out_of_the_capability_identity() -> None:
+    """Emitting images is a data-plane settlement fact, never a dispatch contract.
+
+    Like ``supports_image_generation`` it is excluded from the capability
+    identity, so projecting it onto the text+image chat lanes leaves every
+    pinned ``capabilities_sha256`` where it was.
+    """
+    plain = ModelCapabilities(supports_tools=True)
+    emitting = ModelCapabilities(supports_tools=True, emits_images=True)
+    assert plain.identity_sha256() == emitting.identity_sha256()
+    assert emitting.emits_images is True and plain.emits_images is False

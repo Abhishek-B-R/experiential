@@ -66,8 +66,10 @@ pub struct DeploymentWire {
     /// no such control: the relay serializes the turn to one tool call.
     #[serde(default)]
     pub serialize_tool_calls: bool,
-    /// The served model emits images (`supports_image_generation` on the
-    /// lane) that the chat normalizers carry no event for, so a turn with no
+    /// The served model emits images (`emits_images` on the lane -- never the
+    /// Images-API claim `supports_image_generation`, whose reuse admitted
+    /// image generations onto OpenRouter chat lanes on 2026-09-15) that the
+    /// chat normalizers carry no event for, so a turn with no
     /// renderable output is the EXPECTED shape of an image generation, not a
     /// transient empty answer: the waterfall neither redials nor advances the
     /// ladder on it (each attempt bills the house a whole image -- $0.24 list

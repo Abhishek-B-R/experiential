@@ -456,6 +456,16 @@ class ModelCapabilities(ContractModel):
     # Image generation is served only on a positive claim, like embeddings:
     # ``None`` is unknown and never dispatches to the images surface.
     supports_image_generation: bool | None = None
+    # The model EMITS images inside a chat/Responses turn (a text+image model
+    # such as gpt-5.4-image-2 or the gemini image lanes). A data-plane lane
+    # fact only: the chat normalizers carry no image event, so such a turn
+    # ends output-less, and the waterfall answers its empty completion at
+    # once instead of redialing a second whole image. NEVER an admission
+    # signal -- ``/v1/images`` stays gated on ``supports_image_generation``
+    # plus an Images-API wire (the 2026-09-15 lesson: reusing that claim for
+    # chat lanes admitted image generations onto OpenRouter, whose wire
+    # profile carries an ``images_url`` unconditionally).
+    emits_images: bool = False
     supports_structured_output: bool = False
     supports_completions: bool | None = None
     supports_temperature: bool = True
@@ -621,6 +631,9 @@ class ModelCapabilities(ContractModel):
         # it out of the identity like supports_completions so existing traces
         # and frozen catalogs keep their digests.
         excluded.add("supports_image_generation")
+        # Same reasoning: emitting images changes how the data plane settles an
+        # output-less turn, never what a dispatch may do.
+        excluded.add("emits_images")
         return sha256_json(self.model_dump(mode="json", exclude=excluded))
 
 
