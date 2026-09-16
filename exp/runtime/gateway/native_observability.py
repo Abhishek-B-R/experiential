@@ -42,6 +42,15 @@ class NativeObservabilityMixin:
     _usage_reporter: Callable[[], JsonObject] | None
     _readiness_probe: Callable[[], bool] | None
 
+    def claas_authority(self, argument: str) -> str:
+        """Resolve CLaaS ownership from a valid key without admitting model traffic."""
+        data = json.loads(argument)
+        try:
+            _, identity_id = self._components.store.authenticated_identity(raw_key=data["raw_key"])
+        except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
+            raise _authority_error(exc) from exc
+        return json.dumps({"user_id": identity_id}, separators=(",", ":"))
+
     def models(self, argument: str) -> str:
         """Return the granted model list body for one authenticated key."""
         data = json.loads(argument)

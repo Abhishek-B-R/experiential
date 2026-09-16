@@ -101,9 +101,20 @@ impl CaptureStore {
             .map(|binding| &binding.policy)
     }
 
-    #[cfg(test)]
     pub(crate) fn database_path(&self) -> &str {
         &self.config.database_path
+    }
+
+    pub(crate) fn policy_for_scope(&self, user: &str, application: &str) -> Option<&Policy> {
+        self.config
+            .bindings
+            .iter()
+            .find(|binding| {
+                binding.policy.enabled
+                    && binding.policy.scope.user_id == user
+                    && binding.policy.scope.application_id == application
+            })
+            .map(|binding| &binding.policy)
     }
 
     pub(crate) fn skipped_count(&self) -> u64 {
@@ -262,6 +273,8 @@ fn open_database(path: &Path) -> Result<Connection, String> {
            ON claas_experiences(user_id, application_id, sequence);",
         )
         .map_err(safe_error)?;
+    super::feedback_store::initialize(&connection)
+        .map_err(|_| "cannot initialize CLaaS feedback tables".to_string())?;
     Ok(connection)
 }
 
@@ -302,6 +315,8 @@ fn prune(connection: &Connection, policy: &Policy, timestamp: u64) -> rusqlite::
             policy.maximum_storage_bytes as i64
         ],
     )?;
+    super::feedback_store::prune(connection, timestamp)
+        .map_err(|_| rusqlite::Error::InvalidQuery)?;
     Ok(())
 }
 

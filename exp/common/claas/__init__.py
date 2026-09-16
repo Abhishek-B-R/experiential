@@ -7,6 +7,12 @@ from exp.common.claas.contracts import (
     Experience,
     ExperienceProvenance,
 )
+from exp.common.claas.feedback import (
+    FeedbackRecord,
+    FeedbackRequest,
+    FinalizedEpisode,
+    FinalizeEpisodeRequest,
+)
 
 __all__ = [
     "CapturePolicy",
@@ -14,4 +20,8 @@ __all__ = [
     "ExactTokenEvidence",
     "Experience",
     "ExperienceProvenance",
+    "FeedbackRecord",
+    "FeedbackRequest",
+    "FinalizedEpisode",
+    "FinalizeEpisodeRequest",
 ]
