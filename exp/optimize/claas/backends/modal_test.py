@@ -85,7 +85,7 @@ def test_download_verifies_manifest_and_preserves_immutable_scope(tmp_path: Path
         assert verify_checkpoint(local, spec()).step == 1
         assert Path(local.path).is_dir()
         assert local.path.startswith(str(tmp_path / "local" / scope_id))
-        (source / "optimizer.pt").write_bytes(b"corrupt")
+        (source / "verl/actor/optim_world_size_1_rank_0.pt").write_bytes(b"corrupt")
         with pytest.raises(ValueError, match="missing or changed"):
             await _download_checkpoint(
                 cast(modal.Volume, _Volume(source)), remote, spec(), tmp_path / "second", 1_000_000
