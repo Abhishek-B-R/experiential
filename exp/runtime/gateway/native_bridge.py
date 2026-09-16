@@ -30,6 +30,7 @@ import time
 from collections.abc import Callable
 
 from exp.common.core.artifacts import JsonObject, sha256_bytes
+from exp.runtime.gateway.attempt_tokens import counted_input_tokens
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -46,7 +47,6 @@ from exp.runtime.gateway.guardrails.native import enforce_native_input, enforce_
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
-    record_dead_admission_rungs,
 )
 from exp.runtime.gateway.native_accounting import (
     authority_error as _authority_error,
@@ -54,6 +54,8 @@ from exp.runtime.gateway.native_accounting import (
 from exp.runtime.gateway.native_admission import (
     admitted_route_requests,
     fold_parallel_tool_call_disclosures,
+    log_reasoning_continuation_rejection,
+    record_dead_admission_rungs,
     resolve_admission_route,
 )
 from exp.runtime.gateway.native_batches import NativeBatchRelayMixin
@@ -79,6 +81,7 @@ from exp.runtime.gateway.native_continuation import (
 from exp.runtime.gateway.native_continuation import (
     select_bound_continuation_route as _select_bound_continuation_route,
 )
+from exp.runtime.gateway.native_count_tokens import NativeCountTokensMixin
 from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_body
 from exp.runtime.gateway.native_dispatch import dispatch_signature_headers
 from exp.runtime.gateway.native_embeddings import NativeEmbeddingsMixin
@@ -97,6 +100,7 @@ from exp.runtime.gateway.native_observability import NativeObservabilityMixin
 from exp.runtime.gateway.native_reasoning import (
     authenticate_reasoning_history,
     has_active_reasoning_content,
+    rung_provider_request,
     seal_reasoning_carrier_content,
     strip_stale_reasoning_history,
     unseal_reasoning_history,
@@ -107,6 +111,7 @@ from exp.runtime.gateway.native_responses import (
     continued_request,
     responses_envelope,
 )
+from exp.runtime.gateway.native_rung_policy import throttle_redial_budgets
 from exp.runtime.gateway.native_rungs import build_rung_dispatch
 from exp.runtime.gateway.native_settlement import (
     gateway_updating_failure,
@@ -139,37 +144,15 @@ from exp.runtime.openai_protocol.state import (
 _logger = logging.getLogger(__name__)
 
 
-def _log_reasoning_continuation_rejection(
-    authorization: AuthorizationSnapshot, stage: str, reason: object
-) -> None:
-    """Record why a reasoning-carrier continuation failed, for operators only.
-
-    The caller sees one opaque 400 (naming the differing bound claim would be an
-    authentic-continuation oracle), but an operator needs the exact reason to tell
-    a genuine tamper from a benign authority drift. Nothing here carries a
-    credential or the plaintext reasoning; the catalog-generation fields make a
-    cross-worker or post-republish drift obvious when diffed against the issuing
-    turn's admission log.
-    """
-    _logger.warning(
-        "reasoning carrier continuation rejected",
-        extra={
-            "operation": "native_reasoning_continuation",
-            "stage": stage,
-            "reason": str(reason),
-            "request_id": authorization.request_id,
-            "alias": authorization.alias,
-            "alias_revision_id": authorization.alias_revision_id,
-            "catalog_sha256": authorization.catalog_sha256,
-        },
-    )
-
-
 _REQUEST_TIMEOUT_SECONDS = 120.0
 
 
 class NativeControlPlane(
-    NativeBatchRelayMixin, NativeEmbeddingsMixin, NativeImagesMixin, NativeObservabilityMixin
+    NativeBatchRelayMixin,
+    NativeCountTokensMixin,
+    NativeEmbeddingsMixin,
+    NativeImagesMixin,
+    NativeObservabilityMixin,
 ):
     """Authority and accounting callbacks for the native data plane.
 
@@ -368,7 +351,7 @@ class NativeControlPlane(
                 request,
             )
         except Exception as exc:  # noqa: BLE001 - one public shape prevents an oracle.
-            _log_reasoning_continuation_rejection(authorization, "authenticate", exc)
+            log_reasoning_continuation_rejection(authorization, "authenticate", exc)
             error = invalid_field(
                 "messages.reasoning_content",
                 "'messages.reasoning_content' must be an authentic continuation for this route.",
@@ -393,7 +376,7 @@ class NativeControlPlane(
                 request,
             )
         except Exception as exc:  # noqa: BLE001 - one public shape prevents an oracle.
-            _log_reasoning_continuation_rejection(authorization, "unseal", exc)
+            log_reasoning_continuation_rejection(authorization, "unseal", exc)
             error = invalid_field(
                 "messages.reasoning_content",
                 "'messages.reasoning_content' must be an authentic continuation for this route.",
@@ -404,7 +387,7 @@ class NativeControlPlane(
             and verified_reasoning_route is not None
             and pinned_reasoning_route.deployment != verified_reasoning_route.deployment
         ):
-            _log_reasoning_continuation_rejection(
+            log_reasoning_continuation_rejection(
                 authorization, "route_pin", "authenticate and unseal resolved different deployments"
             )
             raise NativeBridgeError(
@@ -540,17 +523,36 @@ class NativeControlPlane(
             signers: list[GatewayDispatchSigner | None] = []
             dispatch_bindings: list[FrozenDispatchBinding | None] = []
             carrier_authorities: list[ReasoningCarrierAuthority | None] = []
-            for deployment, (profile, client) in zip(
-                route.deployments, resolved_wires, strict=True
+            # How long a throttle is worth waiting on per rung for THIS
+            # request (the pool's schedule scaled by the cache at stake),
+            # decided here so the data plane never waits on a rung whose
+            # throttle should fail over cold at once. `route` is the admitted
+            # route (dead and incompatible rungs already removed), so its last
+            # rung is the one with no cold alternative; the sticky binding is
+            # the one placement already read.
+            redial_budgets = throttle_redial_budgets(
+                self._accounting.loads,
+                route,
+                authorization.organization_id,
+                sticky_deployment_id=placement.sticky_deployment_id,
+            )
+            for deployment, (profile, client), budget in zip(
+                route.deployments, resolved_wires, redial_budgets, strict=True
             ):
+                # A reasoning-pinned route's fallback rung is frozen WITHOUT
+                # the pinned provider's sealed reasoning (it cannot unseal
+                # it), so a failover past the issuing rung dispatches the
+                # conversation minus that turn's thinking, never a foreign
+                # sealed block.
                 dispatch = build_rung_dispatch(
                     route,
                     deployment,
                     profile,
                     client,
-                    provider_request=provider_request,
+                    provider_request=rung_provider_request(route, deployment, provider_request),
                     public_request=public_request,
                     authorization=authorization,
+                    throttle_redial_budget=budget,
                 )
                 if dispatch.parallel_disclosure is not None:
                     parallel_disclosures.add(dispatch.parallel_disclosure)
@@ -656,6 +658,7 @@ class NativeControlPlane(
                 ),
                 affinity_fingerprint=placement.fingerprint,
                 sticky_preferred=placement.sticky_preferred,
+                throttle_redial_budgets=redial_budgets,
             )
         )
         response: JsonObject = {
@@ -672,7 +675,20 @@ class NativeControlPlane(
             "maximum_same_deployment_attempts": MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
             "refusal_failover": authorization.refusal_failover,
             "output_guardrail": bool(policy is not None and policy.output_checks),
+            "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
         }
+        if route.snapshot.throttle_redial is not None:
+            # The pool's frozen backoff-and-redial schedule; absent (not null) on
+            # pools that keep throttles failover-only: their admission is byte-identical.
+            response["throttle_redial"] = route.snapshot.throttle_redial.model_dump(mode="json")
+        if request.surface == GatewayApiSurface.MESSAGES:
+            # Display-only: what `message_start` shows as input when the
+            # upstream reports nothing before its final chunk. The ledger
+            # never reads it; settlement keeps the provider's meters.
+            response["input_token_estimate"] = counted_input_tokens(public_request)
+        if public_request.maximum_output_tokens is not None:
+            # The caller's cap: classifies an output-less, usage-less `stop` (capped -> length).
+            response["maximum_output_tokens"] = public_request.maximum_output_tokens
         if request.surface == GatewayApiSurface.RESPONSES:
             response["surface"] = "responses"
             response["envelope"] = responses_envelope(public_request)

@@ -172,6 +172,10 @@ pub struct UpstreamRelay {
     /// carrying only role/lifecycle scaffolding, so time-to-first-token is
     /// stamped on the first event that carries visible model output.
     first_token_at: Option<SystemTime>,
+    /// Tokens an earlier, refused dial of the same attempt was billed for,
+    /// folded into the first usage report this relay yields so the
+    /// reservation settles both dials' tokens as one.
+    carried_usage: Option<Usage>,
 }
 
 impl UpstreamRelay {
@@ -228,6 +232,7 @@ impl UpstreamRelay {
             first_byte_recorded: false,
             first_byte_deadline,
             first_token_at: None,
+            carried_usage: None,
         }
     }
 
@@ -259,6 +264,12 @@ impl UpstreamRelay {
     /// `parallel_tool_calls: false` to a wire without that control).
     pub fn set_serialize_tool_calls(&mut self, serialize: bool) {
         self.tool_serializer = serialize.then(ToolCallSerializer::new);
+    }
+
+    /// Carry the tokens a refused earlier dial of this attempt was billed
+    /// for; they join the first usage report this relay yields, once.
+    pub fn set_carried_usage(&mut self, carried: Option<Usage>) {
+        self.carried_usage = carried;
     }
 
     /// Enforce the caller's stop sequences on this relay's visible text.
@@ -321,7 +332,7 @@ impl UpstreamRelay {
         request_started: Instant,
     ) -> Result<Option<Event>, Failure> {
         loop {
-            if let Some(event) = self.ready.pop_front() {
+            if let Some(mut event) = self.ready.pop_front() {
                 // Every yielded event exits here, so this is the one place that
                 // stamps time-to-first-token: the first event carrying visible
                 // model output. Prefix events peeked during commit also passed
@@ -329,6 +340,14 @@ impl UpstreamRelay {
                 // whether it is later replayed from a prefix or drained live.
                 if self.first_token_at.is_none() && event.is_output_token() {
                     self.first_token_at = Some(SystemTime::now());
+                }
+                if let (Event::Usage(usage), Some(carried)) =
+                    (&mut event, self.carried_usage.as_ref())
+                {
+                    if usage.has_token_counts() {
+                        *usage = fold_usage(carried, usage.clone());
+                        self.carried_usage = None;
+                    }
                 }
                 return Ok(Some(event));
             }
@@ -349,17 +368,21 @@ impl UpstreamRelay {
             };
             let chunk = match tokio::time::timeout(bound, self.stream.next()).await {
                 Ok(Some(Ok(chunk))) => chunk,
-                Ok(Some(Err(_))) => {
+                Ok(Some(Err(error))) => {
                     // A transport break mid-stream: recover a Gemini partial as
                     // Incomplete, otherwise surface the retryable transport
                     // failure. Pre-content it stays a retryable transport error
-                    // either way.
+                    // either way. The engine's account of the break (never
+                    // provider text) rides to the ledger.
                     self.recover_or_fail(
                         Failure::new(
                             FailureClass::Transport,
                             "provider transport failed; retry the request",
                         )
-                        .with_retry(true, true),
+                        .with_retry(true, true)
+                        .with_provider_detail(Some(
+                            crate::upstream::transport_error_detail("stream", &error),
+                        )),
                     )?;
                     continue;
                 }
@@ -390,13 +413,22 @@ impl UpstreamRelay {
                             }
                         }
                     }
-                    // A Gemini stream may end cleanly after its last content
-                    // frame without a finishReason frame; synthesize the
-                    // terminal completion (folding the last-seen usage) so a
-                    // real answer is not thrown away as malformed. A stream
-                    // that produced no content stays terminal-less and the
-                    // caller still synthesizes `ended_without_terminal`.
-                    self.pending.extend(self.normalizer.on_stream_end());
+                    // A stream may end cleanly without a terminal frame: a
+                    // Gemini stream after its last content frame (no
+                    // finishReason), or an OpenAI-compatible stream whose
+                    // finish_reason chunk arrived without a `[DONE]` sentinel
+                    // (Azure Foundry's DeepSeek content-filter ending). The
+                    // normalizer synthesizes the terminal the dialect already
+                    // declared so a real answer or refusal is not thrown away
+                    // as malformed; a stream that declared nothing stays
+                    // terminal-less and the caller still synthesizes
+                    // `ended_without_terminal`.
+                    match self.normalizer.on_stream_end() {
+                        Ok(events) => self.pending.extend(events),
+                        Err(failure) => {
+                            self.recover_or_fail(failure)?;
+                        }
+                    }
                     continue;
                 }
                 Err(_) => {
@@ -832,6 +864,12 @@ mod h2_abort_tests {
         );
         assert_eq!(failure.failure_class, FailureClass::Transport);
         assert!(failure.failover_eligible, "an aborted rung fails over");
+        // The engine's account of the mid-stream break rides to the ledger.
+        let detail = failure
+            .provider_detail
+            .as_deref()
+            .expect("transport detail");
+        assert!(detail.starts_with("stream "), "{detail}");
     }
 
     #[tokio::test]
@@ -844,5 +882,25 @@ mod h2_abort_tests {
         );
         assert_eq!(failure.failure_class, FailureClass::Transport);
         assert!(failure.failover_eligible);
+    }
+}
+
+/// The tokens of two physical dials of one attempt, summed leg by leg; a leg
+/// neither reported stays absent.
+fn fold_usage(carried: &Usage, current: Usage) -> Usage {
+    let add = |a: Option<u64>, b: Option<u64>| match (a, b) {
+        (Some(a), Some(b)) => Some(a + b),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
+    Usage {
+        input_tokens: add(carried.input_tokens, current.input_tokens),
+        output_tokens: add(carried.output_tokens, current.output_tokens),
+        cached_input_tokens: add(carried.cached_input_tokens, current.cached_input_tokens),
+        cache_creation_input_tokens: add(
+            carried.cache_creation_input_tokens,
+            current.cache_creation_input_tokens,
+        ),
+        reasoning_tokens: add(carried.reasoning_tokens, current.reasoning_tokens),
     }
 }

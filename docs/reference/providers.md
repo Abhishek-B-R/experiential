@@ -94,11 +94,12 @@ required price or limit remains unknown.
 | `supports_structured_output` | boolean | The alias accepts structured output |
 | `maximum_output_tokens` | positive integer | Declared output ceiling |
 | `context_window_tokens` | positive integer | Declared context window, only when the host publishes one |
-| `pricing.input_micro_usd_per_million_tokens` | integer `>= 0` | Configured input price in micro-USD per million tokens |
-| `pricing.output_micro_usd_per_million_tokens` | integer `>= 0` | Configured output price in micro-USD per million tokens |
-| `pricing.cached_input_micro_usd_per_million_tokens` | integer `>= 0` | Configured cached-input price in micro-USD per million tokens |
+| `pricing.input_nano_usd_per_million_tokens` | integer `>= 0` | Configured input price in nano-USD per million tokens |
+| `pricing.output_nano_usd_per_million_tokens` | integer `>= 0` | Configured output price in nano-USD per million tokens |
+| `pricing.cached_input_nano_usd_per_million_tokens` | integer `>= 0` | Configured cached-input price in nano-USD per million tokens |
 
-Micro-USD prices convert to catalog USD-per-million-token prices by dividing by `1_000_000`.
+Nano-USD prices convert to catalog USD-per-million-token prices by dividing by `1_000_000_000`
+(one nano-USD is a billionth of a dollar; `1_250_000_000` is $1.25 per million tokens).
 When a trusted third-party compatible host publishes these fields, completion, tool,
 structured-output, and input/output price declarations can assign world-model and judge roles
 without a questionnaire. Router-candidate setup still requires a published or
@@ -254,3 +255,35 @@ a secret value. A missing Bedrock region lists the AWS resolution order. Azure e
 mismatches name `AZURE_OPENAI_ENDPOINT`, not the key. A malformed user-data credential file
 fails closed and tells the operator to move or delete it, then run `exp config providers`.
 Malformed provider responses fail closed and do not write partial catalog or evidence artifacts.
+
+## Novita error classification (2026-09-16)
+
+Novita is an OpenAI-compatible reseller whose gpt-5.6 lanes front per-region
+Azure OpenAI deployments. Three of its error shapes needed engine rules beyond
+the shared envelope reader (`crate::error_envelope`), all pinned in
+`upstream_reseller_tests.rs`:
+
+- **A 4xx that says the ACCOUNT cannot pay is `provider_quota`.** A drained
+  prepaid balance answers `400 "Insufficient quota available for instant
+  inference"`; a status-only read filed it as the caller's `invalid_request`.
+  A pre-stream 4xx whose code is a quota token or whose sentence carries
+  unambiguous funding wording (`rejected_by_account_quota`: insufficient
+  quota/balance/credits/funds, not enough balance, exceeded your current
+  quota — no bare "billing") takes the quota class, fails over, and keeps the
+  sentence ledger-only.
+- **A relay decode failure is unwrapped.** Novita's Responses relay sometimes
+  cannot decode the UPSTREAM error it received (`failed to decode error
+  response: json: cannot unmarshal number into Go struct field
+  ResponseError.error.code of type string, raw: {…}`) and answers its own 400
+  with the upstream document embedded after `raw: `. Pre-stream and in-stream
+  the engine reads that document (`relayed_decode_failure`; a zero code is
+  "no code", a truncated document still yields its message), classifies by
+  the UPSTREAM code and sentence (a relayed 429 throttles and fails over; a
+  relayed caller error keeps this status's caller class), and relays the
+  upstream sentence ("Exceeded maximum number of images (50) allowed in the
+  request.") instead of the decoder's noise.
+- **`reason` tokens classify** (`INVALID_REQUEST_BODY` generic,
+  `MODEL_NOT_FOUND` → lane policy, `NOT_ENOUGH_BALANCE` under 403 →
+  `provider_quota`, `RATE_LIMIT_EXCEEDED` / `TOKEN_LIMIT_EXCEEDED` throttle,
+  `FAILED_TO_AUTH` / `ACCESS_DENY` authenticate), see the architecture
+  reference.

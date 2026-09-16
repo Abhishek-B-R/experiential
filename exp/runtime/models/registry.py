@@ -535,6 +535,12 @@ class RuntimeModelCatalog:
             http_kwargs["reasoning_output_exposed"] = _supports_flag(
                 capabilities, "reasoning_output_exposed"
             )
+            http_kwargs["reasoning_content_native"] = _supports_flag(
+                capabilities, "reasoning_content_native"
+            )
+            http_kwargs["system_messages_leading_only"] = _supports_flag(
+                capabilities, "system_messages_leading_only"
+            )
         http_client = factory(**http_kwargs)
         embedding_client = (
             http_client

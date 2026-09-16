@@ -46,6 +46,51 @@ fleet-wide pin bump, then the catalog opt-in.
 """
 
 
+class GatewayThrottleRedialPolicy(ContractModel):
+    """Authored per-pool backoff-and-redial schedule for provider throttles.
+
+    When a pool authors this policy, a throttle (429 or overload) on a rung
+    whose warm cache is worth waiting for is no longer failed over or
+    surfaced on its first occurrence: the data plane waits with exponential
+    backoff and re-dials the SAME rung, up to ``max_attempts`` redials per
+    rung, before the ladder advances to the next certified rung, and a
+    throttle surfaces to the caller only once every rung is exhausted. Each
+    redial waits ``base_delay_ms * 2**n`` milliseconds (``n`` counting from
+    zero, equal-jittered, capped at ``max_delay_ms``), or the provider's own
+    ``Retry-After`` when it is longer and still within ``max_delay_ms``. A
+    ``Retry-After`` above ``max_delay_ms`` means the rung is out for longer
+    than the pool is willing to wait, so the ladder advances instead of
+    waiting. A wait never exceeds the rung's first-byte allowance or what
+    the request deadline leaves for the redial itself.
+
+    Unauthored (``None`` on the pool) keeps the historical behavior exactly:
+    a throttle is failover-only and the pool's ``failover_mode`` and
+    ``throttle_cache_threshold`` decide between surfacing and cold failover.
+    Additive-defaulted like every dispatch control: an unauthored pool
+    contributes zero identity bytes under the exclude-defaults digest.
+    """
+
+    max_attempts: int = Field(ge=1, le=6)
+    """Redials of the throttled rung after its throttled dispatch, per rung.
+
+    Every redial is a durably reserved attempt row disclosed as
+    ``throttle_backoff``; the request's hard total attempt cap still bounds
+    the whole ladder, so a deep ladder with many redials per rung may not
+    reach its last rung.
+    """
+    base_delay_ms: int = Field(ge=1, le=60_000)
+    """Wait before the first redial, in milliseconds; each later redial doubles it."""
+    max_delay_ms: int = Field(ge=1, le=120_000)
+    """Ceiling on any single wait, in milliseconds, including a provider ``Retry-After``."""
+
+    @model_validator(mode="after")
+    def _require_ordered_delays(self) -> GatewayThrottleRedialPolicy:
+        """Reject a ceiling below the first wait, which would make every redial impossible."""
+        if self.max_delay_ms < self.base_delay_ms:
+            raise ValueError("max_delay_ms must be at least base_delay_ms")
+        return self
+
+
 class GatewayRungDispatchPolicy(ContractModel):
     """Authored per-rung dispatch controls: admission bounds, rates, and affinity.
 

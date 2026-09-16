@@ -14,6 +14,7 @@ from exp.common.models.catalog import (
     GatewayDeploymentMetadata,
     GatewayRungDispatchPolicy,
 )
+from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
 from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
 from exp.runtime.gateway.contracts import (
@@ -139,7 +140,7 @@ class _RecordingLedger:
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
-        maximum_cost_micro_usd: int | None = None,
+        maximum_cost_nano_usd: int | None = None,
         reserved_input_tokens: int | None = None,
         reserved_output_tokens: int | None = None,
         route_reason: str | None = None,
@@ -148,7 +149,7 @@ class _RecordingLedger:
         preferred_deployment: ExactModelDeployment | None = None,
     ) -> str:
         """Reserve one recorded attempt row, honoring scripted rejections."""
-        del snapshot, maximum_cost_micro_usd, route_reason, fallback_reason
+        del snapshot, maximum_cost_nano_usd, fallback_reason
         scope = self.budget_rejections.get(deployment.deployment_id)
         if scope is not None:
             raise BudgetReservationRejected(scope_kind=scope, reason="scripted")
@@ -162,6 +163,7 @@ class _RecordingLedger:
                 "route_depth": route_depth,
                 "reserved_input_tokens": reserved_input_tokens,
                 "reserved_output_tokens": reserved_output_tokens,
+                "route_reason": route_reason,
                 "dispatch_reason": dispatch_reason,
                 "preferred_deployment_id": (
                     None if preferred_deployment is None else preferred_deployment.deployment_id
@@ -254,6 +256,7 @@ def _start(
     current_depth: int | None = None,
     failure: JsonObject | None = None,
     request_id: str = "request-one",
+    throttle_backoff: bool = False,
 ) -> JsonObject:
     """Call one start_attempt with the data plane's wire shape."""
     return json.loads(
@@ -264,6 +267,7 @@ def _start(
                     "attempt_ordinal": ordinal,
                     "current_depth": current_depth,
                     "failure": failure,
+                    "throttle_backoff": throttle_backoff,
                 }
             )
         )
@@ -549,11 +553,22 @@ def _admit(
     organization_id: str = "organization-one",
     weight: int = 1,
     failover_mode: FailoverMode = "maximize_availability",
+    throttle_cache_threshold: float | None = None,
+    throttle_redial: GatewayThrottleRedialPolicy | None = None,
     affinity_fingerprint: bytes | None = None,
     sticky_preferred: bool = False,
+    reasoning_pinned_deployment_id: str | None = None,
+    catalog_sha256: str = _DIGEST,
 ) -> InflightRequest:
-    """Register one admitted request over the given rung ladder."""
-    authorization = _authorization(_DIGEST).model_copy(
+    """Register one admitted request over the given rung ladder.
+
+    ``reasoning_pinned_deployment_id`` admits the request as a reasoning
+    continuation pinned to that rung (route reason ``reasoning_continuation``).
+    ``catalog_sha256`` places the request under another catalog revision: its
+    health view (circuits, throttle windows) is isolated from the default
+    revision's while the physical rung load registry is shared.
+    """
+    authorization = _authorization(catalog_sha256).model_copy(
         update={
             "request_id": request_id,
             "organization_id": organization_id,
@@ -568,10 +583,15 @@ def _admit(
             pool_id="pool-one",
             deployment_ids=tuple(item.deployment_id for item in deployments),
             failover_mode=failover_mode,
+            throttle_cache_threshold=throttle_cache_threshold,
+            throttle_redial=throttle_redial,
         ),
         deployment=deployments[0],
         fallback_deployments=deployments[1:],
-        route_reason="direct",
+        route_reason=(
+            "direct" if reasoning_pinned_deployment_id is None else "reasoning_continuation"
+        ),
+        reasoning_pinned_deployment_id=reasoning_pinned_deployment_id,
     )
     entry = InflightRequest(
         authorization=authorization,
@@ -857,11 +877,11 @@ def test_deployment_priced_for_service_tier_overrides_only_for_a_carried_tier() 
         capabilities_sha256="c" * 64,
         gateway=GatewayDeploymentMetadata(
             prices=GatewayTokenPrices(
-                input_micro_usd_per_million_tokens=1_000_000,
-                output_micro_usd_per_million_tokens=4_000_000,
+                input_nano_usd_per_million_tokens=1_000_000,
+                output_nano_usd_per_million_tokens=4_000_000,
                 flex=GatewayServiceTierPrices(
-                    input_micro_usd_per_million_tokens=500_000,
-                    output_micro_usd_per_million_tokens=2_000_000,
+                    input_nano_usd_per_million_tokens=500_000,
+                    output_nano_usd_per_million_tokens=2_000_000,
                 ),
             )
         ),
@@ -869,8 +889,8 @@ def test_deployment_priced_for_service_tier_overrides_only_for_a_carried_tier() 
 
     flex = deployment_priced_for_service_tier(deployment, "flex", forwards_tier=True)
     assert flex is not deployment
-    assert flex.gateway.prices.input_micro_usd_per_million_tokens == 500_000
-    assert flex.gateway.prices.output_micro_usd_per_million_tokens == 2_000_000
+    assert flex.gateway.prices.input_nano_usd_per_million_tokens == 500_000
+    assert flex.gateway.prices.output_nano_usd_per_million_tokens == 2_000_000
     # Identity and everything else is preserved on the copy.
     assert flex.deployment_id == "d1" and flex.exact_model_id == "exact-one"
 
@@ -916,7 +936,7 @@ def test_start_attempt_reprices_only_when_the_selected_depth_forwards_the_tier()
             deployment: ExactModelDeployment,
             attempt_ordinal: int,
             route_depth: int,
-            maximum_cost_micro_usd: int | None = None,
+            maximum_cost_nano_usd: int | None = None,
             reserved_input_tokens: int | None = None,
             reserved_output_tokens: int | None = None,
             route_reason: str | None = None,
@@ -926,14 +946,14 @@ def test_start_attempt_reprices_only_when_the_selected_depth_forwards_the_tier()
         ) -> str:
             """Record the reserved input rate, then reserve as the base fake does."""
             self.reserved_input_micro.append(
-                deployment.gateway.prices.input_micro_usd_per_million_tokens
+                deployment.gateway.prices.input_nano_usd_per_million_tokens
             )
             return super().start_attempt(
                 snapshot=snapshot,
                 deployment=deployment,
                 attempt_ordinal=attempt_ordinal,
                 route_depth=route_depth,
-                maximum_cost_micro_usd=maximum_cost_micro_usd,
+                maximum_cost_nano_usd=maximum_cost_nano_usd,
                 reserved_input_tokens=reserved_input_tokens,
                 reserved_output_tokens=reserved_output_tokens,
                 route_reason=route_reason,
@@ -947,11 +967,11 @@ def test_start_attempt_reprices_only_when_the_selected_depth_forwards_the_tier()
             "gateway": GatewayDeploymentMetadata(
                 capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
                 prices=GatewayTokenPrices(
-                    input_micro_usd_per_million_tokens=1_000_000,
-                    output_micro_usd_per_million_tokens=4_000_000,
+                    input_nano_usd_per_million_tokens=1_000_000,
+                    output_nano_usd_per_million_tokens=4_000_000,
                     flex=GatewayServiceTierPrices(
-                        input_micro_usd_per_million_tokens=500_000,
-                        output_micro_usd_per_million_tokens=2_000_000,
+                        input_nano_usd_per_million_tokens=500_000,
+                        output_nano_usd_per_million_tokens=2_000_000,
                     ),
                 ),
             )
@@ -1063,6 +1083,55 @@ class TestRateLimitSheds:
         assert ledger.started[1]["preferred_deployment_id"] == "deployment-a"
         assert registry.rung_admission_counters() == (1, 0)
         assert registry.rung_rate_counters() == (1, 0)
+
+    def test_rate_shed_force_admits_a_reasoning_pinned_rung_until_a_real_failure(self) -> None:
+        """A pinned continuation never spills to a stripped fallback on a policy shed.
+
+        The issuing rung's per-worker rate window is already used by another
+        request; the continuation is still force-admitted THERE
+        (``saturated_overflow``), because its fallbacks run without the
+        request's thinking and a rate fact trips under ordinary load. A real
+        failover-eligible throttle on that attempt then advances to the
+        fallback, recorded as ``reasoning_continuation_failover``.
+        """
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = _rated_pair(requests_per_minute=1)
+        _admit(registry, deployments, request_id="request-1")
+        _admit(
+            registry,
+            deployments,
+            request_id="request-2",
+            reasoning_pinned_deployment_id="deployment-a",
+        )
+        assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
+        kept = _start(registry, ordinal=0, request_id="request-2")
+        assert kept["route_depth"] == 0
+        assert ledger.started[1]["deployment_id"] == "deployment-a"
+        assert ledger.started[1]["dispatch_reason"] == "saturated_overflow"
+        assert ledger.started[1]["route_reason"] == "reasoning_continuation"
+        assert registry.rung_admission_counters() == (1, 1)
+        throttled: JsonObject = {
+            "failure_class": "throttled",
+            "safe_message": "provider throttled the request",
+            "retryable_same_deployment": False,
+            "failover_eligible": True,
+        }
+        _settle(
+            registry,
+            attempt_id=str(kept["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=throttled,
+            request_id="request-2",
+        )
+        advanced = _start(
+            registry, ordinal=1, current_depth=0, failure=throttled, request_id="request-2"
+        )
+        assert advanced["route_depth"] == 1
+        assert ledger.started[2]["deployment_id"] == "deployment-b"
+        assert ledger.started[2]["route_reason"] == "reasoning_continuation_failover"
+        assert ledger.started[2]["dispatch_reason"] != "saturated_overflow"
 
     def test_token_rate_counts_the_worst_case_reservation(self) -> None:
         """An over-cap request bursts into an empty window; the next one spills.
@@ -1568,3 +1637,581 @@ class TestFreshSessionSpillDispatch:
             affinity_fingerprint=b"warm-conversation",
         )
         assert _start(registry, ordinal=0, request_id="request-3")["route_depth"] == 0
+
+
+_THROTTLE: JsonObject = {
+    "failure_class": "throttled",
+    "safe_message": "provider throttled the request",
+    "failover_eligible": True,
+}
+
+
+def _settle_with_usage(
+    registry: NativeAttemptAccounting,
+    *,
+    attempt_id: str,
+    request_id: str,
+    cached_input_tokens: int,
+    input_tokens: int,
+) -> None:
+    """Settle one completed attempt with observed usage, finalizing its request."""
+    registry.settle(
+        json.dumps(
+            {
+                "request_id": request_id,
+                "attempt_id": attempt_id,
+                "outcome": "completed",
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "cached_input_tokens": cached_input_tokens,
+                    "output_tokens": 5,
+                },
+                "tool_names": [],
+                "failure": None,
+                "finalize": True,
+                "opened": True,
+            }
+        )
+    )
+
+
+class TestThrottleCacheThreshold:
+    """The per-request cache-stakes throttle decision and its disclosures."""
+
+    def test_cold_failover_discloses_the_throttled_rung_on_the_next_attempt(self) -> None:
+        """Below the threshold a throttle fails over, disclosed as throttle_failover_cold.
+
+        The organization has no cache evidence on the lead rung, so the
+        fraction reads 0 and the request advances; the cold attempt names the
+        throttled warm rung as its bypassed preferred counterfactual.
+        """
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = (
+            _deployment("deployment-a", connection_sha256="b" * 64),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        _admit(
+            registry,
+            deployments,
+            request_id="request-1",
+            failover_mode="maximize_cache",
+            throttle_cache_threshold=0.5,
+        )
+        first = _start(registry, ordinal=0, request_id="request-1")
+        assert first["route_depth"] == 0
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-1",
+        )
+        failover = _start(
+            registry, ordinal=1, current_depth=0, failure=_THROTTLE, request_id="request-1"
+        )
+        assert failover["route_depth"] == 1
+        assert ledger.started[0]["dispatch_reason"] is None
+        assert ledger.started[1]["dispatch_reason"] == "throttle_failover_cold"
+        assert ledger.started[1]["preferred_deployment_id"] == "deployment-a"
+        assert registry.throttle_cache_counters() == (0, 1, 0, 0)
+
+    def test_warm_cache_surfaces_the_throttle_instead_of_failing_over(self) -> None:
+        """At or above the threshold the ladder ends and the caller gets the throttle.
+
+        The organization's earlier settled traffic on the lead rung taught the
+        worker a cached fraction of 0.9, so under a 0.5 threshold the throttle
+        surfaces even though the pool's mode (availability) would fail over.
+        """
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = (
+            _deployment("deployment-a", connection_sha256="b" * 64),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        _admit(registry, deployments, request_id="request-warm", throttle_cache_threshold=0.5)
+        warm = _start(registry, ordinal=0, request_id="request-warm")
+        _settle_with_usage(
+            registry,
+            attempt_id=str(warm["attempt_id"]),
+            request_id="request-warm",
+            cached_input_tokens=900,
+            input_tokens=1_000,
+        )
+        assert registry.loads.cached_fraction(("deployment-a", "b" * 64), "organization-one") == (
+            pytest.approx(0.9)
+        )
+
+        _admit(
+            registry,
+            deployments,
+            request_id="request-1",
+            failover_mode="maximize_availability",
+            throttle_cache_threshold=0.5,
+        )
+        first = _start(registry, ordinal=0, request_id="request-1")
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-1",
+        )
+        surfaced = _start(
+            registry, ordinal=1, current_depth=0, failure=_THROTTLE, request_id="request-1"
+        )
+        assert surfaced["exhausted"] is True
+        exhaustion = surfaced["failure"]
+        assert isinstance(exhaustion, dict)
+        assert exhaustion["failure_class"] == "throttled"
+        # No cold attempt was reserved; the request terminalized as throttled.
+        assert [row["deployment_id"] for row in ledger.started] == ["deployment-a", "deployment-a"]
+        assert ledger.finished_requests[-1].failure_class == GatewayFailureClass.THROTTLED
+        assert registry.throttle_cache_counters() == (1, 0, 0, 0)
+
+    def test_another_organizations_cache_never_counts(self) -> None:
+        """The fraction is scoped to the requesting organization on the throttled rung."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = (
+            _deployment("deployment-a", connection_sha256="b" * 64),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        registry.loads.record_settle(
+            ("deployment-a", "b" * 64),
+            "organization-other",
+            cached_tokens=1_000,
+            input_tokens=1_000,
+        )
+        _admit(registry, deployments, request_id="request-1", throttle_cache_threshold=0.5)
+        first = _start(registry, ordinal=0, request_id="request-1")
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-1",
+        )
+        failover = _start(
+            registry, ordinal=1, current_depth=0, failure=_THROTTLE, request_id="request-1"
+        )
+        assert failover["route_depth"] == 1
+        assert ledger.started[1]["dispatch_reason"] == "throttle_failover_cold"
+
+    def test_no_threshold_keeps_legacy_decisions_and_records_nothing(self) -> None:
+        """Unauthored pools decide by mode as before: no disclosure, no counters."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = (
+            _deployment("deployment-a", connection_sha256="b" * 64),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        # Even a fully warm cache changes nothing without a threshold.
+        registry.loads.record_settle(
+            ("deployment-a", "b" * 64), "organization-one", cached_tokens=1_000, input_tokens=1_000
+        )
+        _admit(registry, deployments, request_id="request-1", failover_mode="maximize_availability")
+        first = _start(registry, ordinal=0, request_id="request-1")
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-1",
+        )
+        failover = _start(
+            registry, ordinal=1, current_depth=0, failure=_THROTTLE, request_id="request-1"
+        )
+        assert failover["route_depth"] == 1
+        assert all(row["dispatch_reason"] is None for row in ledger.started)
+
+        _admit(registry, deployments, request_id="request-2", failover_mode="maximize_cache")
+        first = _start(registry, ordinal=0, request_id="request-2")
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-2",
+        )
+        surfaced = _start(
+            registry, ordinal=1, current_depth=0, failure=_THROTTLE, request_id="request-2"
+        )
+        assert surfaced["exhausted"] is True
+        assert registry.throttle_cache_counters() == (0, 0, 0, 0)
+
+    def test_cold_decision_that_exhausts_the_ladder_counts_no_failover(self) -> None:
+        """A below-threshold throttle with nothing claimable ends as a plain exhausted throttle.
+
+        The decision was to fail over, but no fallback attempt was reserved,
+        so neither disposition is counted and no attempt discloses a cold
+        failover: the metric reports only failovers that happened.
+        """
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = (
+            _deployment("deployment-a", connection_sha256="b" * 64),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        entry = _admit(registry, deployments, request_id="request-1", throttle_cache_threshold=0.5)
+        # The only fallback rung sits inside its own provider throttle window.
+        registry.health.failed(
+            deployment_health_key(entry.authorization, deployments[1]),
+            GatewayFailure(
+                failure_class=GatewayFailureClass.THROTTLED,
+                safe_message="provider throttled the request",
+                retry_after_seconds=30,
+            ),
+        )
+        first = _start(registry, ordinal=0, request_id="request-1")
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-1",
+        )
+        exhausted = _start(
+            registry, ordinal=1, current_depth=0, failure=_THROTTLE, request_id="request-1"
+        )
+        assert exhausted["exhausted"] is True
+        assert len(ledger.started) == 1
+        assert registry.throttle_cache_counters() == (0, 0, 0, 0)
+
+
+class TestThrottleRedial:
+    """Post-backoff redials of a throttled rung and their disclosures."""
+
+    def test_backoff_redials_reserve_the_same_rung_then_the_cold_advance_is_disclosed(
+        self,
+    ) -> None:
+        """Each redial is its own attempt row on the warm rung; the spent budget fails over."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = (
+            _deployment("deployment-a", connection_sha256="b" * 64),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        _admit(
+            registry,
+            deployments,
+            request_id="request-1",
+            failover_mode="maximize_cache",
+            throttle_redial=GatewayThrottleRedialPolicy(
+                max_attempts=2, base_delay_ms=100, max_delay_ms=2_000
+            ),
+        )
+        first = _start(registry, ordinal=0, request_id="request-1")
+        assert first["route_depth"] == 0
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-1",
+        )
+        # The data plane waited the backoff: two redials of the throttled rung,
+        # each reserved through the rung's own throttle window.
+        for ordinal in (1, 2):
+            redial = _start(
+                registry,
+                ordinal=ordinal,
+                current_depth=0,
+                failure=_THROTTLE,
+                request_id="request-1",
+                throttle_backoff=True,
+            )
+            assert redial["route_depth"] == 0
+            assert ledger.started[ordinal]["dispatch_reason"] == "throttle_backoff"
+            assert ledger.started[ordinal]["preferred_deployment_id"] is None
+            _settle(
+                registry,
+                attempt_id=str(redial["attempt_id"]),
+                outcome="failed",
+                finalize=False,
+                failure=_THROTTLE,
+                request_id="request-1",
+            )
+        # The budget is spent: the data plane no longer asks to wait, and
+        # the throttle advances cold under maximize_cache instead of surfacing.
+        cold = _start(
+            registry, ordinal=3, current_depth=0, failure=_THROTTLE, request_id="request-1"
+        )
+        assert cold["route_depth"] == 1
+        assert ledger.started[3]["dispatch_reason"] == "throttle_failover_cold"
+        assert ledger.started[3]["preferred_deployment_id"] == "deployment-a"
+        assert [row["attempt_ordinal"] for row in ledger.started] == [0, 1, 2, 3]
+        assert registry.throttle_cache_counters() == (0, 1, 2, 0)
+
+    def test_backoff_redial_is_force_admitted_past_the_warm_rungs_own_rate_shed(self) -> None:
+        """A paid-for redial stays on the throttled rung when its rate window would shed it.
+
+        The warm rung authors ``requests_per_minute: 1`` per worker and this
+        request's first attempt already spent that window before the provider
+        throttled it. After the data plane waited the pool's backoff, the
+        redial is admitted THERE anyway, disclosed ``throttle_backoff`` with no
+        counterfactual (never ``rate_limit`` on the cold rung, never
+        ``saturated_overflow``): the per-minute window is pacing the redial
+        already paid on the provider's 429 clock. The shed is still counted,
+        and the forced redial has its own worker counter. Once the redial
+        budget is spent the next throttle advances cold as
+        ``throttle_failover_cold`` exactly as before.
+        """
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = _rated_pair(requests_per_minute=1)
+        _admit(
+            registry,
+            deployments,
+            request_id="request-1",
+            failover_mode="maximize_cache",
+            throttle_redial=GatewayThrottleRedialPolicy(
+                max_attempts=1, base_delay_ms=100, max_delay_ms=2_000
+            ),
+        )
+        first = _start(registry, ordinal=0, request_id="request-1")
+        assert first["route_depth"] == 0
+        assert ledger.started[0]["dispatch_reason"] is None
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-1",
+        )
+        redial = _start(
+            registry,
+            ordinal=1,
+            current_depth=0,
+            failure=_THROTTLE,
+            request_id="request-1",
+            throttle_backoff=True,
+        )
+        assert redial["route_depth"] == 0
+        assert ledger.started[1]["deployment_id"] == "deployment-a"
+        assert ledger.started[1]["dispatch_reason"] == "throttle_backoff"
+        assert ledger.started[1]["preferred_deployment_id"] is None
+        # The rate shed happened and is counted as one; the forced admission is
+        # a backoff redial, not a saturated overflow.
+        assert registry.rung_admission_counters() == (1, 0)
+        assert registry.rung_rate_counters() == (1, 0)
+        assert registry.throttle_cache_counters() == (0, 0, 1, 1)
+        _settle(
+            registry,
+            attempt_id=str(redial["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-1",
+        )
+        cold = _start(
+            registry, ordinal=2, current_depth=0, failure=_THROTTLE, request_id="request-1"
+        )
+        assert cold["route_depth"] == 1
+        assert ledger.started[2]["deployment_id"] == "deployment-b"
+        assert ledger.started[2]["dispatch_reason"] == "throttle_failover_cold"
+        assert ledger.started[2]["preferred_deployment_id"] == "deployment-a"
+        assert [row["attempt_ordinal"] for row in ledger.started] == [0, 1, 2]
+        assert registry.throttle_cache_counters() == (0, 1, 1, 1)
+
+    def test_a_non_redial_rate_shed_after_a_real_failure_still_spills_sideways(self) -> None:
+        """Only the redialed rung is kept; a shed elsewhere on a failed ladder spills as today.
+
+        Rung 1 authors ``requests_per_minute: 1`` and another request already
+        holds its window. This request's throttle on rung 0 advances cold with a
+        spent budget; the shed on rung 1 is not a redial of rung 1, so it spills
+        on to rung 2. The disclosure names the first bypass of the walk, the
+        cold advance past the throttled rung 0, and the shed is counted.
+        """
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = (
+            _deployment("deployment-a", connection_sha256="b" * 64),
+            _deployment(
+                "deployment-b",
+                connection_sha256="c" * 64,
+                dispatch=GatewayRungDispatchPolicy(requests_per_minute=1),
+            ),
+            _deployment("deployment-c", connection_sha256="d" * 64),
+        )
+        _admit(registry, (deployments[1],), request_id="request-other")
+        assert _start(registry, ordinal=0, request_id="request-other")["route_depth"] == 0
+        _admit(
+            registry,
+            deployments,
+            request_id="request-1",
+            failover_mode="maximize_cache",
+            throttle_redial=GatewayThrottleRedialPolicy(
+                max_attempts=1, base_delay_ms=100, max_delay_ms=2_000
+            ),
+        )
+        first = _start(registry, ordinal=0, request_id="request-1")
+        assert first["route_depth"] == 0
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-1",
+        )
+        redial = _start(
+            registry,
+            ordinal=1,
+            current_depth=0,
+            failure=_THROTTLE,
+            request_id="request-1",
+            throttle_backoff=True,
+        )
+        assert redial["route_depth"] == 0
+        _settle(
+            registry,
+            attempt_id=str(redial["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-1",
+        )
+        spilled = _start(
+            registry, ordinal=2, current_depth=0, failure=_THROTTLE, request_id="request-1"
+        )
+        assert spilled["route_depth"] == 2
+        assert ledger.started[3]["deployment_id"] == "deployment-c"
+        assert ledger.started[3]["dispatch_reason"] == "throttle_failover_cold"
+        assert ledger.started[3]["preferred_deployment_id"] == "deployment-a"
+        assert registry.rung_admission_counters() == (1, 0)
+        assert registry.rung_rate_counters() == (1, 0)
+        assert registry.throttle_cache_counters() == (0, 1, 1, 0)
+
+    def test_backoff_redial_shed_by_the_concurrency_bound_spills_sideways(self) -> None:
+        """The hard per-worker bound stays hard for a redial; only the rate window is pacing.
+
+        Rung 0 authors ``concurrency_bound: 1``. This request's first attempt
+        held the slot until the provider throttled it; a request under another
+        catalog revision (its own health view, the same physical rung) then
+        took the slot. The post-backoff redial is shed ``queue_bound`` and
+        spills sideways to rung 1 exactly like any other dispatch: the bound
+        protects the provider connection and the other tenants on the rung,
+        so no redial force-admits past it, and nothing is counted as a backoff
+        redial. Only the redial's own accounting deltas are asserted: the
+        slot-holder's admission on a single-rung ladder is not under test.
+        """
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = _bounded_pair(1)
+        _admit(
+            registry,
+            deployments,
+            request_id="request-1",
+            failover_mode="maximize_cache",
+            throttle_redial=GatewayThrottleRedialPolicy(
+                max_attempts=1, base_delay_ms=100, max_delay_ms=2_000
+            ),
+        )
+        first = _start(registry, ordinal=0, request_id="request-1")
+        assert first["route_depth"] == 0
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-1",
+        )
+        _admit(
+            registry,
+            (deployments[0],),
+            request_id="request-other",
+            organization_id="organization-two",
+            catalog_sha256="f" * 64,
+        )
+        assert _start(registry, ordinal=0, request_id="request-other")["route_depth"] == 0
+        sheds_before, overflows_before = registry.rung_admission_counters()
+        redial = _start(
+            registry,
+            ordinal=1,
+            current_depth=0,
+            failure=_THROTTLE,
+            request_id="request-1",
+            throttle_backoff=True,
+        )
+        assert redial["route_depth"] == 1
+        assert ledger.started[2]["deployment_id"] == "deployment-b"
+        assert ledger.started[2]["dispatch_reason"] == "queue_bound"
+        assert ledger.started[2]["preferred_deployment_id"] == "deployment-a"
+        sheds_after, overflows_after = registry.rung_admission_counters()
+        assert (sheds_after - sheds_before, overflows_after - overflows_before) == (1, 0)
+        assert registry.throttle_cache_counters() == (0, 0, 0, 0)
+
+    def test_budget_rejection_of_a_forced_redial_releases_the_forced_state(self) -> None:
+        """A redial forced past rung 0's rate shed, then budget-rejected there, forces nothing else.
+
+        Rung 0 and rung 1 both author ``requests_per_minute: 1``; another
+        request already holds rung 1's window, and rung 0's hard deployment
+        budget rejects the redial after the shed was force-admitted. The
+        ladder advances to rung 1 with the forced state cleared, so rung 1's
+        own rate shed spills the request on to rung 2 (two sheds, zero
+        saturated overflows, zero backoff redials) instead of rung 1 being
+        forced open and disclosed ``saturated_overflow``.
+        """
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployments = (
+            _deployment(
+                "deployment-a",
+                connection_sha256="b" * 64,
+                dispatch=GatewayRungDispatchPolicy(requests_per_minute=1),
+            ),
+            _deployment(
+                "deployment-b",
+                connection_sha256="c" * 64,
+                dispatch=GatewayRungDispatchPolicy(requests_per_minute=1),
+            ),
+            _deployment("deployment-c", connection_sha256="d" * 64),
+        )
+        _admit(registry, (deployments[1],), request_id="request-other")
+        assert _start(registry, ordinal=0, request_id="request-other")["route_depth"] == 0
+        _admit(
+            registry,
+            deployments,
+            request_id="request-1",
+            failover_mode="maximize_cache",
+            throttle_redial=GatewayThrottleRedialPolicy(
+                max_attempts=1, base_delay_ms=100, max_delay_ms=2_000
+            ),
+        )
+        first = _start(registry, ordinal=0, request_id="request-1")
+        assert first["route_depth"] == 0
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_THROTTLE,
+            request_id="request-1",
+        )
+        ledger.budget_rejections["deployment-a"] = BudgetScopeKind.DEPLOYMENT
+        redial = _start(
+            registry,
+            ordinal=1,
+            current_depth=0,
+            failure=_THROTTLE,
+            request_id="request-1",
+            throttle_backoff=True,
+        )
+        assert redial["route_depth"] == 2
+        assert ledger.started[2]["deployment_id"] == "deployment-c"
+        assert ledger.started[2]["dispatch_reason"] != "saturated_overflow"
+        assert ledger.started[2]["dispatch_reason"] != "throttle_backoff"
+        assert registry.rung_admission_counters() == (2, 0)
+        assert registry.rung_rate_counters() == (2, 0)
+        assert registry.throttle_cache_counters() == (0, 0, 0, 0)
+        assert registry.loads.inflight(("deployment-b", "c" * 64)) == 1

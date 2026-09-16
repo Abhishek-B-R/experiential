@@ -17,6 +17,7 @@ from exp.common.models.content import (
     VideoContentPart,
     require_attachment_ceilings,
 )
+from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import (
     DeploymentId,
     ExactModelId,
@@ -513,6 +514,15 @@ class GatewayRequest(ContractModel):
     logprobs: bool | None = None
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None
+    reasoning_effort_parameter: (
+        Literal["reasoning_effort", "reasoning.effort", "output_config.effort"] | None
+    ) = Field(default=None, exclude=True)
+    """Exact caller field normalized into ``reasoning_effort``, when a surface
+    offers more than one (the Messages surface takes Anthropic's
+    ``output_config.effort`` and the OpenRouter ``reasoning.effort`` extension);
+    an effort the route cannot serve is rejected by that name so the caller's
+    own recovery finds the field it sent. ``None`` means the surface default
+    (see :attr:`caller_effort_parameter`)."""
     # Level-less enable-thinking; the route seam resolves the concrete effort.
     thinking_default_enable: bool = False
     reasoning_summary: Literal["auto", "concise", "detailed"] | None = None
@@ -777,6 +787,28 @@ class GatewayRequest(ContractModel):
             raise ValueError("stop sequences must not repeat")
         return value
 
+    @property
+    def caller_effort_parameter(
+        self,
+    ) -> Literal["reasoning_effort", "reasoning.effort", "output_config.effort"]:
+        """The public field an unservable effort is rejected under.
+
+        The recorded caller field when the decoder knows it; otherwise the
+        surface's one effort field. The name matters: Claude Code carries its
+        effort as Messages ``output_config.effort`` and auto-recovers (drops
+        the field and retries) only when the 400 names that channel, so naming
+        a translated internal field wedges every turn instead.
+        """
+        if self.reasoning_effort_parameter is not None:
+            return self.reasoning_effort_parameter
+        match self.surface:
+            case GatewayApiSurface.RESPONSES:
+                return "reasoning.effort"
+            case GatewayApiSurface.MESSAGES:
+                return "output_config.effort"
+            case _:
+                return "reasoning_effort"
+
     @model_validator(mode="after")
     def _require_coherent_tools(self) -> GatewayRequest:
         """Require named and required tool choices to reference available tools.
@@ -935,3 +967,13 @@ class ExecutionSnapshot(ContractModel):
     # per-attempt retry/failover decision can honor it. Defaults to the
     # historical maximize_availability.
     failover_mode: FailoverMode = "maximize_availability"
+    # The pool's cache-stakes throttle control, carried alongside so the
+    # per-attempt decision can weigh the requesting organization's observed
+    # cached fraction on the throttled rung against it. ``None`` leaves the
+    # failover mode's own throttle rule in force.
+    throttle_cache_threshold: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    # The pool's backoff-and-redial schedule for throttled rungs, carried so
+    # the admission can hand the data plane its frozen retry facts and the
+    # per-attempt decision can honor a post-backoff redial. ``None`` keeps
+    # throttles failover-only.
+    throttle_redial: GatewayThrottleRedialPolicy | None = None

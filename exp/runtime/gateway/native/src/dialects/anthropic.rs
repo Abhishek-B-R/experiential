@@ -57,6 +57,27 @@ impl Normalizer {
                     "Anthropic cache_creation_input_tokens",
                 )
                 .map_err(|message| malformed(&message))?;
+                self.output_tokens =
+                    count_or_zero(usage, "output_tokens", "Anthropic output_tokens")
+                        .map_err(|message| malformed(&message))?;
+                // Surface the start-frame meters at once: the Messages encoder
+                // mirrors them on its own `message_start` (Claude Code reads
+                // the input legs there), and the settlement tracker holds them
+                // as the best known count until the terminal report, which
+                // supersedes them at `message_stop` (server-tool turns re-read
+                // fetched results as input, so the start count undercounts).
+                let input_tokens = bounded_ledger_sum(
+                    &[self.input_tokens, self.cache_read, self.cache_write],
+                    "Anthropic input",
+                )
+                .map_err(|message| malformed(&message))?;
+                events.push(Event::Usage(Usage {
+                    input_tokens: Some(input_tokens),
+                    output_tokens: Some(self.output_tokens),
+                    cached_input_tokens: Some(self.cache_read),
+                    cache_creation_input_tokens: (self.cache_write > 0).then_some(self.cache_write),
+                    reasoning_tokens: None,
+                }));
             }
             "content_block_start" => {
                 let index = require_u64(&payload, "index", "Anthropic content index")
@@ -309,6 +330,10 @@ impl Normalizer {
                     // the caller resumes it by resending the conversation,
                     // and an end_turn rewrite would end the task instead.
                     events.push(Event::PausedTurn);
+                } else if self.dropped_cut_call {
+                    // A call cut mid-fragment under a non-truncating stop
+                    // reason was dropped at its block stop.
+                    events.push(Event::Incomplete);
                 } else {
                     events.push(Event::Completed);
                 }
@@ -409,7 +434,16 @@ mod tests {
             "type": "message_start",
             "message": {"usage": {"input_tokens": 2230, "output_tokens": 25}},
         }));
-        assert!(normalizer.feed(&start_message).expect("start").is_empty());
+        // The start-frame meters surface early so the Messages encoder can put
+        // them on its own `message_start` (Claude Code reads input there); the
+        // terminal report still supersedes them at `message_stop`.
+        assert!(matches!(
+            normalizer.feed(&start_message).expect("start").as_slice(),
+            [Event::Usage(usage)]
+                if usage.input_tokens == Some(2230)
+                    && usage.output_tokens == Some(25)
+                    && usage.cached_input_tokens == Some(0)
+        ));
 
         let start = frame(serde_json::json!({
             "type": "content_block_start",
@@ -522,6 +556,10 @@ mod tests {
     }
 
     fn tool_fragment_stream(stop_reason: &str) -> Vec<SseEvent> {
+        tool_argument_stream(stop_reason, "{\"city\": \"Par")
+    }
+
+    fn tool_argument_stream(stop_reason: &str, partial_json: &str) -> Vec<SseEvent> {
         vec![
             frame(serde_json::json!({
                 "type": "message_start",
@@ -535,7 +573,7 @@ mod tests {
             frame(serde_json::json!({
                 "type": "content_block_delta",
                 "index": 0,
-                "delta": {"type": "input_json_delta", "partial_json": "{\"city\": \"Par"},
+                "delta": {"type": "input_json_delta", "partial_json": partial_json},
             })),
             frame(serde_json::json!({"type": "content_block_stop", "index": 0})),
             frame(serde_json::json!({
@@ -569,9 +607,30 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_call_cut_mid_fragment_under_tool_use_is_the_providers_cut() {
+        // The block closed on an open fragment and the stop reason then said
+        // `tool_use`: a model never ends a well-formed call mid-string, so
+        // the stop reason misreports the cut. The call is dropped and the
+        // turn settles Incomplete instead of failing the served stream.
+        let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
+        let mut events = Vec::new();
+        for frame in tool_fragment_stream("tool_use") {
+            events.extend(normalizer.feed(&frame).expect("cut tool stream normalizes"));
+        }
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, Event::ToolCallCompleted { .. })));
+        assert!(
+            matches!(events.last(), Some(Event::Incomplete)),
+            "{events:?}"
+        );
+    }
+
+    #[test]
     fn a_tool_call_with_garbage_arguments_still_fails_when_the_provider_finished() {
         let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
-        let frames = tool_fragment_stream("tool_use");
+        // A syntax error INSIDE the arguments is corruption, not a cut.
+        let frames = tool_argument_stream("tool_use", "{\"city\": }");
         let mut outcome = Ok(Vec::new());
         for frame in &frames {
             outcome = normalizer.feed(frame);

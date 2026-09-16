@@ -27,13 +27,16 @@ from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, G
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_execution import (
+    DeadRung,
+    deployment_health_key,
     reorder_route_deployments,
     request_carries_cache_markers,
     select_route_deployments,
 )
+from exp.runtime.gateway.native_reasoning import rung_provider_request
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.prompt_cache_affinity import provider_prompt_cache_key
-from exp.runtime.gateway.prompt_size import require_prompt_fits_context_window
+from exp.runtime.gateway.prompt_size import context_window_compatible_indexes
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.sticky_affinity import AffinityPlacement, sticky_first_order
 from exp.runtime.models.providers import (
@@ -46,10 +49,12 @@ from exp.runtime.models.providers.capability_policy import (
     coerce_route_rejections,
     coerce_strict_tool_schemas,
     coerce_structured_text_schema,
+    reserve_thinking_headroom,
 )
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
+    ProviderResponseError,
 )
 from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
@@ -87,6 +92,11 @@ def _with_cache_affinity(
             ),
         }
     )
+
+
+def _output_floors(resolved_wires: _ResolvedWires) -> tuple[int | None, ...]:
+    """Each rung's declared output-token floor, aligned with the route."""
+    return tuple(profile.minimum_output_tokens for profile, _client in resolved_wires)
 
 
 def admitted_route_requests(
@@ -135,10 +145,17 @@ def admitted_route_requests(
     # OTHER tier (auto/default carry no price; scale and any future value) is
     # never rejected here — a non-billable candidate simply strips it at payload
     # build (billing-safe, disclosed), so only the opt-in priced tiers gate.
-    # A prompt that cannot fit any rung's context window is refused HERE, before
-    # a reservation or a provider call: the provider would only 400 it back
-    # (charging nothing but costing a round trip and an opaque message).
-    require_prompt_fits_context_window(route, request)
+    # A rung whose declared context window cannot hold the prompt plus the
+    # requested output budget is dropped HERE, before a reservation or a
+    # provider call (the provider would only 400 it back, after a round trip,
+    # with an opaque message); the request falls to a rung that can hold it
+    # and is refused only when none can.
+    window_indexes = context_window_compatible_indexes(
+        route, request, output_floors=_output_floors(resolved_wires)
+    )
+    if len(window_indexes) != len(route.deployments):
+        route = select_route_deployments(route, window_indexes)
+        resolved_wires = tuple(resolved_wires[index] for index in window_indexes)
 
     if request.service_tier in ("flex", "priority"):
         tier = request.service_tier
@@ -174,19 +191,61 @@ def admitted_route_requests(
             admits=candidate_serves,
         )
         if coercion is None:
+            # No coercion SERVES, but one may still APPLY: the probe refused
+            # every candidate because the coerced request dies one layer
+            # later, on a blocker that has nothing to do with the coerced
+            # field. Re-raising the verbatim rejection here would name that
+            # field (an image on a text-only route read as "thinking is not
+            # supported by this model route", because shaping rejects the
+            # foreign-wire thinking config before preflight ever sees the
+            # image; 25 such 400s on 2026-09-11). Carry the unprobed
+            # coercion forward instead and let the stage that actually
+            # refuses it name the caller's remedy. Nothing is recorded for a
+            # request that never serves.
+            coercion = coerce_generation_parameters(
+                tuple(profile for profile, _client in resolved_wires),
+                admitted_request,
+            )
+        if coercion is None:
             raise
         compatible_indexes = compatible_generation_parameter_profile_indexes(
             tuple(profile for profile, _client in resolved_wires),
             coercion.request,
         )
         admitted_request = coercion.request
-        coercion_disclosures = coercion.disclosures
+        coercion_disclosures = (*coercion_disclosures, *coercion.disclosures)
     route = select_route_deployments(route, compatible_indexes)
     resolved_wires = tuple(resolved_wires[index] for index in compatible_indexes)
+    # The headroom rule reads the rungs that SURVIVED narrowing: a rung with
+    # no reasoning default (or no ``none`` tier) that narrowing has already
+    # removed must not veto the coercion for the default-on rung that will
+    # actually serve. Every surviving rung accepted the request verbatim and
+    # offers ``none``, so the coerced request narrows to the same set.
+    headroom = reserve_thinking_headroom(
+        tuple(profile for profile, _client in resolved_wires), admitted_request
+    )
+    if headroom is not None:
+        admitted_request = headroom.request
+        coercion_disclosures = (*coercion_disclosures, *headroom.disclosures)
     public_request, provider_request = route_generation_parameter_requests(
         tuple(profile for profile, _client in resolved_wires),
         admitted_request,
     )
+    # Shaping can RAISE the output budget past what the caller asked (the
+    # Anthropic required default when max_tokens is unset, the OpenAI-wire
+    # minimum, a rung's declared floor), so the window check runs again on the
+    # shaped budget: a rung it pushed over its window is skipped here, and the
+    # survivors are re-shaped so a floor a dropped rung imposed is not carried.
+    shaped_indexes = context_window_compatible_indexes(
+        route, provider_request, output_floors=_output_floors(resolved_wires)
+    )
+    if len(shaped_indexes) != len(route.deployments):
+        route = select_route_deployments(route, shaped_indexes)
+        resolved_wires = tuple(resolved_wires[index] for index in shaped_indexes)
+        public_request, provider_request = route_generation_parameter_requests(
+            tuple(profile for profile, _client in resolved_wires),
+            admitted_request,
+        )
     provider_request = provider_request.model_copy(update={"stream": True, "include_usage": True})
     protocol_indexes, protocol_errors = protocol_compatible_indexes(
         route,
@@ -338,6 +397,8 @@ def _prefer_cache_capable_rungs(
         return route, resolved_wires
     if len(resolved_wires) < 2 or not request_carries_cache_markers(provider_request):
         return route, resolved_wires
+    if _keeps_issuing_rung_first(route):
+        return route, resolved_wires
     marker_capable = tuple(
         index
         for index, (profile, _client) in enumerate(resolved_wires)
@@ -352,6 +413,21 @@ def _prefer_cache_capable_rungs(
     return (
         reorder_route_deployments(route, order),
         tuple(resolved_wires[index] for index in order),
+    )
+
+
+def _keeps_issuing_rung_first(route: GatewayRoute) -> bool:
+    """Whether a reasoning continuation's issuing rung is on the route and must lead it.
+
+    The issuing rung alone can replay the request's thinking, so while it is
+    still dispatchable no cache-marker or affinity reorder may demote it and
+    its fallbacks stay in pool order. Once admission has narrowed it out as
+    dead the pin is stale: every surviving rung runs without the reasoning,
+    so the pool's normal ordering applies to them.
+    """
+    pinned = route.reasoning_pinned_deployment_id
+    return pinned is not None and any(
+        deployment.deployment_id == pinned for deployment in route.deployments
     )
 
 
@@ -392,7 +468,7 @@ def _affinity_ordered_rungs(
         identity_id=authorization.identity_id,
         material=material,
     )
-    if len(resolved_wires) < 2:
+    if len(resolved_wires) < 2 or _keeps_issuing_rung_first(route):
         return route, resolved_wires, AffinityPlacement(fingerprint=fingerprint)
     weighted_rungs = tuple(
         (
@@ -407,7 +483,7 @@ def _affinity_ordered_rungs(
         for deployment in route.deployments
     )
     order = rendezvous_order(fingerprint, weighted_rungs)
-    order, sticky_index = sticky_first_order(
+    order, sticky_index, sticky_deployment_id = sticky_first_order(
         order,
         route,
         fingerprint=fingerprint,
@@ -429,6 +505,7 @@ def _affinity_ordered_rungs(
     placement = AffinityPlacement(
         fingerprint=fingerprint,
         sticky_preferred=sticky_index is not None and order[0] == sticky_index,
+        sticky_deployment_id=sticky_deployment_id,
     )
     return (
         reorder_route_deployments(route, order),
@@ -525,16 +602,27 @@ def protocol_compatible_indexes(
     Returns:
         Ordered compatible indexes and every rung's rejection in route
         order, so the caller can distinguish a route-wide capability gap
-        from rungs declining for different reasons.
+        from rungs declining for different reasons. A payload builder that
+        cannot represent the conversation as sent (for example an assistant
+        turn with neither text nor a tool call) counts as a rung rejection
+        on ``messages``, so a caller-shaped transcript is refused with a
+        field-specific 400 instead of escaping admission as an internal
+        failure.
     """
     indexes: list[int] = []
     errors: list[ProviderParameterError | ProviderCapabilityError] = []
     for index, (deployment, (profile, _client)) in enumerate(
         zip(route.deployments, resolved_wires, strict=True)
     ):
+        # Each rung is probed with the request IT would dispatch: a
+        # reasoning-pinned route's fallback rung sees the request without the
+        # pinned provider's sealed reasoning, exactly as the dispatch build
+        # shapes it, so the builder's foreign-block rejection never narrows a
+        # legitimate failover rung out of the ladder.
+        rung_request = rung_provider_request(route, deployment, provider_request)
         try:
             preflight_gateway_request(
-                provider_request,
+                rung_request,
                 deployment.gateway.capabilities,
                 model_capabilities=deployment.capabilities,
                 public_stream=public_stream,
@@ -543,12 +631,36 @@ def protocol_compatible_indexes(
                     profile.dialect, emulate_parallel_tool_calls=emulate_parallel_tool_calls
                 ),
             )
-            dialect_stream_payload(profile, provider_request)
+            dialect_stream_payload(profile, rung_request)
         except (ProviderParameterError, ProviderCapabilityError) as exc:
             errors.append(exc)
             continue
+        except ProviderResponseError as exc:
+            errors.append(_unrepresentable_messages_error(exc))
+            continue
         indexes.append(index)
     return tuple(indexes), tuple(errors)
+
+
+def _unrepresentable_messages_error(exc: ProviderResponseError) -> ProviderParameterError:
+    """Turn a payload builder's transcript rejection into a ``messages`` parameter error.
+
+    Args:
+        exc: The builder's gateway-authored reason the conversation cannot be
+            encoded on this wire.
+
+    Returns:
+        A field-specific pre-dispatch rejection the shared admit handler maps
+        to a caller-facing invalid request.
+    """
+    return ProviderParameterError(
+        message=(
+            f"This model route cannot encode the conversation as sent: {exc}. "
+            "Fix the message history or choose a different model."
+        ),
+        param="messages",
+        code="invalid_parameter",
+    )
 
 
 def shape_parallel_tool_calls(
@@ -686,4 +798,58 @@ def resolve_admission_route(
         authorization=authorization,
         request=request,
         episode_namespace=episode,
+    )
+
+
+def record_dead_admission_rungs(
+    accounting: NativeAttemptAccounting,
+    authorization: AuthorizationSnapshot,
+    dead: tuple[DeadRung, ...],
+    *,
+    fallback_available: bool,
+) -> None:
+    """Record admission-dead rungs and surface a lead masked by fallback."""
+    if not dead:
+        return
+    for rung in dead:
+        accounting.health.failed(
+            deployment_health_key(authorization, rung.deployment),
+            rung.failure,
+        )
+    lead = next((rung for rung in dead if rung.index == 0), None)
+    lead_masked = lead is not None and fallback_available
+    accounting.record_admission_rung_skips(len(dead), lead_skipped=lead_masked)
+    if lead is not None and fallback_available:
+        _logger.warning(
+            "gateway admission skipped the lead rung for alias %r: served off a "
+            "fallback because deployment %r (provider %r) was dead at admission",
+            authorization.alias,
+            lead.deployment.deployment_id,
+            lead.deployment.provider,
+        )
+
+
+def log_reasoning_continuation_rejection(
+    authorization: AuthorizationSnapshot, stage: str, reason: object
+) -> None:
+    """Record why a reasoning-carrier continuation failed, for operators only.
+
+    The caller sees one opaque 400 (naming the differing bound claim would be an
+    authentic-continuation oracle), but an operator needs the exact reason to tell
+    a genuine tamper from a benign authority drift. Nothing here carries a
+    credential or the plaintext reasoning; the catalog-generation fields make a
+    cross-worker or post-republish drift obvious when diffed against the issuing
+    turn's admission log.
+    """
+    _logger.warning(
+        "reasoning carrier continuation rejected",
+        extra={
+            "operation": "native_reasoning_continuation",
+            "stage": stage,
+            "reason": str(reason),
+            "request_id": authorization.request_id,
+            "alias": authorization.alias,
+            "alias_revision_id": authorization.alias_revision_id,
+            "catalog_sha256": authorization.catalog_sha256,
+        },
     )

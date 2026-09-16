@@ -52,3 +52,16 @@ def is_deepseek_base_url(base_url: str) -> bool:
         and not parsed.query
         and not parsed.fragment
     )
+
+
+def is_deepseek_model_id(model_id: str) -> bool:
+    """Return whether one provider model identifier names a DeepSeek model.
+
+    Third-party hosts spell the weights as ``deepseek/deepseek-v4-flash``
+    (OpenRouter), ``DeepSeek-V4-Flash`` (Azure AI Foundry deployments), or the
+    bare ``deepseek-chat`` (DeepSeek's own origin); every form carries the
+    ``deepseek`` token, so the match is case-insensitive on that token and
+    never on the host. This is a MODEL-family fact, distinct from
+    ``is_deepseek_base_url`` (an ORIGIN fact about the replay rule).
+    """
+    return "deepseek" in model_id.lower()

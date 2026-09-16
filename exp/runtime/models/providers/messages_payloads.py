@@ -31,6 +31,7 @@ from exp.runtime.models.providers.reasoning_compat import (
 )
 from exp.runtime.models.providers.wire_messages import (
     anthropic_blocks,
+    fold_tool_result_images,
     retained_cache_marked_blocks,
 )
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
@@ -437,10 +438,15 @@ def gemini_generate_content_stream_payload(
         ProviderResponseError: A message cannot preserve its tool linkage on
             Gemini's wire.
     """
+    # Gemini's functionResponse carries JSON text; a tool screenshot rides a
+    # following user content (one content per message, no role alternation
+    # rule on this wire). The native ``functionResponse.parts`` carrier is
+    # documented for the Gemini 3 series only and is not adopted unprobed.
+    folded = request.model_copy(update={"messages": fold_tool_result_images(request.messages)})
     try:
         return gemini_generate_request(
             model_id,
-            gateway_model_request(request),
+            gateway_model_request(folded),
             supports_temperature=supports_temperature,
             supports_top_p=supports_top_p,
             supports_top_k=supports_top_k,

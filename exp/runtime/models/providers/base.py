@@ -204,7 +204,10 @@ class GatewayWireProfile:
     """Exact provider field used to carry normalized reasoning effort."""
 
     reasoning_effort: str | None = None
-    """Optional provider default used when the wire requires an explicit effort."""
+    """The rung's catalog default depth (``reasoning_default_effort``).
+
+    Emitted when the wire requires an explicit effort, and the depth a
+    budget-less caller ``thinking`` config translates to on this rung."""
 
     supported_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
     """Exact caller values declared by this deployment, in canonical order."""
@@ -246,11 +249,33 @@ class GatewayWireProfile:
     Independent of ``reasoning_output_exposed``, which still decides alone
     whether the caller SEES the reasoning deltas on output."""
 
+    system_messages_leading_only: bool = False
+    """Whether this rung's chat template accepts a system message ONLY as the
+    very first message.
+
+    The official Qwen3.6+ ``chat_template.jinja`` raises ``System message must
+    be at the beginning.`` for any system turn that is not ``loop.first`` (a
+    second leading system turn included), so a vLLM origin serving it 400s
+    the whole request; coding agents put instruction turns mid-conversation
+    on every tool loop. A catalog stamp (``ModelCapabilities
+    .system_messages_leading_only``), never a hostname rule: the Chat wire
+    builder folds every instruction turn past the first into user text on a
+    declared rung and leaves every other rung's messages untouched."""
+
     token_limit_key: ChatMaxTokensField = "max_tokens"
     """Wire field carrying the output-token ceiling on Chat Completions."""
 
     maximum_output_tokens: int | None = None
     """Largest caller output-token ceiling accepted by this exact model."""
+
+    minimum_output_tokens: int | None = None
+    """Smallest output-token ceiling this rung's provider accepts, when declared.
+
+    Catalog-declared (``GatewayDeploymentCapabilities.minimum_output_tokens``),
+    never derived from the dialect: a caller ceiling below it is floored with
+    disclosure on every surface instead of dispatching a value the provider
+    400s (Perplexity sonar and Sakana fugu via OpenRouter, grok-4.6 on
+    Bedrock all refuse ``max_tokens < 16`` on the Chat wire)."""
 
     signs_request_body: bool = False
     """Whether dispatch headers are computed per request over the exact

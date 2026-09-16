@@ -9,6 +9,7 @@ engines cannot drift at the message boundary.
 from __future__ import annotations
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.content import ImageContentPart, TextContentPart
 from exp.runtime.gateway.contracts import (
     TOOL_ERROR_TEXT_PREFIX,
     GatewayMessage,
@@ -28,6 +29,84 @@ from exp.runtime.models.providers.images import (
     responses_image_part,
 )
 from exp.runtime.models.providers.videos import openai_chat_video_part, reject_video_part
+
+TOOL_RESULT_IMAGE_FOLD_HEADER = (
+    "Images returned by the tool results above. This model's wire carries only text "
+    "inside tool messages, so each image is attached here, numbered where it appeared:"
+)
+"""Leading text of the user message that carries folded tool-result images."""
+
+
+def tool_result_image_marker(ordinal: int) -> str:
+    """Return the in-place marker left where a folded tool-result image stood."""
+    return f"[image {ordinal}: attached in the next user message]"
+
+
+def fold_tool_result_images(
+    messages: tuple[GatewayMessage, ...],
+) -> tuple[GatewayMessage, ...]:
+    """Move tool-result images into one user message after each run of tool results.
+
+    Chat Completions and Gemini ``functionResponse`` define no image carrier
+    inside a tool result, while a user turn carries images on both wires. The
+    fold keeps every image the caller sent: each tool message keeps its text
+    with a numbered marker where the image stood, and one user message
+    following the LAST tool message of the contiguous run (a user message
+    between two results of one parallel batch breaks the tool-call linkage
+    both providers check) carries the images in order, each introduced by its
+    number and the tool call that returned it. The disclosure travels in
+    ``x-experiential-ignored-parameters`` as ``TOOL_RESULT_IMAGE_FOLD_DISCLOSURE``.
+
+    Args:
+        messages: The request's canonical messages.
+
+    Returns:
+        The folded messages; the same tuple when no tool message carries an image.
+    """
+    if not any(message.role == "tool" and message.images for message in messages):
+        return messages
+    out: list[GatewayMessage] = []
+    pending: list[tuple[int, str, ImageContentPart]] = []
+    ordinal = 0
+
+    def flush() -> None:
+        """Emit the pending images as one user message after the tool run."""
+        if not pending:
+            return
+        parts: list[TextContentPart | ImageContentPart] = [
+            TextContentPart(text=TOOL_RESULT_IMAGE_FOLD_HEADER)
+        ]
+        for number, call_id, image in pending:
+            parts.append(TextContentPart(text=f"\nImage {number} (tool_call_id {call_id}):"))
+            parts.append(image)
+        out.append(
+            GatewayMessage(
+                role="user",
+                content="".join(part.text for part in parts if part.kind == "text"),
+                content_parts=tuple(parts),
+            )
+        )
+        pending.clear()
+
+    for message in messages:
+        if message.role != "tool":
+            flush()
+            out.append(message)
+            continue
+        if not message.images:
+            out.append(message)
+            continue
+        texts: list[str] = []
+        for part in message.content_parts:
+            if part.kind == "image":
+                ordinal += 1
+                pending.append((ordinal, message.tool_call_id or "", part))
+                texts.append(tool_result_image_marker(ordinal))
+            elif part.kind == "text":
+                texts.append(part.text)
+        out.append(message.model_copy(update={"content": "".join(texts), "content_parts": ()}))
+    flush()
+    return tuple(out)
 
 
 def responses_items(message: GatewayMessage) -> list[JsonObject]:
@@ -97,10 +176,14 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
             # Plaintext reasoning replays only on an exposure-gated Chat rung;
             # route narrowing disclosed the drop for this wire.
             continue
+        if block.kind in {"thinking", "redacted_thinking"}:
+            # Anthropic-signed thinking replays only on its own wire; route
+            # shaping disclosed the drop for this one.
+            continue
         if block.kind != "encrypted_reasoning":
-            # Anthropic thinking cannot replay on the OpenAI wire; route
+            # A gateway reasoning carrier belongs to the Chat wire; route
             # admission rejects the combination before dispatch.
-            raise ProviderResponseError("thinking blocks cannot replay on the Responses wire")
+            raise ProviderResponseError("reasoning carriers cannot replay on the Responses wire")
         # Reasoning items precede the assistant action they belong to, and
         # the encrypted payload is the round-trip authority; the display-only
         # summary is deliberately empty on replay. The item id and status are
@@ -569,10 +652,17 @@ def openai_chat_message(
             }
             for call in message.tool_calls
         ]
-    if message.provider_reasoning:
-        if len(message.provider_reasoning) != 1:
+    # Anthropic-signed thinking replays only on its own wire; route shaping
+    # disclosed the drop for this one, so the Chat wire omits those blocks.
+    chat_reasoning = tuple(
+        block
+        for block in message.provider_reasoning
+        if block.kind not in {"thinking", "redacted_thinking"}
+    )
+    if chat_reasoning:
+        if len(chat_reasoning) != 1:
             raise ProviderResponseError("Chat reasoning history requires exactly one carrier")
-        block = message.provider_reasoning[0]
+        block = chat_reasoning[0]
         if block.kind == "exposed_reasoning_content":
             if reasoning_output_exposed or deepseek_reasoning_history:
                 payload["reasoning_content"] = block.content
