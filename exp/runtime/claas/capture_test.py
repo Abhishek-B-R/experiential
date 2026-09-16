@@ -119,3 +119,19 @@ def test_real_native_gateway_capture_is_opt_in_and_ghost_stays_content_free(
         )
     else:
         assert not database.exists()
+
+
+def test_aliases_sharing_application_cannot_conflict_on_retention(tmp_path: Path) -> None:
+    """A second alias cannot silently shorten another alias's retained evidence."""
+    scope = ClaasScope(user_id="user", application_id="app")
+    policy = CapturePolicy(scope=scope, enabled=True)
+    with pytest.raises(ValueError, match="share one capture policy"):
+        CaptureConfiguration(
+            database_path=tmp_path / "capture.sqlite",
+            bindings=(
+                CaptureBinding(alias="first", policy=policy),
+                CaptureBinding(
+                    alias="second", policy=policy.model_copy(update={"retention_seconds": 1})
+                ),
+            ),
+        )

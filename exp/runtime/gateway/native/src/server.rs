@@ -237,7 +237,9 @@ pub async fn run(
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     if let Some(capture) = capture {
-        capture.close();
+        if !capture.close_until(drain_deadline) {
+            eprintln!("CLaaS capture drain reached the graceful shutdown deadline");
+        }
     }
     outcome
 }

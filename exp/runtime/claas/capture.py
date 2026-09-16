@@ -37,4 +37,11 @@ class CaptureConfiguration(ContractModel):
         keys = [(binding.policy.scope.user_id, binding.alias) for binding in self.bindings]
         if len(keys) != len(set(keys)):
             raise ValueError("capture bindings must have unique user_id and alias pairs")
+        policies: dict[tuple[str, str], CapturePolicy] = {}
+        for binding in self.bindings:
+            scope = binding.policy.scope
+            key = (scope.user_id, scope.application_id)
+            previous = policies.setdefault(key, binding.policy)
+            if previous != binding.policy:
+                raise ValueError("aliases for the same application must share one capture policy")
         return self
