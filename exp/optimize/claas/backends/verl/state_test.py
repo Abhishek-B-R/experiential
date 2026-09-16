@@ -1,13 +1,14 @@
 """Checkpoint publication fault tests; inert writers are not training evidence."""
 
+import shutil
 from pathlib import Path
 from typing import cast
 
 import pytest
 from verl.workers.engine_workers import TrainingWorker
 
-from exp.optimize.claas.backends import verl_state
 from exp.optimize.claas.backends.checkpoints_test import checkpoint
+from exp.optimize.claas.backends.verl import state
 from exp.optimize.claas.training_contracts_test import job
 
 
@@ -20,7 +21,6 @@ class InertCheckpointWriter:
 
     def save_checkpoint(self, local_path: str, *, global_step: int) -> None:
         """Copy the actor or teacher native-layout fixture selected by the caller."""
-        import shutil
 
         del global_step
         target = Path(local_path)
@@ -32,7 +32,6 @@ def test_missing_native_state_never_publishes_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A writer that omits optimizer state fails verification before the atomic rename."""
-    import shutil
 
     fixture = tmp_path / "fixture"
     checkpoint(fixture)
@@ -43,9 +42,9 @@ def test_missing_native_state_never_publishes_completion(
         """Write PEFT-shaped inert bytes solely to reach the publication check."""
         shutil.copytree(fixture / target.name, target)
 
-    monkeypatch.setattr(verl_state, "_export_adapter", export_inert)
+    monkeypatch.setattr(state, "_export_adapter", export_inert)
     with pytest.raises(ValueError, match="native veRL"):
-        verl_state.publish_checkpoint(
+        state.publish_checkpoint(
             job(tmp_path), writer, writer, {"loss": 0.0}, tmp_path / "candidate"
         )
     assert not (tmp_path / "candidate").exists()
@@ -57,7 +56,6 @@ def test_flush_failure_never_publishes_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A durable-write failure leaves neither a completed manifest nor temporary state."""
-    import shutil
 
     fixture = tmp_path / "fixture"
     checkpoint(fixture)
@@ -71,10 +69,10 @@ def test_flush_failure_never_publishes_completion(
         """Simulate an unavailable checkpoint device before publication."""
         raise OSError("checkpoint device failed")
 
-    monkeypatch.setattr(verl_state, "_export_adapter", export_inert)
-    monkeypatch.setattr(verl_state.os, "fsync", fail_flush)
+    monkeypatch.setattr(state, "_export_adapter", export_inert)
+    monkeypatch.setattr(state.os, "fsync", fail_flush)
     with pytest.raises(OSError, match="checkpoint device failed"):
-        verl_state.publish_checkpoint(
+        state.publish_checkpoint(
             job(tmp_path), writer, writer, {"loss": 0.0}, tmp_path / "candidate"
         )
     assert not (tmp_path / "candidate").exists()

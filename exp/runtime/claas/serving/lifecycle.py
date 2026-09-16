@@ -15,8 +15,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from exp.common.models import ModelMessage
 from exp.common.tasks import ToolSchema
 from exp.runtime.claas.registry import ServingRevision
-from exp.runtime.claas.sampling import CompletionDecoder, PolicySample
-from exp.runtime.claas.vllm import VllmPolicySampler, serving_model_name
+from exp.runtime.claas.serving.contracts import CompletionDecoder, PolicySample
+from exp.runtime.claas.serving.vllm import VllmPolicySampler, serving_model_name
 
 
 class ServingPausedError(RuntimeError):

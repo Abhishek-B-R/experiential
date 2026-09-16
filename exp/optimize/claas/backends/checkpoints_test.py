@@ -1,13 +1,26 @@
 """Checkpoint digest and scope rejection tests without executing model payloads."""
 
+import json
+import shutil
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from exp.common.core.artifacts import sha256_json
-from exp.optimize.claas.backends.checkpoints import CheckpointManifest, hash_file, verify_checkpoint
-from exp.optimize.claas.training_contracts import TrainingCheckpoint
-from exp.optimize.claas.training_contracts_test import spec
+from exp.optimize.claas.backends.checkpoints import (
+    CheckpointManifest,
+    checkpoint_snapshot,
+    hash_file,
+    verify_checkpoint,
+    verify_training_result,
+)
+from exp.optimize.claas.training_contracts import (
+    TrainingCheckpoint,
+    TrainingResult,
+    next_policy_revision,
+)
+from exp.optimize.claas.training_contracts_test import job, spec
 
 
 def checkpoint(root: Path) -> TrainingCheckpoint:
@@ -87,7 +100,6 @@ def test_rejects_unbound_ancestry_and_extra_payload(tmp_path: Path) -> None:
 
 def test_private_snapshot_keeps_verified_bytes_after_source_replacement(tmp_path: Path) -> None:
     """Concurrent source writes after staging cannot change the paths used by loaders."""
-    from exp.optimize.claas.backends.checkpoints import checkpoint_snapshot
 
     receipt = checkpoint(tmp_path)
     with checkpoint_snapshot(receipt, spec()) as staged:
@@ -105,9 +117,6 @@ def test_snapshot_rejects_content_changed_during_copy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Changing source bytes between verification and copy cannot become resumable state."""
-    import shutil
-
-    from exp.optimize.claas.backends.checkpoints import checkpoint_snapshot
 
     receipt = checkpoint(tmp_path)
     original = shutil.copyfile
@@ -130,9 +139,6 @@ def test_result_verification_rejects_manifest_for_another_update(
     tmp_path: Path, field: str
 ) -> None:
     """Valid file hashes and plausible outer receipt labels cannot hide a different batch."""
-    from exp.optimize.claas.backends.checkpoints import verify_training_result
-    from exp.optimize.claas.training_contracts import TrainingResult, next_policy_revision
-    from exp.optimize.claas.training_contracts_test import job
 
     submitted = job(tmp_path)
     receipt = checkpoint(tmp_path)
@@ -163,9 +169,6 @@ def test_result_verification_rejects_manifest_for_another_update(
 
 def test_custom_optimizer_checkpoint_cannot_masquerade_as_native_verl(tmp_path: Path) -> None:
     """A legacy manifest or standalone optimizer payload cannot satisfy native resume."""
-    import json
-
-    from pydantic import ValidationError
 
     receipt = checkpoint(tmp_path)
     manifest_path = tmp_path / "manifest.json"

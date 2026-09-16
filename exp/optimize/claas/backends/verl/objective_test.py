@@ -5,9 +5,9 @@ from pathlib import Path
 import torch
 
 from exp.optimize.claas.algorithms.sdpo import feedback_objective
-from exp.optimize.claas.backends.verl_inputs import build_engine_batch
-from exp.optimize.claas.backends.verl_objective import FeedbackLoss
-from exp.optimize.claas.backends.verl_worker_test import tokenizer
+from exp.optimize.claas.backends.verl.inputs import build_engine_batch
+from exp.optimize.claas.backends.verl.objective import FeedbackLoss
+from exp.optimize.claas.backends.verl.worker_test import tokenizer
 from exp.optimize.claas.training_contracts_test import job
 
 

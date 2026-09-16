@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from exp.optimize.claas.backends.subprocess import SubprocessVerlBackend
+from exp.optimize.claas.backends.subprocess import (
+    SubprocessVerlBackend,
+    _worker_diagnostic,
+    _worker_environment,
+)
 from exp.optimize.claas.training_contracts import ClaasTrainingError
 from exp.optimize.claas.training_contracts_test import job, spec
 
@@ -83,10 +87,12 @@ def test_close_during_process_creation_waits_for_owned_worker_cleanup(
     original_spawn = asyncio.create_subprocess_exec
 
     async def run() -> None:
+        """Exercise concurrent training startup and session cleanup."""
         started, release = asyncio.Event(), asyncio.Event()
         processes: list[asyncio.subprocess.Process] = []
 
         async def delayed_spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+            """Hold process creation until the test permits ownership transfer."""
             del args, kwargs
             process = await original_spawn(sys.executable, "-c", "import time; time.sleep(60)")
             processes.append(process)
@@ -117,7 +123,6 @@ def test_close_during_process_creation_waits_for_owned_worker_cleanup(
 
 def test_failure_diagnostic_retains_bounded_tail(tmp_path: Path) -> None:
     """A useful terminal exception survives temporary worker-log cleanup."""
-    from exp.optimize.claas.backends.subprocess import _worker_diagnostic
 
     log = tmp_path / "worker.log"
     log.write_bytes(b"earlier-output" * 10000 + b"\nCUDA out of memory\n")
@@ -128,7 +133,6 @@ def test_failure_diagnostic_retains_bounded_tail(tmp_path: Path) -> None:
 
 def test_worker_environment_drops_unrelated_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     """The optional ML process receives only its explicit model token and runtime settings."""
-    from exp.optimize.claas.backends.subprocess import _worker_environment
 
     monkeypatch.setenv("OPENAI_API_KEY", "gateway-secret-canary")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "cloud-secret-canary")

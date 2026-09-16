@@ -17,9 +17,9 @@ from exp.common.claas import ClaasScope
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage
 from exp.common.tasks import ToolSchema
-from exp.runtime.claas.decoding import HermesCompletionDecoder
 from exp.runtime.claas.registry import ServingRevision
-from exp.runtime.claas.vllm import VllmPolicySampler
+from exp.runtime.claas.serving.decoding import HermesCompletionDecoder
+from exp.runtime.claas.serving.vllm import VllmPolicySampler
 
 _JSON = TypeAdapter(JsonObject)
 

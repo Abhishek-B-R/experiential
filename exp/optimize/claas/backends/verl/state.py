@@ -22,7 +22,7 @@ from exp.optimize.claas.backends.checkpoints import (
     verify_checkpoint,
     verify_training_result,
 )
-from exp.optimize.claas.backends.verl_engine import ClaasFeedbackEngine
+from exp.optimize.claas.backends.verl.engine import ClaasFeedbackEngine
 from exp.optimize.claas.training_contracts import TrainingCheckpoint, TrainingJob, TrainingResult
 
 

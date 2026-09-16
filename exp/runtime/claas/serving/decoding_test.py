@@ -2,7 +2,12 @@
 
 import pytest
 
-from exp.runtime.claas.decoding import HermesCompletionDecoder, TextCompletionDecoder
+from exp.common.tasks import ToolSchema
+from exp.runtime.claas.serving.decoding import (
+    HermesCompletionDecoder,
+    Qwen35CompletionDecoder,
+    TextCompletionDecoder,
+)
 
 
 def test_hermes_decodes_tools_and_omits_reasoning() -> None:
@@ -45,8 +50,6 @@ def test_text_decoder_is_explicit() -> None:
 
 def test_qwen35_native_xml_uses_tool_types_without_guessing() -> None:
     """The official Qwen3.5 format preserves string-like numbers and JSON containers."""
-    from exp.common.tasks import ToolSchema
-    from exp.runtime.claas.decoding import Qwen35CompletionDecoder
 
     tool = ToolSchema(
         name="search",

@@ -6,7 +6,7 @@ from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel
 from exp.runtime.claas.registry import ServingRevision
-from exp.runtime.claas.vllm import serving_model_name
+from exp.runtime.claas.serving.vllm import serving_model_name
 
 
 class VllmServerConfig(ContractModel):

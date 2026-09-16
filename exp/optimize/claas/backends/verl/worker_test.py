@@ -24,8 +24,8 @@ from transformers import (
 from verl.workers.engine import BaseEngine, FSDPEngineWithLMHead
 
 from exp.optimize.claas.backends.checkpoints import verify_checkpoint
-from exp.optimize.claas.backends.verl_engine import ClaasFeedbackEngine
-from exp.optimize.claas.backends.verl_worker import (
+from exp.optimize.claas.backends.verl.engine import ClaasFeedbackEngine
+from exp.optimize.claas.backends.verl.worker import (
     _validate_lineage,
     _validate_model_reference,
     require_worker_runtime,

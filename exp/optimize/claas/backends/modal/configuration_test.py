@@ -5,7 +5,7 @@ import sys
 
 import pytest
 
-from exp.optimize.claas.backends.modal_configuration import ModalExecutionConfig
+from exp.optimize.claas.backends.modal.configuration import ModalExecutionConfig
 
 
 def config() -> ModalExecutionConfig:
@@ -39,7 +39,7 @@ def test_configuration_import_does_not_load_optional_runtimes() -> None:
             sys.executable,
             "-c",
             "import sys; "
-            "from exp.optimize.claas.backends.modal_configuration import ModalExecutionConfig; "
+            "from exp.optimize.claas.backends.modal.configuration import ModalExecutionConfig; "
             "assert 'modal' not in sys.modules; assert 'torch' not in sys.modules; "
             "assert 'transformers' not in sys.modules",
         ],

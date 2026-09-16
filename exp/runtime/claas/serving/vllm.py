@@ -17,7 +17,7 @@ from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.models import AssistantAction, ModelMessage
 from exp.common.tasks import ToolSchema
 from exp.runtime.claas.registry import ServingRevision
-from exp.runtime.claas.sampling import CompletionDecoder, PolicySample
+from exp.runtime.claas.serving.contracts import CompletionDecoder, PolicySample
 
 TokenId = Annotated[int, Field(strict=True, ge=0)]
 Logprob = Annotated[float, Field(strict=True, allow_inf_nan=False, le=0)]
