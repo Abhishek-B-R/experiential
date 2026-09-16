@@ -158,6 +158,19 @@ pub struct WaterfallContext<'a> {
     pub output_token_cap: Option<u64>,
 }
 
+/// The bound on one dial's open (request/response-header) phase: the
+/// remaining request deadline or the remaining first-byte allowance,
+/// whichever is nearer. The deployment's per-chunk `timeout_seconds` is
+/// deliberately NOT a term: it paces body reads after the first byte, and
+/// letting it cap the open phase made every authored first-byte allowance
+/// above it a silent no-op.
+pub(crate) fn open_phase_bound(
+    deadline_remaining: Duration,
+    first_byte_remaining: Duration,
+) -> Duration {
+    deadline_remaining.min(first_byte_remaining)
+}
+
 /// The effective first-byte allowance for one attempt: the deployment's (or
 /// serving default's) flat base plus its input-scaled allowance.
 pub(crate) fn first_byte_allowance(
