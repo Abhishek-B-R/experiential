@@ -21,7 +21,7 @@ from exp.runtime.gateway.decisions_contracts import (
 )
 
 
-def _body() -> dict[str, object]:
+def _body() -> JsonObject:
     """Return three representative typed questions over synthetic state."""
     return {
         "model": "type-safe/jev-latest",
@@ -63,14 +63,14 @@ def test_unrepresentable_public_fields_are_rejected(extra: str) -> None:
 
 
 @pytest.mark.parametrize("state", [None, True, 42, 1.5])
-def test_scalar_nontext_states_are_rejected(state: object) -> None:
+def test_scalar_nontext_states_are_rejected(state: JsonValue) -> None:
     """Only text, objects, and arrays are documented as provider state."""
     with pytest.raises(ValueError):
         decode_decision_request(json.dumps({**_body(), "state": state}))
 
 
 @pytest.mark.parametrize("state", ["hello", {"fact": True}, ["a", 2, None]])
-def test_native_state_variants_roundtrip(state: object) -> None:
+def test_native_state_variants_roundtrip(state: JsonValue) -> None:
     """Valid text and structured states survive canonical serialization."""
     request = decode_decision_request(json.dumps({**_body(), "state": state})).request
     assert request.state == state
@@ -102,7 +102,7 @@ def test_duplicate_keys_and_nonfinite_json_are_rejected(raw: str) -> None:
         {"x": {"type": "noul", "instructions": 1}},
     ],
 )
-def test_invalid_questions_fail_before_admission(questions: object) -> None:
+def test_invalid_questions_fail_before_admission(questions: JsonObject) -> None:
     """Invalid native schemas receive a local parameter error, not a provider call."""
     with pytest.raises(ValueError):
         decode_decision_request(json.dumps({**_body(), "questions": questions}))
@@ -276,7 +276,7 @@ def test_question_and_total_input_bounds_are_independent() -> None:
         {"input_tokens": 1},
     ],
 )
-def test_decision_usage_never_coerces_or_invents_counts(usage: dict[str, object]) -> None:
+def test_decision_usage_never_coerces_or_invents_counts(usage: JsonObject) -> None:
     """Only paired, nonnegative integer token counts are settlement evidence."""
     with pytest.raises(ValidationError):
         DecisionUsage.model_validate(usage)
