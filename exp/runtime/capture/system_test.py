@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -45,9 +46,54 @@ def test_root_owned_interpreter_check_rejects_mutable_ancestor(tmp_path: Path) -
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Apple system Python is a macOS prerequisite")
-def test_apple_interpreter_and_prefix_are_root_controlled() -> None:
-    """Exercise only the nonprivileged prerequisite probe on macOS."""
-    system._verify_apple_python()
+def test_apple_interpreter_ownership_controls_elevation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Accept root-controlled installations and reject writable hosted Xcode before sudo."""
+    result = subprocess.run(
+        [
+            "/usr/bin/python3",
+            "-I",
+            "-S",
+            "-c",
+            "import json,sys; sys.stdout.write(json.dumps([sys.executable,sys.base_prefix]))",
+        ],
+        capture_output=True,
+        check=True,
+        timeout=10,
+    )
+    installed_paths = json.loads(result.stdout)
+    assert isinstance(installed_paths, list)
+    paths = [Path("/usr/bin/python3")]
+    for value in installed_paths:
+        assert isinstance(value, str)
+        paths.append(Path(value))
+    unsafe = False
+    for path in paths:
+        for candidate in {path, *path.parents, path.resolve(), *path.resolve().parents}:
+            info = candidate.stat()
+            unsafe |= info.st_uid != 0 or bool(info.st_mode & 0o022)
+    if not unsafe:
+        system._verify_apple_python()
+        return
+
+    real_run = subprocess.run
+
+    def probe_only(
+        command: list[str],
+        *,
+        env: dict[str, str],
+        capture_output: bool = False,
+        check: bool = False,
+        timeout: float | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Permit the nonprivileged probe and fail if unsafe Python requests sudo."""
+        assert command[0] == "/usr/bin/python3", "unsafe installation requested elevation"
+        return real_run(
+            command, env=env, capture_output=capture_output, check=check, timeout=timeout
+        )
+
+    monkeypatch.setattr(system.subprocess, "run", probe_only)
+    with pytest.raises(CaptureSystemError, match="root-owned"):
+        system._authorize()
 
 
 @pytest.mark.parametrize("port, domains", [(443, ("api.openai.com",)), (18080, ("*.openai.com",))])
