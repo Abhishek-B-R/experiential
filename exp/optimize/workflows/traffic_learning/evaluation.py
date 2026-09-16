@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
 from functools import partial
 from typing import Literal, Protocol
 
@@ -28,6 +27,7 @@ from exp.common.models import (
     structured_json_text,
 )
 from exp.common.tasks import ToolSchema
+from exp.optimize.workflows.traffic_learning.calls import run_owned
 from exp.simulation.claas.contracts import ClaasScenario, WorldEpisode
 from exp.simulation.claas.harness import ClaasWorldModel, SourceDisclosure, WorldModelLimits
 from exp.simulation.claas.mining import MiningLimits, mine_experiences
@@ -396,7 +396,7 @@ async def _evaluate_task(
             if policy.policy_revision != revision:
                 raise ValueError("evaluation policy revision changed during generation")
             stage = "world"
-            step = await _run_blocking(partial(session.step, action))
+            step = await run_owned(partial(session.step, action))
             if step.transition.terminal:
                 break
         episode = session.end()
@@ -406,7 +406,7 @@ async def _evaluate_task(
         stage = "judge"
         request = _judge_request(task, rubric, session.messages, judge.limits.maximum_output_tokens)
         judge_request = request
-        response = await _run_blocking(partial(judge.complete, task.scenario.scope, request))
+        response = await run_owned(partial(judge.complete, task.scenario.scope, request))
         judge_response = response
         judgment = SyntheticJudgment.model_validate_json(
             structured_json_text(response.output.content or "")
@@ -500,21 +500,6 @@ def _replay_limits(episode: WorldEpisode) -> WorldModelLimits:
         maximum_call_cost_usd=reservation,
         maximum_total_cost_usd=reservation * 256,
     )
-
-
-async def _run_blocking[T](operation: Callable[[], T]) -> T:
-    """Keep synchronous clients off-loop and join owned work before cancellation exits.
-
-    Provider clients enforce their configured finite transport deadlines. Joining
-    an already-dispatched call preserves its charged reservation and prevents a
-    cancelled evaluation from silently leaving background disclosure in flight.
-    """
-    task = asyncio.create_task(asyncio.to_thread(operation))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        await asyncio.gather(task, return_exceptions=True)
-        raise
 
 
 def verify_evaluation_report(

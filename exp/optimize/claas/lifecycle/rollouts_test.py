@@ -132,3 +132,66 @@ def test_cleanup_failure_preserves_practice_evidence_and_refuses_training(
     if execution_failed:
         expected_evidence["execution_failure_type"] = "ValueError"
     assert receipt.episode.evidence == expected_evidence
+
+
+def test_cancellation_during_failed_episode_cleanup_preserves_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cleanup cancellation overrides prior execution failure and preserves evidence."""
+    closing = asyncio.Event()
+    original_step = LookupSession.step
+
+    async def fail_terminal_step(
+        self: LookupSession, action: AssistantAction
+    ) -> EnvironmentTransition:
+        """Preserve one complete transition before the next execution fails."""
+        if not action.tool_calls:
+            raise ValueError("execution unavailable")
+        return await original_step(self, action)
+
+    async def wait_for_cancellation(
+        self: LookupSession, reason: Literal["terminal", "step_limit", "failed"]
+    ) -> JsonObject:
+        """Expose a pending cleanup that only caller cancellation will interrupt."""
+        del self, reason
+        closing.set()
+        await asyncio.Future[None]()
+        raise AssertionError("cleanup unexpectedly completed")
+
+    monkeypatch.setattr(LookupSession, "step", fail_terminal_step)
+    monkeypatch.setattr(LookupSession, "close", wait_for_cancellation)
+    settings = config()
+    admission = Admission()
+    admission.paused = True
+    serving = Serving(admission, base_revision(settings))
+
+    async def cancel_cleanup() -> None:
+        """Cancel only once execution has failed and the environment is closing."""
+        task = asyncio.create_task(
+            collect_practice(
+                scenarios=(scenario("cancel-cleanup"),),
+                environment=LookupEnvironment(),
+                serving=serving,
+                revision=base_revision(settings),
+                spec=training_spec(settings),
+                limits=settings.limits,
+                directory=tmp_path,
+                cycle_id="cancel",
+            )
+        )
+        await asyncio.wait_for(closing.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_cleanup())
+    receipt = PracticeReceipt.model_validate_json((tmp_path / "cancel-0-0.json").read_bytes())
+    assert len(receipt.samples) == len(receipt.experiences) == 2
+    assert len(receipt.episode.steps) == 1
+    assert receipt.episode.end_reason == "failed"
+    assert receipt.episode.evidence == {
+        "close_complete": False,
+        "cleanup_failure_type": "CancelledError",
+        "execution_end_reason": "failed",
+        "execution_failure_type": "ValueError",
+    }
