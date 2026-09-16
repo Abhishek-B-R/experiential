@@ -365,7 +365,9 @@ def test_killed_helper_leaves_offline_recoverable_journal(
     """SIGKILL bypasses cleanup but releases the lock for a separate offline reset."""
     os.kill(crashed_helper.pid, signal.SIGKILL)
     crashed_helper.wait(timeout=5)
-    assert b"api.openai.com" in state.paths.hosts.read_bytes()
+    original = b"127.0.0.1 localhost\n::1 localhost\n# original"
+    journal = helper.CaptureJournal.decode((state.paths.state / "journal.json").read_bytes())
+    assert state.paths.hosts.read_bytes() == original + journal.block()
     with helper.HostsState(state.paths).locked():
         assert helper.HostsState(state.paths).recover()
-    assert state.paths.hosts.read_bytes() == b"127.0.0.1 localhost\n::1 localhost\n# original"
+    assert state.paths.hosts.read_bytes() == original
