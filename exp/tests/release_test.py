@@ -21,6 +21,10 @@ from typing import cast
 
 from click import unstyle
 
+if sys.platform != "win32":
+    import fcntl
+    import resource
+
 if os.environ.get("EXP_INSTALLED_RELEASE_EVIDENCE") != "1":
     import pytest
 
@@ -3061,9 +3065,6 @@ def test_tty_child_supports_descriptors_above_select_limit(
     """
     if sys.platform == "win32":
         pytest.skip("High-numbered pseudo-terminal descriptors require POSIX.")
-
-    import fcntl
-    import resource
 
     soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
     if soft_limit != resource.RLIM_INFINITY and soft_limit <= 1024:
