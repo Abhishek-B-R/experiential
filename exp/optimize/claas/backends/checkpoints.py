@@ -8,6 +8,7 @@ import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
 from pydantic import Field
 
@@ -24,6 +25,8 @@ from exp.optimize.claas.training_contracts import (
 class CheckpointManifest(ContractModel):
     """Exact frozen configuration and digests for every resumable state file."""
 
+    schema_version: Literal[2]
+    training_backend: Literal["verl-fsdp-0.9.0"]
     spec: ClaasTrainingSpec
     policy_revision: str = Field(min_length=1)
     parent_policy_revision: str = Field(min_length=1)
@@ -33,6 +36,7 @@ class CheckpointManifest(ContractModel):
     consumed_experience_ids: tuple[str, ...] = Field(min_length=1)
     files: dict[str, Sha256] = Field(min_length=1)
     lineage_id: str = Field(default="main", min_length=1, max_length=512)
+    serving_adapter_directory: Literal["student", "serving"] = "student"
 
 
 def hash_file(path: Path) -> str:
@@ -85,10 +89,19 @@ def verify_checkpoint(
         "student/adapter_model.safetensors",
         "teacher/adapter_config.json",
         "teacher/adapter_model.safetensors",
-        "optimizer.pt",
+        "verl/actor/model_world_size_1_rank_0.pt",
+        "verl/actor/optim_world_size_1_rank_0.pt",
+        "verl/actor/extra_state_world_size_1_rank_0.pt",
+        "verl/actor/fsdp_config.json",
+        "verl/teacher/model_world_size_1_rank_0.pt",
+        "verl/teacher/fsdp_config.json",
+        f"{manifest.serving_adapter_directory}/adapter_config.json",
+        f"{manifest.serving_adapter_directory}/adapter_model.safetensors",
     }
     if not required.issubset(manifest.files):
-        raise ValueError("checkpoint lacks student, teacher, or resumable optimizer state")
+        raise ValueError(
+            "checkpoint lacks student, teacher, serving, or native veRL resumable optimizer state"
+        )
     return manifest
 
 
