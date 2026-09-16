@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import select
+import stat
 import subprocess
 import sys
 import time
@@ -20,6 +21,57 @@ from exp.runtime.capture.system_helper import CaptureSystemError, validate_domai
 _HELPER_ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C", "LC_ALL": "C"}
 _READY_TIMEOUT = 30.0
 _CLOSE_TIMEOUT = 25.0
+_APPLE_PYTHON = "/usr/bin/python3"
+
+
+def _require_root_owned(path: Path) -> None:
+    """Require administrator-controlled interpreter files and their enclosing directories."""
+    if not path.is_absolute():
+        raise CaptureSystemError("The Apple Python installation reported an invalid path.")
+    for candidate in {path, *path.parents, path.resolve(), *path.resolve().parents}:
+        info = candidate.stat()
+        if (
+            info.st_uid != 0
+            or info.st_mode & 0o022
+            or not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode))
+        ):
+            raise CaptureSystemError(
+                "Capture needs a root-owned Apple Python installation without user-writable paths."
+            )
+
+
+def _verify_apple_python() -> None:
+    """Check Apple's interpreter and standard-library prefix before requesting elevation."""
+    try:
+        _require_root_owned(Path(_APPLE_PYTHON))
+        result = subprocess.run(
+            [
+                _APPLE_PYTHON,
+                "-I",
+                "-S",
+                "-c",
+                "import json,sys; sys.stdout.write(json.dumps("
+                "{'executable':sys.executable,'prefix':sys.base_prefix,"
+                "'supported':sys.version_info >= (3,9)}))",
+            ],
+            env=_HELPER_ENV,
+            capture_output=True,
+            check=True,
+            timeout=10,
+        )
+        value = json.loads(result.stdout)
+        if not isinstance(value, dict) or value.get("supported") is not True:
+            raise ValueError("unsupported Apple Python")
+        for key in ("executable", "prefix"):
+            path = value.get(key)
+            if not isinstance(path, str):
+                raise ValueError("invalid Apple Python installation")
+            _require_root_owned(Path(path))
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise CaptureSystemError(
+            "Capture requires Apple's Python 3.9 or newer. Install the macOS Command Line Tools "
+            "with xcode-select --install, then retry."
+        ) from exc
 
 
 def _authorize() -> None:
@@ -28,6 +80,7 @@ def _authorize() -> None:
         raise CaptureSystemError("DNS capture currently supports macOS only.")
     if os.geteuid() == 0:
         raise CaptureSystemError("Run exp capture as your normal user, not with sudo.")
+    _verify_apple_python()
     result = subprocess.run(["/usr/bin/sudo", "-v"], env=_HELPER_ENV, check=False)
     if result.returncode:
         raise CaptureSystemError(
@@ -36,20 +89,23 @@ def _authorize() -> None:
 
 
 def _command(action: str, *, port: int = 0, domains: tuple[str, ...] = ()) -> list[str]:
-    """Construct a fixed helper command with isolated imports and no configurable paths."""
+    """Snapshot trusted CLI source before authorization, avoiding privileged file reopening."""
+    arguments = [action]
+    if action == "serve":
+        arguments.extend(("--port", str(validate_port(port))))
+        for domain in validate_domains(domains):
+            arguments.extend(("--domain", domain))
+    source = Path(__file__).with_name("system_helper.py").read_text(encoding="utf-8")
     command = [
         "/usr/bin/sudo",
         "-n",
-        str(Path(sys.executable).resolve()),
+        _APPLE_PYTHON,
         "-I",
         "-S",
-        str(Path(__file__).with_name("system_helper.py").resolve()),
-        action,
+        "-c",
+        source,
+        *arguments,
     ]
-    if action == "serve":
-        command.extend(("--port", str(validate_port(port))))
-        for domain in validate_domains(domains):
-            command.extend(("--domain", domain))
     return command
 
 
@@ -127,7 +183,7 @@ class CaptureSystemSession:
                 raise CaptureSystemError("Capture helper did not confirm readiness.")
             session.heartbeat()
             return session
-        except (CaptureSystemError, OSError):
+        except (CaptureSystemError, OSError, KeyboardInterrupt):
             if process.stdin is not None:
                 process.stdin.close()
             try:
@@ -176,10 +232,11 @@ class CaptureSystemSession:
 
 def reset_capture_system() -> None:
     """Recover this feature's marked hosts entries offline, without loading user credentials."""
+    command = _command("reset")
     _authorize()
     try:
         result = subprocess.run(
-            _command("reset"),
+            command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             env=_HELPER_ENV,

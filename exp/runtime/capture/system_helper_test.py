@@ -371,3 +371,80 @@ def test_killed_helper_leaves_offline_recoverable_journal(
     with helper.HostsState(state.paths).locked():
         assert helper.HostsState(state.paths).recover()
     assert state.paths.hosts.read_bytes() == original
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Exercise Apple's standalone Python 3.9")
+def test_apple_python_runs_relay_and_recovery_without_package_imports(
+    state: helper.HostsState,
+) -> None:
+    """Run the real helper under Apple's isolated interpreter with synthetic paths only."""
+    script = """
+import asyncio, importlib.util, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("capture_helper", sys.argv[1])
+helper = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = helper
+spec.loader.exec_module(helper)
+
+async def echo(reader, writer):
+    '''Echo streaming bytes under Apple's interpreter.'''
+    try:
+        while True:
+            data = await reader.read(65536)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+async def exercise():
+    '''Keep every test mutation inside injected temporary paths.'''
+    paths = helper.SystemPaths(Path(sys.argv[2]), Path(sys.argv[3]), os.geteuid())
+    state = helper.HostsState(paths)
+    before = state.paths.hosts.read_bytes()
+    server = await asyncio.start_server(echo, "127.0.0.1", 0)
+    relay = helper.LoopbackRelay(server.sockets[0].getsockname()[1], listen_port=0)
+    read_fd, write_fd = os.pipe()
+    started = asyncio.Event()
+    serving = asyncio.create_task(helper.serve_capture(
+        state, relay, ("api.openai.com",), read_fd, lambda _: started.set(), lambda: None, 0.5
+    ))
+    try:
+        await asyncio.wait_for(started.wait(), 3)
+        for listener in relay.servers:
+            address = listener.sockets[0].getsockname()
+            reader, writer = await asyncio.open_connection(address[0], address[1])
+            payload = bytes(range(256)) * 1024
+            writer.write(payload)
+            await writer.drain()
+            assert await asyncio.wait_for(reader.readexactly(len(payload)), 3) == payload
+            writer.close()
+            await writer.wait_closed()
+        # Leave the control pipe open: only heartbeat expiry may trigger cleanup.
+        await asyncio.wait_for(serving, 3)
+        assert state.paths.hosts.read_bytes() == before
+        assert not relay.servers
+    finally:
+        os.close(write_fd)
+        os.close(read_fd)
+        server.close()
+        await server.wait_closed()
+
+asyncio.run(exercise())
+"""
+    subprocess.run(
+        [
+            "/usr/bin/python3",
+            "-I",
+            "-S",
+            "-c",
+            script,
+            str(Path(helper.__file__)),
+            str(state.paths.hosts),
+            str(state.paths.state),
+        ],
+        check=True,
+        timeout=10,
+    )

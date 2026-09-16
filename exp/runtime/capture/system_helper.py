@@ -4,7 +4,8 @@ The executable accepts no filesystem paths. It owns one marked hosts block and a
 root-owned recovery journal, never a snapshot of somebody else's hosts file.
 SIGINT/SIGTERM, control-pipe EOF, and an expired heartbeat lease request cleanup.
 Power loss or killing this helper itself requires a later ``reset`` invocation.
-Run this file using an isolated Python interpreter with ``-I -S``.
+Production evaluates an in-memory source snapshot using Apple's root-controlled
+Python 3.9 or newer with ``-I -S``; it does not reopen this source file as root.
 """
 
 from __future__ import annotations
@@ -347,7 +348,7 @@ class LoopbackRelay:
             _, writer = await asyncio.wait_for(
                 asyncio.open_connection("127.0.0.1", self.target_port), timeout=2
             )
-        except (OSError, TimeoutError) as exc:
+        except (OSError, asyncio.TimeoutError) as exc:  # noqa: UP041 - Apple Python 3.9 compatibility.
             raise CaptureSystemError(
                 "The local capture proxy is not listening. Start the proxy before changing hosts."
             ) from exc
@@ -388,16 +389,23 @@ class LoopbackRelay:
     async def _relay(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         """Bridge one client without logging, parsing, storing, or replaying its traffic."""
         upstream: asyncio.StreamWriter | None = None
+        copies: list[asyncio.Task[None]] = []
         try:
             upstream_reader, upstream = await asyncio.wait_for(
                 asyncio.open_connection("127.0.0.1", self.target_port), timeout=2
             )
-            async with asyncio.TaskGroup() as tasks:
-                tasks.create_task(self._copy(reader, upstream))
-                tasks.create_task(self._copy(upstream_reader, writer))
-        except (OSError, TimeoutError, ExceptionGroup):
+            copies = [
+                asyncio.create_task(self._copy(reader, upstream)),
+                asyncio.create_task(self._copy(upstream_reader, writer)),
+            ]
+            await asyncio.gather(*copies)
+        except (OSError, asyncio.TimeoutError):  # noqa: UP041 - Apple Python 3.9 compatibility.
             LOGGER.debug("Capture relay connection ended.")
         finally:
+            for task in copies:
+                task.cancel()
+            if copies:
+                await asyncio.gather(*copies, return_exceptions=True)
             writer.close()
             if upstream is not None:
                 upstream.close()
@@ -444,7 +452,7 @@ async def monitor_control(fd: int, stop: asyncio.Event, timeout: float = HEARTBE
         while not stop.is_set():
             try:
                 data = await asyncio.wait_for(queue.get(), max(0, deadline - time.monotonic()))
-            except TimeoutError:
+            except asyncio.TimeoutError:  # noqa: UP041 - Apple Python 3.9 compatibility.
                 stop.set()
                 break
             pending += data

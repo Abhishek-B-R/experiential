@@ -16,10 +16,38 @@ from exp.runtime.capture.system_helper import CaptureSystemError
 def test_command_is_isolated_and_exposes_only_validated_parameters() -> None:
     """The elevated interface accepts no environment, filesystem, or executable override."""
     command = system._command("serve", port=18080, domains=("api.openai.com",))
-    assert command[:5] == ["/usr/bin/sudo", "-n", str(Path(sys.executable).resolve()), "-I", "-S"]
-    assert command[5] == str(Path(system.__file__).with_name("system_helper.py").resolve())
-    assert command[6:] == ["serve", "--port", "18080", "--domain", "api.openai.com"]
-    assert system._command("reset")[6:] == ["reset"]
+    assert command[:6] == ["/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-S", "-c"]
+    assert command[6] == Path(system.__file__).with_name("system_helper.py").read_text()
+    assert command[7:] == ["serve", "--port", "18080", "--domain", "api.openai.com"]
+    assert system._command("reset")[7:] == ["reset"]
+
+
+def test_command_snapshots_source_before_later_file_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The elevated command cannot reopen a helper path replaced after construction."""
+    source = "import sys; sys.stdout.write('original snapshot')"
+    helper = tmp_path / "system_helper.py"
+    helper.write_text(source)
+    monkeypatch.setattr(system, "__file__", str(tmp_path / "system.py"))
+    command = system._command("reset")
+    helper.write_text("raise AssertionError('replacement executed')")
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", *command[5:]], capture_output=True, check=True
+    )
+    assert result.stdout == b"original snapshot"
+
+
+def test_root_owned_interpreter_check_rejects_mutable_ancestor(tmp_path: Path) -> None:
+    """A world-writable parent cannot become a trusted interpreter location."""
+    with pytest.raises(CaptureSystemError, match="root-owned"):
+        system._require_root_owned(tmp_path)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Apple system Python is a macOS prerequisite")
+def test_apple_interpreter_and_prefix_are_root_controlled() -> None:
+    """Exercise only the nonprivileged prerequisite probe on macOS."""
+    system._verify_apple_python()
 
 
 @pytest.mark.parametrize("port, domains", [(443, ("api.openai.com",)), (18080, ("*.openai.com",))])
