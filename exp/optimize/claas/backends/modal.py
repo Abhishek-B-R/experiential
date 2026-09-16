@@ -14,7 +14,11 @@ import modal
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel, sha256_json
-from exp.optimize.claas.backends.checkpoints import CheckpointManifest, verify_checkpoint
+from exp.optimize.claas.backends.checkpoints import (
+    CheckpointManifest,
+    verify_checkpoint,
+    verify_training_result,
+)
 from exp.optimize.claas.training_contracts import (
     ClaasTrainingError,
     ClaasTrainingSpec,
@@ -78,10 +82,15 @@ class ModalVerlBackend:
     downloaded within a byte ceiling, and verified before any success receipt.
     """
 
-    def __init__(self, *, config: ModalExecutionConfig, checkpoint_root: Path) -> None:
+    def __init__(
+        self, *, config: ModalExecutionConfig, checkpoint_root: Path, lineage_id: str = "main"
+    ) -> None:
         """Bind explicit deployment settings without looking up cloud resources."""
         if not checkpoint_root.is_absolute():
             raise ValueError("checkpoint_root must be an absolute durable local directory")
+        if not lineage_id.strip() or len(lineage_id) > 512:
+            raise ValueError("lineage_id must be a nonblank identifier of at most 512 characters")
+        self.lineage_id = lineage_id
         self.config = config
         self.checkpoint_root = checkpoint_root.resolve()
 
@@ -144,24 +153,9 @@ class ModalVerlBackend:
         local = await _download_checkpoint(
             volume, checkpoint, job.spec, self.checkpoint_root, config.maximum_checkpoint_bytes
         )
-        manifest = verify_checkpoint(local, job.spec)
-        parent = (
-            job.resume_checkpoint.policy_revision
-            if job.resume_checkpoint
-            else job.spec.initial_policy_revision
-        )
-        history = job.resume_checkpoint.policy_history if job.resume_checkpoint else (parent,)
-        expected_history = (checkpoint.policy_revision, *history)[: job.spec.max_policy_lag + 1]
-        if (
-            manifest.batch_id != job.batch.batch_id
-            or manifest.consumed_experience_ids != expected
-            or manifest.parent_policy_revision != parent
-            or manifest.policy_history != expected_history
-        ):
-            raise ClaasTrainingError(
-                "Modal manifest does not describe the submitted optimizer update"
-            )
-        return result.model_copy(update={"checkpoint": local})
+        local_result = result.model_copy(update={"checkpoint": local})
+        verify_training_result(job, local_result)
+        return local_result
 
 
 def _remote_checkpoint(checkpoint: TrainingCheckpoint, local_root: Path) -> TrainingCheckpoint:
@@ -183,16 +177,20 @@ async def _download_checkpoint(
     spec: ClaasTrainingSpec,
     local_root: Path,
     maximum_bytes: int,
+    lineage_id: str = "main",
 ) -> TrainingCheckpoint:
     """Materialize only manifest-listed immutable files and validate before atomic rename."""
     expected_scope = sha256_json(
         {"scope": spec.scope.model_dump(mode="json"), "adapter_id": spec.adapter_id}
     )
-    expected_path = PurePosixPath(REMOTE_ROOT) / expected_scope / checkpoint.policy_revision
+    lineage = sha256_json({"lineage_id": lineage_id})
+    expected_path = (
+        PurePosixPath(REMOTE_ROOT) / expected_scope / lineage / checkpoint.policy_revision
+    )
     if PurePosixPath(checkpoint.path) != expected_path:
         raise ValueError("Modal checkpoint path does not match the exact application and revision")
     remote = expected_path.relative_to(REMOTE_ROOT)
-    directory = local_root / expected_scope
+    directory = local_root / expected_scope / lineage
     directory.mkdir(parents=True, exist_ok=True)
     destination = directory / checkpoint.policy_revision
     if destination.exists():
@@ -268,6 +266,7 @@ class _ModalSession:
                 spec=self._spec,
                 batch=batch,
                 checkpoint_root=REMOTE_ROOT,
+                lineage_id=self._backend.lineage_id,
                 resume_checkpoint=_remote_checkpoint(
                     self._checkpoint, self._backend.checkpoint_root
                 )

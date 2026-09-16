@@ -51,6 +51,7 @@ def create_modal_app(*, config: ModalExecutionConfig, image: modal.Image) -> mod
             checkpoint_root=Path(REMOTE_ROOT),
             cuda_visible_device=os.environ.get("CUDA_VISIBLE_DEVICES", ""),
             timeout_seconds=config.timeout_seconds,
+            lineage_id=job.lineage_id,
         )
         session = await backend.open(job.spec, job.resume_checkpoint)
         try:
