@@ -2,6 +2,8 @@
 
 import json
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from http.server import ThreadingHTTPServer
@@ -15,13 +17,6 @@ from exp.runtime.claas.capture import CaptureBinding, CaptureConfiguration
 from exp.runtime.claas.feedback import FeedbackStore
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.native_bridge import NativeControlPlane
-from exp.runtime.gateway.native_server import serve_native_gateway
-from exp.runtime.gateway.tests.launch_test import (
-    _configure_gateway,
-    _LoopbackProvider,
-    _unused_port,
-    _wait_ready,
-)
 
 
 @pytest.fixture
@@ -135,6 +130,16 @@ def test_real_native_feedback_is_durable_scoped_and_replayable(
     """Use local HTTP and SQLite to verify acknowledgement, key authority, and finalization."""
 
     native = pytest.importorskip("exp_gateway_native")
+    # Keep native-only fixtures behind this test's availability check so collection
+    # still runs the independent SQLite readers when the extension is absent.
+    from exp.runtime.gateway.native_server import serve_native_gateway
+    from exp.runtime.gateway.tests.launch_test import (
+        _configure_gateway,
+        _LoopbackProvider,
+        _unused_port,
+        _wait_ready,
+    )
+
     monkeypatch.setenv("LOOPBACK_PROVIDER_KEY", "provider-secret")
     provider = ThreadingHTTPServer(("127.0.0.1", 0), _LoopbackProvider)
     provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
@@ -261,3 +266,22 @@ def test_real_native_feedback_is_durable_scoped_and_replayable(
         provider_thread.join(timeout=5)
     assert not failures
     assert not thread.is_alive()
+
+
+def test_sqlite_readers_run_without_native_extension() -> None:
+    """Missing optional integration fixtures must not skip independent reader coverage."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.modules['exp_gateway_native'] = None; "
+            "import pytest; raise SystemExit(pytest.main([sys.argv[1], '-q', '-k', "
+            "'scoped_pagination or source_eviction or corrupt_scope']))",
+            str(Path(__file__)),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
