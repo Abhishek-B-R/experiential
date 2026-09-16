@@ -89,6 +89,17 @@ def model_execution_snapshot(
     )
 
 
+def stage_start_authorized(snapshot: ExecutionSnapshot, stage: ModelExecutionStage) -> bool:
+    """Permit an initial hint only for the canonical root or an explicitly authorized child.
+
+    This gate applies before projecting an untrusted hint, not to forward
+    execution after the request has already entered its root waterfall.
+    """
+    return snapshot.authorization.descendant_start_authorized or (
+        stage.exact_model_id == snapshot.exact_model_id and stage.pool_id == snapshot.pool_id
+    )
+
+
 def project_stage_selection(
     snapshot: ExecutionSnapshot,
     indexes: tuple[int, ...],

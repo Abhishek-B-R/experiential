@@ -273,7 +273,11 @@ def test_global_reorder_is_rejected_and_hint_reachability_is_authorized() -> Non
     route = resolver.resolve_direct(authorization)
     with pytest.raises(ValueError, match="boundary"):
         reorder_route_deployments(route, (1, 0, 2))
-    hinted = resolver.resolve_deployment_hint(authorization, "b1")
+    with pytest.raises(ValueError, match="requires explicit authorization"):
+        resolver.resolve_deployment_hint(authorization, "b1")
+    hinted = resolver.resolve_deployment_hint(
+        authorization.model_copy(update={"descendant_start_authorized": True}), "b1"
+    )
     assert hinted.deployment.exact_model_id == "b"
     assert hinted.snapshot.exact_model_id == "a"
     assert hinted.snapshot.pool_id == "pool-a"

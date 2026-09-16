@@ -26,6 +26,11 @@ from exp.common.models.catalog import (
     load_model_catalog,
     write_model_catalog,
 )
+from exp.common.models.gateway_chains import (
+    GatewayDeploymentRung,
+    GatewayModelChain,
+    GatewayModelReferenceRung,
+)
 from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
 from exp.runtime.gateway.catalog_authority import (
     snapshot_current_catalog,
@@ -41,6 +46,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.gateway.embeddings_contracts import ServingRequest
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle import (
     LocalGatewayComponents,
@@ -953,6 +959,225 @@ def test_fireworks_continuation_pins_the_exact_issuing_fallback_rung(tmp_path: P
     assert "reasoning_history" not in fallback_payload
     assert fallback_messages[1]["tool_calls"] == issuing_messages[1]["tool_calls"]
     assert fallback_messages[2] == issuing_messages[2]
+
+
+def test_authenticated_child_reasoning_start_requires_fresh_host_authorization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real child carrier does not authorize skipping root gates on the next request."""
+    manager, raw_key = _configured_pool_gateway(
+        tmp_path,
+        base_urls=("http://127.0.0.1:9/v1", "https://api.hunyuan.cloud.tencent.com/v1"),
+        model_capabilities=(
+            ModelCapabilities(supports_tools=True),
+            ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
+        ),
+    )
+    catalog = load_model_catalog(tmp_path / "models.toml")
+    models = dict(catalog.models)
+    beta = models["beta"]
+    assert beta.gateway is not None
+    models["beta"] = beta.model_copy(
+        update={"gateway": beta.gateway.model_copy(update={"exact_model_id": "child-exact"})}
+    )
+    chains = {
+        "model-revision-exact": GatewayModelChain(
+            model_id="model-revision-exact",
+            pool_id="alpha",
+            revision="root-chain",
+            rungs=(
+                GatewayDeploymentRung(deployment_id="alpha"),
+                GatewayModelReferenceRung(model_id="child-exact"),
+            ),
+        ),
+        "child-exact": GatewayModelChain(
+            model_id="child-exact",
+            pool_id="beta",
+            revision="child-chain",
+            rungs=(
+                GatewayDeploymentRung(deployment_id="beta"),
+                GatewayModelReferenceRung(model_id="model-revision-exact"),
+            ),
+        ),
+    }
+    write_model_catalog(
+        tmp_path / "models.toml",
+        catalog.model_copy(
+            update={
+                "models": models,
+                "gateway_pools": {},
+                "gateway_model_chains": chains,
+            }
+        ),
+    )
+    _, normalized, snapshot = snapshot_current_catalog(tmp_path)
+    manager.activate_direct_alias(
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="revision-child-carrier",
+        pool_id="alpha",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "test-secret"})
+    control = NativeControlPlane(components)
+    initial = _admit(control, raw_key, _chat_body())
+    first = _start_first(control, initial)
+    assert first["route_depth"] == 0
+    failure = {
+        "failure_class": "provider_quota",
+        "safe_message": "account quota exhausted",
+        "retryable_same_deployment": False,
+        "failover_eligible": True,
+    }
+    control.settle(
+        json.dumps(
+            {
+                "request_id": initial["request_id"],
+                "attempt_id": first["attempt_id"],
+                "outcome": "failed",
+                "usage": None,
+                "tool_names": [],
+                "failure": failure,
+                "finalize": False,
+            }
+        )
+    )
+    child = json.loads(
+        control.start_attempt(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "attempt_ordinal": 1,
+                    "current_depth": 0,
+                    "failure": failure,
+                }
+            )
+        )
+    )
+    assert child["route_depth"] == 1
+    wires = cast("list[JsonObject]", initial["route"])
+    sealed = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "route_depth": 1,
+                    "route_sha256": wires[1]["hunyuan_reasoning_route_sha256"],
+                    "content": "authenticated child reasoning",
+                    "assistant_content": None,
+                    "tool_calls": [
+                        {"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}
+                    ],
+                }
+            )
+        )
+    )["carrier"]
+    control.settle(
+        json.dumps(
+            {
+                "request_id": initial["request_id"],
+                "attempt_id": child["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": ["lookup"],
+                "failure": None,
+            }
+        )
+    )
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": sealed,
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+            ],
+        }
+    )
+    with pytest.raises(NativeBridgeError) as refused:
+        _admit(control, raw_key, body)
+    assert isinstance(refused.value.__cause__, GatewayRoutingError)
+    assert (
+        str(refused.value.__cause__) == "descendant reasoning start requires explicit authorization"
+    )
+    public_error = json.loads(refused.value.public_error_json)
+    assert public_error == {
+        "status_code": 400,
+        "code": "invalid_parameter",
+        "error_type": "invalid_request_error",
+        "param": "messages.reasoning_content",
+        "message": "'messages.reasoning_content' must be an authentic continuation for this route.",
+        "retry_after_seconds": None,
+    }
+    with sqlite3.connect(manager.database_path) as database:
+        assert database.execute("SELECT count(*) FROM gateway_requests").fetchone() == (1,)
+        assert database.execute("SELECT count(*) FROM gateway_attempts").fetchone() == (2,)
+        assert database.execute(
+            "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched','running')"
+        ).fetchone() == (0,)
+    assert isinstance(components.store, _ReadyControlStore)
+    host_store = components.store.store
+    original = host_store.authorize_request
+
+    def authorize_child_start(
+        *,
+        raw_key: str,
+        alias: str,
+        request: ServingRequest,
+        deadline_monotonic: float,
+        app_referer: str | None = None,
+        app_title: str | None = None,
+        client_ip: str | None = None,
+    ) -> AuthorizationSnapshot:
+        """Inject only this host's explicit preflight decision after ordinary authorization."""
+        authority = original(
+            raw_key=raw_key,
+            alias=alias,
+            request=request,
+            deadline_monotonic=deadline_monotonic,
+            app_referer=app_referer,
+            app_title=app_title,
+            client_ip=client_ip,
+        )
+        assert authority.descendant_start_authorized is False
+        return authority.model_copy(update={"descendant_start_authorized": True})
+
+    monkeypatch.setattr(host_store, "authorize_request", authorize_child_start)
+    continued = _admit(control, raw_key, body)
+    continued_wires = cast("list[JsonObject]", continued["route"])
+    assert [wire["deployment_id"] for wire in continued_wires] == ["beta"]
+    assert "authenticated child reasoning" in json.dumps(continued_wires[0]["upstream_payload"])
+    assert continued["route_reason"] == "reasoning_continuation"
+    started = _start_first(control, continued)
+    control.settle(
+        json.dumps(
+            {
+                "request_id": continued["request_id"],
+                "attempt_id": started["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": [],
+                "failure": None,
+            }
+        )
+    )
+    with sqlite3.connect(manager.database_path) as database:
+        assert database.execute("SELECT count(*) FROM gateway_attempts").fetchone() == (3,)
+        assert database.execute(
+            "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched','running')"
+        ).fetchone() == (0,)
 
 
 def _reasoning_failover_pool(

@@ -29,7 +29,12 @@ from exp.runtime.gateway.contracts import (
     ProjectSelection,
     ProjectTarget,
 )
-from exp.runtime.gateway.routing import CatalogRouteResolver, GatewayRoutingError, RouteResolver
+from exp.runtime.gateway.native_execution import select_route_deployments
+from exp.runtime.gateway.routing import (
+    CatalogRouteResolver,
+    GatewayRoutingError,
+    RouteResolver,
+)
 
 _REVISION = "revision-one"
 
@@ -576,10 +581,69 @@ def test_project_routes_and_hints_stay_in_selected_exact_pool(
     direct = resolver.resolve_direct(direct_auth)
     assert direct.snapshot.deployment_ids == ("a1", "b1", "a2")
     assert [s.exact_model_id for s in direct.snapshot.model_stages] == ["a", "b", "a"]
-    hint = resolver.resolve_deployment_hint(direct_auth, "b1")
+    hint = resolver.resolve_deployment_hint(
+        direct_auth.model_copy(update={"descendant_start_authorized": True}), "b1"
+    )
     assert hint.snapshot.deployment_ids == ("b1", "a2")
     assert hint.snapshot.exact_model_id == "a"
     assert hint.snapshot.pool_id == "pool-a"
+
+
+@pytest.mark.parametrize(
+    "surface",
+    [
+        GatewayApiSurface.CHAT_COMPLETIONS,
+        GatewayApiSurface.RESPONSES,
+        GatewayApiSurface.MESSAGES,
+    ],
+)
+def test_child_hint_requires_explicit_start_authority_without_blocking_root_suffix(
+    surface: GatewayApiSurface,
+) -> None:
+    """A child grant cannot substitute for root preflight, while root suffix pins remain valid."""
+    catalog = _chained_catalog()
+    digest = catalog.identity_sha256()
+    resolver = _resolver(catalog, digest)
+    auth = _hint_authorization(digest, "pool-a").model_copy(update={"surface": surface})
+    assert auth.descendant_start_authorized is False
+    with pytest.raises(GatewayRoutingError, match="requires explicit authorization"):
+        resolver.resolve_deployment_hint(auth, "b1")
+    for issuer, expected in (("a1", ("a1", "b1", "a2")), ("a2", ("a2",))):
+        root = resolver.resolve_deployment_hint(auth, issuer)
+        assert root.snapshot.deployment_ids == expected
+        assert root.reasoning_pinned_deployment_id == issuer
+    authorized = auth.model_copy(update={"descendant_start_authorized": True})
+    child = resolver.resolve_deployment_hint(authorized, "b1")
+    assert child.snapshot.deployment_ids == ("b1", "a2")
+    assert child.snapshot.stage_for_depth(0).ancestry == ("a", "b")
+    assert child.snapshot.authorization == authorized
+    # A real root pin narrowed after a forward failure keeps its original issuer,
+    # not a newly authorized child start.
+    root = resolver.resolve_deployment_hint(auth, "a1")
+    fallback = select_route_deployments(root, (1, 2))
+    assert fallback.snapshot.deployment_ids == ("b1", "a2")
+    assert fallback.reasoning_pinned_deployment_id == "a1"
+    assert fallback.snapshot.authorization.descendant_start_authorized is False
+
+
+def test_child_start_authorization_never_adds_unreachable_or_revoked_hints() -> None:
+    """Explicit child-start permission preserves the pinned graph's deployment boundaries."""
+    catalog = _chained_catalog(unrelated_models=1)
+    digest = catalog.identity_sha256()
+    resolver = _resolver(catalog, digest)
+    auth = _hint_authorization(digest, "pool-a").model_copy(
+        update={"descendant_start_authorized": True}
+    )
+    for hint in ("missing", "c0"):
+        with pytest.raises(GatewayRoutingError, match="not reachable"):
+            resolver.resolve_deployment_hint(auth, hint)
+    with pytest.raises(GatewayRoutingError, match="snapshot is not active"):
+        resolver.resolve_deployment_hint(
+            auth.model_copy(update={"alias_revision_id": "revoked"}), "b1"
+        )
+    resolver.swap_catalogs({}, project_resolver=None, listing_pools={})
+    with pytest.raises(GatewayRoutingError, match="snapshot is not active"):
+        resolver.resolve_deployment_hint(auth, "b1")
 
 
 def test_index_builds_immutable_chain_maps_once_per_shared_catalog() -> None:
@@ -604,7 +668,7 @@ def test_index_builds_immutable_chain_maps_once_per_shared_catalog() -> None:
         assert set(view.chains) == {"a", "b", *(f"c{i}" for i in range(100))}
         for revision, _ in keys[:3]:
             auth = _hint_authorization(digest, "pool-a").model_copy(
-                update={"alias_revision_id": revision}
+                update={"alias_revision_id": revision, "descendant_start_authorized": True}
             )
             assert resolver.resolve_direct(auth).snapshot.deployment_ids == ("a1", "b1", "a2")
             assert resolver.resolve_deployment_hint(auth, "b1").snapshot.deployment_ids == (
@@ -626,7 +690,12 @@ def test_direct_hint_expands_only_its_authorized_root_once() -> None:
     with unittest.mock.patch.object(
         model_plan, "expand_model_chain", wraps=model_plan.expand_model_chain
     ) as expansion:
-        route = resolver.resolve_deployment_hint(_hint_authorization(digest, "pool-a"), "b1")
+        route = resolver.resolve_deployment_hint(
+            _hint_authorization(digest, "pool-a").model_copy(
+                update={"descendant_start_authorized": True}
+            ),
+            "b1",
+        )
     assert expansion.call_count == 1
     assert expansion.call_args.args[0] == "a"
     assert route.snapshot.deployment_ids == ("b1", "a2")
@@ -644,8 +713,12 @@ def test_chain_indexes_keep_same_revision_catalog_generations_separate_after_swa
         model_chains=(chain("a", "a1", "a2", ">b"),),
     )
     new_digest = new.identity_sha256()
-    old_auth = _hint_authorization(old_digest, "pool-a")
-    new_auth = _hint_authorization(new_digest, "pool-a")
+    old_auth = _hint_authorization(old_digest, "pool-a").model_copy(
+        update={"descendant_start_authorized": True}
+    )
+    new_auth = _hint_authorization(new_digest, "pool-a").model_copy(
+        update={"descendant_start_authorized": True}
+    )
     resolver = _resolver(old, old_digest)
     frozen = resolver.resolve_direct(old_auth)
     resolver.swap_catalogs(

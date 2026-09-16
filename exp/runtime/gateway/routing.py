@@ -33,7 +33,11 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.discovery import PublishedAliasMetadata, published_alias_metadata
 from exp.runtime.gateway.interfaces import ProjectTargetResolver
-from exp.runtime.gateway.model_plan import model_execution_snapshot, project_stage_selection
+from exp.runtime.gateway.model_plan import (
+    model_execution_snapshot,
+    project_stage_selection,
+    stage_start_authorized,
+)
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded, RequestDeadline
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 from exp.runtime.router.runtime import RouterRuntime
@@ -397,12 +401,10 @@ class CatalogRouteResolver:
     ) -> GatewayRoute:
         """Resolve one untrusted carrier hint only inside current alias authority.
 
-        The ``deployment_id`` MUST be a CANONICAL pool member of the authorized
-        alias revision: pool membership is checked against ``pool.deployment_ids``,
-        which names canonicals only, so a BYOK or org-variant deployment id will
-        NOT resolve here. Mapping a variant back to its canonical is the CALLER
-        resolver's responsibility; this method receives an already-canonical id
-        and fails closed on anything the current authority's pools do not name.
+        Hints must name a canonical deployment in the authorized revision's
+        reachable pools. BYOK and organization variant IDs do not resolve here:
+        the caller must first map them to canonical IDs. Catalog membership
+        never substitutes for explicit authority to start on a child model.
 
         Args:
             authorization: Frozen authenticated alias revision and target.
@@ -410,19 +412,15 @@ class CatalogRouteResolver:
                 continuation, resolved only within the authorized revision.
 
         Returns:
-            The pool's ordered ladder with the hinted deployment dispatched
-            first and ``reasoning_pinned_deployment_id`` naming it. The pool's
-            remaining certified deployments follow in pool order as failover
-            fallbacks: each ``requires_reasoning_strip`` because only the
-            issuing rung's credential can unseal the request's active reasoning,
-            so a failover-eligible operational failure on the pinned rung
-            (throttle, provider quota, unavailability, transport) continues on
-            them without the sealed blocks instead of surfacing after one
-            attempt. A single-deployment pool yields no fallbacks.
+            The issuing rung first, followed by its permitted forward suffix.
+            Other rungs require reasoning stripping: only the issuer can unseal
+            the active reasoning. Eligible operational failures may continue
+            without it; a singleton has no fallback. Child starts require the
+            host's explicit root funding and policy authorization.
 
         Raises:
-            GatewayRoutingError: The snapshot is inactive, the id is not an
-                unambiguous canonical pool member, or its identity is invalid.
+            GatewayRoutingError: Snapshot, membership, identity, or child-start
+                authority is invalid.
         """
         view = self._catalogs.get((authorization.alias_revision_id, authorization.catalog_sha256))
         if view is None:
@@ -438,6 +436,10 @@ class CatalogRouteResolver:
                     "reasoning carrier deployment is not reachable in current authority"
                 )
             stage = plan.stage_for_depth(plan.deployment_ids.index(deployment_id))
+            if not stage_start_authorized(plan, stage):
+                raise GatewayRoutingError(
+                    "descendant reasoning start requires explicit authorization"
+                )
             pools = (self._pool(view, stage.pool_id),)
         else:
             if target.catalog_sha256 != authorization.catalog_sha256:
