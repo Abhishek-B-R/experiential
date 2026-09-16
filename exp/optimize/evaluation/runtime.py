@@ -16,6 +16,7 @@ from exp.common.models import ModelSnapshot, verify_completion_reservation
 from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.contracts import EvaluationBudget, EvaluationServices
+from exp.optimize.evaluation.judge import DurableEvaluationJudge
 from exp.optimize.evaluation.planning import estimate_model_evaluation
 from exp.optimize.evaluation.prepare import PreparedModelEvaluation, read_evaluation_judge
 from exp.optimize.evaluation.service import ModelEvaluationResult, evaluate_models
@@ -209,7 +210,11 @@ def run_prepared_model_evaluation(
     return evaluate_models(
         project,
         setup,
-        services=EvaluationServices(simulator_factory, judge, (runtime_input,)),
+        services=EvaluationServices(
+            simulator_factory,
+            DurableEvaluationJudge(judge, bounded_judge, prepared.judge_request),
+            (runtime_input,),
+        ),
         budget=budget,
         created_at=created_at,
         code_revision=code_revision,
