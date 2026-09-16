@@ -9,9 +9,10 @@ use crate::dialects::Dialect;
 use crate::errors::{Failure, FailureClass};
 use crate::param_attribution::{
     bounded_masked_line, content_filtered_completion, generic_error_code,
-    rejected_by_lane_limitation, rejected_by_routing_gate, rejected_caller_reference_not_found,
-    rejected_code, rejected_detail, rejected_encrypted_reasoning, rejected_model_not_found,
-    rejected_parameter, sanitized_detail,
+    rejected_by_account_quota, rejected_by_lane_limitation, rejected_by_routing_gate,
+    rejected_caller_reference_not_found, rejected_code, rejected_detail,
+    rejected_encrypted_reasoning, rejected_model_not_found, rejected_parameter,
+    rejected_via_decode_failure, sanitized_detail,
 };
 use crate::rate_limit_headers::{harvest_rate_limit_headers, retry_after_seconds};
 
@@ -373,6 +374,60 @@ pub async fn open_stream(
             // request fields" for the caller and the ledger alike. A generic
             // family type or bare status adds nothing and is not relayed.
             .or_else(|| code.clone().filter(|token| !generic_error_code(token)));
+        // A relay that could not decode the UPSTREAM error it received (Novita's
+        // Go relay on a numeric `error.code`) answers its own 400 whose
+        // sentence embeds that upstream document: the class and the sentence
+        // the caller needs are the upstream's, so a relayed throttle or quota
+        // fails over as such and a relayed caller error keeps its real sentence
+        // instead of the decoder's noise.
+        let (code, detail) = match body
+            .as_deref()
+            .and_then(|body| rejected_via_decode_failure(dialect, body))
+        {
+            Some((upstream_code, upstream_sentence)) => {
+                let kind = crate::stream_errors::classify_stream_error(
+                    upstream_code.as_deref(),
+                    Some(&upstream_sentence),
+                );
+                let sanitized = sanitized_detail(&upstream_sentence, &request_words);
+                // The relay answered a client-error status, so an upstream
+                // sentence the classifier cannot place (its default is the
+                // provider-fault class) keeps this status's caller class with
+                // the upstream sentence; only a positively classified throttle,
+                // quota, credential, not-found or refusal verdict overrides it.
+                if !matches!(
+                    kind,
+                    crate::stream_errors::StreamErrorKind::InvalidRequest
+                        | crate::stream_errors::StreamErrorKind::ProviderInternal
+                ) {
+                    let ledger_detail =
+                        sanitized.map(|text| format!("{}: {text}", status_detail(status)));
+                    return Err(crate::stream_errors::stream_failure(kind, ledger_detail)
+                        .with_rate_limit_facts(rate_limit.clone(), retry_after));
+                }
+                (upstream_code, sanitized)
+            }
+            None => (code, detail),
+        };
+        // A client-error status whose CODE or SENTENCE says the provider
+        // ACCOUNT cannot pay (Novita `400 "Insufficient quota available for
+        // instant inference"` on a drained prepaid balance) is the house
+        // account's funding state, never the caller's request: it takes the
+        // quota class the exhaustion sweep and pool rotation read, fails over,
+        // and keeps the sentence ledger-only like every operator-facing class.
+        if crate::stream_errors::is_quota_code(code.as_deref())
+            || body
+                .as_deref()
+                .is_some_and(|body| rejected_by_account_quota(dialect, body))
+        {
+            let ledger_detail = detail.as_deref().map_or_else(
+                || status_detail(status),
+                |text| format!("{}: {text}", status_detail(status)),
+            );
+            return Err(transport_failure(Some(402))
+                .with_provider_detail(Some(ledger_detail))
+                .with_rate_limit_facts(rate_limit.clone(), retry_after));
+        }
         // A content-filter CODE under a 4xx is the model's verdict on the
         // content (Azure and Gemini answer 400 for it), not a request-shape
         // error: file and answer it as a refusal naming its bounded category,
