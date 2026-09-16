@@ -320,3 +320,28 @@ def test_multiturn_evaluation_uses_real_http_client_off_the_policy_loop() -> Non
     assert report.paired_mean_delta == 0.5
     assert len(world_transport.requests) == 4 and len(judge_transport.requests) == 2
     assert all(request.url.endswith("/chat/completions") for request in world_transport.requests)
+
+
+def test_loaded_report_rejects_score_tampering_and_wrong_judge_identity() -> None:
+    """A score must derive from retained provider evidence for the frozen judge model."""
+    from exp.optimize.claas.evaluation import PairedEvaluationReport, verify_evaluation_report
+
+    manifest, world, judge = evaluation_fixture()
+    report = asyncio.run(
+        evaluate_policies(
+            manifest,
+            current=Policy("current"),
+            candidate=Policy("candidate"),
+            world=world,
+            judge=judge,
+        )
+    )
+    raw = json.loads(report.model_dump_json())
+    raw["pairs"][0]["candidate"]["judgment"]["score"] = 1.0
+    with pytest.raises(ValueError, match="recorded judge response"):
+        PairedEvaluationReport.model_validate(raw)
+    raw = json.loads(report.model_dump_json())
+    raw["pairs"][0]["candidate"]["judge_response"]["model"]["model_id"] = "other-judge"
+    forged = PairedEvaluationReport.model_validate(raw)
+    with pytest.raises(ValueError, match="different model snapshot"):
+        verify_evaluation_report(forged, manifest)

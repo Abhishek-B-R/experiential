@@ -14,6 +14,7 @@ from exp.common.claas import ClaasScope, Experience
 from exp.common.core.artifacts import ContractModel, Sha256, sha256_json, stable_id
 from exp.common.models import (
     AssistantAction,
+    ModelFinishReason,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -174,6 +175,19 @@ class PolicyTaskEvaluation(ContractModel):
             or self.judge_response is None
         ):
             raise ValueError("scored evaluation requires a terminal episode and judge evidence")
+        if success and self.judge_response is not None:
+            response = self.judge_response
+            if (
+                response.finish_reason != ModelFinishReason.COMPLETED
+                or response.output.tool_calls
+                or response.output.content is None
+            ):
+                raise ValueError("scored evaluation requires a completed structured judge response")
+            recorded = SyntheticJudgment.model_validate_json(
+                structured_json_text(response.output.content)
+            )
+            if recorded != self.judgment:
+                raise ValueError("evaluation judgment differs from its recorded judge response")
         if not success and not self.failure_type:
             raise ValueError("failed evaluation must retain its failure type")
         return self
@@ -466,3 +480,18 @@ def verify_evaluation_report(report: PairedEvaluationReport, manifest: Evaluatio
         or report.judge_version != manifest.judge_version
     ):
         raise ValueError("paired report differs from the authoritative evaluation manifest")
+    tasks = {task.task_id: task for task in manifest.tasks}
+    for pair in report.pairs:
+        task = tasks[pair.task_id]
+        for outcome in (pair.current, pair.candidate):
+            if outcome.episode is not None and outcome.episode.scenario != task.scenario:
+                raise ValueError("reported episode differs from its immutable evaluation task")
+            if (
+                outcome.judge_response is not None
+                and outcome.judge_response.model != manifest.judge_model
+            ):
+                raise ValueError("reported judgment came from a different model snapshot")
+            if outcome.episode is not None and any(
+                step.response.model != manifest.world_model for step in outcome.episode.steps
+            ):
+                raise ValueError("reported episode came from a different world-model snapshot")
