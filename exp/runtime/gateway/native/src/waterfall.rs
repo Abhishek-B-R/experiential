@@ -583,34 +583,45 @@ async fn run_attempt(
         )
     };
     let mut first_byte_deadline = Instant::now() + first_byte_allowance_for();
-    let open_bound = remaining(ctx.deadline)
-        .min(phase_timeout)
-        .min(remaining(first_byte_deadline));
     // What is already known repairs the first dial: the payload this request
     // stripped on an earlier dial of the rung, else the payloads this worker
     // remembers the caller's provider refusing.
     let mut repair = AttemptRepair::begin(wire, ctx.caller_scope, repaired);
-    let response = match open_stream(
-        ctx.http,
-        &wire.url,
-        &headers,
-        &wire.idempotency_key,
-        repair.payload(),
-        repair.raw_body(),
-        open_bound,
-        dialect,
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(failure) => {
-            // The rung refused a replayed reasoning item's encrypted payload
-            // (sealed by another organization or tenant, or never issued by
-            // this provider): one re-dial of the same rung, same reservation,
-            // with those items stripped, before the caller's 400 may surface.
-            // A payload with nothing to strip, or a refusal of the stripped
-            // payload itself, surfaces.
-            if !repair.repair_after(&failure) {
+    // At most one re-dial per attempt: when the rung refuses a replayed
+    // reasoning item's encrypted payload (sealed by another organization or
+    // tenant, or never issued by this provider), whether before the stream (a
+    // 4xx) or inside it (OpenRouter's Responses relay answers 200 and then
+    // fails the stream on its first frame), the same rung is dialed again,
+    // same reservation, with those items stripped, before the caller's 400 may
+    // surface. A payload with nothing to strip, or a refusal of the stripped
+    // payload itself, surfaces.
+    let mut redialed = false;
+    'dial: loop {
+        let open_bound = remaining(ctx.deadline)
+            .min(phase_timeout)
+            .min(remaining(first_byte_deadline));
+        let response = match open_stream(
+            ctx.http,
+            &wire.url,
+            &headers,
+            &wire.idempotency_key,
+            repair.payload(),
+            repair.raw_body(),
+            open_bound,
+            dialect,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(failure) => {
+                if !redialed && repair.repair_after(&failure) {
+                    // The stripped dial is a physical attempt of its own and
+                    // gets a fresh first-byte window, exactly like a same-rung
+                    // redial; the refused open must not eat into it.
+                    redialed = true;
+                    first_byte_deadline = Instant::now() + first_byte_allowance_for();
+                    continue 'dial;
+                }
                 return AttemptEnd::Ladder {
                     failure: customer_owned(failure, wire),
                     refusal_eligible: false,
@@ -621,267 +632,245 @@ async fn run_attempt(
                     encrypted_reasoning_stripped: false,
                 };
             }
-            // The stripped dial is a physical attempt of its own and gets a
-            // fresh first-byte window, exactly like a same-rung redial; the
-            // refused open and its error-body read must not eat into it.
-            first_byte_deadline = Instant::now() + first_byte_allowance_for();
-            let open_bound = remaining(ctx.deadline)
-                .min(phase_timeout)
-                .min(remaining(first_byte_deadline));
-            match open_stream(
-                ctx.http,
-                &wire.url,
-                &headers,
-                &wire.idempotency_key,
-                repair.payload(),
-                None,
-                open_bound,
+        };
+        // Counted and logged only once the dial that carried the repair opened:
+        // a refused re-dial is a failure, not a repair.
+        repair.opened(ctx.request_id);
+        let encrypted_reasoning_stripped = repair.stripped();
+        guard.mark_opened();
+        // The opened response's allowlisted rate-limit headers settle with this
+        // attempt whatever its terminal outcome; a failed OPEN instead carries
+        // them on its failure (attached in `open_stream`).
+        guard.record_rate_limit_headers(harvest_rate_limit_headers(response.headers()));
+        let mut relay = match wire
+            .fireworks_reasoning_route_sha256
+            .clone()
+            .or_else(|| wire.hunyuan_reasoning_route_sha256.clone())
+        {
+            Some(route_sha256) => UpstreamRelay::new_with_reasoning_content_route(
+                response,
                 dialect,
-            )
-            .await
+                first_byte_deadline,
+                Some(route_sha256),
+            ),
+            None => UpstreamRelay::new(response, dialect, first_byte_deadline),
+        };
+        relay.set_stop_sequences(wire.stop_sequences.iter().cloned());
+        relay.set_serialize_tool_calls(wire.serialize_tool_calls);
+        if !wire.model_id.is_empty() {
+            relay.set_request_words([wire.model_id.clone()]);
+        }
+        if wire.billing_customer_managed {
+            // Applied to every failure the relay yields, before or after commit,
+            // so a committed stream's late credential error is the customer's too.
+            relay.set_customer_managed_provider(Some(wire.provider.clone()));
+        }
+        // Per dial: a refused stream's tracked facts belong to that dial, and
+        // a refused open reports no usage.
+        let mut usage: Option<Usage> = None;
+        let mut tool_names: Vec<String> = Vec::new();
+        let mut withheld: Vec<Event> = Vec::new();
+        let mut withheld_bytes = 0usize;
+        loop {
+            let event = match relay
+                .next_event(ctx.deadline, phase_timeout, guard.started)
+                .await
             {
-                Ok(response) => response,
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    return AttemptEnd::Ladder {
+                        failure: ended_without_terminal(),
+                        refusal_eligible: false,
+                        exhaustion_flush: Vec::new(),
+                        usage,
+                        tool_names,
+                        opened: true,
+                        encrypted_reasoning_stripped,
+                    }
+                }
                 Err(failure) => {
                     return AttemptEnd::Ladder {
-                        failure: customer_owned(failure, wire),
+                        failure,
                         refusal_eligible: false,
                         exhaustion_flush: Vec::new(),
-                        usage: None,
-                        tool_names: Vec::new(),
-                        opened: false,
-                        encrypted_reasoning_stripped: false,
+                        usage,
+                        tool_names,
+                        opened: true,
+                        encrypted_reasoning_stripped,
                     }
                 }
-            }
-        }
-    };
-    // Counted and logged only once the dial that carried the repair opened:
-    // a refused re-dial is a failure, not a repair.
-    repair.opened(ctx.request_id);
-    let encrypted_reasoning_stripped = repair.stripped();
-    guard.mark_opened();
-    // The opened response's allowlisted rate-limit headers settle with this
-    // attempt whatever its terminal outcome; a failed OPEN instead carries
-    // them on its failure (attached in `open_stream`).
-    guard.record_rate_limit_headers(harvest_rate_limit_headers(response.headers()));
-    let mut relay = match wire
-        .fireworks_reasoning_route_sha256
-        .clone()
-        .or_else(|| wire.hunyuan_reasoning_route_sha256.clone())
-    {
-        Some(route_sha256) => UpstreamRelay::new_with_reasoning_content_route(
-            response,
-            dialect,
-            first_byte_deadline,
-            Some(route_sha256),
-        ),
-        None => UpstreamRelay::new(response, dialect, first_byte_deadline),
-    };
-    relay.set_stop_sequences(wire.stop_sequences.iter().cloned());
-    relay.set_serialize_tool_calls(wire.serialize_tool_calls);
-    if !wire.model_id.is_empty() {
-        relay.set_request_words([wire.model_id.clone()]);
-    }
-    if wire.billing_customer_managed {
-        // Applied to every failure the relay yields, before or after commit,
-        // so a committed stream's late credential error is the customer's too.
-        relay.set_customer_managed_provider(Some(wire.provider.clone()));
-    }
-    let mut usage: Option<Usage> = None;
-    let mut tool_names: Vec<String> = Vec::new();
-    let mut withheld: Vec<Event> = Vec::new();
-    let mut withheld_bytes = 0usize;
-    loop {
-        let event = match relay
-            .next_event(ctx.deadline, phase_timeout, guard.started)
-            .await
-        {
-            Ok(Some(event)) => event,
-            Ok(None) => {
-                return AttemptEnd::Ladder {
-                    failure: ended_without_terminal(),
-                    refusal_eligible: false,
-                    exhaustion_flush: Vec::new(),
-                    usage,
-                    tool_names,
-                    opened: true,
-                    encrypted_reasoning_stripped,
+            };
+            track_event(&event, &mut usage, &mut tool_names);
+            let refusal_text = match &event {
+                Event::RefusalDelta(text) | Event::ProviderRefusalDelta { delta: text, .. } => {
+                    Some(text)
                 }
-            }
-            Err(failure) => {
-                return AttemptEnd::Ladder {
-                    failure,
-                    refusal_eligible: false,
-                    exhaustion_flush: Vec::new(),
-                    usage,
-                    tool_names,
-                    opened: true,
-                    encrypted_reasoning_stripped,
-                }
-            }
-        };
-        track_event(&event, &mut usage, &mut tool_names);
-        let refusal_text = match &event {
-            Event::RefusalDelta(text) | Event::ProviderRefusalDelta { delta: text, .. } => {
-                Some(text)
-            }
-            _ => None,
-        };
-        if let Some(text) = refusal_text {
-            if ctx.policy.refusal_failover {
-                let event_bytes = text.len();
-                if withheld_bytes + event_bytes > MAXIMUM_WITHHELD_REFUSAL_BYTES
-                    || withheld.len() + 1 > MAXIMUM_WITHHELD_REFUSAL_EVENTS
-                {
-                    // Buffer overflow commits and flushes.
-                    let mut prefix = std::mem::take(&mut withheld);
-                    prefix.push(event);
-                    return AttemptEnd::Committed(Box::new(CommittedAttempt {
-                        depth,
-                        prefix,
-                        relay,
-                        usage,
-                        tool_names,
-                        visible_refusal: true,
-                        encrypted_reasoning_stripped,
-                    }));
-                }
-                withheld_bytes += event_bytes;
-                withheld.push(event);
-                continue;
-            }
-        }
-        if is_semantic(&event) {
-            // First outward semantic output freezes this deployment; any
-            // withheld refusals flush ahead of it.
-            let visible_refusal = !withheld.is_empty()
-                || matches!(
-                    event,
-                    Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
-                );
-            let mut prefix = std::mem::take(&mut withheld);
-            prefix.push(event);
-            return AttemptEnd::Committed(Box::new(CommittedAttempt {
-                depth,
-                prefix,
-                relay,
-                usage,
-                tool_names,
-                visible_refusal,
-                encrypted_reasoning_stripped,
-            }));
-        }
-        if !event.is_terminal() {
-            // Pre-commit non-semantic events are dropped from the outward
-            // stream (usage stays tracked), matching the python executor.
-            continue;
-        }
-        match &event {
-            Event::Failed(failure) => {
-                let typed_refusal = failure.failure_class == FailureClass::Refusal;
-                let exhaustion_flush = if !withheld.is_empty() && !typed_refusal {
-                    let mut flush = std::mem::take(&mut withheld);
-                    flush.push(event.clone());
-                    flush
-                } else {
-                    withheld.clear();
-                    Vec::new()
-                };
-                return AttemptEnd::Ladder {
-                    failure: failure.clone(),
-                    refusal_eligible: typed_refusal && ctx.policy.refusal_failover,
-                    exhaustion_flush,
-                    usage,
-                    tool_names,
-                    opened: true,
-                    encrypted_reasoning_stripped,
-                };
-            }
-            _ => {
-                if !withheld.is_empty() {
-                    // A refusal-only stream that terminated successfully is
-                    // a provider refusal: withhold the output and advance,
-                    // matching the python executor's converted terminal.
-                    withheld.clear();
-                    return AttemptEnd::Ladder {
-                        failure: Failure::new(
-                            FailureClass::Refusal,
-                            "provider refused the request",
-                        ),
-                        refusal_eligible: ctx.policy.refusal_failover,
-                        exhaustion_flush: Vec::new(),
-                        usage,
-                        tool_names,
-                        opened: true,
-                        encrypted_reasoning_stripped,
-                    };
-                }
-                if billed_empty_completion(&event, usage.as_ref()) {
-                    // A `stop` that billed output tokens yet carried no
-                    // semantic event is the provider's fault, not an answer
-                    // (a reasoning-only turn on a rung whose reasoning the
-                    // gateway strips): it takes the ladder like any other
-                    // pre-commit failure instead of settling an empty success.
-                    return AttemptEnd::Ladder {
-                        failure: empty_completion_failure(wire),
-                        refusal_eligible: false,
-                        exhaustion_flush: Vec::new(),
-                        usage,
-                        tool_names,
-                        opened: true,
-                        encrypted_reasoning_stripped,
-                    };
-                }
-                if unreported_empty_completion(&event, usage.as_ref()) {
-                    if ctx.output_token_cap.is_some() {
-                        // A `stop` with no output and no usage report on a
-                        // capped request: the only benign reading is a
-                        // budget the provider's hidden reasoning exhausted
-                        // before the first visible token, mislabelled as a
-                        // plain stop (Meta muse-spark under a small
-                        // `max_tokens`, 2026-09-15). Answer `Incomplete` so
-                        // the caller sees `length` and raises the cap,
-                        // instead of an empty completed answer.
-                        return settle_output_less(
-                            ctx,
-                            guard,
-                            Event::Incomplete,
+                _ => None,
+            };
+            if let Some(text) = refusal_text {
+                if ctx.policy.refusal_failover {
+                    let event_bytes = text.len();
+                    if withheld_bytes + event_bytes > MAXIMUM_WITHHELD_REFUSAL_BYTES
+                        || withheld.len() + 1 > MAXIMUM_WITHHELD_REFUSAL_EVENTS
+                    {
+                        // Buffer overflow commits and flushes.
+                        let mut prefix = std::mem::take(&mut withheld);
+                        prefix.push(event);
+                        return AttemptEnd::Committed(Box::new(CommittedAttempt {
+                            depth,
+                            prefix,
+                            relay,
                             usage,
                             tool_names,
-                            depth,
+                            visible_refusal: true,
                             encrypted_reasoning_stripped,
-                        )
-                        .await;
+                        }));
                     }
-                    // Uncapped, nothing sent, nothing accounted: the provider
-                    // delivered nothing at all. Nothing was committed outward,
-                    // so the ladder is safe, exactly like the billed twin.
+                    withheld_bytes += event_bytes;
+                    withheld.push(event);
+                    continue;
+                }
+            }
+            if is_semantic(&event) {
+                // First outward semantic output freezes this deployment; any
+                // withheld refusals flush ahead of it.
+                let visible_refusal = !withheld.is_empty()
+                    || matches!(
+                        event,
+                        Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
+                    );
+                let mut prefix = std::mem::take(&mut withheld);
+                prefix.push(event);
+                return AttemptEnd::Committed(Box::new(CommittedAttempt {
+                    depth,
+                    prefix,
+                    relay,
+                    usage,
+                    tool_names,
+                    visible_refusal,
+                    encrypted_reasoning_stripped,
+                }));
+            }
+            if !event.is_terminal() {
+                // Pre-commit non-semantic events are dropped from the outward
+                // stream (usage stays tracked), matching the python executor.
+                continue;
+            }
+            match &event {
+                Event::Failed(failure) => {
+                    if !redialed && withheld.is_empty() && repair.repair_after(failure) {
+                        // The rung opened the stream and refused the replayed
+                        // encrypted reasoning on its first frame: the same repair
+                        // as a pre-stream 4xx, nothing outward was committed.
+                        redialed = true;
+                        first_byte_deadline = Instant::now() + first_byte_allowance_for();
+                        continue 'dial;
+                    }
+                    let typed_refusal = failure.failure_class == FailureClass::Refusal;
+                    let exhaustion_flush = if !withheld.is_empty() && !typed_refusal {
+                        let mut flush = std::mem::take(&mut withheld);
+                        flush.push(event.clone());
+                        flush
+                    } else {
+                        withheld.clear();
+                        Vec::new()
+                    };
                     return AttemptEnd::Ladder {
-                        failure: empty_completion_failure(wire),
-                        refusal_eligible: false,
-                        exhaustion_flush: Vec::new(),
+                        failure: failure.clone(),
+                        refusal_eligible: typed_refusal && ctx.policy.refusal_failover,
+                        exhaustion_flush,
                         usage,
                         tool_names,
                         opened: true,
                         encrypted_reasoning_stripped,
                     };
                 }
-                // A successful terminal with no semantic output and nothing
-                // billed for it (a budget exhausted before the first delta,
-                // a zero-token stop): retain the output-less continuation
-                // while the attempt is still in flight, settle, then answer
-                // with the tracked usage ahead of the terminal so the
-                // encoders keep the client-visible token accounting.
-                return settle_output_less(
-                    ctx,
-                    guard,
-                    event,
-                    usage,
-                    tool_names,
-                    depth,
-                    encrypted_reasoning_stripped,
-                )
-                .await;
+                _ => {
+                    if !withheld.is_empty() {
+                        // A refusal-only stream that terminated successfully is
+                        // a provider refusal: withhold the output and advance,
+                        // matching the python executor's converted terminal.
+                        withheld.clear();
+                        return AttemptEnd::Ladder {
+                            failure: Failure::new(
+                                FailureClass::Refusal,
+                                "provider refused the request",
+                            ),
+                            refusal_eligible: ctx.policy.refusal_failover,
+                            exhaustion_flush: Vec::new(),
+                            usage,
+                            tool_names,
+                            opened: true,
+                            encrypted_reasoning_stripped,
+                        };
+                    }
+                    if billed_empty_completion(&event, usage.as_ref()) {
+                        // A `stop` that billed output tokens yet carried no
+                        // semantic event is the provider's fault, not an answer
+                        // (a reasoning-only turn on a rung whose reasoning the
+                        // gateway strips): it takes the ladder like any other
+                        // pre-commit failure instead of settling an empty success.
+                        return AttemptEnd::Ladder {
+                            failure: empty_completion_failure(wire),
+                            refusal_eligible: false,
+                            exhaustion_flush: Vec::new(),
+                            usage,
+                            tool_names,
+                            opened: true,
+                            encrypted_reasoning_stripped,
+                        };
+                    }
+                    if unreported_empty_completion(&event, usage.as_ref()) {
+                        if ctx.output_token_cap.is_some() {
+                            // A `stop` with no output and no usage report on a
+                            // capped request: the only benign reading is a
+                            // budget the provider's hidden reasoning exhausted
+                            // before the first visible token, mislabelled as a
+                            // plain stop (Meta muse-spark under a small
+                            // `max_tokens`, 2026-09-15). Answer `Incomplete` so
+                            // the caller sees `length` and raises the cap,
+                            // instead of an empty completed answer.
+                            return settle_output_less(
+                                ctx,
+                                guard,
+                                Event::Incomplete,
+                                usage,
+                                tool_names,
+                                depth,
+                                encrypted_reasoning_stripped,
+                            )
+                            .await;
+                        }
+                        // Uncapped, nothing sent, nothing accounted: the provider
+                        // delivered nothing at all. Nothing was committed outward,
+                        // so the ladder is safe, exactly like the billed twin.
+                        return AttemptEnd::Ladder {
+                            failure: empty_completion_failure(wire),
+                            refusal_eligible: false,
+                            exhaustion_flush: Vec::new(),
+                            usage,
+                            tool_names,
+                            opened: true,
+                            encrypted_reasoning_stripped,
+                        };
+                    }
+                    // A successful terminal with no semantic output and nothing
+                    // billed for it (a budget exhausted before the first delta,
+                    // a zero-token stop): retain the output-less continuation
+                    // while the attempt is still in flight, settle, then answer
+                    // with the tracked usage ahead of the terminal so the
+                    // encoders keep the client-visible token accounting.
+                    return settle_output_less(
+                        ctx,
+                        guard,
+                        event,
+                        usage,
+                        tool_names,
+                        depth,
+                        encrypted_reasoning_stripped,
+                    )
+                    .await;
+                }
             }
         }
     }

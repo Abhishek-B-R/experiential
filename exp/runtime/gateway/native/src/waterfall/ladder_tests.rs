@@ -102,6 +102,10 @@ enum Answer {
     /// then a `response.completed` terminal (the Responses wire has no
     /// `[DONE]`).
     ResponsesStream(&'static [&'static str]),
+    /// A 200 native Responses event stream whose only frame is this
+    /// `response.failed` terminal (how OpenRouter's Responses relay reports
+    /// an upstream 400).
+    ResponsesFailed(&'static str),
 }
 
 fn render(answer: &Answer) -> String {
@@ -119,6 +123,14 @@ fn render(answer: &Answer) -> String {
                 .unwrap_or_default();
             format!(
                 "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\n{header}\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+        }
+        Answer::ResponsesFailed(frame) => {
+            let body = format!("data: {frame}\n\n");
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
                  content-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len(),
             )
@@ -282,6 +294,20 @@ const INVALID_ENCRYPTED_CONTENT_BODY: &str = concat!(
     "{\"error\":{\"message\":\"The encrypted content rsn_...hA== could not be verified. ",
     "Reason: Encrypted content could not be decrypted or parsed.\",",
     "\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_encrypted_content\"}}"
+);
+
+/// OpenRouter's Responses relay failing the stream on a replayed payload its
+/// account cannot decrypt (live, gpt-5.6-sol, 2026-09-16 00:25Z): a 200, then
+/// this terminal under OpenAI's `invalid_prompt`.
+const RESPONSES_FAILED_ENCRYPTED_FRAME: &str = concat!(
+    "{\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":",
+    "{\"code\":\"invalid_prompt\",\"message\":\"The encrypted content rsn_...hA== could not be verified. ",
+    "Reason: Encrypted content could not be decrypted or parsed.\"}}}"
+);
+
+const RESPONSES_FAILED_OTHER_FRAME: &str = concat!(
+    "{\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":",
+    "{\"code\":\"invalid_prompt\",\"message\":\"Invalid prompt: we've limited access to this content.\"}}}"
 );
 
 const RESPONSES_COMPLETED_FRAME: &str = concat!(
@@ -979,5 +1005,62 @@ fn a_remembered_refused_payload_is_stripped_before_the_first_dial() {
         assert!(committed.encrypted_reasoning_stripped);
         drop(committed);
         assert_eq!(rung.bodies.lock().expect("lock").len(), 2);
+    });
+}
+
+#[test]
+fn an_in_stream_refusal_of_encrypted_reasoning_is_repaired_like_a_pre_stream_one() {
+    block_on(async {
+        // The relay answers 200 and fails the stream on its first frame with
+        // OpenAI's sentence under `invalid_prompt`; the stripped re-dial serves.
+        let harness = Harness::new();
+        let rung = spawn_rung(vec![
+            Answer::ResponsesFailed(RESPONSES_FAILED_ENCRYPTED_FRAME),
+            Answer::ResponsesStream(&[RESPONSES_TEXT_FRAME]),
+        ])
+        .await;
+        let route = [responses_wire(
+            "a",
+            &rung.url,
+            &["rsn_an_in_stream_refusal_hA=="],
+        )];
+        let (won, guard) = harness.run(&route, None, Duration::from_secs(60)).await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("the stripped re-dial serves after an in-stream refusal");
+        };
+        assert_eq!(committed.depth, 0);
+        assert!(committed.encrypted_reasoning_stripped);
+        drop(committed);
+        let bodies = rung.bodies.lock().expect("lock").clone();
+        assert_eq!(bodies.len(), 2);
+        let sent: Value = serde_json::from_str(&bodies[0]).expect("first body");
+        let repaired: Value = serde_json::from_str(&bodies[1]).expect("second body");
+        assert_eq!(sent["input"].as_array().expect("input").len(), 5);
+        let repaired_input = repaired["input"].as_array().expect("input");
+        assert_eq!(repaired_input.len(), 4);
+        assert!(repaired_input
+            .iter()
+            .all(|item| item.get("encrypted_content").is_none()));
+        // One reservation covers the refused stream and its re-dial.
+        let story = harness.story().await;
+        assert_eq!(story["starts"].as_array().expect("starts").len(), 1);
+        let settles = story["settles"].as_array().expect("settles");
+        assert_eq!(settles.len(), 1);
+        assert_eq!(settles[0]["outcome"], "completed");
+
+        // Another in-stream failure keeps the ordinary verdict: no re-dial.
+        let plain = Harness::new();
+        let rung = spawn_rung(vec![Answer::ResponsesFailed(RESPONSES_FAILED_OTHER_FRAME)]).await;
+        let route = [responses_wire(
+            "a",
+            &rung.url,
+            &["rsn_an_in_stream_refusal_other_hA=="],
+        )];
+        let (won, guard) = plain.run(&route, None, Duration::from_secs(60)).await;
+        let Won::Failed(error) = finish(guard, won).await else {
+            panic!("an unrelated in-stream failure is not repaired");
+        };
+        assert_eq!(error.status_code, 400, "{error:?}");
+        assert_eq!(rung.accepted.lock().expect("lock").len(), 1);
     });
 }

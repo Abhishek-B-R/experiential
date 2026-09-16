@@ -333,6 +333,10 @@ pub(crate) struct AttemptRepair<'a> {
     stripped: bool,
     proactive: bool,
     reactive: bool,
+    /// Payloads stripped from memory before the first dial, and after a
+    /// refusal, so the operator line tells a mixed attempt from a miss.
+    proactive_strips: usize,
+    reactive_strips: usize,
 }
 
 impl<'a> AttemptRepair<'a> {
@@ -349,6 +353,8 @@ impl<'a> AttemptRepair<'a> {
             stripped: false,
             proactive: false,
             reactive: false,
+            proactive_strips: 0,
+            reactive_strips: 0,
         };
         if repair.repaired.is_some() {
             repair.stripped = true;
@@ -357,6 +363,8 @@ impl<'a> AttemptRepair<'a> {
             if let Some(stripped) =
                 without_encrypted_reasoning_where(&wire.upstream_payload, remembered)
             {
+                repair.proactive_strips = encrypted_payloads(&wire.upstream_payload).len()
+                    - encrypted_payloads(&stripped).len();
                 *repair.repaired = Some(stripped);
                 repair.stripped = true;
                 repair.proactive = true;
@@ -402,27 +410,34 @@ impl<'a> AttemptRepair<'a> {
         let Some(stripped) = without_encrypted_reasoning(self.payload()) else {
             return false;
         };
-        let present = encrypted_payloads(self.payload());
-        let hint = failure
-            .provider_detail
-            .as_deref()
-            .and_then(refused_payload_hint);
-        let quoted: Vec<&str> = match &hint {
-            Some(hint) => present
-                .iter()
-                .copied()
-                .filter(|content| matches_hint(content, hint))
-                .collect(),
-            None => Vec::new(),
+        let (present_count, digests) = {
+            let present = encrypted_payloads(self.payload());
+            let hint = failure
+                .provider_detail
+                .as_deref()
+                .and_then(refused_payload_hint);
+            let quoted: Vec<&str> = match &hint {
+                Some(hint) => present
+                    .iter()
+                    .copied()
+                    .filter(|content| matches_hint(content, hint))
+                    .collect(),
+                None => Vec::new(),
+            };
+            let refused = if quoted.is_empty() { &present } else { &quoted };
+            let digests: Vec<[u8; 32]> = match self.scope {
+                Some(scope) => refused
+                    .iter()
+                    .map(|content| payload_digest(scope, content))
+                    .collect(),
+                None => Vec::new(),
+            };
+            (present.len(), digests)
         };
-        let refused = if quoted.is_empty() { present } else { quoted };
-        if let Some(scope) = self.scope {
-            MEMORY.remember(
-                refused
-                    .into_iter()
-                    .map(|content| payload_digest(scope, content)),
-            );
+        if !digests.is_empty() {
+            MEMORY.remember(digests);
         }
+        self.reactive_strips = present_count;
         *self.repaired = Some(stripped);
         self.stripped = true;
         self.reactive = true;
@@ -449,6 +464,8 @@ impl<'a> AttemptRepair<'a> {
         let line = json!({
             "event": "encrypted_reasoning_stripped",
             "mode": mode,
+            "proactive_strips": self.proactive_strips,
+            "reactive_strips": self.reactive_strips,
             "request_id": request_id,
             "provider": self.wire.provider,
             "deployment_id": self.wire.deployment_id,
