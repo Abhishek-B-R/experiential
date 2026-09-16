@@ -22,6 +22,10 @@ def test_hermes_decodes_tools_and_omits_reasoning() -> None:
 @pytest.mark.parametrize(
     "text",
     [
+        "<tool_call",
+        "</tool_call",
+        "Plan: <tool_call ",
+        '<tool_call>{"name":"search","arguments":{}}</tool_call',
         '<tool_call>{"name":"search"}',
         "<think>unfinished",
         '<tool_call>{"name":"search","arguments":[]}</tool_call>',

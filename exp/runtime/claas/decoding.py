@@ -47,7 +47,7 @@ class HermesCompletionDecoder:
             raise ValueError("completion ended inside reasoning; increase the token budget")
         blocks = list(re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", visible, re.DOTALL))
         remainder = re.sub(r"<tool_call>\s*.*?\s*</tool_call>", "", visible, flags=re.DOTALL)
-        if "<tool_call>" in remainder or "</tool_call>" in remainder:
+        if "<tool_call" in remainder or "</tool_call" in remainder:
             raise ValueError("completion contains an incomplete tool call; retain it as a failure")
         calls: list[ToolCall] = []
         for index, block in enumerate(blocks):
