@@ -14,7 +14,11 @@ import modal
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel, sha256_json
-from exp.optimize.claas.backends.checkpoints import CheckpointManifest, verify_checkpoint
+from exp.optimize.claas.backends.checkpoints import (
+    CheckpointManifest,
+    verify_checkpoint,
+    verify_training_result,
+)
 from exp.optimize.claas.training_contracts import (
     ClaasTrainingError,
     ClaasTrainingSpec,
@@ -144,24 +148,9 @@ class ModalVerlBackend:
         local = await _download_checkpoint(
             volume, checkpoint, job.spec, self.checkpoint_root, config.maximum_checkpoint_bytes
         )
-        manifest = verify_checkpoint(local, job.spec)
-        parent = (
-            job.resume_checkpoint.policy_revision
-            if job.resume_checkpoint
-            else job.spec.initial_policy_revision
-        )
-        history = job.resume_checkpoint.policy_history if job.resume_checkpoint else (parent,)
-        expected_history = (checkpoint.policy_revision, *history)[: job.spec.max_policy_lag + 1]
-        if (
-            manifest.batch_id != job.batch.batch_id
-            or manifest.consumed_experience_ids != expected
-            or manifest.parent_policy_revision != parent
-            or manifest.policy_history != expected_history
-        ):
-            raise ClaasTrainingError(
-                "Modal manifest does not describe the submitted optimizer update"
-            )
-        return result.model_copy(update={"checkpoint": local})
+        local_result = result.model_copy(update={"checkpoint": local})
+        verify_training_result(job, local_result)
+        return local_result
 
 
 def _remote_checkpoint(checkpoint: TrainingCheckpoint, local_root: Path) -> TrainingCheckpoint:
