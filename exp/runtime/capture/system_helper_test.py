@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -169,6 +170,82 @@ def test_concurrent_hosts_edit_aborts_without_overwrite(state: helper.HostsState
     with pytest.raises(helper.CaptureSystemError, match="Hosts changed"):
         state._replace_hosts(before, b"wrong replacement")
     assert state.paths.hosts.read_bytes() == after
+
+
+@pytest.mark.parametrize("change", ["metadata", "replacement"])
+def test_last_version_check_detects_metadata_and_path_changes(
+    state: helper.HostsState, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """Changes while preparing the replacement abort without erasing external content."""
+    original = state.paths.hosts.read_bytes()
+    external = original + b"\n192.0.2.15 external.example\n"
+    original_copy = helper._copy_hosts_metadata
+
+    def concurrent_copy(source_fd: int, target_fd: int) -> None:
+        """Apply an independent edit after metadata copy and before the final check."""
+        original_copy(source_fd, target_fd)
+        if change == "metadata":
+            state.paths.hosts.chmod(0o600)
+        else:
+            replacement = state.paths.hosts.with_name("independent-edit")
+            replacement.write_bytes(external)
+            replacement.chmod(0o644)
+            os.replace(replacement, state.paths.hosts)
+
+    monkeypatch.setattr(helper, "_copy_hosts_metadata", concurrent_copy)
+    with pytest.raises(helper.CaptureSystemError, match="Hosts changed"):
+        state._replace_hosts(original, b"unwanted stale contents")
+    if change == "metadata":
+        assert state.paths.hosts.read_bytes() == original
+        assert stat.S_IMODE(state.paths.hosts.stat().st_mode) == 0o600
+    else:
+        assert state.paths.hosts.read_bytes() == external
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Apple ACL and file flags are macOS metadata")
+def test_activation_and_recovery_preserve_apple_metadata(state: helper.HostsState) -> None:
+    """Retain ACLs, extended attributes, and harmless flags across both atomic replacements."""
+    hosts = state.paths.hosts
+    subprocess.run(
+        [
+            "/usr/bin/xattr",
+            "-w",
+            "com.experiential.capture-test",
+            "managed-device-metadata",
+            str(hosts),
+        ],
+        check=True,
+    )
+    os.chflags(hosts, stat.UF_NODUMP)
+    subprocess.run(["/bin/chmod", "+a", "everyone allow read", str(hosts)], check=True)
+
+    def acl() -> list[bytes]:
+        """Read only ACL records for the temporary test hosts file."""
+        result = subprocess.run(["/bin/ls", "-le", str(hosts)], capture_output=True, check=True)
+        return result.stdout.splitlines()[1:]
+
+    def attribute() -> bytes:
+        """Read the custom extended attribute from the temporary file only."""
+        result = subprocess.run(
+            ["/usr/bin/xattr", "-p", "com.experiential.capture-test", str(hosts)],
+            capture_output=True,
+            check=True,
+        )
+        return result.stdout.rstrip(b"\n")
+
+    original_acl = acl()
+    assert original_acl
+    before = hosts.read_bytes()
+    with state.locked():
+        state.activate(DOMAINS)
+        assert attribute() == b"managed-device-metadata"
+        assert hosts.stat().st_flags & stat.UF_NODUMP
+        assert acl() == original_acl
+        assert state.recover()
+        assert hosts.read_bytes() == before
+        assert attribute() == b"managed-device-metadata"
+        assert hosts.stat().st_flags & stat.UF_NODUMP
+        assert acl() == original_acl
 
 
 def test_helper_cli_has_no_filesystem_override() -> None:

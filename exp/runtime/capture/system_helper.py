@@ -6,12 +6,16 @@ SIGINT/SIGTERM, control-pipe EOF, and an expired heartbeat lease request cleanup
 Power loss or killing this helper itself requires a later ``reset`` invocation.
 Production evaluates an in-memory source snapshot using Apple's root-controlled
 Python 3.9 or newer with ``-I -S``; it does not reopen this source file as root.
+Hosts transactions use advisory locks and checked atomic replacements. Other
+privileged hosts editors must coordinate with this helper; macOS does not offer
+a compare-and-swap rename that excludes a noncooperating root writer.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import json
 import logging
 import os
@@ -39,6 +43,39 @@ _MARKER = "# EXPERIENTIAL CAPTURE "
 _LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _MAX_HOSTS_BYTES = 4 * 1024 * 1024
 _MAX_JOURNAL_BYTES = 16384
+
+
+def _file_version(info: os.stat_result) -> tuple[int, ...]:
+    """Include metadata changes in the checked version of an open hosts inode."""
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+        info.st_size,
+        info.st_mode,
+        info.st_uid,
+        info.st_gid,
+    )
+
+
+def _copy_hosts_metadata(source_fd: int, target_fd: int) -> None:
+    """Preserve macOS ACLs, extended attributes, flags, ownership, and permissions."""
+    if sys.platform == "darwin":
+        library = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        copy = library.fcopyfile
+        copy.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        copy.restype = ctypes.c_int
+        # copyfile.h: COPYFILE_METADATA = COPYFILE_ACL | COPYFILE_STAT | COPYFILE_XATTR.
+        if copy(source_fd, target_fd, None, 0b111) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+    else:
+        # The elevated CLI rejects non-macOS systems; portable attributes support Linux tests.
+        info = os.fstat(source_fd)
+        os.fchmod(target_fd, stat.S_IMODE(info.st_mode))
+        if os.geteuid() == 0:
+            os.fchown(target_fd, info.st_uid, info.st_gid)
 
 
 class CaptureSystemError(RuntimeError):
@@ -238,20 +275,17 @@ class HostsState:
             temporary_fd = os.open(
                 temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
             )
-            os.fchmod(temporary_fd, stat.S_IMODE(info.st_mode))
-            if os.geteuid() == 0:
-                os.fchown(temporary_fd, info.st_uid, info.st_gid)
             with os.fdopen(temporary_fd, "wb", closefd=False) as stream:
                 stream.write(after)
                 stream.flush()
+                _copy_hosts_metadata(fd, temporary_fd)
                 os.fsync(temporary_fd)
             latest = path.lstat()
-            if (latest.st_dev, latest.st_ino, latest.st_mtime_ns, latest.st_size) != (
-                info.st_dev,
-                info.st_ino,
-                info.st_mtime_ns,
-                info.st_size,
-            ) or self._read(path, private=False, limit=_MAX_HOSTS_BYTES) != before:
+            if (
+                _file_version(latest) != _file_version(info)
+                or _file_version(os.fstat(fd)) != _file_version(info)
+                or self._read(path, private=False, limit=_MAX_HOSTS_BYTES) != before
+            ):
                 raise CaptureSystemError("Hosts changed during capture setup. Retry the operation.")
             os.replace(temporary, path)
             self._sync_directory(path.parent)
