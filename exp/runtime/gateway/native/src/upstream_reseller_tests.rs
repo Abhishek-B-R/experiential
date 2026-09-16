@@ -186,3 +186,116 @@ async fn a_429_whose_body_stalls_never_outlives_the_header_phase_budget() {
     assert!(failure.failover_eligible);
     assert_eq!(failure.provider_detail.as_deref(), Some("http 429"));
 }
+
+#[tokio::test]
+async fn a_resellers_400_naming_an_exhausted_account_is_provider_quota() {
+    // Live Novita sentence (gpt-5.6-sol, 2026-09-16 05:28Z) under HTTP 400 in
+    // the flat `{code:0, message, type}` envelope: the account's prepaid
+    // balance is gone. A status-only read filed it as the caller's 400.
+    let failure = open_against_body(
+        "400 Bad Request",
+        "{\"code\":0,\"message\":\"Insufficient quota available for instant inference. \
+         trace_id: 92913336280c9c28f727ac9bfefbd89c\",\"type\":\"invalid_request_error\"}",
+        "pa/gpt-5.6-sol",
+    )
+    .await;
+    assert_eq!(failure.failure_class, FailureClass::ProviderQuota);
+    assert!(
+        failure.failover_eligible,
+        "another rung must serve the request"
+    );
+    assert!(!failure.retryable_same_deployment);
+    let detail = failure.provider_detail.as_deref().expect("ledger detail");
+    assert!(
+        detail.starts_with("http 400: Insufficient quota available for instant inference"),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains("92913336280c9c28f727ac9bfefbd89c"),
+        "the trace id is masked: {detail}"
+    );
+    assert!(
+        !failure
+            .public_error()
+            .message
+            .contains("Insufficient quota"),
+        "an account-state failure never relays its sentence to the caller"
+    );
+    // An ordinary caller sentence that merely mentions a quota WORD elsewhere
+    // does not qualify: only the funding phrases do.
+    let caller = open_against_body(
+        "400 Bad Request",
+        "{\"error\":{\"message\":\"max_tokens must be less than or equal to 131072\",\
+         \"type\":\"invalid_request_error\"}}",
+        "m",
+    )
+    .await;
+    assert_eq!(caller.failure_class, FailureClass::InvalidRequest);
+}
+
+#[tokio::test]
+async fn a_relays_decode_failure_relays_the_upstream_error_it_embeds() {
+    // Live Novita sentence (gpt-5.6-luna on the Responses wire, 2026-09-16
+    // 05:31Z): the relay's Go decoder choked on a numeric upstream
+    // `error.code` and answered its own 400 with the upstream document after
+    // `raw: `. The caller must see the UPSTREAM sentence (their own image
+    // limit), never the decoder's noise.
+    let failure = open_against_body(
+        "400 Bad Request",
+        "{\"error\":{\"code\":0,\"message\":\"failed to decode error response: json: cannot \
+         unmarshal number into Go struct field ResponseError.error.code of type string, raw: \
+         {\\\"error\\\":{\\\"code\\\":0,\\\"message\\\":\\\"Exceeded maximum number of images (50) \
+         allowed in the request.\\\"}} trace_id: 92913336280c9c28f727ac9bfefbd89c\",\
+         \"type\":\"invalid_request_error\"}}",
+        "pa/gpt-5.6-luna",
+    )
+    .await;
+    assert_eq!(failure.failure_class, FailureClass::InvalidRequest);
+    assert!(!failure.failover_eligible);
+    assert_eq!(
+        failure.provider_detail.as_deref(),
+        Some("Exceeded maximum number of images (50) allowed in the request.")
+    );
+    assert_eq!(
+        failure.public_error().message,
+        "provider rejected the request: Exceeded maximum number of images (50) allowed in the request."
+    );
+    // A relayed THROTTLE takes the throttle class and fails over; the
+    // upstream sentence stays ledger-only under the relay's status.
+    let throttled = open_against_body(
+        "400 Bad Request",
+        "{\"error\":{\"code\":0,\"message\":\"failed to decode error response: json: cannot \
+         unmarshal number into Go struct field ResponseError.error.code of type string, raw: \
+         {\\\"error\\\":{\\\"code\\\":429,\\\"message\\\":\\\"Rate limit exceeded, please retry later.\\\"}}\",\
+         \"type\":\"invalid_request_error\"}}",
+        "pa/gpt-5.6-luna",
+    )
+    .await;
+    assert_eq!(throttled.failure_class, FailureClass::Throttled);
+    assert!(throttled.failover_eligible);
+    assert_eq!(
+        throttled.provider_detail.as_deref(),
+        Some("http 400: Rate limit exceeded, please retry later.")
+    );
+    assert!(!throttled
+        .public_error()
+        .message
+        .contains("Rate limit exceeded, please retry"));
+    // A truncated upstream document (the relay cuts long bodies) still yields
+    // its sentence by the bounded scan.
+    let cut = open_against_body(
+        "400 Bad Request",
+        "{\"error\":{\"code\":0,\"message\":\"failed to decode error response: json: cannot \
+         unmarshal number into Go struct field ResponseError.error.code of type string, raw: \
+         {\\\"error\\\":{\\\"code\\\":0,\\\"message\\\":\\\"Exceeded maximum number of images (50) \
+         allowed in the request. trace_id: 92913336280c9c28f727ac9bfefbd89c\",\
+         \"type\":\"invalid_request_error\"}}",
+        "pa/gpt-5.6-luna",
+    )
+    .await;
+    assert_eq!(cut.failure_class, FailureClass::InvalidRequest);
+    assert!(cut
+        .provider_detail
+        .as_deref()
+        .is_some_and(|detail| detail.starts_with("Exceeded maximum number of images (50)")));
+}
