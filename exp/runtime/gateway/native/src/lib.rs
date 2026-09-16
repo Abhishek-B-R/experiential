@@ -7,6 +7,7 @@
 
 mod admission;
 mod bridge;
+mod claas;
 mod dialects;
 mod encode;
 mod encode_messages;
