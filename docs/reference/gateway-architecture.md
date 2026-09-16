@@ -119,9 +119,9 @@ zero. Missing capability, a project target, or unsupported pricing fails closed 
 The decoder bounds requests to 32 questions, 64 choice or 10 score criteria, and 262,144 bytes.
 Reservations count repeated state and per-question protocol allowances, not the chat tokenizer.
 They are bounded estimates, never provider-enforced token ceilings. Only reported usage settles.
-The route permits at most eight certified deployments, one dispatch each; no same-rung or throttle
-redials. Ambiguous transport outcomes and malformed answers are terminal, never automatic retries.
-There is no chat conversion, streaming, continuation, idempotency replay, or chat guardrail processing.
+Only HTTP 400/401/403/404/422 release a known-rejection hold; 401 may use a certified fallback.
+HTTP 402/429/529, ambiguous transport, and malformed answers are terminal unknown outcomes, holds kept.
+At most eight deployments run once each: no redials, chat, streaming, replay, or chat guardrails.
 
 Multi-deployment certified pools execute natively. Admission returns the full
 ordered route plus the frozen retry-policy facts without starting an attempt;

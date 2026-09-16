@@ -27,7 +27,7 @@ on the exact release checkout.
   64 choice or 10 score criteria, and 262,144 bytes. Accounting reserves bounded per-question
   estimates, not provider-enforced output limits, and settles only provider-reported usage.
   Real Rust HTTP and SQLite tests cover all answer types, authentication, unsupported inputs,
-  missing or invalid usage, certified fallback, cancellation, timeout, and content-free accounting.
+  missing or invalid usage, certified 401 fallback, cancellation, timeout, and content-free accounting.
 - The no-subcommand default gateway launch, the direct `exp run [PROJECT]` form, and the
   `exp --project PROJECT [--ghost]` compatibility form are installed-wheel surfaces. Gateway
   startup is provider-idle and requires explicit authority.
@@ -73,7 +73,7 @@ credentials. `Not run` means exactly that; it is not inferred from fixture cover
 | OpenRouter | Compatible-adapter fixtures for text, tool arguments, usage, cancellation, and refusal | Not run; requires OpenRouter credential |
 | Gemini | Native fixtures for text, structured complete function arguments, usage, cancellation, and refusal | Not run; requires Gemini credential |
 | Amazon Bedrock | Native EventStream fixtures for text, incremental tool arguments, usage, bounded cancellation, refusal, and single dispatch | Not run; requires an authorized AWS account and region |
-| TypeSafe SystemOne | Real Rust HTTP listener and SQLite with a synthetic loopback upstream; three typed answer forms, exact token settlement, error validation, bounded failover, cancellation, and timeout | Direct TypeSafe API smoke with synthetic input succeeded for all three question types on 2026-09-16; no hosted-gateway or deployed-fleet verification |
+| TypeSafe SystemOne | Real Rust HTTP listener and SQLite with a synthetic loopback upstream; three typed answer forms, exact token settlement, error validation, certified 401 authentication fallback, cancellation, and timeout | Direct TypeSafe API smoke with synthetic input succeeded for all three question types on 2026-09-16; no hosted-gateway or deployed-fleet verification |
 
 The machine-readable dated conversational matrix is
 `exp/runtime/gateway/provider_certification.py`. Its live cells remain
@@ -104,7 +104,9 @@ reported usage, not account limits, price-invoice agreement, production availabi
   selection, chat guardrail processing, continuation, or idempotency replay. An inbound
   `Idempotency-Key` is ignored, so a repeat submission is a new request. Execution is capped at
   eight certified deployments and one dispatch each, with no same-rung or throttle redials;
-  ambiguous transport outcomes and malformed answers are terminal rather than automatically retried.
+  HTTP 402/429/529, ambiguous transport outcomes, and malformed answers are terminal unknown outcomes
+  that keep their monetary hold rather than automatically retrying or failing over. Only HTTP
+  400/401/403/404/422 establish a known rejection eligible to release that hold.
 
 These exclusions are product boundaries, not evidence that the corresponding hosted services are
 unsafe or unsupported forever. Any future claim requires separately authorized, finite-budget,

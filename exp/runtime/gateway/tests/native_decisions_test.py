@@ -146,8 +146,9 @@ class _DecisionsUpstream(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         selector = payload["state"]["scenario"]
-        if selector == "failover" and payload["model"] == "jev-latest":
-            self.send_error(529, "Synthetic overload")
+        if selector in {"overload", "auth-failover"} and payload["model"] == "jev-latest":
+            status = 529 if selector == "overload" else 401
+            self.send_error(status, "Synthetic provider rejection")
             return
         answers = _answers()
         body: JsonObject = {
@@ -277,6 +278,48 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         catalog_sha256=normalized.identity_sha256(),
     )
     manager.add_grant(identity_id="default", alias_id="decision-failover")
+    # Separate deployments keep prior malformed/overload circuits out of the
+    # auth-rejection test without bypassing production health policy.
+    for alias, wire_model in (("auth-primary", "jev-latest"), ("auth-backup", "jev-backup")):
+        normalized, _snapshot, _changed = upsert_singleton_deployment(
+            root,
+            deployment_alias=alias,
+            connection_name="typesafe-loopback",
+            provider_model=wire_model,
+            exact_model_id="typesafe-auth-exact",
+            revision=None,
+            capabilities=ModelCapabilities(),
+            gateway_capabilities=GatewayDeploymentCapabilities(supports_decisions=True),
+            prices=GatewayTokenPrices(
+                input_nano_usd_per_million_tokens=_INPUT_RATE,
+                output_nano_usd_per_million_tokens=0,
+            ),
+            pricing_source=None,
+            replace=False,
+        )
+    normalized, snapshot, _changed = upsert_certified_pool(
+        root,
+        pool_id="decision-auth-failover",
+        exact_model_id="typesafe-auth-exact",
+        deployment_aliases=("auth-primary", "auth-backup"),
+        certification=GatewayEquivalenceCertification(
+            certification_id="synthetic-auth-decision-equivalence",
+            provenance="Both loopback deployments serve these deterministic test answers",
+            evidence_sha256="b" * 64,
+            certified_at=datetime.now(UTC),
+        ),
+        expected_catalog_sha256=normalized.identity_sha256(),
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="decision-auth-failover",
+        alias_name="decision-auth-failover",
+        revision_id="revision-decision-auth-failover",
+        pool_id="decision-auth-failover",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="decision-auth-failover")
     SQLiteBudgetStore(manager.database_path).set_limit(
         organization_id=manager.organization_id,
         period=datetime.now(UTC).strftime("%Y-%m"),
@@ -325,7 +368,7 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
                     )
                     if models.status_code == 200 and sorted(
                         model["id"] for model in models.json()["data"]
-                    ) == ["coding", "decision", "decision-failover"]:
+                    ) == ["coding", "decision", "decision-auth-failover", "decision-failover"]:
                         break
                 except (httpx.HTTPError, ValueError, KeyError, TypeError):
                     pass
@@ -567,10 +610,10 @@ def test_authentication_wrong_model_and_chat_misuse_stop_before_dispatch(
     _assert_budget_accounted(engine)
 
 
-def test_repeated_decisions_are_distinct_and_overload_uses_next_rung(
+def test_repeated_decisions_are_distinct_and_only_auth_rejection_fails_over(
     engine: _ServingEngine,
 ) -> None:
-    """Identical calls stay separate; one overload fails over instead of redialing."""
+    """Repeated calls stay distinct; overload holds liability, auth rejection may fail over."""
     before = _request_ids(engine)
     calls_before = _provider_calls()
     responses = [
@@ -603,9 +646,24 @@ def test_repeated_decisions_are_distinct_and_overload_uses_next_rung(
 
     before = _request_ids(engine)
     calls_before = _provider_calls()
-    response = _post(engine, {**_body("failover"), "model": "decision-failover"})
+    response = _post(engine, {**_body("overload"), "model": "decision-failover"})
+    assert response.status_code == 502, response.text
+    assert _provider_calls() == calls_before + 1
+    with _DecisionsUpstream.payloads_lock:
+        assert _DecisionsUpstream.payloads[-1]["model"] == "jev-latest"
+    [(request, attempts)] = _settled(engine, before)
+    assert request["terminal_state"] == "failed"
+    [attempt] = attempts
+    assert attempt["state"] == "failed"
+    assert attempt["route_depth"] == 0
+    assert attempt["failure_class"] == "provider_internal"
+    _assert_unknown_liability(engine, attempt)
+
+    before = _request_ids(engine)
+    calls_before = _provider_calls()
+    response = _post(engine, {**_body("auth-failover"), "model": "decision-auth-failover"})
     assert response.status_code == 200, response.text
-    assert response.json()["model"] == "decision-failover"
+    assert response.json()["model"] == "decision-auth-failover"
     assert response.json()["answers"] == _answers()
     assert response.headers["x-gateway-route-depth"] == "1"
     assert _provider_calls() == calls_before + 2
@@ -622,7 +680,7 @@ def test_repeated_decisions_are_distinct_and_overload_uses_next_rung(
     ]
     failed, completed = attempts
     assert failed["state"] == "failed"
-    assert failed["failure_class"] == "provider_internal"
+    assert failed["failure_class"] == "invalid_request"
     assert failed["estimated_cost_nano_usd"] is None
     assert failed["budget_settled_nano_usd"] == 0
     assert failed["usage_source"] == "unknown"

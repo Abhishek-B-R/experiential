@@ -315,9 +315,9 @@ fn normalization_tolerance_is_small_and_does_not_change_provider_numbers() {
 
 #[test]
 fn default_single_attempt_policy_never_redials_unknown_idempotency() {
-    let failure = crate::upstream::transport_failure(Some(529));
-    assert_eq!(failure.failure_class, FailureClass::ProviderInternal);
-    assert!(failure.retryable_same_deployment);
+    let failure = rejected_http(401);
+    assert_eq!(failure.failure_class, FailureClass::ProviderAuthentication);
+    assert!(!failure.retryable_same_deployment);
     let mut admitted = admission();
     admitted.maximum_total_attempts = 2;
     assert!(!successor_possible(
@@ -384,10 +384,10 @@ fn wire(customer_managed: bool) -> DeploymentWire {
 #[test]
 fn failed_rung_never_requests_a_disallowed_same_deployment_reservation() {
     let policy = admission().policy();
-    let failure = route_failure(rejected_http(529), &wire(false), policy, 1);
+    let failure = route_failure(rejected_http(401), &wire(false), policy, 1);
     assert!(!failure.retryable_same_deployment);
     assert!(failure.failover_eligible);
-    assert_eq!(failure.failure_class, FailureClass::ProviderInternal);
+    assert_eq!(failure.failure_class, FailureClass::ProviderAuthentication);
 }
 
 #[test]
@@ -399,6 +399,9 @@ fn uncertain_outcomes_never_advance_even_with_an_unused_second_rung() {
     let policy = admitted.policy();
     for failure in [
         crate::upstream::transport_failure(None),
+        rejected_http(402),
+        rejected_http(429),
+        rejected_http(529),
         Failure::new(FailureClass::Timeout, "uncertain open").with_retry(true, true),
         Failure::new(FailureClass::MalformedResponse, "uncertain answer").with_retry(true, true),
         timeout_failure(),
@@ -418,7 +421,7 @@ fn uncertain_outcomes_never_advance_even_with_an_unused_second_rung() {
             false
         ));
     }
-    for status in [529, 429, 401] {
+    for status in [401, 403, 404] {
         let failure = route_failure(rejected_http(status), &wire(false), admission().policy(), 1);
         assert!(failure.failover_eligible);
         assert!(successor_possible(
@@ -441,16 +444,16 @@ fn customer_credential_and_quota_failures_keep_caller_ownership() {
         let failure = route_failure(rejected_http(status), &wire(true), policy, 1);
         assert!(failure.customer_owned);
         assert!(!failure.retryable_same_deployment);
-        // Independent customer-managed rungs may still serve with another credential.
-        assert!(failure.failover_eligible);
+        // A credential rejection can advance; undocumented account status cannot.
+        assert_eq!(failure.failover_eligible, status != 402);
         assert_eq!(failure.clone().boundary().public_error().status_code, 400);
         let house = route_failure(rejected_http(status), &wire(false), policy, 1);
         assert!(!house.customer_owned);
-        assert!(house.failover_eligible);
+        assert_eq!(house.failover_eligible, status != 402);
     }
     let failure = route_failure(rejected_http(529), &wire(true), policy, 1);
     assert!(!failure.customer_owned);
-    assert!(failure.failover_eligible);
+    assert!(!failure.failover_eligible);
 }
 
 /// Only synthetic callback recording, not a claim about a durable ledger.
@@ -528,7 +531,7 @@ fn settlement_rejection_marker_comes_from_definitive_http_status_only() {
         block_on(async {
             let (mut guard, observer, _) = guarded();
             let failure = rejected_http(status);
-            let expected = matches!(status, 400 | 401 | 402 | 403 | 404 | 422 | 429 | 529);
+            let expected = matches!(status, 400 | 401 | 403 | 404 | 422);
             assert_eq!(failure.decision_provider_rejected, expected);
             if !expected {
                 assert!(!failure.failover_eligible);

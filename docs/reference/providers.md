@@ -136,9 +136,12 @@ cover input and output. This is an accounting estimate, not a provider-enforced 
 no synthetic `max_tokens` field is sent. Settlement uses only TypeSafe's reported token counts,
 including reported output tokens even though their configured price is zero. Unknown outcomes
 retain a content-free unknown-cost attempt record and keep the monetary reservation held, with
-no invented usage, settled charge, or automatic retry. A witnessed provider HTTP rejection
-releases the reservation without inventing zero-token usage. The certified route permits at most
-eight deployments and one dispatch per deployment, with no same-deployment or throttle redials.
+no invented usage, settled charge, or automatic retry. Only HTTP 400, 401, 403, 404, and 422
+establish a known rejection that releases the reservation without inventing zero-token usage.
+HTTP 402, 429, and 529 do not prove no work occurred: payment, throttle, and overload responses
+are terminal unknown outcomes with the hold retained, not automatic fallback signals. A known
+401 authentication rejection may advance to the next certified deployment. The route permits at
+most eight deployments and one dispatch per deployment, with no same-deployment or throttle redials.
 
 For a local SQLite gateway, an operator resolves one terminal decision hold explicitly through
 `SQLiteAttemptLedger.reconcile_decision_liability(attempt_id=..., assigned_cost_nano_usd=...)`

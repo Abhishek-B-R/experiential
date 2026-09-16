@@ -1472,6 +1472,51 @@ class TestRateLimitSettlement:
             )
             assert len(recorded) == folds, verdict
 
+    @pytest.mark.parametrize(
+        ("surface", "marker", "opened", "expected"),
+        [
+            (GatewayApiSurface.DECISIONS, True, False, True),
+            (GatewayApiSurface.DECISIONS, False, False, False),
+            (GatewayApiSurface.DECISIONS, True, True, False),
+            (GatewayApiSurface.CHAT_COMPLETIONS, True, False, False),
+        ],
+    )
+    def test_swept_rejection_keeps_exact_scoped_liability_evidence(
+        self,
+        surface: GatewayApiSurface,
+        marker: bool,
+        opened: bool,
+        expected: bool,
+    ) -> None:
+        """A failed ledger write must not change a rejection into unknown paid work on retry."""
+        registry, ledger, entry = _registry()
+        started = _start(registry, ordinal=0)
+        entry.authorization = entry.authorization.model_copy(update={"surface": surface})
+        ledger.fail_finishes = 1
+        settlement = json.dumps(
+            {
+                "request_id": entry.authorization.request_id,
+                "attempt_id": str(started["attempt_id"]),
+                "outcome": "failed",
+                "usage": None,
+                "failure": {"failure_class": "provider_internal", "safe_message": "rejected"},
+                "finalize": True,
+                "opened": opened,
+                "decision_provider_rejected": marker,
+            }
+        )
+        with pytest.raises(NativeBridgeError):
+            registry.settle(settlement)
+        first = ledger.terminal_events[-1]
+        assert first is not None and first.decision_provider_rejected is expected
+        assert entry.pending_settlement is not None
+        registry.sweep_expired()
+        recovered = ledger.terminal_events[-1]
+        assert recovered is not None and recovered.decision_provider_rejected is expected
+        assert recovered.usage is None
+        assert entry.pending_settlement is None
+        assert len(ledger.finished) == 1
+
     def test_swept_retained_settlement_still_records_the_cache_fraction(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

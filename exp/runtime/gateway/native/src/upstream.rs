@@ -115,10 +115,10 @@ pub fn transport_failure(status: Option<u16>) -> Failure {
 
 /// Pin TypeSafe rejection evidence to the received status, never an inferred class.
 pub(crate) fn decision_http_failure(mut failure: Failure, status: u16) -> Failure {
-    failure.decision_provider_rejected =
-        matches!(status, 400 | 401 | 402 | 403 | 404 | 422 | 429 | 529);
-    // TypeSafe has no idempotency contract. A timeout or generic 5xx can
-    // follow completed work, so only a definitive rejection can advance.
+    failure.decision_provider_rejected = matches!(status, 400 | 401 | 403 | 404 | 422);
+    // TypeSafe has no idempotency contract. Timeout, overload, and rate-limit
+    // statuses do not guarantee that no work or charge occurred, so only
+    // request, credential, or route rejection can advance.
     failure.retryable_same_deployment = false;
     if !failure.decision_provider_rejected {
         failure.failover_eligible = false;

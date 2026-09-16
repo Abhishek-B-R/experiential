@@ -29,7 +29,6 @@ from exp.runtime.gateway.budgets import (
 )
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
-    GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
     GatewayFailure,
@@ -662,15 +661,7 @@ class NativeAttemptAccounting:
         attempt_id = str(data["attempt_id"])
         finalize = bool(data.get("finalize", True))
         opened = bool(data.get("opened", False))
-        terminal, failure = terminal_from_settlement(data)
-        if (
-            entry.authorization.surface is GatewayApiSurface.DECISIONS
-            and terminal.kind is GatewayEventKind.FAILED
-            and terminal.usage is None
-            and data.get("opened") is False
-            and data.get("decision_provider_rejected") is True
-        ):
-            terminal = terminal.model_copy(update={"decision_provider_rejected": True})
+        terminal, failure = terminal_from_settlement(data, surface=entry.authorization.surface)
         first_token_at = first_token_at_from_settlement(data)
         rate_limit = settlement_rate_limit(data)
         try:
@@ -905,7 +896,9 @@ class NativeAttemptAccounting:
             settlement = entry.pending_settlement
             if settlement is None:
                 continue
-            terminal, failure = terminal_from_settlement(settlement)
+            terminal, failure = terminal_from_settlement(
+                settlement, surface=entry.authorization.surface
+            )
             if self._settle_swept(
                 request_id,
                 entry,
