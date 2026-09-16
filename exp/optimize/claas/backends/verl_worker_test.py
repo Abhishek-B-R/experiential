@@ -136,5 +136,47 @@ def test_checkpoint_flush_failure_cannot_publish_a_completion(
     monkeypatch.setattr(os, "fsync", fail_flush)
     with pytest.raises(OSError, match="checkpoint device failed"):
         train_loaded_model(job(tmp_path), GPT2LMHeadModel(config), tokenizer(), torch.device("cpu"))
-    assert not list(tmp_path.glob("*/claas-*/manifest.json"))
-    assert not list(tmp_path.glob("*/.checkpoint-*"))
+    assert not list(tmp_path.rglob("claas-*/manifest.json"))
+    assert not list(tmp_path.rglob(".checkpoint-*"))
+
+
+def test_rejected_candidate_can_resume_baseline_only_in_explicit_new_lineage(
+    tmp_path: Path,
+) -> None:
+    """A new cycle can branch from active state without weakening stale checks within a cycle."""
+    from exp.optimize.claas.training_contracts import next_policy_revision
+
+    config = GPT2Config.from_dict(
+        {"vocab_size": 8, "n_positions": 128, "n_embd": 16, "n_layer": 1, "n_head": 2}
+    )
+    initial = GPT2LMHeadModel(config)
+    first_job = job(tmp_path)
+    baseline = train_loaded_model(
+        first_job, copy.deepcopy(initial), tokenizer(), torch.device("cpu")
+    )
+    batch = TrainingBatch(
+        batch_id="candidate",
+        expected_policy_revision=baseline.checkpoint.policy_revision,
+        examples=(example(policy=baseline.checkpoint.policy_revision),),
+    )
+    candidate_job = TrainingJob(
+        spec=first_job.spec,
+        batch=batch,
+        checkpoint_root=str(tmp_path),
+        resume_checkpoint=baseline.checkpoint,
+    )
+    candidate = train_loaded_model(
+        candidate_job, copy.deepcopy(initial), tokenizer(), torch.device("cpu")
+    )
+    retry_batch = batch.model_copy(update={"batch_id": "retry-after-rejection"})
+    stale = candidate_job.model_copy(update={"batch": retry_batch})
+    with pytest.raises(ClaasTrainingError, match="newer state"):
+        train_loaded_model(stale, copy.deepcopy(initial), tokenizer(), torch.device("cpu"))
+    next_cycle = stale.model_copy(update={"lineage_id": "cycle-after-rejection"})
+    assert next_policy_revision(stale) != next_policy_revision(next_cycle)
+    resumed = train_loaded_model(
+        next_cycle, copy.deepcopy(initial), tokenizer(), torch.device("cpu")
+    )
+    assert resumed.checkpoint.step == candidate.checkpoint.step == 2
+    assert resumed.checkpoint.policy_history[1] == baseline.checkpoint.policy_revision
+    assert Path(resumed.checkpoint.path).parent != Path(candidate.checkpoint.path).parent

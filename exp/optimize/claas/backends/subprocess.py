@@ -41,6 +41,7 @@ class SubprocessVerlBackend:
         cuda_visible_device: str,
         timeout_seconds: float = 1800,
         model_access_token: str | None = None,
+        lineage_id: str = "main",
     ) -> None:
         """Bind exact runtime, durable storage, one device, and finite job timeout."""
         if not python_executable.is_absolute() or not python_executable.is_file():
@@ -51,11 +52,14 @@ class SubprocessVerlBackend:
             raise ValueError("cuda_visible_device must identify exactly one authorized GPU")
         if not 0 < timeout_seconds <= 86400:
             raise ValueError("timeout_seconds must be finite and between zero and 86400")
+        if not lineage_id.strip() or len(lineage_id) > 512:
+            raise ValueError("lineage_id must contain 1 to 512 nonblank characters")
         self._python = python_executable
         self._root = checkpoint_root
         self._device = cuda_visible_device
         self._timeout = timeout_seconds
         self._model_access_token = model_access_token
+        self._lineage_id = lineage_id
 
     async def open(
         self, spec: ClaasTrainingSpec, resume: TrainingCheckpoint | None = None
@@ -105,6 +109,7 @@ class _SubprocessSession:
                 batch=batch,
                 checkpoint_root=str(self._backend._root),
                 resume_checkpoint=self._checkpoint,
+                lineage_id=self._backend._lineage_id,
             )
             with tempfile.TemporaryDirectory(prefix="claas-job-") as directory:
                 root = Path(directory)

@@ -32,6 +32,7 @@ class CheckpointManifest(ContractModel):
     batch_id: str = Field(min_length=1)
     consumed_experience_ids: tuple[str, ...] = Field(min_length=1)
     files: dict[str, Sha256] = Field(min_length=1)
+    lineage_id: str = Field(default="main", min_length=1, max_length=512)
 
 
 def hash_file(path: Path) -> str:
@@ -142,6 +143,7 @@ def verify_training_result(job: TrainingJob, result: TrainingResult) -> Checkpoi
         or manifest.batch_id != job.batch.batch_id
         or manifest.parent_policy_revision != job.batch.expected_policy_revision
         or manifest.policy_history != expected_history
+        or manifest.lineage_id != job.lineage_id
     ):
         raise ValueError("checkpoint manifest and worker receipt do not match the submitted update")
     return manifest

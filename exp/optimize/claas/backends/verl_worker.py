@@ -218,8 +218,12 @@ def _train_verified_model(
 ) -> TrainingResult:
     """Consume private verified resume files while holding the application update lock."""
     root = Path(job.checkpoint_root).resolve()
-    adapter_root = root / sha256_json(
-        {"scope": job.spec.scope.model_dump(mode="json"), "adapter_id": job.spec.adapter_id}
+    adapter_root = (
+        root
+        / sha256_json(
+            {"scope": job.spec.scope.model_dump(mode="json"), "adapter_id": job.spec.adapter_id}
+        )
+        / sha256_json({"lineage_id": job.lineage_id})
     )
     adapter_root.mkdir(parents=True, exist_ok=True)
     with FileLock(adapter_root / ".training.lock", timeout=0):
@@ -358,6 +362,7 @@ def _save_result(
                 item.experience.experience_id for item in job.batch.examples
             ),
             files=files,
+            lineage_id=job.lineage_id,
         )
         (temporary / "manifest.json").write_text(manifest.model_dump_json(indent=2))
         for path in temporary.rglob("*"):
