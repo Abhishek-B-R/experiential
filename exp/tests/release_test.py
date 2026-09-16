@@ -81,6 +81,7 @@ REQUIRED_WHEEL_MODULES = frozenset(
 )
 REQUIRED_SDIST_MEMBERS = frozenset(
     {
+        "LICENSE",
         "README.md",
         "assets/experiential-workflow.png",
         "docs/reference/gateway-architecture.md",
@@ -192,6 +193,7 @@ def _assert_core_requirements(metadata: str) -> None:
         requirement, _, marker = requirement.partition(";")
         if re.search(r"\bextra\s*==", marker):
             continue
+        assert FORBIDDEN_REQUIREMENT.search(line) is None, f"forbidden core dependency: {line}"
         name = re.split(r"[<>=;~!\s]", requirement, maxsplit=1)[0].casefold()
         assert name not in requirements, f"duplicate core dependency: {name}"
         requirements[name] = re.sub(r"\s+", "", marker).replace("'", '"')
@@ -208,6 +210,10 @@ def test_core_dependency_markers_preserve_sdk_python_312() -> None:
     assert project["requires-python"] == ">=3.12"
     metadata = "\n".join(f"Requires-Dist: {requirement}" for requirement in project["dependencies"])
     _assert_core_requirements(metadata)
+    _assert_core_requirements(metadata + '\nRequires-Dist: anthropic>=1.2; extra == "dev"')
+    for marker in ("", '; python_version >= "3.13"'):
+        with pytest.raises(AssertionError, match="forbidden core dependency"):
+            _assert_core_requirements(metadata + f"\nRequires-Dist: anthropic>=1.2{marker}")
 
 
 def _assert_current_archive_members(
@@ -249,6 +255,7 @@ def _tracked_sdist_members() -> frozenset[str]:
             "git",
             "ls-files",
             ".gitignore",
+            "LICENSE",
             "README.md",
             "assets",
             "docs/reference/gateway-architecture.md",
@@ -3174,7 +3181,6 @@ def test_built_archives_match_current_package_contract() -> None:
             if not name.startswith("exp/") and ".dist-info/" not in name
         )
         assert not outside_package, f"wheel carries members outside the package: {outside_package}"
-        assert FORBIDDEN_REQUIREMENT.search(metadata) is None
         _assert_core_requirements(metadata)
 
     with tarfile.open(sdists[0], mode="r:gz") as sdist:
@@ -3186,7 +3192,6 @@ def test_built_archives_match_current_package_contract() -> None:
         assert frozenset(name for name in names if name and not name.endswith("/")) == (
             _tracked_sdist_members() | {"PKG-INFO"}
         )
-        assert FORBIDDEN_REQUIREMENT.search(metadata) is None
         _assert_core_requirements(metadata)
 
 
