@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
+from functools import partial
 from typing import Literal, Protocol
 
 from pydantic import Field, model_validator
@@ -99,6 +101,13 @@ class EvaluationManifest(ContractModel):
     def _validate_manifest(self) -> EvaluationManifest:
         """Keep loaded manifests complete, group-disjoint, and bound to this judge protocol."""
         held_ids = {group.group_id for group in self.held_out_groups}
+        if len(held_ids) != len(self.held_out_groups):
+            raise ValueError("held-out group IDs must be unique")
+        membership = tuple(
+            identity for group in self.held_out_groups for identity in group.experience_ids
+        )
+        if len(set(membership)) != len(membership):
+            raise ValueError("held-out source groups must have disjoint experience membership")
         if held_ids.intersection(self.fit_group_ids):
             raise ValueError("fit and held-out source groups overlap")
         if len({task.task_id for task in self.tasks}) != len(self.tasks):
@@ -193,6 +202,7 @@ class PairedEvaluationReport(ContractModel):
     score_kind: Literal["synthetic_judge"] = "synthetic_judge"
     current_policy_revision: str
     candidate_policy_revision: str
+    expected_task_ids: tuple[str, ...] = Field(min_length=1)
     pairs: tuple[PairedTaskEvaluation, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -202,6 +212,8 @@ class PairedEvaluationReport(ContractModel):
             raise ValueError("paired report requires distinct policy revisions")
         if len({pair.task_id for pair in self.pairs}) != len(self.pairs):
             raise ValueError("paired report must not duplicate task IDs")
+        if tuple(pair.task_id for pair in self.pairs) != self.expected_task_ids:
+            raise ValueError("paired report must cover every frozen task in its prescribed order")
         for pair in self.pairs:
             if (
                 pair.current.policy_revision != self.current_policy_revision
@@ -298,6 +310,8 @@ async def evaluate_policies(
         raise ValueError("evaluation source disclosure must authorize both exact providers")
     if not 0 < policy_timeout_seconds <= 3600:
         raise ValueError("policy timeout must be finite and between zero and 3600 seconds")
+    world.authorize_source(manifest.scope)
+    judge.authorize_source(manifest.scope)
     revisions = (current.policy_revision, candidate.policy_revision)
     if not all(revision.strip() for revision in revisions) or revisions[0] == revisions[1]:
         raise ValueError("paired evaluation needs two distinct nonempty policy revisions")
@@ -324,6 +338,7 @@ async def evaluate_policies(
         manifest_sha256=manifest.digest,
         current_policy_revision=revisions[0],
         candidate_policy_revision=revisions[1],
+        expected_task_ids=tuple(task.task_id for task in manifest.tasks),
         pairs=tuple(pairs),
     )
 
@@ -360,7 +375,7 @@ async def _evaluate_task(
             if policy.policy_revision != revision:
                 raise ValueError("evaluation policy revision changed during generation")
             stage = "world"
-            step = session.step(action)
+            step = await _run_blocking(partial(session.step, action))
             if step.transition.terminal:
                 break
         episode = session.end()
@@ -394,7 +409,7 @@ async def _evaluate_task(
             maximum_output_tokens=judge.limits.maximum_output_tokens,
         )
         judge_request = request
-        response = judge.complete(task.scenario.scope, request)
+        response = await _run_blocking(partial(judge.complete, task.scenario.scope, request))
         judge_response = response
         judgment = SyntheticJudgment.model_validate_json(
             structured_json_text(response.output.content or "")
@@ -424,3 +439,30 @@ async def _evaluate_task(
     finally:
         if session is not None:
             session.end()
+
+
+async def _run_blocking[T](operation: Callable[[], T]) -> T:
+    """Keep synchronous clients off-loop and join owned work before cancellation exits.
+
+    Provider clients enforce their configured finite transport deadlines. Joining
+    an already-dispatched call preserves its charged reservation and prevents a
+    cancelled evaluation from silently leaving background disclosure in flight.
+    """
+    task = asyncio.create_task(asyncio.to_thread(operation))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+
+
+def verify_evaluation_report(report: PairedEvaluationReport, manifest: EvaluationManifest) -> None:
+    """Verify a loaded report against the authoritative frozen manifest before use."""
+    report = PairedEvaluationReport.model_validate_json(report.model_dump_json())
+    manifest = EvaluationManifest.model_validate_json(manifest.model_dump_json())
+    if (
+        report.manifest_sha256 != manifest.digest
+        or report.expected_task_ids != tuple(task.task_id for task in manifest.tasks)
+        or report.judge_version != manifest.judge_version
+    ):
+        raise ValueError("paired report differs from the authoritative evaluation manifest")
