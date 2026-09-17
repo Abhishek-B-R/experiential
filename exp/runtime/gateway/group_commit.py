@@ -225,6 +225,7 @@ class GroupCommitAttemptLedger:
         ratelimit_remaining_requests: int | None = None,
         ratelimit_limit_tokens: int | None = None,
         ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
     ) -> None:
         """Durably settle one attempt with normalized content-free fields.
 
@@ -239,6 +240,7 @@ class GroupCommitAttemptLedger:
             ratelimit_remaining_requests: Provider-stated requests remaining.
             ratelimit_limit_tokens: Provider-stated token-rate ceiling.
             ratelimit_remaining_tokens: Provider-stated tokens remaining.
+            upstream_provider: The upstream an aggregator rung named as serving.
         """
         await self._submit(
             lambda connection: self.core.apply_finish_attempt(
@@ -253,6 +255,7 @@ class GroupCommitAttemptLedger:
                 ratelimit_remaining_requests=ratelimit_remaining_requests,
                 ratelimit_limit_tokens=ratelimit_limit_tokens,
                 ratelimit_remaining_tokens=ratelimit_remaining_tokens,
+                upstream_provider=upstream_provider,
             )
         )
 
@@ -568,6 +571,7 @@ class SyncGroupCommitLedger:
         ratelimit_remaining_requests: int | None = None,
         ratelimit_limit_tokens: int | None = None,
         ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
     ) -> None:
         """Durably settle one attempt with normalized content-free fields.
 
@@ -582,6 +586,7 @@ class SyncGroupCommitLedger:
             ratelimit_remaining_requests: Provider-stated requests remaining.
             ratelimit_limit_tokens: Provider-stated token-rate ceiling.
             ratelimit_remaining_tokens: Provider-stated tokens remaining.
+            upstream_provider: The upstream an aggregator rung named as serving.
         """
         self._writer.submit_blocking(
             lambda connection: self._writer.core.apply_finish_attempt(
@@ -596,6 +601,7 @@ class SyncGroupCommitLedger:
                 ratelimit_remaining_requests=ratelimit_remaining_requests,
                 ratelimit_limit_tokens=ratelimit_limit_tokens,
                 ratelimit_remaining_tokens=ratelimit_remaining_tokens,
+                upstream_provider=upstream_provider,
             )
         )
 

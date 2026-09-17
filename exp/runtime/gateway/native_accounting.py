@@ -65,8 +65,9 @@ from exp.runtime.gateway.native_settlement import (
     ledger_failure,
     settlement_rate_limit,
     terminal_from_settlement,
+    upstream_provider_from_settlement,
+    upstream_provider_kwarg,
 )
-from exp.runtime.gateway.rate_limit_headers import RateLimitObservation
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 from exp.runtime.openai_protocol.errors import (
@@ -158,6 +159,7 @@ class NativeAttemptAccounting:
                 skips the sample (fails closed).
         """
         self._write_ledger = write_ledger
+        self._finish_attempt: Callable[..., None] = write_ledger.finish_attempt
         self._budget_error_factory = budget_error_factory
         self._cache_sample_gate = cache_sample_gate
         # Revision-scoped deployment health; physical-lane load survives catalog rolls.
@@ -666,8 +668,9 @@ class NativeAttemptAccounting:
         terminal, failure = terminal_from_settlement(data, surface=entry.authorization.surface)
         first_token_at = first_token_at_from_settlement(data)
         rate_limit = settlement_rate_limit(data)
+        upstream = upstream_provider_from_settlement(data)
         try:
-            self._write_ledger.finish_attempt(
+            self._finish_attempt(
                 attempt_id=attempt_id,
                 terminal_event=terminal,
                 failure=failure,
@@ -678,6 +681,7 @@ class NativeAttemptAccounting:
                 ratelimit_remaining_requests=rate_limit.remaining_requests,
                 ratelimit_limit_tokens=rate_limit.limit_tokens,
                 ratelimit_remaining_tokens=rate_limit.remaining_tokens,
+                **upstream_provider_kwarg(self._finish_attempt, upstream),
             )
         except Exception as exc:  # noqa: BLE001 - the data plane retries.
             # The exact settlement is retained so a retry (from the data
@@ -908,7 +912,7 @@ class NativeAttemptAccounting:
                 terminal=terminal,
                 failure=failure,
                 finalize=bool(settlement.get("finalize", True)),
-                rate_limit=settlement_rate_limit(settlement),
+                settlement=settlement,
             ):
                 with self._lock:
                     entry.pending_settlement = None
@@ -956,16 +960,17 @@ class NativeAttemptAccounting:
         terminal: GatewayEvent,
         failure: GatewayFailure | None,
         finalize: bool,
-        rate_limit: RateLimitObservation | None = None,
+        settlement: JsonObject | None = None,
     ) -> bool:
-        """Land one swept settlement; keep the entry for retry on failure.
+        """Land one swept settlement from its retained payload; keep the entry to retry on failure.
 
         Returns:
             Whether the swept terminal write reached the ledger.
         """
-        observation = RateLimitObservation() if rate_limit is None else rate_limit
+        observation = settlement_rate_limit(settlement)
+        upstream = upstream_provider_from_settlement(settlement)
         try:
-            self._write_ledger.finish_attempt(
+            self._finish_attempt(
                 attempt_id=attempt_id,
                 terminal_event=terminal,
                 failure=failure,
@@ -975,6 +980,7 @@ class NativeAttemptAccounting:
                 ratelimit_remaining_requests=observation.remaining_requests,
                 ratelimit_limit_tokens=observation.limit_tokens,
                 ratelimit_remaining_tokens=observation.remaining_tokens,
+                **upstream_provider_kwarg(self._finish_attempt, upstream),
             )
         except Exception:  # noqa: BLE001 - keep the entry; the sweep retries.
             self._accounting_healthy = False

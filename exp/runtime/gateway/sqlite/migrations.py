@@ -16,7 +16,7 @@ from exp.runtime.gateway.sqlite.nano_usd_migration import (
     migrate_money_to_nano_usd,
 )
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 
 class GatewaySchemaError(RuntimeError):
@@ -749,6 +749,7 @@ _MIGRATIONS: dict[int, tuple[MigrationStep, ...]] = {
         "CREATE TABLE gateway_schema_refresh_v21 (noop INTEGER) STRICT",
         "DROP TABLE gateway_schema_refresh_v21",
     ),
+    22: ("ALTER TABLE gateway_attempts ADD COLUMN upstream_provider TEXT",),  # aggregator label
 }
 
 

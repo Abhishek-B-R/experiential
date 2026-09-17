@@ -11,9 +11,12 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.native_settlement import (
     _usage_from_payload,  # noqa: PLC2701 - direct unit coverage for normalization.
+    accepts_keyword,
     first_token_at_from_settlement,
     settlement_rate_limit,
     terminal_from_settlement,
+    upstream_provider_from_settlement,
+    upstream_provider_kwarg,
 )
 
 
@@ -330,3 +333,40 @@ def test_settlement_rate_limit_reads_the_optional_header_map() -> None:
     assert observation.remaining_requests == 9_500
     assert observation.retry_after_seconds == 7
     assert settlement_rate_limit({"outcome": "completed"}).is_empty
+
+
+def test_upstream_provider_parses_the_aggregators_label_and_nothing_else() -> None:
+    """A named upstream threads through; absent, blank, typed-wrong or over-long yields None."""
+    assert upstream_provider_from_settlement({"upstream_provider": "Azure"}) == "Azure"
+    assert upstream_provider_from_settlement({"upstream_provider": "  Amazon Bedrock "}) == (
+        "Amazon Bedrock"
+    )
+    assert upstream_provider_from_settlement({}) is None
+    assert upstream_provider_from_settlement({"upstream_provider": None}) is None
+    assert upstream_provider_from_settlement({"upstream_provider": ""}) is None
+    assert upstream_provider_from_settlement({"upstream_provider": 7}) is None
+    assert upstream_provider_from_settlement({"upstream_provider": "x" * 129}) is None
+
+
+def test_accepts_keyword_reads_named_and_variadic_signatures() -> None:
+    """Named, keyword-only, ``**kwargs`` accept; absent and unreadable do not."""
+
+    def named(*, upstream_provider: str | None = None) -> None:
+        del upstream_provider
+
+    def positional(upstream_provider: str | None = None) -> None:
+        del upstream_provider
+
+    def variadic(**kwargs: object) -> None:
+        del kwargs
+
+    def absent(*, other: int = 0) -> None:
+        del other
+
+    assert accepts_keyword(named, "upstream_provider")
+    assert accepts_keyword(positional, "upstream_provider")
+    assert accepts_keyword(variadic, "upstream_provider")
+    assert not accepts_keyword(absent, "upstream_provider")
+    assert upstream_provider_kwarg(named, "Azure") == {"upstream_provider": "Azure"}
+    assert upstream_provider_kwarg(variadic, None) == {"upstream_provider": None}
+    assert upstream_provider_kwarg(absent, "Azure") == {}

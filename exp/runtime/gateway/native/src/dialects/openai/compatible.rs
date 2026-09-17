@@ -159,6 +159,13 @@ impl Normalizer {
             ))]);
         }
         let mut events = Vec::new();
+        // An aggregator names the upstream that serves the stream on each
+        // chunk (OpenRouter `provider`, opted in by its metadata header); the
+        // first label is kept for settlement so a zero-data-retention
+        // dispatch records which retention-free endpoint answered.
+        if let Some(Value::String(provider)) = payload.get("provider") {
+            self.note_upstream_provider(provider);
+        }
         if let Some(raw_usage) = payload.get("usage") {
             if !raw_usage.is_null() {
                 self.usage = Some(

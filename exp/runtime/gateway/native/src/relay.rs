@@ -243,6 +243,12 @@ impl UpstreamRelay {
         self.first_token_at
     }
 
+    /// The upstream an aggregator named as serving this stream (OpenRouter's
+    /// per-chunk `provider`), read at commit to settle with the attempt.
+    pub fn upstream_provider(&self) -> Option<String> {
+        self.normalizer.upstream_provider().map(str::to_string)
+    }
+
     /// Caller-known label words (the dispatched model id) exempt from the
     /// provider-identifier screen on stream-error detail.
     pub fn set_request_words<I, S>(&mut self, words: I)

@@ -34,6 +34,7 @@ from exp.runtime.gateway.reasoning_carrier import (
     parse_reasoning_content_carrier,
     scheme_for_carrier,
 )
+from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.cache_control import (
     drop_opencode_cache_control,
 )
@@ -225,7 +226,7 @@ def decode_chat(
     _validate_official(
         _CHAT_OFFICIAL,
         _without_chat_message_extensions(payload),
-        extension_fields={"top_k", "reasoning_effort", "enable_thinking"},
+        extension_fields={"top_k", "reasoning_effort", "enable_thinking", "provider"},
     )
     request = _validate_wire(_ChatRequest, payload)
     idempotency_key, client_request_id = _validated_operation_headers(
@@ -254,6 +255,8 @@ def decode_chat(
                 *thinking.disclosures,
                 *_replayed_reasoning_disclosures(request.messages),
             ),
+            zdr_requested=request.provider is not None and request.provider.demands_zdr,
+            provider_preferences=_provider_preferences(payload, request.provider),
             maximum_output_tokens=maximum,
             maximum_output_tokens_parameter=(
                 "max_completion_tokens"
@@ -355,7 +358,7 @@ def decode_responses(
     _validate_official(
         _RESPONSES_OFFICIAL,
         official_probe,
-        extension_fields={"top_k", "reasoning", "client_metadata"},
+        extension_fields={"top_k", "reasoning", "client_metadata", "provider"},
     )
     include_encrypted_reasoning = _include_encrypted_reasoning(request.include)
     idempotency_key, client_request_id = _validated_operation_headers(
@@ -411,6 +414,8 @@ def decode_responses(
                     else tuple(item for item in request.input if isinstance(item, _ResponseMessage))
                 ),
             ),
+            zdr_requested=request.provider is not None and request.provider.demands_zdr,
+            provider_preferences=_provider_preferences(payload, request.provider),
             maximum_output_tokens=request.max_output_tokens,
             maximum_output_tokens_parameter=(
                 "max_output_tokens" if request.max_output_tokens is not None else None
@@ -486,6 +491,16 @@ def decode_responses(
         request=canonical,
         developer_messages_param=developer_messages_param,
     )
+
+
+def _provider_preferences(
+    payload: JsonObject, preferences: ProviderRoutingPreferences | None
+) -> JsonObject | None:
+    """The caller's validated ``provider`` object as sent, or None when absent."""
+    if preferences is None:
+        return None
+    raw = payload.get("provider")
+    return dict(raw) if isinstance(raw, dict) else None
 
 
 def _validate_manifest(payload: JsonObject, manifest: CompatibilityManifest) -> None:

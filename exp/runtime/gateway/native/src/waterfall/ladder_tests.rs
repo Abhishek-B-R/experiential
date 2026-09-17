@@ -278,6 +278,7 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         time_to_first_byte_seconds_per_million_input_tokens: None,
         throttle_redial_budget,
         failover_only_on: None,
+        zdr_constrained: false,
     }
 }
 
@@ -742,6 +743,7 @@ fn rule_wire(deployment_id: &str, url: &str, tokens: &[&str]) -> DeploymentWire 
     DeploymentWire {
         billing_customer_managed: true,
         failover_only_on: Some(tokens.iter().map(|token| token.to_string()).collect()),
+        zdr_constrained: false,
         ..wire(deployment_id, url, 0)
     }
 }
