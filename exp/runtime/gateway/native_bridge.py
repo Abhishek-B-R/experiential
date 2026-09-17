@@ -38,6 +38,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
+from exp.runtime.gateway.guardrails import deterministic
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
 from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
@@ -220,6 +221,10 @@ class NativeControlPlane(
         self._budget_error_factory = budget_error_factory
         self._native_route_eligible = native_route_eligible
         self._guardrails = guardrails
+        # Deterministic rules compile once here, never per request.
+        self._guardrail_detectors = deterministic.compile_native_detectors(
+            {} if guardrails is None else guardrails.deterministic_specifications
+        )
         # The accounting registry owns in-flight requests, per-dispatch
         # reservations, deployment-health circuits, and the deadline sweep.
         self._accounting = NativeAttemptAccounting(
@@ -231,6 +236,11 @@ class NativeControlPlane(
         # a fresh process pays that once at bind time, never on its first
         # request, and a corrupt table fails startup with its own message.
         reservation_encoder()
+
+    @property
+    def guardrail_detectors(self) -> dict[str, deterministic.NativeDetector]:
+        """Return the compiled deterministic rules the data plane enforces."""
+        return dict(self._guardrail_detectors)
 
     @property
     def request_timeout_seconds(self) -> float:
@@ -269,11 +279,8 @@ class NativeControlPlane(
     def admit(self, argument: str) -> str:
         """Decode, authorize, inspect, route, and durably accept one request.
 
-        The raw body is decoded with the same ``decode_chat`` the python
-        engine uses, and every deployment's upstream payload is built with
-        the same shared payload builders, so the two engines cannot drift at
-        the protocol or provider boundary. No attempt row is written here:
-        each physical dispatch is reserved by :meth:`start_attempt`.
+        Shared decoders and payload builders preserve protocol parity.
+        Each physical dispatch is reserved separately by :meth:`start_attempt`.
 
         Args:
             argument: JSON object with ``raw_key``, ``body`` (raw request
@@ -282,13 +289,9 @@ class NativeControlPlane(
                 ``app_referer``/``app_title`` caller app identity.
 
         Returns:
-            JSON wire configuration carrying the full ordered certified
-            ``route`` (one dialect, endpoint, headers, payload, and
-            per-deployment idempotency key entry per deployment) plus the
-            frozen retry-policy facts, or an ``{"escalate": reason}``
-            disposition (its accepted request already finalized, with no
-            attempt row) naming why the native plane cannot serve the
-            request.
+            The ordered certified ``route`` with dispatch and retry configuration,
+            or ``{"escalate": reason}`` after finalizing an accepted request that
+            the native plane cannot serve without writing an attempt row.
 
         Raises:
             NativeBridgeError: Decoding, authorization, routing, or
@@ -365,6 +368,7 @@ class NativeControlPlane(
                 authorization=authorization,
                 request=request,
                 deadline_monotonic=deadline,
+                detectors=self._guardrail_detectors,
             )
         except GuardrailRejected as exc:
             raise NativeBridgeError(public_failure_error(exc.failure)) from exc
@@ -641,6 +645,7 @@ class NativeControlPlane(
             self._accounting.finish_request_quietly(authorization, failure)
             raise error from exc
 
+        plan = deterministic.native_output_plan(policy, self._guardrail_detectors)
         self._accounting.register(
             InflightRequest(
                 authorization=authorization,
@@ -674,13 +679,15 @@ class NativeControlPlane(
             "maximum_total_attempts": MAXIMUM_TOTAL_ATTEMPTS,
             "maximum_same_deployment_attempts": MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
             "refusal_failover": authorization.refusal_failover,
-            "output_guardrail": bool(policy is not None and policy.output_checks),
+            "output_guardrail": bool(policy and policy.output_checks and plan is None),
             "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
         }
         if route.snapshot.throttle_redial is not None:
             # The pool's frozen backoff-and-redial schedule; absent (not null) on
             # pools that keep throttles failover-only: their admission is byte-identical.
             response["throttle_redial"] = route.snapshot.throttle_redial.model_dump(mode="json")
+        if plan is not None:
+            response["guardrail_output_plan"] = plan
         if request.surface == GatewayApiSurface.MESSAGES:
             # Display-only: what `message_start` shows as input when the
             # upstream reports nothing before its final chunk. The ledger
@@ -754,17 +761,13 @@ class NativeControlPlane(
         """Reserve one physical dispatch through the accounting registry.
 
         Args:
-            argument: JSON object with ``request_id``, ``attempt_ordinal``,
-                optional ``current_depth``, and the optional classified
-                ``failure``; see
-                :meth:`NativeAttemptAccounting.start_attempt`.
+            argument: JSON payload for ``NativeAttemptAccounting.start_attempt``.
 
         Returns:
             The registry's reservation or exhaustion disposition.
 
         Raises:
-            NativeBridgeError: The reservation failed; the request is
-                finalized before the error is raised.
+            NativeBridgeError: Reservation failed after finalizing the request.
         """
         return self._accounting.start_attempt(argument)
 
@@ -772,15 +775,13 @@ class NativeControlPlane(
         """Durably settle one reserved attempt through the accounting registry.
 
         Args:
-            argument: JSON settlement payload; see
-                :meth:`NativeAttemptAccounting.settle`.
+            argument: JSON payload for ``NativeAttemptAccounting.settle``.
 
         Returns:
             An empty JSON object; repeated settlement is a no-op.
 
         Raises:
-            NativeBridgeError: The durable terminal write failed; the entry
-                is retained so a retried settlement can still land.
+            NativeBridgeError: Write failed; the entry remains available for retry.
         """
         return self._accounting.settle(argument)
 
@@ -788,15 +789,13 @@ class NativeControlPlane(
         """Terminalize one accepted request through the accounting registry.
 
         Args:
-            argument: JSON object with ``request_id`` and optional
-                ``failure``; see :meth:`NativeAttemptAccounting.abandon`.
+            argument: JSON payload for ``NativeAttemptAccounting.abandon``.
 
         Returns:
             An empty JSON object; an unknown request is a no-op.
 
         Raises:
-            NativeBridgeError: The durable terminal write failed; the entry
-                is kept so the deadline sweep can still close it.
+            NativeBridgeError: Write failed; the entry remains for the deadline sweep.
         """
         return self._accounting.abandon(argument)
 

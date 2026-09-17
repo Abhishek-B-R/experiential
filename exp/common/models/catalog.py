@@ -381,53 +381,30 @@ class GatewayDeploymentCapabilities(ContractModel):
     supports_structured_text: bool = False
     supports_stop_sequences: bool = False
     supports_image_input: bool = False
-    """Whether this deployment's wire and model can carry caller image parts.
-
-    Image input is declaration-driven and never assumed: a route that does
-    not declare it rejects an image request at admission, so a picture is
-    never dropped and answered from the surrounding text alone.
-    """
+    """Whether the wire and model accept images; undeclared image input is rejected."""
     supports_image_url_input: bool = False
-    """Whether this route's provider fetches a caller image URL itself.
+    """Whether the provider fetches remote images; undeclared URLs are rejected.
 
-    Inline base64 rides every image-capable wire, but only some wires accept a
-    remote URL. A route that does not declare this rejects a URL image at
-    admission, which lets a waterfall narrow to a rung that can carry it.
+    Every image-capable wire accepts inline base64; URL support varies by route.
     """
     supports_video_input: bool = False
-    """Whether this deployment's wire and model can carry caller video parts.
+    """Whether the wire and model accept video; undeclared video input is rejected.
 
-    Video is narrower than images: only the Gemini, Bedrock Converse, and
-    OpenAI-compatible ``video_url`` wires define a video carrier, and only
-    some models on those wires accept one. Like images the declaration is
-    never assumed, so a route without it rejects a video at admission rather
-    than answering from the surrounding text.
+    Video carriers exist on Gemini, Bedrock Converse, and compatible ``video_url`` wires.
     """
     supports_video_url_input: bool = False
-    """Whether this route's provider fetches a caller video URL itself.
+    """Whether the provider fetches video URLs (Gemini and OpenAI-compatible wires).
 
-    Bedrock accepts inline bytes (or an S3 location the gateway does not
-    author) only; Gemini and the OpenAI-compatible video wires fetch an
-    http(s) URL on the caller's behalf.
+    Bedrock requires inline bytes or an S3 location that the gateway does not author.
     """
     supports_audio_input: bool = False
-    """Whether this deployment's wire and model can carry caller audio parts.
+    """Whether the wire and model accept audio; undeclared audio input is rejected.
 
-    Audio is the narrowest attachment: only the OpenAI-compatible Chat
-    ``input_audio`` wire and the Gemini ``inline_data`` wire carry a clip a
-    model serves, and on those wires only specific models (the gpt-audio
-    family, audio-capable Gemini models) accept one. The declaration is never
-    assumed, so a route without it rejects audio at admission rather than
-    answering from the surrounding text. Audio has no remote URL carrier on
-    any public surface, so there is no separate URL declaration.
+    Supported models use compatible Chat ``input_audio`` or Gemini ``inline_data``.
+    No public audio surface accepts remote URLs.
     """
     supports_pdf_input: bool = False
-    """Whether this deployment's wire and model can carry caller PDF documents.
-
-    Like image input this is declaration-driven and never assumed: a route
-    that does not declare it rejects a document request at admission, so a
-    PDF is never dropped and answered from the surrounding text alone.
-    """
+    """Whether the wire and model accept PDFs; undeclared document input is rejected."""
     supports_pdf_url_input: bool = False
     """Whether this route's provider fetches a caller PDF URL itself.
 
@@ -570,15 +547,10 @@ NanoUsdRatePerMillionTokens = Annotated[
 class GatewayLongContextTier(ContractModel):
     """Premium rates a provider applies to whole long-context requests.
 
-    Both published tier schedules this models (Gemini's ``prompts > 200k``
-    rates and Anthropic's legacy 1M-beta premium) reprice the ENTIRE request
-    once provider-reported input tokens reach the threshold, never only the
-    tokens past it, so that is the one semantic implemented: when
-    ``usage.input_tokens >= input_threshold_tokens``, these rates replace
-    the base rates for every dimension of the request. ``None`` means the
-    tier rate is unknown exactly as on the base schedule; it never inherits
-    the base rate, so a deployment reporting a dimension without a tier
-    price stays honestly unpriced above the threshold.
+    When ``usage.input_tokens >= input_threshold_tokens``, tier rates replace
+    base rates for every dimension of the whole request, not just excess tokens.
+    This models Gemini and Anthropic's long-context premium schedules. A ``None``
+    tier rate stays unknown; it never inherits the base rate.
     """
 
     input_threshold_tokens: int = Field(gt=0)
