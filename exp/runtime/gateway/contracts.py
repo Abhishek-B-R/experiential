@@ -991,3 +991,9 @@ class ExecutionSnapshot(ContractModel):
     # per-attempt decision can honor a post-backoff redial. ``None`` keeps
     # throttles failover-only.
     throttle_redial: GatewayThrottleRedialPolicy | None = None
+    # Rungs the host flagged for OpenRouter's per-request zero-data-retention
+    # constraint (an org requiring ZDR on a rung that is ZDR only on request):
+    # eligibility stays the host's; the dispatch builder tightens each flagged
+    # rung's payload and header, and fails closed on a wire that cannot. Empty
+    # on ordinary routes; ids outside deployment_ids are ignored.
+    zdr_constrained_deployment_ids: tuple[DeploymentId, ...] = ()

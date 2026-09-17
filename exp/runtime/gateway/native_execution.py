@@ -830,6 +830,7 @@ def deployment_wire_entry(
     stop_sequences: Sequence[str] = (),
     serialize_tool_calls: bool = False,
     throttle_redial_budget: int = 0,
+    zdr_constrained: bool = False,
 ) -> JsonObject:
     """Build one deployment's wire configuration for the admitted route.
 
@@ -860,6 +861,9 @@ def deployment_wire_entry(
             authored threshold, a proportional share below it), so the data
             plane backs off and re-dials the rung that many times before the
             ladder advances. Zero keeps the rung failover-only.
+        zdr_constrained: The payload was tightened to OpenRouter's ZDR routing
+            constraint (``snapshot.zdr_constrained_deployment_ids``); the data
+            plane echoes ``x-gateway-zdr-constrained: true`` when it serves.
 
     Returns:
         The JSON-compatible wire entry consumed by the data plane.
@@ -913,6 +917,7 @@ def deployment_wire_entry(
         "failover_only_on": (
             None if capabilities.failover_only_on is None else list(capabilities.failover_only_on)
         ),
+        "zdr_constrained": zdr_constrained,
     }
 
 

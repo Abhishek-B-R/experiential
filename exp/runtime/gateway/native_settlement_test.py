@@ -14,6 +14,7 @@ from exp.runtime.gateway.native_settlement import (
     first_token_at_from_settlement,
     settlement_rate_limit,
     terminal_from_settlement,
+    upstream_provider_from_settlement,
 )
 
 
@@ -330,3 +331,16 @@ def test_settlement_rate_limit_reads_the_optional_header_map() -> None:
     assert observation.remaining_requests == 9_500
     assert observation.retry_after_seconds == 7
     assert settlement_rate_limit({"outcome": "completed"}).is_empty
+
+
+def test_upstream_provider_parses_the_aggregators_label_and_nothing_else() -> None:
+    """A named upstream threads through; absent, blank, typed-wrong or over-long yields None."""
+    assert upstream_provider_from_settlement({"upstream_provider": "Azure"}) == "Azure"
+    assert upstream_provider_from_settlement({"upstream_provider": "  Amazon Bedrock "}) == (
+        "Amazon Bedrock"
+    )
+    assert upstream_provider_from_settlement({}) is None
+    assert upstream_provider_from_settlement({"upstream_provider": None}) is None
+    assert upstream_provider_from_settlement({"upstream_provider": ""}) is None
+    assert upstream_provider_from_settlement({"upstream_provider": 7}) is None
+    assert upstream_provider_from_settlement({"upstream_provider": "x" * 129}) is None

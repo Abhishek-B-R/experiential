@@ -234,6 +234,34 @@ def terminal_from_settlement(
     return terminal, failure
 
 
+UPSTREAM_PROVIDER_MAX_CHARS = 128
+"""Longest upstream label the settlement carries; anything longer is not a name."""
+
+
+def upstream_provider_from_settlement(data: JsonObject) -> str | None:
+    """Return the upstream an aggregator rung named as serving the attempt.
+
+    The native data plane includes ``upstream_provider`` when the provider's
+    stream named the endpoint behind the answer (OpenRouter's per-chunk
+    ``provider`` field, opted in by the ZDR constraint's metadata header). A
+    missing, empty, non-string, or over-long value yields ``None`` so an
+    engine or a provider that names nothing settles exactly as before.
+
+    Args:
+        data: Parsed native settlement payload.
+
+    Returns:
+        The provider label, or ``None`` when the attempt named none.
+    """
+    raw = data.get("upstream_provider")
+    if not isinstance(raw, str):
+        return None
+    label = raw.strip()
+    if not label or len(label) > UPSTREAM_PROVIDER_MAX_CHARS:
+        return None
+    return label
+
+
 def first_token_at_from_settlement(data: JsonObject) -> datetime | None:
     """Return the winning attempt's first-token wall-clock time from a settlement payload.
 

@@ -25,6 +25,7 @@ fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         time_to_first_byte_seconds_per_million_input_tokens: slope,
         throttle_redial_budget: 0,
         failover_only_on: None,
+        zdr_constrained: false,
     }
 }
 

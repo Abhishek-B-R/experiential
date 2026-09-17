@@ -124,6 +124,7 @@ class _RecordingLedger:
         self.started: list[JsonObject] = []
         self.finished: list[JsonObject] = []
         self.terminal_events: list[GatewayEvent | None] = []
+        self.upstream_providers: list[str | None] = []
         self.rate_limit_settlements: list[JsonObject] = []
         self.finished_requests: list[GatewayFailure] = []
         self.budget_rejections: dict[str, BudgetScopeKind] = {}
@@ -186,9 +187,11 @@ class _RecordingLedger:
         ratelimit_remaining_requests: int | None = None,
         ratelimit_limit_tokens: int | None = None,
         ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
     ) -> None:
         """Record one settled attempt, tracking harvested rate-limit values apart."""
         del first_token_at
+        self.upstream_providers.append(upstream_provider)
         self.terminal_events.append(terminal_event)
         if self.fail_finishes > 0:
             self.fail_finishes -= 1

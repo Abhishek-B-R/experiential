@@ -1071,3 +1071,22 @@ def test_wire_entry_carries_the_throttle_redial_budget() -> None:
         ]
         == 3
     )
+
+
+def test_route_narrowing_and_reordering_keep_the_zdr_constraint_flags() -> None:
+    """The snapshot's constrained ids survive every route rebuild the admission does."""
+    route = _route()
+    flagged = route.model_copy(
+        update={
+            "snapshot": route.snapshot.model_copy(
+                update={"zdr_constrained_deployment_ids": ("two",)}
+            )
+        }
+    )
+
+    narrowed = select_route_deployments(flagged, (1, 2))
+    reordered = reorder_route_deployments(flagged, (2, 0, 1))
+
+    assert narrowed.snapshot.zdr_constrained_deployment_ids == ("two",)
+    assert reordered.snapshot.zdr_constrained_deployment_ids == ("two",)
+    assert route.snapshot.zdr_constrained_deployment_ids == ()

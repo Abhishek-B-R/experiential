@@ -65,6 +65,7 @@ from exp.runtime.gateway.native_settlement import (
     ledger_failure,
     settlement_rate_limit,
     terminal_from_settlement,
+    upstream_provider_from_settlement,
 )
 from exp.runtime.gateway.rate_limit_headers import RateLimitObservation
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
@@ -678,6 +679,7 @@ class NativeAttemptAccounting:
                 ratelimit_remaining_requests=rate_limit.remaining_requests,
                 ratelimit_limit_tokens=rate_limit.limit_tokens,
                 ratelimit_remaining_tokens=rate_limit.remaining_tokens,
+                upstream_provider=upstream_provider_from_settlement(data),
             )
         except Exception as exc:  # noqa: BLE001 - the data plane retries.
             # The exact settlement is retained so a retry (from the data
@@ -909,6 +911,7 @@ class NativeAttemptAccounting:
                 failure=failure,
                 finalize=bool(settlement.get("finalize", True)),
                 rate_limit=settlement_rate_limit(settlement),
+                upstream_provider=upstream_provider_from_settlement(settlement),
             ):
                 with self._lock:
                     entry.pending_settlement = None
@@ -957,6 +960,7 @@ class NativeAttemptAccounting:
         failure: GatewayFailure | None,
         finalize: bool,
         rate_limit: RateLimitObservation | None = None,
+        upstream_provider: str | None = None,
     ) -> bool:
         """Land one swept settlement; keep the entry for retry on failure.
 
@@ -975,6 +979,7 @@ class NativeAttemptAccounting:
                 ratelimit_remaining_requests=observation.remaining_requests,
                 ratelimit_limit_tokens=observation.limit_tokens,
                 ratelimit_remaining_tokens=observation.remaining_tokens,
+                upstream_provider=upstream_provider,
             )
         except Exception:  # noqa: BLE001 - keep the entry; the sweep retries.
             self._accounting_healthy = False
