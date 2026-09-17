@@ -220,6 +220,10 @@ applies the same rule after commitment, when every committed event was one it ca
 Provider-internal retry layers are disabled so every
 possible billable dispatch is visible to the gateway ledger.
 
+**Per-rung conditional failover (`failover_only_on`).** A deployment may restrict itself to
+failover duty for a named set of failures (a customer's trusted-access OpenAI key taking only the
+house rung's `refusal:cyber_policy`); see [gateway-failover-rules.md](gateway-failover-rules.md).
+
 A provider throttle (HTTP 429, an overload answer, or a rate-limit error declared inside the
 stream) is classed `throttled` and is failover-eligible but never redialed on its own: the 429
 sets the rung's throttle window before the next candidate is chosen. What happens next is the

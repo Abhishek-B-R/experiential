@@ -31,6 +31,7 @@ from exp.runtime.gateway.native_execution import (
     rung_load_key,
     throttle_disposition,
 )
+from exp.runtime.gateway.native_fallback_rules import route_fallback_rules
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed, RungShedReason
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
@@ -170,6 +171,7 @@ def failed_dispatch_candidate(
         throttle_redial_budget=(
             entry.throttle_redial_budgets[current_depth] - entry.throttle_redials[current_depth]
         ),
+        fallback_rules=route_fallback_rules(route),
     )
     disposition = throttle_disposition(
         failure,
