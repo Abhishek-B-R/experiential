@@ -368,7 +368,18 @@ def _usage_from_payload(
     payload: JsonObject | None,
     tool_names: list[str],
 ) -> GatewayUsage | None:
-    """Build normalized usage from settlement scalars and tool names."""
+    """Build normalized usage without inventing absent token or TTL evidence.
+
+    Args:
+        payload: Native settlement usage object, or None.
+        tool_names: Observed tool names in invocation order.
+
+    Returns:
+        Typed token or tool-only usage, or None when neither was observed.
+
+    Raises:
+        ValueError: The observed token totals or subsets are contradictory.
+    """
     names = tuple(str(name) for name in tool_names)
     if payload is None or payload.get("input_tokens") is None:
         return GatewayUsage(tool_names=names) if names else None
@@ -376,6 +387,10 @@ def _usage_from_payload(
         input_tokens=_optional_count(payload.get("input_tokens")),
         output_tokens=_optional_count(payload.get("output_tokens")),
         cached_input_tokens=_optional_count(payload.get("cached_input_tokens")),
+        cache_creation_input_tokens=_optional_count(payload.get("cache_creation_input_tokens")),
+        cache_creation_1h_input_tokens=_optional_count(
+            payload.get("cache_creation_1h_input_tokens")
+        ),
         reasoning_tokens=_optional_count(payload.get("reasoning_tokens")),
         tool_names=names,
     )

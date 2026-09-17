@@ -907,6 +907,49 @@ fn fold_usage(carried: &Usage, current: Usage) -> Usage {
             carried.cache_creation_input_tokens,
             current.cache_creation_input_tokens,
         ),
+        cache_creation_1h_input_tokens: match (
+            carried.cache_creation_input_tokens.unwrap_or(0),
+            carried.cache_creation_1h_input_tokens,
+            current.cache_creation_input_tokens.unwrap_or(0),
+            current.cache_creation_1h_input_tokens,
+        ) {
+            (a, None, _, _) if a > 0 => None,
+            (_, _, b, None) if b > 0 => None,
+            (_, a, _, b) => add(a, b),
+        },
         reasoning_tokens: add(carried.reasoning_tokens, current.reasoning_tokens),
+    }
+}
+
+#[cfg(test)]
+mod cache_write_tests {
+    use super::{fold_usage, Usage};
+
+    #[test]
+    fn redial_preserves_unknown_ttl_until_every_write_leg_is_observed() {
+        let known = Usage {
+            cache_creation_input_tokens: Some(10),
+            cache_creation_1h_input_tokens: Some(4),
+            ..Usage::default()
+        };
+        let unknown = Usage {
+            cache_creation_input_tokens: Some(20),
+            ..Usage::default()
+        };
+        let folded = fold_usage(&known, known.clone());
+        assert_eq!(folded.cache_creation_input_tokens, Some(20));
+        assert_eq!(folded.cache_creation_1h_input_tokens, Some(8));
+        assert_eq!(
+            fold_usage(&known, unknown.clone()).cache_creation_1h_input_tokens,
+            None
+        );
+        assert_eq!(
+            fold_usage(&unknown, known.clone()).cache_creation_1h_input_tokens,
+            None
+        );
+        assert_eq!(
+            fold_usage(&Usage::default(), known).cache_creation_1h_input_tokens,
+            Some(4)
+        );
     }
 }

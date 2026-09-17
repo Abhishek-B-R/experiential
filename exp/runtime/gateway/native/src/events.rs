@@ -41,11 +41,13 @@ pub struct Usage {
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     /// Cache-write tokens inside the input total, present only when the
-    /// provider reported a nonzero count (Anthropic-only today). The ledger
-    /// keeps billing the folded input total; this leg exists so callers see
-    /// their prompt being cached (Claude Code displays it).
+    /// provider reported a nonzero count. Cache reads and writes are
+    /// disjoint subsets of input and have separately configured prices.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
+    /// Observed one-hour subset; absent when no complete TTL breakdown exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h_input_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
 }
 
@@ -614,6 +616,9 @@ pub fn simplified_event(event: &Event) -> Value {
             });
             if let Some(creation) = usage.cache_creation_input_tokens {
                 payload["cache_creation_input_tokens"] = serde_json::json!(creation);
+            }
+            if let Some(hour) = usage.cache_creation_1h_input_tokens {
+                payload["cache_creation_1h_input_tokens"] = serde_json::json!(hour);
             }
             payload
         }
