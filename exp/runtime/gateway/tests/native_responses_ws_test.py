@@ -143,6 +143,8 @@ def test_websocket_transport_mirrors_the_http_event_stream(
             )
             completed = first[-1]["response"]
             assert isinstance(completed, dict)
+            assert type(completed["created_at"]) is int
+            assert type(completed["completed_at"]) is int
             output = completed["output"]
             assert isinstance(output, list)
             message = output[0]

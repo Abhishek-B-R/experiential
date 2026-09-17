@@ -9,11 +9,10 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from exp.common.core.artifacts import ContractModel
-from exp.common.models.gateway_catalog import BillingSource, ExactModelDeployment
+from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.auth import utc_text
 from exp.runtime.gateway.budgets import (
-    MAXIMUM_MICRO_USD,
+    MAXIMUM_NANO_USD,
     budget_period_start,
     current_budget_period,
     require_attempt_budget,
@@ -23,6 +22,7 @@ from exp.runtime.gateway.contracts import (
     AttemptId,
     AuthorizationSnapshot,
     ExecutionSnapshot,
+    GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
     GatewayFailure,
@@ -30,7 +30,14 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.gateway.interfaces import GatewayClock
-from exp.runtime.gateway.ledger_valuation import estimated_cost_micro_usd, optional_int
+from exp.runtime.gateway.ledger_usage import (
+    BillingSourceUsage,
+    IdentityUsage,
+    LedgerUsageSnapshot,
+    billing_source_usage_rows,
+    identity_usage_rows,
+)
+from exp.runtime.gateway.ledger_valuation import estimated_cost_nano_usd, optional_int
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
 from exp.runtime.gateway.sqlite.store import SystemGatewayClock
 
@@ -87,52 +94,6 @@ class IdempotencyReplayUnavailableError(AttemptRejectedError):
                 safe_message="completed keyed result is unavailable for durable replay",
             ),
         )
-
-
-class UsageTerminalCount(ContractModel):
-    """Count of attempts ending in one normalized terminal state."""
-
-    state: str
-    attempts: int
-
-
-class IdentityUsage(ContractModel):
-    """Content-free usage totals for one identity."""
-
-    organization_id: str
-    identity_id: str
-    requests: int
-    attempts: int
-    input_tokens: int
-    cached_input_tokens: int
-    output_tokens: int
-    reasoning_tokens: int
-    known_estimated_cost_micro_usd: int
-    unknown_cost_attempts: int
-    total_latency_ms: int
-    average_latency_ms: float | None
-    terminal_counts: tuple[UsageTerminalCount, ...]
-
-
-class BillingSourceUsage(ContractModel):
-    """Content-free physical-attempt totals for one credential ownership source."""
-
-    billing_source: BillingSource
-    attempts: int
-    input_tokens: int
-    cached_input_tokens: int
-    output_tokens: int
-    reasoning_tokens: int
-    known_estimated_cost_micro_usd: int
-    unknown_cost_attempts: int
-    terminal_counts: tuple[UsageTerminalCount, ...]
-
-
-class LedgerUsageSnapshot(ContractModel):
-    """One SQLite read snapshot containing identity and billing-source aggregates."""
-
-    identities: tuple[IdentityUsage, ...]
-    by_billing_source: tuple[BillingSourceUsage, ...]
 
 
 class SQLiteAttemptLedger:
@@ -273,9 +234,13 @@ class SQLiteAttemptLedger:
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
-        maximum_cost_micro_usd: int | None = None,
+        maximum_cost_nano_usd: int | None = None,
+        reserved_input_tokens: int | None = None,
+        reserved_output_tokens: int | None = None,
         route_reason: str | None = None,
         fallback_reason: str | None = None,
+        dispatch_reason: str | None = None,
+        preferred_deployment: ExactModelDeployment | None = None,
     ) -> AttemptId:
         """Durably mark a provider dispatch before starting network work.
 
@@ -284,9 +249,13 @@ class SQLiteAttemptLedger:
             deployment: Exact deployment about to receive the request.
             attempt_ordinal: Zero-based physical dispatch position for this request.
             route_depth: Zero-based operational route position.
-            maximum_cost_micro_usd: Conservative charge reserved before dispatch.
+            maximum_cost_nano_usd: Conservative charge reserved before dispatch.
             route_reason: Optional learned-selection reason code.
             fallback_reason: Optional embedding or router fallback reason code.
+            dispatch_reason: Optional policy-dispatch disclosure code.
+            preferred_deployment: The route's bypassed preferred rung, given
+                only when it differs from ``deployment``; its base rates are
+                frozen for the settle-time counterfactual cost.
 
         Returns:
             Stable new attempt ID.
@@ -298,9 +267,13 @@ class SQLiteAttemptLedger:
                 deployment=deployment,
                 attempt_ordinal=attempt_ordinal,
                 route_depth=route_depth,
-                maximum_cost_micro_usd=maximum_cost_micro_usd,
+                maximum_cost_nano_usd=maximum_cost_nano_usd,
+                reserved_input_tokens=reserved_input_tokens,
+                reserved_output_tokens=reserved_output_tokens,
                 route_reason=route_reason,
                 fallback_reason=fallback_reason,
+                dispatch_reason=dispatch_reason,
+                preferred_deployment=preferred_deployment,
             )
 
     def apply_start_attempt(
@@ -311,9 +284,13 @@ class SQLiteAttemptLedger:
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
-        maximum_cost_micro_usd: int | None = None,
+        maximum_cost_nano_usd: int | None = None,
+        reserved_input_tokens: int | None = None,
+        reserved_output_tokens: int | None = None,
         route_reason: str | None = None,
         fallback_reason: str | None = None,
+        dispatch_reason: str | None = None,
+        preferred_deployment: ExactModelDeployment | None = None,
     ) -> AttemptId:
         """Run the dispatch reservation inside the caller's open write transaction.
 
@@ -323,22 +300,35 @@ class SQLiteAttemptLedger:
             deployment: Exact deployment about to receive the request.
             attempt_ordinal: Zero-based physical dispatch position for this request.
             route_depth: Zero-based operational route position.
-            maximum_cost_micro_usd: Conservative charge reserved before dispatch.
+            maximum_cost_nano_usd: Conservative charge reserved before dispatch.
             route_reason: Optional learned-selection reason code.
             fallback_reason: Optional embedding or router fallback reason code.
+            dispatch_reason: Optional policy-dispatch disclosure code.
+            preferred_deployment: The route's bypassed preferred rung, given
+                only when it differs from ``deployment``; its base rates are
+                frozen for the settle-time counterfactual cost.
 
         Returns:
             Stable new attempt ID.
         """
-        for value in (route_reason, fallback_reason):
+        # The in-process SQLite mirror carries no promo / rate-limit token
+        # columns, so the reservations are accepted for Protocol parity and
+        # dropped here; the platform's Postgres ledger stores and counts them.
+        del reserved_input_tokens, reserved_output_tokens
+        for value in (route_reason, fallback_reason, dispatch_reason):
             if value is not None and (len(value) > 512 or any(ord(char) < 32 for char in value)):
                 raise GatewayLedgerError("route context must be a short display-safe code")
         if deployment.deployment_id not in snapshot.deployment_ids:
             raise GatewayLedgerError("attempt deployment is absent from the execution snapshot")
         if deployment.exact_model_id != snapshot.exact_model_id:
             raise GatewayLedgerError("attempt deployment changes the selected exact model")
-        if maximum_cost_micro_usd is not None and not (
-            0 <= maximum_cost_micro_usd <= MAXIMUM_MICRO_USD
+        if (
+            preferred_deployment is not None
+            and preferred_deployment.deployment_id == deployment.deployment_id
+        ):
+            raise GatewayLedgerError("a preferred rung disclosure requires a divergent rung")
+        if maximum_cost_nano_usd is not None and not (
+            0 <= maximum_cost_nano_usd <= MAXIMUM_NANO_USD
         ):
             raise GatewayLedgerError("maximum attempt cost must fit a nonnegative SQLite integer")
         attempt_id = f"attempt-{uuid.uuid4().hex}"
@@ -371,9 +361,13 @@ class SQLiteAttemptLedger:
                 long_context_cached_input_rate, long_context_output_rate,
                 long_context_reasoning_rate,
                 route_reason, fallback_reason,
-                state, started_at, budget_period_start, budget_reserved_micro_usd
+                dispatch_reason, preferred_deployment_id,
+                preferred_input_rate, preferred_cached_input_rate,
+                preferred_output_rate, preferred_reasoning_rate,
+                state, started_at, budget_period_start, budget_reserved_nano_usd
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?,
                 'dispatched', ?, ?, ?
             )
             """,
@@ -395,10 +389,10 @@ class SQLiteAttemptLedger:
                     if deployment.gateway.pricing_effective_at is None
                     else utc_text(deployment.gateway.pricing_effective_at)
                 ),
-                prices.input_micro_usd_per_million_tokens,
-                prices.cached_input_micro_usd_per_million_tokens,
-                prices.output_micro_usd_per_million_tokens,
-                prices.reasoning_micro_usd_per_million_tokens,
+                prices.input_nano_usd_per_million_tokens,
+                prices.cached_input_nano_usd_per_million_tokens,
+                prices.output_nano_usd_per_million_tokens,
+                prices.reasoning_nano_usd_per_million_tokens,
                 (
                     None
                     if prices.long_context is None
@@ -407,28 +401,42 @@ class SQLiteAttemptLedger:
                 (
                     None
                     if prices.long_context is None
-                    else prices.long_context.input_micro_usd_per_million_tokens
+                    else prices.long_context.input_nano_usd_per_million_tokens
                 ),
                 (
                     None
                     if prices.long_context is None
-                    else prices.long_context.cached_input_micro_usd_per_million_tokens
+                    else prices.long_context.cached_input_nano_usd_per_million_tokens
                 ),
                 (
                     None
                     if prices.long_context is None
-                    else prices.long_context.output_micro_usd_per_million_tokens
+                    else prices.long_context.output_nano_usd_per_million_tokens
                 ),
                 (
                     None
                     if prices.long_context is None
-                    else prices.long_context.reasoning_micro_usd_per_million_tokens
+                    else prices.long_context.reasoning_nano_usd_per_million_tokens
                 ),
                 route_reason,
                 fallback_reason,
+                dispatch_reason,
+                None if preferred_deployment is None else preferred_deployment.deployment_id,
+                None
+                if preferred_deployment is None
+                else preferred_deployment.gateway.prices.input_nano_usd_per_million_tokens,
+                None
+                if preferred_deployment is None
+                else preferred_deployment.gateway.prices.cached_input_nano_usd_per_million_tokens,
+                None
+                if preferred_deployment is None
+                else preferred_deployment.gateway.prices.output_nano_usd_per_million_tokens,
+                None
+                if preferred_deployment is None
+                else preferred_deployment.gateway.prices.reasoning_nano_usd_per_million_tokens,
                 utc_text(now),
                 period_start,
-                maximum_cost_micro_usd,
+                maximum_cost_nano_usd,
             ),
         )
         require_attempt_budget(
@@ -440,7 +448,7 @@ class SQLiteAttemptLedger:
             deployment_id=deployment.deployment_id,
             attempt_id=attempt_id,
             period_start=period_start,
-            maximum_cost_micro_usd=maximum_cost_micro_usd,
+            maximum_cost_nano_usd=maximum_cost_nano_usd,
         )
         return attempt_id
 
@@ -452,6 +460,11 @@ class SQLiteAttemptLedger:
         failure: GatewayFailure | None,
         finalize_request: bool = True,
         first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
     ) -> None:
         """Idempotently settle one attempt with normalized content-free fields.
 
@@ -461,6 +474,12 @@ class SQLiteAttemptLedger:
             failure: Sanitized failure when no successful terminal event exists.
             finalize_request: Whether this attempt is the final route for its parent request.
             first_token_at: Wall-clock time the attempt streamed its first token, or ``None``.
+            retry_after_seconds: Provider-stated wait from the response's
+                ``Retry-After`` header, when one was harvested.
+            ratelimit_limit_requests: Provider-stated request-rate ceiling.
+            ratelimit_remaining_requests: Provider-stated requests remaining.
+            ratelimit_limit_tokens: Provider-stated token-rate ceiling.
+            ratelimit_remaining_tokens: Provider-stated tokens remaining.
         """
         with self._transaction() as connection:
             self.apply_finish_attempt(
@@ -470,6 +489,11 @@ class SQLiteAttemptLedger:
                 failure=failure,
                 finalize_request=finalize_request,
                 first_token_at=first_token_at,
+                retry_after_seconds=retry_after_seconds,
+                ratelimit_limit_requests=ratelimit_limit_requests,
+                ratelimit_remaining_requests=ratelimit_remaining_requests,
+                ratelimit_limit_tokens=ratelimit_limit_tokens,
+                ratelimit_remaining_tokens=ratelimit_remaining_tokens,
             )
 
     def apply_finish_attempt(
@@ -481,6 +505,11 @@ class SQLiteAttemptLedger:
         failure: GatewayFailure | None,
         finalize_request: bool = True,
         first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
     ) -> None:
         """Run the attempt settlement inside the caller's open write transaction.
 
@@ -491,6 +520,12 @@ class SQLiteAttemptLedger:
             failure: Sanitized failure when no successful terminal event exists.
             finalize_request: Whether this attempt is the final route for its parent request.
             first_token_at: Wall-clock time the attempt streamed its first token, or ``None``.
+            retry_after_seconds: Provider-stated wait from the response's
+                ``Retry-After`` header, when one was harvested.
+            ratelimit_limit_requests: Provider-stated request-rate ceiling.
+            ratelimit_remaining_requests: Provider-stated requests remaining.
+            ratelimit_limit_tokens: Provider-stated token-rate ceiling.
+            ratelimit_remaining_tokens: Provider-stated tokens remaining.
         """
         state, normalized_failure, failure_message, usage = _terminal_values(
             terminal_event, failure
@@ -501,7 +536,12 @@ class SQLiteAttemptLedger:
                    output_rate, reasoning_rate,
                    long_context_threshold_tokens, long_context_input_rate,
                    long_context_cached_input_rate, long_context_output_rate,
-                   long_context_reasoning_rate, budget_reserved_micro_usd
+                   long_context_reasoning_rate, budget_reserved_nano_usd,
+                   preferred_deployment_id, preferred_input_rate,
+                   preferred_cached_input_rate, preferred_output_rate,
+                   preferred_reasoning_rate,
+                   (SELECT api_surface FROM gateway_requests
+                    WHERE request_id = gateway_attempts.request_id) AS api_surface
             FROM gateway_attempts WHERE attempt_id = ?
             """,
             (attempt_id,),
@@ -524,7 +564,7 @@ class SQLiteAttemptLedger:
             and usage.input_tokens >= threshold
         )
         prefix = "long_context_" if long_context else ""
-        cost = estimated_cost_micro_usd(
+        cost = estimated_cost_nano_usd(
             usage,
             input_rate=optional_int(row[f"{prefix}input_rate"]),
             cached_input_rate=optional_int(row[f"{prefix}cached_input_rate"]),
@@ -532,10 +572,36 @@ class SQLiteAttemptLedger:
             reasoning_rate=optional_int(row[f"{prefix}reasoning_rate"]),
         )
         budget_settlement = (
-            cost if cost is not None else optional_int(row["budget_reserved_micro_usd"])
+            cost if cost is not None else optional_int(row["budget_reserved_nano_usd"])
         )
-        if budget_settlement is not None and budget_settlement > MAXIMUM_MICRO_USD:
+        if row["api_surface"] == GatewayApiSurface.DECISIONS.value and cost is None:
+            # An unmetered decision can still have executed upstream. Keep the
+            # reservation held without inventing usage or a settled charge.
+            # Only a witnessed HTTP rejection proves that this hold can release.
+            rejected = (
+                terminal_event is not None
+                and terminal_event.kind is GatewayEventKind.FAILED
+                and terminal_event.decision_provider_rejected
+                and usage is None
+            )
+            budget_settlement = 0 if rejected else None
+        if budget_settlement is not None and budget_settlement > MAXIMUM_NANO_USD:
             raise GatewayLedgerError("attempt cost exceeds SQLite integer capacity")
+        # Cost-optimality counterfactual: the SAME observed usage priced at the
+        # bypassed preferred rung's frozen BASE rates (long-context tiers are
+        # deliberately not modeled here; this is telemetry, never billing). A
+        # missing preferred rate yields NULL rather than a guess.
+        counterfactual_cost = (
+            None
+            if row["preferred_deployment_id"] is None
+            else estimated_cost_nano_usd(
+                usage,
+                input_rate=optional_int(row["preferred_input_rate"]),
+                cached_input_rate=optional_int(row["preferred_cached_input_rate"]),
+                output_rate=optional_int(row["preferred_output_rate"]),
+                reasoning_rate=optional_int(row["preferred_reasoning_rate"]),
+            )
+        )
         terminal_at = utc_text(self._clock.now())
         connection.execute(
             """
@@ -543,8 +609,12 @@ class SQLiteAttemptLedger:
             SET state = ?, terminal_at = ?, first_token_at = ?, failure_class = ?,
                 failure_message = ?,
                 input_tokens = ?, cached_input_tokens = ?, output_tokens = ?,
-                reasoning_tokens = ?, usage_source = ?, estimated_cost_micro_usd = ?,
-                budget_settled_micro_usd = ?
+                reasoning_tokens = ?, usage_source = ?, estimated_cost_nano_usd = ?,
+                counterfactual_cost_nano_usd = ?,
+                budget_settled_nano_usd = ?,
+                retry_after_seconds = ?, ratelimit_limit_requests = ?,
+                ratelimit_remaining_requests = ?, ratelimit_limit_tokens = ?,
+                ratelimit_remaining_tokens = ?
             WHERE attempt_id = ? AND state = 'dispatched'
             """,
             (
@@ -559,14 +629,20 @@ class SQLiteAttemptLedger:
                 None if usage is None else usage.reasoning_tokens,
                 "unknown" if usage is None else "observed",
                 cost,
+                counterfactual_cost,
                 budget_settlement,
+                retry_after_seconds,
+                ratelimit_limit_requests,
+                ratelimit_remaining_requests,
+                ratelimit_limit_tokens,
+                ratelimit_remaining_tokens,
                 attempt_id,
             ),
         )
         settle_attempt_budgets(
             connection,
             attempt_id=attempt_id,
-            settled_micro_usd=budget_settlement,
+            settled_nano_usd=budget_settlement,
         )
         if finalize_request and state in {"completed", "failed", "cancelled", "incomplete"}:
             connection.execute(
@@ -575,6 +651,55 @@ class SQLiteAttemptLedger:
                 WHERE request_id = ? AND terminal_state IS NULL
                 """,
                 (state, terminal_at, str(row["request_id"])),
+            )
+
+    def reconcile_decision_liability(
+        self,
+        *,
+        attempt_id: AttemptId,
+        assigned_cost_nano_usd: int,
+    ) -> None:
+        """Resolve one terminal decision's held liability at an operator-assigned cost.
+
+        Assignment changes budget accounting only, never provider usage or its
+        unknown cost estimate. Repeating the same assignment is a no-op; a
+        conflicting assignment or an attempt without a held bound is refused.
+        """
+        if (
+            isinstance(assigned_cost_nano_usd, bool)
+            or not isinstance(assigned_cost_nano_usd, int)
+            or not 0 <= assigned_cost_nano_usd <= MAXIMUM_NANO_USD
+        ):
+            raise ValueError("assigned decision cost must fit a nonnegative SQLite integer")
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT a.state, a.usage_source, a.budget_reserved_nano_usd, "
+                "a.budget_settled_nano_usd, r.api_surface FROM gateway_attempts AS a "
+                "JOIN gateway_requests AS r ON r.request_id = a.request_id "
+                "WHERE a.attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["api_surface"] != GatewayApiSurface.DECISIONS.value
+                or row["state"] == "dispatched"
+                or row["usage_source"] != "unknown"
+                or row["budget_reserved_nano_usd"] is None
+            ):
+                raise GatewayLedgerError("attempt has no terminal decision liability to reconcile")
+            settled = optional_int(row["budget_settled_nano_usd"])
+            if settled is not None:
+                if settled == assigned_cost_nano_usd:
+                    return
+                raise GatewayLedgerError("decision liability already resolved at another cost")
+            settle_attempt_budgets(
+                connection,
+                attempt_id=attempt_id,
+                settled_nano_usd=assigned_cost_nano_usd,
+            )
+            connection.execute(
+                "UPDATE gateway_attempts SET budget_settled_nano_usd = ? WHERE attempt_id = ?",
+                (assigned_cost_nano_usd, attempt_id),
             )
 
     def finish_request(
@@ -764,13 +889,13 @@ class SQLiteAttemptLedger:
         with self._connect() as connection:
             connection.execute("BEGIN")
             try:
-                identities = self._identity_usage_rows(
+                identities = identity_usage_rows(
                     connection,
                     organization_id=organization_id,
                     predicate=predicate,
                     parameters=parameters,
                 )
-                by_billing_source = self._billing_source_usage_rows(
+                by_billing_source = billing_source_usage_rows(
                     connection,
                     predicate=source_predicate,
                     parameters=parameters,
@@ -780,139 +905,6 @@ class SQLiteAttemptLedger:
         return LedgerUsageSnapshot(
             identities=identities,
             by_billing_source=by_billing_source,
-        )
-
-    def _identity_usage_rows(
-        self,
-        connection: sqlite3.Connection,
-        *,
-        organization_id: str,
-        predicate: str,
-        parameters: tuple[str, ...],
-    ) -> tuple[IdentityUsage, ...]:
-        """Read bounded identity aggregates inside the caller's SQLite snapshot."""
-        rows = connection.execute(
-            f"""
-            SELECT i.identity_id,
-                   COUNT(DISTINCT r.request_id) AS requests,
-                   COUNT(a.attempt_id) AS attempts,
-                   COALESCE(SUM(a.input_tokens), 0) AS input_tokens,
-                   COALESCE(SUM(a.cached_input_tokens), 0) AS cached_input_tokens,
-                   COALESCE(SUM(a.output_tokens), 0) AS output_tokens,
-                   COALESCE(SUM(a.reasoning_tokens), 0) AS reasoning_tokens,
-                   COALESCE(SUM(a.estimated_cost_micro_usd), 0) AS known_cost,
-                   COALESCE(SUM(CASE
-                       WHEN a.attempt_id IS NOT NULL
-                        AND a.estimated_cost_micro_usd IS NULL THEN 1 ELSE 0 END), 0
-                   ) AS unknown_cost_attempts,
-                   COALESCE(SUM(CASE WHEN a.terminal_at IS NOT NULL THEN
-                       ROUND((julianday(a.terminal_at) - julianday(a.started_at)) * 86400000)
-                       ELSE 0 END), 0) AS total_latency_ms,
-                   AVG(CASE WHEN a.terminal_at IS NOT NULL THEN
-                       (julianday(a.terminal_at) - julianday(a.started_at)) * 86400000
-                       ELSE NULL END) AS average_latency_ms
-            FROM identities AS i
-            LEFT JOIN gateway_requests AS r
-              ON r.organization_id = i.organization_id AND r.identity_id = i.identity_id
-            LEFT JOIN gateway_attempts AS a ON a.request_id = r.request_id
-            WHERE {predicate}
-            GROUP BY i.identity_id ORDER BY i.identity_id
-            """,
-            parameters,
-        ).fetchall()
-        terminal_rows = connection.execute(
-            f"""
-            SELECT i.identity_id, a.state, COUNT(*) AS attempts
-            FROM identities AS i
-            JOIN gateway_requests AS r
-              ON r.organization_id = i.organization_id AND r.identity_id = i.identity_id
-            JOIN gateway_attempts AS a ON a.request_id = r.request_id
-            WHERE {predicate} AND a.state != 'dispatched'
-            GROUP BY i.identity_id, a.state ORDER BY i.identity_id, a.state
-            """,
-            parameters,
-        ).fetchall()
-        terminals: dict[str, list[UsageTerminalCount]] = {}
-        for row in terminal_rows:
-            terminals.setdefault(str(row["identity_id"]), []).append(
-                UsageTerminalCount(state=str(row["state"]), attempts=int(row["attempts"]))
-            )
-        return tuple(
-            IdentityUsage(
-                organization_id=organization_id,
-                identity_id=str(row["identity_id"]),
-                requests=int(row["requests"]),
-                attempts=int(row["attempts"]),
-                input_tokens=int(row["input_tokens"]),
-                cached_input_tokens=int(row["cached_input_tokens"]),
-                output_tokens=int(row["output_tokens"]),
-                reasoning_tokens=int(row["reasoning_tokens"]),
-                known_estimated_cost_micro_usd=int(row["known_cost"]),
-                unknown_cost_attempts=int(row["unknown_cost_attempts"]),
-                total_latency_ms=int(row["total_latency_ms"]),
-                average_latency_ms=(
-                    None if row["average_latency_ms"] is None else float(row["average_latency_ms"])
-                ),
-                terminal_counts=tuple(terminals.get(str(row["identity_id"]), ())),
-            )
-            for row in rows
-        )
-
-    def _billing_source_usage_rows(
-        self,
-        connection: sqlite3.Connection,
-        *,
-        predicate: str,
-        parameters: tuple[str, ...],
-    ) -> tuple[BillingSourceUsage, ...]:
-        """Read bounded source aggregates inside the caller's SQLite snapshot."""
-        rows = connection.execute(
-            f"""
-            SELECT a.billing_source,
-                   COUNT(a.attempt_id) AS attempts,
-                   COALESCE(SUM(a.input_tokens), 0) AS input_tokens,
-                   COALESCE(SUM(a.cached_input_tokens), 0) AS cached_input_tokens,
-                   COALESCE(SUM(a.output_tokens), 0) AS output_tokens,
-                   COALESCE(SUM(a.reasoning_tokens), 0) AS reasoning_tokens,
-                   COALESCE(SUM(a.estimated_cost_micro_usd), 0) AS known_cost,
-                   COALESCE(SUM(CASE
-                       WHEN a.estimated_cost_micro_usd IS NULL THEN 1 ELSE 0 END), 0
-                   ) AS unknown_cost_attempts
-            FROM gateway_attempts AS a
-            JOIN gateway_requests AS r ON r.request_id = a.request_id
-            WHERE {predicate}
-            GROUP BY a.billing_source ORDER BY a.billing_source
-            """,
-            parameters,
-        ).fetchall()
-        terminal_rows = connection.execute(
-            f"""
-            SELECT a.billing_source, a.state, COUNT(*) AS attempts
-            FROM gateway_attempts AS a
-            JOIN gateway_requests AS r ON r.request_id = a.request_id
-            WHERE {predicate} AND a.state != 'dispatched'
-            GROUP BY a.billing_source, a.state ORDER BY a.billing_source, a.state
-            """,
-            parameters,
-        ).fetchall()
-        terminals: dict[str, list[UsageTerminalCount]] = {}
-        for row in terminal_rows:
-            terminals.setdefault(str(row["billing_source"]), []).append(
-                UsageTerminalCount(state=str(row["state"]), attempts=int(row["attempts"]))
-            )
-        return tuple(
-            BillingSourceUsage(
-                billing_source=BillingSource(str(row["billing_source"])),
-                attempts=int(row["attempts"]),
-                input_tokens=int(row["input_tokens"]),
-                cached_input_tokens=int(row["cached_input_tokens"]),
-                output_tokens=int(row["output_tokens"]),
-                reasoning_tokens=int(row["reasoning_tokens"]),
-                known_estimated_cost_micro_usd=int(row["known_cost"]),
-                unknown_cost_attempts=int(row["unknown_cost_attempts"]),
-                terminal_counts=tuple(terminals.get(str(row["billing_source"]), ())),
-            )
-            for row in rows
         )
 
     @contextmanager

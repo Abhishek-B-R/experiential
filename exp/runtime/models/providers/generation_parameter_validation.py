@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Sequence
 
 from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.models.providers.anthropic_tool_compat import (
+    anthropic_input_schema_reshaping,
+    anthropic_rejects_assistant_prefill,
+)
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderParameterError
-from exp.runtime.models.providers.reasoning_compat import supported_reasoning_efforts
+from exp.runtime.models.providers.reasoning_compat import (
+    REASONING_EFFORTS,
+    supported_reasoning_efforts,
+)
 
 
 def effective_profile_reasoning_effort(
@@ -30,6 +38,87 @@ def profile_reasoning_efforts(profile: GatewayWireProfile) -> tuple[str, ...]:
         configured_effort=profile.reasoning_effort,
         explicit_efforts=profile.supported_reasoning_efforts or None,
     )
+
+
+def resolve_level_less_enable(
+    profiles: Sequence[GatewayWireProfile], *, effort_path: str
+) -> str | None:
+    """Resolve a level-less "enable thinking" to the tier the route should pin.
+
+    The LANE default (the first rung in route order pinning an active catalog
+    ``reasoning_default_effort``) when every rung can serve it, else a
+    route-wide required default when portable, else the LOWEST portable
+    non-none tier (default-not-high avoids surprising cost).
+
+    Returns ``None`` when the enable is already satisfied: no rung can be
+    turned off (``none`` on no ladder: kimi-k2-thinking) and the ladders share
+    no tier to pin, so whichever rung serves reasons anyway (the caller
+    discloses the no-op; 605 rejections across 44 organizations in the 7 days
+    to 2026-09-15 told callers to "choose a reasoning model" about one).
+
+    Raises:
+        ProviderParameterError: No rung offers a reasoning mode, or the rungs
+            CAN be off yet share no on-tier (clearing the enable there could
+            serve the request without the reasoning the caller asked for).
+    """
+    portable = set(REASONING_EFFORTS)
+    for profile in profiles:
+        portable.intersection_update(profile_reasoning_efforts(profile))
+    portable_non_none = tuple(e for e in REASONING_EFFORTS if e in portable and e != "none")
+    if not portable_non_none:
+        if all(
+            profile.supports_reasoning and "none" not in profile_reasoning_efforts(profile)
+            for profile in profiles
+        ):
+            return None
+        raise ProviderParameterError(
+            message=(
+                "This model does not support thinking: no rung on its route offers a "
+                "reasoning mode. Remove the enable-thinking field or choose a reasoning model."
+            ),
+            param=effort_path,
+            code="unsupported_parameter",
+        )
+    lane_default = lane_default_reasoning_effort(profiles)
+    if lane_default in portable_non_none:
+        return lane_default
+    required_defaults = {
+        profile.reasoning_effort
+        for profile in profiles
+        if profile.reasoning_effort_required and profile.reasoning_effort in portable_non_none
+    }
+    if len(required_defaults) == 1:
+        return next(iter(required_defaults))
+    return portable_non_none[0]
+
+
+def lane_default_reasoning_effort(profiles: Sequence[GatewayWireProfile]) -> str | None:
+    """Return the depth a level-less "think" asks for on a route of effort rungs.
+
+    A budget-less thinking config (``adaptive``, or the bare ``enabled`` Claude
+    Code sends) asks the MODEL to pick its depth, and on an effort rung the
+    model's own depth is its catalog default (``reasoning_default_effort``,
+    carried on the wire profile as ``reasoning_effort``): the first rung in
+    route order that pins an active default it can serve names the tier, so an
+    operator sets a lane's think-mode depth by catalog, not by code. A ``none``
+    default is not a depth (that rung reasons only when asked) and is skipped.
+
+    Args:
+        profiles: Ordered wire profiles for every live route deployment.
+
+    Returns:
+        The lane's default tier, or ``None`` when no rung pins a servable one.
+    """
+    for profile in profiles:
+        default = profile.reasoning_effort
+        if (
+            default is not None
+            and default in REASONING_EFFORTS
+            and default != "none"
+            and default in profile_reasoning_efforts(profile)
+        ):
+            return default
+    return None
 
 
 def require_route_numeric_parameter(
@@ -108,13 +197,99 @@ def anthropic_reasoning_disengaged(request: GatewayRequest) -> bool:
     return not thinking_on and not effort_on
 
 
-def mid_conversation_system_present(request: GatewayRequest) -> bool:
-    """Whether a system turn appears after the conversation has begun."""
-    conversation_started = False
-    for message in request.messages:
-        if message.role in {"system", "developer"} and message.provider_native_item is None:
-            if conversation_started:
-                return True
-        else:
-            conversation_started = True
-    return False
+def require_assistant_prefill_supported(
+    profiles: Sequence[GatewayWireProfile], request: GatewayRequest
+) -> None:
+    """Refuse a trailing assistant turn before dispatch on rungs whose model rejects it.
+
+    Anthropic's 4.6+ and 5-generation releases answer assistant prefill with a
+    400 after the request was dispatched and billed for admission. The rungs
+    that carry such a model narrow out here with the same fact stated for the
+    caller; a route with no other rung surfaces it as the request's 400. The
+    check keys on the MODEL, not the wire: relays (OpenRouter's
+    ``anthropic/claude-opus-5``, Azure Foundry's Claude deployments) forward
+    the same rejection (live 2026-09-07: "Azure: This model does not support
+    assistant message prefill" through OpenRouter), and the release matcher
+    only ever matches a Claude release id.
+
+    Raises:
+        ProviderParameterError: The final message is an assistant turn and a
+            profile's model refuses prefill.
+    """
+    if not request.messages or request.messages[-1].role != "assistant":
+        return
+    if request.messages[-1].provider_native_item is not None:
+        return
+    for profile in profiles:
+        if not anthropic_rejects_assistant_prefill(profile.model_id):
+            continue
+        raise ProviderParameterError(
+            message=(
+                f"{profile.model_id} does not accept an assistant message as the final "
+                "turn (assistant prefill). End the conversation with a user message, or "
+                "choose a model alias that supports prefill."
+            ),
+            param="messages",
+            code="unsupported_parameter",
+        )
+
+
+_ANTHROPIC_TOOL_NAME = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
+_ANTHROPIC_TOOL_NAME_DIALECTS = frozenset({"anthropic_messages", "bedrock_converse_stream"})
+
+
+def require_tool_names_supported(
+    profiles: Sequence[GatewayWireProfile], request: GatewayRequest
+) -> None:
+    """Refuse a tool name the Anthropic wire will 400 by name, before dispatch.
+
+    Anthropic (and Bedrock, which relays the same rule) accepts tool names
+    matching ``^[a-zA-Z0-9_-]{1,128}$``; a client sending dots, spaces, or
+    a longer name learned that only from the provider's 400 after dispatch
+    ("tools.0.custom.name: String should match pattern"). The rung narrows
+    out with the index named; the name itself is caller content and stays
+    out of the message.
+
+    Raises:
+        ProviderParameterError: A profile speaks an Anthropic wire and a tool
+            name does not match.
+    """
+    if not request.tools or not any(
+        profile.dialect in _ANTHROPIC_TOOL_NAME_DIALECTS for profile in profiles
+    ):
+        return
+    for index, tool in enumerate(request.tools):
+        if _ANTHROPIC_TOOL_NAME.fullmatch(tool.name) is None:
+            raise ProviderParameterError(
+                message=(
+                    f"tools[{index}].name is not accepted by this model route: tool names "
+                    "must match ^[a-zA-Z0-9_-]{1,128} (letters, digits, underscore, "
+                    "hyphen). Rename the tool or choose a different model alias."
+                ),
+                param=f"tools[{index}].name",
+                code="invalid_parameter",
+            )
+
+
+_ANTHROPIC_SCHEMA_DIALECTS = frozenset({"anthropic_messages", "bedrock_converse_stream"})
+
+
+def disclose_anthropic_tool_schemas(
+    profiles: Sequence[GatewayWireProfile], request: GatewayRequest, ignored: list[str]
+) -> None:
+    """Record every tool schema an Anthropic-family rung will reshape at dispatch.
+
+    ``anthropic_input_schema`` flattens a root oneOf/anyOf/allOf into one
+    object and adds a missing root ``type``; the caller reads the change in
+    ``ignored_parameters`` as ``tools[i].parameters->reshaped(<kind>)``.
+    """
+    if not request.tools or not any(
+        profile.dialect in _ANTHROPIC_SCHEMA_DIALECTS for profile in profiles
+    ):
+        return
+    for index, tool in enumerate(request.tools):
+        kind = anthropic_input_schema_reshaping(tool.parameters)
+        if kind is not None:
+            note = f"tools[{index}].parameters->reshaped({kind})"
+            if note not in ignored:
+                ignored.append(note)

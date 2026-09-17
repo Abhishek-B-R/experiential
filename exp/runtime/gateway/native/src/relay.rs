@@ -16,6 +16,8 @@ use crate::dialects::{
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::metrics::METRICS;
+use crate::stop_sequences::StopSequenceGuard;
+use crate::tool_serialization::ToolCallSerializer;
 use crate::waterfall::CommittedAttempt;
 
 /// Map one collection failure to its public error, honoring the shared
@@ -144,7 +146,19 @@ pub struct UpstreamRelay {
     stream: BoxStream<'static, reqwest::Result<Bytes>>,
     decoder: FrameDecoder,
     normalizer: Normalizer,
+    /// Normalized events not yet passed through the stop-sequence guard.
     pending: VecDeque<Event>,
+    /// Guarded events ready to yield.
+    ready: VecDeque<Event>,
+    /// Gateway-emulated stop sequences for this rung, when the provider wire
+    /// carries none; `None` passes every event straight through.
+    stop_guard: Option<StopSequenceGuard>,
+    /// Gateway-emulated `parallel_tool_calls: false`: one tool call per turn.
+    tool_serializer: Option<ToolCallSerializer>,
+    /// The provider of a customer-managed (BYOK) rung: a credential or account
+    /// failure the provider declares on this stream, before or after commit,
+    /// is re-owned as the customer's. `None` on house rungs.
+    customer_managed_provider: Option<String>,
     eof: bool,
     first_byte_recorded: bool,
     /// Fail-fast bound for the very first provider byte. Once the first byte
@@ -158,6 +172,10 @@ pub struct UpstreamRelay {
     /// carrying only role/lifecycle scaffolding, so time-to-first-token is
     /// stamped on the first event that carries visible model output.
     first_token_at: Option<SystemTime>,
+    /// Tokens an earlier, refused dial of the same attempt was billed for,
+    /// folded into the first usage report this relay yields so the
+    /// reservation settles both dials' tokens as one.
+    carried_usage: Option<Usage>,
 }
 
 impl UpstreamRelay {
@@ -206,10 +224,15 @@ impl UpstreamRelay {
                 reasoning_content_route_sha256,
             ),
             pending: VecDeque::new(),
+            ready: VecDeque::new(),
+            stop_guard: None,
+            tool_serializer: None,
+            customer_managed_provider: None,
             eof: false,
             first_byte_recorded: false,
             first_byte_deadline,
             first_token_at: None,
+            carried_usage: None,
         }
     }
 
@@ -218,6 +241,72 @@ impl UpstreamRelay {
     /// the winning attempt's time-to-first-token.
     pub fn first_token_at(&self) -> Option<SystemTime> {
         self.first_token_at
+    }
+
+    /// Caller-known label words (the dispatched model id) exempt from the
+    /// provider-identifier screen on stream-error detail.
+    pub fn set_request_words<I, S>(&mut self, words: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.normalizer.set_request_words(words);
+    }
+
+    /// Name the customer-managed provider this relay dispatches on, so every
+    /// provider-declared credential or quota failure it yields is the
+    /// customer's (see `stream_errors::customer_credential_failure`).
+    pub fn set_customer_managed_provider(&mut self, provider: Option<String>) {
+        self.customer_managed_provider = provider;
+    }
+
+    /// Serialize this relay's tool calls to one per turn (the caller sent
+    /// `parallel_tool_calls: false` to a wire without that control).
+    pub fn set_serialize_tool_calls(&mut self, serialize: bool) {
+        self.tool_serializer = serialize.then(ToolCallSerializer::new);
+    }
+
+    /// Carry the tokens a refused earlier dial of this attempt was billed
+    /// for; they join the first usage report this relay yields, once.
+    pub fn set_carried_usage(&mut self, carried: Option<Usage>) {
+        self.carried_usage = carried;
+    }
+
+    /// Enforce the caller's stop sequences on this relay's visible text.
+    /// Installed before the first event is yielded; an empty set is a no-op.
+    pub fn set_stop_sequences<I, S>(&mut self, sequences: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.stop_guard = StopSequenceGuard::new(sequences);
+    }
+
+    /// Move one normalized event through the stop-sequence guard (if any)
+    /// onto the ready queue.
+    fn guard_next_pending(&mut self) -> bool {
+        let Some(mut event) = self.pending.pop_front() else {
+            return false;
+        };
+        if let (Some(provider), Event::Failed(failure)) =
+            (self.customer_managed_provider.as_deref(), &event)
+        {
+            event = Event::Failed(crate::stream_errors::customer_credential_failure(
+                failure.clone(),
+                provider,
+            ));
+        }
+        if let Some(serializer) = self.tool_serializer.as_mut() {
+            let Some(kept) = serializer.filter(event) else {
+                return true;
+            };
+            event = kept;
+        }
+        match self.stop_guard.as_mut() {
+            Some(guard) => self.ready.extend(guard.filter(event)),
+            None => self.ready.push_back(event),
+        }
+        true
     }
 
     /// Route an abnormal stream termination through the normalizer's recovery.
@@ -243,7 +332,7 @@ impl UpstreamRelay {
         request_started: Instant,
     ) -> Result<Option<Event>, Failure> {
         loop {
-            if let Some(event) = self.pending.pop_front() {
+            if let Some(mut event) = self.ready.pop_front() {
                 // Every yielded event exits here, so this is the one place that
                 // stamps time-to-first-token: the first event carrying visible
                 // model output. Prefix events peeked during commit also passed
@@ -252,7 +341,18 @@ impl UpstreamRelay {
                 if self.first_token_at.is_none() && event.is_output_token() {
                     self.first_token_at = Some(SystemTime::now());
                 }
+                if let (Event::Usage(usage), Some(carried)) =
+                    (&mut event, self.carried_usage.as_ref())
+                {
+                    if usage.has_token_counts() {
+                        *usage = fold_usage(carried, usage.clone());
+                        self.carried_usage = None;
+                    }
+                }
                 return Ok(Some(event));
+            }
+            if self.guard_next_pending() {
+                continue;
             }
             if self.eof {
                 return Ok(None);
@@ -268,17 +368,21 @@ impl UpstreamRelay {
             };
             let chunk = match tokio::time::timeout(bound, self.stream.next()).await {
                 Ok(Some(Ok(chunk))) => chunk,
-                Ok(Some(Err(_))) => {
+                Ok(Some(Err(error))) => {
                     // A transport break mid-stream: recover a Gemini partial as
                     // Incomplete, otherwise surface the retryable transport
                     // failure. Pre-content it stays a retryable transport error
-                    // either way.
+                    // either way. The engine's account of the break (never
+                    // provider text) rides to the ledger.
                     self.recover_or_fail(
                         Failure::new(
                             FailureClass::Transport,
                             "provider transport failed; retry the request",
                         )
-                        .with_retry(true, true),
+                        .with_retry(true, true)
+                        .with_provider_detail(Some(
+                            crate::upstream::transport_error_detail("stream", &error),
+                        )),
                     )?;
                     continue;
                 }
@@ -309,13 +413,22 @@ impl UpstreamRelay {
                             }
                         }
                     }
-                    // A Gemini stream may end cleanly after its last content
-                    // frame without a finishReason frame; synthesize the
-                    // terminal completion (folding the last-seen usage) so a
-                    // real answer is not thrown away as malformed. A stream
-                    // that produced no content stays terminal-less and the
-                    // caller still synthesizes `ended_without_terminal`.
-                    self.pending.extend(self.normalizer.on_stream_end());
+                    // A stream may end cleanly without a terminal frame: a
+                    // Gemini stream after its last content frame (no
+                    // finishReason), or an OpenAI-compatible stream whose
+                    // finish_reason chunk arrived without a `[DONE]` sentinel
+                    // (Azure Foundry's DeepSeek content-filter ending). The
+                    // normalizer synthesizes the terminal the dialect already
+                    // declared so a real answer or refusal is not thrown away
+                    // as malformed; a stream that declared nothing stays
+                    // terminal-less and the caller still synthesizes
+                    // `ended_without_terminal`.
+                    match self.normalizer.on_stream_end() {
+                        Ok(events) => self.pending.extend(events),
+                        Err(failure) => {
+                            self.recover_or_fail(failure)?;
+                        }
+                    }
                     continue;
                 }
                 Err(_) => {
@@ -449,6 +562,114 @@ mod tests {
             relay.first_token_at().is_some(),
             "the first content delta stamps time-to-first-token"
         );
+    }
+
+    #[tokio::test]
+    async fn stop_sequences_cut_the_relayed_text_and_keep_usage_and_settlement_exact() {
+        // A Chat-compatible stream stands in for any dialect: "</block>" spans
+        // two content deltas, more text follows it, then usage and the
+        // provider's own terminal arrive. The guard cuts at the match, drops
+        // the trailing text, still yields the usage, and replaces the terminal.
+        let frames = vec![
+            Ok::<_, reqwest::Error>(Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"allow</bl\"}}]}\n\n",
+            )),
+            Ok::<_, reqwest::Error>(Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ock>ignored\"}}]}\n\n",
+            )),
+            Ok::<_, reqwest::Error>(Bytes::from(
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\n",
+            )),
+            Ok::<_, reqwest::Error>(Bytes::from(
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            )),
+            Ok::<_, reqwest::Error>(Bytes::from("data: [DONE]\n\n")),
+        ];
+        let mut relay = UpstreamRelay::from_stream(
+            stream::iter(frames).boxed(),
+            Dialect::OpenAiCompatible,
+            Instant::now() + Duration::from_secs(5),
+        );
+        relay.set_stop_sequences(["</block>"]);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let per_chunk = Duration::from_secs(5);
+        let mut events = Vec::new();
+        loop {
+            match relay.next_event(deadline, per_chunk, Instant::now()).await {
+                Ok(Some(event)) => {
+                    let terminal = event.is_terminal();
+                    events.push(event);
+                    if terminal {
+                        break;
+                    }
+                }
+                Ok(None) => panic!("the stream must end on a terminal"),
+                Err(failure) => panic!("unexpected failure: {failure:?}"),
+            }
+        }
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::TextDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "allow", "text stops exactly before the sequence");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Usage(usage) if usage.has_token_counts())),
+            "usage still reaches settlement after the cut"
+        );
+        assert!(
+            matches!(events.last(), Some(Event::StoppedAtSequence(sequence)) if sequence == "</block>"),
+            "the terminal names the matched sequence"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_customer_managed_relay_re_owns_a_declared_credential_failure_after_output() {
+        // Text has already streamed (the attempt is committed) when the
+        // provider declares a 401 in-stream: the customer still gets their
+        // own message, not the house "ask the gateway operator" one.
+        let frames = vec![
+            Ok::<_, reqwest::Error>(Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            )),
+            Ok::<_, reqwest::Error>(Bytes::from(
+                "data: {\"error\":{\"code\":401,\"message\":\"Incorrect API key provided\"}}\n\n",
+            )),
+        ];
+        let mut relay = UpstreamRelay::from_stream(
+            stream::iter(frames).boxed(),
+            Dialect::OpenAiCompatible,
+            Instant::now() + Duration::from_secs(5),
+        );
+        relay.set_customer_managed_provider(Some("openai".to_string()));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let per_chunk = Duration::from_secs(5);
+        let first = relay
+            .next_event(deadline, per_chunk, Instant::now())
+            .await
+            .expect("yields")
+            .expect("event");
+        assert!(matches!(&first, Event::TextDelta(text) if text == "hi"));
+        let second = relay
+            .next_event(deadline, per_chunk, Instant::now())
+            .await
+            .expect("yields")
+            .expect("event");
+        match second {
+            Event::Failed(failure) => {
+                assert_eq!(failure.failure_class, FailureClass::ProviderAuthentication);
+                assert!(failure.customer_owned);
+                assert!(failure
+                    .safe_message
+                    .contains("your connected openai credential"));
+                assert_eq!(failure.public_error().status_code, 400);
+            }
+            other => panic!("expected the re-owned failure, got {other:?}"),
+        }
     }
 
     #[test]
@@ -643,6 +864,12 @@ mod h2_abort_tests {
         );
         assert_eq!(failure.failure_class, FailureClass::Transport);
         assert!(failure.failover_eligible, "an aborted rung fails over");
+        // The engine's account of the mid-stream break rides to the ledger.
+        let detail = failure
+            .provider_detail
+            .as_deref()
+            .expect("transport detail");
+        assert!(detail.starts_with("stream "), "{detail}");
     }
 
     #[tokio::test]
@@ -655,5 +882,25 @@ mod h2_abort_tests {
         );
         assert_eq!(failure.failure_class, FailureClass::Transport);
         assert!(failure.failover_eligible);
+    }
+}
+
+/// The tokens of two physical dials of one attempt, summed leg by leg; a leg
+/// neither reported stays absent.
+fn fold_usage(carried: &Usage, current: Usage) -> Usage {
+    let add = |a: Option<u64>, b: Option<u64>| match (a, b) {
+        (Some(a), Some(b)) => Some(a + b),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
+    Usage {
+        input_tokens: add(carried.input_tokens, current.input_tokens),
+        output_tokens: add(carried.output_tokens, current.output_tokens),
+        cached_input_tokens: add(carried.cached_input_tokens, current.cached_input_tokens),
+        cache_creation_input_tokens: add(
+            carried.cache_creation_input_tokens,
+            current.cache_creation_input_tokens,
+        ),
+        reasoning_tokens: add(carried.reasoning_tokens, current.reasoning_tokens),
     }
 }

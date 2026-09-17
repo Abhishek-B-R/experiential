@@ -3,7 +3,7 @@
 
 use serde_json::{Map, Value};
 
-use super::{complete_streamed_tool, malformed, parse_object, refusal_failure, Normalizer};
+use super::{malformed, parse_object, Normalizer};
 use crate::errors::{Failure, FailureClass};
 use crate::events::{bedrock_usage, require_string, require_u64, Event, ToolAccumulator};
 
@@ -23,7 +23,7 @@ fn bedrock_exception_detail(frame: &crate::sse::SseEvent) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(str::to_string)
         });
-    let detail = super::provider_error_detail(None, message.as_deref());
+    let detail = super::provider_error_detail(None, message.as_deref(), &[]);
     if let Some(detail) = &detail {
         // The same structured operator line the other dialects emit, so a
         // Bedrock-declared failure is equally visible in the immediate
@@ -203,7 +203,9 @@ impl Normalizer {
             return Ok(Vec::new());
         };
         let mut events = Vec::new();
-        complete_streamed_tool(index, &mut tool, &mut events)?;
+        // The stop reason arrives in the following messageStop, so a fragment
+        // left open by the output budget cannot be told from garbage yet.
+        self.complete_tool_deferring_failure(index, &mut tool, &mut events);
         Ok(events)
     }
 
@@ -220,6 +222,11 @@ impl Normalizer {
 
     /// Map the retained Bedrock stop reason to one terminal gateway event.
     fn bedrock_terminal(&mut self, reason: &str) -> Event {
+        let truncated = matches!(reason, "max_tokens" | "model_context_window_exceeded");
+        if let Err(failure) = self.resolve_deferred_tool_failure(truncated) {
+            self.tools.clear();
+            return Event::Failed(failure);
+        }
         if !self.tools.is_empty() {
             self.tools.clear();
             return Event::Failed(Failure::new(
@@ -228,9 +235,15 @@ impl Normalizer {
             ));
         }
         match reason {
+            // A call cut mid-fragment under a non-truncating stop reason was
+            // dropped at its block stop; the turn is the provider's cut.
+            "end_turn" | "stop_sequence" | "tool_use" if self.dropped_cut_call => Event::Incomplete,
             "end_turn" | "stop_sequence" | "tool_use" => Event::Completed,
             "max_tokens" | "model_context_window_exceeded" => Event::Incomplete,
-            "content_filtered" | "guardrail_intervened" => Event::Failed(refusal_failure()),
+            // The Bedrock stop reason names the content verdict.
+            "content_filtered" | "guardrail_intervened" => Event::Failed(Failure::refusal(
+                crate::stream_errors::refusal_reason(Some(reason), None),
+            )),
             _ => Event::Failed(Failure::new(
                 FailureClass::ProviderInternal,
                 "provider ended the stream unexpectedly",
@@ -413,7 +426,8 @@ mod bedrock_tests {
                 json!({
                     "kind": "failed",
                     "failure_class": "refusal",
-                    "safe_message": "provider refused the request",
+                    "safe_message": "provider refused the request: content policy",
+                    "refusal_reason": "content_policy",
                 }),
             ),
             (
@@ -421,7 +435,8 @@ mod bedrock_tests {
                 json!({
                     "kind": "failed",
                     "failure_class": "refusal",
-                    "safe_message": "provider refused the request",
+                    "safe_message": "provider refused the request: content policy",
+                    "refusal_reason": "content_policy",
                 }),
             ),
             (
@@ -488,6 +503,67 @@ mod bedrock_tests {
         assert_eq!(events[1]["kind"], "usage");
         assert_eq!(events[2]["kind"], "failed");
         assert_eq!(events[2]["failure_class"], "malformed_response");
+    }
+
+    #[test]
+    fn bedrock_tool_fragment_at_the_output_budget_is_incomplete_not_malformed() {
+        let fragment = |stop_reason: &str| tool_stream(stop_reason, "{\"city\": \"Par");
+        let (events, failure) = run_stream(&fragment("max_tokens"));
+        assert!(failure.is_none());
+        assert!(!events
+            .iter()
+            .any(|event| event["kind"] == "tool_call_completed"));
+        assert_eq!(
+            events.last().map(|event| event["kind"].clone()),
+            Some(json!("incomplete"))
+        );
+
+        // Bedrock's DeepSeek and Qwen shims close the block on an open
+        // fragment and report `tool_use`/`end_turn` (production 2026-09-09..15,
+        // 33 attempts): the stop reason misreports the cut, so the call is
+        // dropped and the turn settles Incomplete, never a 502.
+        for stop_reason in ["end_turn", "tool_use"] {
+            let (events, failure) = run_stream(&fragment(stop_reason));
+            assert!(failure.is_none());
+            assert!(!events
+                .iter()
+                .any(|event| event["kind"] == "tool_call_completed"));
+            assert_eq!(
+                events.last().map(|event| event["kind"].clone()),
+                Some(json!("incomplete")),
+                "{stop_reason}: {events:?}"
+            );
+        }
+
+        // A syntax error INSIDE the arguments is corruption, not a cut, and a
+        // non-truncating stop reason still surfaces it.
+        let (events, failure) = run_stream(&tool_stream("end_turn", "{\"city\": }"));
+        assert!(failure.is_none());
+        let last = events.last().expect("terminal");
+        assert_eq!(last["kind"], "failed");
+        assert_eq!(last["failure_class"], "malformed_response");
+    }
+
+    fn tool_stream(stop_reason: &str, input: &str) -> Vec<Vec<u8>> {
+        vec![
+            event(
+                "contentBlockStart",
+                &json!({
+                    "contentBlockIndex": 0,
+                    "start": {"toolUse": {"toolUseId": "call-1", "name": "lookup"}},
+                }),
+            ),
+            event(
+                "contentBlockDelta",
+                &json!({"contentBlockIndex": 0, "delta": {"toolUse": {"input": input}}}),
+            ),
+            event("contentBlockStop", &json!({"contentBlockIndex": 0})),
+            event("messageStop", &json!({"stopReason": stop_reason})),
+            event(
+                "metadata",
+                &json!({"usage": {"inputTokens": 1, "outputTokens": 1}}),
+            ),
+        ]
     }
 
     #[test]

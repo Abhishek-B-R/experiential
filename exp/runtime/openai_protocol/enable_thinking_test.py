@@ -35,6 +35,42 @@ def test_thinking_enabled_defers_to_the_model_default() -> None:
     assert request.ignored_parameters == ("thinking->translated(reasoning_effort)",)
 
 
+def test_thinking_adaptive_defers_to_the_model_default() -> None:
+    """Anthropic's 4.6+ on-mode is admitted on the Chat wire like ``enabled``.
+
+    Claude-configured clients (Anthropic SDKs, Claude Code shims, Cherry
+    Studio) pin ``thinking: {type: adaptive}`` on every model; 3,935 Chat
+    requests over 7 days were refused at decode for it (2026-09-15).
+    """
+    request = _decode(thinking={"type": "adaptive"})
+    assert request.reasoning_effort is None
+    assert request.thinking_default_enable is True
+    assert request.ignored_parameters == ("thinking->translated(reasoning_effort)",)
+
+
+def test_thinking_adaptive_budget_tokens_is_disclosed_not_carried() -> None:
+    request = _decode(thinking={"type": "adaptive", "budget_tokens": 4096})
+    assert request.thinking_default_enable is True
+    assert request.ignored_parameters == (
+        "budget_tokens->dropped(not_carried)",
+        "thinking->translated(reasoning_effort)",
+    )
+
+
+def test_thinking_unknown_type_names_the_members_not_the_json_type() -> None:
+    """A non-member string is a value fault; the members are the useful fact.
+
+    The old rendering ("expected one of 'enabled' or 'disabled', but got a
+    string instead") told callers their string was not a string.
+    """
+    with pytest.raises(OpenAIProtocolError) as error:
+        _decode(thinking={"type": "extended"})
+    assert error.value.detail.param == "thinking.type"
+    assert error.value.detail.message == (
+        "Invalid value for 'thinking.type': expected one of 'enabled', 'disabled' or 'adaptive'."
+    )
+
+
 def test_thinking_enabled_budget_tokens_is_disclosed_not_carried() -> None:
     request = _decode(thinking={"type": "enabled", "budget_tokens": 4096})
     assert request.thinking_default_enable is True
@@ -88,3 +124,87 @@ def test_agreeing_enable_fields_prefer_the_nested_level() -> None:
     request = _decode(reasoning={"effort": "medium"}, thinking={"type": "enabled"})
     assert request.reasoning_effort == "medium"
     assert request.thinking_default_enable is False
+
+
+def test_top_level_enable_thinking_translates_like_chat_template_kwargs() -> None:
+    """DashScope's top-level switch enables at the model default or disables to none."""
+    enabled = _decode(enable_thinking=True)
+    assert enabled.reasoning_effort is None
+    assert enabled.thinking_default_enable is True
+    assert enabled.ignored_parameters == ("enable_thinking->translated(reasoning_effort)",)
+    disabled = _decode(enable_thinking=False)
+    assert disabled.reasoning_effort == "none"
+    assert disabled.thinking_default_enable is False
+
+
+def test_openrouter_reasoning_enabled_translates_to_the_canonical_control() -> None:
+    """``reasoning.enabled`` is OpenRouter's literal on/off vote."""
+    enabled = _decode(reasoning={"enabled": True})
+    assert enabled.reasoning_effort is None
+    assert enabled.thinking_default_enable is True
+    assert enabled.ignored_parameters == ("reasoning->translated(reasoning_effort)",)
+    disabled = _decode(reasoning={"enabled": False})
+    assert disabled.reasoning_effort == "none"
+    assert disabled.thinking_default_enable is False
+
+
+@pytest.mark.parametrize(
+    ("budget", "effort"), [(1024, "low"), (4096, "low"), (8192, "medium"), (32768, "high")]
+)
+def test_openrouter_reasoning_budget_snaps_to_the_nearest_tier(budget: int, effort: str) -> None:
+    """A ``max_tokens`` budget maps through the Messages surface's budget table."""
+    request = _decode(reasoning={"max_tokens": budget})
+    assert request.reasoning_effort == effort
+    assert request.thinking_default_enable is False
+    assert request.ignored_parameters == (
+        "reasoning.max_tokens->translated(reasoning_effort)",
+        "reasoning->translated(reasoning_effort)",
+    )
+
+
+def test_openrouter_reasoning_exclude_is_disclosed_not_carried() -> None:
+    """``exclude: true`` (hide reasoning in the response) is accepted and disclosed."""
+    request = _decode(reasoning={"effort": "high", "exclude": True})
+    assert request.reasoning_effort == "high"
+    assert request.ignored_parameters == (
+        "reasoning.exclude->dropped(not_carried)",
+        "reasoning->translated(reasoning_effort)",
+    )
+    # exclude:false is the default and carries nothing to disclose.
+    assert _decode(reasoning={"effort": "high", "exclude": False}).ignored_parameters == (
+        "reasoning->translated(reasoning_effort)",
+    )
+
+
+def test_openrouter_reasoning_object_rejects_internal_contradictions_by_field() -> None:
+    """``enabled: false`` beside a tier or budget, or a tier beside a budget, is named."""
+    with pytest.raises(OpenAIProtocolError) as disagree:
+        _decode(reasoning={"effort": "high", "enabled": False})
+    assert disagree.value.detail.param == "reasoning.enabled"
+    with pytest.raises(OpenAIProtocolError) as both:
+        _decode(reasoning={"effort": "high", "max_tokens": 10})
+    assert both.value.detail.param == "reasoning"
+    assert "mutually exclusive" in both.value.detail.message
+
+
+def test_explicit_flat_effort_reports_every_present_alternate_spelling() -> None:
+    request = _decode(reasoning_effort="low", reasoning={"enabled": True}, enable_thinking=True)
+    assert request.reasoning_effort == "low"
+    assert request.ignored_parameters == (
+        "reasoning->ignored(explicit_reasoning_effort)",
+        "enable_thinking->ignored(explicit_reasoning_effort)",
+    )
+
+
+def test_explicit_flat_effort_ignores_alternate_objects_whole() -> None:
+    """When the flat effort wins, an alternate object's inner fields are not
+    separately reported as translated or dropped."""
+    request = _decode(
+        reasoning_effort="low",
+        reasoning={"max_tokens": 2048, "exclude": True},
+        thinking={"type": "enabled", "budget_tokens": 4096},
+    )
+    assert request.ignored_parameters == (
+        "reasoning->ignored(explicit_reasoning_effort)",
+        "thinking->ignored(explicit_reasoning_effort)",
+    )

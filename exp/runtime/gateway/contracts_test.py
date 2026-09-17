@@ -7,7 +7,7 @@ from typing import Literal
 import pytest
 from pydantic import ValidationError
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.models.model import ToolCall
 from exp.runtime.gateway.compatibility import (
     CompatibilityDisposition,
@@ -27,7 +27,9 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
     ProjectTarget,
+    StructuredTextFormat,
 )
+from exp.runtime.gateway.replay_identity import canonical_request_sha256
 
 
 def test_gateway_request_preserves_developer_and_raw_tool_history() -> None:
@@ -118,6 +120,33 @@ def test_targets_and_compatibility_manifest_are_closed_and_deterministic() -> No
             surface=GatewayApiSurface.CHAT_COMPLETIONS,
             fields=(manifest.fields[0], manifest.fields[0]),
         )
+
+
+def test_authorization_snapshot_carries_the_trusted_client_ip() -> None:
+    """The optional trusted-hop client IP round-trips and defaults to None."""
+    without_ip = AuthorizationSnapshot(
+        request_id="request-1",
+        organization_id="organization-1",
+        identity_id="identity-1",
+        virtual_key_id="key-1",
+        alias="coding",
+        alias_revision_id="alias-revision-1",
+        target=ProjectTarget(
+            project_ref="support-agent",
+            activation_ref="activation-1",
+            catalog_sha256="a" * 64,
+        ),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        catalog_sha256="a" * 64,
+        canonical_request_sha256="b" * 64,
+        deadline_monotonic=10.0,
+    )
+    assert without_ip.client_ip is None
+
+    with_ip = without_ip.model_copy(update={"client_ip": "198.51.100.9"})
+    assert with_ip.client_ip == "198.51.100.9"
+    restored = AuthorizationSnapshot.model_validate_json(with_ip.model_dump_json())
+    assert restored.client_ip == "198.51.100.9"
 
 
 def test_project_authorization_precedes_route_bound_execution() -> None:
@@ -760,6 +789,23 @@ def test_native_tool_carriers_are_scoped_verbatim_and_join_replay_identity() -> 
         )
 
 
+def test_text_verbosity_is_carried_on_responses_and_chat_but_not_messages() -> None:
+    """The one verbosity carrier serves both OpenAI spellings and no other surface."""
+    for surface in (GatewayApiSurface.RESPONSES, GatewayApiSurface.CHAT_COMPLETIONS):
+        request = GatewayRequest(
+            surface=surface,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            text_verbosity="high",
+        )
+        assert request.text_verbosity == "high"
+    with pytest.raises(ValidationError, match="valid only for Responses and Chat"):
+        GatewayRequest(
+            surface=GatewayApiSurface.MESSAGES,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            text_verbosity="high",
+        )
+
+
 def test_required_tool_choice_counts_native_tool_declarations() -> None:
     """A toolset made only of verbatim native declarations satisfies required."""
     request = GatewayRequest(
@@ -970,6 +1016,35 @@ def test_service_tier_is_serialization_inert_but_binds_replay_identity() -> None
             surface=GatewayApiSurface.MESSAGES,
             messages=messages,
             service_tier="flex",
+        )
+
+
+def test_json_object_output_is_serialization_inert_but_binds_replay_identity() -> None:
+    """Mode-free Chat digests are untouched; an enabled JSON mode is its own operation."""
+    messages = (GatewayMessage(role="user", content="hi"),)
+    bare = GatewayRequest(surface=GatewayApiSurface.CHAT_COMPLETIONS, messages=messages)
+    json_mode = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=messages,
+        json_object_output=True,
+    )
+    assert "json_object_output" not in bare.model_dump(mode="json")
+    assert json_mode.model_dump(mode="json") == bare.model_dump(mode="json")
+    assert sha256_json(json_mode) == sha256_json(bare)
+    assert canonical_request_sha256(bare) == sha256_json(bare)
+    assert canonical_request_sha256(json_mode) != canonical_request_sha256(bare)
+    with pytest.raises(ValidationError, match="mutually exclusive"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=messages,
+            json_object_output=True,
+            structured_text=StructuredTextFormat(name="out", json_schema={"type": "object"}),
+        )
+    with pytest.raises(ValidationError, match="valid only for Chat Completions"):
+        GatewayRequest(
+            surface=GatewayApiSurface.MESSAGES,
+            messages=messages,
+            json_object_output=True,
         )
 
 

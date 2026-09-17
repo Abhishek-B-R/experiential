@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import tomllib
 from pathlib import Path
-from typing import Literal, cast
+from typing import Annotated, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import tomli_w
@@ -30,35 +30,29 @@ from exp.common.core.artifacts import (
     validate_artifact_id,
 )
 from exp.common.core.files import write_text_atomic
+from exp.common.models.bedrock_connection import require_bedrock_connection_shape
+from exp.common.models.catalog_roles import ModelRoles
+from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
+from exp.common.models.failover_tokens import FailoverToken
+from exp.common.models.gateway_pools import GatewayPoolRecord
 from exp.common.models.model import (
     BillingSource,
     ModelCapabilities,
     ModelSnapshot,
     ReasoningEffort,
 )
+from exp.common.models.nano_usd_upgrade import upgrade_model_catalog_document
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AZURE_API_VERSION = re.compile(r"^(?:v1|\d{4}-\d{2}-\d{2}(?:-preview)?)$")
 _AWS_REGION_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _VERTEX_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-)?aiplatform\.googleapis\.com")
-_FIXED_ORIGIN_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "openrouter", "tinker"})
+_FIXED_ORIGIN_PROVIDERS = frozenset(
+    {"anthropic", "gemini", "openai", "openrouter", "tinker", "typesafe"}
+)
 _EXPLICIT_CAPABILITY_PROVIDERS = frozenset({"azure", "bedrock", "openai-compatible", "vertex"})
 
 AzureApiSurface = Literal["openai_deployments", "model_inference"]
-
-FailoverMode = Literal["maximize_availability", "maximize_cache"]
-"""How a pool's waterfall reacts to a failed attempt.
-
-``maximize_availability`` (the default, historical behavior) fails over to the
-next rung on any failover-eligible error. ``maximize_cache`` does NOT fail over on
-a throttle (429) -- it returns the throttle so the caller retries the warm rung
-after backoff, preserving its prompt cache rather than restarting cold on another
-provider -- while STILL failing over on operational deadness
-(auth/not-found/5xx/transport) and on a stalled lane (a first-byte or
-header-phase timeout that never answered), for which there is no warm cache to
-preserve. A genuinely retryable timeout (provider 408) redials the warm rung in
-both modes. Client errors reject without failover in both modes.
-"""
 """Azure wire surface a connection speaks: classic deployments or Foundry model inference."""
 
 _FOUNDRY_HOST_SUFFIXES = (".services.ai.azure.com", ".inference.ai.azure.com")
@@ -162,6 +156,8 @@ class ConnectionConfig(ContractModel):
     region: str | None = Field(default=None, max_length=64)
     aws_access_key_id_env: str | None = Field(default=None, max_length=256)
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
+    # Opt-in: native provider via a trusted https base_url in its own dialect (default-off).
+    trusted_custom_origin: bool = False
 
     @field_validator("api_key_env", "aws_access_key_id_env")
     @classmethod
@@ -196,10 +192,17 @@ class ConnectionConfig(ContractModel):
                 "aws_access_key_id_env and bedrock_auth_mode are only accepted for "
                 "provider='bedrock'"
             )
-        if self.provider in _FIXED_ORIGIN_PROVIDERS and self.base_url is not None:
+        if self.trusted_custom_origin:
+            if self.provider not in _FIXED_ORIGIN_PROVIDERS:
+                raise ValueError("trusted_custom_origin applies only to a native provider")
+            if self.base_url is None:
+                raise ValueError("trusted_custom_origin requires an explicit base_url")
+            if urlsplit(self.base_url).scheme != "https":
+                raise ValueError("trusted_custom_origin requires an https base_url")
+        elif self.provider in _FIXED_ORIGIN_PROVIDERS and self.base_url is not None:
             raise ValueError(
                 f"native provider {self.provider!r} uses its built-in official endpoint; "
-                "use provider='openai-compatible' for a trusted custom endpoint"
+                "set trusted_custom_origin=True or use provider='openai-compatible'"
             )
         if self.provider == "azure":
             if self.base_url is None:
@@ -224,26 +227,13 @@ class ConnectionConfig(ContractModel):
             if self.region is not None:
                 raise ValueError("region is only accepted for provider='bedrock'")
         elif self.provider == "bedrock":
-            if self.bedrock_auth_mode == "api_key":
-                if self.api_key_env is None or self.aws_access_key_id_env is not None:
-                    raise ValueError(
-                        "bedrock api_key auth requires api_key_env and forbids "
-                        "aws_access_key_id_env"
-                    )
-            elif self.bedrock_auth_mode == "access_key_pair":
-                if self.api_key_env is None or self.aws_access_key_id_env is None:
-                    raise ValueError(
-                        "bedrock access_key_pair auth requires both credential environment names"
-                    )
-            elif (self.api_key_env is None) != (self.aws_access_key_id_env is None):
-                raise ValueError(
-                    "bedrock explicit access-key auth requires both api_key_env naming the "
-                    "secret access key and aws_access_key_id_env naming the access key id"
-                )
-            if self.base_url is not None:
-                raise ValueError("bedrock does not accept base_url")
-            if self.api_version is not None:
-                raise ValueError("api_version is only accepted for provider='azure'")
+            require_bedrock_connection_shape(
+                bedrock_auth_mode=self.bedrock_auth_mode,
+                api_key_env=self.api_key_env,
+                aws_access_key_id_env=self.aws_access_key_id_env,
+                base_url=self.base_url,
+                api_version=self.api_version,
+            )
             if self.region is not None and not _AWS_REGION_NAME.fullmatch(self.region):
                 raise ValueError("bedrock region must be an AWS region name")
         elif self.provider == "vertex":
@@ -315,6 +305,8 @@ class ConnectionConfig(ContractModel):
             identity["azure_api_surface"] = "model_inference"
         if self.region is not None:
             identity["region"] = self.region
+        if self.trusted_custom_origin:  # endpoint identity; added only when set
+            identity["trusted_custom_origin"] = True
         effective_bedrock_auth_mode = self.bedrock_auth_mode
         if (
             self.provider == "bedrock"
@@ -349,6 +341,8 @@ class ConnectionConfig(ContractModel):
             serialized.pop("aws_access_key_id_env", None)
         if self.bedrock_auth_mode is None:
             serialized.pop("bedrock_auth_mode", None)
+        if not self.trusted_custom_origin:
+            serialized.pop("trusted_custom_origin", None)
         return serialized
 
 
@@ -376,6 +370,9 @@ class GatewayDeploymentCapabilities(ContractModel):
     gateway protocol without invalidating existing router artifacts.
     """
 
+    supports_decisions: bool = False
+    """Whether this deployment serves native typed decisions instead of chat."""
+
     supports_developer_messages: bool = False
     supports_streaming: bool = False
     supports_streaming_tool_arguments: bool = False
@@ -384,53 +381,30 @@ class GatewayDeploymentCapabilities(ContractModel):
     supports_structured_text: bool = False
     supports_stop_sequences: bool = False
     supports_image_input: bool = False
-    """Whether this deployment's wire and model can carry caller image parts.
-
-    Image input is declaration-driven and never assumed: a route that does
-    not declare it rejects an image request at admission, so a picture is
-    never dropped and answered from the surrounding text alone.
-    """
+    """Whether the wire and model accept images; undeclared image input is rejected."""
     supports_image_url_input: bool = False
-    """Whether this route's provider fetches a caller image URL itself.
+    """Whether the provider fetches remote images; undeclared URLs are rejected.
 
-    Inline base64 rides every image-capable wire, but only some wires accept a
-    remote URL. A route that does not declare this rejects a URL image at
-    admission, which lets a waterfall narrow to a rung that can carry it.
+    Every image-capable wire accepts inline base64; URL support varies by route.
     """
     supports_video_input: bool = False
-    """Whether this deployment's wire and model can carry caller video parts.
+    """Whether the wire and model accept video; undeclared video input is rejected.
 
-    Video is narrower than images: only the Gemini, Bedrock Converse, and
-    OpenAI-compatible ``video_url`` wires define a video carrier, and only
-    some models on those wires accept one. Like images the declaration is
-    never assumed, so a route without it rejects a video at admission rather
-    than answering from the surrounding text.
+    Video carriers exist on Gemini, Bedrock Converse, and compatible ``video_url`` wires.
     """
     supports_video_url_input: bool = False
-    """Whether this route's provider fetches a caller video URL itself.
+    """Whether the provider fetches video URLs (Gemini and OpenAI-compatible wires).
 
-    Bedrock accepts inline bytes (or an S3 location the gateway does not
-    author) only; Gemini and the OpenAI-compatible video wires fetch an
-    http(s) URL on the caller's behalf.
+    Bedrock requires inline bytes or an S3 location that the gateway does not author.
     """
     supports_audio_input: bool = False
-    """Whether this deployment's wire and model can carry caller audio parts.
+    """Whether the wire and model accept audio; undeclared audio input is rejected.
 
-    Audio is the narrowest attachment: only the OpenAI-compatible Chat
-    ``input_audio`` wire and the Gemini ``inline_data`` wire carry a clip a
-    model serves, and on those wires only specific models (the gpt-audio
-    family, audio-capable Gemini models) accept one. The declaration is never
-    assumed, so a route without it rejects audio at admission rather than
-    answering from the surrounding text. Audio has no remote URL carrier on
-    any public surface, so there is no separate URL declaration.
+    Supported models use compatible Chat ``input_audio`` or Gemini ``inline_data``.
+    No public audio surface accepts remote URLs.
     """
     supports_pdf_input: bool = False
-    """Whether this deployment's wire and model can carry caller PDF documents.
-
-    Like image input this is declaration-driven and never assumed: a route
-    that does not declare it rejects a document request at admission, so a
-    PDF is never dropped and answered from the surrounding text alone.
-    """
+    """Whether the wire and model accept PDFs; undeclared document input is rejected."""
     supports_pdf_url_input: bool = False
     """Whether this route's provider fetches a caller PDF URL itself.
 
@@ -455,6 +429,9 @@ class GatewayDeploymentCapabilities(ContractModel):
     field). A concrete value lets admission reject an over-limit list locally with a
     named parameter error instead of forwarding it and surfacing the provider's
     opaque 4xx (e.g. Gemini caps ``stopSequences`` at 5)."""
+    minimum_output_tokens: int | None = Field(default=None, ge=1)
+    """Provider output-token floor (sonar/fugu via OpenRouter, grok-4.6 on Bedrock: 16); a
+    smaller caller ceiling is floored to it with disclosure on every surface (see the profile)."""
     supported_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
     """Exact caller values this deployment can preserve without normalization.
 
@@ -463,7 +440,13 @@ class GatewayDeploymentCapabilities(ContractModel):
     ordered set here because their supported values vary by model.
     """
     reasoning_default_effort: ReasoningEffort | None = None
-    """Explicit provider default used only when the wire requires this field."""
+    """The depth this deployment reasons at when the caller names none.
+
+    Emitted on a wire that requires an explicit effort, and read by Messages
+    admission as the depth a budget-less ``thinking`` config (``adaptive``, or
+    Claude Code's bare ``{type: enabled}``) asks for on an effort rung, so a
+    lane's think-mode depth is set here, not in code.
+    """
     reasoning_effort_required: bool = False
     """Whether this deployment requires an explicit reasoning effort on its wire."""
     reports_refusals: bool = False
@@ -502,6 +485,14 @@ class GatewayDeploymentCapabilities(ContractModel):
     ``None`` uses the serving configuration's default; ``0`` disables scaling
     for this deployment.
     """
+    failover_only_on: tuple[FailoverToken, ...] | None = None
+    """Failure tokens this rung serves as a failover for, or ``None`` for an unrestricted rung.
+
+    A rung carrying a set is never dialed first and is dialed as a successor only
+    when the failure being failed over from spells one of its tokens (see
+    ``exp.common.models.failover_tokens``); a rule-carrying rung reached that way
+    records ``fallback_reason = failover_only_on:<token>``.
+    """
 
     @property
     def declares_reasoning_contract(self) -> bool:
@@ -537,25 +528,36 @@ class GatewayDeploymentCapabilities(ContractModel):
         return self
 
 
+MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS = 1_000_000_000_000
+"""Upper bound on any authored rate: $1,000 per million tokens in nano-USD.
+
+Every published price today is far below it (the highest authored rate is
+$600 per million, 6e11 nano-USD), and at this ceiling on every dimension a
+1M-context request with the full output ceiling still sums to well under the
+signed 64-bit ledger column before the per-million division, so no authored
+catalog can produce an attempt cost the ledger cannot hold.
+"""
+
+NanoUsdRatePerMillionTokens = Annotated[
+    int | None, Field(ge=0, le=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS)
+]
+"""One optional integer nano-USD-per-million-tokens rate; ``None`` is unknown, never zero."""
+
+
 class GatewayLongContextTier(ContractModel):
     """Premium rates a provider applies to whole long-context requests.
 
-    Both published tier schedules this models (Gemini's ``prompts > 200k``
-    rates and Anthropic's legacy 1M-beta premium) reprice the ENTIRE request
-    once provider-reported input tokens reach the threshold, never only the
-    tokens past it, so that is the one semantic implemented: when
-    ``usage.input_tokens >= input_threshold_tokens``, these rates replace
-    the base rates for every dimension of the request. ``None`` means the
-    tier rate is unknown exactly as on the base schedule; it never inherits
-    the base rate, so a deployment reporting a dimension without a tier
-    price stays honestly unpriced above the threshold.
+    When ``usage.input_tokens >= input_threshold_tokens``, tier rates replace
+    base rates for every dimension of the whole request, not just excess tokens.
+    This models Gemini and Anthropic's long-context premium schedules. A ``None``
+    tier rate stays unknown; it never inherits the base rate.
     """
 
     input_threshold_tokens: int = Field(gt=0)
-    input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    cached_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
 
 
 class GatewayServiceTierPrices(ContractModel):
@@ -567,23 +569,25 @@ class GatewayServiceTierPrices(ContractModel):
     on the base schedule (never the base rate). v1 bills the REQUESTED tier.
     """
 
-    input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    cached_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
 
 
 class GatewayTokenPrices(ContractModel):
     """Integer gateway attribution rates for one provider deployment.
 
-    Values are micro-USD per million provider-reported tokens. ``None`` means the rate is unknown;
-    it must never be interpreted as zero. Existing optimizer float pricing remains unchanged.
+    Values are integer nano-USD per million provider-reported tokens (one nano-USD is a
+    billionth of a dollar: $1.25 per million is ``1_250_000_000``), bounded above by
+    ``MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS``. ``None`` means the rate is unknown; it must
+    never be interpreted as zero. Existing optimizer float pricing remains unchanged.
     """
 
-    input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    cached_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     long_context: GatewayLongContextTier | None = None
     """Whole-request premium schedule for long-context input, when one exists.
 
@@ -615,10 +619,10 @@ class GatewayTokenPrices(ContractModel):
         if card is None:
             return self
         return GatewayTokenPrices(
-            input_micro_usd_per_million_tokens=card.input_micro_usd_per_million_tokens,
-            cached_input_micro_usd_per_million_tokens=card.cached_input_micro_usd_per_million_tokens,
-            output_micro_usd_per_million_tokens=card.output_micro_usd_per_million_tokens,
-            reasoning_micro_usd_per_million_tokens=card.reasoning_micro_usd_per_million_tokens,
+            input_nano_usd_per_million_tokens=card.input_nano_usd_per_million_tokens,
+            cached_input_nano_usd_per_million_tokens=card.cached_input_nano_usd_per_million_tokens,
+            output_nano_usd_per_million_tokens=card.output_nano_usd_per_million_tokens,
+            reasoning_nano_usd_per_million_tokens=card.reasoning_nano_usd_per_million_tokens,
             long_context=None,
         )
 
@@ -633,45 +637,8 @@ class GatewayDeploymentMetadata(ContractModel):
     prices: GatewayTokenPrices = Field(default_factory=GatewayTokenPrices)
     pricing_source: str | None = Field(default=None, min_length=1, max_length=512)
     pricing_effective_at: AwareDatetime | None = None
-
-
-class GatewayEquivalenceCertification(ContractModel):
-    """Operator-authored evidence that deployments serve one exact model revision."""
-
-    authority: Literal["operator"] = "operator"
-    certification_id: ArtifactId
-    provenance: str = Field(min_length=1, max_length=2_048)
-    evidence_sha256: Sha256
-    certified_at: AwareDatetime
-
-    @model_validator(mode="after")
-    def _require_safe_provenance(self) -> GatewayEquivalenceCertification:
-        """Reject credential-like or control-bearing equivalence provenance."""
-        try:
-            assert_secret_free(self.model_dump(mode="json"))
-        except SecretBoundaryError as exc:
-            raise ValueError("equivalence provenance must be secret-free") from exc
-        if any(ord(character) < 32 for character in self.provenance):
-            raise ValueError("equivalence provenance must be display-safe")
-        return self
-
-
-class GatewayPoolRecord(ContractModel):
-    """Authored ordered deployments explicitly certified as one exact model."""
-
-    exact_model_id: ArtifactId
-    deployment_aliases: tuple[ArtifactId, ...] = Field(min_length=2)
-    equivalence: GatewayEquivalenceCertification
-    # Per-model failover policy for this pool's waterfall. Defaults to the
-    # historical maximize_availability so an unset authored pool is unchanged.
-    failover_mode: FailoverMode = "maximize_availability"
-
-    @model_validator(mode="after")
-    def _require_unique_deployments(self) -> GatewayPoolRecord:
-        """Reject repeated deployment aliases inside one equivalence pool."""
-        if len(set(self.deployment_aliases)) != len(self.deployment_aliases):
-            raise ValueError("gateway pool deployment aliases must not repeat")
-        return self
+    dispatch: GatewayRungDispatchPolicy | None = None
+    """Optional dispatch policy for this rung; ``None`` is fully inert."""
 
 
 class ModelRecord(ContractModel):
@@ -741,53 +708,8 @@ class ModelRecord(ContractModel):
         return self
 
 
-class ModelRoles(ContractModel):
-    """Project roles that select stable aliases without revealing credentials.
-
-    Each completion role may carry its own reasoning-effort choice, so one alias can use
-    different efforts as world model, judge, or router candidate. An absent role effort means
-    the alias's catalog capability pin applies unchanged.
-    """
-
-    candidates: tuple[str, ...] = ()
-    incumbent: str | None = None
-    world_model: str | None = None
-    judge: str | None = None
-    rubric_proposer: str | None = None
-    embedder: str | None = None
-    teacher: str | None = None
-    world_model_reasoning_effort: ReasoningEffort | None = None
-    judge_reasoning_effort: ReasoningEffort | None = None
-    candidate_reasoning_efforts: dict[str, ReasoningEffort] = Field(default_factory=dict)
-
-    @field_validator("candidates")
-    @classmethod
-    def _require_unique_candidates(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if len(set(value)) != len(value):
-            raise ValueError("candidate aliases must not repeat")
-        return value
-
-    @model_validator(mode="after")
-    def _require_role_bound_reasoning_efforts(self) -> ModelRoles:
-        """Require every role-specific effort to name a currently assigned role alias.
-
-        Returns:
-            The validated roles.
-
-        Raises:
-            ValueError: An effort is declared for an unassigned role or unknown candidate.
-        """
-        if self.world_model_reasoning_effort is not None and self.world_model is None:
-            raise ValueError("world_model_reasoning_effort requires an assigned world_model")
-        if self.judge_reasoning_effort is not None and self.judge is None:
-            raise ValueError("judge_reasoning_effort requires an assigned judge")
-        unknown = sorted(set(self.candidate_reasoning_efforts).difference(self.candidates))
-        if unknown:
-            raise ValueError(
-                "candidate_reasoning_efforts name unassigned candidates: " + ", ".join(unknown)
-            )
-        return self
-
+MODEL_CATALOG_SCHEMA_VERSION = 3
+"""Authored catalog revision this build writes (3 = integer nano-USD prices)."""
 
 SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION = 10_000
 """Upper bound on an authored catalog version this parser accepts as real.
@@ -801,8 +723,13 @@ and fails closed rather than being read as a future contract.
 class ModelCatalog(ContractModel):
     """The local model aliases, connection metadata, and project role assignments."""
 
-    schema_version: int = Field(default=2, ge=2, le=SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION)
+    schema_version: int = Field(
+        default=MODEL_CATALOG_SCHEMA_VERSION, ge=2, le=SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION
+    )
     """Authored catalog contract revision. Deliberately NOT a ``Literal``.
+
+    Schema 3 prices in integer nano-USD; schema 2 (micro-USD) documents are
+    upgraded at every read boundary by ``upgrade_model_catalog_document``.
 
     Every cross-version hydration parses the authored document first, and a
     changed ``Literal`` value on a known field raises ``literal_error``, which
@@ -935,7 +862,9 @@ def load_model_catalog(path: Path) -> ModelCatalog:
     except tomllib.TOMLDecodeError as exc:
         raise ModelCatalogError(f"model catalog is invalid TOML: {path}") from exc
     try:
-        return ModelCatalog.model_validate(_migrate_legacy_model_catalog(raw_catalog))
+        return ModelCatalog.model_validate(
+            upgrade_model_catalog_document(_migrate_legacy_model_catalog(raw_catalog))
+        )
     except ValueError as exc:
         raise ModelCatalogError(f"model catalog is invalid: {exc}") from exc
 

@@ -11,7 +11,7 @@ from enum import StrEnum
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject
-from exp.common.models.model import ToolCall
+from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ToolCall
 
 
 class GatewayUsage(ContractModel):
@@ -93,12 +93,20 @@ class GatewayEvent(ContractModel):
     redacted_thinking_data: str | None = None
     encrypted_content: str | None = None
     tool_call_index: int | None = Field(default=None, ge=0)
-    tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
+    tool_call_id: str | None = Field(
+        default=None, min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS
+    )
     tool_name: str | None = Field(default=None, min_length=1, max_length=256)
     raw_arguments_delta: str | None = None
     tool_call: ToolCall | None = None
     usage: GatewayUsage | None = None
     failure: GatewayFailure | None = None
+    decision_provider_rejected: bool = Field(default=False, exclude=True, strict=True)
+    """Internal decision settlement evidence that an HTTP rejection preceded execution.
+
+    False leaves unmetered decision work financially unresolved. This is not
+    provider token usage and never joins serialized events or replay identity.
+    """
 
     @model_validator(mode="after")
     def _require_event_payload(self) -> GatewayEvent:
@@ -171,6 +179,12 @@ class GatewayFailureClass(StrEnum):
     # every mode. Distinct from QUOTA_EXCEEDED, the CALLER's gateway credit.
     PROVIDER_QUOTA = "provider_quota"
     REFUSAL = "refusal"
+    # The provider closed the turn as complete and delivered nothing the caller
+    # can receive (an OpenAI empty assistant message; a reasoning-only turn on a
+    # rung whose reasoning the gateway strips). The model's answer to the
+    # request content, like REFUSAL: never a deployment-circuit failure, and a
+    # 400 the SDKs do not auto-retry.
+    EMPTY_COMPLETION = "empty_completion"
     MALFORMED_RESPONSE = "malformed_response"
     PROVIDER_INTERNAL = "provider_internal"
     CANCELLED = "cancelled"
@@ -181,6 +195,24 @@ class GatewayFailureClass(StrEnum):
     # INTERNAL it is not a bug signal and does not page; unlike a provider class
     # it never opens a deployment circuit.
     UNAVAILABLE = "unavailable"
+
+
+class GatewayRefusalReason(StrEnum):
+    """The bounded category of a provider refusal, mirroring the native
+    ``RefusalReason``.
+
+    A refusal answer names WHICH policy declined the content as a closed
+    vocabulary, so a client can branch on it and the control plane can count
+    refusals by reason without parsing the free-form provider detail. The
+    caller never sees the provider's own prose, only the fixed category.
+    """
+
+    CYBER_POLICY = "cyber_policy"
+    CBRN = "cbrn"
+    CONTENT_POLICY = "content_policy"
+    RECITATION = "recitation"
+    DATA_INSPECTION = "data_inspection"
+    UNSPECIFIED = "unspecified"
 
 
 class GatewayFailure(ContractModel):
@@ -196,9 +228,20 @@ class GatewayFailure(ContractModel):
     provider_detail: str | None = Field(default=None, min_length=1, max_length=240)
     """Provider explanation of a client error, relayed only for that class."""
     retry_after_seconds: int | None = Field(default=None, ge=1)
+    """The failure is the caller's own provider configuration: a rejected
+    credential or exhausted account on their customer-managed (BYOK) rung. The
+    class keeps its ladder semantics; the ledger files it as the caller's
+    invalid request and the terminal answer is their 400."""
+    customer_owned: bool = False
     """Known wait before a retry can dispatch (a throttle window's remainder).
 
     When present on a throttled failure, the public mapping advertises this
     value as ``Retry-After`` instead of its fixed default, so the header and
     the message never tell the caller two different waits.
     """
+    refusal_reason: GatewayRefusalReason | None = None
+    """The bounded refusal category, present only on a ``REFUSAL`` failure.
+
+    Set from the provider's own code and sentence and carried on the public
+    error and the settlement argument, so the caller reads the category and
+    the control plane counts refusals by reason without parsing detail."""

@@ -1,6 +1,6 @@
 [project]
 name = "experiential"
-version = "0.7.40"
+version = "0.7.87"
 description = "Build simulations and optimize model routing from agent traces."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -8,7 +8,7 @@ requires-python = ">=3.12"
 dependencies = [
     # Cross-platform advisory locking for durable registries edited in place. Declared directly
     # because `exp.common.core.locks` imports it and Unix-only `fcntl` is not a portable boundary.
-    "exp-gateway-native>=0.3.36,<0.4",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
+    "exp-gateway-native>=0.3.81,<0.4",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
     "filelock>=3.12",
     "typer>=0.16",
     "click>=8.2",  # pins no_args_is_help semantics: help + usage-error exit 2 (<8.2 exited 0)
@@ -26,6 +26,10 @@ dependencies = [
     # Vertex mints OAuth tokens from service-account JSON through Google's official credential
     # library. Imports stay lazy inside the Vertex adapter, mirroring the Bedrock boundary.
     "google-auth>=2.35,<3",
+    # Realistic input-token estimates for per-attempt reservations (free-tier windows and the
+    # paid worst-case ceiling) count the prompt with the o200k BPE instead of a byte bound.
+    "tiktoken>=0.9,<1",
+    "google-re2>=1.1,<2",
 ]
 
 [project.optional-dependencies]
