@@ -711,16 +711,36 @@ def test_persistent_primary_failure_fails_over_to_the_second_deployment(
     assert rows == [(0, 0, "failed"), (1, 0, "failed"), (2, 1, "completed")]
 
 
+def _open_primary_circuit(engine: _ServingEngine) -> None:
+    """Make sure the primary's circuit is open before a scenario that relies on it.
+
+    The failover scenario opens it with two operational failures, but under
+    ``pytest -n --dist worksteal`` a module's tail can land on a worker whose
+    engine never ran that scenario. One ``always-500`` request either opens a
+    cold circuit (two primary failures, then the fallback) or, on an already
+    open one, dispatches straight to the fallback; both leave it open.
+    """
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json=_chat_payload("always-500"),
+        timeout=30.0,
+    )
+    assert response.status_code == 200
+    assert response.headers["x-gateway-route-depth"] == "1"
+
+
 def test_streaming_request_skips_the_open_primary_circuit(
     engine: _ServingEngine,
 ) -> None:
     """An open primary circuit routes a streamed request straight to depth one.
 
-    The previous scenario's two operational failures opened the primary's
-    circuit, so this streamed request dispatches once on the fallback and its
-    committed headers name the winning deployment position before the first
-    byte flows.
+    With the primary's circuit open (the failover scenario's two operational
+    failures, re-established here so the scenario holds on any worker), this
+    streamed request dispatches once on the fallback and its committed headers
+    name the winning deployment position before the first byte flows.
     """
+    _open_primary_circuit(engine)
     collected = b""
     with httpx.stream(
         "POST",
@@ -743,9 +763,11 @@ def test_streaming_request_skips_the_open_primary_circuit(
 def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None:
     """Every accepted request settles: no open attempts, matched totals.
 
-    Runs last in the module (pytest preserves definition order), so it sees
-    the traffic of every scenario above plus its own success probe, which the
-    still-open primary circuit routes to the fallback in one dispatch.
+    Conservation is asserted against the ledger itself, whatever traffic this
+    worker's engine has seen (under ``pytest -n --dist worksteal`` a module's
+    tail may run on a worker that ran only some scenarios): the usage report's
+    request total equals the accepted request rows, every attempt row is
+    terminal, and the report's terminal attempt counts equal the attempt rows.
     """
     response = httpx.post(
         f"{engine.base}/v1/chat/completions",
@@ -755,17 +777,15 @@ def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None
     )
     assert response.status_code == 200
     report = httpx.get(f"{engine.base}/usage.json", timeout=5.0).json()
-    # Eight scenario requests, the integer-timestamp scenario's two, the
-    # output-less continuation scenario's four (two first turns and their two
-    # continuations), and this probe.
-    assert report["totals"]["requests"] == 15
     terminal_attempts = sum(int(count["attempts"]) for count in report["totals"]["terminal_counts"])
     with sqlite3.connect(engine.database_path) as connection:
+        (total_requests,) = connection.execute("SELECT count(*) FROM gateway_requests").fetchone()
         (total_attempts,) = connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()
         (open_attempts,) = connection.execute(
             "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched', 'running')"
         ).fetchone()
+    # At least this probe was accepted and settled in one dispatch.
+    assert total_requests >= 1
+    assert report["totals"]["requests"] == total_requests
     assert open_attempts == 0
-    # Fifteen single-dispatch requests plus the five extra physical attempts
-    # the redial, empty-completion, and failover scenarios spend.
-    assert terminal_attempts == total_attempts == 20
+    assert terminal_attempts == total_attempts >= total_requests
