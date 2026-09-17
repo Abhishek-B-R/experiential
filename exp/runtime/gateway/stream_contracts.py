@@ -11,7 +11,7 @@ from enum import StrEnum
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject
-from exp.common.models.model import ToolCall
+from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ToolCall
 
 
 class GatewayUsage(ContractModel):
@@ -20,7 +20,7 @@ class GatewayUsage(ContractModel):
     Cached-input, cache-write, and reasoning counts are disjoint subsets of
     the total input and output counts when present. They identify differently
     priced portions of those totals and must not be added a second time by
-    callers. ``cache_creation_input_tokens`` is the Anthropic cache-write
+    callers. ``cache_creation_input_tokens`` is the provider cache-write
     surcharge leg; it is disjoint from ``cached_input_tokens`` inside
     ``input_tokens``, so ``fresh = input - cached - cache_creation``.
 
@@ -32,16 +32,26 @@ class GatewayUsage(ContractModel):
     output_tokens: int | None = Field(default=None, ge=0)
     cached_input_tokens: int | None = Field(default=None, ge=0)
     cache_creation_input_tokens: int | None = Field(default=None, ge=0)
-    """Cache-write tokens inside the input total (Anthropic-only today),
+    """Cache-write tokens inside the input total (Anthropic and Bedrock),
     disjoint from the cache-read leg; present only when the provider reported
     a nonzero count."""
+    cache_creation_1h_input_tokens: int | None = Field(default=None, ge=0)
+    """Observed 1-hour subset of cache writes; zero proves all writes use 5m.
+    None means no complete TTL breakdown was reported, so write cost is unknown."""
     reasoning_tokens: int | None = Field(default=None, ge=0)
     tool_names: tuple[str, ...] = ()
     """Invoked tool names in first-use order, names only and never arguments."""
 
     @model_validator(mode="after")
     def _require_complete_tokens_or_tool_names(self) -> GatewayUsage:
-        """Require complete token totals unless this is tool-only terminal metadata."""
+        """Require complete totals and a covering cache-write total for the TTL subset.
+
+        Returns:
+            This validated token or tool-only usage record.
+
+        Raises:
+            ValueError: Totals are incomplete or a TTL subset lacks a covering total.
+        """
         totals = (self.input_tokens, self.output_tokens)
         if (totals[0] is None) != (totals[1] is None):
             raise ValueError("input and output token counts must be reported together")
@@ -49,11 +59,17 @@ class GatewayUsage(ContractModel):
             if (
                 self.cached_input_tokens is not None
                 or self.cache_creation_input_tokens is not None
+                or self.cache_creation_1h_input_tokens is not None
                 or self.reasoning_tokens is not None
             ):
                 raise ValueError("token detail counts require input and output totals")
             if not self.tool_names:
                 raise ValueError("usage requires token totals or invoked tool names")
+        if self.cache_creation_1h_input_tokens is not None and (
+            self.cache_creation_input_tokens is None
+            or self.cache_creation_1h_input_tokens > self.cache_creation_input_tokens
+        ):
+            raise ValueError("1-hour cache writes require a covering cache-creation total")
         return self
 
     @property
@@ -96,12 +112,20 @@ class GatewayEvent(ContractModel):
     redacted_thinking_data: str | None = None
     encrypted_content: str | None = None
     tool_call_index: int | None = Field(default=None, ge=0)
-    tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
+    tool_call_id: str | None = Field(
+        default=None, min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS
+    )
     tool_name: str | None = Field(default=None, min_length=1, max_length=256)
     raw_arguments_delta: str | None = None
     tool_call: ToolCall | None = None
     usage: GatewayUsage | None = None
     failure: GatewayFailure | None = None
+    decision_provider_rejected: bool = Field(default=False, exclude=True, strict=True)
+    """Internal decision settlement evidence that an HTTP rejection preceded execution.
+
+    False leaves unmetered decision work financially unresolved. This is not
+    provider token usage and never joins serialized events or replay identity.
+    """
 
     @model_validator(mode="after")
     def _require_event_payload(self) -> GatewayEvent:
@@ -174,6 +198,12 @@ class GatewayFailureClass(StrEnum):
     # every mode. Distinct from QUOTA_EXCEEDED, the CALLER's gateway credit.
     PROVIDER_QUOTA = "provider_quota"
     REFUSAL = "refusal"
+    # The provider closed the turn as complete and delivered nothing the caller
+    # can receive (an OpenAI empty assistant message; a reasoning-only turn on a
+    # rung whose reasoning the gateway strips). The model's answer to the
+    # request content, like REFUSAL: never a deployment-circuit failure, and a
+    # 400 the SDKs do not auto-retry.
+    EMPTY_COMPLETION = "empty_completion"
     MALFORMED_RESPONSE = "malformed_response"
     PROVIDER_INTERNAL = "provider_internal"
     CANCELLED = "cancelled"
@@ -184,6 +214,24 @@ class GatewayFailureClass(StrEnum):
     # INTERNAL it is not a bug signal and does not page; unlike a provider class
     # it never opens a deployment circuit.
     UNAVAILABLE = "unavailable"
+
+
+class GatewayRefusalReason(StrEnum):
+    """The bounded category of a provider refusal, mirroring the native
+    ``RefusalReason``.
+
+    A refusal answer names WHICH policy declined the content as a closed
+    vocabulary, so a client can branch on it and the control plane can count
+    refusals by reason without parsing the free-form provider detail. The
+    caller never sees the provider's own prose, only the fixed category.
+    """
+
+    CYBER_POLICY = "cyber_policy"
+    CBRN = "cbrn"
+    CONTENT_POLICY = "content_policy"
+    RECITATION = "recitation"
+    DATA_INSPECTION = "data_inspection"
+    UNSPECIFIED = "unspecified"
 
 
 class GatewayFailure(ContractModel):
@@ -199,9 +247,20 @@ class GatewayFailure(ContractModel):
     provider_detail: str | None = Field(default=None, min_length=1, max_length=240)
     """Provider explanation of a client error, relayed only for that class."""
     retry_after_seconds: int | None = Field(default=None, ge=1)
+    """The failure is the caller's own provider configuration: a rejected
+    credential or exhausted account on their customer-managed (BYOK) rung. The
+    class keeps its ladder semantics; the ledger files it as the caller's
+    invalid request and the terminal answer is their 400."""
+    customer_owned: bool = False
     """Known wait before a retry can dispatch (a throttle window's remainder).
 
     When present on a throttled failure, the public mapping advertises this
     value as ``Retry-After`` instead of its fixed default, so the header and
     the message never tell the caller two different waits.
     """
+    refusal_reason: GatewayRefusalReason | None = None
+    """The bounded refusal category, present only on a ``REFUSAL`` failure.
+
+    Set from the provider's own code and sentence and carried on the public
+    error and the settlement argument, so the caller reads the category and
+    the control plane counts refusals by reason without parsing detail."""

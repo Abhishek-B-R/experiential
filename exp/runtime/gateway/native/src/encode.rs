@@ -37,8 +37,10 @@ pub struct ReasoningCarrierToolCall {
     pub raw_arguments: String,
 }
 
+/// Shared by the Chat and Messages encoders: both surfaces retain the same
+/// hidden-reasoning candidate and seal it under the same authority.
 #[derive(Default)]
-struct ReasoningCarrierState {
+pub(crate) struct ReasoningCarrierState {
     route_sha256: Option<String>,
     content: String,
     assistant_content: String,
@@ -48,7 +50,7 @@ struct ReasoningCarrierState {
 }
 
 impl ReasoningCarrierState {
-    fn observe(&mut self, event: &Event) -> Result<(), PublicError> {
+    pub(crate) fn observe(&mut self, event: &Event) -> Result<(), PublicError> {
         match event {
             Event::TextDelta(delta) => self.assistant_content.push_str(delta),
             Event::ReasoningContentDelta {
@@ -118,7 +120,7 @@ impl ReasoningCarrierState {
         Ok(())
     }
 
-    fn candidate(&self) -> Result<Option<ReasoningCarrierCandidate>, PublicError> {
+    pub(crate) fn candidate(&self) -> Result<Option<ReasoningCarrierCandidate>, PublicError> {
         if self.content.is_empty() || self.tool_ids.is_empty() {
             return Ok(None);
         }
@@ -378,7 +380,10 @@ impl ChatSseEncoder {
                 }
                 Ok(Vec::new())
             }
-            Event::Completed | Event::Incomplete | Event::PausedTurn => {
+            Event::Completed
+            | Event::Incomplete
+            | Event::StoppedAtSequence(_)
+            | Event::PausedTurn => {
                 self.terminal = true;
                 let finish_reason = if matches!(event, Event::Incomplete) {
                     "length"
@@ -388,7 +393,9 @@ impl ChatSseEncoder {
                     "stop"
                 };
                 let mut frames = Vec::new();
-                if matches!(event, Event::Completed) && self.reasoning.candidate()?.is_some() {
+                if matches!(event, Event::Completed | Event::StoppedAtSequence(_))
+                    && self.reasoning.candidate()?.is_some()
+                {
                     let carrier = self.reasoning_content_carrier.as_ref().ok_or_else(|| {
                         invalid_provider_stream(
                             "Chat reasoning content was not sealed by the gateway authority.",
@@ -630,7 +637,10 @@ pub fn completed_chat_body_with_carrier(
         "refusal": if refusal.is_empty() { Value::Null } else { Value::String(refusal) },
         "tool_calls": if tool_calls.is_empty() { Value::Null } else { Value::Array(tool_calls) },
     });
-    if matches!(terminal, Event::Completed) && has_tool_calls && reasoning.is_some() {
+    if matches!(terminal, Event::Completed | Event::StoppedAtSequence(_))
+        && has_tool_calls
+        && reasoning.is_some()
+    {
         // A tool turn's reasoning round-trips as the sealed opaque carrier
         // (never raw plaintext — that would be a CoT-injection vector on the
         // way back in), so `reasoning_content` carries the carrier.

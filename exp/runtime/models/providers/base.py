@@ -79,6 +79,16 @@ def completion_timeout_seconds(
     return max(configured_timeout_seconds, min(scaled, MAXIMUM_COMPLETION_TIMEOUT_SECONDS))
 
 
+SERVICE_TIER_DIALECTS = frozenset({"openai_responses", "openai_compatible"})
+"""Wire dialects with a request field that preserves the caller's service tier.
+
+Canonical here (the lowest module both the wire dispatch and the profile share);
+``dialect_dispatch`` re-exports it so existing import paths are unchanged. A tier
+on any other dialect is stripped or declined, so ``forwards_tier`` gates on it to
+keep FORWARD and BILL consistent by construction.
+"""
+
+
 @dataclass(frozen=True)
 class GatewayWireProfile:
     """Everything a gateway data plane needs to dispatch one provider call.
@@ -95,8 +105,8 @@ class GatewayWireProfile:
     url: str
     """Full endpoint URL, including provider-specific query parameters."""
 
-    headers: Mapping[str, str] = field(default_factory=dict)
-    """Authenticated request headers for every dispatch."""
+    headers: Mapping[str, str] = field(default_factory=dict, repr=False)
+    """Authenticated request headers for every dispatch, excluded from diagnostics."""
 
     model_id: str = ""
     """Exact provider model identifier."""
@@ -108,6 +118,24 @@ class GatewayWireProfile:
     """Whether the exact model accepts explicit sampling temperature."""
 
     billing_customer_managed: bool = False
+    service_tier_pricing_enabled: bool = False
+    """Whether this HOST-funded rung may still forward ``service_tier``.
+
+    Normally a host-funded rung strips the tier (the gateway bills catalog
+    rates while a tier changes provider pricing). A model whose catalog carries
+    per-tier PASS-THROUGH pricing sets this so the tier reaches the provider on
+    the house lane too, and settlement bills the REQUESTED tier at that card's
+    cost. BYOK rungs forward regardless (``billing_customer_managed``); this
+    only widens the host-funded case for opted-in models.
+    """
+    service_tier_cards: frozenset[str] = frozenset()
+    """The named tiers this host-funded rung carries a pass-through card for.
+
+    Forwarding is PER-TIER, not lane-level: a mixed route may pair a rung
+    carded for ``flex`` with one that is not, and the tier is emitted only on
+    the candidate that can also BILL it. Populated from the deployment's
+    per-tier price cards; BYOK ignores it (it forwards every tier).
+    """
     forwards_prompt_cache_key: bool = False
     """Whether this rung's provider routes by ``prompt_cache_key``.
 
@@ -176,7 +204,10 @@ class GatewayWireProfile:
     """Exact provider field used to carry normalized reasoning effort."""
 
     reasoning_effort: str | None = None
-    """Optional provider default used when the wire requires an explicit effort."""
+    """The rung's catalog default depth (``reasoning_default_effort``).
+
+    Emitted when the wire requires an explicit effort, and the depth a
+    budget-less caller ``thinking`` config translates to on this rung."""
 
     supported_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
     """Exact caller values declared by this deployment, in canonical order."""
@@ -204,11 +235,47 @@ class GatewayWireProfile:
     category (Tencent/DeepSeek/Anthropic) so the caller sees the model's thinking
     it is already billed for; the round-trip token stays the sealed carrier."""
 
+    deepseek_reasoning_history: bool = False
+    """Whether this rung is DeepSeek's own API, whose thinking mode enforces
+    ``reasoning_content`` on every assistant tool-call turn in the history.
+
+    Origin-derived (``is_deepseek_base_url``), never a catalog stamp: the Chat
+    wire builder replays caller plaintext ``reasoning_content`` verbatim on
+    this rung and backfills an empty string on every assistant message that
+    lacks it — the provider requires the field on each assistant message of
+    the current turn, text-only ones included, and accepts an empty one
+    anywhere (DeepSeek validates presence, not content; verified live
+    2026-09-10).
+    Independent of ``reasoning_output_exposed``, which still decides alone
+    whether the caller SEES the reasoning deltas on output."""
+
+    system_messages_leading_only: bool = False
+    """Whether this rung's chat template accepts a system message ONLY as the
+    very first message.
+
+    The official Qwen3.6+ ``chat_template.jinja`` raises ``System message must
+    be at the beginning.`` for any system turn that is not ``loop.first`` (a
+    second leading system turn included), so a vLLM origin serving it 400s
+    the whole request; coding agents put instruction turns mid-conversation
+    on every tool loop. A catalog stamp (``ModelCapabilities
+    .system_messages_leading_only``), never a hostname rule: the Chat wire
+    builder folds every instruction turn past the first into user text on a
+    declared rung and leaves every other rung's messages untouched."""
+
     token_limit_key: ChatMaxTokensField = "max_tokens"
     """Wire field carrying the output-token ceiling on Chat Completions."""
 
     maximum_output_tokens: int | None = None
     """Largest caller output-token ceiling accepted by this exact model."""
+
+    minimum_output_tokens: int | None = None
+    """Smallest output-token ceiling this rung's provider accepts, when declared.
+
+    Catalog-declared (``GatewayDeploymentCapabilities.minimum_output_tokens``),
+    never derived from the dialect: a caller ceiling below it is floored with
+    disclosure on every surface instead of dispatching a value the provider
+    400s (Perplexity sonar and Sakana fugu via OpenRouter, grok-4.6 on
+    Bedrock all refuse ``max_tokens < 16`` on the Chat wire)."""
 
     signs_request_body: bool = False
     """Whether dispatch headers are computed per request over the exact
@@ -221,9 +288,23 @@ class GatewayWireProfile:
     ``headers``; ``None`` when the connection speaks no embeddings wire, so the
     embeddings surface excludes the rung instead of dispatching a chat URL."""
 
+    decisions_url: str | None = None
+    """Full TypeSafe SystemOne endpoint, absent on non-decision connections."""
+
     images_url: str | None = None
     """Full OpenAI-wire ``/images/generations`` endpoint for this connection,
     sharing ``headers``; ``None`` when the connection speaks no images wire."""
+
+    @property
+    def replays_plaintext_reasoning(self) -> bool:
+        """Whether this rung forwards caller plaintext ``reasoning_content`` verbatim.
+
+        True on an exposure-stamped rung (the caller replays what that rung
+        itself returned) and on DeepSeek's origin, which REQUIRES the field on
+        tool-call history regardless of whether its output is exposed. Route
+        narrowing and the disclosure gate read this, never the two flags apart.
+        """
+        return self.reasoning_output_exposed or self.deepseek_reasoning_history
 
     def __post_init__(self) -> None:
         """Reject malformed operator wire contracts before admission."""
@@ -233,6 +314,7 @@ class GatewayWireProfile:
             "openai_compatible",
             "gemini_generate_content",
             "bedrock_converse_stream",
+            "typesafe_systemone",
         }:
             raise ValueError("gateway wire dialect is not implemented")
         if self.reasoning_wire_format not in {
@@ -308,6 +390,33 @@ class GatewayWireProfile:
             or self.maximum_output_tokens <= 0
         ):
             raise ValueError("gateway wire maximum_output_tokens must be a positive integer")
+
+    @property
+    def forwards_service_tier(self) -> bool:
+        """Whether this rung emits ``service_tier`` to the provider.
+
+        True on BYOK rungs (the caller pays the provider directly) and on
+        host-funded rungs whose model carries per-tier pass-through pricing.
+        """
+        return self.billing_customer_managed or self.service_tier_pricing_enabled
+
+    def forwards_tier(self, tier: str | None) -> bool:
+        """Whether this rung emits and can BILL the SPECIFIC requested ``tier``.
+
+        The single source of truth for FORWARD == BILL: forwarding is per-tier
+        AND requires a tier-capable wire dialect, so the accounting reprice and
+        the payload emission can never diverge. No tier -> False; a dialect with
+        no ``service_tier`` wire field -> False (it would strip or decline);
+        BYOK -> True (the caller pays the provider directly); otherwise the
+        host-funded rung must carry a pass-through card for THAT tier (else it
+        strips the tier and runs the provider default at the base rate —
+        billing-safe and disclosed).
+        """
+        if tier is None or self.dialect not in SERVICE_TIER_DIALECTS:
+            return False
+        if self.billing_customer_managed:
+            return True
+        return self.service_tier_pricing_enabled and tier in self.service_tier_cards
 
 
 class ProviderHttpClient(abc.ABC):

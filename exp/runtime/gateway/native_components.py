@@ -41,9 +41,13 @@ class SyncWriteLedger(Protocol):
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
-        maximum_cost_micro_usd: int | None = None,
+        maximum_cost_nano_usd: int | None = None,
+        reserved_input_tokens: int | None = None,
+        reserved_output_tokens: int | None = None,
         route_reason: str | None = None,
         fallback_reason: str | None = None,
+        dispatch_reason: str | None = None,
+        preferred_deployment: ExactModelDeployment | None = None,
     ) -> AttemptId:
         """Durably mark one provider dispatch before network work."""
         ...
@@ -56,8 +60,19 @@ class SyncWriteLedger(Protocol):
         failure: GatewayFailure | None,
         finalize_request: bool = True,
         first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
     ) -> None:
-        """Durably settle one attempt exactly once."""
+        """Durably settle one attempt exactly once.
+
+        The ``retry_after_seconds`` and ``ratelimit_*`` values are the
+        provider's own rate-limit response headers, normalized, present on
+        successes and failures alike when the data plane harvested any; a
+        hosted ledger persists them per attempt for calibration analytics.
+        """
         ...
 
     def finish_request(

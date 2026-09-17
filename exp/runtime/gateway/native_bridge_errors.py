@@ -12,6 +12,7 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
     GatewayApiSurface.CHAT_COMPLETIONS: {
         "developer_messages": "messages",
         "function_tools": "tools",
+        "forced_tool_choice": "tool_choice",
         "image_input": "messages",
         "image_url_input": "messages",
         "video_input": "messages",
@@ -33,6 +34,7 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
     GatewayApiSurface.RESPONSES: {
         "developer_messages": "instructions",
         "function_tools": "tools",
+        "forced_tool_choice": "tool_choice",
         "image_input": "input",
         "image_url_input": "input",
         "video_input": "input",
@@ -53,6 +55,7 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
     GatewayApiSurface.MESSAGES: {
         "developer_messages": "system",
         "function_tools": "tools",
+        "forced_tool_choice": "tool_choice",
         "image_input": "messages",
         "image_url_input": "messages",
         "video_input": "messages",
@@ -72,6 +75,10 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
 
 
 _ATTACHMENT_CAPABILITY_MESSAGES = {
+    "service_tier": (
+        "This model does not offer a flex or priority processing tier. "
+        "Remove service_tier, or choose a model with tiered pricing enabled."
+    ),
     "image_input": (
         "The selected model route cannot accept image input. "
         "Send text only or choose an image-capable model alias."
@@ -108,6 +115,11 @@ _ATTACHMENT_CAPABILITY_MESSAGES = {
         "The request references media uploaded to a different provider than the "
         "selected model route. Send the media inline or choose a model alias "
         "served by the provider that holds the upload."
+    ),
+    "forced_tool_choice": (
+        "The selected model rejects a forced tool_choice ('required' or a named tool), "
+        "and the gateway will not silently weaken it to 'auto'. Send tool_choice 'auto' "
+        "(the model may still call the tool) or choose a different model alias."
     ),
 }
 """Why an attachment was refused, since the field itself is the caller's message.
@@ -178,3 +190,18 @@ def public_capability_error(
 def escalation(reason: str) -> str:
     """Return a content-free native admission escalation disposition."""
     return json.dumps({"escalate": reason}, separators=(",", ":"))
+
+
+def ledger_capability_message(safe_message: str, public_param: str | None) -> str:
+    """Suffix the public request field onto the ledger's generic capability sentence.
+
+    Args:
+        safe_message: The provider-neutral capability rejection text.
+        public_param: The caller-facing field the public 400 named, if any.
+
+    Returns:
+        The ledger message, with ``(field: <param>)`` appended when known.
+    """
+    if not public_param:
+        return safe_message
+    return f"{safe_message} (field: {public_param})"

@@ -4,10 +4,15 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from exp.runtime.gateway.contracts import GatewayEventKind, GatewayFailureClass
+from exp.runtime.gateway.contracts import (
+    GatewayEventKind,
+    GatewayFailureClass,
+    GatewayRefusalReason,
+)
 from exp.runtime.gateway.native_settlement import (
     _usage_from_payload,  # noqa: PLC2701 - direct unit coverage for normalization.
     first_token_at_from_settlement,
+    settlement_rate_limit,
     terminal_from_settlement,
 )
 
@@ -113,6 +118,67 @@ def test_terminal_from_settlement_normalizes_usage_and_tools() -> None:
     assert terminal.usage.tool_names == ("search", "fetch")
 
 
+def test_all_zero_token_report_on_a_finished_attempt_settles_as_unknown() -> None:
+    """A finished attempt whose provider report is zero everywhere carries no usage.
+
+    The OpenAI lane's truncations intermittently report zero input and zero
+    output tokens for a prompt the provider processed; the ledger must file
+    that as unknown usage, never as an observed free attempt.
+    """
+    zero = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 0,
+    }
+    for outcome in ("completed", "incomplete"):
+        terminal, failure = terminal_from_settlement(
+            {"outcome": outcome, "usage": dict(zero), "tool_names": [], "failure": None}
+        )
+        assert failure is None
+        assert terminal.kind == GatewayEventKind(outcome)
+        assert terminal.usage is None
+
+    # Tool names ride the same usage object and the control plane files any
+    # non-null usage as observed, so an all-zero report drops them too: a
+    # tool call is output the meter should have counted.
+    with_tools, _ = terminal_from_settlement(
+        {"outcome": "incomplete", "usage": dict(zero), "tool_names": ["search"], "failure": None}
+    )
+    assert with_tools.usage is None
+
+
+def test_partial_zero_reports_and_failed_zero_reports_stay_observed() -> None:
+    """Only the all-zero FINISHED report is demoted; every other shape is kept verbatim."""
+    # A truncation that processed the prompt but produced nothing (OpenRouter
+    # codex lanes at a 16-token budget) is a real observation.
+    input_only, _ = terminal_from_settlement(
+        {
+            "outcome": "incomplete",
+            "usage": {"input_tokens": 13, "output_tokens": 0, "reasoning_tokens": 0},
+            "tool_names": [],
+            "failure": None,
+        }
+    )
+    assert input_only.usage is not None
+    assert input_only.usage.input_tokens == 13
+    assert input_only.usage.output_tokens == 0
+
+    # A failed terminal's zeros settle at nothing either way and a billed
+    # refusal keys on positive counts, so the report is kept as sent.
+    failed, failure = terminal_from_settlement(
+        {
+            "outcome": "failed",
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "tool_names": [],
+            "failure": {"failure_class": "provider_internal", "safe_message": "boom"},
+        }
+    )
+    assert failure is not None
+    assert failed.usage is not None
+    assert failed.usage.input_tokens == 0
+
+
 def test_terminal_from_settlement_normalizes_failure() -> None:
     """Failed payloads attach the sanitized failure to the terminal."""
     terminal, failure = terminal_from_settlement(
@@ -165,3 +231,147 @@ def test_terminal_from_settlement_carries_the_provider_detail() -> None:
     )
     assert blank is not None
     assert blank.provider_detail is None
+
+
+def test_terminal_from_settlement_carries_the_refusal_reason() -> None:
+    """A refusal settlement threads the bounded category through, and an
+    unknown token fails closed to None instead of raising."""
+    _terminal, failure = terminal_from_settlement(
+        {
+            "outcome": "failed",
+            "usage": None,
+            "tool_names": [],
+            "failure": {
+                "failure_class": "refusal",
+                "safe_message": "provider refused the request: cybersecurity policy",
+                "refusal_reason": "cyber_policy",
+            },
+        }
+    )
+    assert failure is not None
+    assert failure.refusal_reason is GatewayRefusalReason.CYBER_POLICY
+
+    _t, unknown = terminal_from_settlement(
+        {
+            "outcome": "failed",
+            "usage": None,
+            "tool_names": [],
+            "failure": {
+                "failure_class": "refusal",
+                "safe_message": "provider refused the request",
+                "refusal_reason": "reason_a_stale_worker_does_not_know",
+            },
+        }
+    )
+    assert unknown is not None
+    assert unknown.refusal_reason is None
+
+
+def test_customer_owned_failures_settle_as_the_callers_invalid_request() -> None:
+    """A BYOK credential failure keeps its ladder class in the data plane but files client-side."""
+    terminal, failure = terminal_from_settlement(
+        {
+            "outcome": "failed",
+            "failure": {
+                "failure_class": "provider_authentication",
+                "safe_message": "your connected openai credential was rejected by the provider",
+                "customer_owned": True,
+            },
+        }
+    )
+    assert failure is not None
+    assert failure.failure_class == GatewayFailureClass.INVALID_REQUEST
+    assert failure.safe_message.startswith("your connected openai credential")
+    assert terminal.failure is failure
+
+    _terminal, house = terminal_from_settlement(
+        {
+            "outcome": "failed",
+            "failure": {
+                "failure_class": "provider_authentication",
+                "safe_message": "provider authentication failed",
+            },
+        }
+    )
+    assert house is not None
+    assert house.failure_class == GatewayFailureClass.PROVIDER_AUTHENTICATION
+
+
+def test_throttled_settlement_takes_retry_after_from_harvested_headers() -> None:
+    """A throttled failure without its own wait borrows the header's wait."""
+    _terminal, failure = terminal_from_settlement(
+        {
+            "outcome": "failed",
+            "failure": {
+                "failure_class": "throttled",
+                "safe_message": "provider throttled the request",
+            },
+            "rate_limit_headers": {"retry-after": "3600"},
+        }
+    )
+    assert failure is not None
+    assert failure.retry_after_seconds == 3_600
+
+
+def test_failure_payloads_own_retry_after_wins_over_the_headers() -> None:
+    """A wait the failure payload names is kept verbatim."""
+    _terminal, failure = terminal_from_settlement(
+        {
+            "outcome": "failed",
+            "failure": {
+                "failure_class": "throttled",
+                "safe_message": "provider throttled the request",
+                "retry_after_seconds": 42,
+            },
+            "rate_limit_headers": {"retry-after": "3600"},
+        }
+    )
+    assert failure is not None
+    assert failure.retry_after_seconds == 42
+
+
+def test_non_throttled_failures_never_borrow_a_retry_after() -> None:
+    """Only the throttled class reads the harvested wait; garbage stays None."""
+    _terminal, failure = terminal_from_settlement(
+        {
+            "outcome": "failed",
+            "failure": {
+                "failure_class": "provider_internal",
+                "safe_message": "provider service failed",
+            },
+            "rate_limit_headers": {"retry-after": "3600"},
+        }
+    )
+    assert failure is not None
+    assert failure.retry_after_seconds is None
+    _terminal, garbled = terminal_from_settlement(
+        {
+            "outcome": "failed",
+            "failure": {
+                "failure_class": "throttled",
+                "safe_message": "provider throttled the request",
+                "retry_after_seconds": "soon",
+            },
+            "rate_limit_headers": {"retry-after": "eventually"},
+        }
+    )
+    assert garbled is not None
+    assert garbled.retry_after_seconds is None
+
+
+def test_settlement_rate_limit_reads_the_optional_header_map() -> None:
+    """The typed observation parses when present and stays empty when absent."""
+    observation = settlement_rate_limit(
+        {
+            "outcome": "completed",
+            "rate_limit_headers": {
+                "anthropic-ratelimit-requests-limit": "10000",
+                "anthropic-ratelimit-requests-remaining": "9500",
+                "retry-after": "7",
+            },
+        }
+    )
+    assert observation.limit_requests == 10_000
+    assert observation.remaining_requests == 9_500
+    assert observation.retry_after_seconds == 7
+    assert settlement_rate_limit({"outcome": "completed"}).is_empty

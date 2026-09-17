@@ -56,6 +56,12 @@ def _resolved_wire_profile(
             profile,
             model_id=profile.model_id or runtime_model.snapshot.model_id,
             billing_customer_managed=(deployment.billing_source == BillingSource.CUSTOMER_MANAGED),
+            service_tier_pricing_enabled=capabilities.service_tier_pricing_enabled,
+            service_tier_cards=frozenset(
+                tier
+                for tier in ("flex", "priority")
+                if deployment.gateway.prices.service_tier(tier) is not None
+            ),
             minimum_temperature=(
                 max(profile.minimum_temperature, capabilities.minimum_temperature)
                 if capabilities.minimum_temperature is not None
@@ -101,6 +107,11 @@ def _resolved_wire_profile(
             ),
             token_limit_key=capabilities.chat_max_tokens_field or profile.token_limit_key,
             maximum_output_tokens=min(output_limits) if output_limits else None,
+            # The provider's output-token floor is a catalog lane fact the
+            # client profile cannot know (a relay serves floored and unfloored
+            # models on one wire); the deployment declaration is the only
+            # source, so it is carried, never intersected.
+            minimum_output_tokens=gateway_capabilities.minimum_output_tokens,
         )
     raise TypeError(
         f"provider {deployment.provider!r} resolved to a client without a native wire profile"

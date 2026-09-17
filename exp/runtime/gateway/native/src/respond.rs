@@ -12,12 +12,74 @@ use bytes::Bytes;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::encode::compact_json;
+use crate::encode::{chat_data, compact_json, ChatSseEncoder};
+use crate::encode_responses::ResponsesSseEncoder;
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::relay::remaining;
 use crate::replay::{CachedResponse, OwnerLease};
 use crate::settlement::AttemptGuard;
+
+/// Build a chat encoder's sanitized failure frame and done sentinel when the
+/// stream has not already reached a terminal.
+pub(crate) fn failure_frames(encoder: &mut ChatSseEncoder, failure: &Failure) -> Vec<Bytes> {
+    if encoder.saw_terminal() {
+        return Vec::new();
+    }
+    encoder
+        .feed(&Event::Failed(failure.clone()))
+        .unwrap_or_else(|_| {
+            vec![
+                chat_data(&failure.public_error().json_body()),
+                "data: [DONE]\n\n".to_string(),
+            ]
+        })
+        .into_iter()
+        .map(Bytes::from)
+        .collect()
+}
+
+/// Emit the Responses encoder's sanitized failure lifecycle when the stream
+/// has not already reached a terminal.
+pub(crate) async fn emit_responses_failure(
+    sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
+    deadline: Instant,
+    encoder: &mut ResponsesSseEncoder,
+    failure: &Failure,
+) {
+    if encoder.saw_terminal() {
+        return;
+    }
+    let frames = encoder
+        .feed(&Event::Failed(failure.clone()))
+        .unwrap_or_default();
+    for frame in frames {
+        if !send_bounded(sender, deadline, Bytes::from(frame)).await {
+            return;
+        }
+    }
+}
+
+/// Return the event the caller should see, tracking visible refusal text.
+///
+/// A typed refusal that follows refusal text the caller already saw closes
+/// the stream publicly; the ledger still records the provider's refusal.
+pub(crate) fn outward_event(event: &Event, visible_refusal: &mut bool) -> Event {
+    if matches!(
+        event,
+        Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
+    ) {
+        *visible_refusal = true;
+    }
+    match event {
+        Event::Failed(failure)
+            if failure.failure_class == FailureClass::Refusal && *visible_refusal =>
+        {
+            Event::Completed
+        }
+        other => other.clone(),
+    }
+}
 
 /// Largest accepted request body on every native-served route. Bounded so
 /// one client cannot hold unbounded gateway memory; far above any real chat
@@ -96,6 +158,28 @@ pub(crate) fn bearer_key(headers: &HeaderMap) -> Result<String, PublicError> {
         return Err(PublicError::invalid_key());
     }
     Ok(trimmed.to_string())
+}
+
+/// Resolve the caller IP from the TRUSTED proxy hop for per-key IP enforcement:
+/// `X-Real-IP` when present, else the RIGHTMOST `X-Forwarded-For` entry. The
+/// leftmost XFF token is client-forgeable per request, so it is never trusted;
+/// the rightmost entry is the one our own ingress appended. Content-free (an
+/// address), decoded latin-1 like every other header. `None` when no trusted hop
+/// yields a non-empty address — the hosted authority then treats the IP as
+/// unknown (an allowlist fails closed, a denylist open).
+pub(crate) fn client_ip(headers: &HeaderMap) -> Option<String> {
+    if let Some(real) = latin1_header(headers, "x-real-ip") {
+        let trimmed = real.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    let forwarded = latin1_header_list(headers, "x-forwarded-for")?;
+    forwarded
+        .rsplit(',')
+        .map(str::trim)
+        .find(|token| !token.is_empty())
+        .map(str::to_string)
 }
 
 /// Read one request body under the shared explicit cap.
@@ -356,5 +440,45 @@ mod tests {
             latin1_header_list(&headers, "anthropic-beta").as_deref(),
             Some("context-1m-2025-08-07")
         );
+    }
+
+    #[test]
+    fn client_ip_prefers_x_real_ip() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-real-ip", "203.0.113.7".parse().unwrap());
+        headers.append("x-forwarded-for", "10.0.0.1, 198.51.100.9".parse().unwrap());
+        assert_eq!(client_ip(&headers).as_deref(), Some("203.0.113.7"));
+    }
+
+    #[test]
+    fn client_ip_takes_the_rightmost_forwarded_entry() {
+        // The leftmost token is client-forgeable; the rightmost is our ingress's.
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "x-forwarded-for",
+            "1.2.3.4, 10.0.0.1, 198.51.100.9".parse().unwrap(),
+        );
+        assert_eq!(client_ip(&headers).as_deref(), Some("198.51.100.9"));
+    }
+
+    #[test]
+    fn client_ip_takes_the_rightmost_across_repeated_lines() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        headers.append("x-forwarded-for", "198.51.100.9".parse().unwrap());
+        assert_eq!(client_ip(&headers).as_deref(), Some("198.51.100.9"));
+    }
+
+    #[test]
+    fn client_ip_is_none_without_a_trusted_hop() {
+        assert_eq!(client_ip(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn client_ip_skips_a_blank_real_ip_and_trailing_forwarded_commas() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-real-ip", "   ".parse().unwrap());
+        headers.append("x-forwarded-for", "203.0.113.7, ".parse().unwrap());
+        assert_eq!(client_ip(&headers).as_deref(), Some("203.0.113.7"));
     }
 }
