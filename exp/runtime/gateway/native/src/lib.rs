@@ -260,7 +260,7 @@ fn metrics_snapshot_json() -> String {
 fn encode_responses_fixture(
     request_id: &str,
     model: &str,
-    created_at: f64,
+    created_at: i64,
     envelope_json: &str,
     events_json: &str,
 ) -> PyResult<Vec<String>> {
@@ -288,7 +288,7 @@ fn encode_responses_fixture(
 fn completed_responses_fixture(
     request_id: &str,
     model: &str,
-    created_at: f64,
+    created_at: i64,
     envelope_json: &str,
     events_json: &str,
 ) -> PyResult<String> {
