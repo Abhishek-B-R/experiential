@@ -63,14 +63,14 @@ def encode_chat_fixture(
 def encode_responses_fixture(
     request_id: str,
     model: str,
-    created_at: float,
+    created_at: int,
     envelope_json: str,
     events_json: str,
 ) -> list[str]: ...
 def completed_responses_fixture(
     request_id: str,
     model: str,
-    created_at: float,
+    created_at: int,
     envelope_json: str,
     events_json: str,
 ) -> str: ...

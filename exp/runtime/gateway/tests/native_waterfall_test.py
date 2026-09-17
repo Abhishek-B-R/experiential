@@ -600,6 +600,43 @@ def test_keyed_responses_replays_the_owner_response_exactly(
     assert rows == [(0, 0, "completed")]
 
 
+def test_responses_timestamps_are_integer_seconds(engine: _ServingEngine) -> None:
+    """Responses bodies and every stream envelope carry integer epoch seconds.
+
+    api.openai.com emits ``created_at`` and ``completed_at`` as integers, and
+    strict typed clients (Goose's Rust Responses decoder) reject a float.
+    """
+    headers = {"authorization": f"Bearer {engine.raw_key}"}
+    before = int(time.time())
+    plain = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers=headers,
+        json={"model": "coding", "input": "hello"},
+        timeout=30.0,
+    )
+    assert plain.status_code == 200, plain.text
+    body = plain.json()
+    assert type(body["created_at"]) is int and body["created_at"] >= before
+    assert type(body["completed_at"]) is int and body["completed_at"] == body["created_at"]
+
+    streamed = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers=headers,
+        json={"model": "coding", "input": "hello", "stream": True},
+        timeout=30.0,
+    )
+    assert streamed.status_code == 200, streamed.text
+    envelopes = [
+        json.loads(line[len("data: ") :])["response"]
+        for line in streamed.text.splitlines()
+        if line.startswith("data: ") and '"response":' in line
+    ]
+    assert envelopes and envelopes[-1]["status"] == "completed"
+    for envelope in envelopes:
+        assert type(envelope["created_at"]) is int, envelope
+        assert envelope["completed_at"] is None or type(envelope["completed_at"]) is int
+
+
 @pytest.mark.parametrize("stream", [False, True], ids=["json", "sse"])
 def test_output_less_incomplete_response_stays_continuable(
     engine: _ServingEngine, stream: bool
@@ -718,9 +755,10 @@ def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None
     )
     assert response.status_code == 200
     report = httpx.get(f"{engine.base}/usage.json", timeout=5.0).json()
-    # Eight scenario requests, the output-less continuation scenario's four
-    # (two first turns and their two continuations), and this probe.
-    assert report["totals"]["requests"] == 13
+    # Eight scenario requests, the integer-timestamp scenario's two, the
+    # output-less continuation scenario's four (two first turns and their two
+    # continuations), and this probe.
+    assert report["totals"]["requests"] == 15
     terminal_attempts = sum(int(count["attempts"]) for count in report["totals"]["terminal_counts"])
     with sqlite3.connect(engine.database_path) as connection:
         (total_attempts,) = connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()
@@ -728,6 +766,6 @@ def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None
             "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched', 'running')"
         ).fetchone()
     assert open_attempts == 0
-    # Thirteen single-dispatch requests plus the five extra physical attempts
+    # Fifteen single-dispatch requests plus the five extra physical attempts
     # the redial, empty-completion, and failover scenarios spend.
-    assert terminal_attempts == total_attempts == 18
+    assert terminal_attempts == total_attempts == 20
