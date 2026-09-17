@@ -33,6 +33,7 @@ from exp.common.core.files import write_text_atomic
 from exp.common.models.bedrock_connection import require_bedrock_connection_shape
 from exp.common.models.catalog_roles import ModelRoles
 from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
+from exp.common.models.failover_tokens import FailoverToken
 from exp.common.models.gateway_pools import GatewayPoolRecord
 from exp.common.models.model import (
     BillingSource,
@@ -483,6 +484,14 @@ class GatewayDeploymentCapabilities(ContractModel):
     bytes divided by four; an allowance heuristic, never a billing quantity).
     ``None`` uses the serving configuration's default; ``0`` disables scaling
     for this deployment.
+    """
+    failover_only_on: tuple[FailoverToken, ...] | None = None
+    """Failure tokens this rung serves as a failover for, or ``None`` for an unrestricted rung.
+
+    A rung carrying a set is never dialed first and is dialed as a successor only
+    when the failure being failed over from spells one of its tokens (see
+    ``exp.common.models.failover_tokens``); a rule-carrying rung reached that way
+    records ``fallback_reason = failover_only_on:<token>``.
     """
 
     @property

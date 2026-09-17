@@ -679,6 +679,28 @@ def test_wire_entry_carries_emulated_stop_sequences_for_the_data_plane() -> None
     assert default["stop_sequences"] == []
 
 
+def test_wire_entry_carries_the_rungs_failover_only_on_tokens() -> None:
+    """A failover-only rung's entry lists its tokens; an unrestricted rung carries null."""
+    route = _route()
+    profile = GatewayWireProfile(dialect="openai_responses", url="https://provider.test")
+    assert deployment_wire_entry(route, route.deployment, profile, {})["failover_only_on"] is None
+    restricted = route.deployment.model_copy(
+        update={
+            "gateway": route.deployment.gateway.model_copy(
+                update={
+                    "capabilities": route.deployment.gateway.capabilities.model_copy(
+                        update={"failover_only_on": ("refusal:cyber_policy", "throttled")}
+                    )
+                }
+            )
+        }
+    )
+    assert deployment_wire_entry(route, restricted, profile, {})["failover_only_on"] == [
+        "refusal:cyber_policy",
+        "throttled",
+    ]
+
+
 def test_wire_entry_names_customer_managed_billing_for_the_data_plane() -> None:
     """A BYOK rung's entry says so, so the data plane re-owns credential failures."""
     route = _route()

@@ -227,7 +227,7 @@ async fn run_ladder(
                 let boundary = failure.clone().boundary();
                 let possible = successor_possible(
                     policy,
-                    admission.route.len(),
+                    &admission.route,
                     deadline,
                     total_attempts,
                     counts[depth],
