@@ -653,38 +653,37 @@ class GatewayRequest(ContractModel):
     provider_output_config: JsonObject | None = Field(default=None, exclude=True)
     """Verbatim caller ``output_config`` from the Messages surface.
 
-    Anthropic's native output configuration (Claude Code sends
-    ``{"effort": ...}`` by default). A canonical ``effort`` value also maps
-    into ``reasoning_effort`` so the shared effort machinery applies; the
-    raw object forwards byte-for-byte on Anthropic rungs with caller keys
-    winning over engine-derived ones. Excluded from serialization like the
-    other Anthropic-only carriers; a present value joins replay identity
-    through :func:`canonical_request_sha256`.
+    Anthropic's native output configuration (Claude Code sends ``{"effort":
+    ...}``); a canonical ``effort`` also maps into ``reasoning_effort``. The
+    raw object forwards byte-for-byte on Anthropic rungs, caller keys winning.
+    Excluded from serialization like the other Anthropic-only carriers; a
+    present value joins replay identity through :func:`canonical_request_sha256`.
     """
     provider_native_tools: tuple[GatewayProviderNativeTool, ...] = Field(default=(), exclude=True)
     """Verbatim non-function OpenAI Responses tool declarations.
 
-    See :class:`GatewayProviderNativeTool`. Rungs that are not native
-    Responses cannot serve these, so route admission rejects by name instead
-    of silently dropping a capability the caller asked for. Excluded from
-    serialization like the other carriers so declaration-free digests are
-    unperturbed; present entries join replay identity through
+    See :class:`GatewayProviderNativeTool`. Non-Responses rungs cannot serve
+    these, so admission rejects by name. Excluded from serialization like the
+    other carriers; present entries join replay identity through
     :func:`canonical_request_sha256`.
     """
     provider_server_tools: tuple[JsonObject, ...] = Field(default=(), exclude=True)
     """Verbatim Anthropic server-tool entries from the Messages ``tools`` array.
 
-    Server tools (``web_search_20250305``-style typed entries with no
-    ``input_schema``) execute at the provider; their per-type configuration
-    is an evolving provider surface, so each entry is validated shallowly at
-    decode and re-emitted byte-for-byte AFTER the converted custom tools on
-    native Anthropic rungs only (an accepted ordering deviation from the
-    caller's interleaving). Other rungs cannot execute them, so route
-    admission rejects by name instead of silently dropping a capability the
-    caller asked for. Excluded from serialization like the other carriers so
-    server-tool-free digests are unperturbed; present entries join replay
-    identity through :func:`canonical_request_sha256`.
+    Typed entries with no ``input_schema`` execute at the provider; validated
+    shallowly at decode and re-emitted byte-for-byte AFTER the converted custom
+    tools on native Anthropic rungs only. Other rungs cannot execute them, so
+    admission rejects by name. Excluded from serialization like the other
+    carriers; present entries join replay identity through
+    :func:`canonical_request_sha256`.
     """
+    # `provider: {"zdr": true}`: the caller demanded ZDR routing. Tightening
+    # only: the host applies its require_zdr posture filter to this request and
+    # refuses with the same 403 when no rung qualifies. Part of identity.
+    zdr_requested: bool = False
+    # Verbatim caller `provider` object: forwarded to OpenRouter rungs (tightened
+    # when the rung is constrained), dropped on every other wire.
+    provider_preferences: JsonObject | None = Field(default=None, exclude=True)
     stream: bool = False
     include_usage: bool = False
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
@@ -961,6 +960,9 @@ class AuthorizationSnapshot(ContractModel):
     and never a credential; ``None`` when no trusted hop yields an address (an
     allowlist then fails closed, a denylist open). 45 chars fits any IPv6 form."""
     fair_share_weight: int = Field(default=1, ge=1, le=1_000_000)
+    # The request demanded ZDR routing (GatewayRequest.zdr_requested), carried
+    # here so every resolver entry point can tighten the org's posture filter.
+    zdr_requested: bool = False
     """Relative weight of this organization for fair-share rung admission.
 
     Populated by the hosted store's ``authorize_request`` from its own org data
@@ -991,9 +993,6 @@ class ExecutionSnapshot(ContractModel):
     # per-attempt decision can honor a post-backoff redial. ``None`` keeps
     # throttles failover-only.
     throttle_redial: GatewayThrottleRedialPolicy | None = None
-    # Rungs the host flagged for OpenRouter's per-request zero-data-retention
-    # constraint (an org requiring ZDR on a rung that is ZDR only on request):
-    # eligibility stays the host's; the dispatch builder tightens each flagged
-    # rung's payload and header, and fails closed on a wire that cannot. Empty
-    # on ordinary routes; ids outside deployment_ids are ignored.
+    # Rungs the host flagged for OpenRouter's per-request ZDR constraint; the
+    # dispatch builder tightens each and fails closed on a wire that cannot.
     zdr_constrained_deployment_ids: tuple[DeploymentId, ...] = ()

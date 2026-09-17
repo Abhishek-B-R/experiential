@@ -69,6 +69,7 @@ from exp.runtime.gateway.contracts import (
     RedactedThinkingBlock,
     ThinkingBlock,
 )
+from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import disposition_map
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
@@ -300,6 +301,8 @@ class _MessagesRequest(AnthropicWireModel):
     rungs, and dropped with disclosure elsewhere: a cache hint changes
     cost, not semantics."""
     inference_geo: str | None = Field(default=None, min_length=1, max_length=64)
+    provider: ProviderRoutingPreferences | None = None
+    """The gateway's cross-surface ZDR demand / OpenRouter routing preferences."""
     """Inference-region selector, forwarded verbatim (accepted live without
     a beta, 2026-08-30). Bounded but deliberately not enumerated: the
     region set is an evolving provider surface."""
@@ -458,6 +461,10 @@ def _decode(
             inference_geo=request.inference_geo,
             provider_beta_tokens=forwarded_betas,
             ignored_parameters=(*dropped_beta_disclosures, *channels.disclosures),
+            zdr_requested=request.provider is not None and request.provider.demands_zdr,
+            provider_preferences=(
+                cast(JsonObject, payload["provider"]) if request.provider is not None else None
+            ),
             reasoning_effort=channels.effort,
             reasoning_effort_parameter=channels.effort_parameter,
             provider_output_config=channels.output_config,

@@ -16,7 +16,9 @@ the response, which the data plane records per attempt as the settlement's
 
 from __future__ import annotations
 
-from typing import Final
+from typing import Final, Literal
+
+from pydantic import BaseModel, ConfigDict, StrictBool
 
 from exp.common.core.artifacts import JsonObject, JsonValue
 
@@ -29,6 +31,47 @@ OPENROUTER_METADATA_ENABLED: Final = "enabled"
 
 ZDR_PROVIDER_PREFERENCES: Final[JsonObject] = {"zdr": True, "data_collection": "deny"}
 """The strict values the constraint forces onto ``payload["provider"]``."""
+
+
+class ProviderRoutingPreferences(BaseModel):
+    """The caller's top-level ``provider`` object, OpenRouter's routing-preference shape.
+
+    Accepted on every gateway surface (Chat Completions, Responses, Messages).
+    ``zdr: true`` is the one field the gateway acts on itself: it DEMANDS
+    zero-data-retention routing for the request (the host's route filter
+    applies the same posture filter as an organization ``require_zdr``, and
+    the request can only tighten an organization policy, never loosen it).
+    Every other key (``data_collection``, ``order``, ``only``, ...) is
+    forwarded to OpenRouter rungs verbatim, tightened by the constraint when
+    the route is constrained, and dropped on every other wire, which has no
+    such field.
+    """
+
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+    zdr: StrictBool | None = None
+    data_collection: Literal["allow", "deny"] | None = None
+
+    @property
+    def demands_zdr(self) -> bool:
+        """Whether the caller demanded zero-data-retention routing."""
+        return self.zdr is True
+
+
+def forward_provider_preferences(payload: JsonObject, preferences: JsonObject) -> JsonObject:
+    """Return ``payload`` carrying the caller's ``provider`` object for an OpenRouter rung.
+
+    Args:
+        payload: A built Chat Completions payload for an OpenRouter rung.
+        preferences: The caller's validated ``provider`` object.
+
+    Returns:
+        A new payload whose ``provider`` is a copy of ``preferences``; the
+        constraint (:func:`constrain_openrouter_zero_data_retention`) tightens
+        on top when the rung is flagged. The input is never mutated.
+    """
+    forwarded: JsonValue = dict(preferences)
+    return {**payload, "provider": forwarded}
 
 
 def constrain_openrouter_zero_data_retention(payload: JsonObject) -> JsonObject:

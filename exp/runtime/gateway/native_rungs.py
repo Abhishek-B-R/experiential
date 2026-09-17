@@ -40,6 +40,7 @@ from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.openrouter_routing import (
     OPENROUTER_PROVIDER_ID,
     constrain_openrouter_zero_data_retention,
+    forward_provider_preferences,
     openrouter_metadata_headers,
 )
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
@@ -93,6 +94,12 @@ def build_rung_dispatch(
         provider_request, deployment.gateway.capabilities
     )
     upstream_payload = dialect_stream_payload(profile, rung_request)
+    if rung_request.provider_preferences is not None and _openrouter_wire(deployment, profile):
+        # The caller's routing preferences reach the one wire that defines
+        # them; every other dialect's builder never emits the field.
+        upstream_payload = forward_provider_preferences(
+            upstream_payload, rung_request.provider_preferences
+        )
     request_headers = (
         anthropic_request_headers(dict(profile.headers), rung_request)
         if profile.dialect == "anthropic_messages"
@@ -167,9 +174,14 @@ def zdr_constrained_dispatch(
             wire, so no request field can express the constraint; the request
             fails closed rather than dispatching to a retaining upstream.
     """
-    if deployment.provider != OPENROUTER_PROVIDER_ID or profile.dialect != "openai_compatible":
+    if not _openrouter_wire(deployment, profile):
         raise ProviderCapabilityError(capability=ZDR_CONSTRAINT_CAPABILITY)
     return (
         constrain_openrouter_zero_data_retention(upstream_payload),
         openrouter_metadata_headers(dict(profile.headers)),
     )
+
+
+def _openrouter_wire(deployment: ExactModelDeployment, profile: GatewayWireProfile) -> bool:
+    """Whether this rung is OpenRouter's Chat Completions wire (the only ``provider`` field)."""
+    return deployment.provider == OPENROUTER_PROVIDER_ID and profile.dialect == "openai_compatible"

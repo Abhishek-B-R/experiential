@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models.catalog import GatewayDeploymentCapabilities, GatewayDeploymentMetadata
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
@@ -88,13 +89,14 @@ def _profile(dialect: str = "openai_compatible") -> GatewayWireProfile:
     )
 
 
-def _request() -> GatewayRequest:
-    """One streaming chat request."""
+def _request(preferences: JsonObject | None = None) -> GatewayRequest:
+    """One streaming chat request, optionally carrying a caller ``provider`` object."""
     return GatewayRequest(
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
         messages=(GatewayMessage(role="user", content="hi"),),
         stream=True,
         include_usage=True,
+        provider_preferences=None if preferences is None else dict(preferences),
     )
 
 
@@ -106,14 +108,19 @@ class _NoSigningClient:
         return _profile()
 
 
-def _dispatch(route: GatewayRoute, deployment: ExactModelDeployment) -> RungDispatch:
+def _dispatch(
+    route: GatewayRoute,
+    deployment: ExactModelDeployment,
+    preferences: JsonObject | None = None,
+    dialect: str = "openai_compatible",
+) -> RungDispatch:
     """Freeze one rung of ``route`` for the fixture request."""
-    request = _request()
+    request = _request(preferences)
     client: NativeWireClient = _NoSigningClient()
     return build_rung_dispatch(
         route,
         deployment,
-        _profile(),
+        _profile(dialect),
         client,
         provider_request=request,
         public_request=request,
@@ -172,3 +179,36 @@ def test_a_flagged_rung_on_another_wire_fails_closed() -> None:
         _dispatch(_route((rung,), constrained=("fw-rung",)), rung)
 
     assert excinfo.value.capability == ZDR_CONSTRAINT_CAPABILITY
+
+
+def test_caller_provider_preferences_forward_to_openrouter_and_tighten_under_the_flag() -> None:
+    """The caller object reaches OpenRouter verbatim; a flagged rung tightens it, never loosens."""
+    rung = _deployment("or-rung", "openrouter")
+    preferences: JsonObject = {
+        "zdr": False,
+        "data_collection": "allow",
+        "order": ["Azure"],
+    }
+
+    plain = _dispatch(_route((rung,)), rung, preferences).wire_entry
+    tight = _dispatch(_route((rung,), constrained=("or-rung",)), rung, preferences).wire_entry
+
+    plain_payload = plain["upstream_payload"]
+    assert isinstance(plain_payload, dict)
+    assert plain_payload["provider"] == preferences
+    tight_payload = tight["upstream_payload"]
+    assert isinstance(tight_payload, dict)
+    assert tight_payload["provider"] == {
+        "zdr": True,
+        "data_collection": "deny",
+        "order": ["Azure"],
+    }
+
+
+def test_caller_provider_preferences_are_dropped_on_wires_without_the_field() -> None:
+    """A non-OpenRouter compatible rung never sees the object; other dialects have no field."""
+    rung = _deployment("fw-rung", "fireworks")
+    entry = _dispatch(_route((rung,)), rung, {"zdr": True, "order": ["Azure"]}).wire_entry
+    payload = entry["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert "provider" not in payload

@@ -4629,3 +4629,53 @@ def test_chat_decoder_rejects_misplaced_or_malformed_reasoning_details() -> None
             }
         )
     assert unknown.value.detail.param == "messages.0.compaction"
+
+
+def test_provider_zdr_demand_decodes_on_both_openai_surfaces() -> None:
+    """``provider: {"zdr": true}`` sets the demand; other keys ride along verbatim."""
+    chat = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "provider": {"zdr": True, "data_collection": "deny", "order": ["Azure"]},
+        }
+    ).request
+    assert chat.zdr_requested is True
+    assert chat.provider_preferences == {
+        "zdr": True,
+        "data_collection": "deny",
+        "order": ["Azure"],
+    }
+    responses = decode_responses(
+        {"model": "coding", "input": "hi", "provider": {"zdr": True}}
+    ).request
+    assert responses.zdr_requested is True
+    assert responses.provider_preferences == {"zdr": True}
+    # Preferences without the demand are carried but demand nothing.
+    plain = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "provider": {"data_collection": "deny"},
+        }
+    ).request
+    assert plain.zdr_requested is False
+    assert plain.provider_preferences == {"data_collection": "deny"}
+    # No object: no demand, nothing to forward.
+    bare = decode_chat({"model": "coding", "messages": [{"role": "user", "content": "hi"}]}).request
+    assert bare.zdr_requested is False
+    assert bare.provider_preferences is None
+
+
+def test_provider_object_is_validated_where_the_gateway_reads_it() -> None:
+    """A non-boolean zdr or an unknown data_collection value is a 400, not a silent pass."""
+    for provider in ({"zdr": "yes"}, {"data_collection": "maybe"}, "Azure"):
+        with pytest.raises(OpenAIProtocolError) as captured:
+            decode_chat(
+                {
+                    "model": "coding",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "provider": provider,
+                }
+            )
+        assert captured.value.status_code == 400
