@@ -17,6 +17,30 @@ use crate::encode::compact_json;
 use crate::errors::{Failure, FailureClass};
 use crate::events::Usage;
 use crate::metrics::METRICS;
+use crate::replay::OwnerLease;
+use crate::waterfall::CommittedAttempt;
+
+/// Settle one guarded attempt as failed and release its owner lease.
+pub(crate) async fn settle_guarded_failure(
+    guard: &mut AttemptGuard,
+    committed: &mut CommittedAttempt,
+    lease: &mut Option<OwnerLease>,
+    failure: &Failure,
+) {
+    let usage = committed.usage.clone();
+    guard
+        .settle(
+            "failed",
+            usage.as_ref(),
+            &committed.tool_names,
+            Some(failure),
+            true,
+        )
+        .await;
+    if let Some(mut owner) = lease.take() {
+        owner.abandon().await;
+    }
+}
 
 /// Format one wall-clock instant as an RFC 3339 / ISO 8601 UTC string with
 /// millisecond precision, e.g. `2026-08-30T12:34:56.789+00:00`.
@@ -101,6 +125,9 @@ fn settle_argument(
         })),
         "finalize": finalize,
         "opened": opened,
+        // Explicit HTTP-rejection provenance for decisions only. Unknown
+        // outcomes and cancellation never authorize zero-cost accounting.
+        "decision_provider_rejected": failure.is_some_and(|failure| failure.decision_provider_rejected),
         "first_token_at": first_token_at.map(system_time_to_rfc3339),
         // Allowlisted rate-limit headers of the attempt's provider response
         // (successes and failures alike, absent when none were present); the

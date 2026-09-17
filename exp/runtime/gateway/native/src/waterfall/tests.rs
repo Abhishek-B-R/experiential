@@ -26,7 +26,13 @@ fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         time_to_first_byte_seconds_per_million_input_tokens: slope,
         throttle_redial_budget: 0,
         throttle_redial: None,
+        failover_only_on: None,
     }
+}
+
+/// `length` unrestricted rungs: the historical route shape.
+fn plain(length: usize) -> Vec<DeploymentWire> {
+    (0..length).map(|_| wire(None, None)).collect()
 }
 
 #[test]
@@ -96,7 +102,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
     // Same-deployment retry within the per-deployment cap.
     assert!(successor_possible(
         policy(false),
-        1,
+        &plain(1),
         far_deadline(),
         1,
         1,
@@ -107,7 +113,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
     // The per-deployment cap forbids a redial but failover still runs.
     assert!(successor_possible(
         policy(false),
-        2,
+        &plain(2),
         far_deadline(),
         2,
         2,
@@ -118,7 +124,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
     // A single-deployment route with the redial cap reached is exhausted.
     assert!(!successor_possible(
         policy(false),
-        1,
+        &plain(1),
         far_deadline(),
         2,
         2,
@@ -129,7 +135,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
     // The hard total cap ends the ladder regardless of class.
     assert!(!successor_possible(
         policy(false),
-        4,
+        &plain(4),
         far_deadline(),
         8,
         1,
@@ -140,7 +146,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
     // An expired deadline ends the ladder.
     assert!(!successor_possible(
         policy(false),
-        4,
+        &plain(4),
         Instant::now(),
         1,
         1,
@@ -155,7 +161,7 @@ fn ineligible_classes_never_advance_without_refusal_opt_in() {
     let invalid = Failure::new(FailureClass::InvalidRequest, "bad request");
     assert!(!successor_possible(
         policy(false),
-        4,
+        &plain(4),
         far_deadline(),
         1,
         1,
@@ -166,7 +172,7 @@ fn ineligible_classes_never_advance_without_refusal_opt_in() {
     let refusal = Failure::new(FailureClass::Refusal, "provider refused the request");
     assert!(!successor_possible(
         policy(false),
-        4,
+        &plain(4),
         far_deadline(),
         1,
         1,
@@ -177,7 +183,7 @@ fn ineligible_classes_never_advance_without_refusal_opt_in() {
     // The refusal advances only when the alias revision opted in.
     assert!(successor_possible(
         policy(true),
-        4,
+        &plain(4),
         far_deadline(),
         1,
         1,
@@ -188,7 +194,7 @@ fn ineligible_classes_never_advance_without_refusal_opt_in() {
     // Refusal failover cannot pass the last deployment.
     assert!(!successor_possible(
         policy(true),
-        1,
+        &plain(1),
         far_deadline(),
         1,
         1,
@@ -203,7 +209,7 @@ fn failover_only_classes_skip_the_redial_and_advance() {
     let throttled = Failure::new(FailureClass::Throttled, "throttled").with_retry(false, true);
     assert!(successor_possible(
         policy(false),
-        2,
+        &plain(2),
         far_deadline(),
         1,
         1,
@@ -213,7 +219,7 @@ fn failover_only_classes_skip_the_redial_and_advance() {
     ));
     assert!(!successor_possible(
         policy(false),
-        1,
+        &plain(1),
         far_deadline(),
         1,
         1,

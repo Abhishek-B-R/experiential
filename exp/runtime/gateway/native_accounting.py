@@ -42,6 +42,7 @@ from exp.runtime.gateway.native_execution import (
     dispatch_disclosure,
     rung_load_key,
 )
+from exp.runtime.gateway.native_fallback_rules import eligible_ladder, rule_fallback_reason
 from exp.runtime.gateway.native_recovery import (
     observe_reserved_attempt,
     record_departure,
@@ -144,9 +145,7 @@ class NativeAttemptAccounting:
         self._health = DeploymentHealthRegistry()
         # Physical-lane admission counters survive catalog rolls.
         self._loads = RungLoadRegistry()
-        # Worker-local conversation-to-rung bindings under
-        # maximize_cache_affinity, so a spilled conversation keeps serving off
-        # the rung holding its warm cache instead of bouncing back.
+        # Cache-affinity spills stay on the rung holding the warmed conversation.
         self._sticky = StickySpillRegistry()
         self._inflight: dict[str, InflightRequest] = {}
         self._lock = threading.Lock()
@@ -377,6 +376,7 @@ class NativeAttemptAccounting:
             raise NativeBridgeError(public_failure_error(failure))
         failure = failure_from_boundary_payload(data.get("failure"))
         current_depth = data.get("current_depth")
+        ladder = eligible_ladder(route, failure)  # The depths this walk may claim at all.
         # Rung dispatch policies shed a claimed rung SIDEWAYS to the next
         # claimable one instead of queueing on it. Each shed is remembered so
         # the dispatched attempt can disclose the bypassed rung, and so a ladder
@@ -407,7 +407,7 @@ class NativeAttemptAccounting:
                 policy_sheds.append((current_depth, THROTTLE_FAILOVER_COLD))
             last_failure: GatewayFailure | None = failure
         else:
-            candidate = claim_route_from(self._health, keys, 0)
+            candidate = claim_route_from(self._health, keys, 0, ladder)
             last_failure = None
         forced_overflow = False
         # The input half of the reservation tokenizes the whole prompt, so it
@@ -428,7 +428,7 @@ class NativeAttemptAccounting:
                     break
             if route.snapshot.stage_for_depth(candidate).pool_id in entry.denied_destination_pools:
                 self._health.release_probe(keys[candidate])
-                candidate = claim_route_from(self._health, keys, candidate + 1)
+                candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
                 continue
             deployment = deployment_priced_for_service_tier(
                 route.deployments[candidate],
@@ -460,7 +460,7 @@ class NativeAttemptAccounting:
                     route, candidate, redial_depth, last_failure, ticket.reason
                 )
                 if not forced_overflow:
-                    candidate = claim_route_from(self._health, keys, candidate + 1)
+                    candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
                 continue
             throttle_backoff = candidate == redial_depth
             dispatch_reason, preferred_deployment = dispatch_disclosure(
@@ -483,7 +483,7 @@ class NativeAttemptAccounting:
                     reserved_input_tokens=reserved_input_tokens,
                     reserved_output_tokens=reserved_output_tokens,
                     route_reason=route.attempt_route_reason(route.deployments[candidate]),
-                    fallback_reason=route.fallback_reason,
+                    fallback_reason=rule_fallback_reason(route, candidate, current_depth, failure),
                     dispatch_reason=entry.recovery_reason
                     if candidate == 0
                     and entry.total_attempts == 0
@@ -501,7 +501,7 @@ class NativeAttemptAccounting:
                     entry.denied_destination_pools.add(denied_pool)
                     last_failure = budget_quota_failure()
                     forced_overflow = False
-                    candidate = claim_route_from(self._health, keys, candidate + 1)
+                    candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
                     continue
                 if exc.scope_kind is not BudgetScopeKind.DEPLOYMENT:
                     error = (
@@ -523,7 +523,7 @@ class NativeAttemptAccounting:
                 if candidate == redial_depth:
                     # The forced admission belonged to the redialed rung alone.
                     forced_overflow = False
-                candidate = claim_route_from(self._health, keys, candidate + 1)
+                candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
                 continue
             except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
                 # A reservation that raised before returning an attempt id
@@ -663,7 +663,7 @@ class NativeAttemptAccounting:
         attempt_id = str(data["attempt_id"])
         finalize = bool(data.get("finalize", True))
         opened = bool(data.get("opened", False))
-        terminal, failure = terminal_from_settlement(data)
+        terminal, failure = terminal_from_settlement(data, surface=entry.authorization.surface)
         first_token_at = first_token_at_from_settlement(data)
         rate_limit = settlement_rate_limit(data)
         try:
@@ -901,7 +901,9 @@ class NativeAttemptAccounting:
             settlement = entry.pending_settlement
             if settlement is None:
                 continue
-            terminal, failure = terminal_from_settlement(settlement)
+            terminal, failure = terminal_from_settlement(
+                settlement, surface=entry.authorization.surface
+            )
             if self._settle_swept(
                 request_id,
                 entry,

@@ -101,6 +101,13 @@ pub struct DeploymentWire {
     /// Stage-local schedule; its budget is zero when this stage disables redial.
     #[serde(default)]
     pub throttle_redial: Option<ThrottleRedial>,
+    /// Failure tokens this rung serves as a failover for (see
+    /// `fallback_rules`): a rung carrying a set is never the first dial and
+    /// is dialed as a successor only when the failure being failed over from
+    /// spells one of them. Absent or null on an unrestricted rung, which
+    /// behaves exactly as before.
+    #[serde(default)]
+    pub failover_only_on: Option<Vec<String>>,
 }
 
 /// The frozen retry-policy facts returned by admission.

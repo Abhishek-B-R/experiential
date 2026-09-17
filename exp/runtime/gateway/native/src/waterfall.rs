@@ -177,7 +177,7 @@ pub(crate) struct StartResponse {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn successor_possible(
     policy: RoutePolicy,
-    route_length: usize,
+    route: &[DeploymentWire],
     deadline: Instant,
     total_attempts: u32,
     same_deployment_attempts: u32,
@@ -190,7 +190,15 @@ pub(crate) fn successor_possible(
     }
     let same = failure.retryable_same_deployment
         && same_deployment_attempts < policy.maximum_same_deployment_attempts;
-    let failover = (failure.failover_eligible || refusal_eligible) && depth + 1 < route_length;
+    // An unrestricted later rung takes the failure when the route policy
+    // advances it; a failover-only rung takes it when its own set names it,
+    // whatever the policy says (`fallback_rules`).
+    let failover = fallback_rules::successor_available(
+        route,
+        depth,
+        failure,
+        failure.failover_eligible || refusal_eligible,
+    );
     same || failover
 }
 
@@ -370,6 +378,21 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 .await;
             return Won::Failed(PublicError::internal());
         };
+        if !fallback_rules::dial_admitted(wire, current_depth, depth, last_failure.as_ref()) {
+            // The control plane reserved a failover-only rung outside its
+            // rules (a first dial, or a successor to a failure its set does
+            // not name); the two halves of the contract disagree, so the
+            // request fails closed rather than dialing the rung.
+            guard.rebind(attempt_id);
+            let failure = Failure::new(
+                FailureClass::Internal,
+                "gateway attempt wire contract failed: failover-only rung reserved outside its rules",
+            );
+            guard
+                .settle("failed", None, &[], Some(&failure), true)
+                .await;
+            return Won::Failed(PublicError::internal());
+        }
         if current_depth == Some(depth) {
             METRICS.record_open_retry();
         }
@@ -409,7 +432,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 let possible = backoff.is_some()
                     || successor_possible(
                         ctx.policy,
-                        ctx.route.len(),
+                        ctx.route,
                         ctx.deadline,
                         total_attempts,
                         counts[depth],
@@ -673,6 +696,13 @@ async fn run_attempt(
             // so a committed stream's late credential error is the customer's too.
             relay.set_customer_managed_provider(Some(wire.provider.clone()));
         }
+        // Refusal deltas are withheld when the alias revision opted into
+        // refusal failover, or when a failover-only rung downstream accepts
+        // an unnamed refusal (`fallback_rules`); the ladder decision below
+        // still distinguishes the two, so the policy alone never advances a
+        // refusal onto an unrestricted rung it did not opt into.
+        let refusal_failover = ctx.policy.refusal_failover
+            || fallback_rules::refusal_deltas_withheld_for(ctx.route, depth);
         // Per dial: tracked facts belong to the dial that produced them; a
         // refused dial's billed usage travels through the relay above.
         let mut usage: Option<Usage> = None;
@@ -716,7 +746,7 @@ async fn run_attempt(
                 _ => None,
             };
             if let Some(text) = refusal_text {
-                if ctx.policy.refusal_failover {
+                if refusal_failover {
                     let event_bytes = text.len();
                     if withheld_bytes + event_bytes > MAXIMUM_WITHHELD_REFUSAL_BYTES
                         || withheld.len() + 1 > MAXIMUM_WITHHELD_REFUSAL_EVENTS
@@ -932,6 +962,7 @@ async fn settle_output_less(
     })
 }
 
+mod fallback_rules;
 mod wire;
 pub(crate) use wire::{first_byte_allowance, open_phase_bound};
 pub use wire::{DeploymentWire, RoutePolicy, WaterfallContext};

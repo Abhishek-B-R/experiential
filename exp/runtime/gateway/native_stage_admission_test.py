@@ -34,6 +34,7 @@ from exp.runtime.gateway.native_execution import (
     select_route_deployments,
 )
 from exp.runtime.gateway.native_execution_test import _route
+from exp.runtime.gateway.native_fallback_rules import FailoverRulesError, require_unrestricted_rung
 from exp.runtime.gateway.native_recovery import record_session_outcome, session_cache_key
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_stage_admission import stage_affinity_ordered_rungs as _stage_order
@@ -301,6 +302,96 @@ def test_live_reasoning_pin_precedes_stage_cache_and_recovery_ordering(
     if has_stages:
         assert admitted.snapshot.exact_model_id == "root"
         assert all(s.ancestry == ("root", "child") for s in admitted.snapshot.model_stages)
+
+
+@pytest.mark.parametrize("tokens", [("transport",), ("refusal",)])
+@pytest.mark.parametrize("staged", [False, True])
+def test_retained_conditional_rung_cannot_discard_first_dial_routes(
+    tokens: tuple[str, ...],
+    staged: bool,
+) -> None:
+    """Prior matched failures never authorize a conditional rung on a later request."""
+    route, wires = _affinity_fixture()
+    request = GatewayRequest(
+        surface=route.snapshot.authorization.surface,
+        messages=(GatewayMessage(role="system", content="stable"),),
+        prompt_cache_key="session",
+        provider_prompt_cache_key="xpl-session",
+    )
+    if staged:
+        route = route.model_copy(
+            update={
+                "snapshot": route.snapshot.model_copy(
+                    update={
+                        "authorization": route.snapshot.authorization.model_copy(
+                            update={"descendant_start_authorized": True}
+                        ),
+                        "exact_model_id": "root-model",
+                        "model_stages": (route.snapshot.stage_for_depth(0),),
+                    }
+                )
+            }
+        )
+    host = Host()
+    accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=host)
+    accounting.recovery = SessionRecoveryRegistry(clock=Clock())
+    auth = route.snapshot.authorization
+    ordered, _, _ = stage_affinity_ordered_rungs(
+        route, wires, request, accounting=accounting, authorization=auth, continuation=None
+    )
+    retained = ordered.deployments[-1]
+    key = session_cache_key(InflightRequest(auth, ordered, request, time.monotonic() + 30))
+    assert key is not None
+    accounting.recovery.record_success(
+        key,
+        retained.deployment_id,
+        host.scope_for(retained, auth.organization_id),
+        cached_tokens=80,
+        cache_write_tokens=0,
+        retention_seconds=100,
+        sticky_seconds=60,
+    )
+    deployments = tuple(
+        d.model_copy(
+            update={
+                "gateway": d.gateway.model_copy(
+                    update={
+                        "capabilities": d.gateway.capabilities.model_copy(
+                            update={"failover_only_on": tokens}
+                        )
+                    }
+                )
+            }
+        )
+        if d.deployment_id == retained.deployment_id
+        else d
+        for d in route.deployments
+    )
+    restricted = route.model_copy(
+        update={"deployment": deployments[0], "fallback_deployments": deployments[1:]}
+    )
+    admitted, _, placement = stage_affinity_ordered_rungs(
+        restricted, wires, request, accounting=accounting, authorization=auth, continuation=None
+    )
+    assert admitted.snapshot.deployment_ids == ordered.snapshot.deployment_ids
+    assert placement.verified_warm_deployment_id is None
+    assert not placement.sticky_preferred
+    require_unrestricted_rung(admitted)
+    conditional_only = select_route_deployments(
+        restricted, (restricted.snapshot.deployment_ids.index(retained.deployment_id),)
+    )
+    conditional_wire = (wires[restricted.snapshot.deployment_ids.index(retained.deployment_id)],)
+    remaining, _, standing = stage_affinity_ordered_rungs(
+        conditional_only,
+        conditional_wire,
+        request,
+        accounting=accounting,
+        authorization=auth,
+        continuation=None,
+    )
+    assert standing.verified_warm_deployment_id is None
+    with pytest.raises(FailoverRulesError):
+        require_unrestricted_rung(remaining)
 
 
 @pytest.mark.parametrize("trial", [False, True], ids=["retained", "trial"])

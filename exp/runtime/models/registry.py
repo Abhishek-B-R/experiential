@@ -53,6 +53,7 @@ from exp.runtime.models.providers.tinker_sampling import (
     create_tinker_sampler,
 )
 from exp.runtime.models.providers.transport import JsonHttpTransport
+from exp.runtime.models.providers.typesafe import TYPESAFE_BASE_URL, TypeSafeClient
 from exp.runtime.models.providers.vertex import (
     VertexClient,
     VertexOpenAIClient,
@@ -635,6 +636,7 @@ _HTTP_PROVIDERS: Mapping[str, tuple[_HttpClientFactory, str | None]] = {
     "gemini": (GeminiClient, GEMINI_BASE_URL),
     "openai-compatible": (OpenAICompatibleClient, None),
     "openrouter": (OpenRouterClient, OPENROUTER_BASE_URL),
+    "typesafe": (TypeSafeClient, TYPESAFE_BASE_URL),
 }
 
 SUPPORTED_PROVIDERS = frozenset(_HTTP_PROVIDERS) | {

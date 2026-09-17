@@ -19,6 +19,7 @@ from exp.runtime.gateway.native_execution import (
     request_carries_cache_markers,
     select_route_deployments,
 )
+from exp.runtime.gateway.native_fallback_rules import rung_rules
 from exp.runtime.gateway.native_recovery import recovery_prefix_digest
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.recovery import SessionCacheKey
@@ -153,8 +154,8 @@ def stage_affinity_ordered_rungs(
     by_id = {d.deployment_id: d for d in route.deployments[:recovery_depth]}
 
     def eligible(deployment_id: str) -> bool:
-        """Require current graph membership and unsuppressed actual deployment health."""
-        return not accounting.health.suppressed(
+        """Require a first-dial route; historical failures never activate conditional rungs."""
+        return rung_rules(by_id[deployment_id]) is None and not accounting.health.suppressed(
             deployment_health_key(authorization, by_id[deployment_id])
         )
 

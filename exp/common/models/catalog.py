@@ -30,8 +30,10 @@ from exp.common.core.artifacts import (
     validate_artifact_id,
 )
 from exp.common.core.files import write_text_atomic
+from exp.common.models.bedrock_connection import require_bedrock_connection_shape
 from exp.common.models.catalog_roles import ModelRoles
 from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
+from exp.common.models.failover_tokens import FailoverToken
 from exp.common.models.gateway_chains import GatewayModelChain
 from exp.common.models.gateway_pools import GatewayPoolRecord
 from exp.common.models.model import (
@@ -49,7 +51,9 @@ _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AZURE_API_VERSION = re.compile(r"^(?:v1|\d{4}-\d{2}-\d{2}(?:-preview)?)$")
 _AWS_REGION_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _VERTEX_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-)?aiplatform\.googleapis\.com")
-_FIXED_ORIGIN_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "openrouter", "tinker"})
+_FIXED_ORIGIN_PROVIDERS = frozenset(
+    {"anthropic", "gemini", "openai", "openrouter", "tinker", "typesafe"}
+)
 _EXPLICIT_CAPABILITY_PROVIDERS = frozenset({"azure", "bedrock", "openai-compatible", "vertex"})
 
 AzureApiSurface = Literal["openai_deployments", "model_inference"]
@@ -139,47 +143,6 @@ def _normalize_connection_base_url(connection: ConnectionConfig) -> str | None:
     ):
         return normalized[: -len(_MODEL_INFERENCE_IDENTITY_SUFFIX)].rstrip("/")
     return normalized
-
-
-def require_bedrock_connection_shape(
-    *,
-    bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None,
-    api_key_env: str | None,
-    aws_access_key_id_env: str | None,
-    base_url: str | None,
-    api_version: str | None,
-) -> None:
-    """Reject a Bedrock connection whose credential and endpoint fields are inconsistent.
-
-    Args:
-        bedrock_auth_mode: Explicit auth mode, or ``None`` to infer it from the env names.
-        api_key_env: Environment variable naming the API key or secret access key.
-        aws_access_key_id_env: Environment variable naming the access key id.
-        base_url: Custom endpoint, which Bedrock never accepts.
-        api_version: Azure-only API version, which Bedrock never accepts.
-
-    Raises:
-        ValueError: The field combination cannot describe one Bedrock credential source.
-    """
-    if bedrock_auth_mode == "api_key":
-        if api_key_env is None or aws_access_key_id_env is not None:
-            raise ValueError(
-                "bedrock api_key auth requires api_key_env and forbids aws_access_key_id_env"
-            )
-    elif bedrock_auth_mode == "access_key_pair":
-        if api_key_env is None or aws_access_key_id_env is None:
-            raise ValueError(
-                "bedrock access_key_pair auth requires both credential environment names"
-            )
-    elif (api_key_env is None) != (aws_access_key_id_env is None):
-        raise ValueError(
-            "bedrock explicit access-key auth requires both api_key_env naming the "
-            "secret access key and aws_access_key_id_env naming the access key id"
-        )
-    if base_url is not None:
-        raise ValueError("bedrock does not accept base_url")
-    if api_version is not None:
-        raise ValueError("api_version is only accepted for provider='azure'")
 
 
 class ModelCatalogError(ValueError):
@@ -411,6 +374,9 @@ class GatewayDeploymentCapabilities(ContractModel):
     gateway protocol without invalidating existing router artifacts.
     """
 
+    supports_decisions: bool = False
+    """Whether this deployment serves native typed decisions instead of chat."""
+
     supports_developer_messages: bool = False
     supports_streaming: bool = False
     supports_streaming_tool_arguments: bool = False
@@ -419,53 +385,30 @@ class GatewayDeploymentCapabilities(ContractModel):
     supports_structured_text: bool = False
     supports_stop_sequences: bool = False
     supports_image_input: bool = False
-    """Whether this deployment's wire and model can carry caller image parts.
-
-    Image input is declaration-driven and never assumed: a route that does
-    not declare it rejects an image request at admission, so a picture is
-    never dropped and answered from the surrounding text alone.
-    """
+    """Whether the wire and model accept images; undeclared image input is rejected."""
     supports_image_url_input: bool = False
-    """Whether this route's provider fetches a caller image URL itself.
+    """Whether the provider fetches remote images; undeclared URLs are rejected.
 
-    Inline base64 rides every image-capable wire, but only some wires accept a
-    remote URL. A route that does not declare this rejects a URL image at
-    admission, which lets a waterfall narrow to a rung that can carry it.
+    Every image-capable wire accepts inline base64; URL support varies by route.
     """
     supports_video_input: bool = False
-    """Whether this deployment's wire and model can carry caller video parts.
+    """Whether the wire and model accept video; undeclared video input is rejected.
 
-    Video is narrower than images: only the Gemini, Bedrock Converse, and
-    OpenAI-compatible ``video_url`` wires define a video carrier, and only
-    some models on those wires accept one. Like images the declaration is
-    never assumed, so a route without it rejects a video at admission rather
-    than answering from the surrounding text.
+    Video carriers exist on Gemini, Bedrock Converse, and compatible ``video_url`` wires.
     """
     supports_video_url_input: bool = False
-    """Whether this route's provider fetches a caller video URL itself.
+    """Whether the provider fetches video URLs (Gemini and OpenAI-compatible wires).
 
-    Bedrock accepts inline bytes (or an S3 location the gateway does not
-    author) only; Gemini and the OpenAI-compatible video wires fetch an
-    http(s) URL on the caller's behalf.
+    Bedrock requires inline bytes or an S3 location that the gateway does not author.
     """
     supports_audio_input: bool = False
-    """Whether this deployment's wire and model can carry caller audio parts.
+    """Whether the wire and model accept audio; undeclared audio input is rejected.
 
-    Audio is the narrowest attachment: only the OpenAI-compatible Chat
-    ``input_audio`` wire and the Gemini ``inline_data`` wire carry a clip a
-    model serves, and on those wires only specific models (the gpt-audio
-    family, audio-capable Gemini models) accept one. The declaration is never
-    assumed, so a route without it rejects audio at admission rather than
-    answering from the surrounding text. Audio has no remote URL carrier on
-    any public surface, so there is no separate URL declaration.
+    Supported models use compatible Chat ``input_audio`` or Gemini ``inline_data``.
+    No public audio surface accepts remote URLs.
     """
     supports_pdf_input: bool = False
-    """Whether this deployment's wire and model can carry caller PDF documents.
-
-    Like image input this is declaration-driven and never assumed: a route
-    that does not declare it rejects a document request at admission, so a
-    PDF is never dropped and answered from the surrounding text alone.
-    """
+    """Whether the wire and model accept PDFs; undeclared document input is rejected."""
     supports_pdf_url_input: bool = False
     """Whether this route's provider fetches a caller PDF URL itself.
 
@@ -546,6 +489,14 @@ class GatewayDeploymentCapabilities(ContractModel):
     ``None`` uses the serving configuration's default; ``0`` disables scaling
     for this deployment.
     """
+    failover_only_on: tuple[FailoverToken, ...] | None = None
+    """Failure tokens this rung serves as a failover for, or ``None`` for an unrestricted rung.
+
+    A rung carrying a set is never dialed first and is dialed as a successor only
+    when the failure being failed over from spells one of its tokens (see
+    ``exp.common.models.failover_tokens``); a rule-carrying rung reached that way
+    records ``fallback_reason = failover_only_on:<token>``.
+    """
 
     @property
     def declares_reasoning_contract(self) -> bool:
@@ -600,15 +551,10 @@ NanoUsdRatePerMillionTokens = Annotated[
 class GatewayLongContextTier(ContractModel):
     """Premium rates a provider applies to whole long-context requests.
 
-    Both published tier schedules this models (Gemini's ``prompts > 200k``
-    rates and Anthropic's legacy 1M-beta premium) reprice the ENTIRE request
-    once provider-reported input tokens reach the threshold, never only the
-    tokens past it, so that is the one semantic implemented: when
-    ``usage.input_tokens >= input_threshold_tokens``, these rates replace
-    the base rates for every dimension of the request. ``None`` means the
-    tier rate is unknown exactly as on the base schedule; it never inherits
-    the base rate, so a deployment reporting a dimension without a tier
-    price stays honestly unpriced above the threshold.
+    When ``usage.input_tokens >= input_threshold_tokens``, tier rates replace
+    base rates for every dimension of the whole request, not just excess tokens.
+    This models Gemini and Anthropic's long-context premium schedules. A ``None``
+    tier rate stays unknown; it never inherits the base rate.
     """
 
     input_threshold_tokens: int = Field(gt=0)

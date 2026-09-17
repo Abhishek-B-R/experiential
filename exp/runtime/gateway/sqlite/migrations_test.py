@@ -31,16 +31,13 @@ from exp.runtime.gateway.sqlite.provider_authority import active_provider_connec
 
 
 def _replay_history(connection: sqlite3.Connection, *, upto: int) -> None:
-    """Replay the historical SQL migrations ``1..upto-1`` onto one raw connection.
-
-    Every migration before v20 is a tuple of plain SQL statements; the v20 money
-    unit move is a callable step and is never replayed here (the tests that need
-    it go through ``initialize_database``).
-    """
+    """Build a source schema by applying migrations ``1..upto-1`` to a raw connection."""
     for version in range(1, upto):
         for step in migrations._MIGRATIONS[version]:
-            assert isinstance(step, str), f"migration {version} is not plain SQL"
-            connection.execute(step)
+            if isinstance(step, str):
+                connection.execute(step)
+            else:
+                step(connection)
 
 
 def test_persistent_connection_reuses_one_idle_connection_per_thread(tmp_path: Path) -> None:
@@ -1092,23 +1089,25 @@ def test_v14_migration_widens_api_surface_to_embeddings_and_preserves_rows(
         migrated.close()
 
 
-def test_v15_migration_widens_api_surface_to_images_and_preserves_rows(
+@pytest.mark.parametrize(
+    ("source_version", "prior_surface", "added_surface"),
+    [(14, "embeddings", "images"), (20, "images", "decisions")],
+)
+def test_surface_migration_preserves_requests_attempts_and_constraints(
     tmp_path: Path,
+    source_version: int,
+    prior_surface: str,
+    added_surface: str,
 ) -> None:
-    """The v15 rewrite admits the images surface without touching v14 data.
-
-    A v14 database with one full request-and-attempt chain migrates in place:
-    the existing rows and the child foreign key survive, an ``images``
-    request becomes insertable, and any other surface value stays rejected.
-    """
+    """CHECK-only expansion preserves child rows and admits only declared surfaces."""
     path = tmp_path / "gateway.db"
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(descriptor)
     connection = connect_database(path)
     try:
         connection.execute("BEGIN EXCLUSIVE")
-        _replay_history(connection, upto=15)
-        connection.execute("PRAGMA user_version = 14")
+        _replay_history(connection, upto=source_version + 1)
+        connection.execute(f"PRAGMA user_version = {source_version}")
         seed_statements = """
             INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't');
             INSERT INTO identities VALUES ('id', 'org', 'Identity', NULL, 1, 't', 't');
@@ -1130,7 +1129,7 @@ def test_v15_migration_widens_api_surface_to_images_and_preserves_rows(
                 alias_revision_id, api_surface, canonical_request_sha256,
                 accepted_at, deadline_at
             ) VALUES (
-                'req-1', 'org', 'id', 'key', 'alias', 'rev', 'embeddings',
+                'req-1', 'org', 'id', 'key', 'alias', 'rev', '{prior_surface}',
                 '{digest}', 't', 't'
             );
             INSERT INTO gateway_attempts (
@@ -1141,34 +1140,56 @@ def test_v15_migration_widens_api_surface_to_images_and_preserves_rows(
                 'att-1', 'req-1', 'org', 0, 0, 'deploy', 'provider', 'exact',
                 'pool', '{digest}', 'completed', 't', '2026-08-01T00:00:00+00:00'
             );
-            """.format(fingerprint="a" * 64, digest="b" * 64)
+            """.format(fingerprint="a" * 64, digest="b" * 64, prior_surface=prior_surface)
         for statement in seed_statements.split(";"):
             if statement.strip():
                 connection.execute(statement)
         connection.execute("COMMIT")
+        before_request = tuple(connection.execute("SELECT * FROM gateway_requests").fetchone())
+        before_attempt = tuple(connection.execute("SELECT * FROM gateway_attempts").fetchone())
     finally:
         connection.close()
 
     backup = initialize_database(path)
 
     assert backup is not None and backup.exists()
+    if source_version == 20:
+        with sqlite3.connect(backup) as original:
+            assert original.execute("PRAGMA user_version").fetchone() == (20,)
+            assert original.execute("SELECT * FROM gateway_requests").fetchone() == before_request
+            assert original.execute("SELECT * FROM gateway_attempts").fetchone() == before_attempt
     migrated = connect_database(path)
     try:
         assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert migrated.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
+        if source_version == 20:
+            assert (
+                tuple(migrated.execute("SELECT * FROM gateway_requests").fetchone())
+                == before_request
+            )
+            assert (
+                tuple(migrated.execute("SELECT * FROM gateway_attempts").fetchone())
+                == before_attempt
+            )
         surviving = migrated.execute(
             "SELECT api_surface FROM gateway_requests WHERE request_id = 'req-1'"
         ).fetchone()
-        assert surviving[0] == "embeddings"
+        assert surviving[0] == prior_surface
+        assert (
+            migrated.execute(
+                "SELECT request_id FROM gateway_attempts WHERE attempt_id = 'att-1'"
+            ).fetchone()[0]
+            == "req-1"
+        )
         request_columns = (
             "request_id, organization_id, identity_id, key_id, alias_id, "
             "alias_revision_id, api_surface, canonical_request_sha256, accepted_at, deadline_at"
         )
         migrated.execute(
             f"INSERT INTO gateway_requests ({request_columns}) "
-            "VALUES ('req-2', 'org', 'id', 'key', 'alias', 'rev', 'images', ?, 't', 't')",
-            ("c" * 64,),
+            "VALUES ('req-2', 'org', 'id', 'key', 'alias', 'rev', ?, ?, 't', 't')",
+            (added_surface, "c" * 64),
         )
         with pytest.raises(sqlite3.IntegrityError):
             migrated.execute(

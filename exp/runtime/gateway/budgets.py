@@ -8,51 +8,32 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal, assert_never
+from typing import Literal
 
 from pydantic import Field, model_validator
 
 from exp.common.config.settings import GatewayResourceSettings
 from exp.common.core.artifacts import ContractModel, stable_id
-from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
+from exp.runtime.gateway.attempt_costs import (
+    LONG_CONTEXT_TIER_MARGIN_PERCENT as LONG_CONTEXT_TIER_MARGIN_PERCENT,
+)
+from exp.runtime.gateway.attempt_costs import (
+    maximum_attempt_cost_nano_usd as maximum_attempt_cost_nano_usd,
+)
 from exp.runtime.gateway.auth import utc_text
 from exp.runtime.gateway.budget_authority import (
     BudgetAliasRevision,
     active_budget_revision,
     validate_budget_revision,
 )
-from exp.runtime.gateway.contracts import GatewayRequest
-from exp.runtime.gateway.embeddings_contracts import (
-    EmbeddingsRequest,
-    ServingRequest,
-    embeddings_input_ceiling_nano_usd,
-)
-from exp.runtime.gateway.images_contracts import ImagesRequest, images_ceiling_nano_usd
 from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.ledger_valuation import (
     MAXIMUM_NANO_USD,
-    require_representable_nano_usd,
 )
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
 from exp.runtime.gateway.sqlite.store import SystemGatewayClock
 
 __all__ = ["MAXIMUM_NANO_USD"]
-
-LONG_CONTEXT_TIER_MARGIN_PERCENT = 20
-"""How far below a long-context threshold the input estimate may sit and still
-reserve at the premium schedule.
-
-The input reservation is a realistic estimate with headroom, not an upper
-bound, so an estimate just under the threshold can settle just over it and
-be repriced for the WHOLE request (the tier doubles Gemini's rates above
-200k). The reservation therefore treats the tier as reachable inside this
-band below the threshold: a request estimated at 160k+ tokens against a 200k
-tier reserves at premium rates and settles at whatever schedule the provider
-actually applied. The cost of the rule is a one-attempt over-reservation of
-roughly the tier multiple inside the band; without it a hard monthly budget
-could be overdrawn by the same multiple on a threshold-straddling request.
-"""
 
 
 class BudgetScopeKind(StrEnum):
@@ -526,102 +507,6 @@ def budget_period_start(period: str) -> str:
     if canonical != period:
         raise ValueError("budget period must use zero-padded YYYY-MM")
     return f"{period}-01T00:00:00+00:00"
-
-
-def maximum_attempt_cost_nano_usd(
-    request: ServingRequest,
-    deployment: ExactModelDeployment,
-    *,
-    input_tokens: int | None = None,
-) -> int | None:
-    """Return a conservative nano-USD ceiling for one physical call (per surface).
-
-    ``input_tokens`` is the request's :func:`worst_case_input_tokens` when the
-    caller already computed it (a ladder walk prices every candidate from one
-    tokenizer pass); it is computed here otherwise. Both the platform's token
-    reservation and this money ceiling price the same estimate.
-    """
-    if input_tokens is None:
-        input_tokens = worst_case_input_tokens(request)
-    match request:
-        case EmbeddingsRequest():
-            return embeddings_input_ceiling_nano_usd(
-                input_tokens=input_tokens,
-                input_rate=deployment.gateway.prices.input_nano_usd_per_million_tokens,
-            )
-        case ImagesRequest():
-            return images_ceiling_nano_usd(
-                request,
-                input_tokens=input_tokens,
-                input_rate=deployment.gateway.prices.input_nano_usd_per_million_tokens,
-                output_rate=deployment.gateway.prices.output_nano_usd_per_million_tokens,
-            )
-        case GatewayRequest():
-            return _completion_attempt_cost_nano_usd(request, deployment, input_tokens)
-        case _:  # pragma: no cover - exhaustive over the ServingRequest union.
-            assert_never(request)
-
-
-def _completion_attempt_cost_nano_usd(
-    request: GatewayRequest,
-    deployment: ExactModelDeployment,
-    input_tokens: int,
-) -> int | None:
-    """Return a conservative nano-USD ceiling for one chat/responses call.
-
-    The input estimate carries its own headroom; the output ceiling is the
-    caller's, else the frozen deployment limit, else a reservation-only default
-    bounded by the context window. Cached and reasoning tokens are subsets of the
-    totals, so the worst case charges the higher rate for the whole leg.
-    """
-    output_tokens = worst_case_output_tokens(request, deployment)
-    prices = deployment.gateway.prices
-    capabilities = deployment.gateway.capabilities
-    # The tier reprices the whole request once actual input reaches its
-    # threshold, and the estimate can land under a threshold the provider's
-    # count then crosses, so the tier is treated as reachable from
-    # LONG_CONTEXT_TIER_MARGIN_PERCENT below it; a reachable tier must survive
-    # the whole-request premium schedule.
-    tier = prices.long_context
-    if tier is not None and input_tokens * 100 < tier.input_threshold_tokens * (
-        100 - LONG_CONTEXT_TIER_MARGIN_PERCENT
-    ):
-        tier = None
-    schedules = [prices] if tier is None else [prices, tier]
-    for schedule in schedules:
-        required_rates = [
-            schedule.input_nano_usd_per_million_tokens,
-            schedule.output_nano_usd_per_million_tokens,
-        ]
-        if capabilities.reports_cached_input_tokens:
-            required_rates.append(schedule.cached_input_nano_usd_per_million_tokens)
-        if capabilities.reports_reasoning_tokens:
-            required_rates.append(schedule.reasoning_nano_usd_per_million_tokens)
-        if any(rate is None for rate in required_rates):
-            return None
-    input_rate = max(
-        rate
-        for schedule in schedules
-        for rate in (
-            schedule.input_nano_usd_per_million_tokens,
-            schedule.cached_input_nano_usd_per_million_tokens,
-        )
-        if rate is not None
-    )
-    output_rate = max(
-        rate
-        for schedule in schedules
-        for rate in (
-            schedule.output_nano_usd_per_million_tokens,
-            schedule.reasoning_nano_usd_per_million_tokens,
-        )
-        if rate is not None
-    )
-    numerator = input_tokens * input_rate
-    numerator += output_tokens * output_rate
-    return require_representable_nano_usd(
-        (numerator + 999_999) // 1_000_000, what="attempt reservation ceiling"
-    )
 
 
 def require_attempt_budget(

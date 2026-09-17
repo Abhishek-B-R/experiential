@@ -300,6 +300,10 @@ pub struct Failure {
     /// answer is their 400 naming the fix, and settlement files it client-side.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub customer_owned: bool,
+    /// A TypeSafe HTTP response definitively rejected dispatch before work.
+    /// Only the transport may set this; unknown outcomes remain false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub decision_provider_rejected: bool,
     /// The bounded category of a refusal, set by every refusal builder so
     /// the public error and the settlement ledger can name which policy
     /// declined the content without parsing `provider_detail`.
@@ -332,6 +336,7 @@ impl Failure {
             provider_detail: None,
             retry_after_seconds: None,
             customer_owned: false,
+            decision_provider_rejected: false,
             refusal_reason: None,
             rate_limit_headers: None,
             encrypted_reasoning_rejected: false,

@@ -33,6 +33,9 @@ It serves:
   `supports_image_generation` on an OpenAI-wire connection, billed on the provider's reported
   prompt and image tokens, so a model that answers without token usage is refused as
   unbillable rather than served for free)
+- `POST /v1/systemone` (TypeSafe native decisions: typed `noul`, `choice`, and `score`
+  questions, buffered answers, provider-reported usage, and explicit decision capability and
+  pricing admission; no chat, streaming, continuation, or idempotency replay)
 - `GET /health/live` and `GET /health/ready`
 - `GET /usage` and `GET /usage.json`
 
@@ -88,36 +91,37 @@ relay that already declared its finish settles by that finish, and every other w
 
 ## The data plane
 
-The gateway has exactly one data plane: a native Rust HTTP server compiled as
-a PyO3 extension (`exp_gateway_native`). Every launch path serves through it,
-and a missing compiled extension fails the launch with the exact build
-command rather than falling back.
+The gateway has one data plane: the native Rust HTTP server in the PyO3 extension
+`exp_gateway_native`. Every launch uses it; a missing extension fails with its build command,
+never a Python fallback. Sockets, upstream dispatch, normalization, and SSE encoding run off the
+GIL. JSON-string callbacks authenticate and admit requests, reserve each physical dispatch through
+`start_attempt`, and settle outcomes. `enforce_output` runs only when admission sets
+`output_guardrail`; unguarded and non-chat decision requests do not call it.
+Python owns surface-specific decoding, authority, exact deployment identity, payload construction,
+and durable SQLite transactions over hot-reloadable authority generations. Chat uses `decode_chat`
+and the `streaming_requests` builders; decisions use `decode_decision_request` and their typed body.
+Wire facts come from each resolved client's `gateway_wire_profile()`. The dialects are
+`openai_responses`, `anthropic_messages`, `openai_compatible` (including Azure and OpenRouter),
+`gemini_generate_content`, `bedrock_converse_stream`, and decision-only `typesafe_systemone`.
+Bedrock uses AWS binary event streams, not SSE. Admission freezes the Converse body; after its
+bounded dispatch permit, the data plane obtains SigV4 headers through Python's `sign_dispatch`
+callback immediately before POSTing those exact bytes. Signing after queue wait avoids stale
+signatures. The bounded immediate open retry reuses that signature; later retries sign afresh.
 
-The native engine owns the public socket and every serving fast path:
-upstream dispatch, provider stream normalization, the certified deployment
-waterfall, and public SSE encoding run off the GIL, with JSON-string
-callbacks into python per request (authenticate, admit, `start_attempt` per
-physical dispatch, settle, and `enforce_output` only when admission sets
-`output_guardrail`). Unguarded traffic never calls that output callback.
-Everything protocol- and authority-shaped stays in python: admission decodes
-the raw body with `decode_chat`, enforces the deployment-identity invariant,
-builds every deployment's upstream payload with the `streaming_requests`
-builders, and writes durable SQLite transactions over hot-reloadable
-authority generations.
-Provider wire facts come from the public `gateway_wire_profile()` on each
-resolved provider client; native dialects are `openai_responses`,
-`anthropic_messages`, `openai_compatible` (which also covers Azure and
-OpenRouter connections), `gemini_generate_content`, and
-`bedrock_converse_stream`, so every granted provider has a native dialect.
-Bedrock streams the AWS binary event-stream framing rather than SSE, and it
-authenticates with per-request SigV4 signatures: admission freezes the exact
-serialized Converse body, and the data plane signs it python-side through the
-`sign_dispatch` callback (credentials never cross the boundary) after its
-bounded dispatch permit and immediately before the provider POST, then sends
-the frozen bytes verbatim. Signing at dispatch time means queue wait can
-never age a signature toward AWS's short clock window; the engine's immediate
-bounded open retry reuses the result within milliseconds, and any later retry
-is a fresh admission and a fresh signature.
+### Native decisions
+
+`POST /v1/systemone` accepts only `model`, `state`, and named `questions`; see
+[TypeSafe SystemOne decisions](providers.md#typesafe-systemone-decisions) for all three typed
+question and answer shapes. Authentication precedes decoding; authorization and durable acceptance
+precede direct-route resolution. Admission requires `deployment.gateway.capabilities.supports_decisions`
+and the `typesafe_systemone` endpoint, plus a known nonnegative input rate and output rate exactly
+zero. Missing capability, a project target, or unsupported pricing fails closed before dispatch.
+The decoder bounds requests to 32 questions, 64 choice or 10 score criteria, and 262,144 bytes.
+Reservations count repeated state and per-question protocol allowances, not the chat tokenizer.
+They are bounded estimates, never provider-enforced token ceilings. Only reported usage settles.
+Only HTTP 400/401/403/404/422 release a known-rejection hold; 401 may use a certified fallback.
+HTTP 402/429/529, ambiguous transport, and malformed answers are terminal unknown outcomes, holds kept.
+At most eight deployments run once each: no redials, chat, streaming, replay, or chat guardrails.
 
 Multi-deployment certified pools execute natively. Admission returns the full
 ordered route plus the frozen retry-policy facts without starting an attempt;
@@ -140,10 +144,8 @@ deployment resolves to a provider client with a native dialect) and fails
 with the offending aliases named otherwise. Shutdown drains admitted work
 within `--graceful-timeout`.
 
-Identity-scoped guardrails are optional and default-off. Policies are keyed by
-organization and identity. See `docs/reference/gateway-guardrails.md` for
-policy lookup, the internal classifier seam, and the input and output
-enforcement order.
+Conversational guardrails are optional and default-off, keyed by organization and identity.
+See `docs/reference/gateway-guardrails.md` for policy lookup, classifiers, and enforcement order.
 
 ## Authority and management
 
@@ -164,11 +166,10 @@ the user-data credential file and are resolved after a non-empty environment ove
 pepper is mode
 `0600` and is not exported.
 
-Every data-plane request is authenticated and authorized before request decoding, routing,
-continuation lookup, or provider work. Authorization freezes organization, identity, API surface,
-alias revision, target, catalog digest, request digest, optional hashed operation identity, and one
-monotonic deadline. Identity disable, key revocation or expiry, grant removal, and alias revision
-changes fail closed.
+Authentication precedes body decoding; authorization precedes routing and provider work. It freezes
+organization, identity, API surface, alias revision, target, catalog and request digests, optional
+hashed operation identity, and a monotonic deadline. Disabled identities, revoked or expired keys,
+removed grants, and alias revision changes fail closed.
 
 ## Catalog, aliases, and exact-model pools
 
@@ -198,7 +199,7 @@ deployment IDs. Each physical provider dispatch gets its own durable attempt row
 network work. Attempt ordinal counts all physical dispatches; route depth identifies the selected
 deployment position.
 
-Provider execution is always internally streaming. Bounded same-deployment retries and ordered
+Conversational provider execution is internally streaming. Bounded same-deployment retries and ordered
 deployment fallback are allowed only for typed precommit failures. The first outward text, refusal,
 or tool-call semantic event commits the deployment, after which the gateway never switches
 providers. Typed refusal fallback is disabled unless the active alias revision explicitly enables
@@ -218,6 +219,10 @@ and takes the same ladder as the billed empty stop. The Messages surface
 applies the same rule after commitment, when every committed event was one it cannot render.
 Provider-internal retry layers are disabled so every
 possible billable dispatch is visible to the gateway ledger.
+
+**Per-rung conditional failover (`failover_only_on`).** A deployment may restrict itself to
+failover duty for a named set of failures (a customer's trusted-access OpenAI key taking only the
+house rung's `refusal:cyber_policy`); see [gateway-failover-rules.md](gateway-failover-rules.md).
 
 A provider throttle (HTTP 429, an overload answer, or a rate-limit error declared inside the
 stream) is classed `throttled` and is failover-eligible but never redialed on its own: the 429
@@ -360,8 +365,8 @@ cover the local team, one identity, one alias pool, and each provider deployment
 An exhausted deployment allocation removes only that route from the current certified waterfall.
 If no route can fit the shared team, identity, or total pool allocation, the neutral protocol
 returns HTTP 429 with OpenAI `insufficient_quota` semantics before provider work. Any required
-unknown price makes that route ineligible while a hard limit applies. The input half of every
-reservation is a realistic tokenizer estimate, not a byte bound: the prompt text, tool schemas,
+unknown price makes that route ineligible while a hard limit applies. For conversational requests,
+the input reservation is a tokenizer estimate, not a byte bound: prompt text, tool schemas,
 structured-output schema, and replayed provider carriers are counted once with the o200k BPE,
 inline media reserve documented planning constants instead of their base64 length, and the
 total carries fifteen percent headroom plus per-message and per-tool framing. The same number
@@ -985,10 +990,9 @@ subprocess-bound loopback gateway, a real loopback upstream, and the official SD
 scanner checks database, WAL, backups when present, catalog snapshots, stdout, stderr, logs, usage
 responses, and error bodies for raw content and secret canaries.
 
-`exp/runtime/gateway/provider_certification.py` is the dated provider capability matrix. Each cell
-names the official client SDK, public gateway surfaces, provider wire surface, fixture result, and
-credential-gated live status. OpenAI and Anthropic have native fixtures; generic OpenAI-compatible,
-Azure, and OpenRouter share compatible-stream coverage; Gemini and Bedrock have native deterministic
-fixtures. Live provider cells remain explicitly `not_run_requires_credentials` until a separately
-authorized run supplies dated evidence. Deterministic fixtures do not imply hosted-provider
-availability, billing, or account-specific behavior.
+`exp/runtime/gateway/provider_certification.py` is the dated provider matrix, including client,
+gateway surface, wire, fixture result, and live status. Its live cells remain
+`not_run_requires_credentials`; fixtures alone prove no hosted availability or account behavior.
+TypeSafe cells name decisions, not chat: real Rust HTTP plus SQLite tests use a loopback provider.
+A direct TypeSafe API smoke with synthetic input exercised all three question types on 2026-09-16.
+That direct success is not hosted-gateway, deployed-fleet, price-invoice, or reliability certification.

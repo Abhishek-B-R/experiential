@@ -22,6 +22,7 @@ from exp.runtime.gateway.contracts import (
     AttemptId,
     AuthorizationSnapshot,
     ExecutionSnapshot,
+    GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
     GatewayFailure,
@@ -551,7 +552,9 @@ class SQLiteAttemptLedger:
                    long_context_reasoning_rate, budget_reserved_nano_usd,
                    preferred_deployment_id, preferred_input_rate,
                    preferred_cached_input_rate, preferred_output_rate,
-                   preferred_reasoning_rate
+                   preferred_reasoning_rate,
+                   (SELECT api_surface FROM gateway_requests
+                    WHERE request_id = gateway_attempts.request_id) AS api_surface
             FROM gateway_attempts WHERE attempt_id = ?
             """,
             (attempt_id,),
@@ -584,6 +587,17 @@ class SQLiteAttemptLedger:
         budget_settlement = (
             cost if cost is not None else optional_int(row["budget_reserved_nano_usd"])
         )
+        if row["api_surface"] == GatewayApiSurface.DECISIONS.value and cost is None:
+            # An unmetered decision can still have executed upstream. Keep the
+            # reservation held without inventing usage or a settled charge.
+            # Only a witnessed HTTP rejection proves that this hold can release.
+            rejected = (
+                terminal_event is not None
+                and terminal_event.kind is GatewayEventKind.FAILED
+                and terminal_event.decision_provider_rejected
+                and usage is None
+            )
+            budget_settlement = 0 if rejected else None
         if budget_settlement is not None and budget_settlement > MAXIMUM_NANO_USD:
             raise GatewayLedgerError("attempt cost exceeds SQLite integer capacity")
         # Cost-optimality counterfactual: the SAME observed usage priced at the
@@ -650,6 +664,55 @@ class SQLiteAttemptLedger:
                 WHERE request_id = ? AND terminal_state IS NULL
                 """,
                 (state, terminal_at, str(row["request_id"])),
+            )
+
+    def reconcile_decision_liability(
+        self,
+        *,
+        attempt_id: AttemptId,
+        assigned_cost_nano_usd: int,
+    ) -> None:
+        """Resolve one terminal decision's held liability at an operator-assigned cost.
+
+        Assignment changes budget accounting only, never provider usage or its
+        unknown cost estimate. Repeating the same assignment is a no-op; a
+        conflicting assignment or an attempt without a held bound is refused.
+        """
+        if (
+            isinstance(assigned_cost_nano_usd, bool)
+            or not isinstance(assigned_cost_nano_usd, int)
+            or not 0 <= assigned_cost_nano_usd <= MAXIMUM_NANO_USD
+        ):
+            raise ValueError("assigned decision cost must fit a nonnegative SQLite integer")
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT a.state, a.usage_source, a.budget_reserved_nano_usd, "
+                "a.budget_settled_nano_usd, r.api_surface FROM gateway_attempts AS a "
+                "JOIN gateway_requests AS r ON r.request_id = a.request_id "
+                "WHERE a.attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["api_surface"] != GatewayApiSurface.DECISIONS.value
+                or row["state"] == "dispatched"
+                or row["usage_source"] != "unknown"
+                or row["budget_reserved_nano_usd"] is None
+            ):
+                raise GatewayLedgerError("attempt has no terminal decision liability to reconcile")
+            settled = optional_int(row["budget_settled_nano_usd"])
+            if settled is not None:
+                if settled == assigned_cost_nano_usd:
+                    return
+                raise GatewayLedgerError("decision liability already resolved at another cost")
+            settle_attempt_budgets(
+                connection,
+                attempt_id=attempt_id,
+                settled_nano_usd=assigned_cost_nano_usd,
+            )
+            connection.execute(
+                "UPDATE gateway_attempts SET budget_settled_nano_usd = ? WHERE attempt_id = ?",
+                (assigned_cost_nano_usd, attempt_id),
             )
 
     def finish_request(

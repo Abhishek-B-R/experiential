@@ -110,7 +110,7 @@ class GatewayWireProfile:
     """Full endpoint URL, including provider-specific query parameters."""
 
     headers: Mapping[str, str] = field(default_factory=dict, repr=False)
-    """Authenticated request headers for every dispatch."""
+    """Authenticated request headers for every dispatch, excluded from diagnostics."""
 
     credential_receipt: DispatchCredentialReceipt | None = field(default=None, repr=False)
     """Worker-private receipt for static auth; never serialized onto the native wire."""
@@ -301,6 +301,9 @@ class GatewayWireProfile:
     ``headers``; ``None`` when the connection speaks no embeddings wire, so the
     embeddings surface excludes the rung instead of dispatching a chat URL."""
 
+    decisions_url: str | None = None
+    """Full TypeSafe SystemOne endpoint, absent on non-decision connections."""
+
     images_url: str | None = None
     """Full OpenAI-wire ``/images/generations`` endpoint for this connection,
     sharing ``headers``; ``None`` when the connection speaks no images wire."""
@@ -324,6 +327,7 @@ class GatewayWireProfile:
             "openai_compatible",
             "gemini_generate_content",
             "bedrock_converse_stream",
+            "typesafe_systemone",
         }:
             raise ValueError("gateway wire dialect is not implemented")
         if self.reasoning_wire_format not in {

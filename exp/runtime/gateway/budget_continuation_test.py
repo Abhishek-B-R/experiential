@@ -81,7 +81,7 @@ class ScopedLedger(_RecordingLedger):
                     application="destination",
                 ),
             )
-        return super().start_attempt(
+        attempt_id = super().start_attempt(
             snapshot=snapshot,
             deployment=deployment,
             attempt_ordinal=attempt_ordinal,
@@ -94,6 +94,8 @@ class ScopedLedger(_RecordingLedger):
             dispatch_reason=dispatch_reason,
             preferred_deployment=preferred_deployment,
         )
+        self.started[-1]["fallback_reason"] = fallback_reason
+        return attempt_id
 
 
 def test_denied_pool_skips_later_members_without_poisoning_parent() -> None:
@@ -145,6 +147,71 @@ def test_denied_pool_skips_later_members_without_poisoning_parent() -> None:
     assert not accounting.health.suppressed(
         (auth.catalog_sha256, by_id["b1"].deployment_id, by_id["b1"].connection_sha256)
     )
+
+
+@pytest.mark.parametrize("pre_denied", [False, True])
+@pytest.mark.parametrize("allowed", [False, True])
+def test_denied_child_pool_cannot_bypass_conditional_parent_successor(
+    pre_denied: bool, allowed: bool
+) -> None:
+    """Every path skipping a denied child retains the same conditional-fallback ladder."""
+    catalog = model_catalog()
+    auth = _route().snapshot.authorization
+    snapshot = model_execution_snapshot(catalog, auth, catalog.pools[0])
+    by_id = {d.deployment_id: d for d in catalog.deployments}
+    parent = by_id["a2"]
+    restricted = parent.model_copy(
+        update={
+            "gateway": parent.gateway.model_copy(
+                update={
+                    "capabilities": parent.gateway.capabilities.model_copy(
+                        update={"failover_only_on": ("transport",) if allowed else ("refusal",)}
+                    )
+                }
+            )
+        }
+    )
+    route = GatewayRoute(
+        snapshot=snapshot,
+        deployment=by_id["a1"],
+        fallback_deployments=(by_id["b1"], restricted),
+        route_reason="direct",
+    )
+    ledger = ScopedLedger()
+    accounting = NativeAttemptAccounting(ledger)
+    entry = InflightRequest(auth, route, _request("test"), time.monotonic() + 30)
+    entry.recovery_reason = "scoped_recovery"
+    if pre_denied:
+        entry.denied_destination_pools.add("pool-b")
+    accounting.register(entry)
+    first = _start(accounting, ordinal=0, request_id=auth.request_id)
+    assert ledger.started[0]["dispatch_reason"] == "scoped_recovery"
+    _settle(
+        accounting,
+        attempt_id=str(first["attempt_id"]),
+        outcome="failed",
+        finalize=False,
+        request_id=auth.request_id,
+        failure={"failure_class": "transport", "safe_message": "failed"},
+    )
+    result = _start(
+        accounting,
+        ordinal=1,
+        current_depth=0,
+        request_id=auth.request_id,
+        failure={"failure_class": "transport", "safe_message": "failed", "failover_eligible": True},
+    )
+    checked = ["a1"] if pre_denied else ["a1", "b1"]
+    if allowed:
+        assert result["route_depth"] == 2
+        assert ledger.checked == [*checked, "a2"]
+        assert [row["deployment_id"] for row in ledger.started] == ["a1", "a2"]
+        assert ledger.started[-1]["fallback_reason"] == "failover_only_on:transport"
+        assert ledger.started[-1]["dispatch_reason"] != "scoped_recovery"
+    else:
+        assert result["exhausted"] is True
+        assert ledger.checked == checked
+        assert [row["deployment_id"] for row in ledger.started] == ["a1"]
 
 
 def test_child_pool_refusal_continues_to_funded_parent_suffix(tmp_path: Path) -> None:

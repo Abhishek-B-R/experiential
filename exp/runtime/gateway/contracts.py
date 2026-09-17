@@ -113,6 +113,7 @@ class GatewayApiSurface(StrEnum):
     MESSAGES = "messages"
     EMBEDDINGS = "embeddings"
     IMAGES = "images"
+    DECISIONS = "decisions"
 
 
 class StructuredTextFormat(ContractModel):

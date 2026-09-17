@@ -73,7 +73,7 @@ def test_installed_native_exports_ordered_stage_contract() -> None:
 
 
 @pytest.fixture(name="engine")
-def stage_engine(tmp_path: Path) -> Iterator[_ServingEngine]:
+def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_ServingEngine]:
     """Serve a genuinely different fallback model, with no false pool equivalence."""
     primary = ThreadingHTTPServer(("127.0.0.1", 0), _PrimaryUpstream)
     secondary = ThreadingHTTPServer(("127.0.0.1", 0), _StageSecondaryUpstream)
@@ -90,8 +90,15 @@ def stage_engine(tmp_path: Path) -> Iterator[_ServingEngine]:
     models = dict(catalog.models)
     beta = models["beta"]
     assert beta.gateway is not None
+    capabilities = beta.gateway.capabilities
+    if hasattr(request, "param"):
+        capabilities = capabilities.model_copy(update={"failover_only_on": (request.param,)})
     models["beta"] = beta.model_copy(
-        update={"gateway": beta.gateway.model_copy(update={"exact_model_id": "secondary-exact"})}
+        update={
+            "gateway": beta.gateway.model_copy(
+                update={"exact_model_id": "secondary-exact", "capabilities": capabilities}
+            )
+        }
     )
     chain = GatewayModelChain(
         model_id="model-revision-exact",
@@ -168,6 +175,34 @@ def stage_engine(tmp_path: Path) -> Iterator[_ServingEngine]:
                 server.shutdown()
                 server.server_close()
             assert process.returncode == 0, log_path.read_text()
+
+
+@pytest.mark.parametrize(
+    "engine,allowed", [("provider_internal", True), ("refusal", False)], indirect=["engine"]
+)
+def test_native_child_stage_honors_conditional_failover(
+    engine: _ServingEngine, allowed: bool
+) -> None:
+    """The actual native child wire is reachable only for its authored upstream failure token."""
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "messages": [{"role": "user", "content": "always-500"}]},
+        timeout=30,
+    )
+    with sqlite3.connect(engine.database_path) as db:
+        attempts = db.execute(
+            "SELECT deployment_id,state,fallback_reason FROM gateway_attempts "
+            "ORDER BY attempt_ordinal"
+        ).fetchall()
+    assert attempts[:2] == [("alpha", "failed", None), ("alpha", "failed", None)]
+    assert response.status_code == (200 if allowed else 502)
+    if allowed:
+        assert response.headers["x-gateway-canonical-model"] == "secondary-exact"
+        assert attempts[2:] == [("beta", "completed", "failover_only_on:provider_internal")]
+    else:
+        assert response.status_code == 502
+        assert len(attempts) == 2
 
 
 @pytest.mark.parametrize("surface", ["chat/completions", "responses", "messages"])
