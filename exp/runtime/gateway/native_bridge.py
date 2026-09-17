@@ -42,7 +42,12 @@ from exp.runtime.gateway.guardrails import deterministic
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
 from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
-from exp.runtime.gateway.guardrails.native import enforce_native_input, enforce_native_output
+from exp.runtime.gateway.guardrails.native import (
+    enforce_native_input,
+    enforce_native_output,
+    enforce_native_output_segment,
+    native_output_mode,
+)
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
@@ -181,10 +186,8 @@ class NativeControlPlane(
         Args:
             components: Authority, ledger, routes, and runtime catalogs.
             request_timeout_seconds: Total per-request budget from admission.
-            data_plane_metrics: Optional provider of the native engine's
-                content-free metrics snapshot as one JSON string; the local
-                launch injects ``exp_gateway_native.metrics_snapshot_json``.
-                Without it the snapshot reports ``data_plane`` as ``None``.
+            data_plane_metrics: Optional native metrics JSON supplier, typically
+                ``exp_gateway_native.metrics_snapshot_json``; otherwise reports ``None``.
             continuation_store: Optional injected Responses continuation
                 state; a host supplies its own bounded namespaced history,
                 and the default is one in-process bounded store.
@@ -311,11 +314,7 @@ class NativeControlPlane(
         request = decoded.request
         deadline = time.monotonic() + self._request_timeout_seconds
         try:
-            # ``app_referer``/``app_title`` are forwarded when the native engine includes the
-            # caller HTTP-Referer/X-Title in its admit payload; absent them app attribution
-            # stays null on the default path until the Rust engine populates them. ``client_ip``
-            # rides the same seam: the Rust engine resolves the trusted proxy hop and includes
-            # it so the hosted store can freeze it onto the snapshot for per-key IP enforcement.
+            # Freeze native app attribution and the trusted client IP onto caller authority.
             authorization = self._components.store.authorize_request(
                 raw_key=data["raw_key"],
                 alias=decoded.alias,
@@ -679,7 +678,7 @@ class NativeControlPlane(
             "maximum_total_attempts": MAXIMUM_TOTAL_ATTEMPTS,
             "maximum_same_deployment_attempts": MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
             "refusal_failover": authorization.refusal_failover,
-            "output_guardrail": bool(policy and policy.output_checks and plan is None),
+            "output_guardrail": native_output_mode(self._guardrails, policy, public_request).value,
             "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
         }
         if route.snapshot.throttle_redial is not None:
@@ -799,6 +798,15 @@ class NativeControlPlane(
         """
         return self._accounting.abandon(argument)
 
+    def enforce_output_segment(self, argument: str) -> str:
+        """Release the settled part of one streamed ``stream`` mode tail."""
+        entry = self._accounting.entry(str(json.loads(argument).get("request_id") or ""))
+        policy = None if entry is None else entry.policy
+        deadline = time.monotonic() if entry is None else entry.deadline_monotonic
+        return enforce_native_output_segment(
+            self._guardrails, policy, argument, deadline_monotonic=deadline
+        )
+
     def enforce_output(self, argument: str) -> str:
         """Run one output-chain callback for a native buffered completion."""
         data = json.loads(argument)
@@ -820,16 +828,9 @@ class NativeControlPlane(
     def claim_scope(self, argument: str) -> str:
         """Resolve the replay-store scope for one keyed request.
 
-        The data plane owns the bounded in-process replay store; this call
-        performs the decode and authorization once so the store key (tenant
-        namespace, hashed caller operation, canonical request digest) is
-        computed by exactly one implementation. The surface is part of the
-        key, so keyed Chat Completions and keyed Responses operations never
-        collide. A direct route whose provider has no native dialect is
-        escalated before any replay claim, so an unservable caller operation
-        never occupies the replay store; project targets resolve their
-        deployment at admission through the same frozen selection, so their
-        scope claims natively.
+        Decode and authorize once to scope replay by tenant, surface, operation,
+        and canonical request digest. Unsupported direct routes escalate before
+        any claim; project targets use the frozen admission deployment selection.
 
         Args:
             argument: JSON object with ``raw_key``, ``body``, optional
