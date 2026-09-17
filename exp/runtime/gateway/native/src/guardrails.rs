@@ -264,7 +264,17 @@ fn classify(event: &Event) -> StreamAdmission {
         Event::ProviderOutputItemStarted { .. }
         | Event::ProviderOutputItemCompleted { .. }
         | Event::TextBlockStarted { .. } => StreamAdmission::Boundary,
-        _ => StreamAdmission::Passthrough,
+        // Keep this match exhaustive: a new event variant must receive an
+        // explicit safety classification before guarded streaming compiles.
+        Event::ThinkingSignature { .. }
+        | Event::RedactedThinking { .. }
+        | Event::EncryptedReasoning { .. }
+        | Event::Usage(_)
+        | Event::Completed
+        | Event::Incomplete
+        | Event::StoppedAtSequence(_)
+        | Event::PausedTurn
+        | Event::Failed(_) => StreamAdmission::Passthrough,
     }
 }
 
