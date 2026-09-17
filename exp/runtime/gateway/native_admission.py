@@ -33,6 +33,7 @@ from exp.runtime.gateway.native_execution import (
     request_carries_cache_markers,
     select_route_deployments,
 )
+from exp.runtime.gateway.native_fallback_rules import require_unrestricted_rung
 from exp.runtime.gateway.native_reasoning import rung_provider_request
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.prompt_cache_affinity import provider_prompt_cache_key
@@ -356,6 +357,9 @@ def admitted_route_requests(
         authorization=authorization,
         continuation=continuation,
     )
+    # Every surviving rung failover-only would leave nothing to dial first:
+    # fail closed here, named, instead of exhausting a ladder that dialed nothing.
+    require_unrestricted_rung(route)
     return route, resolved_wires, public_request, provider_request, placement
 
 
