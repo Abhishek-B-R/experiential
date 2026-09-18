@@ -83,3 +83,46 @@ def test_chat_marker_keeps_exact_text_boundaries() -> None:
     ).request
     assert request.messages[0].content == "prefixdynamic suffix"
     assert request.messages[0].provider_text_blocks == tuple(blocks)
+
+
+@pytest.mark.parametrize("wire", ["bedrock_converse_stream", "openrouter"])
+def test_folded_instruction_keeps_prior_checkpoint(wire: str) -> None:
+    """A dynamic system reminder must not erase or extend the user's cached prefix."""
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "stable prefix",
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {"role": "system", "content": "dynamic reminder"},
+            ],
+        }
+    ).request
+    profile = GatewayWireProfile(
+        dialect="openai_compatible" if wire == "openrouter" else wire,
+        model_id="claude-sonnet-4-6",
+        url="https://example.invalid",
+        forwards_cache_control=wire == "openrouter",
+        system_messages_leading_only=wire == "openrouter",
+    )
+    payload = dialect_stream_payload(profile, request)
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    first = messages[0]
+    assert isinstance(first, dict)
+    if wire == "bedrock_converse_stream":
+        assert first["content"] == [
+            {"text": "stable prefix"},
+            {"cachePoint": {"type": "default"}},
+            {"text": "\n\n"},
+            {"text": "dynamic reminder"},
+        ]
+    else:
+        assert first["content"] == [
+            {"type": "text", "text": "stable prefix", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "\n\n"},
+            {"type": "text", "text": "dynamic reminder"},
+        ]
