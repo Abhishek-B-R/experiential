@@ -14,7 +14,14 @@ from typing import Literal, cast
 from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError, field_validator
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.content import MessageContentPart, TextContentPart
 from exp.runtime.gateway.contracts import GatewayMessage
+from exp.runtime.models.providers.cache_policy import (
+    merge_cache_checkpoint,
+    multimodal_text_cache_blocks,
+    retain_multimodal_cache_boundaries,
+)
+from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.openai_protocol.errors import invalid_field
 
 _TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
@@ -77,6 +84,16 @@ def drop_opencode_cache_control(payload: JsonObject) -> JsonObject:
 def restore_chat_cache_control(
     messages: tuple[GatewayMessage, ...], payload: JsonObject
 ) -> tuple[tuple[GatewayMessage, ...], tuple[str, ...]]:
+    """Retain ordered checkpoints or return a typed refusal before dispatch."""
+    try:
+        return _restore_chat_cache_control(messages, payload)
+    except ProviderParameterError as error:
+        raise invalid_field("messages.content.cache_control", str(error)) from error
+
+
+def _restore_chat_cache_control(
+    messages: tuple[GatewayMessage, ...], payload: JsonObject
+) -> tuple[tuple[GatewayMessage, ...], tuple[str, ...]]:
     """Carry validated Chat hints past official SDK validation onto wire metadata.
 
     The decoder validates the cleaned body first. Its one-to-one message mapping
@@ -112,23 +129,55 @@ def restore_chat_cache_control(
                     message.tool_calls[-1].model_copy(update={"cache_control": marker}),
                 )
                 message = message.model_copy(update={"tool_calls": calls})
-            elif message.content_parts and message.content_parts[-1].kind != "text":
-                last = message.content_parts[-1]
-                if last.kind != "image" and last.kind != "document":
+            elif message.content_parts:
+                pass  # The complete ordered sequence below owns this boundary.
+            elif blocks:
+                previous = blocks[-1].get("cache_control")
+                blocks[-1]["cache_control"] = merge_cache_checkpoint(
+                    previous if isinstance(previous, dict) else None, marker
+                )
+        if message.content_parts and isinstance(content, list):
+            # Match validated parts back to the original sequence before discarded
+            # empty text can move a checkpoint across an attachment.
+            canonical = iter(message.content_parts)
+            ordered: list[MessageContentPart] = []
+            for raw_part in content:
+                assert isinstance(raw_part, dict)
+                if raw_part.get("type") in _TEXT_PART_TYPES:
+                    part = next(canonical) if raw_part.get("text") else TextContentPart(text="")
+                    hint = raw_part.get("cache_control")
+                    if isinstance(hint, dict):
+                        part = part.model_copy(update={"cache_control": hint})
+                else:
+                    part = next(canonical)
+                ordered.append(part)
+            if isinstance(marker, dict) and not message.tool_calls and ordered:
+                last = ordered[-1]
+                if last.kind == "text" or last.kind == "image" or last.kind == "document":
+                    merged = merge_cache_checkpoint(last.cache_control, marker)
+                    ordered[-1] = last.model_copy(update={"cache_control": merged})
+                else:
                     disclosures.append(
                         f"messages.{index}.cache_control->dropped(unsupported_media)"
                     )
-                else:
-                    message = message.model_copy(
-                        update={
-                            "content_parts": (
-                                *message.content_parts[:-1],
-                                last.model_copy(update={"cache_control": marker}),
-                            )
-                        }
-                    )
-            elif blocks:
-                blocks[-1]["cache_control"] = marker
+            retained, unsupported = retain_multimodal_cache_boundaries(ordered)
+            if unsupported:
+                disclosures.append(
+                    f"messages.{index}.content.cache_control->dropped(unsupported_media)"
+                )
+            blocks = list(multimodal_text_cache_blocks(retained))
+            message = message.model_copy(update={"content_parts": retained})
+        elif any("cache_control" in block for block in blocks):
+            text_parts = tuple(
+                TextContentPart(
+                    text=str(block["text"]),
+                    cache_control=cast(JsonObject | None, block.get("cache_control")),
+                )
+                for block in blocks
+            )
+            retain_multimodal_cache_boundaries(
+                text_parts
+            )  # Validate without changing text-only carriers.
         if any("cache_control" in block for block in blocks):
             message = message.model_copy(update={"provider_text_blocks": tuple(blocks)})
         restored.append(message)
