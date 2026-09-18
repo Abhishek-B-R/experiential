@@ -13,8 +13,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::admission::{
-    acquire_permit, apply_output_guardrail, new_guard, served_headers, wire_drift_response,
-    Admission,
+    acquire_permit, apply_output_guardrail, new_guard, served_headers, wire_drift_response, Admission,
 };
 use crate::billing::SettledBilling;
 use crate::encode::{compact_json, reasoning_carrier_candidate};
@@ -763,8 +762,7 @@ async fn stream_responses(
         let mut terminal: Option<Event> = None;
         let mut retention = ResponsesRetention::default();
         let mut reasoning_content_carrier: Option<String> = None;
-        // Deterministic output redaction as bytes flow: only the trailing
-        // window the detector cannot yet decide about is withheld.
+        // Streaming redaction withholds only the detector's unresolved trailing window.
         let mut redactor = incremental_guardrail.then(|| StreamRedactor::new(&request_id));
         // Withhold terminal frames until continuation retention lands.
         let terminal_frames: Vec<String>;
@@ -925,9 +923,7 @@ async fn stream_responses(
             }
         }
 
-        // Retention runs before the terminal frames flush; a bounded
-        // retention failure truncates the stream before its terminal, the
-        // same observable behavior as the python service.
+        // A bounded retention failure truncates the stream before its terminal.
         let retainable = !matches!(terminal, Some(Event::Failed(_)));
         if retainable {
             if let Err(_error) = remember_continuation(
@@ -949,17 +945,21 @@ async fn stream_responses(
                 return;
             }
         }
-        // The durable settlement lands before any keyed publication so a
-        // replayable success can never outlive a lost accounting write; a
-        // failed terminal abandons ownership so duplicates fail closed.
-        settle_stream_end(
+        // Failed settlement or terminals cannot publish replayable success.
+        if !settle_stream_end(
             &mut guard,
             terminal.as_ref(),
             usage.as_ref(),
             &tool_names,
             false,
         )
-        .await;
+        .await
+        {
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
+            }
+            return;
+        }
         if matches!(terminal, Some(Event::Failed(_))) {
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;

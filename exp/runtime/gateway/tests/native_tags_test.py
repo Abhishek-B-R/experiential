@@ -76,6 +76,8 @@ class _Gateway:
     billing: SettledRequestBilling | None = None
     billing_reads: list[str] = field(default_factory=list)
     billing_delay: float = 0.0
+    fail_settlement: bool = False
+    settlement_failures: int = 0
     controls: list[NativeControlPlane] = field(default_factory=list)
 
     def read_billing(self, request_id: str) -> SettledRequestBilling | None:
@@ -130,6 +132,17 @@ def gateway(
         tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
     )
     result = _Gateway(raw_key)
+    original_settle = NativeControlPlane.settle
+
+    def settle(control: NativeControlPlane, argument: str) -> str:
+        """Fail the real bridge settlement without publishing a pretend success."""
+        if result.fail_settlement:
+            result.settlement_failures += 1
+            message = "Fixture ledger unavailable"
+            raise RuntimeError(message)
+        return original_settle(control, argument)
+
+    monkeypatch.setattr(NativeControlPlane, "settle", settle)
     request_timeout = float(getattr(request, "param", 120.0))
     original = SyncGroupCommitLedger.accept_request
 
@@ -458,3 +471,23 @@ def test_slow_billing_cannot_truncate_settled_success(gateway: _Gateway, surface
     assert terminal in answer.text
     assert '"cost"' not in answer.text
     assert len(gateway.billing_reads) == 1
+
+
+@pytest.mark.parametrize("gateway", [2.0], indirect=True)
+def test_failed_responses_settlement_never_reads_billing_or_publishes_success(
+    gateway: _Gateway,
+) -> None:
+    """A lost ledger write cannot produce annotated or replayable terminal success."""
+    gateway.fail_settlement = True
+    gateway.billing = SettledRequestBilling(paid_nano_usd=1234567, byok_nano_usd=0, is_byok=False)
+    body = {"model": "coding", "input": "hello", "stream": True}
+    headers = {"Authorization": "Bearer " + gateway.key, "Idempotency-Key": "failed-settlement"}
+    answer = httpx.post(gateway.origins[0] + "/responses", json=body, headers=headers, timeout=5)
+    assert answer.status_code == 200
+    assert '"type":"response.completed"' not in answer.text
+    assert '"cost"' not in answer.text
+    assert gateway.settlement_failures > 0
+    assert gateway.billing_reads == []
+    replay = httpx.post(gateway.origins[0] + "/responses", json=body, headers=headers, timeout=5)
+    assert replay.status_code == 409
+    assert len(_TagsUpstream.payloads) == 1

@@ -69,9 +69,10 @@ with at most 16 unique string keys and string values:
 - A keyed Chat or Responses retry must carry the same tag map. JSON whitespace
   and key order do not matter; changing, adding, or dropping a tag returns 409
   `idempotency_conflict`. Messages remains unkeyed even with `Idempotency-Key`.
-- Tags apply to this request only. A Responses continuation may change or omit
-  tags, including on another worker; its namespace remains organization,
-  identity, and response ID only. Tags are not inherited from prior turns.
+- Tags apply to this request only and are not inherited from prior turns. A
+  Responses continuation may change or omit tags without changing its store's
+  namespace. An injected hosted store retains its own organization, identity,
+  and response-ID key; tags add no alias or revision binding.
 
 ### Host consumption contract
 
