@@ -10,6 +10,10 @@ def cache_markers(request: GatewayRequest) -> tuple[JsonObject, ...]:
     """Return all explicit cache hints without serializing prompt content."""
     markers: list[JsonObject | None] = [request.provider_cache_control]
     markers.extend(tool.cache_control for tool in request.tools)
+    for tool in request.provider_server_tools:
+        marker = tool.get("cache_control")
+        if isinstance(marker, dict):
+            markers.append(marker)
     for message in request.messages:
         markers.append(message.cache_control)
         markers.extend(call.cache_control for call in message.tool_calls)
