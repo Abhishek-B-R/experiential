@@ -419,7 +419,7 @@ def _prefer_cache_capable_rungs(
     marker_capable = tuple(
         index
         for index, (profile, _client) in enumerate(resolved_wires)
-        if profile.dialect == "anthropic_messages"
+        if profile.preserves_cache_control
     )
     if not marker_capable or len(marker_capable) == len(resolved_wires):
         return route, resolved_wires

@@ -527,7 +527,7 @@ def route_generation_parameter_requests(
     # from the winning Anthropic rung too, billing every turn's full context
     # uncached (~10x on input for a large system prompt).
     if request.provider_cache_control is not None and not any(
-        profile.dialect == "anthropic_messages" for profile in profiles
+        profile.preserves_cache_control for profile in profiles
     ):
         ignore("provider_cache_control", f"cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}")
     if request.inference_geo is not None and not all(
@@ -587,7 +587,7 @@ def route_generation_parameter_requests(
         call.cache_control is not None
         for message in request.messages
         for call in message.tool_calls
-    ) and not all(profile.dialect == "anthropic_messages" for profile in profiles):
+    ) and not all(profile.preserves_cache_control for profile in profiles):
         tool_call_marker = f"messages.tool_calls.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}"
         if tool_call_marker not in ignored:
             ignored.append(tool_call_marker)
@@ -601,7 +601,7 @@ def route_generation_parameter_requests(
     if any(
         message.provider_text_blocks or message.cache_control is not None
         for message in request.messages
-    ) and not any(profile.dialect == "anthropic_messages" for profile in profiles):
+    ) and not any(profile.preserves_cache_control for profile in profiles):
         content_marker = f"messages.content.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}"
         if content_marker not in ignored:
             ignored.append(content_marker)
@@ -621,7 +621,8 @@ def route_generation_parameter_requests(
         tool_annotation_paths = (
             (
                 f"tools.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}",
-                any(tool.cache_control is not None for tool in request.tools),
+                any(tool.cache_control is not None for tool in request.tools)
+                and not all(profile.preserves_cache_control for profile in profiles),
             ),
             (
                 "tools.eager_input_streaming",

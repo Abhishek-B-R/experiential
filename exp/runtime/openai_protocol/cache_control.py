@@ -3,9 +3,8 @@
 The @ai-sdk stack attaches Anthropic-style ephemeral cache hints to recent
 messages for Claude-family model ids. Placements are classified in
 ``CHAT_CACHE_CONTROL_PLACEMENTS``: message-level and text-part hints are
-validated and dropped here before official validation, while a hint inside a
-``tool_calls`` entry is carried by the request decoder onto the canonical
-tool call for the one wire that honors it.
+validated and temporarily removed for official SDK validation, then retained
+on canonical message carriers. Tool-call hints ride canonical tool calls.
 """
 
 from __future__ import annotations
@@ -15,6 +14,7 @@ from typing import Literal, cast
 from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError, field_validator
 
 from exp.common.core.artifacts import JsonObject
+from exp.runtime.gateway.contracts import GatewayMessage
 from exp.runtime.openai_protocol.errors import invalid_field
 
 _TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
@@ -27,7 +27,7 @@ class _HintWireModel(BaseModel):
 
 
 class EphemeralCacheControl(_HintWireModel):
-    """OpenCode/Anthropic cache breakpoint accepted only so it can be dropped.
+    """Validated OpenCode/Anthropic cache breakpoint.
 
     The object form is ``{"type": "ephemeral"}`` with an optional ``ttl`` of
     ``5m`` or ``1h``. An explicit ``ttl: null`` is not in that allowlist.
@@ -72,6 +72,63 @@ def drop_opencode_cache_control(payload: JsonObject) -> JsonObject:
     cleaned_payload = dict(payload)
     cleaned_payload["messages"] = cleaned_messages
     return cleaned_payload
+
+
+def restore_chat_cache_control(
+    messages: tuple[GatewayMessage, ...], payload: JsonObject
+) -> tuple[GatewayMessage, ...]:
+    """Carry validated Chat hints past official SDK validation onto wire metadata.
+
+    The decoder validates the cleaned body first. Its one-to-one message mapping
+    lets the original markers ride the same carriers used by Messages requests.
+    """
+    raw_messages = cast(list[JsonObject], payload["messages"])
+    restored: list[GatewayMessage] = []
+    for message, raw in zip(messages, raw_messages, strict=True):
+        marker = raw.get("cache_control")
+        content = raw.get("content")
+        blocks: list[JsonObject] = []
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in _TEXT_PART_TYPES:
+                    block: JsonObject = {"type": "text", "text": part["text"]}
+                    if isinstance(part.get("cache_control"), dict):
+                        block["cache_control"] = part["cache_control"]
+                    blocks.append(block)
+        elif isinstance(content, str):
+            blocks.append({"type": "text", "text": content})
+        if message.role == "tool":
+            # A tool result is one upstream block; its last text breakpoint
+            # therefore belongs to the whole result.
+            markers = [b["cache_control"] for b in blocks if "cache_control" in b]
+            tool_marker = marker if isinstance(marker, dict) else markers[-1] if markers else None
+            restored.append(message.model_copy(update={"cache_control": tool_marker}))
+            continue
+        if isinstance(marker, dict):
+            if message.tool_calls:
+                calls = (
+                    *message.tool_calls[:-1],
+                    message.tool_calls[-1].model_copy(update={"cache_control": marker}),
+                )
+                message = message.model_copy(update={"tool_calls": calls})
+            elif message.content_parts and message.content_parts[-1].kind != "text":
+                last = message.content_parts[-1]
+                if last.kind != "image" and last.kind != "document":
+                    raise invalid_field("messages.cache_control")
+                message = message.model_copy(
+                    update={
+                        "content_parts": (
+                            *message.content_parts[:-1],
+                            last.model_copy(update={"cache_control": marker}),
+                        )
+                    }
+                )
+            elif blocks:
+                blocks[-1]["cache_control"] = marker
+        if any("cache_control" in block for block in blocks):
+            message = message.model_copy(update={"provider_text_blocks": tuple(blocks)})
+        restored.append(message)
+    return tuple(restored)
 
 
 def _without_message_hint(raw_message: JsonValue, index: int) -> tuple[JsonValue, bool]:
