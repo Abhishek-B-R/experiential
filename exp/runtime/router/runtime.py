@@ -702,6 +702,11 @@ class RouterRuntime:
         pricing_snapshot_sha256: Sha256,
         pricing_candidate_aliases: tuple[ModelAlias, ...],
     ) -> None:
+        """Verify activation artifacts and candidate identity match the frozen policy.
+
+        Raises:
+            RouterRuntimeIntegrityError: Any policy, manifest, bank, or pricing identity differs.
+        """
         if pricing_snapshot_id != self.policy.pricing_snapshot_id:
             raise RouterRuntimeIntegrityError("runtime pricing snapshot differs from fit time")
         if pricing_snapshot_sha256 != self.policy.pricing_snapshot_sha256:

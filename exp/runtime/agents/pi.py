@@ -184,6 +184,7 @@ class _PiBridge(AbstractContextManager["_PiBridge"]):
         model: ModelClient,
         environment: EnvironmentSession,
     ) -> None:
+        """Bind one Pi process to its task, model, and execute-only environment."""
         self._task = task
         self._model = model
         self._environment = environment
