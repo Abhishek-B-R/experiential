@@ -10,7 +10,7 @@ import pytest
 
 from exp.runtime.gateway.contracts import AuthorizationSnapshot
 from exp.runtime.gateway.lifecycle import load_gateway_components
-from exp.runtime.gateway.native_bridge import NativeControlPlane
+from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
 from exp.runtime.gateway.native_capture import (
     CaptureConfiguration,
     CaptureController,
@@ -19,6 +19,7 @@ from exp.runtime.gateway.native_capture import (
     CaptureSseResponse,
 )
 from exp.runtime.gateway.native_server import serve_native_gateway
+from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.gateway.tests.launch_test import (
     _configure_gateway,
     _LoopbackProvider,
@@ -86,6 +87,57 @@ def test_python_and_rust_configuration_fail_closed() -> None:
         CaptureConfiguration(maximum_pending_bytes=1)
     with pytest.raises(ValueError):
         native.CaptureCollector('{"unknown": true}', lambda _: None)
+
+
+def test_accepted_routing_failure_keeps_effective_prompt_without_inventing_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Capture begins after acceptance but before a route can fail without dispatch."""
+    monkeypatch.setenv("LOOPBACK_PROVIDER_KEY", "provider-secret")
+    _manager, raw_key = _configure_gateway(tmp_path, base_url="http://127.0.0.1:1/v1")
+    components = load_gateway_components(tmp_path)
+    records: list[str] = []
+    authorized: list[str] = []
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), records.append)
+
+    def application_for(authorization: AuthorizationSnapshot) -> str:
+        """Record the authenticated request for an explicit hosted terminal verdict."""
+        authorized.append(authorization.request_id)
+        return "application"
+
+    capture = CaptureController(collector, application_for=application_for)
+    control = NativeControlPlane(components, capture=capture)
+
+    def unavailable(*_args: object, **_kwargs: object) -> None:
+        """Reject route construction without making a provider call."""
+        raise GatewayRoutingError("unavailable route")
+
+    monkeypatch.setattr(control, "_resolve_route", unavailable)
+    try:
+        with pytest.raises(NativeBridgeError):
+            control.admit(
+                json.dumps(
+                    {
+                        "raw_key": raw_key,
+                        "body": json.dumps(
+                            {
+                                "model": "coding",
+                                "messages": [{"role": "user", "content": "retained task"}],
+                            }
+                        ),
+                    }
+                )
+            )
+        assert len(authorized) == 1
+        collector.settle(authorized[0], True, False)
+        assert collector.close(1)
+    finally:
+        collector.close(1)
+        components.write_ledger.close()
+    parsed = CaptureRecord.model_validate_json(records[0])
+    assert parsed.request.model_id is None
+    assert parsed.response is None
+    assert "retained task" in records[0]
 
 
 @pytest.mark.parametrize("policy", ["local", "hosted", "off", "broken"])
@@ -181,5 +233,6 @@ def test_real_http_surfaces_use_one_collector_without_affecting_serving(
         "messages",
     }
     assert all(record.request.scope.identity_id == "default" for record in completed)
+    assert all(record.request.model_id is not None for record in completed)
     assert "provider-secret" not in "".join(records)
     assert raw_key not in "".join(records)

@@ -29,7 +29,7 @@ pub(crate) struct Request {
     pub request_id: String,
     pub scope: Scope,
     pub protocol: Protocol,
-    pub model_id: String,
+    pub model_id: Option<String>,
     pub context: Value,
 }
 
@@ -72,10 +72,14 @@ impl Record {
                 &self.request.scope.organization_id,
                 &self.request.scope.identity_id,
                 &self.request.scope.application_id,
-                &self.request.model_id,
             ]
             .iter()
             .any(|value| value.trim().is_empty() || value.len() > 512)
+            || self
+                .request
+                .model_id
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty() || value.len() > 512)
             || self
                 .request
                 .context
