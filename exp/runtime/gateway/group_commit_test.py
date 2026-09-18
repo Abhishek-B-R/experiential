@@ -568,8 +568,10 @@ def test_cancelled_write_task_yields_none() -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("writes", [None, 0, 3])
 def test_facades_forward_upstream_provider_only_to_a_host_hook_that_accepts_it(
     tmp_path: Path,
+    writes: int | None,
 ) -> None:
     """The hosted-ledger seam probes the host's apply hook, not the engine facade.
 
@@ -581,6 +583,8 @@ def test_facades_forward_upstream_provider_only_to_a_host_hook_that_accepts_it(
     store, core, raw_key = _authority_fixture(tmp_path, clock)
     recorded: list[dict[str, object]] = []
     original = core.apply_finish_attempt
+    observed = datetime(2026, 9, 18, 1, 2, 3, tzinfo=UTC)
+    usage = GatewayUsage(input_tokens=10, output_tokens=4, cache_creation_input_tokens=writes)
 
     def legacy_apply(
         connection: sqlite3.Connection,
@@ -597,6 +601,8 @@ def test_facades_forward_upstream_provider_only_to_a_host_hook_that_accepts_it(
         ratelimit_remaining_tokens: int | None = None,
     ) -> None:
         """The pre-keyword host hook shape: any extra keyword would TypeError here."""
+        assert terminal_event is not None and terminal_event.usage == usage
+        assert first_token_at == observed
         recorded.append({"attempt_id": attempt_id, "finalize": finalize_request})
         original(
             connection,
@@ -630,9 +636,10 @@ def test_facades_forward_upstream_provider_only_to_a_host_hook_that_accepts_it(
             terminal_event=GatewayEvent(
                 kind=GatewayEventKind.COMPLETED,
                 sequence_number=1,
-                usage=GatewayUsage(input_tokens=10, output_tokens=4),
+                usage=usage,
             ),
             failure=None,
+            first_token_at=observed,
             upstream_provider="Azure",
         )
         facade.flush()
@@ -665,9 +672,10 @@ def test_facades_forward_upstream_provider_only_to_a_host_hook_that_accepts_it(
         terminal_event=GatewayEvent(
             kind=GatewayEventKind.COMPLETED,
             sequence_number=1,
-            usage=GatewayUsage(input_tokens=10, output_tokens=4),
+            usage=usage,
         ),
         failure=None,
+        first_token_at=observed,
         upstream_provider="Azure",
     )
     facade.flush()
@@ -681,7 +689,10 @@ def test_facades_forward_upstream_provider_only_to_a_host_hook_that_accepts_it(
         connection.close()
 
 
-def test_async_facade_withholds_upstream_provider_from_a_legacy_host_hook(tmp_path: Path) -> None:
+@pytest.mark.parametrize("writes", [None, 0, 3])
+def test_async_facade_withholds_upstream_provider_from_a_legacy_host_hook(
+    tmp_path: Path, writes: int | None
+) -> None:
     """``GroupCommitAttemptLedger.finish_attempt`` probes the host hook the same way.
 
     The async facade captures the hook, probes it and queues its own lambda
@@ -693,6 +704,8 @@ def test_async_facade_withholds_upstream_provider_from_a_legacy_host_hook(tmp_pa
     store, core, raw_key = _authority_fixture(tmp_path, clock)
     recorded: list[str] = []
     original = core.apply_finish_attempt
+    usage = GatewayUsage(input_tokens=10, output_tokens=4, cache_creation_input_tokens=writes)
+    observed = datetime(2026, 9, 18, 1, 2, 3, tzinfo=UTC)
 
     def legacy_apply(
         connection: sqlite3.Connection,
@@ -709,6 +722,8 @@ def test_async_facade_withholds_upstream_provider_from_a_legacy_host_hook(tmp_pa
         ratelimit_remaining_tokens: int | None = None,
     ) -> None:
         """The pre-keyword host hook shape: any extra keyword would TypeError here."""
+        assert terminal_event is not None and terminal_event.usage == usage
+        assert first_token_at == observed
         recorded.append(attempt_id)
         original(
             connection,
@@ -744,9 +759,10 @@ def test_async_facade_withholds_upstream_provider_from_a_legacy_host_hook(tmp_pa
                 terminal_event=GatewayEvent(
                     kind=GatewayEventKind.COMPLETED,
                     sequence_number=1,
-                    usage=GatewayUsage(input_tokens=10, output_tokens=4),
+                    usage=usage,
                 ),
                 failure=None,
+                first_token_at=observed,
                 upstream_provider="Azure",
             )
             await grouped.flush()

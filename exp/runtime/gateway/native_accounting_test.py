@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Literal, cast
 
 import pytest
@@ -582,12 +582,14 @@ def test_sweep_cancels_the_active_attempt_after_the_deadline() -> None:
     assert registry.counters()[1] == 1
 
 
+@pytest.mark.parametrize("writes", [None, 0, 25])
 @pytest.mark.parametrize("fault", ["raise", "provider", "exact_model_id", "organization_id"])
-@pytest.mark.parametrize("swept", [False, True])
+@pytest.mark.parametrize("delivery", ["direct", "retry", "sweep"])
 @pytest.mark.parametrize("finalize", [False, True])
 def test_recovery_observer_failure_cannot_block_durable_settlement_cleanup(
+    writes: int | None,
     fault: Literal["raise", "provider", "exact_model_id", "organization_id"],
-    swept: bool,
+    delivery: Literal["direct", "retry", "sweep"],
     finalize: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -612,34 +614,51 @@ def test_recovery_observer_failure_cannot_block_durable_settlement_cleanup(
         deployment.provider_model,
         invalid_scope,
     )
+    frozen_bindings = dict(entry.recovery_bindings)
     started = _start(registry, ordinal=0, request_id=entry.authorization.request_id)
     settlement = json.dumps(
         {
             "request_id": entry.authorization.request_id,
             "attempt_id": started["attempt_id"],
             "outcome": "completed",
-            "usage": {"input_tokens": 100, "output_tokens": 5, "cached_input_tokens": 50},
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 5,
+                "cached_input_tokens": 50,
+                "cache_creation_input_tokens": writes,
+            },
             "first_token_at": "2026-09-18T01:02:03+00:00",
             "upstream_provider": "Azure",
             "finalize": finalize,
         }
     )
-    if swept:
+    if delivery != "direct":
         ledger.fail_finishes = 1
         with pytest.raises(NativeBridgeError):
             registry.settle(settlement)
-        assert entry.pending_settlement is not None
-        registry.sweep_expired()
-        assert entry.pending_settlement is None
-        assert registry.counters()[0] == 1
+        assert entry.pending_settlement == json.loads(settlement)
+        if delivery == "sweep":
+            registry.sweep_expired()
+            assert entry.pending_settlement is None
+            assert registry.counters()[0] == 1
+        else:
+            assert registry.settle(settlement) == "{}"
     else:
         assert registry.settle(settlement) == "{}"
     assert len(ledger.finished) == 1 and ledger.finished[0]["finalize"] is finalize
     observed = datetime.fromisoformat("2026-09-18T01:02:03+00:00")
-    assert ledger.first_token_times == [observed] * (2 if swept else 1)
-    assert ledger.upstream_providers == ["Azure"] * (2 if swept else 1)
+    calls = 1 if delivery == "direct" else 2
+    assert ledger.first_token_times == [observed] * calls
+    assert ledger.upstream_providers == ["Azure"] * calls
+    assert len(ledger.terminal_events) == calls
+    for event in ledger.terminal_events:
+        assert event is not None and event.usage is not None
+        assert event.usage.cache_creation_input_tokens == writes
+        assert event.usage.input_tokens == 100
+        assert event.usage.cached_input_tokens == 50
     assert registry.loads.inflight(("deployment-a", "b" * 64)) == 0
     assert registry.accounting_healthy
+    assert entry.recovery_bindings == frozen_bindings
     assert not entry.recovery_recorded_attempts
     assert not registry.recovery._sessions  # noqa: SLF001 - scope faults must write no evidence.
     assert "synthetic-private-detail" not in caplog.text
@@ -2497,12 +2516,52 @@ class _LegacySignatureLedger(_RecordingLedger):
         ratelimit_remaining_tokens: int | None = None,
     ) -> None:
         """Record the settle exactly as the previous engine handed it over."""
-        del first_token_at, retry_after_seconds, ratelimit_limit_requests
+        del retry_after_seconds, ratelimit_limit_requests
         del ratelimit_remaining_requests, ratelimit_limit_tokens, ratelimit_remaining_tokens
+        self.first_token_times.append(first_token_at)
         self.terminal_events.append(terminal_event)
         self.finished.append(
             {"attempt_id": attempt_id, "finalize": finalize_request, "failed": failure is not None}
         )
+
+
+@pytest.mark.parametrize("writes", [None, 0, 25])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_cache_write_usage_keeps_legacy_and_current_host_signatures(
+    writes: int | None, legacy: bool
+) -> None:
+    """Cache writes ride typed usage, never a new keyword an older host must accept."""
+    ledger = _LegacySignatureLedger() if legacy else _RecordingLedger()
+    registry = NativeAttemptAccounting(cast("SyncWriteLedger", ledger))
+    _admit(registry, _bounded_pair(1), request_id="cache-write-host")
+    started = _start(registry, ordinal=0, request_id="cache-write-host")
+    observed = datetime(2026, 9, 18, 1, 2, 3, tzinfo=UTC)
+    registry.settle(
+        json.dumps(
+            {
+                "request_id": "cache-write-host",
+                "attempt_id": started["attempt_id"],
+                "outcome": "completed",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 5,
+                    "cached_input_tokens": 50,
+                    "cache_creation_input_tokens": writes,
+                },
+                "first_token_at": observed.isoformat(),
+                "upstream_provider": "Azure",
+                "finalize": True,
+                "opened": True,
+            }
+        )
+    )
+    (event,) = ledger.terminal_events
+    assert event is not None and event.usage is not None
+    assert event.usage.cache_creation_input_tokens == writes
+    assert ledger.first_token_times == [observed]
+    assert ledger.upstream_providers == ([] if legacy else ["Azure"])
+    assert len(ledger.finished) == 1
+    assert registry.entry("cache-write-host") is None
 
 
 def _settle_naming_upstream(

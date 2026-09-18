@@ -103,9 +103,9 @@ def stage_affinity_ordered_rungs(
         if stage.failover_mode != "maximize_availability" and request_carries_cache_markers(
             request
         ):
-            indexes = tuple(
-                i for i in indexes if wires[i][0].dialect == "anthropic_messages"
-            ) + tuple(i for i in indexes if wires[i][0].dialect != "anthropic_messages")
+            indexes = tuple(i for i in indexes if wires[i][0].preserves_cache_control) + tuple(
+                i for i in indexes if not wires[i][0].preserves_cache_control
+            )
         order.extend(indexes)
         offset += len(stage.deployment_ids)
     route = reorder_route_deployments(route, tuple(order))

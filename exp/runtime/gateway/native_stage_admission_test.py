@@ -34,7 +34,11 @@ from exp.runtime.gateway.native_execution import (
     select_route_deployments,
 )
 from exp.runtime.gateway.native_execution_test import _route
-from exp.runtime.gateway.native_fallback_rules import FailoverRulesError, require_unrestricted_rung
+from exp.runtime.gateway.native_fallback_rules import (
+    FailoverRulesError,
+    eligible_ladder,
+    require_unrestricted_rung,
+)
 from exp.runtime.gateway.native_recovery import record_session_outcome, session_cache_key
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_stage_admission import stage_affinity_ordered_rungs as _stage_order
@@ -183,6 +187,99 @@ def stage_affinity_ordered_rungs(
     )
 
 
+@pytest.mark.parametrize("mode", ["maximize_cache", "maximize_cache_affinity"])
+@pytest.mark.parametrize("wire", ["anthropic_messages", "bedrock_converse_stream", "openrouter"])
+@pytest.mark.parametrize("conditional", [False, True])
+def test_marker_capable_rungs_stay_inside_root_and_child_segments(
+    mode: FailoverMode, wire: str, conditional: bool
+) -> None:
+    """Every supported marker wire ranks locally without granting conditional first dials."""
+    route, original_wires = _affinity_fixture()
+    template = route.deployment
+    deployments = tuple(
+        template.model_copy(
+            update={
+                "deployment_id": f"{model}-{kind}",
+                "exact_model_id": model,
+                "gateway": template.gateway.model_copy(
+                    update={
+                        "capabilities": template.gateway.capabilities.model_copy(
+                            update={
+                                "failover_only_on": ("refusal",)
+                                if conditional and kind == "marked"
+                                else None
+                            }
+                        )
+                    }
+                ),
+            }
+        )
+        for model in ("root", "child")
+        for kind in ("generic", "marked")
+    )
+    stages = tuple(
+        route.snapshot.stage_for_depth(0).model_copy(
+            update={
+                "stage_index": index,
+                "exact_model_id": model,
+                "pool_id": f"pool-{model}",
+                "deployment_ids": tuple(
+                    d.deployment_id for d in deployments[index * 2 : index * 2 + 2]
+                ),
+                "rung_positions": (0, 1),
+                "ancestry": ("root",) if index == 0 else ("root", "child"),
+                "failover_mode": mode,
+            }
+        )
+        for index, model in enumerate(("root", "child"))
+    )
+    route = route.model_copy(
+        update={
+            "snapshot": route.snapshot.model_copy(
+                update={
+                    "exact_model_id": "root",
+                    "pool_id": "pool-root",
+                    "deployment_ids": tuple(d.deployment_id for d in deployments),
+                    "model_stages": stages,
+                }
+            ),
+            "deployment": deployments[0],
+            "fallback_deployments": deployments[1:],
+        }
+    )
+    client = original_wires[0][1]
+    generic = GatewayWireProfile(dialect="openai_compatible", url="https://generic.test")
+    marked = GatewayWireProfile(
+        dialect="openai_compatible" if wire == "openrouter" else wire,
+        url="https://marked.test",
+        forwards_cache_control=wire == "openrouter",
+    )
+    wires = ((generic, client), (marked, client), (generic, client), (marked, client))
+    ordered, resolved, _ = stage_affinity_ordered_rungs(
+        route,
+        wires,
+        _marked_request(),
+        accounting=NativeAttemptAccounting(_RecordingLedger()),
+        authorization=route.snapshot.authorization,
+        continuation=None,
+    )
+    assert ordered.snapshot.deployment_ids == (
+        "root-marked",
+        "root-generic",
+        "child-marked",
+        "child-generic",
+    )
+    assert [s.rung_positions for s in ordered.snapshot.model_stages] == [(1, 0), (1, 0)]
+    assert [s.ancestry for s in ordered.snapshot.model_stages] == [("root",), ("root", "child")]
+    assert [profile.preserves_cache_control for profile, _ in resolved] == [
+        True,
+        False,
+        True,
+        False,
+    ]
+    assert eligible_ladder(ordered, None) == ((1, 3) if conditional else (0, 1, 2, 3))
+
+
 def test_settlement_records_successful_session_cache_once_and_never_dispatch_only() -> None:
     """The native settlement hook owns evidence, independent of aggregate fairness samples."""
     normalized = catalog()
@@ -238,9 +335,11 @@ def test_settlement_records_successful_session_cache_once_and_never_dispatch_onl
 
 @pytest.mark.parametrize("has_stages", [False, True])
 @pytest.mark.parametrize("with_host", [False, True])
+@pytest.mark.parametrize("wire", ["anthropic_messages", "bedrock_converse_stream", "openrouter"])
 def test_live_reasoning_pin_precedes_stage_cache_and_recovery_ordering(
     has_stages: bool,
     with_host: bool,
+    wire: str,
 ) -> None:
     """A live child issuer is preserved, while a removed issuer is never resurrected."""
     route, wires = _affinity_fixture()
@@ -258,7 +357,14 @@ def test_live_reasoning_pin_precedes_stage_cache_and_recovery_ordering(
     )
     wires = (
         wires[0],
-        (GatewayWireProfile(dialect="anthropic_messages", url="https://cache.test"), wires[1][1]),
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible" if wire == "openrouter" else wire,
+                url="https://cache.test",
+                forwards_cache_control=wire == "openrouter",
+            ),
+            wires[1][1],
+        ),
         wires[2],
     )
     accounting = NativeAttemptAccounting(

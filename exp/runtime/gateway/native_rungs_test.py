@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.catalog import GatewayDeploymentCapabilities, GatewayDeploymentMetadata
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -27,7 +29,7 @@ from exp.runtime.gateway.native_rungs import (
 )
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models.providers.base import GatewayWireProfile
-from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
 from exp.runtime.models.providers.openrouter_routing import OPENROUTER_METADATA_HEADER
 from exp.runtime.models.providers.protocol import NativeWireClient
 
@@ -129,6 +131,72 @@ def _dispatch(
         public_request=request,
         authorization=route.snapshot.authorization,
     )
+
+
+@pytest.mark.parametrize("customer_managed", [False, True])
+@pytest.mark.parametrize("ttl", ["5m", "1h"])
+@pytest.mark.parametrize("deployment_id", ["a1", "b1"])
+def test_server_tool_ttl_guard_applies_before_root_and_child_dispatch(
+    customer_managed: bool, ttl: str, deployment_id: str
+) -> None:
+    """Neither a root nor a child can freeze an unpriced hosted server-tool cache write."""
+    catalog = staged_catalog()
+    auth = _AUTHORIZATION.model_copy(update={"target": DirectTarget(pool_id="pool-a")})
+    snapshot = model_execution_snapshot(catalog, auth, catalog.pools[0])
+    by_id = {
+        d.deployment_id: d.model_copy(
+            update={
+                "provider": "anthropic",
+                "gateway": GatewayDeploymentMetadata(
+                    capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+                ),
+            }
+        )
+        for d in catalog.deployments
+    }
+    route = GatewayRoute(
+        snapshot=snapshot,
+        deployment=by_id["a1"],
+        fallback_deployments=(by_id["b1"], by_id["a2"]),
+        route_reason="model_chain",
+    )
+    request = decode_messages(
+        {
+            "model": "public-model",
+            "max_tokens": 32,
+            "tools": [
+                {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "cache_control": {"type": "ephemeral", "ttl": ttl},
+                }
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+    ).request
+    profile = replace(_profile("anthropic_messages"), billing_customer_managed=customer_managed)
+
+    def dispatch() -> RungDispatch:
+        """Drive the real per-rung serializer and final frozen dispatch boundary."""
+        return build_rung_dispatch(
+            route,
+            by_id[deployment_id],
+            profile,
+            _NoSigningClient(),
+            provider_request=request,
+            public_request=request,
+            authorization=auth,
+        )
+
+    if ttl == "1h" and not customer_managed:
+        with pytest.raises(ProviderParameterError, match="5-minute"):
+            dispatch()
+    else:
+        result = dispatch()
+        assert result.wire_entry["exact_model_id"] == ("a" if deployment_id == "a1" else "b")
+        payload = result.wire_entry["upstream_payload"]
+        assert isinstance(payload, dict)
+        assert payload["tools"] == list(request.provider_server_tools)
 
 
 @pytest.mark.parametrize("caller_required", [False, True])

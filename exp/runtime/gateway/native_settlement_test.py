@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from exp.runtime.gateway.contracts import (
     GatewayEventKind,
     GatewayFailureClass,
@@ -405,3 +407,19 @@ def test_accepts_keyword_reads_named_and_variadic_signatures() -> None:
     assert upstream_provider_kwarg(named, "Azure") == {"upstream_provider": "Azure"}
     assert upstream_provider_kwarg(variadic, None) == {"upstream_provider": None}
     assert upstream_provider_kwarg(absent, "Azure") == {}
+
+
+@pytest.mark.parametrize("writes", [None, 0, 6108])
+def test_cache_write_count_crosses_the_settlement_boundary(writes: int | None) -> None:
+    """A reported write count, including zero, reaches hosted settlement unchanged."""
+    usage = _usage_from_payload(
+        {
+            "input_tokens": 6119,
+            "output_tokens": 5,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": writes,
+        },
+        [],
+    )
+    assert usage is not None
+    assert usage.cache_creation_input_tokens == writes
