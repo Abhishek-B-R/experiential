@@ -317,7 +317,7 @@ def _run_gateway(
                         _emit_gateway_ready(
                             port=port,
                             compatibility=compatibility,
-                            ghost=ghost,
+                            capture_enabled=capture is not None,
                         )
                         _emit_unavailable_aliases(components.unavailable_aliases)
 
@@ -539,7 +539,7 @@ def _emit_gateway_ready(
     *,
     port: int,
     compatibility: object | None,
-    ghost: bool,
+    capture_enabled: bool,
 ) -> None:
     """Print the green startup result and project compatibility credentials."""
     _console.print(
@@ -548,7 +548,7 @@ def _emit_gateway_ready(
     )
     _console.print(
         "Traffic content capture disabled."
-        if ghost
+        if not capture_enabled
         else "Local traffic content capture enabled. Use --ghost to disable.",
         markup=False,
     )

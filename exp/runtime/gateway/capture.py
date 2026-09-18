@@ -81,6 +81,9 @@ class PromptCapturePayload(BaseModel):
     # Canonical messages serialized to a JSON string (bounded); the writer
     # passes it to Postgres as jsonb.
     messages_json: str
+    # Optional effective request evidence. Hosts persist it with authenticated identity.
+    request_context_json: str | None = None
+    identity_id: str | None = None
 
 
 class ResponseCapturePayload(BaseModel):

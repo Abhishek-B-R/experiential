@@ -1,9 +1,8 @@
 """Python control plane for the native (Rust) gateway data plane.
 
-The native engine (`exp_gateway_native`) owns sockets, upstream streaming,
-normalization, and SSE encoding. Shared Python contracts own decoding,
-authorization, payload construction, continuation state, and durable ledger
-transactions. Every boundary call takes and returns one JSON string.
+The native engine owns sockets, upstream streaming, normalization, and SSE encoding.
+Python contracts own decoding, authorization, payloads, continuations, and the ledger.
+Every boundary call takes and returns one JSON string.
 
 Admission returns the certified route and frozen retry policy without starting an attempt.
 The data plane reserves each dispatch through ``start_attempt`` and records its durable
@@ -28,7 +27,11 @@ from collections.abc import Callable
 
 from exp.common.core.artifacts import JsonObject, sha256_bytes
 from exp.runtime.gateway.attempt_tokens import counted_input_tokens
-from exp.runtime.gateway.capture_context import capture_request_context
+from exp.runtime.gateway.capture_context import (
+    RequestCapture,
+    capture_request_context,
+    notify_request_capture,
+)
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -176,17 +179,16 @@ class NativeControlPlane(
         native_route_eligible: Callable[[GatewayRoute, GatewayRequest], bool] | None = None,
         guardrails: GuardrailEngine | None = None,
         capture_context: bool = False,
+        request_capture: RequestCapture | None = None,
     ) -> None:
         """Bind loaded gateway components for serving.
 
         Args:
             components: Authority, ledger, routes, and runtime catalogs.
             request_timeout_seconds: Total per-request budget from admission.
-            data_plane_metrics: Optional native metrics JSON supplier, typically
-                ``exp_gateway_native.metrics_snapshot_json``; otherwise reports ``None``.
-            continuation_store: Optional injected Responses continuation
-                state; a host supplies its own bounded namespaced history,
-                and the default is one in-process bounded store.
+            data_plane_metrics: Optional content-free native metrics JSON; absent means None.
+            continuation_store: Optional bounded namespaced Responses history.
+                Defaults to one in-process bounded store.
             readiness_probe: Optional hosted lifecycle readiness callback.
             usage_reporter: Optional hosted usage report callback.
             budget_error_factory: Optional hosted mapping for a rejected reservation.
@@ -198,13 +200,14 @@ class NativeControlPlane(
             native_route_eligible: Optional hosted policy for complete native semantics.
             guardrails: Optional identity-scoped engine. ``None`` leaves traffic unguarded.
             capture_context: Include bounded effective request evidence for local capture.
+            request_capture: Optional host callback for post-guardrail, expanded capture.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
         self._capture_context = capture_context
-        # The optional batch lane: hosts without it leave every batch route
-        # answering the uniform not-enabled error below.
+        self._request_capture = request_capture
+        # Hosts without the optional batch lane return the uniform not-enabled error.
         self._batches = getattr(components, "batches", None)
         # Hosted compositions have no local group-commit writer; they settle
         # directly through their own synchronous ledger.
@@ -407,11 +410,8 @@ class NativeControlPlane(
             # continuation store keeps the post-guardrail history sealed.
             continuation_context.messages = retention_request.messages
 
-        # The ledger accepts the logical request before route selection, so a
-        # keyed operation whose durable terminal already exists (or whose key
-        # was reused with different content) fails closed here, before
-        # learned selection can run request-time embedding or any other
-        # provider-touching work.
+        notify_request_capture(self._request_capture, authorization, retention_request)
+        # Accept before route selection or any provider work; keyed replay fails closed.
         try:
             self._write_ledger.accept_request(authorization=authorization)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
@@ -683,10 +683,10 @@ class NativeControlPlane(
         if route.snapshot.throttle_redial is not None:
             # The pool's frozen backoff-and-redial schedule; absent on default pools.
             response["throttle_redial"] = route.snapshot.throttle_redial.model_dump(mode="json")
-        if plan is not None:
-            response["guardrail_output_plan"] = plan
         if self._capture_context:
             response["capture_context"] = capture_request_context(retention_request)
+        if plan is not None:
+            response["guardrail_output_plan"] = plan
         if request.surface == GatewayApiSurface.MESSAGES:
             # Display-only: what `message_start` shows as input when the
             # upstream reports nothing before its final chunk. The ledger

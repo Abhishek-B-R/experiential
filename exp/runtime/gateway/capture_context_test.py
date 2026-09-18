@@ -1,5 +1,7 @@
 """Effective context capture preserves tools and never mutates serving input."""
 
+import json
+
 from exp.runtime.gateway.capture_context import capture_request_context
 from exp.runtime.openai_protocol.requests import decode_chat
 
@@ -50,3 +52,18 @@ def test_excluded_provider_carriers_are_retained_separately() -> None:
     provider = context["provider_context"]
     assert isinstance(provider, dict)
     assert provider["provider_thinking_config"] == {"type": "enabled", "budget_tokens": 32}
+
+
+def test_capture_context_is_storable_and_omits_transport_replay_key() -> None:
+    """Normalization touches the stored copy, not the served prompt or opaque key."""
+    request = decode_chat(
+        {"model": "coding", "messages": [{"role": "user", "content": "a\x00b\ud800"}]}
+    ).request.model_copy(update={"idempotency_key": "private-header"})
+    before = request.model_dump()
+    context = capture_request_context(request)
+    assert context is not None
+    serialized = json.dumps(context)
+    assert "\\u0000" not in serialized
+    assert "\\ud800" not in serialized
+    assert "private-header" not in serialized
+    assert request.model_dump() == before

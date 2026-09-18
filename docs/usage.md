@@ -55,7 +55,9 @@ specific variables avoid overwriting an upstream provider's `OPENAI_API_KEY`. Th
 unavailable alias and provider configuration; fix that configuration and rerun `exp`. If the
 one-time key was not saved, issue a replacement with
 `exp config gateway key issue IDENTITY --key-id KEY --json`.
-The gateway writes no prompts, responses, tool arguments, raw keys, or provider secrets to SQLite.
+The accounting database stays content-free. Local traffic content is captured separately by default;
+use `--ghost` to disable it. See [local traffic capture](reference/local_gateway_traffic.md).
+Raw virtual keys and resolved provider credentials are never copied into capture or accounting.
 `GET /usage` and `GET /usage.json` expose the same schema-v2 content-free overall and per-identity
 counts, token usage, latency, terminal states, and attributed estimated cost. Their attempt-only
 `by_billing_source` buckets conserve attempts, tokens, known cost, unknown-cost attempts, and

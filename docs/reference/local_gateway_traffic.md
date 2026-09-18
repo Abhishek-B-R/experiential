@@ -1,5 +1,17 @@
 # Build from local gateway traffic
 
+## Shared engine contract
+
+Hosts can supply `NativeControlPlane(request_capture=...)` to receive authenticated
+authority and expanded, post-input-guardrail request context before ledger accept.
+The default is no callback. Callback failure never fails inference and never logs
+content. `capture_request_context` creates a bounded, durable-text-normalized copy
+with tool definitions, generation settings and semantic provider carriers, excluding
+transport replay keys and resolved credentials. The served request is unchanged.
+The native local collector receives the same projection as `exp_context`.
+
+## Local collection
+
 Normal local gateway startup captures completed Chat Completions and Responses
 exchanges for its authenticated identity grants. No hosted account or existing
 router project is required. Traffic using your own provider keys is included.

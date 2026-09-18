@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.local_capture import local_capture_configuration, local_capture_path
 from exp.runtime.gateway.native_bridge import NativeControlPlane
@@ -58,12 +59,22 @@ def test_real_gateway_traffic_reopens_as_scoped_build_evidence(
     port = _unused_port()
     shutdown = exp_gateway_native.shutdown_handle()
     failures: list[BaseException] = []
+    captured_requests: list[GatewayRequest] = []
+
+    def capture_request(authorization: AuthorizationSnapshot, request: GatewayRequest) -> None:
+        """Exercise the host seam, including capture failure without inference failure."""
+        assert authorization.identity_id == "default"
+        captured_requests.append(request)
+        if ghost:
+            raise RuntimeError("a failed host capture must not fail serving")
 
     def run() -> None:
         """Serve one actual native runtime, retaining startup failures for the assertion."""
         try:
             serve_native_gateway(
-                NativeControlPlane(components, capture_context=not ghost),
+                NativeControlPlane(
+                    components, capture_context=not ghost, request_capture=capture_request
+                ),
                 host="127.0.0.1",
                 port=port,
                 capture=capture,
@@ -122,6 +133,8 @@ def test_real_gateway_traffic_reopens_as_scoped_build_evidence(
         provider_thread.join(timeout=5)
     assert not failures
     assert not worker.is_alive()
+    assert len(captured_requests) == 5
+    assert any(len(request.messages) >= 3 for request in captured_requests)
     database = local_capture_path(tmp_path)
     if ghost:
         assert not database.exists()
