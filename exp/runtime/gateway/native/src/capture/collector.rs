@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -54,22 +54,61 @@ struct Pending {
     closed: bool,
 }
 
+struct MaintainedSink<S> {
+    sink: S,
+    pending: Arc<Mutex<Pending>>,
+    skipped: Arc<AtomicU64>,
+}
+
+impl<S: Sink> Sink for MaintainedSink<S> {
+    fn write(&mut self, record: &str) -> Result<(), ()> {
+        self.sink.write(record)
+    }
+
+    fn maintain(&mut self) -> Result<(), ()> {
+        if let Ok(mut pending) = self.pending.lock() {
+            expire_pending(&mut pending, &self.skipped);
+        }
+        self.sink.maintain()
+    }
+}
+
+fn expire_pending(pending: &mut Pending, skipped: &AtomicU64) {
+    let now = Instant::now();
+    pending.entries.retain(|_, entry| {
+        if entry.expires <= now {
+            pending.bytes -= entry.bytes;
+            skipped.fetch_add(1, Ordering::Relaxed);
+            false
+        } else {
+            true
+        }
+    });
+}
+
 pub(crate) struct Collector {
     pub config: Configuration,
     delivery: Delivery,
-    pending: Mutex<Pending>,
-    skipped: AtomicU64,
+    pending: Arc<Mutex<Pending>>,
+    skipped: Arc<AtomicU64>,
     body_bytes: AtomicUsize,
 }
 
 impl Collector {
     pub(crate) fn new(config: Configuration, sink: impl Sink) -> Result<Self, &'static str> {
         config.validate()?;
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let skipped = Arc::new(AtomicU64::new(0));
+        let sink = MaintainedSink {
+            sink,
+            pending: pending.clone(),
+            skipped: skipped.clone(),
+        };
         Ok(Self {
             delivery: Delivery::new(config.delivery.clone(), sink)?,
             config,
-            pending: Mutex::new(Pending::default()),
-            skipped: AtomicU64::new(0),
+            pending,
+            skipped,
             body_bytes: AtomicUsize::new(0),
         })
     }
@@ -115,6 +154,35 @@ impl Collector {
             },
         );
         true
+    }
+
+    /// Freeze resolved provenance once; a pre-dispatch rejection has no selected model.
+    pub(crate) fn select_model(&self, request_id: &str, model_id: &str) {
+        if model_id.trim().is_empty() || model_id.len() > 512 {
+            return;
+        }
+        if let Ok(mut pending) = self.pending.lock() {
+            self.expire(&mut pending);
+            let Some(mut entry) = pending.entries.remove(request_id) else {
+                return;
+            };
+            pending.bytes -= entry.bytes;
+            if entry.record.request.model_id.is_none() && !entry.attached {
+                entry.record.request.model_id = Some(model_id.to_owned());
+                entry.bytes += model_id.len() + 2;
+            }
+            if pending.bytes.saturating_add(entry.bytes) > self.config.maximum_pending_bytes
+                || entry
+                    .record
+                    .encode(self.config.maximum_request_bytes)
+                    .is_none()
+            {
+                self.skip();
+                return;
+            }
+            pending.bytes += entry.bytes;
+            pending.entries.insert(request_id.to_owned(), entry);
+        }
     }
 
     /// Exactly one original response can attach; keyed replays cannot capture twice.
@@ -206,16 +274,7 @@ impl Collector {
     }
 
     fn expire(&self, pending: &mut Pending) {
-        let now = Instant::now();
-        pending.entries.retain(|_, entry| {
-            if entry.expires <= now {
-                pending.bytes -= entry.bytes;
-                self.skip();
-                false
-            } else {
-                true
-            }
-        });
+        expire_pending(pending, &self.skipped);
     }
 
     pub(crate) fn skip(&self) -> bool {

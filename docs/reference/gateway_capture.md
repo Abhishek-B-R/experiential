@@ -29,13 +29,16 @@ contain sensitive information; this is not content redaction or encryption.
 The synchronous `write_record(str)` destination runs on a dedicated Rust-owned
 worker. Validate its input with `CaptureRecord.model_validate_json`. Schema version
 1 includes the authenticated scope, effective request, optional response, model and
-deployment provenance, and capture timestamp. It is an idempotent request update:
+deployment provenance, and capture timestamp. The selected model is null for an
+accepted request that failed before routing. It is an idempotent request update:
 the response can arrive after an earlier prompt-only record. A hosted collector
 does not enqueue content until terminal eligibility permits it, so queue overload
 cannot lose a BYOK deletion behind an already queued prompt.
 
 Chat Completions, Responses and Messages HTTP surfaces share the same native tap.
-JSON bodies and ordered SSE data payloads retain unknown fields. `truncated` and
+JSON bodies and ordered SSE data payloads retain unknown fields. The observation
+boundary is the native HTTP listener, which may feed a hosted relay; it does not
+prove that an end user consumed every byte. `truncated` and
 `client_disconnected` explicitly distinguish a prefix from complete evidence.
 Output and settlement may arrive in either order. Keyed replays do not attach a
 second response tap. WebSocket and batch response capture are not added here.
@@ -43,9 +46,11 @@ second response tap. WebSocket and batch response capture are not added here.
 Delivery limits bound record count, each encoded record and all queued string
 capacity, including a record currently held by a slow destination. Separate bounds
 cover in-flight entry count, encoded pending content, total response-buffer capacity
-and request lifetime. Saturation drops capture without delaying provider work.
+and request lifetime. Expiration runs on collector operations and once per second
+on an idle destination worker; a blocked destination delays idle maintenance but
+does not remove the memory caps. Saturation drops capture without delaying provider work.
 Destination exceptions are counted without printing potentially sensitive details.
-`counts()` returns pending records, retained delivery bytes, persisted records,
+`counts()` returns pending records, retained delivery bytes, successful destination calls,
 destination failures, delivery drops and collector skips. A bounded `close()` drains
 while releasing the GIL; a blocked destination cannot extend that caller's deadline.
 

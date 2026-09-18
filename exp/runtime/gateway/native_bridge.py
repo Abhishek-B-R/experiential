@@ -65,7 +65,11 @@ from exp.runtime.gateway.native_bridge_errors import (
 from exp.runtime.gateway.native_bridge_errors import (
     public_capability_error as _public_capability_error,
 )
-from exp.runtime.gateway.native_capture import CaptureController, begin_capture
+from exp.runtime.gateway.native_capture import (
+    CaptureController,
+    begin_capture,
+    select_capture_model,
+)
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
 from exp.runtime.gateway.native_continuation import (
     continuation_binding_error as _continuation_binding_error,
@@ -279,9 +283,6 @@ class NativeControlPlane(
     def admit(self, argument: str) -> str:
         """Decode, authorize, inspect, route, and durably accept one request.
 
-        Shared decoders and payload builders preserve protocol parity.
-        Each physical dispatch is reserved separately by :meth:`start_attempt`.
-
         Args:
             argument: JSON object with ``raw_key``, ``body`` (raw request
                 body text), optional ``surface`` (``"chat"`` or
@@ -416,8 +417,8 @@ class NativeControlPlane(
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
 
-        # Escalation runs after acceptance; the accepted request is finished
-        # quietly before the disposition returns, so an unservable request is
+        begin_capture(self._capture, authorization, retention_request)
+        # Escalation finishes the accepted request quietly before returning, so it is
         # accounted content-free and never billed. Routing failures found by
         # the probe are raised against the accepted request below.
         probe_failure: Exception | None = None
@@ -662,9 +663,7 @@ class NativeControlPlane(
                 throttle_redial_budgets=redial_budgets,
             )
         )
-        begin_capture(
-            self._capture, authorization, retention_request, route.snapshot.exact_model_id
-        )
+        select_capture_model(self._capture, authorization.request_id, route.snapshot.exact_model_id)
         response: JsonObject = {
             "request_id": authorization.request_id,
             "alias": authorization.alias,

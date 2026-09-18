@@ -47,7 +47,7 @@ fn collector(maximum_response_bytes: usize) -> (Arc<Collector>, mpsc::Receiver<R
             application_id: "alias".into()
         },
         protocol: Protocol::ChatCompletions,
-        model_id: "model".into(),
+        model_id: Some("model".into()),
         context: json!({"schema_version":1,"request":{"messages":[]}}),
     }));
     (collector, receiver)

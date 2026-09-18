@@ -71,7 +71,7 @@ class CaptureRequest(ContractModel):
     request_id: Identifier
     scope: CaptureScope
     protocol: Literal["chat_completions", "responses", "messages"]
-    model_id: Identifier
+    model_id: Identifier | None
     context: JsonObject
 
 
@@ -127,7 +127,7 @@ class CaptureController:
         self._maximum_request_bytes = maximum_request_bytes
 
     def begin(
-        self, authorization: AuthorizationSnapshot, request: GatewayRequest, model_id: str
+        self, authorization: AuthorizationSnapshot, request: GatewayRequest, model_id: str | None
     ) -> None:
         """Prepare only an allowed identity's post-guardrail, expanded request."""
         application_id = self._application_for(authorization)
@@ -160,7 +160,7 @@ def begin_capture(
     controller: CaptureController | None,
     authorization: AuthorizationSnapshot,
     request: GatewayRequest,
-    model_id: str,
+    model_id: str | None = None,
 ) -> None:
     """Contain optional capture failures without logging customer content or exceptions."""
     if controller is None:
@@ -169,3 +169,15 @@ def begin_capture(
         controller.begin(authorization, request, model_id)
     except Exception:  # noqa: BLE001 - capture must never fail an otherwise valid admission.
         _LOGGER.warning("capture.admission_dropped request_id=%s", authorization.request_id)
+
+
+def select_capture_model(
+    controller: CaptureController | None, request_id: str, model_id: str
+) -> None:
+    """Freeze resolved model provenance without interfering with provider dispatch."""
+    if controller is None:
+        return
+    try:
+        controller.native.select_model(request_id, model_id)
+    except Exception:  # noqa: BLE001 - capture is observational only.
+        _LOGGER.warning("capture.model_dropped request_id=%s", request_id)

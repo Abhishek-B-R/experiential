@@ -89,6 +89,12 @@ impl CaptureCollector {
         })
     }
 
+    /// Freeze resolved model provenance before response collection begins.
+    fn select_model(&self, py: Python<'_>, request_id: &str, model_id: &str) {
+        let collector = self.inner.clone();
+        py.detach(|| collector.select_model(request_id, model_id));
+    }
+
     /// Apply the host's final content eligibility, independently of inference accounting.
     fn settle(&self, py: Python<'_>, request_id: &str, keep_prompt: bool, keep_response: bool) {
         let collector = self.inner.clone();

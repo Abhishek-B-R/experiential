@@ -38,7 +38,7 @@ fn request(id: &str) -> Request {
             application_id: "alias".into(),
         },
         protocol: Protocol::ChatCompletions,
-        model_id: "model".into(),
+        model_id: Some("model".into()),
         context: json!({"schema_version":1,"request":{"messages":[{"role":"user","content":"task"}],"tools":[{"name":"search"}]}}),
     }
 }
@@ -61,6 +61,44 @@ fn collector(config: Configuration) -> (Arc<Collector>, mpsc::Receiver<Record>) 
 fn drain(collector: &Collector, receiver: mpsc::Receiver<Record>) -> Vec<Record> {
     assert!(collector.close_until(Instant::now() + Duration::from_secs(1)));
     receiver.try_iter().collect()
+}
+
+#[test]
+fn routing_provenance_is_optional_until_selected_and_then_immutable() {
+    let (collector, receiver) = collector(config());
+    let mut input = request("request");
+    input.model_id = None;
+    assert!(collector.begin(input.clone()));
+    collector.select_model("request", "selected");
+    collector.select_model("request", "replacement");
+    collector.settle("request", true, false);
+    input.request_id = "rejected".into();
+    assert!(collector.begin(input));
+    collector.settle("rejected", true, false);
+    let records = drain(&collector, receiver);
+    assert_eq!(records[0].request.model_id.as_deref(), Some("selected"));
+    assert_eq!(records[1].request.model_id, None);
+}
+
+#[test]
+fn idle_maintenance_expires_pending_content_without_another_request() {
+    let (collector, receiver) = collector(config());
+    assert!(collector.begin(request("request")));
+    collector
+        .pending
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut("request")
+        .unwrap()
+        .expires = Instant::now();
+    let until = Instant::now() + Duration::from_secs(3);
+    while !collector.pending.lock().unwrap().entries.is_empty() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(collector.pending.lock().unwrap().entries.is_empty());
+    assert_eq!(collector.counts()[5], 1);
+    assert!(drain(&collector, receiver).is_empty());
 }
 
 #[test]
