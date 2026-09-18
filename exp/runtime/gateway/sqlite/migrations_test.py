@@ -1168,9 +1168,11 @@ def test_surface_migration_preserves_requests_attempts_and_constraints(
                 tuple(migrated.execute("SELECT * FROM gateway_requests").fetchone())
                 == before_request
             )
-            assert (
-                tuple(migrated.execute("SELECT * FROM gateway_attempts").fetchone())
-                == before_attempt
+            # v22 appends the nullable upstream_provider column; every value
+            # the v20 row carried survives in place.
+            assert tuple(migrated.execute("SELECT * FROM gateway_attempts").fetchone()) == (
+                *before_attempt,
+                None,
             )
         surviving = migrated.execute(
             "SELECT api_surface FROM gateway_requests WHERE request_id = 'req-1'"

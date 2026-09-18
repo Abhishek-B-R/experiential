@@ -65,6 +65,7 @@ class SyncWriteLedger(Protocol):
         ratelimit_remaining_requests: int | None = None,
         ratelimit_limit_tokens: int | None = None,
         ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
     ) -> None:
         """Durably settle one attempt exactly once.
 
@@ -72,6 +73,10 @@ class SyncWriteLedger(Protocol):
         provider's own rate-limit response headers, normalized, present on
         successes and failures alike when the data plane harvested any; a
         hosted ledger persists them per attempt for calibration analytics.
+        ``upstream_provider`` is the upstream an aggregator rung (OpenRouter)
+        named as having served the attempt in its response metadata, so a
+        zero-data-retention dispatch records which retention-free upstream
+        answered; ``None`` on every rung that names none.
         """
         ...
 

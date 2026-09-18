@@ -91,6 +91,7 @@ fn settle_argument(
     opened: bool,
     first_token_at: Option<SystemTime>,
     rate_limit_headers: Option<&serde_json::Map<String, Value>>,
+    upstream_provider: Option<&str>,
 ) -> String {
     compact_json(&json!({
         "request_id": request_id,
@@ -133,6 +134,12 @@ fn settle_argument(
         // (successes and failures alike, absent when none were present); the
         // control plane normalizes and persists them per attempt.
         "rate_limit_headers": rate_limit_headers,
+        // The upstream an aggregator rung named as serving the attempt
+        // (OpenRouter's per-chunk `provider` under its metadata opt-in),
+        // absent when the stream named none; the control plane persists it
+        // per attempt so a zero-data-retention dispatch shows WHICH
+        // retention-free upstream answered.
+        "upstream_provider": upstream_provider,
     }))
 }
 
@@ -203,6 +210,9 @@ pub struct AttemptGuard {
     /// outcome. An attempt that failed at open instead carries them on its
     /// `Failure`, which settlement hoists into the same payload field.
     rate_limit_headers: Option<serde_json::Map<String, Value>>,
+    /// The upstream an aggregator named as serving the active attempt's
+    /// committed stream, recorded at commit and settled alongside the outcome.
+    upstream_provider: Option<String>,
 }
 
 /// Holds one unit of the shutdown drain counter for a detached stream task,
@@ -249,6 +259,7 @@ impl AttemptGuard {
             started,
             first_token_at: None,
             rate_limit_headers: None,
+            upstream_provider: None,
         }
     }
 
@@ -259,9 +270,11 @@ impl AttemptGuard {
         self.decided_settlement = None;
         // Each physical attempt observes its own first token; a prior failed
         // attempt's timing never carries into its successor. The same holds
-        // for its provider response's rate-limit headers.
+        // for its provider response's rate-limit headers and the upstream
+        // its stream named.
         self.first_token_at = None;
         self.rate_limit_headers = None;
+        self.upstream_provider = None;
     }
 
     /// Record the wall-clock time the active attempt streamed its first output
@@ -282,6 +295,12 @@ impl AttemptGuard {
     /// opened provider response, for settlement.
     pub fn record_rate_limit_headers(&mut self, headers: Option<serde_json::Map<String, Value>>) {
         self.rate_limit_headers = headers;
+    }
+
+    /// Record the upstream the active attempt's committed stream named as
+    /// serving it (an aggregator's per-chunk provider label), for settlement.
+    pub fn record_upstream_provider(&mut self, provider: Option<String>) {
+        self.upstream_provider = provider;
     }
 
     /// Record this request's terminal outcome and duration exactly once, at
@@ -332,6 +351,7 @@ impl AttemptGuard {
             self.opened,
             self.first_token_at,
             rate_limit_headers,
+            self.upstream_provider.as_deref(),
         );
         if finalize {
             let cancelled = failure.map(|failure| failure.failure_class == FailureClass::Cancelled)
@@ -440,6 +460,7 @@ impl Drop for AttemptGuard {
                             self.opened,
                             self.first_token_at,
                             self.rate_limit_headers.as_ref(),
+                            self.upstream_provider.as_deref(),
                         ),
                     )
                 }
@@ -494,6 +515,43 @@ mod tests {
     }
 
     #[test]
+    fn settle_argument_carries_the_upstream_provider_only_when_the_stream_named_one() {
+        let named = settle_argument(
+            "req",
+            "att",
+            "completed",
+            None,
+            &[],
+            None,
+            true,
+            true,
+            None,
+            None,
+            Some("Azure"),
+        );
+        let parsed: Value = serde_json::from_str(&named).expect("valid json");
+        assert_eq!(
+            parsed["upstream_provider"],
+            Value::String("Azure".to_string())
+        );
+        let unnamed = settle_argument(
+            "req",
+            "att",
+            "completed",
+            None,
+            &[],
+            None,
+            true,
+            true,
+            None,
+            None,
+            None,
+        );
+        let parsed: Value = serde_json::from_str(&unnamed).expect("valid json");
+        assert_eq!(parsed["upstream_provider"], Value::Null);
+    }
+
+    #[test]
     fn settle_argument_carries_first_token_at_only_when_observed() {
         let observed = UNIX_EPOCH + Duration::from_millis(1_700_000_000_500);
         let with_token = settle_argument(
@@ -506,6 +564,7 @@ mod tests {
             true,
             true,
             Some(observed),
+            None,
             None,
         );
         let parsed: Value = serde_json::from_str(&with_token).expect("valid json");
@@ -524,6 +583,7 @@ mod tests {
             None,
             true,
             true,
+            None,
             None,
             None,
         );
@@ -546,6 +606,7 @@ mod tests {
             Some(&failure),
             true,
             true,
+            None,
             None,
             None,
         );
@@ -571,6 +632,7 @@ mod tests {
             true,
             None,
             None,
+            None,
         );
         let parsed: Value = serde_json::from_str(&owned_argument).expect("valid json");
         assert_eq!(
@@ -590,6 +652,7 @@ mod tests {
             Some(&bare),
             true,
             true,
+            None,
             None,
             None,
         );
@@ -620,6 +683,7 @@ mod tests {
             false,
             None,
             throttled.rate_limit_headers.as_deref(),
+            None,
         );
         let parsed: Value = serde_json::from_str(&argument).expect("valid json");
         assert_eq!(parsed["failure"]["retry_after_seconds"], 3_600);
@@ -641,6 +705,7 @@ mod tests {
             true,
             None,
             Some(&headers),
+            None,
         );
         let parsed: Value = serde_json::from_str(&success).expect("valid json");
         assert_eq!(parsed["rate_limit_headers"]["retry-after"], "3600");
@@ -653,6 +718,7 @@ mod tests {
             None,
             true,
             true,
+            None,
             None,
             None,
         );

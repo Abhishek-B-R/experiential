@@ -183,12 +183,11 @@ pub(crate) fn commit_independent(
 /// Commit-dependent headers, mirroring `commit_dependent_headers`: the
 /// deployment identity and route depth that actually served the request.
 pub(crate) fn commit_dependent(admission: &Admission, depth: usize) -> Vec<(String, String)> {
-    let (provider, deployment_id) = admission
-        .route
-        .get(depth)
+    let served = admission.route.get(depth);
+    let (provider, deployment_id) = served
         .map(|wire| (wire.provider.clone(), wire.deployment_id.clone()))
         .unwrap_or_default();
-    vec![
+    let mut headers = vec![
         (
             "x-gateway-canonical-model".to_string(),
             admission
@@ -205,7 +204,14 @@ pub(crate) fn commit_dependent(admission: &Admission, depth: usize) -> Vec<(Stri
             "x-gateway-route-reason".to_string(),
             admission.route_reason.clone(),
         ),
-    ]
+    ];
+    // A rung dispatched under OpenRouter's zero-data-retention constraint
+    // says so, so the host can attest the answer as ZDR-served; absent on
+    // every ordinary rung rather than a literal `false`.
+    if served.is_some_and(|wire| wire.zdr_constrained) {
+        headers.push(("x-gateway-zdr-constrained".to_string(), "true".to_string()));
+    }
+    headers
 }
 
 /// Every header one served attempt carries: the request identity, the rung
@@ -309,4 +315,53 @@ pub(crate) async fn apply_output_guardrail(
         return Ok(events);
     }
     guardrails::enforce_collected_output(&state.bridge, &admission.request_id, events).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn admission(zdr_constrained: bool) -> Admission {
+        serde_json::from_value(serde_json::json!({
+            "request_id": "req",
+            "alias": "public-model",
+            "alias_revision_id": "rev",
+            "stream": true,
+            "include_usage": true,
+            "exact_model_id": "exact",
+            "route_reason": "direct",
+            "route": [{
+                "provider": "openrouter",
+                "deployment_id": "or-rung",
+                "dialect": "openai_compatible",
+                "url": "https://openrouter.ai/api/v1/chat/completions",
+                "headers": {},
+                "model_id": "anthropic/claude-opus-5",
+                "billing_customer_managed": false,
+                "timeout_seconds": 60.0,
+                "upstream_payload": {},
+                "upstream_body": null,
+                "idempotency_key": "op",
+                "zdr_constrained": zdr_constrained,
+            }],
+            "maximum_total_attempts": 1,
+            "maximum_same_deployment_attempts": 1,
+        }))
+        .expect("admission decodes")
+    }
+
+    #[test]
+    fn a_zdr_constrained_rung_names_the_constraint_on_its_served_headers() {
+        let headers = commit_dependent(&admission(true), 0);
+        assert!(headers.contains(&("x-gateway-zdr-constrained".to_string(), "true".to_string())));
+        assert!(headers.contains(&("x-gateway-deployment".to_string(), "or-rung".to_string())));
+    }
+
+    #[test]
+    fn an_ordinary_rung_carries_no_constraint_header_at_all() {
+        let headers = commit_dependent(&admission(false), 0);
+        assert!(headers
+            .iter()
+            .all(|(name, _)| name != "x-gateway-zdr-constrained"));
+    }
 }

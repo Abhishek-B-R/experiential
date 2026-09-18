@@ -34,6 +34,7 @@ from exp.runtime.gateway.tests.native_waterfall_test import (
     _PrimaryUpstream,
     _SecondaryUpstream,
     _ServingEngine,
+    _sse_frame,
     _terminal_frames,
 )
 
@@ -48,7 +49,15 @@ class _StageSecondaryUpstream(_SecondaryUpstream):
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
-        if "response_format" in payload:
+        if "provider" in payload:
+            text = json.dumps(
+                {
+                    "from-secondary": True,
+                    "provider": payload["provider"],
+                    "metadata": self.headers.get("X-OpenRouter-Metadata"),
+                }
+            )
+        elif "response_format" in payload:
             text = json.dumps(
                 {
                     "from-secondary": True,
@@ -59,7 +68,18 @@ class _StageSecondaryUpstream(_SecondaryUpstream):
         else:
             text = "from-secondary"
         try:
-            self.wfile.write(_content_chunk(text))
+            self.wfile.write(
+                _sse_frame(
+                    {
+                        "provider": "fixture-upstream",
+                        "choices": [
+                            {"index": 0, "delta": {"content": text}, "finish_reason": None}
+                        ],
+                    }
+                )
+                if "provider" in payload
+                else _content_chunk(text)
+            )
             self.wfile.write(_terminal_frames(prompt_tokens=3, completion_tokens=1))
         except OSError:
             return
@@ -91,7 +111,8 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
     beta = models["beta"]
     assert beta.gateway is not None
     capabilities = beta.gateway.capabilities
-    if hasattr(request, "param"):
+    zdr_child = getattr(request, "param", None) == "zdr-child"
+    if hasattr(request, "param") and not zdr_child:
         capabilities = capabilities.model_copy(update={"failover_only_on": (request.param,)})
     models["beta"] = beta.model_copy(
         update={
@@ -109,9 +130,15 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
             GatewayModelReferenceRung(model_id="secondary-exact"),
         ),
     )
+    connections = dict(catalog.connections)
+    if zdr_child:
+        connections[beta.connection] = connections[beta.connection].model_copy(
+            update={"provider": "openrouter", "base_url": None}
+        )
     authored = catalog.model_copy(
         update={
             "models": models,
+            "connections": connections,
             "gateway_pools": {},
             "gateway_model_chains": {"model-revision-exact": chain},
         }
@@ -127,7 +154,28 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
         catalog_sha256=normalized.identity_sha256(),
     )
     driver = tmp_path / "driver.py"
-    driver.write_text(_DRIVER_SOURCE + "\n")
+    source = _DRIVER_SOURCE
+    if zdr_child:
+        source = source.replace(
+            "    components = load_gateway_components(",
+            "    from exp.runtime.models import registry\n"
+            "    factory, _origin = registry._HTTP_PROVIDERS['openrouter']\n"
+            "    registry._HTTP_PROVIDERS['openrouter'] = (factory, config['child_origin'])\n"
+            "    components = load_gateway_components(",
+        )
+        source = source.replace(
+            "    control_plane = NativeControlPlane(",
+            "    from exp.runtime.gateway.routing import CatalogRouteResolver\n"
+            "    original = CatalogRouteResolver.resolve_direct\n"
+            "    def constrained(self, authorization):\n"
+            '        """Apply only the fixture host\'s frozen child ZDR policy."""\n'
+            "        route = original(self, authorization)\n"
+            "        return route.model_copy(update={'snapshot': route.snapshot.model_copy(\n"
+            "            update={'zdr_constrained_deployment_ids': ('beta',)})})\n"
+            "    CatalogRouteResolver.resolve_direct = constrained\n"
+            "    control_plane = NativeControlPlane(",
+        )
+    driver.write_text(source + "\n")
     log_path = tmp_path / "driver.log"
     environment = {**os.environ, "TEST_PROVIDER_KEY": "loopback-secret"}
     with log_path.open("w") as log:
@@ -135,7 +183,13 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
             [
                 sys.executable,
                 str(driver),
-                json.dumps({"root": str(tmp_path), "request_timeout_seconds": 10}),
+                json.dumps(
+                    {
+                        "root": str(tmp_path),
+                        "request_timeout_seconds": 10,
+                        "child_origin": f"http://127.0.0.1:{secondary.server_port}/v1",
+                    }
+                ),
             ],
             stdout=subprocess.PIPE,
             stderr=log,
@@ -175,6 +229,42 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
                 server.shutdown()
                 server.server_close()
             assert process.returncode == 0, log_path.read_text()
+
+
+@pytest.mark.parametrize("engine", ["zdr-child"], indirect=True)
+def test_actual_child_zdr_constraint_and_upstream_identity_survive_fallback(
+    engine: _ServingEngine,
+) -> None:
+    """The actual child wire, committed identity and settled upstream retain host ZDR policy."""
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "always-500"}],
+            "provider": {"zdr": False, "data_collection": "allow", "order": ["fixture-upstream"]},
+        },
+        timeout=30,
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["x-gateway-canonical-model"] == "secondary-exact"
+    assert response.headers["x-gateway-zdr-constrained"] == "true"
+    assert response.headers["x-gateway-deployment"] == "beta"
+    content = json.loads(response.json()["choices"][0]["message"]["content"])
+    assert content == {
+        "from-secondary": True,
+        "metadata": "enabled",
+        "provider": {"zdr": True, "data_collection": "deny", "order": ["fixture-upstream"]},
+    }
+    with sqlite3.connect(engine.database_path) as db:
+        assert db.execute(
+            "SELECT exact_model_id,upstream_provider,state FROM gateway_attempts "
+            "ORDER BY attempt_ordinal"
+        ).fetchall() == [
+            ("model-revision-exact", None, "failed"),
+            ("model-revision-exact", None, "failed"),
+            ("secondary-exact", "fixture-upstream", "completed"),
+        ]
 
 
 @pytest.mark.parametrize(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime
-from typing import Literal
+from typing import Literal, cast
 
 import pytest
 
@@ -34,6 +34,7 @@ from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
 )
+from exp.runtime.gateway.native_components import SyncWriteLedger
 from exp.runtime.gateway.native_execution import InflightRequest, deployment_health_key
 from exp.runtime.gateway.native_recovery_test import RecoveryHostFake
 from exp.runtime.gateway.native_settlement import failure_from_boundary_payload, ledger_failure
@@ -153,6 +154,8 @@ class _RecordingLedger:
         self.started: list[JsonObject] = []
         self.finished: list[JsonObject] = []
         self.terminal_events: list[GatewayEvent | None] = []
+        self.upstream_providers: list[str | None] = []
+        self.first_token_times: list[datetime | None] = []
         self.rate_limit_settlements: list[JsonObject] = []
         self.finished_requests: list[GatewayFailure] = []
         self.budget_rejections: dict[str, BudgetScopeKind] = {}
@@ -218,9 +221,11 @@ class _RecordingLedger:
         ratelimit_remaining_requests: int | None = None,
         ratelimit_limit_tokens: int | None = None,
         ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
     ) -> None:
         """Record one settled attempt, tracking harvested rate-limit values apart."""
-        del first_token_at
+        self.first_token_times.append(first_token_at)
+        self.upstream_providers.append(upstream_provider)
         self.terminal_events.append(terminal_event)
         if self.fail_finishes > 0:
             self.fail_finishes -= 1
@@ -614,6 +619,8 @@ def test_recovery_observer_failure_cannot_block_durable_settlement_cleanup(
             "attempt_id": started["attempt_id"],
             "outcome": "completed",
             "usage": {"input_tokens": 100, "output_tokens": 5, "cached_input_tokens": 50},
+            "first_token_at": "2026-09-18T01:02:03+00:00",
+            "upstream_provider": "Azure",
             "finalize": finalize,
         }
     )
@@ -628,6 +635,9 @@ def test_recovery_observer_failure_cannot_block_durable_settlement_cleanup(
     else:
         assert registry.settle(settlement) == "{}"
     assert len(ledger.finished) == 1 and ledger.finished[0]["finalize"] is finalize
+    observed = datetime.fromisoformat("2026-09-18T01:02:03+00:00")
+    assert ledger.first_token_times == [observed] * (2 if swept else 1)
+    assert ledger.upstream_providers == ["Azure"] * (2 if swept else 1)
     assert registry.loads.inflight(("deployment-a", "b" * 64)) == 0
     assert registry.accounting_healthy
     assert not entry.recovery_recorded_attempts
@@ -2467,3 +2477,76 @@ class TestThrottleRedial:
         assert registry.rung_rate_counters() == (2, 0)
         assert registry.throttle_cache_counters() == (0, 0, 0, 0)
         assert registry.loads.inflight(("deployment-b", "c" * 64)) == 1
+
+
+class _LegacySignatureLedger(_RecordingLedger):
+    """A hosted ledger whose settle predates the ``upstream_provider`` keyword."""
+
+    def finish_attempt(  # ty: ignore[invalid-method-override] - the drift under test
+        self,
+        *,
+        attempt_id: str,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool = True,
+        first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
+    ) -> None:
+        """Record the settle exactly as the previous engine handed it over."""
+        del first_token_at, retry_after_seconds, ratelimit_limit_requests
+        del ratelimit_remaining_requests, ratelimit_limit_tokens, ratelimit_remaining_tokens
+        self.terminal_events.append(terminal_event)
+        self.finished.append(
+            {"attempt_id": attempt_id, "finalize": finalize_request, "failed": failure is not None}
+        )
+
+
+def _settle_naming_upstream(
+    registry: NativeAttemptAccounting, *, attempt_id: str, request_id: str
+) -> str:
+    """One completed settle whose stream named the upstream that served it."""
+    return registry.settle(
+        json.dumps(
+            {
+                "request_id": request_id,
+                "attempt_id": attempt_id,
+                "outcome": "completed",
+                "usage": None,
+                "tool_names": [],
+                "failure": None,
+                "finalize": True,
+                "opened": True,
+                "upstream_provider": "Azure",
+            }
+        )
+    )
+
+
+def test_settle_hands_the_upstream_provider_only_to_a_ledger_that_accepts_it() -> None:
+    """The hosted-ledger seam: a pre-keyword ledger settles cleanly; a current one gets the value.
+
+    The engine repins independently of the host's ledger, so the new settle
+    keyword must never TypeError a host that has not learned it (the 2026-08-30
+    hosted-ledger incident class); the signature is probed once at construction.
+    """
+    legacy = _LegacySignatureLedger()
+    # The older host shape is exactly the drift under test, so the protocol
+    # mismatch is asserted away at this one seam.
+    registry = NativeAttemptAccounting(cast("SyncWriteLedger", legacy))
+    deployments = _bounded_pair(1)
+    _admit(registry, deployments, request_id="request-1")
+    started = _start(registry, ordinal=0, request_id="request-1")
+    _settle_naming_upstream(registry, attempt_id=str(started["attempt_id"]), request_id="request-1")
+    assert legacy.finished[-1]["finalize"] is True
+    assert legacy.upstream_providers == []
+
+    current = _RecordingLedger()
+    registry = NativeAttemptAccounting(current)
+    _admit(registry, deployments, request_id="request-2")
+    started = _start(registry, ordinal=0, request_id="request-2")
+    _settle_naming_upstream(registry, attempt_id=str(started["attempt_id"]), request_id="request-2")
+    assert current.upstream_providers == ["Azure"]

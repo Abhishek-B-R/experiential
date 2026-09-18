@@ -88,3 +88,28 @@ def test_score_criteria_order_is_significant() -> None:
         }
     )
     assert canonical_request_sha256(request) != canonical_request_sha256(reordered)
+
+
+def test_provider_preferences_join_request_identity() -> None:
+    """A reused operation key with a different ``provider`` object is a different request.
+
+    The caller's OpenRouter routing preferences (order, only, data_collection,
+    zdr) change which upstream serves the same body, so they join the digest;
+    a request without the object keeps its exact pre-existing identity.
+    """
+    from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
+
+    def request(preferences: JsonObject | None) -> GatewayRequest:
+        return GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            provider_preferences=preferences,
+        )
+
+    bare = request(None)
+    assert canonical_request_sha256(bare) == sha256_json(bare)
+    strict = canonical_request_sha256(request({"zdr": True, "data_collection": "deny"}))
+    loose = canonical_request_sha256(request({"zdr": True, "data_collection": "allow"}))
+    ordered = canonical_request_sha256(request({"zdr": True, "order": ["Azure"]}))
+    assert len({canonical_request_sha256(bare), strict, loose, ordered}) == 4
+    assert strict == canonical_request_sha256(request({"data_collection": "deny", "zdr": True}))

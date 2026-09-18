@@ -101,6 +101,11 @@ pub struct DeploymentWire {
     /// Stage-local schedule; its budget is zero when this stage disables redial.
     #[serde(default)]
     pub throttle_redial: Option<ThrottleRedial>,
+    /// The rung's payload was tightened to OpenRouter's zero-data-retention
+    /// routing constraint at admission; an answer it serves carries
+    /// `x-gateway-zdr-constrained: true` so the host can attest it.
+    #[serde(default)]
+    pub zdr_constrained: bool,
     /// Failure tokens this rung serves as a failover for (see
     /// `fallback_rules`): a rung carrying a set is never the first dial and
     /// is dialed as a successor only when the failure being failed over from

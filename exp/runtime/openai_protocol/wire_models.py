@@ -23,6 +23,7 @@ from exp.common.models.content import (
 )
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort
 from exp.runtime.gateway.reasoning_carrier import MAXIMUM_REASONING_CARRIER_BYTES
+from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.cache_control import EphemeralCacheControl
 from exp.runtime.openai_protocol.reasoning_replay import ReasoningDetail
 
@@ -590,6 +591,7 @@ class _ChatRequest(_WireModel):
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None
+    provider: ProviderRoutingPreferences | None = None
     """Provider processing tier, forwarded only on BYOK OpenAI-family rungs."""
     verbosity: Literal["low", "medium", "high"] | None = None
     """Output-length hint (GPT-5 family), the Chat spelling of Responses ``text.verbosity``.
@@ -990,4 +992,5 @@ class _ResponsesRequest(_WireModel):
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None
+    provider: ProviderRoutingPreferences | None = None
     """Provider processing tier, forwarded only on BYOK OpenAI-family rungs."""

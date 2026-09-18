@@ -8,9 +8,12 @@ typed :class:`GatewayFailure`.
 
 from __future__ import annotations
 
+import functools
+import inspect
 import math
+from collections.abc import Callable
 from datetime import datetime
-from typing import cast
+from typing import NotRequired, TypedDict, cast
 
 from exp.common.core.artifacts import JsonObject, stable_id
 from exp.common.models.gateway_catalog import ExactModelDeployment
@@ -234,6 +237,105 @@ def terminal_from_settlement(
     return terminal, failure
 
 
+UPSTREAM_PROVIDER_MAX_CHARS = 128
+
+
+@functools.lru_cache(maxsize=128)
+def accepts_keyword(callable_object: Callable[..., object], name: str) -> bool:
+    """Whether ``callable_object`` accepts keyword ``name`` (named or through ``**kwargs``).
+
+    Capability detection for the hosted ledger seam: the engine may ship a new
+    settle keyword before the host's ledger learns it, so the value is handed
+    over only where the signature admits it. An unreadable signature is read
+    as not accepting, never as accepting. Cached per callable (a bound method
+    hashes by its function and receiver), so the probe runs once per ledger.
+    """
+    try:
+        signature = inspect.signature(callable_object)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.name == name and parameter.kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            return True
+    return False
+
+
+def upstream_provider_kwarg(
+    settle: Callable[..., object], upstream_provider: str | None
+) -> dict[str, str | None]:
+    """The ``upstream_provider`` settle keyword for ``settle``, empty when it predates the field.
+
+    ``settle`` is the hosted ledger's ``finish_attempt``; a host whose ledger
+    has not learned the keyword gets no such argument (never a TypeError on
+    every settle after an engine repin), one that has gets the named upstream.
+    """
+    if not accepts_keyword(settle, "upstream_provider"):
+        return {}
+    return {"upstream_provider": upstream_provider}
+
+
+"""Longest upstream label the settlement carries; anything longer is not a name."""
+
+
+class SettlementMetadata(TypedDict):
+    """Content-free observation fields forwarded identically on direct and swept writes."""
+
+    first_token_at: datetime | None
+    retry_after_seconds: int | None
+    ratelimit_limit_requests: int | None
+    ratelimit_remaining_requests: int | None
+    ratelimit_limit_tokens: int | None
+    ratelimit_remaining_tokens: int | None
+    upstream_provider: NotRequired[str | None]
+
+
+def settlement_metadata(
+    data: JsonObject | None, settle: Callable[..., object]
+) -> SettlementMetadata:
+    """Project original observations while withholding unsupported host keywords."""
+    observed = settlement_rate_limit(data)
+    fields: SettlementMetadata = {
+        "first_token_at": None if data is None else first_token_at_from_settlement(data),
+        "retry_after_seconds": observed.retry_after_seconds,
+        "ratelimit_limit_requests": observed.limit_requests,
+        "ratelimit_remaining_requests": observed.remaining_requests,
+        "ratelimit_limit_tokens": observed.limit_tokens,
+        "ratelimit_remaining_tokens": observed.remaining_tokens,
+    }
+    if accepts_keyword(settle, "upstream_provider"):
+        fields["upstream_provider"] = upstream_provider_from_settlement(data)
+    return fields
+
+
+def upstream_provider_from_settlement(data: JsonObject | None) -> str | None:
+    """Return the upstream an aggregator rung named as serving the attempt.
+
+    The native data plane includes ``upstream_provider`` when the provider's
+    stream named the endpoint behind the answer (OpenRouter's per-chunk
+    ``provider`` field, opted in by the ZDR constraint's metadata header). A
+    missing, empty, non-string, or over-long value yields ``None`` so an
+    engine or a provider that names nothing settles exactly as before.
+
+    Args:
+        data: Parsed native settlement payload; ``None`` (a cancelled sweep) names none.
+
+    Returns:
+        The provider label, or ``None`` when the attempt named none.
+    """
+    raw = None if data is None else data.get("upstream_provider")
+    if not isinstance(raw, str):
+        return None
+    label = raw.strip()
+    if not label or len(label) > UPSTREAM_PROVIDER_MAX_CHARS:
+        return None
+    return label
+
+
 def first_token_at_from_settlement(data: JsonObject) -> datetime | None:
     """Return the winning attempt's first-token wall-clock time from a settlement payload.
 
@@ -323,7 +425,7 @@ def _optional_wait(value: object) -> int | None:
     return value
 
 
-def settlement_rate_limit(data: JsonObject) -> RateLimitObservation:
+def settlement_rate_limit(data: JsonObject | None) -> RateLimitObservation:
     """Parse the settlement's optional harvested rate-limit headers.
 
     The data plane forwards the allowlisted provider rate-limit response
@@ -337,6 +439,8 @@ def settlement_rate_limit(data: JsonObject) -> RateLimitObservation:
     Returns:
         The typed observation for the ledger and throttle calibration.
     """
+    if data is None:
+        return RateLimitObservation()
     return rate_limit_observation_from_payload(data.get("rate_limit_headers"))
 
 

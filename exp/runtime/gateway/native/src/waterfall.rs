@@ -401,7 +401,13 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
         counts[depth] += 1;
         let end = run_attempt(ctx, guard, wire, depth, &mut repaired[depth]).await;
         match end {
-            AttemptEnd::Committed(committed) => return Won::Committed(committed),
+            AttemptEnd::Committed(committed) => {
+                // The committed stream has parsed at least its first
+                // semantic chunk, so an aggregator's upstream label (if any)
+                // is known here; settle it with whatever outcome follows.
+                guard.record_upstream_provider(committed.relay.upstream_provider());
+                return Won::Committed(committed);
+            }
             AttemptEnd::Settled(settled) => return Won::Settled(settled),
             AttemptEnd::Accounting => return Won::Failed(PublicError::internal()),
             AttemptEnd::Retention(error) => return Won::Failed(error),

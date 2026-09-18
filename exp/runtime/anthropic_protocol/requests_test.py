@@ -2172,3 +2172,13 @@ def test_a_superseded_thinking_budget_is_never_refused() -> None:
         )
     )
     assert off.request.provider_thinking_config == {"type": "disabled"}
+
+
+def test_provider_zdr_demand_decodes_on_the_messages_surface() -> None:
+    """The cross-surface ``provider`` object works through Anthropic ``extra_body`` too."""
+    decoded = decode_messages(_body(provider={"zdr": True, "order": ["Amazon Bedrock"]}))
+    assert decoded.request.zdr_requested is True
+    assert decoded.request.provider_preferences == {"zdr": True, "order": ["Amazon Bedrock"]}
+    plain = decode_messages(_body())
+    assert plain.request.zdr_requested is False
+    assert plain.request.provider_preferences is None

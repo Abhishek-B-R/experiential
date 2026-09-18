@@ -773,9 +773,13 @@ def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None
     assert report["totals"]["requests"] == before["totals"]["requests"] + 1
     terminal_attempts = sum(int(count["attempts"]) for count in report["totals"]["terminal_counts"])
     with sqlite3.connect(engine.database_path) as connection:
+        (total_requests,) = connection.execute("SELECT count(*) FROM gateway_requests").fetchone()
         (total_attempts,) = connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()
         (open_attempts,) = connection.execute(
             "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched', 'running')"
         ).fetchone()
+    # At least this probe was accepted and settled in one dispatch.
+    assert total_requests >= 1
+    assert report["totals"]["requests"] == total_requests
     assert open_attempts == 0
     assert terminal_attempts == total_attempts == before_attempts + 1

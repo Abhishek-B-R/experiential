@@ -100,6 +100,11 @@ CHAT_MANIFEST = CompatibilityManifest(
         _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
         _field("user", CompatibilityDisposition.METADATA_ONLY),
         _field("prompt_cache_key", CompatibilityDisposition.CONDITIONALLY_SUPPORTED),
+        # OpenRouter-shaped routing preferences. `zdr: true` demands
+        # zero-data-retention routing for this request (honored at admission
+        # on every route); the object forwards to OpenRouter rungs and is
+        # dropped on wires that have no such field.
+        _field("provider", CompatibilityDisposition.SUPPORTED),
         # Both API surfaces share the native Responses output-length hint;
         # other routes omit it with disclosure. Values remain validated.
         _field("verbosity", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "verbosity"),
@@ -175,6 +180,11 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
         _field("user", CompatibilityDisposition.METADATA_ONLY),
         _field("prompt_cache_key", CompatibilityDisposition.CONDITIONALLY_SUPPORTED),
+        # OpenRouter-shaped routing preferences. `zdr: true` demands
+        # zero-data-retention routing for this request (honored at admission
+        # on every route); the object forwards to OpenRouter rungs and is
+        # dropped on wires that have no such field.
+        _field("provider", CompatibilityDisposition.SUPPORTED),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (

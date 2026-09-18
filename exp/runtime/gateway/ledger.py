@@ -478,6 +478,7 @@ class SQLiteAttemptLedger:
         ratelimit_remaining_requests: int | None = None,
         ratelimit_limit_tokens: int | None = None,
         ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
     ) -> None:
         """Idempotently settle one attempt with normalized content-free fields.
 
@@ -493,6 +494,8 @@ class SQLiteAttemptLedger:
             ratelimit_remaining_requests: Provider-stated requests remaining.
             ratelimit_limit_tokens: Provider-stated token-rate ceiling.
             ratelimit_remaining_tokens: Provider-stated tokens remaining.
+            upstream_provider: The upstream an aggregator rung (OpenRouter)
+                named as having served the attempt, when its response said.
         """
         with self._transaction() as connection:
             self.apply_finish_attempt(
@@ -507,6 +510,7 @@ class SQLiteAttemptLedger:
                 ratelimit_remaining_requests=ratelimit_remaining_requests,
                 ratelimit_limit_tokens=ratelimit_limit_tokens,
                 ratelimit_remaining_tokens=ratelimit_remaining_tokens,
+                upstream_provider=upstream_provider,
             )
 
     def apply_finish_attempt(
@@ -523,6 +527,7 @@ class SQLiteAttemptLedger:
         ratelimit_remaining_requests: int | None = None,
         ratelimit_limit_tokens: int | None = None,
         ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
     ) -> None:
         """Run the attempt settlement inside the caller's open write transaction.
 
@@ -539,6 +544,8 @@ class SQLiteAttemptLedger:
             ratelimit_remaining_requests: Provider-stated requests remaining.
             ratelimit_limit_tokens: Provider-stated token-rate ceiling.
             ratelimit_remaining_tokens: Provider-stated tokens remaining.
+            upstream_provider: The upstream an aggregator rung (OpenRouter)
+                named as having served the attempt, when its response said.
         """
         state, normalized_failure, failure_message, usage = _terminal_values(
             terminal_event, failure
@@ -627,7 +634,7 @@ class SQLiteAttemptLedger:
                 budget_settled_nano_usd = ?,
                 retry_after_seconds = ?, ratelimit_limit_requests = ?,
                 ratelimit_remaining_requests = ?, ratelimit_limit_tokens = ?,
-                ratelimit_remaining_tokens = ?
+                ratelimit_remaining_tokens = ?, upstream_provider = ?
             WHERE attempt_id = ? AND state = 'dispatched'
             """,
             (
@@ -649,6 +656,7 @@ class SQLiteAttemptLedger:
                 ratelimit_remaining_requests,
                 ratelimit_limit_tokens,
                 ratelimit_remaining_tokens,
+                upstream_provider,
                 attempt_id,
             ),
         )
