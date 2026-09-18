@@ -163,6 +163,7 @@ def stage_affinity_ordered_rungs(
         bound = []
         for deployment, (profile, client) in zip(route.deployments, wires, strict=True):
             scope = host.scope_for(deployment, authorization.organization_id)
+            profile = replace(profile, operational_region=scope.region_scope)
             receipt = DispatchCredentialReceipt(uuid5(NAMESPACE_URL, host.credential))
             binding = FrozenRecoveryBinding(
                 deployment.deployment_id,

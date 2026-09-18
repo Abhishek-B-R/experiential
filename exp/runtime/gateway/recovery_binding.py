@@ -32,16 +32,14 @@ def bind_recovery_profiles(
     for deployment, (profile, client) in zip(deployments, wires, strict=True):
         receipt = profile.credential_receipt
         binding = None
+        region = _resolved_region(profile)
         if (
             host is not None
             and receipt is not None
             and not profile.signs_request_body
             and request_region is None
+            and region is not None
         ):
-            parsed = urlsplit(profile.url)
-            region = profile.operational_region
-            if region is None and parsed.hostname in _GLOBAL_SERVICE_HOSTS:
-                region = "global-service"
             scope = RecoveryScope(
                 provider=deployment.provider,
                 exact_model_id=deployment.exact_model_id,
@@ -59,13 +57,24 @@ def bind_recovery_profiles(
                 profile.operational_region,
                 profile.dialect,
             )
-            if region is not None:
-                try:
-                    host.observe_scope(scope.operational())
-                except Exception:  # noqa: BLE001 - optional evidence never changes serving.
-                    _logger.warning("Recovery scope observation skipped")
+            try:
+                host.observe_scope(scope.operational())
+            except Exception:  # noqa: BLE001 - optional evidence never changes serving.
+                _logger.warning("Recovery scope observation skipped")
         bound.append((replace(profile, recovery_binding=binding), client))
     return tuple(bound)
+
+
+def _resolved_region(profile: GatewayWireProfile) -> str | None:
+    """Use declared wire geography or the existing authoritative global-service scope."""
+    if profile.operational_region:
+        return profile.operational_region
+    if (
+        profile.operational_region is None
+        and urlsplit(profile.url).hostname in _GLOBAL_SERVICE_HOSTS
+    ):
+        return "global-service"
+    return None
 
 
 def _endpoint_scope(profile: GatewayWireProfile) -> str:
@@ -86,7 +95,7 @@ def validated_recovery_binding(
 ) -> FrozenRecoveryBinding | None:
     """Reject accidental binding reassignment after route narrowing or reordering."""
     binding = profile.recovery_binding
-    if binding is None:
+    if binding is None or not binding.scope.region_scope:
         return None
     if (
         binding.deployment_id != deployment.deployment_id
@@ -103,6 +112,8 @@ def validated_recovery_binding(
         or binding.scope.credential_scope != str(profile.credential_receipt.binding_id)
     ):
         raise ValueError("resolved recovery binding differs from its authorized wire")
+    if _resolved_region(profile) is None:
+        return None
     return binding
 
 
@@ -113,7 +124,7 @@ def frozen_scope(
 ) -> RecoveryScope | None:
     """Read a retained scope without consulting mutable credential or catalog state."""
     binding = bindings.get(deployment.deployment_id)
-    if binding is None:
+    if binding is None or not binding.scope.region_scope:
         return None
     if (
         binding.deployment_id != deployment.deployment_id

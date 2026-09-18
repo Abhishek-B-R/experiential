@@ -13,12 +13,14 @@ from exp.common.models.catalog import GatewayRungDispatchPolicy
 from exp.common.models.gateway_catalog import normalize_gateway_catalog
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayUsage
 from exp.runtime.gateway.execution_resolution import _resolved_wire_profile
-from exp.runtime.gateway.native_accounting import NativeBridgeError
-from exp.runtime.gateway.native_accounting_test import _registry, _start
+from exp.runtime.gateway.native_accounting import NativeAttemptAccounting, NativeBridgeError
+from exp.runtime.gateway.native_accounting_test import _RecordingLedger, _registry, _start
+from exp.runtime.gateway.native_admission_test import _affinity_fixture
 from exp.runtime.gateway.native_execution import InflightRequest, deployment_wire_entry
 from exp.runtime.gateway.native_execution_test import _route
 from exp.runtime.gateway.native_recovery import record_session_outcome, session_cache_key
 from exp.runtime.gateway.native_recovery_test import request
+from exp.runtime.gateway.native_stage_admission import stage_affinity_ordered_rungs
 from exp.runtime.gateway.recovery import (
     FrozenRecoveryBinding,
     OperationalScope,
@@ -289,8 +291,203 @@ def test_unknown_receipt_or_region_does_not_invent_shared_recovery() -> None:
         "org",
         host,
     )[0][0]
-    assert bound.recovery_binding is not None and bound.recovery_binding.scope.region_scope is None
+    assert bound.recovery_binding is None
+    assert bound.url == profile.url and bound.dialect == profile.dialect
     assert not host.observed
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("region", [None, "region", "global-service"])
+def test_real_binding_gates_retained_stage_recovery_without_changing_normal_affinity(
+    staged: bool, region: str | None
+) -> None:
+    """Actual binding admission must not turn unknown geography into retained warmth."""
+    route, wires = _affinity_fixture()
+    if staged:
+        route = route.model_copy(
+            update={
+                "snapshot": route.snapshot.model_copy(
+                    update={"model_stages": (route.snapshot.stage_for_depth(0),)}
+                )
+            }
+        )
+    host = Host()
+    accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=host)
+    accounting.recovery = SessionRecoveryRegistry(clock=Clock())
+    auth = route.snapshot.authorization
+    wire_request = request()
+    resolved = tuple(
+        (
+            replace(
+                profile,
+                url="https://api.openai.com/v1/chat/completions"
+                if region == "global-service"
+                else "https://custom.test/v1",
+                operational_region="region" if region == "region" else None,
+                credential_receipt=DispatchCredentialReceipt(uuid4()),
+            ),
+            client,
+        )
+        for profile, client in wires
+    )
+    bound = bind_recovery_profiles(route.deployments, resolved, auth.organization_id, host)
+    baseline, _, _ = stage_affinity_ordered_rungs(
+        route, bound, wire_request, accounting=accounting, authorization=auth, continuation=None
+    )
+    preferred = baseline.deployments[-1]
+    profile = bound[route.snapshot.deployment_ids.index(preferred.deployment_id)][0]
+    binding = profile.recovery_binding
+    if binding is None:
+        assert region is None
+        assert profile.credential_receipt is not None
+        scope = RecoveryScope(
+            provider=preferred.provider,
+            exact_model_id=preferred.exact_model_id,
+            endpoint_scope="old-endpoint",
+            region_scope=None,
+            credential_scope=str(profile.credential_receipt.binding_id),
+            organization_id=auth.organization_id,
+        )
+    else:
+        scope = binding.scope
+    key = session_cache_key(InflightRequest(auth, route, wire_request, 10))
+    assert key is not None
+    accounting.recovery.record_success(
+        key,
+        preferred.deployment_id,
+        scope,
+        cached_tokens=80,
+        cache_write_tokens=0,
+        retention_seconds=100,
+        sticky_seconds=60,
+    )
+    ordered, _, placement = stage_affinity_ordered_rungs(
+        route, bound, wire_request, accounting=accounting, authorization=auth, continuation=None
+    )
+    if region is None:
+        assert all(profile.recovery_binding is None for profile, _ in bound)
+        assert ordered.snapshot.deployment_ids == baseline.snapshot.deployment_ids
+        assert placement.verified_warm_deployment_id is None
+        assert not host.observed
+        # A pre-fix binding copied onto an otherwise unchanged wire cannot
+        # make retained positive history eligible again.
+        stale = FrozenRecoveryBinding(
+            preferred.deployment_id,
+            preferred.connection_sha256,
+            profile.url,
+            profile.model_id,
+            scope,
+            profile.operational_region,
+            profile.dialect,
+        )
+        stale_wires = tuple(
+            (replace(wire, recovery_binding=stale), client)
+            if deployment.deployment_id == preferred.deployment_id
+            else (wire, client)
+            for deployment, (wire, client) in zip(route.deployments, bound, strict=True)
+        )
+        assert (
+            validated_recovery_binding(
+                preferred, replace(profile, recovery_binding=stale), auth.organization_id
+            )
+            is None
+        )
+        reused, _, reused_placement = stage_affinity_ordered_rungs(
+            route,
+            stale_wires,
+            wire_request,
+            accounting=accounting,
+            authorization=auth,
+            continuation=None,
+        )
+        assert reused.snapshot.deployment_ids == baseline.snapshot.deployment_ids
+        assert reused_placement.verified_warm_deployment_id is None
+    else:
+        assert ordered.deployment.deployment_id == preferred.deployment_id
+        assert placement.verified_warm_deployment_id == preferred.deployment_id
+        assert host.observed
+
+
+@pytest.mark.parametrize("swept", [False, True])
+def test_unknown_frozen_region_does_not_record_settled_cache_evidence(swept: bool) -> None:
+    """Old unknown-region bindings cannot seed history through direct or retained settlement."""
+    accounting, ledger, entry = _registry()
+    host = Host()
+    accounting.recovery_host = host
+    accounting.recovery = SessionRecoveryRegistry(clock=Clock())
+    deployment = entry.route.deployment.model_copy(
+        update={
+            "gateway": entry.route.deployment.gateway.model_copy(
+                update={
+                    "cache_retention_seconds": 100,
+                    "dispatch": GatewayRungDispatchPolicy(sticky_spill_seconds=60),
+                }
+            )
+        }
+    )
+    entry.route = entry.route.model_copy(
+        update={
+            "deployment": deployment,
+            "snapshot": entry.route.snapshot.model_copy(
+                update={"failover_mode": "maximize_cache_affinity"}
+            ),
+        }
+    )
+    entry.request = request()
+    scope = RecoveryScope(
+        provider=deployment.provider,
+        exact_model_id=deployment.exact_model_id,
+        endpoint_scope="endpoint",
+        region_scope=None,
+        credential_scope=str(uuid4()),
+        organization_id=entry.authorization.organization_id,
+    )
+    binding = FrozenRecoveryBinding(
+        deployment.deployment_id,
+        deployment.connection_sha256,
+        "https://custom.test/v1",
+        deployment.provider_model,
+        scope,
+    )
+    entry.recovery_bindings = {deployment.deployment_id: binding}
+    started = _start(accounting, ordinal=0)
+    payload = json.dumps(
+        {
+            "request_id": entry.authorization.request_id,
+            "attempt_id": started["attempt_id"],
+            "outcome": "completed",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 1,
+                "cached_input_tokens": 80,
+                "cache_creation_input_tokens": 10,
+            },
+            "first_token_at": "2026-09-18T01:02:03+00:00",
+            "upstream_provider": "Azure",
+            "finalize": True,
+        }
+    )
+    if swept:
+        ledger.fail_finishes = 1
+        with pytest.raises(NativeBridgeError):
+            accounting.settle(payload)
+        accounting.sweep_expired()
+    else:
+        accounting.settle(payload)
+    key = session_cache_key(entry)
+    assert key is not None and not accounting.recovery.has_retained_history(key)
+    assert (
+        frozen_scope(entry.recovery_bindings, deployment, entry.authorization.organization_id)
+        is None
+    )
+    assert entry.recovery_bindings[deployment.deployment_id] is binding
+    assert len(ledger.finished) == 1 and accounting.accounting_healthy
+    assert not host.observed
+    assert ledger.first_token_times[-1] is not None
+    assert ledger.upstream_providers[-1] == "Azure"
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None and terminal.usage is not None
+    assert terminal.usage.cache_creation_input_tokens == 10
 
 
 @pytest.mark.parametrize("region", ["us", "eu", "future-region"])
