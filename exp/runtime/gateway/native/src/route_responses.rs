@@ -13,7 +13,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::admission::{
-    acquire_permit, apply_output_guardrail, new_guard, served_headers, wire_drift_response, Admission,
+    acquire_permit, apply_output_guardrail, new_guard, served_headers, wire_drift_response,
+    Admission,
 };
 use crate::billing::SettledBilling;
 use crate::encode::{compact_json, reasoning_carrier_candidate};
@@ -822,9 +823,7 @@ async fn stream_responses(
             };
             track_event(&event, &mut usage, &mut tool_names);
             if redactor.is_none() {
-                // A guarded stream retains what the caller actually saw, so
-                // a continuation replays the redacted text, never the raw
-                // completion; retention then runs over the released events.
+                // Guarded continuations retain released redacted events, not raw output.
                 retention.track(&event);
             }
             // Mirror the relay's first-token time onto the guard as tokens stream.
