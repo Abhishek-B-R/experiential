@@ -382,7 +382,6 @@ def _build_trace_review(
         rollout_input: Exact target rollout pointer.
         reference_input: Optional comparison rollout pointer.
         provisional_input: Provisional calibration used for raw judging.
-        rubric: Exact finalized rubric revision.
         judgment: Normalized immutable configured-judge response.
         judgment_input: Exact normalized judgment pointer.
         probes: Original immutable provider-response pointers.
