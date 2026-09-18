@@ -227,7 +227,11 @@ pub(crate) async fn chat(
                 created_at,
                 lease,
                 client_request_id,
-                SettledBilling::read(&state.bridge, &admission.request_id, deadline).await,
+                if !admission.stream || admission.include_usage {
+                    SettledBilling::read(&state.bridge, &admission.request_id, deadline).await
+                } else {
+                    None
+                },
             )
             .await
         }
@@ -590,7 +594,11 @@ async fn respond_from_chat_events(
         }
         return error_response(&PublicError::internal());
     }
-    let billing = SettledBilling::read(&guard.bridge, &admission.request_id, deadline).await;
+    let billing = if !stream_body || admission.include_usage {
+        SettledBilling::read(&guard.bridge, &admission.request_id, deadline).await
+    } else {
+        None
+    };
     let headers = served_headers(&admission, client_request_id.as_deref(), served);
     if stream_body {
         let body = match encode_chat_sse(
@@ -905,8 +913,11 @@ async fn stream_response(
                 {
                     return;
                 }
-                encoder
-                    .set_billing(SettledBilling::read(&guard.bridge, &request_id, deadline).await);
+                if include_usage {
+                    encoder.set_billing(
+                        SettledBilling::read(&guard.bridge, &request_id, deadline).await,
+                    );
+                }
             }
             for outward in outward_events {
                 let encoded = match encoder.feed(&outward) {

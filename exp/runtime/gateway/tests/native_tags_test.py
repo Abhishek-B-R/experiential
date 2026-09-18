@@ -440,6 +440,31 @@ def test_billing_is_in_terminal_bytes_and_keyed_replay(
         assert len(gateway.billing_reads) == 1
 
 
+@pytest.mark.parametrize("guarded", [False, True])
+@pytest.mark.parametrize("prompt", ["hello", "empty-token", "truncated-token"])
+def test_chat_stream_without_usage_never_reads_optional_billing(
+    gateway: _Gateway, guarded: bool, prompt: str
+) -> None:
+    """A stream with no usage event must not spend optional bridge capacity."""
+    if guarded:
+        gateway.enable_output_guardrail()
+    gateway.billing = SettledRequestBilling(paid_nano_usd=1, byok_nano_usd=0, is_byok=False)
+    answer = httpx.post(
+        gateway.origins[0] + "/chat/completions",
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True,
+        },
+        headers={"Authorization": "Bearer " + gateway.key},
+        timeout=5,
+    )
+    assert answer.status_code == 200, answer.text
+    assert "data: [DONE]" in answer.text
+    assert '"cost"' not in answer.text
+    assert gateway.billing_reads == []
+
+
 @pytest.mark.parametrize("gateway", [0.5], indirect=True)
 @pytest.mark.parametrize("surface", ["chat/completions", "responses", "messages"])
 def test_slow_billing_cannot_truncate_settled_success(gateway: _Gateway, surface: str) -> None:

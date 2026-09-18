@@ -77,7 +77,22 @@ impl SettledBilling {
 
     /// A terminal frame may contain multiple SSE events. Event names and [DONE]
     /// stay untouched; only a data object's existing usage gains the extension.
-    pub fn annotate_sse(&self, frame: &str) -> String {
+    pub fn annotate_sse(&self, frame: String) -> String {
+        // Our encoders put one named event in each owned frame. Large output
+        // item/text closing events contain no usage and keep their allocation.
+        if let Some(named) = frame.strip_prefix("event: ") {
+            if !matches!(
+                named.split('\n').next(),
+                Some(
+                    "response.completed"
+                        | "response.incomplete"
+                        | "response.failed"
+                        | "message_delta"
+                )
+            ) {
+                return frame;
+            }
+        }
         frame
             .split_inclusive('\n')
             .map(|line| {
@@ -109,7 +124,7 @@ pub fn terminal_frame(
     frame: String,
 ) -> String {
     match billing.filter(|_| event.is_terminal()) {
-        Some(billing) => billing.annotate_sse(&frame),
+        Some(billing) => billing.annotate_sse(frame),
         None => frame,
     }
 }
@@ -123,7 +138,7 @@ pub async fn frames(
 ) -> Vec<String> {
     match SettledBilling::read(bridge, request_id, deadline).await {
         Some(billing) => frames
-            .iter()
+            .into_iter()
             .map(|frame| billing.annotate_sse(frame))
             .collect(),
         None => frames,
@@ -193,12 +208,26 @@ mod tests {
             is_byok: true,
         };
         let frame = "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2}}\n\ndata: [DONE]\n\n";
-        let result = billing.annotate_sse(frame);
+        let result = billing.annotate_sse(frame.to_string());
         assert!(result.starts_with("event: message_delta\n"));
         assert!(result.contains("upstream_inference_cost"));
         assert!(result.ends_with("data: [DONE]\n\n"));
         let start =
             "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":2}}}\n\n";
-        assert_eq!(billing.annotate_sse(start), start);
+        assert_eq!(billing.annotate_sse(start.to_string()), start);
+        for event in [
+            "response.output_text.done",
+            "response.output_item.done",
+            "message_stop",
+        ] {
+            let frame = format!(
+                "event: {event}\ndata: {{\"text\":\"{}\"}}\n\n",
+                "x".repeat(1_000_000)
+            );
+            let allocation = frame.as_ptr();
+            let result = billing.annotate_sse(frame);
+            assert_eq!(result.as_ptr(), allocation);
+            assert!(!result.contains("cost"));
+        }
     }
 }

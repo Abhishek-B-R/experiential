@@ -69,6 +69,16 @@ def decode_native_body(
     payload = _load_object_body(body)
     try:
         tags = _TAGS.validate_python({} if request_tags is None else request_tags)
+    except ValidationError as exc:
+        raise NativeDecodeError(
+            OpenAIProtocolError(
+                status_code=400,
+                code="invalid_parameter",
+                message="Invalid X-Explabs-Tags. Send a flat map of valid tag keys and values.",
+                param="X-Explabs-Tags",
+            )
+        ) from exc
+    try:
         if surface == "messages":
             decoded = decode_messages(payload, anthropic_beta=anthropic_beta)
         else:
@@ -86,8 +96,8 @@ def decode_native_body(
             OpenAIProtocolError(
                 status_code=400,
                 code="invalid_parameter",
-                message="Invalid X-Explabs-Tags. Send a flat map of valid tag keys and values.",
-                param="X-Explabs-Tags",
+                message="Invalid request content. Check the messages or input and resend.",
+                param="input" if surface == "responses" else "messages",
             )
         ) from exc
     except OpenAIProtocolError as exc:

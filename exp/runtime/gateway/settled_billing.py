@@ -21,7 +21,12 @@ class SettledRequestBilling(ContractModel):
 
 
 class NativeSettledBillingMixin:
-    """Read-only native callback; the embedding host owns durable price truth."""
+    """Read-only native callback; the host owns price truth and strict I/O deadlines.
+
+    The native timeout bounds result delivery, not execution of Python. Readers
+    must finish within the host's shutdown budget: bridge teardown joins their
+    fixed worker threads rather than abandoning thread-local resources.
+    """
 
     _settled_billing_reader: Callable[[str], SettledRequestBilling | None] | None
 

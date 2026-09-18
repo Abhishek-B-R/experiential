@@ -13,7 +13,18 @@ extensions are omitted rather than asserting zero. The native read never queues
 behind busy bridge workers and waits at most 100ms or half the remaining request
 lifetime, whichever is smaller. A timeout omits the annotation without delaying the
 terminal until its delivery deadline; a timed-out callback retains its worker slot
-until it finishes.
+until it finishes. At most one optional callback can execute per bridge, leaving
+other workers for mandatory authorization and settlement. A one-worker bridge
+skips optional enrichment entirely. Chat streams without a terminal usage event
+skip the reader too.
+
+The 100ms budget bounds waiting for a result, not Python execution. The host reader
+must configure its own strict database/network deadline, shorter than the host's
+shutdown budget. Native shutdown joins fixed bridge threads to release their
+thread-local resources; an unfinished callback can therefore delay shutdown beyond
+`graceful_timeout_seconds`. Readers must not block indefinitely. The engine does
+not detach threads or kill Python work on timeout. Actual optional callback duration
+is included in the bridge latency metric even when the HTTP caller stopped waiting.
 
 Chat Completions, Responses, and Messages add `usage.cost` and `usage.is_byok` to
 terminal responses; BYOK summaries also add
