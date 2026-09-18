@@ -5024,8 +5024,7 @@ def test_hosted_tool_echoes_reemit_natively_and_drop_with_disclosure_on_a_foreig
     assert [message.role for message in provider.messages] == ["user", "user"]
     assert all(message.provider_native_item is None for message in provider.messages)
     assert (
-        "input.web_search_call->dropped(unsupported_by_provider)"
-        in public_mixed.ignored_parameters
+        "input.web_search_call->dropped(unsupported_by_provider)" in public_mixed.ignored_parameters
     )
 
 
