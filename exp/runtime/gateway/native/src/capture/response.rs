@@ -150,7 +150,17 @@ pub(crate) fn capture_response(
         .get("x-gateway-deployment")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let expected = response.body().size_hint().exact();
+    // A relay can stop polling once Content-Length bytes have arrived, without
+    // polling EOF on a streaming body wrapper (notably retained Responses JSON).
+    let expected = response.body().size_hint().exact().or_else(|| {
+        response
+            .headers()
+            .get("content-length")?
+            .to_str()
+            .ok()?
+            .parse::<u64>()
+            .ok()
+    });
     let status = response.status().as_u16();
     let (parts, body) = response.into_parts();
     let tap = Tap {

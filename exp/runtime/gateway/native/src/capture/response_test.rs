@@ -91,6 +91,29 @@ fn sse_parser_preserves_multiline_crlf_done_and_ignores_unfinished_event() {
 }
 
 #[tokio::test]
+async fn content_length_json_is_complete_even_when_consumer_never_polls_eof() {
+    let (collector, receiver) = collector(4096);
+    let bytes = Bytes::from_static(br#"{"id":"response","status":"completed"}"#);
+    let source = futures_util::stream::iter([Ok::<_, Infallible>(bytes.clone())])
+        .chain(futures_util::stream::pending());
+    let response = Response::builder()
+        .header("content-type", "application/json")
+        .header("content-length", bytes.len())
+        .body(Body::from_stream(source))
+        .unwrap();
+    let mut body = capture_response(Some(collector.clone()), "request", response)
+        .into_body()
+        .into_data_stream();
+    assert_eq!(body.next().await.unwrap().unwrap(), bytes);
+    drop(body);
+    let record = record(&collector, receiver);
+    assert!(matches!(
+        record.response,
+        Some(CapturedResponse::Json { .. })
+    ));
+}
+
+#[tokio::test]
 async fn dropped_stream_keeps_only_whole_observed_frames_and_marks_disconnect() {
     let (collector, receiver) = collector(4096);
     let prefix = Bytes::from_static(b"data: {\"delta\":\"hello\"}\n\n");

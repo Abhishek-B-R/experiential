@@ -16,6 +16,7 @@ from exp.runtime.gateway.native_capture import (
     CaptureController,
     CaptureDeliveryLimits,
     CaptureRecord,
+    CaptureSseResponse,
 )
 from exp.runtime.gateway.native_server import serve_native_gateway
 from exp.runtime.gateway.tests.launch_test import (
@@ -168,6 +169,12 @@ def test_real_http_surfaces_use_one_collector_without_affecting_serving(
     parsed = [CaptureRecord.model_validate_json(value) for value in records]
     completed = [record for record in parsed if record.response is not None]
     assert len(completed) == 6
+    assert sum(record.response.kind == "json" for record in completed if record.response) == 3
+    assert all(
+        not record.response.truncated and not record.response.client_disconnected
+        for record in completed
+        if isinstance(record.response, CaptureSseResponse)
+    )
     assert {record.request.protocol for record in completed} == {
         "chat_completions",
         "responses",
