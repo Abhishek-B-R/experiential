@@ -327,17 +327,12 @@ provider serves 200K); non-allowlisted tokens drop with a per-token
 and drop with disclosure elsewhere. Chat `verbosity` accepts `low`, `medium`, or `high` as the
 same hint: forwarded as `text.verbosity` on native Responses routes and omitted with a
 `verbosity` disclosure on other routes. Invalid values remain named parameter errors.
-Codex-native input items (`additional_tools` tool namespaces,
-`custom_tool_call`/`custom_tool_call_output` freeform history) and non-function top-level tool
-declarations (`custom` freeform-grammar tools, `namespace` tool trees, `web_search`,
-`tool_search`) carry byte-for-byte at their caller positions on homogeneous native Responses
-routes. Foreign or mixed routes translate namespaces and custom tools to ordinary functions;
-unsupported hosted tools and history drop with explicit disclosure. The selected attempt's
-inverse map restores tool names, namespaces and custom-call identity. A translated custom call
-starts immediately, but its input is emitted as one decoded delta only after the bounded JSON
-wrapper completes. Invalid wrappers fail rather than expose JSON as executable freeform input;
-ordinary and namespaced function arguments remain incremental. Native Responses custom calls
-keep their incremental native events and continuation retention. Echoed message items accept
+Native Responses declarations and history keep their caller positions and wire shapes on
+homogeneous native routes. Foreign or mixed routes translate custom and namespaced tools to
+functions; unsupported hosted tools/history drop with explicit disclosure. The selected
+attempt restores original identities. Translated custom input emits one decoded delta after
+the bounded wrapper completes; invalid wrappers fail. Ordinary/namespaced function arguments
+and native custom input remain incremental. Echoed message items accept
 `id`/`phase` with `status` optional (non-assistant identity drops). The item-level `namespace` on
 `function_call` (plus the `name`/`namespace` pair on `function_call_output` and the
 `custom_tool_call` namespace) round-trips verbatim through decode, the client stream, and
