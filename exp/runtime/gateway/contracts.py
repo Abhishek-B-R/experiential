@@ -660,6 +660,16 @@ class GatewayRequest(ContractModel):
     present value joins replay identity through :func:`canonical_request_sha256`.
     """
     provider_native_tools: tuple[GatewayProviderNativeTool, ...] = Field(default=(), exclude=True)
+    native_tool_translation: dict[str, tuple[str, str | None, bool]] | None = Field(
+        default=None, exclude=True
+    )
+    """Reverse map (provider-facing name -> origin name, namespace, is_custom)
+    set on the PROVIDER request when Codex native tools were translated for a
+    foreign wire. It rides on the dispatched request only, never the canonical
+    or public request, so it does not perturb replay identity; the response
+    path reads it to re-shape tool calls into the native items the caller
+    declared. Excluded from serialization like the other provider-only
+    carriers."""
     """Verbatim non-function OpenAI Responses tool declarations.
 
     See :class:`GatewayProviderNativeTool`. Non-Responses rungs cannot serve
