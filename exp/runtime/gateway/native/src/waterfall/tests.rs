@@ -1,5 +1,7 @@
 //! Unit tests for the waterfall's pure successor and allowance rules.
 
+use std::collections::HashMap;
+
 use super::*;
 
 fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
@@ -237,6 +239,7 @@ fn usage(output_tokens: Option<u64>, reasoning_tokens: Option<u64>) -> Usage {
         output_tokens,
         cached_input_tokens: None,
         cache_creation_input_tokens: None,
+        cache_creation_1h_input_tokens: None,
         reasoning_tokens,
     }
 }

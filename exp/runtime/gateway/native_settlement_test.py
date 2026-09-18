@@ -6,10 +6,12 @@ from datetime import UTC, datetime
 
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     GatewayEventKind,
     GatewayFailureClass,
     GatewayRefusalReason,
+    GatewayUsage,
 )
 from exp.runtime.gateway.native_settlement import (
     _usage_from_payload,  # noqa: PLC2701 - direct unit coverage for normalization.
@@ -18,8 +20,14 @@ from exp.runtime.gateway.native_settlement import (
     settlement_metadata,
     settlement_rate_limit,
     terminal_from_settlement,
+    tool_search_requests_from_settlement,
+    tool_search_requests_from_terminal,
+    tool_search_requests_kwarg,
     upstream_provider_from_settlement,
     upstream_provider_kwarg,
+    web_search_requests_from_settlement,
+    web_search_requests_from_terminal,
+    web_search_requests_kwarg,
 )
 
 
@@ -88,6 +96,54 @@ def test_usage_from_payload_handles_tokens_and_tool_names() -> None:
     assert complete.input_tokens == 10
     assert complete.output_tokens == 3
     assert complete.cached_input_tokens == 2
+
+
+def test_usage_from_payload_preserves_cache_write_leg() -> None:
+    """Cache-write tokens survive settlement even when cache-read is absent."""
+    usage = _usage_from_payload(
+        {
+            "input_tokens": 1_000,
+            "output_tokens": 10,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 1_000,
+        },
+        [],
+    )
+    assert usage is not None
+    assert usage.input_tokens == 1_000
+    assert usage.cached_input_tokens == 0
+    assert usage.cache_creation_input_tokens == 1_000
+
+    # Fresh and cache-write streams must not collapse to the same usage.
+    fresh = _usage_from_payload(
+        {"input_tokens": 1_000, "output_tokens": 10},
+        [],
+    )
+    assert fresh is not None
+    assert fresh.cache_creation_input_tokens is None
+    assert usage != fresh
+    assert usage.model_dump(exclude_none=True) != fresh.model_dump(exclude_none=True)
+
+
+def test_terminal_from_settlement_preserves_cache_write_usage_and_upstream_provider() -> None:
+    """Settlement retains the TTL breakdown alongside selected upstream evidence."""
+    payload: JsonObject = {
+        "outcome": "completed",
+        "usage": {
+            "input_tokens": 1_000,
+            "output_tokens": 10,
+            "cache_creation_input_tokens": 600,
+            "cache_creation_1h_input_tokens": 200,
+        },
+        "tool_names": [],
+        "failure": None,
+        "upstream_provider": "Azure",
+    }
+    terminal, _failure = terminal_from_settlement(payload)
+    assert terminal.usage is not None
+    assert terminal.usage.cache_creation_input_tokens == 600
+    assert terminal.usage.cache_creation_1h_input_tokens == 200
+    assert upstream_provider_from_settlement(payload) == "Azure"
 
 
 def test_terminal_from_settlement_normalizes_usage_and_tools() -> None:
@@ -423,3 +479,161 @@ def test_cache_write_count_crosses_the_settlement_boundary(writes: int | None) -
     )
     assert usage is not None
     assert usage.cache_creation_input_tokens == writes
+
+
+def test_web_search_requests_parses_the_top_level_count_and_nothing_else() -> None:
+    """The count sits beside ``usage`` in the settle argument; anything unusable reads as zero."""
+    assert web_search_requests_from_settlement({"web_search_requests": 2}) == 2
+    assert web_search_requests_from_settlement({}) == 0
+    assert web_search_requests_from_settlement(None) == 0
+    assert web_search_requests_from_settlement({"web_search_requests": None}) == 0
+    assert web_search_requests_from_settlement({"web_search_requests": "2"}) == 0
+    assert web_search_requests_from_settlement({"web_search_requests": True}) == 0
+    assert web_search_requests_from_settlement({"web_search_requests": -1}) == 0
+    # Inside "usage" is the wrong place: the engine never puts it there.
+    assert web_search_requests_from_settlement({"usage": {"web_search_requests": 2}}) == 0
+
+
+def test_web_search_requests_ride_on_the_settled_usage() -> None:
+    """Token-bearing and tool-only usage both carry the count; no usage means no carrier."""
+    tokens: JsonObject = {"input_tokens": 8, "output_tokens": 3}
+    terminal, _failure = terminal_from_settlement(
+        {"outcome": "completed", "usage": tokens, "tool_names": [], "web_search_requests": 2}
+    )
+    assert terminal.usage is not None and terminal.usage.web_search_requests == 2
+    assert web_search_requests_from_terminal(terminal) == 2
+
+    tools_only, _failure = terminal_from_settlement(
+        {
+            "outcome": "completed",
+            "usage": None,
+            "tool_names": ["web_search"],
+            "web_search_requests": 1,
+        }
+    )
+    assert tools_only.usage is not None and tools_only.usage.web_search_requests == 1
+    assert not tools_only.usage.has_token_counts
+
+    # A count with neither tokens nor tool names has nothing to ride on: the
+    # contract's validator keeps a bare count from being usage, so it is dropped.
+    bare, _failure = terminal_from_settlement(
+        {"outcome": "completed", "usage": None, "tool_names": [], "web_search_requests": 3}
+    )
+    assert bare.usage is None
+    assert web_search_requests_from_terminal(bare) == 0
+    assert web_search_requests_from_terminal(None) == 0
+
+    # Absent stays byte-identical to the pre-field engine: zero on the usage.
+    absent, _failure = terminal_from_settlement(
+        {"outcome": "completed", "usage": tokens, "tool_names": []}
+    )
+    assert absent.usage is not None and absent.usage.web_search_requests == 0
+    assert _usage_from_payload(tokens, [], web_search_requests=4) == GatewayUsage(
+        input_tokens=8, output_tokens=3, web_search_requests=4
+    )
+
+
+def test_web_search_requests_kwarg_is_withheld_at_zero_and_from_a_legacy_ledger() -> None:
+    """Same seam as ``upstream_provider_kwarg``, plus: a zero count sends nothing at all."""
+
+    def named(*, web_search_requests: int = 0) -> None:
+        del web_search_requests
+
+    def variadic(**kwargs: object) -> None:
+        del kwargs
+
+    def absent(*, upstream_provider: str | None = None) -> None:
+        del upstream_provider
+
+    assert web_search_requests_kwarg(named, 2) == {"web_search_requests": 2}
+    assert web_search_requests_kwarg(variadic, 1) == {"web_search_requests": 1}
+    assert web_search_requests_kwarg(absent, 2) == {}
+    assert web_search_requests_kwarg(named, 0) == {}
+    assert web_search_requests_kwarg(variadic, 0) == {}
+
+
+def test_tool_search_requests_parses_the_top_level_count_and_nothing_else() -> None:
+    """The count sits beside ``usage`` in the settle argument; anything unusable reads as zero."""
+    assert tool_search_requests_from_settlement({"tool_search_requests": 2}) == 2
+    assert tool_search_requests_from_settlement({}) == 0
+    assert tool_search_requests_from_settlement(None) == 0
+    assert tool_search_requests_from_settlement({"tool_search_requests": None}) == 0
+    assert tool_search_requests_from_settlement({"tool_search_requests": "2"}) == 0
+    assert tool_search_requests_from_settlement({"tool_search_requests": True}) == 0
+    assert tool_search_requests_from_settlement({"tool_search_requests": -1}) == 0
+    # Inside "usage" is the wrong place: the engine never puts it there.
+    assert tool_search_requests_from_settlement({"usage": {"tool_search_requests": 2}}) == 0
+    # The two meters are independent keys: one never reads as the other.
+    assert tool_search_requests_from_settlement({"web_search_requests": 2}) == 0
+    assert web_search_requests_from_settlement({"tool_search_requests": 2}) == 0
+
+
+def test_tool_search_requests_ride_on_the_settled_usage() -> None:
+    """Token-bearing and tool-only usage both carry the count; no usage means no carrier."""
+    tokens: JsonObject = {"input_tokens": 8, "output_tokens": 3}
+    terminal, _failure = terminal_from_settlement(
+        {"outcome": "completed", "usage": tokens, "tool_names": [], "tool_search_requests": 2}
+    )
+    assert terminal.usage is not None and terminal.usage.tool_search_requests == 2
+    assert terminal.usage.web_search_requests == 0
+    assert tool_search_requests_from_terminal(terminal) == 2
+
+    tools_only, _failure = terminal_from_settlement(
+        {
+            "outcome": "completed",
+            "usage": None,
+            "tool_names": ["tool_search"],
+            "tool_search_requests": 1,
+        }
+    )
+    assert tools_only.usage is not None and tools_only.usage.tool_search_requests == 1
+    assert not tools_only.usage.has_token_counts
+
+    # A count with neither tokens nor tool names has nothing to ride on: the
+    # contract's validator keeps a bare count from being usage, so it is dropped.
+    bare, _failure = terminal_from_settlement(
+        {"outcome": "completed", "usage": None, "tool_names": [], "tool_search_requests": 3}
+    )
+    assert bare.usage is None
+    assert tool_search_requests_from_terminal(bare) == 0
+    assert tool_search_requests_from_terminal(None) == 0
+
+    # Absent stays byte-identical to the pre-field engine: zero on the usage.
+    absent, _failure = terminal_from_settlement(
+        {"outcome": "completed", "usage": tokens, "tool_names": []}
+    )
+    assert absent.usage is not None and absent.usage.tool_search_requests == 0
+    assert _usage_from_payload(tokens, [], tool_search_requests=4) == GatewayUsage(
+        input_tokens=8, output_tokens=3, tool_search_requests=4
+    )
+    # Both meters settle side by side on one usage.
+    both, _failure = terminal_from_settlement(
+        {
+            "outcome": "completed",
+            "usage": tokens,
+            "tool_names": [],
+            "web_search_requests": 1,
+            "tool_search_requests": 2,
+        }
+    )
+    assert both.usage is not None
+    assert (both.usage.web_search_requests, both.usage.tool_search_requests) == (1, 2)
+
+
+def test_tool_search_requests_kwarg_is_withheld_at_zero_and_from_a_legacy_ledger() -> None:
+    """Same seam as ``web_search_requests_kwarg``: zero or a pre-meter ledger gets nothing."""
+
+    def named(*, tool_search_requests: int = 0) -> None:
+        del tool_search_requests
+
+    def variadic(**kwargs: object) -> None:
+        del kwargs
+
+    def pre_tool_search(*, web_search_requests: int = 0) -> None:
+        del web_search_requests
+
+    assert tool_search_requests_kwarg(named, 2) == {"tool_search_requests": 2}
+    assert tool_search_requests_kwarg(variadic, 1) == {"tool_search_requests": 1}
+    assert tool_search_requests_kwarg(pre_tool_search, 2) == {}
+    assert tool_search_requests_kwarg(named, 0) == {}
+    assert tool_search_requests_kwarg(variadic, 0) == {}

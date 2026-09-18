@@ -7,11 +7,11 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from typing import Final
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
-from exp.runtime.gateway.boundary import boundary_protocol_error
 from exp.runtime.gateway.budget_continuation import denied_destination_pool
 from exp.runtime.gateway.budgets import (
     BudgetReservationRejected,
@@ -28,7 +28,11 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.ledger import AttemptRejectedError
-from exp.runtime.gateway.native_bridge_errors import encoded_public_error, internal_protocol_error
+from exp.runtime.gateway.native_accounting_errors import (
+    NativeBridgeError,
+    authority_error,
+    internal_protocol_error,
+)
 from exp.runtime.gateway.native_components import SyncWriteLedger
 from exp.runtime.gateway.native_execution import (
     THROTTLE_BACKOFF,
@@ -62,14 +66,15 @@ from exp.runtime.gateway.native_settlement import (
     ledger_failure,
     settlement_metadata,
     terminal_from_settlement,
+    tool_search_requests_from_terminal,
+    tool_search_requests_kwarg,
+    web_search_requests_from_terminal,
+    web_search_requests_kwarg,
 )
 from exp.runtime.gateway.recovery import RecoveryHost, SessionRecoveryRegistry
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
-from exp.runtime.openai_protocol.errors import (
-    OpenAIProtocolError,
-    public_failure_error,
-)
+from exp.runtime.openai_protocol.errors import public_failure_error
 
 _SWEEP_GRACE_SECONDS = 5.0
 _SWEEP_INTERVAL_SECONDS = 5.0
@@ -77,29 +82,8 @@ _SWEEP_BATCH = 16
 _logger = logging.getLogger(__name__)
 
 
-class NativeBridgeError(Exception):
-    """One sanitized boundary failure delivered to the native data plane."""
-
-    def __init__(self, error: OpenAIProtocolError) -> None:
-        """Retain the public error as the JSON payload the data plane returns.
-
-        Args:
-            error: Sanitized protocol error carrying its HTTP representation.
-        """
-        super().__init__(error.detail.message)
-        self.public_error_json = encoded_public_error(error)
-
-
-def authority_error(exception: Exception) -> NativeBridgeError:
-    """Map boundary failures through the shared service-layer mapper.
-
-    Args:
-        exception: Store, grant, routing, or execution failure.
-
-    Returns:
-        A boundary error carrying the matching public OpenAI error.
-    """
-    return NativeBridgeError(boundary_protocol_error(exception))
+TOOL_SEARCH_ROUND: Final = "tool_search_round"
+"""Dispatch reason of a same-rung re-dial after a gateway tool-search round."""
 
 
 class NativeAttemptAccounting:
@@ -383,6 +367,7 @@ class NativeAttemptAccounting:
         policy_sheds: list[tuple[int, str]] = []
         disposition: ThrottleDisposition | None = None
         redial_depth: int | None = None  # The rung a post-backoff redial re-dials.
+        tool_search_round = False
         if failure is not None and isinstance(current_depth, int):
             candidate, disposition = failed_dispatch_candidate(
                 health=self._health,
@@ -406,7 +391,15 @@ class NativeAttemptAccounting:
                 policy_sheds.append((current_depth, THROTTLE_FAILOVER_COLD))
             last_failure: GatewayFailure | None = failure
         else:
-            candidate = claim_route_from(self._health, keys, 0, ladder)
+            # A gateway tool-search round re-dials the rung that just served
+            # the withheld search call (its conversation now extended); the
+            # claim starts there and only moves on if that rung went unhealthy.
+            tool_search_round = data.get("tool_search_round") is True and isinstance(
+                current_depth, int
+            )
+            candidate = claim_route_from(
+                self._health, keys, current_depth if tool_search_round else 0, ladder
+            )
             last_failure = None
         forced_overflow = False
         # The input half of the reservation tokenizes the whole prompt, so it
@@ -470,6 +463,8 @@ class NativeAttemptAccounting:
                 sticky_preferred=entry.sticky_preferred,
                 throttle_backoff=throttle_backoff,
             )
+            if tool_search_round:
+                dispatch_reason = TOOL_SEARCH_ROUND
             try:
                 attempt_id = self._write_ledger.start_attempt(
                     snapshot=route.snapshot,
@@ -670,6 +665,12 @@ class NativeAttemptAccounting:
                 failure=failure,
                 finalize_request=finalize,
                 **settlement_metadata(data, self._finish_attempt),
+                **web_search_requests_kwarg(
+                    self._finish_attempt, web_search_requests_from_terminal(terminal)
+                ),
+                **tool_search_requests_kwarg(
+                    self._finish_attempt, tool_search_requests_from_terminal(terminal)
+                ),
             )
         except Exception as exc:  # noqa: BLE001 - the data plane retries.
             # The exact settlement is retained so a retry (from the data
@@ -965,6 +966,12 @@ class NativeAttemptAccounting:
                 failure=failure,
                 finalize_request=finalize,
                 **settlement_metadata(settlement, self._finish_attempt),
+                **web_search_requests_kwarg(
+                    self._finish_attempt, web_search_requests_from_terminal(terminal)
+                ),
+                **tool_search_requests_kwarg(
+                    self._finish_attempt, tool_search_requests_from_terminal(terminal)
+                ),
             )
         except Exception:  # noqa: BLE001 - keep the entry; the sweep retries.
             self._accounting_healthy = False

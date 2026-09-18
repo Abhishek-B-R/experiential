@@ -74,6 +74,8 @@ from exp.runtime.gateway.tool_contracts import (
 from exp.runtime.gateway.tool_contracts import (
     GatewayToolDefinition as GatewayToolDefinition,
 )
+from exp.runtime.gateway.tool_search.contracts import GatewayToolSearch
+from exp.runtime.gateway.web_search.contracts import GatewayWebSearch
 
 GatewayAliasName = ArtifactId
 OrganizationId = ArtifactId
@@ -146,25 +148,17 @@ class GatewayMessage(ContractModel):
     artifacts are unaffected by it.
     """
     provider_specific_fields: JsonObject | None = Field(default=None, exclude=True)
-    """LiteLLM's per-message ``provider_specific_fields`` bookkeeping, when echoed.
-
-    Accepted so a client that replays LiteLLM message dumps verbatim keeps
-    working; no provider wire takes the object, so admission always drops it
-    with a ``messages.provider_specific_fields`` disclosure. Excluded from
-    serialization like the other carried-but-never-forwarded message fields.
-    """
+    """LiteLLM's echoed per-message ``provider_specific_fields``: accepted so verbatim
+    replays keep working, dropped on every wire with a disclosure, excluded from
+    serialization like the other carried-but-never-forwarded message fields."""
     provider_reasoning: tuple[ProviderReasoningBlock, ...] = Field(default=(), exclude=True)
     """Ordered opaque provider-reasoning blocks carried on assistant turns.
 
-    Thinking and redacted-thinking blocks exist only on the Anthropic wire;
-    encrypted reasoning items exist only on the OpenAI Responses wire. Route
-    admission therefore requires every waterfall rung to speak the one
-    dialect that can replay them, mirroring ``tool_is_error``. Like that
-    flag, the carrier is excluded from model serialization so immutable
-    artifacts and carrier-free request digests are unperturbed; requests that
-    do carry it join replay identity through
-    :func:`canonical_request_sha256`, so a caller operation key reused with
-    different reasoning is a rejected conflict, never a silent replay.
+    Thinking blocks exist only on the Anthropic wire and encrypted reasoning
+    items only on OpenAI Responses, so route admission requires every rung to
+    speak the one dialect that can replay them (mirroring ``tool_is_error``).
+    Excluded from serialization; a present carrier joins replay identity, so a
+    reused operation key with different reasoning is a conflict, never a replay.
     """
     provider_item_id: str | None = Field(default=None, min_length=1, max_length=256, exclude=True)
     provider_output_index: int | None = Field(default=None, ge=0, exclude=True)
@@ -596,9 +590,7 @@ class GatewayRequest(ContractModel):
     """
     provider_native_tools: tuple[GatewayProviderNativeTool, ...] = Field(default=(), exclude=True)
     """Verbatim non-function OpenAI Responses tool declarations (see
-    :class:`GatewayProviderNativeTool`); excluded from serialization, present
-    entries join replay identity via ``canonical_request_sha256``.
-    """
+    :class:`GatewayProviderNativeTool`); excluded, join replay identity when present."""
     native_tool_translation: dict[str, tuple[str, str | None, bool]] | None = Field(
         default=None, exclude=True
     )
@@ -607,12 +599,16 @@ class GatewayRequest(ContractModel):
     """Verbatim Anthropic server-tool entries from the Messages ``tools`` array.
 
     Typed entries with no ``input_schema`` execute at the provider; validated
-    shallowly at decode and re-emitted byte-for-byte AFTER the converted custom
-    tools on native Anthropic rungs only. Other rungs cannot execute them, so
-    admission rejects by name. Excluded from serialization like the other
-    carriers; present entries join replay identity through
-    :func:`canonical_request_sha256`.
+    shallowly at decode, re-emitted byte-for-byte AFTER the converted custom tools
+    on native Anthropic rungs only (other rungs reject by name). Excluded from
+    serialization; present entries join replay identity (``canonical_request_sha256``).
     """
+    web_search: GatewayWebSearch | None = Field(default=None, exclude=True)
+    """The caller's normalized pre-answer web-search request (any spelling); excluded
+    from serialization, joins replay identity when present. See ``web_search.plan``."""
+    tool_search: GatewayToolSearch | None = Field(default=None, exclude=True)
+    """The caller's normalized tool-search declaration (any spelling); excluded from
+    serialization, joins replay identity when present. See ``tool_search.plan``."""
     # `provider: {"zdr": true}`: the caller demanded ZDR routing. Tightening
     # only: the host applies its require_zdr posture filter to this request and
     # refuses with the same 403 when no rung qualifies. Part of identity.
@@ -824,7 +820,14 @@ class GatewayRequest(ContractModel):
         if self.inference_geo is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("inference_geo is valid only for Messages requests")
         if (
-            any(tool.has_anthropic_tool_carriers() for tool in self.tools)
+            # defer_loading is also OpenAI's and OpenRouter's marker, so it is
+            # valid on every surface; the other carriers stay Anthropic-only.
+            any(
+                tool.eager_input_streaming is not None
+                or tool.allowed_callers is not None
+                or tool.input_examples is not None
+                for tool in self.tools
+            )
             and self.surface != GatewayApiSurface.MESSAGES
         ):
             raise ValueError("Anthropic tool carriers are valid only for Messages requests")
@@ -834,8 +837,11 @@ class GatewayRequest(ContractModel):
             raise ValueError("service_tier is not valid for Messages requests")
         if self.provider_server_tools and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_server_tools are valid only for Messages requests")
-        if self.provider_native_tools and self.surface != GatewayApiSurface.RESPONSES:
-            raise ValueError("provider_native_tools are valid only for Responses requests")
+        if self.provider_native_tools and self.surface not in {
+            GatewayApiSurface.RESPONSES,
+            GatewayApiSurface.CHAT_COMPLETIONS,
+        }:
+            raise ValueError("provider_native_tools are valid only for Responses and Chat requests")
         if self.provider_native_tools:
             # Positions must tile one tools array with the converted function
             # tools exactly, so native re-emission is total by construction.

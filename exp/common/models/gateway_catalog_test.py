@@ -60,41 +60,51 @@ def _minimal_normalized() -> NormalizedGatewayCatalog:
     return NormalizedGatewayCatalog(deployments=(deployment,), pools=(pool,))
 
 
-class _PreChainSchema4(ContractModel):
-    """Frozen top-level schema-4 reader shape before model-chain execution existed."""
+class _PreChainSchema5(ContractModel):
+    """Frozen current-main top-level reader shape without model-chain execution."""
 
-    schema_version: int = Field(default=4, ge=1)
+    schema_version: int = Field(default=5, ge=1)
     deployments: tuple[ExactModelDeployment, ...] = ()
     pools: tuple[ExactModelPool, ...] = ()
 
     def identity_sha256(self) -> Sha256:
-        """Reproduce the published schema-4 default-excluding identity contract."""
+        """Reproduce the current-main default-excluding identity contract."""
         return sha256_json(self.model_dump(mode="json", by_alias=True, exclude_defaults=True))
 
 
-def _read_pre_chain_schema4(data: str, digest: str) -> _PreChainSchema4:
-    """Exercise the pre-chain strict same-version and tolerant foreign-version decision."""
-    parsed, _dropped = load_forward_compatible(_PreChainSchema4, data)
-    if parsed.schema_version == 4 and parsed.identity_sha256() != digest:
+class _PreChainSchema4(_PreChainSchema5):
+    """Older stable reader uses tolerant parsing for schema-five documents."""
+
+    schema_version: int = Field(default=4, ge=1)
+
+
+def _read_pre_chain(data: str, digest: str, *, schema: int) -> _PreChainSchema5:
+    """Exercise each old reader's same-schema digest check and foreign-schema bypass."""
+    parsed, _dropped = load_forward_compatible(
+        _PreChainSchema5 if schema == 5 else _PreChainSchema4, data
+    )
+    if parsed.schema_version == schema and parsed.identity_sha256() != digest:
         raise CatalogSnapshotDigestError("catalog snapshot digest does not match pinned authority")
     return parsed
 
 
-def test_empty_model_chains_remain_compatible_with_pre_chain_schema4() -> None:
-    """Omitted and explicitly empty chain fields preserve old-reader digest identity."""
+def test_empty_model_chains_preserve_current_main_schema5_identity() -> None:
+    """Empty chains preserve current-main identity and older serving compatibility."""
     current = _minimal_normalized()
     for explicit in (False, True):
         document = current.model_dump(mode="json")
         if not explicit:
             document.pop("model_chains")
-        loaded = _read_pre_chain_schema4(json.dumps(document), current.identity_sha256())
-        assert loaded.deployments == current.deployments
-        assert loaded.pools == current.pools
-        assert loaded.identity_sha256() == current.identity_sha256()
+        for schema in (4, 5):
+            loaded = _read_pre_chain(json.dumps(document), current.identity_sha256(), schema=schema)
+            assert loaded.deployments == current.deployments
+            assert loaded.pools == current.pools
+            if schema == 5:
+                assert loaded.identity_sha256() == current.identity_sha256()
 
 
-def test_populated_chain_policy_is_not_silently_dropped_by_same_schema_old_reader() -> None:
-    """New policy requires an upgraded fleet; changing only the stamp would hide its loss."""
+def test_populated_chains_require_a_feature_floor_not_only_schema5() -> None:
+    """Current-main refuses lost policy, but schema-four workers require the host fleet fence."""
     plain = _minimal_normalized()
     policy = GatewayModelChain(
         model_id="exact-1",
@@ -105,12 +115,10 @@ def test_populated_chain_policy_is_not_silently_dropped_by_same_schema_old_reade
     )
     current = plain.model_copy(update={"model_chains": (policy,)})
     with pytest.raises(CatalogSnapshotDigestError):
-        _read_pre_chain_schema4(current.model_dump_json(), current.identity_sha256())
-    # A stamp-only bump would accept a deployment explicitly unavailable under
-    # the authored policy. It cannot be the remedy for new-feature activation.
-    document = current.model_dump(mode="json")
-    document["schema_version"] = 5
-    lost_policy = _read_pre_chain_schema4(json.dumps(document), current.identity_sha256())
+        _read_pre_chain(current.model_dump_json(), current.identity_sha256(), schema=5)
+    # Schema four treats five as foreign and silently drops the unavailable
+    # policy. Publishing chains to that fleet is unsafe even though main uses five.
+    lost_policy = _read_pre_chain(current.model_dump_json(), current.identity_sha256(), schema=4)
     assert lost_policy.deployments == plain.deployments
     assert "model_chains" not in type(lost_policy).model_fields
 
@@ -186,7 +194,7 @@ def test_read_pinned_snapshot_upgrades_schema_3_and_refuses_older_money_units() 
     time by version (see ``nano_usd_upgrade_test`` for the price twin pins);
     schema 1 and 2 are refused by name; a schema-4 document smuggling a micro
     key is refused. The refusal is its own error, never a digest mismatch."""
-    assert SNAPSHOT_SCHEMA_VERSION == 4
+    assert SNAPSHOT_SCHEMA_VERSION == 5
     assert FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION == 4
     micro: dict[str, Any] = json.loads(_minimal_normalized().model_dump_json())
     # The previous build wrote every price key under its micro name (nulls too).
@@ -310,7 +318,7 @@ def test_identity_digest_is_pinned_until_a_deliberate_schema_version_bump() -> N
     """
     normalized = normalize_gateway_catalog(_identity_fixture_catalog())
     assert (SNAPSHOT_SCHEMA_VERSION, normalized.identity_sha256()) == (
-        4,
+        5,
         "df22e497cb162814a54a4321963859fd1bc8499e8fdd68c1e35c7df6a1520f0e",
     )
 
@@ -344,6 +352,58 @@ def test_added_defaulted_fields_and_explicit_defaults_do_not_perturb_identity() 
     )
 
 
+def test_defaulted_cache_write_fields_do_not_perturb_identity_but_populated_ones_do() -> None:
+    """Defaulted cache-write fields stay identity-invisible; populated ones change the digest."""
+    # Defaulted cache-write pricing and capability stay excluded from identity.
+    assert (
+        GatewayDeploymentCapabilities(reports_cache_creation_input_tokens=False).model_dump(
+            mode="json", by_alias=True, exclude_defaults=True
+        )
+        == {}
+    )
+    assert GatewayTokenPrices().model_dump(mode="json", by_alias=True, exclude_defaults=True) == {}
+    assert GatewayLongContextTier(input_threshold_tokens=200_000).model_dump(
+        mode="json", by_alias=True, exclude_defaults=True
+    ) == {"input_threshold_tokens": 200000}
+
+    base = _identity_fixture_catalog()
+    base_digest = normalize_gateway_catalog(base).identity_sha256()
+
+    # Populated cache-write pricing changes the deployment digest and thus the catalog identity.
+    priced = base.model_copy(deep=True)
+    priced.models["bare"] = priced.models["bare"].model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                prices=GatewayTokenPrices(
+                    cache_creation_input_nano_usd_per_million_tokens=3_750_000,
+                    long_context=GatewayLongContextTier(
+                        input_threshold_tokens=200_000,
+                        cache_creation_input_nano_usd_per_million_tokens=3_000_000,
+                    ),
+                ),
+                capabilities=GatewayDeploymentCapabilities(
+                    reports_cache_creation_input_tokens=True
+                ),
+            )
+        }
+    )
+    assert normalize_gateway_catalog(priced).identity_sha256() != base_digest
+
+    # Explicit defaults still hash identically to leaving them unset.
+    explicit = base.model_copy(deep=True)
+    explicit.models["bare"] = explicit.models["bare"].model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                prices=GatewayTokenPrices(cache_creation_input_nano_usd_per_million_tokens=None),
+                capabilities=GatewayDeploymentCapabilities(
+                    reports_cache_creation_input_tokens=False
+                ),
+            )
+        }
+    )
+    assert normalize_gateway_catalog(explicit).identity_sha256() == base_digest
+
+
 def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
     """Anti-regression change-detector for the roll-safety contract.
 
@@ -365,7 +425,7 @@ def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
         "pool": sorted(ExactModelPool.model_fields),
     }
     assert fingerprint == {
-        "schema_version": 4,
+        "schema_version": 5,
         "normalized": ["deployments", "model_chains", "pools", "schema_version"],
         "deployment": [
             "billing_source",

@@ -44,6 +44,7 @@ from exp.runtime.gateway.reasoning_carrier import ReasoningCarrierAuthority
 from exp.runtime.gateway.recovery import FrozenRecoveryBinding
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.rung_admission import RungLoadKey
+from exp.runtime.gateway.tool_search.plan import ToolSearchState
 from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -205,12 +206,9 @@ class InflightRequest:
     signers: tuple[GatewayDispatchSigner | None, ...] = ()
     dispatch_bindings: tuple[FrozenDispatchBinding | None, ...] = ()
     reasoning_carrier_authorities: tuple[ReasoningCarrierAuthority | None, ...] = ()
-    # Whether each route depth actually FORWARDS the requested service tier to
-    # its provider (``GatewayWireProfile.forwards_tier``), captured at admission
-    # where the resolved wire profiles exist. The accounting reprice gates on
-    # this so it applies the per-tier card ONLY on a depth that emits the tier —
-    # forward and bill stay consistent even if a card sits on a lane that would
-    # strip it. Empty on surfaces without a service tier (images, embeddings).
+    # Whether each route depth FORWARDS the requested service tier to its provider
+    # (``GatewayWireProfile.forwards_tier``), so the reprice applies the per-tier
+    # card only on a depth that emits the tier. Empty on tier-less surfaces.
     tier_forwarded_by_depth: tuple[bool, ...] = ()
     # The request's tenant-isolated affinity fingerprint on a
     # ``maximize_cache_affinity`` pool (None elsewhere), captured at admission
@@ -235,6 +233,12 @@ class InflightRequest:
     recovery_reason: str | None = None
     overflow_used: bool = False
     denied_destination_pools: set[str] = field(default_factory=set)
+    # Rebuild material for gateway tool-search rounds: the admitted wires and
+    # the public request ``build_rung_dispatch`` needs again, plus the search
+    # state; ``None`` on requests the gateway runs no tool search for.
+    resolved_wires: tuple[tuple[GatewayWireProfile, NativeWireClient], ...] | None = None
+    public_request: GatewayRequest | None = None
+    tool_search: ToolSearchState | None = None
 
     def __post_init__(self) -> None:
         """Size the per-deployment attempt counters to the frozen route."""

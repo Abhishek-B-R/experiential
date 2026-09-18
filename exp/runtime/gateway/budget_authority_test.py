@@ -106,7 +106,7 @@ def test_budget_snapshot_authority_rejects_unverified_semantics(
     assert budgets.limits(organization_id="org", period="2026-08") == ()
 
 
-@pytest.mark.parametrize("version", [1, 3, 5, 10_001])
+@pytest.mark.parametrize("version", [1, 3, 4, 6, 10_001])
 def test_budget_snapshot_rejects_other_schemas_even_with_matching_parsed_identity(
     tmp_path: Path, version: int
 ) -> None:
@@ -125,7 +125,7 @@ def test_budget_snapshot_accepts_supported_schema_with_full_defaults(tmp_path: P
     (tmp_path / "snapshot").write_bytes(canonical_json_bytes(raw))
     loaded = read_budget_snapshot(tmp_path / "gateway.db", "snapshot", catalog.identity_sha256())
     assert loaded == catalog
-    assert loaded.schema_version == 4
+    assert loaded.schema_version == 5
 
 
 def test_pinned_graph_file_resource_override_and_reachable_authority(tmp_path: Path) -> None:

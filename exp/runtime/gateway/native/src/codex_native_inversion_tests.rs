@@ -1,6 +1,7 @@
 //! Actual relay and Responses encoder coverage for translated native tools.
 
 use super::*;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -276,7 +277,7 @@ async fn suppressed_custom_deltas_still_obey_the_normalizer_byte_bound() {
 #[test]
 fn native_custom_events_remain_incremental_with_an_empty_mapping() {
     use crate::events::{CompletedToolCall, ProviderOutputItemKind, ProviderOutputItemStatus};
-    let mut inversion = NativeToolInversion::default();
+    let mut inversion = NativeToolInverter::default();
     let mut encoder = ResponsesSseEncoder::new("r", "alias", 1, ResponsesEnvelope::default());
     encoder.start().unwrap();
     let mut ready = VecDeque::new();
@@ -328,7 +329,7 @@ fn native_custom_events_remain_incremental_with_an_empty_mapping() {
     ];
     let mut encoded = Vec::new();
     for event in events {
-        inversion.push(event, &mut ready).unwrap();
+        ready.extend(inversion.filter(event).unwrap());
         assert_eq!(ready.len(), 1);
         encoded.extend(encoder.feed(&ready.pop_front().unwrap()).unwrap());
     }
@@ -341,118 +342,4 @@ fn native_custom_events_remain_incremental_with_an_empty_mapping() {
     assert_eq!(deltas[0]["delta"], "not ");
     assert_eq!(deltas[1]["delta"], "JSON 😀");
     assert_eq!(deltas[0]["item_id"], "ctc-native");
-}
-
-fn started(index: u32, name: &str) -> Event {
-    Event::ToolCallStarted {
-        index,
-        call_id: "call-1".into(),
-        name: name.into(),
-        namespace: None,
-        caller: None,
-        custom: false,
-    }
-}
-
-fn completed(index: u32, name: &str, arguments: &str) -> Event {
-    Event::ToolCallCompleted {
-        index,
-        call: crate::events::CompletedToolCall {
-            call_id: "call-1".into(),
-            name: name.into(),
-            namespace: None,
-            caller: None,
-            provider_item_id: None,
-            provider_status: None,
-            raw_arguments: arguments.into(),
-            custom: false,
-        },
-    }
-}
-
-#[test]
-fn namespaced_started_regains_its_namespace_and_name() {
-    let mut inverse = NativeToolInversion::new(translation());
-    let mut ready = VecDeque::new();
-    inverse
-        .push(started(0, "agents__close"), &mut ready)
-        .unwrap();
-    assert!(
-        matches!(ready.pop_front().unwrap(),Event::ToolCallStarted{name,namespace,custom:false,..} if name=="close" && namespace.as_deref()==Some("agents"))
-    );
-}
-
-#[test]
-fn namespaced_completed_regains_name_and_namespace_and_stays_a_function() {
-    let mut inverse = NativeToolInversion::new(translation());
-    let mut ready = VecDeque::new();
-    inverse
-        .push(completed(0, "agents__close", "{\"id\":\"a\"}"), &mut ready)
-        .unwrap();
-    assert!(
-        matches!(ready.pop_front().unwrap(),Event::ToolCallCompleted{call,..} if call.name=="close" && call.namespace.as_deref()==Some("agents") && !call.custom && call.raw_arguments=="{\"id\":\"a\"}")
-    );
-}
-
-#[test]
-fn custom_completed_unwraps_input_and_becomes_custom() {
-    let mut inverse = NativeToolInversion::new(translation());
-    let mut ready = VecDeque::new();
-    inverse.push(started(0, "apply_patch"), &mut ready).unwrap();
-    ready.clear();
-    inverse
-        .push(
-            completed(
-                0,
-                "apply_patch",
-                "{\"input\":\"*** Begin Patch\\n*** End Patch\"}",
-            ),
-            &mut ready,
-        )
-        .unwrap();
-    assert!(
-        matches!(ready.pop_front().unwrap(),Event::ToolArgumentsDelta{delta,..} if delta=="*** Begin Patch\n*** End Patch")
-    );
-    assert!(
-        matches!(ready.pop_front().unwrap(),Event::ToolCallCompleted{call,..} if call.custom && call.raw_arguments=="*** Begin Patch\n*** End Patch")
-    );
-}
-
-#[test]
-fn custom_completed_with_malformed_arguments_fails_instead_of_passing_wrapper_bytes() {
-    let mut inverse = NativeToolInversion::new(translation());
-    let mut ready = VecDeque::new();
-    inverse.push(started(0, "apply_patch"), &mut ready).unwrap();
-    ready.clear();
-    assert!(inverse
-        .push(completed(0, "apply_patch", "not json at all"), &mut ready)
-        .is_err());
-    assert!(ready.is_empty());
-}
-
-#[test]
-fn unmapped_tool_call_is_untouched() {
-    let mut inverse = NativeToolInversion::new(translation());
-    let mut ready = VecDeque::new();
-    inverse
-        .push(
-            completed(0, "exec_command", "{\"cmd\":[\"ls\"]}"),
-            &mut ready,
-        )
-        .unwrap();
-    assert!(
-        matches!(ready.pop_front().unwrap(),Event::ToolCallCompleted{call,..} if call.name=="exec_command" && !call.custom && call.raw_arguments=="{\"cmd\":[\"ls\"]}")
-    );
-}
-
-#[test]
-fn empty_translation_is_a_no_op() {
-    let mut inverse = NativeToolInversion::default();
-    let mut ready = VecDeque::new();
-    inverse
-        .push(completed(0, "apply_patch", "{\"input\":\"x\"}"), &mut ready)
-        .unwrap();
-    assert!(
-        matches!(ready.pop_front().unwrap(),Event::ToolCallCompleted{call,..} if call.name=="apply_patch" && !call.custom && call.raw_arguments=="{\"input\":\"x\"}")
-    );
 }

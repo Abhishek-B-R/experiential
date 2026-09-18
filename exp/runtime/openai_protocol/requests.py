@@ -72,7 +72,13 @@ from exp.runtime.openai_protocol.structured_text import (
     chat_structured_text,
     responses_structured_text,
 )
+from exp.runtime.openai_protocol.tool_search import chat_tool_search, responses_tool_search
 from exp.runtime.openai_protocol.validation_errors import validation_protocol_error
+from exp.runtime.openai_protocol.web_search import (
+    chat_web_search,
+    responses_web_search,
+    split_online_suffix,
+)
 from exp.runtime.openai_protocol.wire_models import (
     HOSTED_TOOL_ITEM_TYPES_TOOL,
     _AdditionalToolsItem,
@@ -228,9 +234,10 @@ def decode_chat(
     _validate_official(
         _CHAT_OFFICIAL,
         _without_chat_message_extensions(payload),
-        extension_fields={"top_k", "reasoning_effort", "enable_thinking", "provider"},
+        extension_fields={"top_k", "reasoning_effort", "enable_thinking", "provider", "plugins"},
     )
     request = _validate_wire(_ChatRequest, payload)
+    alias, online_suffix = split_online_suffix(request.model)
     idempotency_key, client_request_id = _validated_operation_headers(
         idempotency_key, client_request_id
     )
@@ -243,6 +250,12 @@ def decode_chat(
         else request.stop
     )
     thinking = translate_enable_thinking(request)
+    raw_chat_tools = payload.get("tools")
+    chat_native_tools = tuple(
+        GatewayProviderNativeTool(index=index, tool=cast("JsonObject", raw_chat_tools[index]))
+        for index, tool in enumerate(request.tools)
+        if tool.type != "function" and isinstance(raw_chat_tools, list)
+    )
     messages, cache_disclosures = restore_chat_cache_control(
         _messages(request.messages, "messages"), cache_payload
     )
@@ -250,7 +263,9 @@ def decode_chat(
         canonical = GatewayRequest(
             surface=GatewayApiSurface.CHAT_COMPLETIONS,
             messages=messages,
-            tools=tuple(_chat_tool(tool) for tool in request.tools),
+            tools=tuple(_chat_tool(tool) for tool in request.tools if tool.type == "function"),
+            provider_native_tools=chat_native_tools,
+            tool_search=chat_tool_search(chat_native_tools),
             tool_choice=_chat_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=chat_structured_text(request.response_format),
@@ -263,6 +278,11 @@ def decode_chat(
             ),
             zdr_requested=request.provider is not None and request.provider.demands_zdr,
             provider_preferences=_provider_preferences(payload, request.provider),
+            web_search=chat_web_search(
+                options=request.web_search_options,
+                plugins=request.plugins,
+                online_suffix=online_suffix,
+            ),
             maximum_output_tokens=maximum,
             maximum_output_tokens_parameter=(
                 "max_completion_tokens"
@@ -296,7 +316,7 @@ def decode_chat(
         )
     except ValidationError as exc:
         raise validation_protocol_error(exc) from exc
-    return DecodedGatewayRequest(alias=request.model, request=canonical)
+    return DecodedGatewayRequest(alias=alias, request=canonical)
 
 
 def decode_embeddings(payload: JsonObject) -> DecodedEmbeddingsRequest:
@@ -355,6 +375,7 @@ def decode_responses(
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
     request = _validate_wire(_ResponsesRequest, payload)
+    alias, online_suffix = split_online_suffix(request.model)
     require_responses_input(request)
     if not isinstance(request.input, str):
         for item_index, item in enumerate(request.input):
@@ -409,6 +430,8 @@ def decode_responses(
             messages=tuple(messages),
             tools=tuple(function_tools),
             provider_native_tools=tuple(native_tools),
+            web_search=responses_web_search(native_tools, online_suffix=online_suffix),
+            tool_search=responses_tool_search(native_tools),
             tool_choice=_responses_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=responses_structured_text(request.text),
@@ -493,7 +516,7 @@ def decode_responses(
         if developer_index is not None:
             developer_messages_param = f"input.{developer_index}.role"
     return DecodedGatewayRequest(
-        alias=request.model,
+        alias=alias,
         request=canonical,
         developer_messages_param=developer_messages_param,
     )
@@ -694,11 +717,13 @@ def _tool_call(call: _AssistantToolCall, param: str) -> ToolCall:
 
 def _chat_tool(tool: _ChatTool) -> GatewayToolDefinition:
     """Convert one Chat function tool without weakening strictness."""
+    assert tool.function is not None  # the wire validator pairs type and body
     return GatewayToolDefinition(
         name=tool.function.name,
         description=tool.function.description,
         parameters=tool.function.parameters,
         strict=tool.function.strict,
+        defer_loading=tool.defer_loading,
     )
 
 
@@ -709,6 +734,7 @@ def _response_tool(tool: _ResponseTool) -> GatewayToolDefinition:
         description=tool.description,
         parameters=tool.parameters,
         strict=bool(tool.strict),
+        defer_loading=tool.defer_loading,
     )
 
 

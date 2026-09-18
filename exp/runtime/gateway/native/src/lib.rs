@@ -41,9 +41,11 @@ mod sse;
 mod stop_sequences;
 mod stream_errors;
 mod throttle_backoff;
+mod tool_search;
 mod tool_serialization;
 mod upstream;
 mod waterfall;
+mod web_search;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -588,6 +590,9 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
             "usage" => events::Event::Usage(events::Usage {
                 input_tokens: object
                     .get("input_tokens")
+                    .and_then(serde_json::Value::as_u64),
+                cache_creation_1h_input_tokens: object
+                    .get("cache_creation_1h_input_tokens")
                     .and_then(serde_json::Value::as_u64),
                 cache_creation_input_tokens: object
                     .get("cache_creation_input_tokens")
