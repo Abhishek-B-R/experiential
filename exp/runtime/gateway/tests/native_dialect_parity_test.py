@@ -467,6 +467,7 @@ BEDROCK_GOLDEN_EVENTS: tuple[JsonObject, ...] = (
         "output_tokens": 4,
         "cached_input_tokens": 2,
         "reasoning_tokens": None,
+        "cache_creation_input_tokens": 1,
     },
     {"kind": "completed"},
 )

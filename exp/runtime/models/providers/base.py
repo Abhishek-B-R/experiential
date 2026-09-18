@@ -154,6 +154,16 @@ class GatewayWireProfile:
     reaches the provider there.
     """
 
+    forwards_cache_control: bool = False
+    """Whether this Chat adapter accepts explicit Anthropic cache markers."""
+
+    @property
+    def preserves_cache_control(self) -> bool:
+        """Whether this adapter can carry or translate explicit cache checkpoints."""
+        return self.dialect in {"anthropic_messages", "bedrock_converse_stream"} or (
+            self.dialect == "openai_compatible" and self.forwards_cache_control
+        )
+
     minimum_temperature: float = 0.0
     """Smallest temperature value accepted by this provider wire."""
 

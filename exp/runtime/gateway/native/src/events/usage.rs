@@ -138,16 +138,13 @@ pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
         total_tokens,
         "OpenAI output",
     )?;
+    let (cached_input_tokens, cache_creation_input_tokens) =
+        cache_subsets(object, "input_tokens_details", input_tokens)?;
     Ok(Some(Usage {
         input_tokens: Some(input_tokens),
         output_tokens: Some(output_tokens),
-        cached_input_tokens: optional_usage_detail(
-            object,
-            "input_tokens_details",
-            "cached_tokens",
-            "OpenAI cached_tokens",
-        )?,
-        cache_creation_input_tokens: None,
+        cached_input_tokens,
+        cache_creation_input_tokens,
         reasoning_tokens,
     }))
 }
@@ -176,18 +173,36 @@ pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
         total_tokens,
         "OpenAI-compatible output",
     )?;
+    let (cached_input_tokens, cache_creation_input_tokens) =
+        cache_subsets(object, "prompt_tokens_details", input_tokens)?;
     Ok(Usage {
         input_tokens: Some(input_tokens),
         output_tokens: Some(output_tokens),
-        cached_input_tokens: optional_usage_detail(
-            object,
-            "prompt_tokens_details",
-            "cached_tokens",
-            "cached_tokens",
-        )?,
-        cache_creation_input_tokens: None,
+        cached_input_tokens,
+        cache_creation_input_tokens,
         reasoning_tokens,
     })
+}
+
+/// Cache reads and writes are disjoint subsets of OpenAI-shaped total input.
+fn cache_subsets(
+    object: &Map<String, Value>,
+    detail_key: &str,
+    input_tokens: u64,
+) -> Result<(Option<u64>, Option<u64>), String> {
+    let reads = optional_usage_detail(object, detail_key, "cached_tokens", "cached_tokens")?;
+    let writes = optional_usage_detail(
+        object,
+        detail_key,
+        "cache_write_tokens",
+        "cache_write_tokens",
+    )?;
+    if bounded_ledger_sum(&[reads.unwrap_or(0), writes.unwrap_or(0)], "cache subsets")?
+        > input_tokens
+    {
+        return Err("cache read and write tokens exceed total input tokens".to_string());
+    }
+    Ok((reads, writes))
 }
 
 /// Parse Gemini `usageMetadata`: cached tokens are an input subset, absent
@@ -268,7 +283,11 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
             "Bedrock outputTokens",
         )?),
         cached_input_tokens: Some(cache_read),
-        cache_creation_input_tokens: None,
+        cache_creation_input_tokens: count_if_present(
+            usage,
+            "cacheWriteInputTokens",
+            "Bedrock usage",
+        )?,
         reasoning_tokens: None,
     })
 }

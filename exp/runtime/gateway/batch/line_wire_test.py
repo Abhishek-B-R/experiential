@@ -209,7 +209,7 @@ def test_message_result_renders_as_a_chat_completion_with_cached_usage() -> None
         "prompt_tokens": 4516,
         "completion_tokens": 4,
         "total_tokens": 4520,
-        "prompt_tokens_details": {"cached_tokens": 0},
+        "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 4501},
         "completion_tokens_details": None,
     }
 

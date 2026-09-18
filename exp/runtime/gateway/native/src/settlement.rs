@@ -101,6 +101,7 @@ fn settle_argument(
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
             "cached_input_tokens": usage.cached_input_tokens,
+            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
             "reasoning_tokens": usage.reasoning_tokens,
         })),
         "tool_names": tool_names,
@@ -512,6 +513,32 @@ mod tests {
             system_time_to_rfc3339(leap),
             "2020-02-29T00:00:00.000+00:00"
         );
+    }
+
+    #[test]
+    fn settle_argument_retains_cache_write_counts_and_unknowns() {
+        for count in [None, Some(0), Some(6108)] {
+            let usage = Usage {
+                input_tokens: Some(6119),
+                cache_creation_input_tokens: count,
+                ..Usage::default()
+            };
+            let argument = settle_argument(
+                "req",
+                "att",
+                "completed",
+                Some(&usage),
+                &[],
+                None,
+                true,
+                true,
+                None,
+                None,
+                None,
+            );
+            let parsed: Value = serde_json::from_str(&argument).expect("valid json");
+            assert_eq!(parsed["usage"]["cache_creation_input_tokens"], json!(count));
+        }
     }
 
     #[test]

@@ -626,7 +626,7 @@ def _assert_no_cache_control(decoded: DecodedGatewayRequest) -> None:
         assert "cache_control" not in message.model_dump(mode="json")
 
 
-def test_chat_decoder_drops_opencode_message_cache_control() -> None:
+def test_chat_decoder_retains_opencode_message_cache_control() -> None:
     """OpenCode Chat Completions annotate messages with Anthropic cache_control.
 
     The live failure is Invalid value for 'messages.0.cache_control' because the
@@ -673,7 +673,7 @@ def test_chat_decoder_drops_opencode_message_cache_control() -> None:
     _assert_no_cache_control(decoded)
 
 
-def test_chat_decoder_drops_opencode_text_part_cache_control() -> None:
+def test_chat_decoder_retains_opencode_text_part_cache_control() -> None:
     """OpenCode openai-compatible conversion can put cache_control on text parts.
 
     applyCaching marks the last content part, and @ai-sdk/openai-compatible
@@ -1717,8 +1717,8 @@ def test_every_chat_cache_control_placement_follows_its_classified_decision() ->
     from exp.runtime.openai_protocol.manifest import CHAT_CACHE_CONTROL_PLACEMENTS
 
     assert CHAT_CACHE_CONTROL_PLACEMENTS == {
-        "messages": "validated_and_dropped",
-        "messages.content": "validated_and_dropped",
+        "messages": "validated_and_forwarded_to_cache_capable_adapters",
+        "messages.content": "validated_and_forwarded_to_cache_capable_adapters",
         "messages.tool_calls": "validated_and_forwarded_to_anthropic_tool_use",
     }
     decoded = decode_chat(
@@ -1761,7 +1761,11 @@ def test_every_chat_cache_control_placement_follows_its_classified_decision() ->
     calls = decoded.request.messages[1].tool_calls
     assert calls[0].cache_control is None
     assert calls[1].cache_control == {"type": "ephemeral"}
-    # Message- and part-level hints stay validated-and-dropped.
+    assert decoded.request.messages[0].provider_text_blocks[-1]["cache_control"] == {
+        "type": "ephemeral",
+        "ttl": "5m",
+    }
+    # Cache metadata stays outside content serialization.
     assert "cache_control" not in decoded.request.messages[0].model_dump(mode="json")
 
     with pytest.raises(OpenAIProtocolError) as raised:
