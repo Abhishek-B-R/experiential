@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -24,13 +25,13 @@ _FUNCTION = {
     "strict": False,
     "parameters": {"type": "object", "properties": {}},
 }
-_CUSTOM = {
+_CUSTOM: JsonObject = {
     "type": "custom",
     "name": "apply_patch",
     "description": "Use the `apply_patch` tool to edit files.",
     "format": {"type": "grammar", "syntax": "lark", "definition": "start: x"},
 }
-_NAMESPACE = {
+_NAMESPACE: JsonObject = {
     "type": "namespace",
     "name": "multi_agent_v1",
     "description": "Tools for spawning and managing sub-agents.",
@@ -44,8 +45,8 @@ _NAMESPACE = {
         }
     ],
 }
-_WEB_SEARCH = {"type": "web_search", "external_web_access": False}
-_TOOL_SEARCH = {
+_WEB_SEARCH: JsonObject = {"type": "web_search", "external_web_access": False}
+_TOOL_SEARCH: JsonObject = {
     "type": "tool_search",
     "description": "Search for additional tools.",
     "parameters": {"type": "object", "properties": {}},
@@ -53,9 +54,18 @@ _TOOL_SEARCH = {
 }
 
 
-def _request(**kwargs: object) -> GatewayRequest:
-    kwargs.setdefault("messages", (GatewayMessage(role="user", content="hi"),))
-    return GatewayRequest(surface=GatewayApiSurface.RESPONSES, **kwargs)
+def _request(
+    *,
+    tools: tuple[GatewayToolDefinition, ...] = (),
+    provider_native_tools: tuple[GatewayProviderNativeTool, ...] = (),
+    messages: tuple[GatewayMessage, ...] | None = None,
+) -> GatewayRequest:
+    return GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=messages if messages is not None else (GatewayMessage(role="user", content="hi"),),
+        tools=tools,
+        provider_native_tools=provider_native_tools,
+    )
 
 
 def test_translate_hoists_functions_converts_custom_drops_hosted() -> None:
