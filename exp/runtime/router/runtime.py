@@ -121,6 +121,26 @@ class RouterRuntime:
         decision_ttl_seconds: float = 24 * 60 * 60,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        """Validate and activate the frozen policy, bank, catalog, and pricing identity.
+
+        Args:
+            policy: Frozen router policy used for model selection.
+            manifest: Bank manifest bound to the policy.
+            bank: Evidence bank used to embed and route requests.
+            catalog: Runtime catalog resolving the policy's model aliases.
+            pricing_snapshot_id: Pricing artifact identity authorized for activation.
+            pricing_snapshot_sha256: Digest of the authorized pricing artifact.
+            pricing_candidate_aliases: Candidate order frozen during pricing.
+            pricing_candidate_prices: Optional prices matching the candidate order.
+            decision_sink: Optional recorder for emitted routing decisions.
+            decision_capacity: Maximum retained decisions per identity scope.
+            decision_ttl_seconds: Retention period for cached decisions.
+            clock: Monotonic clock used for decision expiration.
+
+        Raises:
+            ValueError: A decision capacity or retention period is not positive.
+            RouterRuntimeIntegrityError: Frozen runtime identities cannot be activated.
+        """
         if decision_capacity < 1 or decision_ttl_seconds <= 0:
             raise ValueError("router decision bounds must be positive")
         self.policy = policy
