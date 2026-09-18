@@ -460,8 +460,10 @@ month. Management and remaining-allocation reports are CLI surfaces only. There 
 dashboard.
 
 Normalized usage follows OpenAI subset semantics on every wire: `reasoning_tokens` counts a subset
-of `output_tokens` and `cached_input_tokens` a subset of `input_tokens`, and settlement prices the
-subset at its own rate and the remainder at the base rate. Wires that report reasoning outside
+of `output_tokens`; cache reads and writes are disjoint subsets of `input_tokens`.
+`cache_creation_input_tokens` crosses the hosted settlement callback; Chat exposes it as
+`prompt_tokens_details.cache_write_tokens`. Hosted settlement prices each observed subset at
+its own rate; the local SQLite cost estimate still lacks a separate cache-write rate. Wires that report reasoning outside
 their output total are folded by the native usage mappers before the counts leave the data plane:
 Gemini `thoughtsTokenCount` is additive by Google's definition and always folds into
 `output_tokens`; on the OpenAI-shaped wires (Chat Completions and Responses) the provider's own
@@ -549,24 +551,18 @@ budget under Anthropic's 1024 minimum is only a depth hint and is carried), requ
 `max_tokens` (a ceiling under 1024 with no reasoning signal of the caller's own, on a route whose
 every rung reasons by default and offers a `none` tier, dispatches at `reasoning_effort: none`
 disclosed as `reasoning_effort->none(max_tokens_headroom)`, so the reply is text rather than
-thinking cut off at the ceiling), validates `cache_control` (carrying it everywhere the Anthropic wire caches
-natively: `tool_use` blocks, tool definitions, the top-level automatic marker, and block-level
-markers on system and message text runs and on `tool_result` breakpoints all forward verbatim.
-Marked runs re-emit the caller's exact block structure while the flattened string stays the
-canonical content for every other wire and for digests; markerless payloads stay byte-identical.
-This is what makes Claude Code sessions cacheable at all: it marks its system blocks and
-conversation breakpoints on every request, and flattening them once billed whole sessions
-uncached at ~10x. Responses report both cache legs back out of the folded ledger total, so
-callers see `cache_creation_input_tokens` on the writing turn and `cache_read_input_tokens` on
-later turns. Routes with no Anthropic rung have no field for the markers and disclose them as
-`<path>.cache_control->not_forwarded(provider_decides_caching; cache reads reported in
-usage.cache_read_input_tokens)`: the wording never says "ignored", never claims caching is on or
-off (OpenAI-family and most OpenAI-compatible providers cache the prefix implicitly, without
-breakpoints, and the ledger bills those reads at the cached rate; a generic endpoint may never
-cache), and names where whatever the provider does shows up, because the disclosure rides in
-`x-experiential-ignored-parameters` and a bare "not forwarded" beside a billed cache read was
-read as "caching is ignored" (Harbor, 2026-09-11: `cache_read_input_tokens: 256` on a Tencent
-rung under the old wording; a provider that never caches reports the leg as 0),
+thinking cut off at the ceiling), and validates `cache_control`. Both Messages and Chat
+Completions retain message/text breakpoints on canonical carriers. Anthropic (including Claude
+on Azure Foundry) forwards them, Bedrock translates them into `cachePoint` blocks, and OpenRouter
+forwards them on its Chat wire. Generic Chat adapters disclose marker omission in
+`x-experiential-ignored-parameters`; a provider label or cached price does not prove support.
+`maximize_cache` prefers marker-preserving adapters but may fall back to another provider or
+an adapter that drops markers; it is not a cache-capability requirement or hit guarantee.
+Cache markers retain their requested TTL. Gateway reservations require the corresponding
+five-minute or one-hour price; settlement uses provider-observed TTL counts, never the request
+marker. Missing rates or incomplete TTL evidence remain unknown rather than using another rate.
+Responses expose observed cache reads and writes; absent write counts remain unknown.
+The decoder also
 carries the provider-native tool annotations (`strict`,
 `eager_input_streaming`, `defer_loading`, `allowed_callers`, `input_examples`; each accepted
 bare by the live API, verified 2026-08-30) and `inference_geo` verbatim on Anthropic rungs with

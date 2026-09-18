@@ -37,6 +37,7 @@ from exp.runtime.gateway.reasoning_carrier import (
 from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.cache_control import (
     drop_opencode_cache_control,
+    restore_chat_cache_control,
 )
 from exp.runtime.openai_protocol.enable_thinking import translate_enable_thinking
 from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
@@ -202,8 +203,8 @@ def decode_chat(
 
     OpenCode may attach an Anthropic-style ``cache_control`` annotation on
     Chat messages and on text content parts. Supported ephemeral forms are
-    validated and removed before official OpenAI validation and before
-    canonical conversion. Other unknown nested fields stay rejected. The
+    validated outside official OpenAI validation and retained on canonical
+    cache carriers for adapters that support them. Other unknown nested fields stay rejected. The
     Vercel AI SDK's camelCase ``promptCacheKey`` is folded onto
     ``prompt_cache_key`` first, so it decodes as the documented wire field.
 
@@ -219,6 +220,7 @@ def decode_chat(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
     payload, alias_disclosures = fold_prompt_cache_key_alias(payload)
+    cache_payload = payload
     payload = drop_opencode_cache_control(payload)
     _validate_manifest(payload, CHAT_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
@@ -241,10 +243,13 @@ def decode_chat(
         else request.stop
     )
     thinking = translate_enable_thinking(request)
+    messages, cache_disclosures = restore_chat_cache_control(
+        _messages(request.messages, "messages"), cache_payload
+    )
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.CHAT_COMPLETIONS,
-            messages=_messages(request.messages, "messages"),
+            messages=messages,
             tools=tuple(_chat_tool(tool) for tool in request.tools),
             tool_choice=_chat_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
@@ -252,6 +257,7 @@ def decode_chat(
             json_object_output=chat_json_object_output(request.response_format),
             ignored_parameters=(
                 *alias_disclosures,
+                *cache_disclosures,
                 *thinking.disclosures,
                 *_replayed_reasoning_disclosures(request.messages),
             ),

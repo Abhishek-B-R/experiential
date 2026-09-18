@@ -227,5 +227,6 @@ def dialect_stream_payload(
             system_messages_leading_only=profile.system_messages_leading_only,
             forwards_service_tier=profile.forwards_tier(provider_request.service_tier),
             forwards_prompt_cache_key=profile.forwards_prompt_cache_key,
+            forwards_cache_control=profile.forwards_cache_control,
         )
     raise ProviderCapabilityError(capability=f"wire_dialect:{profile.dialect}")

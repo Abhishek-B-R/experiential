@@ -46,6 +46,7 @@ from exp.runtime.gateway.rung_admission import RungLoadKey
 from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.cache_policy import cache_markers
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 
@@ -763,22 +764,8 @@ def select_route_deployments(
 
 
 def request_carries_cache_markers(request: GatewayRequest) -> bool:
-    """Whether any prompt-cache marker rides this request.
-
-    Markers live on the top-level automatic carrier, tool definitions,
-    assistant tool calls, message text runs, and tool-result breakpoints;
-    every one of them is honored only by the Anthropic Messages wire.
-    """
-    return (
-        request.provider_cache_control is not None
-        or any(tool.cache_control is not None for tool in request.tools)
-        or any(
-            message.provider_text_blocks
-            or message.cache_control is not None
-            or any(call.cache_control is not None for call in message.tool_calls)
-            for message in request.messages
-        )
-    )
+    """Whether a supported text, media, tool, or automatic marker rides the request."""
+    return bool(cache_markers(request))
 
 
 def reorder_route_deployments(
@@ -831,6 +818,7 @@ def deployment_wire_entry(
     serialize_tool_calls: bool = False,
     throttle_redial_budget: int = 0,
     zdr_constrained: bool = False,
+    native_tool_translation: Mapping[str, tuple[str, str | None, bool]] | None = None,
 ) -> JsonObject:
     """Build one deployment's wire configuration for the admitted route.
 
@@ -891,6 +879,13 @@ def deployment_wire_entry(
         # whose payload already carries the caller's stop field.
         "stop_sequences": list(stop_sequences),
         "serialize_tool_calls": serialize_tool_calls,
+        # Codex native tools translated to function tools on a foreign wire;
+        # the data plane inverts the tool-call responses back to the native
+        # (namespaced / custom) shape the caller declared. Empty on native
+        # Responses routes and every non-Codex request.
+        "native_tool_translation": {
+            mangled: list(origin) for mangled, origin in (native_tool_translation or {}).items()
+        },
         # An image-emitting lane (the platform projects `emits_images` from the
         # model's output modalities): the data plane answers an empty
         # completion there at once instead of redialing a second whole image.

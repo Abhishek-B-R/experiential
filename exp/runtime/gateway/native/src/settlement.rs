@@ -517,6 +517,32 @@ mod tests {
     }
 
     #[test]
+    fn settle_argument_retains_cache_write_counts_and_unknowns() {
+        for count in [None, Some(0), Some(6108)] {
+            let usage = Usage {
+                input_tokens: Some(6119),
+                cache_creation_input_tokens: count,
+                ..Usage::default()
+            };
+            let argument = settle_argument(
+                "req",
+                "att",
+                "completed",
+                Some(&usage),
+                &[],
+                None,
+                true,
+                true,
+                None,
+                None,
+                None,
+            );
+            let parsed: Value = serde_json::from_str(&argument).expect("valid json");
+            assert_eq!(parsed["usage"]["cache_creation_input_tokens"], json!(count));
+        }
+    }
+
+    #[test]
     fn settle_argument_preserves_upstream_provider_and_cache_ttl_usage_together() {
         let usage = Usage {
             input_tokens: Some(1_000),

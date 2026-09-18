@@ -546,3 +546,49 @@ fn custom_tool_input_passes_through_the_hold_back_untouched() {
         "{}\"\" ls -la"
     );
 }
+
+#[test]
+fn openai_cache_write_subsets_survive_normalization() {
+    let chat = openai_compatible_usage(&json!({
+        "prompt_tokens": 105, "completion_tokens": 3,
+        "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 100}
+    }))
+    .expect("valid cache write");
+    assert_eq!(chat.input_tokens, Some(105));
+    assert_eq!(chat.cache_creation_input_tokens, Some(100));
+    let responses = openai_usage(Some(&json!({
+        "input_tokens": 105, "output_tokens": 3,
+        "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 100}
+    })))
+    .expect("valid cache write")
+    .expect("usage");
+    assert_eq!(responses.input_tokens, chat.input_tokens);
+    assert_eq!(responses.cache_creation_input_tokens, Some(100));
+    assert!(openai_compatible_usage(&json!({
+        "prompt_tokens": 105, "prompt_tokens_details": {"cache_write_tokens": -1}
+    }))
+    .is_err());
+}
+
+#[test]
+fn cache_subsets_cannot_exceed_openai_total_input() {
+    for (reads, writes) in [(0, 11), (6, 5), (11, 0)] {
+        assert!(openai_compatible_usage(&json!({
+            "prompt_tokens": 10, "completion_tokens": 1,
+            "prompt_tokens_details": {"cached_tokens": reads, "cache_write_tokens": writes}
+        }))
+        .is_err());
+        assert!(openai_usage(Some(&json!({
+            "input_tokens": 10, "output_tokens": 1,
+            "input_tokens_details": {"cached_tokens": reads, "cache_write_tokens": writes}
+        })))
+        .is_err());
+    }
+    let usage = openai_compatible_usage(&json!({
+        "prompt_tokens": 10, "completion_tokens": 1,
+        "prompt_tokens_details": {"cached_tokens": 6, "cache_write_tokens": 4}
+    }))
+    .unwrap();
+    assert_eq!(usage.cached_input_tokens, Some(6));
+    assert_eq!(usage.cache_creation_input_tokens, Some(4));
+}
