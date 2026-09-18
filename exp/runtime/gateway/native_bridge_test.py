@@ -5974,15 +5974,27 @@ def test_affinity_pool_routes_each_session_deterministically(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize("trial", [False, True], ids=["retained", "trial"])
+@pytest.mark.parametrize("known_region", [False, True], ids=["unknown-region", "known-region"])
 def test_bridge_carries_scoped_verified_warmth_to_registered_request(
-    tmp_path: Path, trial: bool
+    tmp_path: Path, trial: bool, known_region: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Real offline admission preserves retained/trial evidence without populating sticky state."""
+    """Real admission preserves proven warmth but unknown geography only serves normally."""
+    from dataclasses import replace
     from uuid import uuid4
 
     from exp.runtime.models.credentials import CredentialResolution, DispatchCredentialReceipt
     from exp.runtime.models.credentials_test import AtomicEnvironment
+    from exp.runtime.models.providers.base import GatewayWireProfile
+    from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 
+    original_profile = OpenAICompatibleClient.gateway_wire_profile
+
+    def declared_profile(client: OpenAICompatibleClient) -> GatewayWireProfile:
+        """Declare fixture topology without changing its actual endpoint or authentication."""
+        return replace(original_profile(client), operational_region="region")
+
+    if known_region:
+        monkeypatch.setattr(OpenAICompatibleClient, "gateway_wire_profile", declared_profile)
     environment = AtomicEnvironment(
         CredentialResolution(
             "provider-secret-canary", "environment", receipt=DispatchCredentialReceipt(uuid4())
@@ -5999,6 +6011,29 @@ def test_bridge_carries_scoped_verified_warmth_to_registered_request(
     key = session_cache_key(original)
     assert key is not None
     lead, fallback = original.route.deployments
+    if not known_region:
+        assert not original.recovery_bindings
+        # Even plausible cached history cannot prove this custom wire's region.
+        accounting.recovery.record_success(
+            key,
+            fallback.deployment_id,
+            host.scope_for(fallback, original.authorization.organization_id),
+            cached_tokens=80,
+            cache_write_tokens=0,
+            retention_seconds=100,
+            sticky_seconds=60,
+        )
+        admission = _admit(control, raw_key, body, client_request_id="warm-session")
+        entry = accounting.entry(str(admission["request_id"]))
+        assert entry is not None and entry.recovery_scoped
+        assert entry.route.deployments == original.route.deployments
+        assert not entry.recovery_bindings
+        assert entry.verified_warm_deployment_id is None and entry.recovery_reason is None
+        assert _start_first(control, admission)["route_depth"] == 0
+        return
+    assert all(
+        binding.scope.region_scope == "region" for binding in original.recovery_bindings.values()
+    )
     for deployment in (lead, fallback) if trial else (fallback,):
         accounting.recovery.record_success(
             key,
