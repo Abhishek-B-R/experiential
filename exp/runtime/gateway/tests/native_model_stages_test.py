@@ -139,8 +139,9 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
     """Serve a genuinely different fallback model, with no false pool equivalence."""
     primary = ThreadingHTTPServer(("127.0.0.1", 0), _PrimaryUpstream)
     child_cancel = getattr(request, "param", None) == "tool-child-cancel"
+    child_collision = getattr(request, "param", None) == "tool-child-collision"
     secondary_handler = _StageSecondaryUpstream
-    if child_cancel:
+    if child_cancel or child_collision:
         from exp.runtime.gateway.tests.native_responses_tool_translation_test import _ToolUpstream
 
         secondary_handler = _ToolUpstream
@@ -170,7 +171,11 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
     zdr_child = getattr(request, "param", None) == "zdr-child"
     mapping_isolation = getattr(request, "param", None) == "tool-map-isolation"
     if hasattr(request, "param") and not zdr_child:
-        rule = "provider_internal" if mapping_isolation or child_cancel else request.param
+        rule = (
+            "provider_internal"
+            if mapping_isolation or child_cancel or child_collision
+            else request.param
+        )
         capabilities = capabilities.model_copy(update={"failover_only_on": (rule,)})
     models["beta"] = beta.model_copy(
         update={
@@ -213,7 +218,7 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
     )
     driver = tmp_path / "driver.py"
     source = _DRIVER_SOURCE
-    if mapping_isolation:
+    if mapping_isolation or child_collision:
         source = source.replace(
             "    control_plane = NativeControlPlane(",
             "    original_admit = NativeControlPlane.admit\n"
@@ -563,3 +568,29 @@ def test_actual_child_custom_start_disconnect_settles_once(engine: _ServingEngin
         assert db.execute(
             "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched','running')"
         ).fetchone() == (0,)
+
+
+@pytest.mark.parametrize("engine", ["tool-child-collision"], indirect=True)
+@pytest.mark.parametrize("stream", [False, True])
+def test_actual_child_collision_uses_its_own_declared_and_inverse_names(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """Failed-root inverse metadata cannot rename any selected child's colliding tool."""
+    from exp.runtime.gateway.tests.native_responses_tool_translation_test import (
+        _assert_collision_response,
+        _collision_request,
+    )
+
+    response = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json=_collision_request(stream),
+        timeout=30,
+    )
+    _assert_collision_response(response, stream)
+    assert response.headers["x-gateway-canonical-model"] == "secondary-exact"
+    assert _attempt_rows(engine, response.headers["x-request-id"]) == [
+        (0, 0, "failed"),
+        (1, 0, "failed"),
+        (2, 1, "completed"),
+    ]

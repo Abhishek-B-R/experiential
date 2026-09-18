@@ -15,6 +15,7 @@ from typing import cast
 import httpx
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.tests import native_waterfall_test as waterfall
@@ -36,6 +37,9 @@ class _ToolUpstream(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
+        if any(tool["function"]["name"] == "apply_patch_3" for tool in payload["tools"]):
+            self._collision_stream(payload)
+            return
         names = ["apply_patch", "agents__close", "plain"]
         assert {tool["function"]["name"] for tool in payload["tools"]} == set(names)
         arguments = (
@@ -145,6 +149,60 @@ class _ToolUpstream(BaseHTTPRequestHandler):
         except OSError:
             type(self).stopped.set()
             return
+
+    def _collision_stream(self, payload: JsonObject) -> None:
+        """Require declaration/history agreement before returning colliding public names."""
+        names = [
+            "apply_patch",
+            "apply_patch_2",
+            "agents__close",
+            "apply_patch_3",
+            "agents__close_2",
+        ]
+        tools = cast("list[JsonObject]", payload["tools"])
+        assert [cast("JsonObject", tool["function"])["name"] for tool in tools] == names
+        messages = cast("list[JsonObject]", payload["messages"])
+        calls = [
+            call
+            for message in messages
+            for call in cast("list[JsonObject]", message.get("tool_calls", []))
+        ]
+        assert [(call["id"], cast("JsonObject", call["function"])["name"]) for call in calls] == [
+            ("old-custom", "apply_patch_3"),
+            ("old-ns", "agents__close_2"),
+        ]
+        assert [message["tool_call_id"] for message in messages if message["role"] == "tool"] == [
+            "old-custom",
+            "old-ns",
+        ]
+        for index, name in enumerate(names):
+            arguments = json.dumps(
+                {"input": "new patch"} if name == "apply_patch_3" else {"id": name}
+            )
+            self.wfile.write(
+                _sse_frame(
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": index,
+                                            "id": f"new-{index}",
+                                            "function": {"name": name, "arguments": arguments},
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    }
+                )
+            )
+        self.wfile.write(
+            _sse_frame({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})
+        )
+        self.wfile.write(waterfall._terminal_frames(prompt_tokens=7, completion_tokens=3))
 
     def log_message(self, format: str, *args: object) -> None:
         """Keep loopback request output quiet."""
@@ -302,3 +360,88 @@ def test_custom_start_disconnect_cancels_without_replay(
     )
     assert [state for _, _, state in waterfall._attempt_rows(engine, request_id)] == [expected]
     assert _ToolUpstream.calls == 1
+
+
+def _collision_request(stream: bool) -> JsonObject:
+    """Replay custom and namespaced calls whose flattened names are plain declarations."""
+    return {
+        "model": "coding",
+        "stream": stream,
+        "tools": [
+            {"type": "function", "name": "apply_patch", "parameters": {"type": "object"}},
+            {"type": "function", "name": "apply_patch_2", "parameters": {"type": "object"}},
+            {"type": "function", "name": "agents__close", "parameters": {"type": "object"}},
+            {"type": "custom", "name": "apply_patch"},
+            {
+                "type": "namespace",
+                "name": "agents",
+                "tools": [
+                    {"type": "function", "name": "close", "parameters": {"type": "object"}},
+                ],
+            },
+        ],
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "old-custom",
+                "name": "apply_patch",
+                "input": "old patch",
+            },
+            {"type": "custom_tool_call_output", "call_id": "old-custom", "output": "done"},
+            {
+                "type": "function_call",
+                "call_id": "old-ns",
+                "name": "close",
+                "namespace": "agents",
+                "arguments": "{}",
+            },
+            {"type": "function_call_output", "call_id": "old-ns", "output": "done"},
+            {"role": "user", "content": "always-500"},
+        ],
+    }
+
+
+def _assert_collision_response(response: httpx.Response, stream: bool) -> None:
+    """Require exact public custom/function identity without corrupting ordinary calls."""
+    assert response.status_code == 200, response.text
+    if stream:
+        events = [
+            json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")
+        ]
+        body = next(event["response"] for event in events if event["type"] == "response.completed")
+        added = [event["item"] for event in events if event["type"] == "response.output_item.added"]
+        assert [item["type"] for item in added] == ["function_call"] * 3 + [
+            "custom_tool_call",
+            "function_call",
+        ]
+    else:
+        body = response.json()
+    output = body["output"]
+    assert [item["call_id"] for item in output] == [f"new-{i}" for i in range(5)]
+    assert [(item["type"], item["name"], item.get("namespace")) for item in output] == [
+        ("function_call", "apply_patch", None),
+        ("function_call", "apply_patch_2", None),
+        ("function_call", "agents__close", None),
+        ("custom_tool_call", "apply_patch", None),
+        ("function_call", "close", "agents"),
+    ]
+    assert output[3]["input"] == "new patch"
+    assert json.loads(output[0]["arguments"]) == {"id": "apply_patch"}
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_actual_native_collision_history_and_inverse_agree(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """Actual Rust buffered and streamed responses preserve every colliding tool origin."""
+    response = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json=_collision_request(stream),
+        timeout=30,
+    )
+    _assert_collision_response(response, stream)
+    assert _ToolUpstream.calls == 1
+    assert [
+        state for _, _, state in waterfall._attempt_rows(engine, response.headers["x-request-id"])
+    ] == ["completed"]
