@@ -1,18 +1,13 @@
 """Python control plane for the native (Rust) gateway data plane.
 
-The native engine (`exp_gateway_native`) owns sockets, upstream streaming,
-normalization, and SSE encoding. Shared Python contracts own decoding,
-authorization, payload construction, continuation state, and durable ledger
-transactions. Every boundary call takes and returns one JSON string.
+Rust owns sockets, upstream streams, normalization and SSE; Python owns decoding,
+authorization, payloads, continuations and durable accounting. Each callback takes
+and returns one JSON string. Admission freezes ordered wires and retry policy;
+``start_attempt`` reserves before dispatch and ``settle`` finalizes only on the
+terminal attempt. Python owns candidate selection, health circuits and budget skipping.
 
-Admission returns ordered wire configurations and frozen retry policy. Each
-physical dispatch reserves through ``start_attempt`` before network work and
-settles through ``settle``; only the terminal attempt finalizes the request.
-Candidate selection, health circuits and budget skipping stay in this plane.
-
-Boundary errors raise :class:`NativeBridgeError` carrying sanitized protocol
-errors. Unsupported native routes finalize content-free and return an escalation
-disposition; the data plane records the reason and fails closed, never falling back.
+``NativeBridgeError`` sanitizes failures. Unsupported routes finalize content-free;
+their escalation disposition records a reason and fails closed, never falling back.
 """
 
 from __future__ import annotations
@@ -187,9 +182,8 @@ class NativeControlPlane(
             request_timeout_seconds: Total per-request budget from admission.
             data_plane_metrics: Optional native metrics JSON supplier, typically
                 ``exp_gateway_native.metrics_snapshot_json``; otherwise reports ``None``.
-            continuation_store: Optional injected Responses continuation
-                state; a host supplies its own bounded namespaced history,
-                and the default is one in-process bounded store.
+            continuation_store: Optional bounded namespaced Responses history;
+                defaults to one in-process bounded store.
             readiness_probe: Optional hosted lifecycle readiness callback.
             usage_reporter: Optional hosted usage report callback.
             budget_error_factory: Optional hosted mapping for a rejected reservation.
