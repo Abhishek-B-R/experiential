@@ -1,18 +1,13 @@
 """Python control plane for the native (Rust) gateway data plane.
 
-The native engine owns sockets, upstream streaming, normalization, and SSE encoding.
-Python contracts own decoding, authorization, payloads, continuations, and the ledger.
-Every boundary call takes and returns one JSON string.
-
-Admission returns the certified route and frozen retry policy without starting an attempt.
-The data plane reserves each dispatch through ``start_attempt`` and records its durable
-terminal through ``settle``. Candidate selection, health circuits, and budget skipping
-stay in the control plane.
-
+Rust owns sockets, streaming and normalization. Python owns authorization,
+payloads, continuations and ledger transactions. Boundaries use JSON.
+Admission returns the certified route without starting an attempt; Rust reserves
+each dispatch through ``start_attempt`` and records its durable terminal through
+``settle``. Candidate selection, health circuits and budget skipping stay here.
 Boundary errors raise :class:`NativeBridgeError`, whose ``public_error_json``
-attribute carries the sanitized OpenAI-shaped error the data plane returns to
-the caller through the shared boundary mapping. Requests the native path
-cannot serve (resolved clients exposing no native wire profile) are answered
+attribute carries the sanitized OpenAI-shaped error returned to the caller.
+Requests the native path cannot serve (clients without a wire profile) return
 with an ``{"escalate": reason}`` admission disposition after the accepted
 request is finalized content-free; the data plane classifies the reason for
 metrics and fails the request closed with the shared internal error.
@@ -27,11 +22,6 @@ from collections.abc import Callable
 
 from exp.common.core.artifacts import JsonObject, sha256_bytes
 from exp.runtime.gateway.attempt_tokens import counted_input_tokens
-from exp.runtime.gateway.capture_context import (
-    RequestCapture,
-    capture_request_context,
-    notify_request_capture,
-)
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -75,6 +65,7 @@ from exp.runtime.gateway.native_bridge_errors import (
 from exp.runtime.gateway.native_bridge_errors import (
     public_capability_error as _public_capability_error,
 )
+from exp.runtime.gateway.native_capture import CaptureController, begin_capture
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
 from exp.runtime.gateway.native_continuation import (
     continuation_binding_error as _continuation_binding_error,
@@ -163,7 +154,12 @@ class NativeControlPlane(
     NativeImagesMixin,
     NativeObservabilityMixin,
 ):
-    """Authority callbacks sharing a locked, deadline-swept accounting registry."""
+    """Authority and accounting callbacks for the native data plane.
+
+    Rust worker threads share the group-commit writer and the locked in-flight
+    registry. Opportunistic sweeps bound abandoned reservations to the request
+    deadline plus the sweep grace.
+    """
 
     def __init__(
         self,
@@ -178,17 +174,18 @@ class NativeControlPlane(
         cache_sample_gate: Callable[[str], bool] | None = None,
         native_route_eligible: Callable[[GatewayRoute, GatewayRequest], bool] | None = None,
         guardrails: GuardrailEngine | None = None,
-        capture_context: bool = False,
-        request_capture: RequestCapture | None = None,
+        capture: CaptureController | None = None,
     ) -> None:
         """Bind loaded gateway components for serving.
 
         Args:
             components: Authority, ledger, routes, and runtime catalogs.
             request_timeout_seconds: Total per-request budget from admission.
-            data_plane_metrics: Optional content-free native metrics JSON; absent means None.
-            continuation_store: Optional bounded namespaced Responses history.
-                Defaults to one in-process bounded store.
+            data_plane_metrics: Optional native metrics JSON supplier, typically
+                ``exp_gateway_native.metrics_snapshot_json``; otherwise reports ``None``.
+            continuation_store: Optional injected Responses continuation
+                state; a host supplies its own bounded namespaced history,
+                and the default is one in-process bounded store.
             readiness_probe: Optional hosted lifecycle readiness callback.
             usage_reporter: Optional hosted usage report callback.
             budget_error_factory: Optional hosted mapping for a rejected reservation.
@@ -199,15 +196,14 @@ class NativeControlPlane(
                 admits every sample; a raising gate skips the sample.
             native_route_eligible: Optional hosted policy for complete native semantics.
             guardrails: Optional identity-scoped engine. ``None`` leaves traffic unguarded.
-            capture_context: Include bounded effective request evidence for local capture.
-            request_capture: Optional host callback for post-guardrail, expanded capture.
+            capture: Optional identity-scoped native capture controller.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
-        self._capture_context = capture_context
-        self._request_capture = request_capture
-        # Hosts without the optional batch lane return the uniform not-enabled error.
+        self._capture = capture
+        # The optional batch lane: hosts without it leave every batch route
+        # answering the uniform not-enabled error below.
         self._batches = getattr(components, "batches", None)
         # Hosted compositions have no local group-commit writer; they settle
         # directly through their own synchronous ledger.
@@ -410,8 +406,11 @@ class NativeControlPlane(
             # continuation store keeps the post-guardrail history sealed.
             continuation_context.messages = retention_request.messages
 
-        notify_request_capture(self._request_capture, authorization, retention_request)
-        # Accept before route selection or any provider work; keyed replay fails closed.
+        # The ledger accepts the logical request before route selection, so a
+        # keyed operation whose durable terminal already exists (or whose key
+        # was reused with different content) fails closed here, before
+        # learned selection can run request-time embedding or any other
+        # provider-touching work.
         try:
             self._write_ledger.accept_request(authorization=authorization)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
@@ -663,6 +662,9 @@ class NativeControlPlane(
                 throttle_redial_budgets=redial_budgets,
             )
         )
+        begin_capture(
+            self._capture, authorization, retention_request, route.snapshot.exact_model_id
+        )
         response: JsonObject = {
             "request_id": authorization.request_id,
             "alias": authorization.alias,
@@ -678,13 +680,11 @@ class NativeControlPlane(
             "refusal_failover": authorization.refusal_failover,
             "output_guardrail": native_output_mode(self._guardrails, policy, public_request).value,
             "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
-            "caller_identity_id": authorization.identity_id,
         }
         if route.snapshot.throttle_redial is not None:
-            # The pool's frozen backoff-and-redial schedule; absent on default pools.
+            # The pool's frozen backoff-and-redial schedule; absent (not null) on
+            # pools that keep throttles failover-only: their admission is byte-identical.
             response["throttle_redial"] = route.snapshot.throttle_redial.model_dump(mode="json")
-        if self._capture_context:
-            response["capture_context"] = capture_request_context(retention_request)
         if plan is not None:
             response["guardrail_output_plan"] = plan
         if request.surface == GatewayApiSurface.MESSAGES:

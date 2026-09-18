@@ -12,6 +12,7 @@ from exp.common.claas import CapturePolicy, ClaasScope
 from exp.runtime.claas.capture import CaptureBinding, CaptureConfiguration
 from exp.runtime.claas.store import ExperienceStore
 from exp.runtime.gateway.lifecycle import load_gateway_components
+from exp.runtime.gateway.local_capture import open_local_capture
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.native_server import serve_native_gateway
 from exp.runtime.gateway.tests.launch_test import (
@@ -56,6 +57,7 @@ def test_real_native_gateway_capture_is_opt_in_and_ghost_stays_content_free(
             CaptureBinding(alias="coding", policy=CapturePolicy(scope=scope, enabled=enabled)),
         ),
     )
+    controller = open_local_capture(None if ghost else capture)
     port = _unused_port()
     shutdown = exp_gateway_native.shutdown_handle()
     failures: list[BaseException] = []
@@ -64,11 +66,10 @@ def test_real_native_gateway_capture_is_opt_in_and_ghost_stays_content_free(
         """Run the native host with explicit scoped capture, retaining startup errors."""
         try:
             serve_native_gateway(
-                NativeControlPlane(components),
+                NativeControlPlane(components, capture=controller),
                 host="127.0.0.1",
                 port=port,
-                capture=capture,
-                ghost=ghost,
+                capture=None if controller is None else controller.native,
                 shutdown=shutdown,
             )
         except BaseException as error:  # noqa: BLE001 - assert the error after thread shutdown.

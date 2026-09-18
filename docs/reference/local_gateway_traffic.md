@@ -2,13 +2,13 @@
 
 ## Shared engine contract
 
-Hosts can supply `NativeControlPlane(request_capture=...)` to receive authenticated
-authority and expanded, post-input-guardrail request context before ledger accept.
-The default is no callback. Callback failure never fails inference and never logs
-content. `capture_request_context` creates a bounded, durable-text-normalized copy
-with tool definitions, generation settings and semantic provider carriers, excluding
-transport replay keys and resolved credentials. The served request is unchanged.
-The native local collector receives the same projection as `exp_context`.
+Local and hosted capture share Experiential's Rust `CaptureCollector`: one native
+response tap, bounded input/output rendezvous and count/byte-bounded delivery worker.
+Python supplies authenticated policy and the expanded post-input-guardrail context.
+The local SQLite sink consumes those versioned records directly; it has no second
+collector or queue. Tool definitions, generation settings and semantic provider
+carriers are retained, excluding transport replay keys and resolved credentials.
+The served request is unchanged. See [the hosting contract](gateway_capture.md).
 
 ## Local collection
 
@@ -43,7 +43,7 @@ Native capture uses a bounded asynchronous writer, seven-day expiry, at most
 10,000 records and 256 MiB of serialized payloads per identity, with a 1 MiB
 per-record ceiling. SQLite indexes/journals add disk overhead. Oversize,
 interrupted and non-successful responses are not reproducible completed records.
-The native capture skip counter reports writer/size failures. Readers exclude
+The collector's content-free counters report delivery and collection failures. Readers exclude
 expired records even after the gateway stops.
 
 Bindings reflect active identities and aliases at startup. Restart after changing

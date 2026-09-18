@@ -65,8 +65,15 @@ pub(crate) async fn chat(
         Err(_) => return error_response(&PublicError::invalid_json()),
     };
 
-    // Only Idempotency-Key deduplicates operations; x-client-request-id
-    // correlates separate turns. Replay keys retain their authenticated scope.
+    // Replay-keyed chat runs the python engine's exact idempotency protocol
+    // natively: the shared control plane computes the tenant-scoped replay
+    // key (or escalates a request the native path cannot serve), then the
+    // bounded replay store dedupes concurrent duplicates and replays the
+    // owner's exact stored response. Headers are decoded latin-1 so any
+    // HTTP-legal value matches the python engine's view byte for byte.
+    // Only the standard Idempotency-Key opts into replay: callers reuse
+    // x-client-request-id as a session correlation id across distinct
+    // sequential requests, so it never keys an operation.
     let idempotency_key = latin1_header(&headers, "idempotency-key");
     let client_request_id = latin1_header(&headers, "x-client-request-id");
     let mut lease: Option<OwnerLease> = None;
@@ -217,12 +224,8 @@ pub(crate) async fn chat(
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or(0);
 
-    let capture = crate::claas::CaptureSession::begin(
-        &state.capture,
-        &admission,
-        &body_text,
-        "chat_completions",
-    );
+    let capture = state.capture.clone();
+    let capture_request_id = admission.request_id.clone();
     let response = match won {
         Won::Failed(error) => {
             if let Some(mut owner) = lease.take() {
@@ -277,7 +280,7 @@ pub(crate) async fn chat(
             }
         }
     };
-    crate::claas::capture_response(capture, response)
+    crate::capture::response::capture_response(capture, &capture_request_id, response)
 }
 
 /// Answer one attempt that the waterfall already settled: a successful

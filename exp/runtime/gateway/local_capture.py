@@ -3,12 +3,54 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from exp.common.claas import CapturePolicy, ClaasScope
 from exp.runtime.claas.capture import CaptureBinding, CaptureConfiguration
+from exp.runtime.gateway.contracts import AuthorizationSnapshot
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.native_capture import (
+    CaptureConfiguration as CollectorConfiguration,
+)
+from exp.runtime.gateway.native_capture import (
+    CaptureController,
+    CaptureDeliveryLimits,
+)
+
+if TYPE_CHECKING:
+    from exp_gateway_native import CaptureCollector
 
 GATEWAY_CAPTURE_APPLICATION = "gateway"
+
+
+def open_local_capture(configuration: CaptureConfiguration | None) -> CaptureController | None:
+    """Bind local policy and SQLite to the common native collector, never a second tap."""
+    if configuration is None:
+        return None
+    from exp_gateway_native import CaptureCollector
+
+    collector_configuration = CollectorConfiguration(
+        settlement_required=False,
+        delivery=CaptureDeliveryLimits(maximum_records=configuration.queue_capacity),
+    )
+    collector: CaptureCollector | None = CaptureCollector.sqlite(
+        collector_configuration.model_dump_json(), configuration.model_dump_json()
+    )
+    if collector is None:
+        return None
+    bindings = {
+        (binding.policy.scope.user_id, binding.alias): binding.policy.scope.application_id
+        for binding in configuration.bindings
+        if binding.policy.enabled
+    }
+
+    def application_for(authorization: AuthorizationSnapshot) -> str | None:
+        """Use exact authenticated identifiers, never parsed caller-controlled metadata."""
+        if authorization.surface.value not in {"chat_completions", "responses"}:
+            return None
+        return bindings.get((authorization.identity_id, authorization.alias))
+
+    return CaptureController(collector, application_for=application_for)
 
 
 def local_capture_path(root: Path) -> Path:

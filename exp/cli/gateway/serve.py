@@ -12,7 +12,7 @@ from rich.text import Text
 
 from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.cli.shared.theme import EXP_THEME
-from exp.runtime.gateway.local_capture import local_capture_configuration
+from exp.runtime.gateway.local_capture import local_capture_configuration, open_local_capture
 from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -276,11 +276,12 @@ def _run_gateway(
                 exp_gateway_native = importlib.import_module("exp_gateway_native")
                 guardrails = load_guardrail_engine(root)
                 capture = local_capture_configuration(root, ghost=ghost)
+                capture_controller = None if check else open_local_capture(capture)
                 control_plane = NativeControlPlane(
                     components,
                     data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
                     guardrails=guardrails,
-                    capture_context=capture is not None,
+                    capture=capture_controller,
                 )
                 receipt = {
                     "schema_version": 1,
@@ -336,11 +337,13 @@ def _run_gateway(
                         max_active_requests=max_active_requests,
                         graceful_timeout_seconds=graceful_timeout,
                         on_listening=announce_ready,
-                        capture=capture,
-                        ghost=ghost,
+                        capture=None if capture_controller is None else capture_controller.native,
                     )
                 except NativeGatewayServerError as exc:
                     raise typer.BadParameter(str(exc)) from exc
+                finally:
+                    if capture_controller is not None:
+                        capture_controller.native.close(0)
     except typer.BadParameter:
         if setup is not None:
             _emit_setup_recovery(setup=setup)

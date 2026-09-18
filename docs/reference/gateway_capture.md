@@ -1,36 +1,57 @@
 # Gateway capture hosting interface
 
-`exp.runtime.gateway.capture` owns the stored message/response shape and the
-bounded lifecycle handoff. A hosting application supplies consent and a typed
-`CaptureWriter`. No database, provider connection, or hosted account is required
-to use the capture primitives.
+Experiential owns one Rust collector for authenticated request context, HTTP
+response capture, bounded lifecycle state and asynchronous delivery. Python
+prepares the effective request during admission and configures a destination.
+There is no Python callback per response chunk and no database work on serving.
 
-The public lifecycle is `serialize_capture_messages` -> `PromptCaptureBuffer`
--> `CaptureWriter.enqueue` after durable request acceptance. Response capture
-uses `ResponseCaptureRegistry` and `ResponseCaptureHandoff` to reconcile final
-settlement with the relayed response. The host's destination receives typed
-`PromptCapturePayload`, `ResponseCapturePayload`, and `CaptureDiscard` records.
+```python
+from exp_gateway_native import CaptureCollector
+from exp.runtime.gateway.native_capture import CaptureConfiguration, CaptureController
 
-The destination must preserve enqueue order. A response or discard must not
-overtake its accepted prompt. The host remains responsible for consent checks
-at the durable write, tenant authorization, retention, and deletion. Failure of
-observability persistence must not become failure of serving or accounting.
+configuration = CaptureConfiguration()  # requires a hosted settlement decision
+collector = CaptureCollector(configuration.model_dump_json(), write_record)
+capture = CaptureController(collector, application_for=allowed_application)
+# Pass capture to NativeControlPlane and collector to serve_native_gateway.
+# Only after the final hosted lane decision:
+collector.settle(request_id, keep_prompt=True, keep_response=served)
+# A BYOK lane or denied policy retains nothing:
+collector.settle(request_id, keep_prompt=False, keep_response=False)
+```
 
-The host registers response permission only after its final settlement decision.
-The relay claims that permission before parsing a completed response. If the
-caller disconnects first, `handoff.park` retains a bounded prefix until settlement
-either claims it or it expires. Both arrival orders preserve the same explicit
-`client_disconnected` and `truncated` markers. A replay has no new settlement
-permission and therefore cannot create a second content capture.
+`allowed_application(authorization)` returns an explicitly configured application
+id or `None`. Organization and identity always come from authenticated authority,
+never request metadata. The projection includes expanded messages, tool definitions,
+generation settings and semantic provider context after input guardrails. Transport
+replay keys and resolved provider credentials are excluded. Prompts may themselves
+contain sensitive information; this is not content redaction or encryption.
 
-Serialization changes only the saved copy. Message arrays preserve the canonical
-gateway message shape. Responses retain their complete JSON body or ordered SSE
-data frames, including unknown fields. Invalid durable-text characters are
-normalized without merging object keys. Oversized prompts and non-stream
-responses are rejected; oversized streams may retain an explicitly truncated
-prefix. The destination must also enforce its own physical storage limits.
+The synchronous `write_record(str)` destination runs on a dedicated Rust-owned
+worker. Validate its input with `CaptureRecord.model_validate_json`. Schema version
+1 includes the authenticated scope, effective request, optional response, model and
+deployment provenance, and capture timestamp. It is an idempotent request update:
+the response can arrive after an earlier prompt-only record. A hosted collector
+does not enqueue content until terminal eligibility permits it, so queue overload
+cannot lose a BYOK deletion behind an already queued prompt.
 
-These primitives are a hosting interface, not an automatic local collection
-workflow. Local gateway launch does not enable content capture through this
-module alone. They are separate from anonymous product telemetry and the
-content-free request/attempt accounting ledger.
+Chat Completions, Responses and Messages HTTP surfaces share the same native tap.
+JSON bodies and ordered SSE data payloads retain unknown fields. `truncated` and
+`client_disconnected` explicitly distinguish a prefix from complete evidence.
+Output and settlement may arrive in either order. Keyed replays do not attach a
+second response tap. WebSocket and batch response capture are not added here.
+
+Delivery limits bound record count, each encoded record and all queued string
+capacity, including a record currently held by a slow destination. Separate bounds
+cover in-flight entry count, encoded pending content, total response-buffer capacity
+and request lifetime. Saturation drops capture without delaying provider work.
+Destination exceptions are counted without printing potentially sensitive details.
+`counts()` returns pending records, retained delivery bytes, persisted records,
+destination failures, delivery drops and collector skips. A bounded `close()` drains
+while releasing the GIL; a blocked destination cannot extend that caller's deadline.
+
+Destinations must enforce their own current consent, identity ownership, consent
+generation, retention and physical storage constraints at the durable write. Native
+admission policy is a performance gate, not a replacement for those checks. Capture
+does not alter user-visible content, provider attribution, billing or the content-free
+accounting ledger. The local CLI integration supplies the same collector with
+identity/application bindings and a SQLite sink, without a hosted settlement gate.

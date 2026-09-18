@@ -66,10 +66,6 @@ pub struct ServeConfig {
     pub native_usage_enabled: bool,
     #[serde(default = "default_graceful_timeout_seconds")]
     pub graceful_timeout_seconds: f64,
-    #[serde(default)]
-    pub capture: Option<crate::claas::CaptureConfiguration>,
-    #[serde(default)]
-    pub ghost: bool,
 }
 
 fn default_graceful_timeout_seconds() -> f64 {
@@ -124,7 +120,7 @@ pub(crate) struct AppState {
     /// Bounded in-process keyed-response replay, the native mirror of the
     /// python engine's `BoundedReplayStore`.
     pub(crate) replays: Arc<ReplayStore>,
-    pub(crate) capture: Option<Arc<crate::claas::CaptureStore>>,
+    pub(crate) capture: Option<Arc<crate::capture::collector::Collector>>,
     /// Deterministic guardrail rules compiled once by the control plane,
     /// keyed by policy `adapter_id`. An admission whose output chain names
     /// only these adapters is enforced here instead of in python.
@@ -141,21 +137,13 @@ pub async fn run(
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     on_listening: Option<Py<PyAny>>,
     guardrail_detectors: Arc<DetectorMap>,
+    capture: Option<Arc<crate::capture::collector::Collector>>,
 ) -> Result<(), String> {
     let connect_timeout = Duration::from_secs_f64(config.connect_timeout_seconds.max(0.001));
     let http = crate::upstream::build_client(connect_timeout)?;
     let pending_settlements = Arc::new(AtomicUsize::new(0));
     let max_active_requests = config.max_active_requests.max(1);
     let handled_requests = Arc::new(AtomicUsize::new(0));
-    let capture = if config.ghost {
-        None
-    } else {
-        config
-            .capture
-            .map(crate::claas::CaptureStore::open)
-            .transpose()?
-            .flatten()
-    };
     let state = AppState {
         bridge,
         http,
@@ -238,7 +226,7 @@ pub async fn run(
     }
     if let Some(capture) = capture {
         if !capture.close_until(drain_deadline) {
-            eprintln!("CLaaS capture drain reached the graceful shutdown deadline");
+            eprintln!("capture delivery exceeded the graceful shutdown deadline");
         }
     }
     outcome
@@ -363,13 +351,7 @@ async fn usage_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
 async fn metrics_json(State(state): State<AppState>) -> Response {
     match state.bridge.call("metrics_json", "{}".to_string()).await {
         Ok(text) => match serde_json::from_str::<Value>(&text) {
-            Ok(mut payload) => {
-                payload["claas_capture_skipped"] = json!(state
-                    .capture
-                    .as_ref()
-                    .map_or(0, |store| store.skipped_count()));
-                json_response(StatusCode::OK, &payload, &[])
-            }
+            Ok(payload) => json_response(StatusCode::OK, &payload, &[]),
             Err(_) => error_response(&PublicError::internal()),
         },
         Err(error) => error_response(&error),

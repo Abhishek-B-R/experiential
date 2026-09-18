@@ -86,12 +86,6 @@ pub(crate) struct Admission {
     /// Absent from an older control plane, which disables that memory.
     #[serde(default)]
     pub caller_scope: Option<String>,
-    /// Exact key-derived identity, carried separately because IDs may contain colons.
-    #[serde(default)]
-    pub caller_identity_id: Option<String>,
-    /// Post-guardrail, expanded evidence supplied only by an opted-in control plane.
-    #[serde(default)]
-    pub capture_context: Option<Value>,
 }
 
 /// How one admission's output chain is enforced on the data plane.
