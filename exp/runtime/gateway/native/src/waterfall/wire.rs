@@ -71,8 +71,7 @@ pub struct DeploymentWire {
     /// request carried translated Codex native tools; see
     /// `codex_native_inversion`.
     #[serde(default)]
-    pub native_tool_translation:
-        std::collections::HashMap<String, (String, Option<String>, bool)>,
+    pub native_tool_translation: std::collections::HashMap<String, (String, Option<String>, bool)>,
     /// The served model emits images (`emits_images` on the lane -- never the
     /// Images-API claim `supports_image_generation`, whose reuse admitted
     /// image generations onto OpenRouter chat lanes on 2026-09-15) that the

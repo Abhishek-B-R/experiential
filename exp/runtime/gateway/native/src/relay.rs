@@ -10,11 +10,11 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 
+use crate::codex_native_inversion::{invert_tool_event, NativeToolTranslation};
 use crate::dialects::{
     Dialect, FrameDecoder, Normalizer, MAXIMUM_RETAINED_OUTPUT_BYTES, OUTPUT_OVERFLOW_MESSAGE,
 };
 use crate::errors::{Failure, FailureClass, PublicError};
-use crate::codex_native_inversion::{invert_tool_event, NativeToolTranslation};
 use crate::events::{Event, Usage};
 use crate::metrics::METRICS;
 use crate::stop_sequences::StopSequenceGuard;

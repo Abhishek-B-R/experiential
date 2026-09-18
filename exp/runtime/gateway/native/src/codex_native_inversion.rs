@@ -97,7 +97,11 @@ mod tests {
         // A namespaced function tool: hoisted to `multi_agent_v1__close_agent`.
         map.insert(
             "multi_agent_v1__close_agent".to_string(),
-            ("close_agent".to_string(), Some("multi_agent_v1".to_string()), false),
+            (
+                "close_agent".to_string(),
+                Some("multi_agent_v1".to_string()),
+                false,
+            ),
         );
         // A freeform custom tool (apply_patch): presented as a function.
         map.insert(
@@ -135,7 +139,9 @@ mod tests {
         };
         invert_tool_event(&mut event, &map);
         match event {
-            Event::ToolCallStarted { name, namespace, .. } => {
+            Event::ToolCallStarted {
+                name, namespace, ..
+            } => {
                 assert_eq!(name, "close_agent");
                 assert_eq!(namespace.as_deref(), Some("multi_agent_v1"));
             }
@@ -162,7 +168,10 @@ mod tests {
     #[test]
     fn custom_completed_unwraps_input_and_becomes_custom() {
         let map = translation();
-        let mut event = completed("apply_patch", "{\"input\": \"*** Begin Patch\\n*** End Patch\"}");
+        let mut event = completed(
+            "apply_patch",
+            "{\"input\": \"*** Begin Patch\\n*** End Patch\"}",
+        );
         invert_tool_event(&mut event, &map);
         match event {
             Event::ToolCallCompleted { call, .. } => {
