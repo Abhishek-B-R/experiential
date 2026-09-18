@@ -11,11 +11,13 @@ from rich.console import Console
 
 from exp.cli.auth import run_login
 from exp.cli.providers.experiential_cloud import (
+    HOSTED_PLATFORM_DEFAULT_URL,
     hosted_connection,
+    hosted_credential_binding,
     hosted_gateway_base_url,
     hosted_platform_url,
 )
-from exp.common.auth import ProviderAuthStore
+from exp.common.auth import ProviderAuthStore, StoredCredentialEndpointMismatch
 from exp.runtime.models.credentials import lookup_connection_credential
 
 
@@ -68,13 +70,26 @@ def capture_credentials(
             "EXP_GATEWAY_URL must be an HTTPS /v1 endpoint (HTTP is allowed on loopback)."
         )
     connection = hosted_connection(environment)
-    credential = lookup_connection_credential(
-        connection.catalog_config(),
-        connection_id=connection.name,
-        environment=environment,
-        store=store,
-    )
+    try:
+        credential = lookup_connection_credential(
+            connection.catalog_config(),
+            connection_id=connection.name,
+            environment=environment,
+            store=store,
+        )
+    except StoredCredentialEndpointMismatch:
+        console.print("Saved login does not match this endpoint. Sign in to update your CLI login.")
+        credential = None
     if credential is None:
+        if (
+            hosted_credential_binding(environment) != hosted_credential_binding({})
+            and urlsplit(hosted_platform_url(environment)).hostname
+            == urlsplit(HOSTED_PLATFORM_DEFAULT_URL).hostname
+        ):
+            raise ValueError(
+                "Set EXP_PLATFORM_URL to this API endpoint's Platform web origin before login. "
+                "Capture cannot use production browser login with a different API endpoint."
+            )
         run_login(console=console, environment=environment, root=root, store=store)
         credential = lookup_connection_credential(
             connection.catalog_config(),

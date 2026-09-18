@@ -79,9 +79,14 @@ control plane for captured content.
 
 For an unreleased Platform preview, set both `EXP_GATEWAY_URL` to the preview API `/v1` URL and
 `EXP_PLATFORM_URL` to its web origin before `exp login` and `exp capture`. Saved credentials are
-bound to their endpoint, so a production login is not silently sent to a preview. Capture checks
-the cloud API before installing hosts overrides. Live Codex and Claude Code compatibility remains
-part of local acceptance; existing open connections may need to be restarted to enter capture.
+bound to their endpoint, so a production login is not silently sent to a preview. If the saved
+login belongs to another endpoint, Capture opens normal login for the configured environment;
+successful login replaces the saved CLI login. To keep a preview's login and catalog separate,
+set `XDG_DATA_HOME` to a dedicated preview data directory and pass a separate `--root` to Capture.
+Keep that data directory selected when using `exp capture reset` for the preview.
+Capture checks the cloud API before installing hosts overrides. Live Codex and Claude Code
+compatibility remains part of local acceptance; existing open connections may need to be
+restarted to enter capture.
 
 `build`, judge calibration, `optimize router`, and `optimize model` use the same cost authorization
 policy. An estimate at or below 50% of the budget runs automatically. A higher estimate
