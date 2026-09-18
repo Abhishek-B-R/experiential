@@ -69,6 +69,11 @@ from exp.runtime.gateway.contracts import (
     RedactedThinkingBlock,
     ThinkingBlock,
 )
+from exp.runtime.models.providers.cache_policy import (
+    multimodal_text_cache_blocks,
+    retain_multimodal_cache_boundaries,
+)
+from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import disposition_map
@@ -343,7 +348,10 @@ def decode_messages(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
             The HTTP layer renders it in the Anthropic error envelope.
     """
-    return _decode(payload, _MessagesRequest, anthropic_beta=anthropic_beta)
+    try:
+        return _decode(payload, _MessagesRequest, anthropic_beta=anthropic_beta)
+    except ProviderParameterError as error:
+        raise invalid_field("messages.content.cache_control", str(error)) from error
 
 
 def decode_messages_count_tokens(
@@ -368,7 +376,10 @@ def decode_messages_count_tokens(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
-    return _decode(payload, _CountTokensRequest, anthropic_beta=anthropic_beta)
+    try:
+        return _decode(payload, _CountTokensRequest, anthropic_beta=anthropic_beta)
+    except ProviderParameterError as error:
+        raise invalid_field("messages.content.cache_control", str(error)) from error
 
 
 def _decode(
@@ -588,6 +599,8 @@ def _system_text(system: str | tuple[_TextBlock, ...] | None) -> str | None:
 
 def _marked_text_blocks(
     blocks: str | tuple[_TextBlock, ...] | None,
+    *,
+    text_only: bool = True,
 ) -> tuple[JsonObject, ...]:
     """Rebuild a text-block run verbatim when any block carries a cache marker.
 
@@ -602,6 +615,18 @@ def _marked_text_blocks(
         return ()
     if all(block.cache_control is None for block in blocks):
         return ()
+    if text_only:
+        retain_multimodal_cache_boundaries(
+            tuple(
+                TextContentPart(
+                    text=block.text,
+                    cache_control=block.cache_control.model_dump(mode="json", exclude_none=True)
+                    if block.cache_control is not None
+                    else None,
+                )
+                for block in blocks
+            )
+        )
     rebuilt: list[JsonObject] = []
     for block in blocks:
         entry: JsonObject = {"type": "text", "text": block.text}
@@ -757,17 +782,23 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
         anthropic_thinking = any(
             block.kind in {"thinking", "redacted_thinking"} for block in reasoning
         )
+        retained = retain_multimodal_cache_boundaries(content_parts)[0] if attachments else ()
+        marked_text = (
+            multimodal_text_cache_blocks(retained)
+            if attachments
+            else _marked_text_blocks(tuple(text_parts), text_only=not (reasoning or tool_calls))
+        )
         out.append(
             GatewayMessage(
                 role=message.role,
                 content=content or ("" if attachments else None),
-                content_parts=tuple(content_parts) if attachments else (),
+                content_parts=retained,
                 tool_calls=tuple(tool_calls),
                 provider_reasoning=tuple(reasoning),
                 # The marked run is carried alongside the retained parts: its
                 # blocks are the same text in the same order, so a multimodal
                 # turn keeps its cache markers when it re-emits.
-                provider_text_blocks=_marked_text_blocks(tuple(text_parts)),
+                provider_text_blocks=marked_text,
                 provider_anthropic_blocks=tuple(ordered_blocks) if anthropic_thinking else None,
             )
         )
@@ -801,10 +832,16 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
             # carries no information and drops; a cache marker on the block
             # survives through the marked-run carrier.
             text_parts.append(block)
-            # An empty text block cannot ride a multimodal turn: Anthropic
-            # rejects a standalone empty block, so it never becomes a part.
-            if block.text:
-                content_parts.append(TextContentPart(text=block.text))
+            # Keep empty checkpoints until the complete media order is known;
+            # flush relocates the marker before dropping the unsupported text.
+            content_parts.append(
+                TextContentPart(
+                    text=block.text,
+                    cache_control=block.cache_control.model_dump(mode="json", exclude_none=True)
+                    if block.cache_control is not None
+                    else None,
+                )
+            )
             # The ordered replay keeps an empty text block only for the cache
             # marker it may carry; emission drops the block and migrates the
             # marker (``ordered_blocks_with_markers``).
