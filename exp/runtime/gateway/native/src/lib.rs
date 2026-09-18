@@ -526,6 +526,10 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .to_string(),
             },
             "tool_call_started" => events::Event::ToolCallStarted {
+                custom: object
+                    .get("custom")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
                 index,
                 call_id: object
                     .get("call_id")

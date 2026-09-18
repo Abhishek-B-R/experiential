@@ -10,7 +10,7 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 
-use crate::codex_native_inversion::{invert_tool_event, NativeToolTranslation};
+use crate::codex_native_inversion::{NativeToolInverter, NativeToolTranslation};
 use crate::dialects::{
     Dialect, FrameDecoder, Normalizer, MAXIMUM_RETAINED_OUTPUT_BYTES, OUTPUT_OVERFLOW_MESSAGE,
 };
@@ -146,7 +146,7 @@ pub fn track_event(event: &Event, usage: &mut Option<Usage>, tool_names: &mut Ve
 pub struct UpstreamRelay {
     /// Response-side inversion map for Codex native tools translated on a
     /// foreign wire; empty on every native-Responses route (a no-op there).
-    native_tool_translation: NativeToolTranslation,
+    native_tool_inverter: NativeToolInverter,
     stream: BoxStream<'static, reqwest::Result<Bytes>>,
     decoder: FrameDecoder,
     normalizer: Normalizer,
@@ -236,7 +236,7 @@ impl UpstreamRelay {
             first_byte_recorded: false,
             first_byte_deadline,
             first_token_at: None,
-            native_tool_translation: NativeToolTranslation::new(),
+            native_tool_inverter: NativeToolInverter::default(),
             carried_usage: None,
         }
     }
@@ -268,7 +268,7 @@ impl UpstreamRelay {
     /// `codex_native_inversion`); applied to every tool-call event this relay
     /// yields. Empty leaves every event untouched.
     pub fn set_native_tool_translation(&mut self, translation: NativeToolTranslation) {
-        self.native_tool_translation = translation;
+        self.native_tool_inverter.translation = translation;
     }
 
     /// Name the customer-managed provider this relay dispatches on, so every
@@ -320,9 +320,11 @@ impl UpstreamRelay {
             };
             event = kept;
         }
-        match self.stop_guard.as_mut() {
-            Some(guard) => self.ready.extend(guard.filter(event)),
-            None => self.ready.push_back(event),
+        for event in self.native_tool_inverter.filter(event) {
+            match self.stop_guard.as_mut() {
+                Some(guard) => self.ready.extend(guard.filter(event)),
+                None => self.ready.push_back(event),
+            }
         }
         true
     }
@@ -351,7 +353,6 @@ impl UpstreamRelay {
     ) -> Result<Option<Event>, Failure> {
         loop {
             if let Some(mut event) = self.ready.pop_front() {
-                invert_tool_event(&mut event, &self.native_tool_translation);
                 // Every yielded event exits here, so this is the one place that
                 // stamps time-to-first-token: the first event carrying visible
                 // model output. Prefix events peeked during commit also passed
@@ -966,3 +967,7 @@ mod cache_write_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "codex_native_stream_tests.rs"]
+mod codex_native_stream_tests;

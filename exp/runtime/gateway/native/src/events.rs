@@ -208,6 +208,8 @@ pub enum Event {
         delta: String,
     },
     ToolCallStarted {
+        /// Whether the public call carries freeform custom input.
+        custom: bool,
         index: u32,
         call_id: String,
         name: String,
@@ -477,6 +479,7 @@ pub fn simplified_event(event: &Event) -> Value {
             "text": delta,
         }),
         Event::ToolCallStarted {
+            custom,
             index,
             call_id,
             name,
@@ -489,6 +492,9 @@ pub fn simplified_event(event: &Event) -> Value {
                 "call_id": call_id,
                 "name": name,
             });
+            if *custom {
+                payload["custom"] = Value::Bool(true);
+            }
             if let Some(namespace) = namespace {
                 payload["namespace"] = Value::String(namespace.clone());
             }
