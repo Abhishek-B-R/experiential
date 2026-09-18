@@ -253,6 +253,7 @@ pub(super) async fn spawn_rung(script: Vec<Answer>) -> Rung {
 
 pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) -> DeploymentWire {
     DeploymentWire {
+        native_tool_translation: Default::default(),
         provider: "openai".to_string(),
         deployment_id: deployment_id.to_string(),
         exact_model_id: "exact-model".to_string(),
@@ -304,6 +305,7 @@ pub(super) fn responses_wire(deployment_id: &str, url: &str, encrypted: &[&str])
         );
     }
     DeploymentWire {
+        native_tool_translation: Default::default(),
         dialect: "openai_responses".to_string(),
         url: url.replace("/v1/chat/completions", "/v1/responses"),
         upstream_payload: json!({
@@ -764,6 +766,7 @@ const CYBER_POLICY_BODY: &str = concat!(
 /// key enrolled in a trusted-access program, in the reference case).
 fn rule_wire(deployment_id: &str, url: &str, tokens: &[&str]) -> DeploymentWire {
     DeploymentWire {
+        native_tool_translation: Default::default(),
         billing_customer_managed: true,
         failover_only_on: Some(tokens.iter().map(|token| token.to_string()).collect()),
         zdr_constrained: false,

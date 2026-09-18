@@ -10,6 +10,7 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 
+use crate::codex_native_inversion::{NativeToolInversion, NativeToolTranslation};
 use crate::dialects::{
     Dialect, FrameDecoder, Normalizer, MAXIMUM_RETAINED_OUTPUT_BYTES, OUTPUT_OVERFLOW_MESSAGE,
 };
@@ -143,6 +144,9 @@ pub fn track_event(event: &Event, usage: &mut Option<Usage>, tool_names: &mut Ve
 /// whichever wire framing the dialect uses (SSE, or the AWS binary
 /// event-stream framing for Bedrock).
 pub struct UpstreamRelay {
+    /// Response-side inversion for native tools translated on foreign or
+    /// mixed routes; empty when the selected request needed no translation.
+    native_tool_inversion: NativeToolInversion,
     stream: BoxStream<'static, reqwest::Result<Bytes>>,
     decoder: FrameDecoder,
     normalizer: Normalizer,
@@ -202,7 +206,7 @@ impl UpstreamRelay {
     }
 
     #[cfg(test)]
-    fn from_stream(
+    pub(crate) fn from_stream(
         stream: BoxStream<'static, reqwest::Result<Bytes>>,
         dialect: Dialect,
         first_byte_deadline: Instant,
@@ -232,6 +236,7 @@ impl UpstreamRelay {
             first_byte_recorded: false,
             first_byte_deadline,
             first_token_at: None,
+            native_tool_inversion: NativeToolInversion::default(),
             carried_usage: None,
         }
     }
@@ -257,6 +262,13 @@ impl UpstreamRelay {
         S: Into<String>,
     {
         self.normalizer.set_request_words(words);
+    }
+
+    /// Carry the Codex native-tool inversion map (see
+    /// `codex_native_inversion`); applied to every tool-call event this relay
+    /// yields. Empty leaves every event untouched.
+    pub fn set_native_tool_translation(&mut self, translation: NativeToolTranslation) {
+        self.native_tool_inversion = NativeToolInversion::new(translation);
     }
 
     /// Name the customer-managed provider this relay dispatches on, so every
@@ -290,9 +302,9 @@ impl UpstreamRelay {
 
     /// Move one normalized event through the stop-sequence guard (if any)
     /// onto the ready queue.
-    fn guard_next_pending(&mut self) -> bool {
+    fn guard_next_pending(&mut self) -> Result<bool, Failure> {
         let Some(mut event) = self.pending.pop_front() else {
-            return false;
+            return Ok(false);
         };
         if let (Some(provider), Event::Failed(failure)) =
             (self.customer_managed_provider.as_deref(), &event)
@@ -304,15 +316,19 @@ impl UpstreamRelay {
         }
         if let Some(serializer) = self.tool_serializer.as_mut() {
             let Some(kept) = serializer.filter(event) else {
-                return true;
+                return Ok(true);
             };
             event = kept;
         }
         match self.stop_guard.as_mut() {
-            Some(guard) => self.ready.extend(guard.filter(event)),
-            None => self.ready.push_back(event),
+            Some(guard) => {
+                for kept in guard.filter(event) {
+                    self.native_tool_inversion.push(kept, &mut self.ready)?;
+                }
+            }
+            None => self.native_tool_inversion.push(event, &mut self.ready)?,
         }
-        true
+        Ok(true)
     }
 
     /// Route an abnormal stream termination through the normalizer's recovery.
@@ -357,7 +373,7 @@ impl UpstreamRelay {
                 }
                 return Ok(Some(event));
             }
-            if self.guard_next_pending() {
+            if self.guard_next_pending()? {
                 continue;
             }
             if self.eof {

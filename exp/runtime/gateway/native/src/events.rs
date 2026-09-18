@@ -206,6 +206,8 @@ pub enum Event {
         delta: String,
     },
     ToolCallStarted {
+        /// Freeform custom input, including provider-translated Responses calls.
+        custom: bool,
         index: u32,
         call_id: String,
         name: String,
@@ -480,6 +482,7 @@ pub fn simplified_event(event: &Event) -> Value {
             name,
             namespace,
             caller,
+            ..
         } => {
             let mut payload = serde_json::json!({
                 "kind": "tool_call_started",

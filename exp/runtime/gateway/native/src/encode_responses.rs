@@ -198,7 +198,15 @@ impl ResponsesSseEncoder {
                 name,
                 namespace,
                 caller,
-            } => self.tool_started(*index, call_id, name, namespace.as_deref(), caller.as_ref()),
+                custom,
+            } => self.tool_started(
+                *index,
+                call_id,
+                name,
+                namespace.as_deref(),
+                caller.as_ref(),
+                *custom,
+            ),
             Event::ToolArgumentsDelta { index, delta } => self.tool_arguments(*index, delta),
             Event::ToolCallCompleted { index, call } => self.tool_completed(*index, call),
             // Anthropic text-block boundaries and citation metadata have no
@@ -491,6 +499,7 @@ impl ResponsesSseEncoder {
         name: &str,
         namespace: Option<&str>,
         caller: Option<&Value>,
+        custom: bool,
     ) -> Result<Vec<String>, PublicError> {
         if self.tools.contains_key(&index) {
             return Err(invalid_provider_stream(
@@ -525,10 +534,11 @@ impl ResponsesSseEncoder {
                 false,
             ),
         };
-        let custom = self
-            .provider_output_starts
-            .get(&index)
-            .is_some_and(|start| start.kind == ProviderOutputItemKind::CustomToolCall);
+        let custom = custom
+            || self
+                .provider_output_starts
+                .get(&index)
+                .is_some_and(|start| start.kind == ProviderOutputItemKind::CustomToolCall);
         let state = ToolState {
             item_id,
             output_index,
@@ -708,7 +718,9 @@ impl ResponsesSseEncoder {
                     frames.extend(self.close_message(key, item_status));
                 }
                 OutputSlot::Tool(index) if !self.tools[&index].done => {
-                    let item_status = if self.provider_output_starts.contains_key(&index) {
+                    let item_status = if self.provider_output_starts.contains_key(&index)
+                        || self.tools[&index].custom
+                    {
                         fallback_status
                     } else {
                         ProviderOutputItemStatus::Completed

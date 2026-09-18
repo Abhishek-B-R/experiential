@@ -20,6 +20,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import load_model_catalog, write_model_catalog
+from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.common.models.gateway_chains import (
     GatewayDeploymentRung,
     GatewayModelChain,
@@ -68,6 +69,47 @@ class _StageSecondaryUpstream(_SecondaryUpstream):
         else:
             text = "from-secondary"
         try:
+            if payload.get("tools"):
+                tools = payload["tools"]
+                functions = [tool["function"] for tool in tools]
+                assert [tool["name"] for tool in functions] == ["apply_patch", "agents__close"]
+                for index, name in enumerate(("apply_patch", "agents__close")):
+                    self.wfile.write(
+                        _sse_frame(
+                            {
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {
+                                            "tool_calls": [
+                                                {
+                                                    "index": index,
+                                                    "id": f"call-{index}",
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": name,
+                                                        "arguments": json.dumps(
+                                                            {"input": "portable patch"}
+                                                            if index == 0
+                                                            else {"id": "agent-one"}
+                                                        ),
+                                                    },
+                                                }
+                                            ]
+                                        },
+                                        "finish_reason": None,
+                                    }
+                                ]
+                            }
+                        )
+                    )
+                self.wfile.write(
+                    _sse_frame(
+                        {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+                    )
+                )
+                self.wfile.write(_terminal_frames(prompt_tokens=7, completion_tokens=3))
+                return
             self.wfile.write(
                 _sse_frame(
                     {
@@ -96,7 +138,13 @@ def test_installed_native_exports_ordered_stage_contract() -> None:
 def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_ServingEngine]:
     """Serve a genuinely different fallback model, with no false pool equivalence."""
     primary = ThreadingHTTPServer(("127.0.0.1", 0), _PrimaryUpstream)
-    secondary = ThreadingHTTPServer(("127.0.0.1", 0), _StageSecondaryUpstream)
+    child_cancel = getattr(request, "param", None) == "tool-child-cancel"
+    secondary_handler = _StageSecondaryUpstream
+    if child_cancel:
+        from exp.runtime.gateway.tests.native_responses_tool_translation_test import _ToolUpstream
+
+        secondary_handler = _ToolUpstream
+    secondary = ThreadingHTTPServer(("127.0.0.1", 0), secondary_handler)
     for server in (primary, secondary):
         threading.Thread(target=server.serve_forever, daemon=True).start()
     manager, raw_key = _configured_pool_gateway(
@@ -105,6 +153,14 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
             f"http://127.0.0.1:{primary.server_port}/v1",
             f"http://127.0.0.1:{secondary.server_port}/v1",
         ),
+        gateway_capabilities=(
+            GatewayDeploymentCapabilities(
+                supports_streaming=True, supports_streaming_tool_arguments=True
+            ),
+            GatewayDeploymentCapabilities(
+                supports_streaming=True, supports_streaming_tool_arguments=True
+            ),
+        ),
     )
     catalog = load_model_catalog(tmp_path / "models.toml")
     models = dict(catalog.models)
@@ -112,8 +168,10 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
     assert beta.gateway is not None
     capabilities = beta.gateway.capabilities
     zdr_child = getattr(request, "param", None) == "zdr-child"
+    mapping_isolation = getattr(request, "param", None) == "tool-map-isolation"
     if hasattr(request, "param") and not zdr_child:
-        capabilities = capabilities.model_copy(update={"failover_only_on": (request.param,)})
+        rule = "provider_internal" if mapping_isolation or child_cancel else request.param
+        capabilities = capabilities.model_copy(update={"failover_only_on": (rule,)})
     models["beta"] = beta.model_copy(
         update={
             "gateway": beta.gateway.model_copy(
@@ -155,6 +213,22 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
     )
     driver = tmp_path / "driver.py"
     source = _DRIVER_SOURCE
+    if mapping_isolation:
+        source = source.replace(
+            "    control_plane = NativeControlPlane(",
+            "    original_admit = NativeControlPlane.admit\n"
+            "    def distinct_root_mapping(self, payload):\n"
+            '        """Give the failed root a distinct frozen inverse to detect leakage."""\n'
+            "        admitted = json.loads(original_admit(self, payload))\n"
+            "        for wire in admitted['route']:\n"
+            "            if wire['deployment_id'] == 'alpha':\n"
+            "                wire['native_tool_translation'] = {\n"
+            "                    'apply_patch': ['root-only', None, True],\n"
+            "                    'agents__close': ['root-close', 'root-space', False]}\n"
+            "        return json.dumps(admitted)\n"
+            "    NativeControlPlane.admit = distinct_root_mapping\n"
+            "    control_plane = NativeControlPlane(",
+        )
     if zdr_child:
         source = source.replace(
             "    components = load_gateway_components(",
@@ -229,6 +303,80 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
                 server.shutdown()
                 server.server_close()
             assert process.returncode == 0, log_path.read_text()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "engine,allowed",
+    [("provider_internal", True), ("refusal", False), ("tool-map-isolation", True)],
+    indirect=["engine"],
+)
+def test_actual_responses_tool_translation_survives_conditional_child_stage(
+    engine: _ServingEngine, allowed: bool, stream: bool
+) -> None:
+    """Real Rust dispatch inverts selected child tools while preserving rule and ledger identity."""
+    response = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "input": "always-500",
+            "stream": stream,
+            "tools": [
+                {"type": "custom", "name": "apply_patch", "description": "Apply a patch."},
+                {
+                    "type": "namespace",
+                    "name": "agents",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "close",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"id": {"type": "string"}},
+                                "required": ["id"],
+                                "additionalProperties": False,
+                            },
+                        }
+                    ],
+                },
+            ],
+        },
+        timeout=30,
+    )
+    with sqlite3.connect(engine.database_path) as db:
+        rows = db.execute(
+            "SELECT deployment_id,exact_model_id,state,fallback_reason "
+            "FROM gateway_attempts ORDER BY attempt_ordinal"
+        ).fetchall()
+    assert rows[:2] == [("alpha", "model-revision-exact", "failed", None)] * 2
+    if not allowed:
+        assert response.status_code == 502
+        assert len(rows) == 2
+        return
+    assert response.status_code == 200, response.text
+    assert response.headers["x-gateway-canonical-model"] == "secondary-exact"
+    assert rows[2:] == [
+        ("beta", "secondary-exact", "completed", "failover_only_on:provider_internal")
+    ]
+    if stream:
+        events = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        completed = next(
+            event["response"] for event in events if event["type"] == "response.completed"
+        )
+    else:
+        completed = response.json()
+    output = completed["output"]
+    custom = next(item for item in output if item["type"] == "custom_tool_call")
+    namespaced = next(item for item in output if item["type"] == "function_call")
+    assert custom["name"] == "apply_patch" and custom["input"] == "portable patch"
+    assert namespaced["name"] == "close" and namespaced["namespace"] == "agents"
+    assert json.loads(namespaced["arguments"]) == {"id": "agent-one"}
+    assert completed["model"] == "coding"
 
 
 @pytest.mark.parametrize("engine", ["zdr-child"], indirect=True)
@@ -337,7 +485,9 @@ def test_actual_stage_header_alias_and_single_request_ledger(
                 chunk.get("x-experiential-ignored-parameters") == ["verbosity"] for chunk in chunks
             )
         else:
-            text = response.json()["choices"][0]["message"]["content"]
+            message = response.json()["choices"][0]["message"]
+            assert "tool_calls" not in message
+            text = message["content"]
             assert response.json()["x-experiential-ignored-parameters"] == ["verbosity"]
         assert json.loads(text) == {
             "from-secondary": True,
@@ -363,6 +513,52 @@ def test_actual_stage_header_alias_and_single_request_ledger(
             ("model-revision-exact", "alpha"),
             ("secondary-exact", "beta"),
         ]
+        assert db.execute("SELECT count(*) FROM gateway_requests").fetchone() == (1,)
+        assert db.execute(
+            "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched','running')"
+        ).fetchone() == (0,)
+
+
+@pytest.mark.parametrize("engine", ["tool-child-cancel"], indirect=True)
+def test_actual_child_custom_start_disconnect_settles_once(engine: _ServingEngine) -> None:
+    """Only the selected child cancels; the failed parent is never re-entered."""
+    with httpx.stream(
+        "POST",
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "input": "always-500",
+            "stream": True,
+            "tools": [
+                {"type": "custom", "name": "apply_patch"},
+                {
+                    "type": "namespace",
+                    "name": "agents",
+                    "tools": [
+                        {"type": "function", "name": "close", "parameters": {"type": "object"}},
+                    ],
+                },
+                {"type": "function", "name": "plain", "parameters": {"type": "object"}},
+            ],
+        },
+        timeout=30,
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["x-gateway-canonical-model"] == "secondary-exact"
+        request_id = response.headers["x-request-id"]
+        for line in response.iter_lines():
+            if line.startswith("data: "):
+                event = json.loads(line[6:])
+                if event["type"] == "response.output_item.added":
+                    assert event["item"]["type"] == "custom_tool_call"
+                    break
+    assert _attempt_rows(engine, request_id) == [
+        (0, 0, "failed"),
+        (1, 0, "failed"),
+        (2, 1, "cancelled"),
+    ]
+    with sqlite3.connect(engine.database_path) as db:
         assert db.execute("SELECT count(*) FROM gateway_requests").fetchone() == (1,)
         assert db.execute(
             "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched','running')"

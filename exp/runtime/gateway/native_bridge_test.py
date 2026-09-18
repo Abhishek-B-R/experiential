@@ -2326,6 +2326,126 @@ def _pool_control_plane(
     return NativeControlPlane(components), raw_key
 
 
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("native_root", [False, True])
+def test_responses_native_tools_use_released_adaptation_on_stage_and_root_wires(
+    tmp_path: Path, staged: bool, native_root: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Actual admission freezes tool inversion alongside unchanged stage and replay authority."""
+    from dataclasses import replace
+
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
+    from exp.runtime.models.providers.base import GatewayWireProfile
+    from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
+
+    declared = GatewayDeploymentCapabilities(
+        supports_streaming=True, supports_streaming_tool_arguments=True
+    )
+    manager, raw_key = _configured_pool_gateway(tmp_path, gateway_capabilities=(declared, declared))
+    if staged:
+        catalog = load_model_catalog(tmp_path / "models.toml")
+        models = dict(catalog.models)
+        beta = models["beta"]
+        assert beta.gateway is not None
+        models["beta"] = beta.model_copy(
+            update={
+                "gateway": beta.gateway.model_copy(
+                    update={
+                        "exact_model_id": "child-exact",
+                        "capabilities": declared.model_copy(
+                            update={"failover_only_on": ("provider_internal",)}
+                        ),
+                    }
+                )
+            }
+        )
+        root = GatewayModelChain(
+            model_id="model-revision-exact",
+            pool_id="alpha",
+            revision="tools-stage",
+            rungs=(
+                GatewayDeploymentRung(deployment_id="alpha"),
+                GatewayModelReferenceRung(model_id="child-exact"),
+            ),
+        )
+        write_model_catalog(
+            tmp_path / "models.toml",
+            catalog.model_copy(
+                update={
+                    "models": models,
+                    "gateway_pools": {},
+                    "gateway_model_chains": {root.model_id: root},
+                }
+            ),
+        )
+        _, normalized, snapshot = snapshot_current_catalog(tmp_path)
+        manager.activate_direct_alias(
+            alias_id="coding",
+            alias_name="coding",
+            revision_id="tools-stage",
+            pool_id="alpha",
+            snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+            catalog_sha256=normalized.identity_sha256(),
+        )
+    original = OpenAICompatibleClient.gateway_wire_profile
+
+    def profile(client: OpenAICompatibleClient) -> GatewayWireProfile:
+        """Give only the actual root fixture a native Responses dialect."""
+        resolved = original(client)
+        return (
+            replace(resolved, dialect="openai_responses")
+            if native_root and resolved.model_id == "alpha-model-exact"
+            else resolved
+        )
+
+    monkeypatch.setattr(OpenAICompatibleClient, "gateway_wire_profile", profile)
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "test-only"})
+    )
+    body: JsonObject = {
+        "model": "coding",
+        "input": "continue",
+        "stream": False,
+        "tools": [
+            {"type": "custom", "name": "apply_patch"},
+            {
+                "type": "namespace",
+                "name": "agents",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "close",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            },
+        ],
+    }
+    canonical = decode_responses(body).request
+    digest = canonical_request_sha256(canonical)
+    admission = _admit(control, raw_key, json.dumps(body), surface="responses")
+    entry = control._accounting.entry(str(admission["request_id"]))
+    assert entry is not None
+    assert entry.authorization.canonical_request_sha256 == digest
+    assert canonical_request_sha256(canonical) == digest
+    assert canonical.native_tool_translation is None
+    wires = cast("list[JsonObject]", admission["route"])
+    assert [wire["deployment_id"] for wire in wires] == ["alpha", "beta"]
+    for wire in wires:
+        assert wire["native_tool_translation"] == {
+            "apply_patch": ["apply_patch", None, True],
+            "agents__close": ["close", "agents", False],
+        }
+        assert wire["exact_model_id"] == (
+            "child-exact" if staged and wire["deployment_id"] == "beta" else "model-revision-exact"
+        )
+        assert wire["failover_only_on"] == (
+            ["provider_internal"] if staged and wire["deployment_id"] == "beta" else None
+        )
+    assert bool(entry.route.snapshot.model_stages) is staged
+    assert _start_first(control, admission)["route_depth"] == 0
+
+
 def test_admit_returns_the_full_ordered_route_without_starting_attempts(
     tmp_path: Path,
 ) -> None:

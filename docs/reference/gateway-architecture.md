@@ -330,10 +330,15 @@ same hint: forwarded as `text.verbosity` on native Responses routes and omitted 
 Codex-native input items (`additional_tools` tool namespaces,
 `custom_tool_call`/`custom_tool_call_output` freeform history) and non-function top-level tool
 declarations (`custom` freeform-grammar tools, `namespace` tool trees, `web_search`,
-`tool_search`) carry byte-for-byte at their caller positions and require a homogeneous native
-Responses route; echoed message items accept `id`/`phase` with `status`
-optional (non-assistant identity drops); and freeform custom tool calls stream end to end with
-their native event names, including continuation retention. The item-level `namespace` on
+`tool_search`) carry byte-for-byte at their caller positions on homogeneous native Responses
+routes. Foreign or mixed routes translate namespaces and custom tools to ordinary functions;
+unsupported hosted tools and history drop with explicit disclosure. The selected attempt's
+inverse map restores tool names, namespaces and custom-call identity. A translated custom call
+starts immediately, but its input is emitted as one decoded delta only after the bounded JSON
+wrapper completes. Invalid wrappers fail rather than expose JSON as executable freeform input;
+ordinary and namespaced function arguments remain incremental. Native Responses custom calls
+keep their incremental native events and continuation retention. Echoed message items accept
+`id`/`phase` with `status` optional (non-assistant identity drops). The item-level `namespace` on
 `function_call` (plus the `name`/`namespace` pair on `function_call_output` and the
 `custom_tool_call` namespace) round-trips verbatim through decode, the client stream, and
 continuation retention: the provider rejects a namespaced call replayed without it, so the
