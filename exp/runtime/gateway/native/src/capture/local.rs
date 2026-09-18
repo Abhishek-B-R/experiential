@@ -87,7 +87,7 @@ impl Sink for SqliteSink {
             .get("id")
             .and_then(serde_json::Value::as_str)
             .ok_or(())?;
-        let protocol = serde_json::to_value(&record.request.protocol).map_err(|_| ())?;
+        let protocol = serde_json::to_value(record.request.protocol).map_err(|_| ())?;
         let experience_id = format!(
             "experience-{:x}",
             Sha256::digest(
