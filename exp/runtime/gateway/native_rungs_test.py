@@ -4,13 +4,22 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.catalog import GatewayDeploymentCapabilities, GatewayDeploymentMetadata
+from exp.common.models.catalog import (
+    GatewayDeploymentCapabilities,
+    GatewayDeploymentMetadata,
+    GatewayTokenPrices,
+)
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.anthropic_protocol.requests import decode_messages
+from exp.runtime.gateway.attempt_costs import maximum_attempt_cost_nano_usd
+from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
+from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScope, BudgetScopeKind
+from exp.runtime.gateway.budgets_test import _accepted_chain, _activate_chain, _authority, _Clock
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -29,7 +38,7 @@ from exp.runtime.gateway.native_rungs import (
 )
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models.providers.base import GatewayWireProfile
-from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
+from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.openrouter_routing import OPENROUTER_METADATA_HEADER
 from exp.runtime.models.providers.protocol import NativeWireClient
 
@@ -136,10 +145,11 @@ def _dispatch(
 @pytest.mark.parametrize("customer_managed", [False, True])
 @pytest.mark.parametrize("ttl", ["5m", "1h"])
 @pytest.mark.parametrize("deployment_id", ["a1", "b1"])
-def test_server_tool_ttl_guard_applies_before_root_and_child_dispatch(
-    customer_managed: bool, ttl: str, deployment_id: str
+@pytest.mark.parametrize("hour_rate", [None, 6_000_000])
+def test_server_tool_ttl_reaches_root_and_child_pricing_and_dispatch(
+    customer_managed: bool, ttl: str, deployment_id: str, hour_rate: int | None
 ) -> None:
-    """Neither a root nor a child can freeze an unpriced hosted server-tool cache write."""
+    """Both stages retain server-tool TTL while reservation prices its applicable write rate."""
     catalog = staged_catalog()
     auth = _AUTHORIZATION.model_copy(update={"target": DirectTarget(pool_id="pool-a")})
     snapshot = model_execution_snapshot(catalog, auth, catalog.pools[0])
@@ -148,7 +158,15 @@ def test_server_tool_ttl_guard_applies_before_root_and_child_dispatch(
             update={
                 "provider": "anthropic",
                 "gateway": GatewayDeploymentMetadata(
-                    capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+                    capabilities=GatewayDeploymentCapabilities(
+                        supports_streaming=True, reports_cache_creation_input_tokens=True
+                    ),
+                    prices=GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=3_000_000,
+                        output_nano_usd_per_million_tokens=15_000_000,
+                        cache_creation_input_nano_usd_per_million_tokens=3_750_000,
+                        cache_creation_1h_input_nano_usd_per_million_tokens=hour_rate,
+                    ),
                 ),
             }
         )
@@ -188,15 +206,21 @@ def test_server_tool_ttl_guard_applies_before_root_and_child_dispatch(
             authorization=auth,
         )
 
-    if ttl == "1h" and not customer_managed:
-        with pytest.raises(ProviderParameterError, match="5-minute"):
-            dispatch()
-    else:
-        result = dispatch()
-        assert result.wire_entry["exact_model_id"] == ("a" if deployment_id == "a1" else "b")
-        payload = result.wire_entry["upstream_payload"]
-        assert isinstance(payload, dict)
-        assert payload["tools"] == list(request.provider_server_tools)
+    # Serialization preserves a supported TTL. Reservation, not the serializer,
+    # owns missing-price handling and the premium ceiling on current main.
+    cost = maximum_attempt_cost_nano_usd(request, by_id[deployment_id])
+    input_rate = hour_rate if ttl == "1h" else 3_750_000
+    assert cost == (
+        None
+        if input_rate is None
+        else (worst_case_input_tokens(request) * input_rate + 32 * 15_000_000 + 999_999)
+        // 1_000_000
+    )
+    result = dispatch()
+    assert result.wire_entry["exact_model_id"] == ("a" if deployment_id == "a1" else "b")
+    payload = result.wire_entry["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert payload["tools"] == list(request.provider_server_tools)
 
 
 @pytest.mark.parametrize("caller_required", [False, True])
@@ -344,3 +368,73 @@ def test_caller_provider_preferences_are_dropped_on_wires_without_the_field() ->
     payload = entry["upstream_payload"]
     assert isinstance(payload, dict)
     assert "provider" not in payload
+
+
+@pytest.mark.parametrize("destination", ["primary", "child"])
+@pytest.mark.parametrize("hour_rate", [None, 6_000_000])
+def test_server_tool_hour_cost_cannot_bypass_root_reservation(
+    tmp_path: Path, destination: str, hour_rate: int | None
+) -> None:
+    """Actual root authority rejects unknown or premium child writes before opening an attempt."""
+    clock = _Clock()
+    store, ledger, budgets, key = _authority(tmp_path, clock)
+    catalog = _activate_chain(store, tmp_path)
+    snapshot = _accepted_chain(store, ledger, clock, key, catalog)
+    request = decode_messages(
+        {
+            "model": "coding",
+            "max_tokens": 32,
+            "tools": [
+                {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                }
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+    ).request
+    source = next(item for item in catalog.deployments if item.deployment_id == destination)
+    deployment = source.model_copy(
+        update={
+            "gateway": source.gateway.model_copy(
+                update={
+                    "capabilities": source.gateway.capabilities.model_copy(
+                        update={"reports_cache_creation_input_tokens": True}
+                    ),
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=3_000_000,
+                        output_nano_usd_per_million_tokens=15_000_000,
+                        cache_creation_input_nano_usd_per_million_tokens=3_750_000,
+                        cache_creation_1h_input_nano_usd_per_million_tokens=hour_rate,
+                    ),
+                }
+            )
+        }
+    )
+    five_minute_ceiling = (
+        worst_case_input_tokens(request) * 3_750_000
+        + worst_case_output_tokens(request, deployment) * 15_000_000
+        + 999_999
+    ) // 1_000_000
+    budgets.set_limit(
+        organization_id="org",
+        period="2026-08",
+        scope=BudgetScope(kind=BudgetScopeKind.POOL, alias_id="coding", pool_id="pool"),
+        limit_nano_usd=five_minute_ceiling,
+        strict_unknown_cost=True,
+    )
+    cost = maximum_attempt_cost_nano_usd(request, deployment)
+    assert cost is None if hour_rate is None else cost is not None and cost > five_minute_ceiling
+    with pytest.raises(BudgetReservationRejected) as rejected:
+        ledger.start_attempt(
+            snapshot=snapshot,
+            deployment=deployment,
+            attempt_ordinal=0,
+            route_depth=snapshot.deployment_ids.index(destination),
+            maximum_cost_nano_usd=cost,
+        )
+    assert rejected.value.binding is not None
+    assert rejected.value.binding.application == ("shared" if destination == "primary" else "root")
+    with ledger._connect() as connection:
+        assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()[0] == 0
