@@ -667,7 +667,7 @@ class GatewayRequest(ContractModel):
     native_tool_translation: dict[str, tuple[str, str | None, bool]] | None = Field(
         default=None, exclude=True
     )
-    """Provider-only reverse map for translated Codex native tools; excluded from replay identity."""
+    """Provider-only reverse map for translated Codex native tools; not in replay identity."""
     provider_server_tools: tuple[JsonObject, ...] = Field(default=(), exclude=True)
     """Verbatim Anthropic server-tool entries from the Messages ``tools`` array.
 
