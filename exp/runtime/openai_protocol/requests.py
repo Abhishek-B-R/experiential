@@ -243,12 +243,13 @@ def decode_chat(
         else request.stop
     )
     thinking = translate_enable_thinking(request)
+    messages, cache_disclosures = restore_chat_cache_control(
+        _messages(request.messages, "messages"), cache_payload
+    )
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.CHAT_COMPLETIONS,
-            messages=restore_chat_cache_control(
-                _messages(request.messages, "messages"), cache_payload
-            ),
+            messages=messages,
             tools=tuple(_chat_tool(tool) for tool in request.tools),
             tool_choice=_chat_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
@@ -256,6 +257,7 @@ def decode_chat(
             json_object_output=chat_json_object_output(request.response_format),
             ignored_parameters=(
                 *alias_disclosures,
+                *cache_disclosures,
                 *thinking.disclosures,
                 *_replayed_reasoning_disclosures(request.messages),
             ),

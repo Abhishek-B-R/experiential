@@ -512,7 +512,7 @@ def _affinity_ordered_rungs(
         marker_capable = frozenset(
             index
             for index, (profile, _client) in enumerate(resolved_wires)
-            if profile.dialect == "anthropic_messages"
+            if profile.preserves_cache_control
         )
         if marker_capable and len(marker_capable) < len(resolved_wires):
             order = (

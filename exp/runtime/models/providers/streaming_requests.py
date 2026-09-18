@@ -599,7 +599,13 @@ def route_generation_parameter_requests(
     # them. Claude Code marks its system prompt and conversation
     # breakpoints on every request.
     if any(
-        message.provider_text_blocks or message.cache_control is not None
+        message.provider_text_blocks
+        or message.cache_control is not None
+        or any(
+            part.cache_control is not None
+            for part in message.content_parts
+            if part.kind == "text" or part.kind == "image" or part.kind == "document"
+        )
         for message in request.messages
     ) and not any(profile.preserves_cache_control for profile in profiles):
         content_marker = f"messages.content.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}"

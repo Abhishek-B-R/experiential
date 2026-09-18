@@ -46,6 +46,7 @@ from exp.runtime.gateway.rung_admission import RungLoadKey
 from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.cache_policy import cache_markers
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 
@@ -763,22 +764,8 @@ def select_route_deployments(
 
 
 def request_carries_cache_markers(request: GatewayRequest) -> bool:
-    """Whether any prompt-cache marker rides this request.
-
-    Markers live on the top-level automatic carrier, tool definitions,
-    assistant tool calls, message text runs, and tool-result breakpoints;
-    every one of them is honored only by the Anthropic Messages wire.
-    """
-    return (
-        request.provider_cache_control is not None
-        or any(tool.cache_control is not None for tool in request.tools)
-        or any(
-            message.provider_text_blocks
-            or message.cache_control is not None
-            or any(call.cache_control is not None for call in message.tool_calls)
-            for message in request.messages
-        )
-    )
+    """Whether a supported text, media, tool, or automatic marker rides the request."""
+    return bool(cache_markers(request))
 
 
 def reorder_route_deployments(

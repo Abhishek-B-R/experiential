@@ -126,3 +126,34 @@ def test_folded_instruction_keeps_prior_checkpoint(wire: str) -> None:
             {"type": "text", "text": "\n\n"},
             {"type": "text", "text": "dynamic reminder"},
         ]
+
+
+@pytest.mark.parametrize(
+    "media",
+    [
+        {"type": "video_url", "video_url": {"url": "https://example.test/clip.mp4"}},
+        {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+    ],
+)
+def test_unsupported_media_marker_drops_with_disclosure(media: JsonObject) -> None:
+    """A cache hint cannot turn an accepted media request into a 400."""
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "prefix", "cache_control": {"type": "ephemeral"}},
+                        media,
+                    ],
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        }
+    ).request
+    assert request.ignored_parameters == ("messages.0.cache_control->dropped(unsupported_media)",)
+    assert len(request.messages[0].content_parts) == 2
+    assert request.messages[0].provider_text_blocks == (
+        {"type": "text", "text": "prefix", "cache_control": {"type": "ephemeral"}},
+    )

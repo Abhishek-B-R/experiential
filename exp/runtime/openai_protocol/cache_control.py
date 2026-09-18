@@ -76,7 +76,7 @@ def drop_opencode_cache_control(payload: JsonObject) -> JsonObject:
 
 def restore_chat_cache_control(
     messages: tuple[GatewayMessage, ...], payload: JsonObject
-) -> tuple[GatewayMessage, ...]:
+) -> tuple[tuple[GatewayMessage, ...], tuple[str, ...]]:
     """Carry validated Chat hints past official SDK validation onto wire metadata.
 
     The decoder validates the cleaned body first. Its one-to-one message mapping
@@ -84,7 +84,8 @@ def restore_chat_cache_control(
     """
     raw_messages = cast(list[JsonObject], payload["messages"])
     restored: list[GatewayMessage] = []
-    for message, raw in zip(messages, raw_messages, strict=True):
+    disclosures: list[str] = []
+    for index, (message, raw) in enumerate(zip(messages, raw_messages, strict=True)):
         marker = raw.get("cache_control")
         content = raw.get("content")
         blocks: list[JsonObject] = []
@@ -114,21 +115,24 @@ def restore_chat_cache_control(
             elif message.content_parts and message.content_parts[-1].kind != "text":
                 last = message.content_parts[-1]
                 if last.kind != "image" and last.kind != "document":
-                    raise invalid_field("messages.cache_control")
-                message = message.model_copy(
-                    update={
-                        "content_parts": (
-                            *message.content_parts[:-1],
-                            last.model_copy(update={"cache_control": marker}),
-                        )
-                    }
-                )
+                    disclosures.append(
+                        f"messages.{index}.cache_control->dropped(unsupported_media)"
+                    )
+                else:
+                    message = message.model_copy(
+                        update={
+                            "content_parts": (
+                                *message.content_parts[:-1],
+                                last.model_copy(update={"cache_control": marker}),
+                            )
+                        }
+                    )
             elif blocks:
                 blocks[-1]["cache_control"] = marker
         if any("cache_control" in block for block in blocks):
             message = message.model_copy(update={"provider_text_blocks": tuple(blocks)})
         restored.append(message)
-    return tuple(restored)
+    return tuple(restored), tuple(disclosures)
 
 
 def _without_message_hint(raw_message: JsonValue, index: int) -> tuple[JsonValue, bool]:
