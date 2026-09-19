@@ -308,6 +308,15 @@ the listing (`publishers/google/models/gemma-4-26b-a4b-it-maas`) and are told ap
 Vertex's `-maas` endpoint suffix, so both that spelling and `google/gemma-4-26b-a4b-it-maas`
 take the MaaS route.
 
+For models available in Google's US or EU multi-region, set the entire project-and-location
+root to `https://aiplatform.us.rep.googleapis.com/v1/projects/PROJECT/locations/us`
+or `https://aiplatform.eu.rep.googleapis.com/v1/projects/PROJECT/locations/eu`.
+Both the synchronous client and native gateway preserve that endpoint. A global endpoint
+does not guarantee a processing location; verify the model's availability and the applicable
+[Google data residency commitments](https://docs.cloud.google.com/gemini-enterprise-agent-platform/resources/data-residency)
+before selecting a jurisdiction. Endpoint support alone does not enforce a routing policy
+on other models or fallback connections.
+
 Vertex is catalog-and-API configuration only: the interactive `exp config providers` picker
 does not offer it. Like Azure and Bedrock, provider names do not imply protocol support or
 prices, so every Vertex alias declares explicit capabilities. Embeddings are not supported on
