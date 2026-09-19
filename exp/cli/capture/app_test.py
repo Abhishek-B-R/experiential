@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import pytest
+from click import unstyle
 from rich.console import Console
 from typer.testing import CliRunner
 
@@ -51,9 +52,16 @@ def test_capture_without_selection_never_starts_setup(
 
     monkeypatch.setattr(capture_module, "_require_macos", lambda: None)
     monkeypatch.setattr(capture_module, "_capture", unexpected_capture)
-    result = CliRunner().invoke(app, ["capture"], input=selection)
+    result = CliRunner().invoke(
+        app,
+        ["capture"],
+        input=selection,
+        env={"TERM": "xterm-256color", "FORCE_COLOR": "1"},
+    )
     assert result.exit_code == exit_code, result.output
-    assert "Capture cancelled" in result.output if selection else "--domain HOST" in result.output
+    output = " ".join(unstyle(result.output).replace("│", " ").split())
+    expected = "Capture cancelled" if selection else "--domain HOST"
+    assert expected in output
 
 
 def test_explicit_domains_bypass_picker(monkeypatch: pytest.MonkeyPatch) -> None:
