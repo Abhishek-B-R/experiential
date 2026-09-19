@@ -291,7 +291,57 @@ def _assert_release_archive_metadata(metadata: str) -> None:
     headers = Parser().parsestr(metadata, headersonly=True)
     assert headers["Name"] == project["name"]
     assert headers["Version"] == project["version"]
+    native_project = tomllib.loads(
+        (repository / "exp/runtime/gateway/native/pyproject.toml").read_text()
+    )["project"]
+    _assert_exact_native_requirement(metadata, native_project["version"])
     _assert_release_requirements(metadata)
+
+
+def _assert_exact_native_requirement(metadata: str, native_version: str) -> None:
+    """Require exactly one unconditional registry pin to the reviewed native companion."""
+    requirements = [
+        Requirement(value)
+        for value in Parser().parsestr(metadata, headersonly=True).get_all("Requires-Dist", [])
+    ]
+    native = [item for item in requirements if canonicalize_name(item.name) == "exp-gateway-native"]
+    assert len(native) == 1, "release must name exactly one native companion"
+    requirement = native[0]
+    assert requirement.marker is None and requirement.url is None and not requirement.extras
+    assert str(requirement.specifier) == f"=={native_version}", (
+        "release must pin the exact reviewed native companion"
+    )
+
+
+def test_native_companion_dependency_is_exact_in_source() -> None:
+    """The local path lock cannot substitute for a published exact dependency."""
+    repository = Path(__file__).resolve().parent.parent.parent
+    project = tomllib.loads((repository / "pyproject.toml").read_text())["project"]
+    native = tomllib.loads((repository / "exp/runtime/gateway/native/pyproject.toml").read_text())[
+        "project"
+    ]
+    cargo = tomllib.loads((repository / "exp/runtime/gateway/native/Cargo.toml").read_text())
+    lock = tomllib.loads((repository / "uv.lock").read_text())
+    locked = [package for package in lock["package"] if package["name"] == "exp-gateway-native"]
+    assert len(locked) == 1 and locked[0]["version"] == native["version"]
+    assert cargo["package"]["version"].replace("-rc.", "rc") == native["version"]
+    metadata = "\n".join(f"Requires-Dist: {value}" for value in project["dependencies"])
+    _assert_exact_native_requirement(metadata, native["version"])
+
+
+def test_native_companion_metadata_rejects_unreviewed_resolution() -> None:
+    """A version range, wrong release, marker or direct URL cannot bypass exact pairing."""
+    _assert_exact_native_requirement("Requires-Dist: exp-gateway-native==0.3.88\n", "0.3.88")
+    for requirement in (
+        "exp-gateway-native>=0.3.88,<0.4",
+        "exp-gateway-native==0.3.*",
+        "exp-gateway-native~=0.3.88",
+        "exp-gateway-native==0.3.89",
+        'exp-gateway-native==0.3.88; sys_platform == "linux"',
+        "exp-gateway-native @ https://example.test/native.whl",
+    ):
+        with pytest.raises(AssertionError):
+            _assert_exact_native_requirement(f"Requires-Dist: {requirement}\n", "0.3.88")
 
 
 def _assert_release_requirements(metadata: str) -> None:
