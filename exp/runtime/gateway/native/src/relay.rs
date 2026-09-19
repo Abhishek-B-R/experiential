@@ -82,9 +82,11 @@ pub fn stream_timeout_failure(deadline: Instant) -> Failure {
 }
 
 /// Classify a provider that accepted the connection but did not stream its
-/// first byte within the fail-fast time-to-first-byte bound. A stalled lead
-/// deployment must not hold the request for its full per-chunk timeout, so
-/// this is a transient, capacity-shaped failure that is failover-eligible.
+/// first TOKEN (the first semantic event) within the fail-fast first-token
+/// bound. Headers, keepalive comments and role-only frames do not count. A
+/// stalled lead deployment must not hold the request for its full per-chunk
+/// timeout, so this is a transient, capacity-shaped failure that is
+/// failover-eligible.
 ///
 /// It is deliberately *not* same-deployment retryable: a lane that accepted
 /// the connection but never answered is the clearest dead-lane signal, and
@@ -168,11 +170,23 @@ pub struct UpstreamRelay {
     /// is re-owned as the customer's. `None` on house rungs.
     customer_managed_provider: Option<String>,
     eof: bool,
+    /// Whether any body byte has arrived: stamps the time-to-first-byte
+    /// histogram once. It does NOT satisfy the stall bound below: a provider
+    /// can send headers, keepalive comments and role-only frames at once and
+    /// still stall for minutes before its first token (2026-09-19, ~2 min
+    /// medians on a lane whose first byte was instant).
     first_byte_recorded: bool,
-    /// Fail-fast bound for the very first provider byte. Once the first byte
-    /// arrives (`first_byte_recorded`), subsequent reads use the deployment's
-    /// per-chunk timeout instead, so a slow reasoning model can stream for a
-    /// long time after it has started answering.
+    /// Whether the fail-fast first-token bound still applies. Armed until the
+    /// waterfall COMMITS the attempt (`commit`, called at the moment the
+    /// first semantic event -- content, reasoning, a tool call, an output
+    /// item -- makes this attempt the answer); from then on reads are paced
+    /// by the deployment's per-chunk timeout, so a slow reasoning model
+    /// streams for as long as it needs once it has started answering. Armed
+    /// exactly until commit keeps the stall failover-safe: a refusal delta
+    /// the waterfall WITHHOLDS under refusal failover is semantic but not a
+    /// commit, and a provider that stalls behind it still trips the bound.
+    stall_bound_armed: bool,
+    /// Fail-fast bound for the provider's first token, absolute from the dial.
     first_byte_deadline: Instant,
     /// Wall-clock time this relay yielded its first output token (a content,
     /// reasoning, or tool-call delta), or `None` before any token arrives.
@@ -238,12 +252,22 @@ impl UpstreamRelay {
             customer_managed_provider: None,
             eof: false,
             first_byte_recorded: false,
+            stall_bound_armed: true,
             first_byte_deadline,
             first_token_at: None,
             native_tool_inverter: NativeToolInverter::default(),
             tool_search: ToolSearchWithholder::default(),
             carried_usage: None,
         }
+    }
+
+    /// The waterfall committed the attempt on this relay: the first-token
+    /// bound is disarmed and every later read is paced by the deployment's
+    /// per-chunk timeout. Called at the commit point and nowhere else, so a
+    /// semantic event the waterfall withholds (a refusal delta under refusal
+    /// failover) leaves the bound armed.
+    pub fn commit(&mut self) {
+        self.stall_bound_armed = false;
     }
 
     /// The wall-clock time this relay yielded its first output token, or
@@ -417,11 +441,13 @@ impl UpstreamRelay {
             if self.eof {
                 return Ok(None);
             }
-            // Before the first byte the fail-fast time-to-first-byte bound
-            // applies; after it, each chunk is paced by the deployment's own
-            // per-chunk timeout so long-running generation is never capped.
-            let waiting_for_first_byte = !self.first_byte_recorded;
-            let bound = if waiting_for_first_byte {
+            // Until the first semantic event the fail-fast first-token bound
+            // applies -- absolute from the dial, so keepalive comments,
+            // pings and role-only frames buy the provider nothing; after it,
+            // each chunk is paced by the deployment's own per-chunk timeout
+            // so long-running generation is never capped.
+            let waiting_for_first_token = self.stall_bound_armed;
+            let bound = if waiting_for_first_token {
                 remaining(deadline).min(remaining(self.first_byte_deadline))
             } else {
                 remaining(deadline).min(phase_timeout)
@@ -492,12 +518,12 @@ impl UpstreamRelay {
                     continue;
                 }
                 Err(_) => {
-                    // A first-byte stall while the request deadline still has
+                    // A first-token stall while the request deadline still has
                     // budget is the fail-fast case: classify it as a
                     // failover-eligible transient so the next rung is tried at
                     // once. A later chunk stall, or an exhausted request
                     // deadline, keeps the existing transport/deadline mapping.
-                    if waiting_for_first_byte && !remaining(deadline).is_zero() {
+                    if waiting_for_first_token && !remaining(deadline).is_zero() {
                         return Err(first_byte_timeout_failure());
                     }
                     return Err(stream_timeout_failure(deadline));

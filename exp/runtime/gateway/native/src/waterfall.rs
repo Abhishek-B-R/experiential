@@ -136,37 +136,6 @@ impl SettledAttempt {
     }
 }
 
-fn is_semantic(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::TextDelta(_)
-            | Event::RefusalDelta(_)
-            | Event::ProviderTextDelta { .. }
-            | Event::ProviderRefusalDelta { .. }
-            | Event::ProviderOutputItemStarted { .. }
-            | Event::ProviderOutputItemCompleted { .. }
-            | Event::ReasoningSummaryDelta { .. }
-            | Event::ThinkingDelta { .. }
-            | Event::ThinkingSignature { .. }
-            | Event::RedactedThinking { .. }
-            | Event::EncryptedReasoning { .. }
-            | Event::ReasoningContentDelta { .. }
-            | Event::ToolCallStarted { .. }
-            | Event::ToolArgumentsDelta { .. }
-            | Event::ToolCallCompleted { .. }
-            | Event::TextBlockStarted { .. }
-            | Event::CitationDelta { .. }
-            | Event::ServerToolUseStarted { .. }
-            | Event::ServerToolArgumentsDelta { .. }
-            | Event::ServerToolUseCompleted { .. }
-            | Event::ServerToolResult { .. }
-            | Event::HostedToolItemStarted { .. }
-            | Event::HostedToolItemProgress { .. }
-            | Event::HostedToolItemCompleted { .. }
-            | Event::ProviderTextAnnotation { .. }
-    )
-}
-
 /// The control plane's answer to one `start_attempt` callback.
 #[derive(Debug, Deserialize)]
 pub(crate) struct StartResponse {
@@ -745,6 +714,7 @@ async fn run_attempt(
                         let mut prefix = std::mem::take(&mut withheld);
                         prefix.push(event);
                         let tool_search_dropped_after_output = relay.withheld_search_call_seen();
+                        relay.commit();
                         return AttemptEnd::Committed(Box::new(CommittedAttempt {
                             depth,
                             prefix,
@@ -775,6 +745,7 @@ async fn run_attempt(
                 // A search call withheld in the same turn is dropped: the
                 // rung is frozen on this output, and the caller is told.
                 let tool_search_dropped_after_output = relay.withheld_search_call_seen();
+                relay.commit();
                 return AttemptEnd::Committed(Box::new(CommittedAttempt {
                     depth,
                     prefix,
@@ -942,6 +913,8 @@ async fn run_attempt(
     }
 }
 
+mod commit;
+pub(crate) use commit::is_semantic;
 mod fallback_rules;
 mod wire;
 pub(crate) use wire::{first_byte_allowance, open_phase_bound};
