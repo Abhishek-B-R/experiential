@@ -1825,16 +1825,36 @@ def test_sweep_replays_the_original_completed_settlement(tmp_path: Path) -> None
 
 
 def test_abandoned_inflight_attempts_are_swept_after_the_deadline(tmp_path: Path) -> None:
-    """An admitted request the data plane never settles is closed by the sweep."""
+    """Start before the deadline, then advance only the deadline clock to sweep once."""
     control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.01)
-    abandoned = _admit_started(control, raw_key, _chat_body())
-    time.sleep(0.05)
-    with mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0):
+    deadline_clock = mock.Mock(wraps=time)
+    deadline_clock.monotonic.return_value = time.monotonic()
+    # Replace each module's time reference, not the shared time module used by
+    # SQLite group commits, real sleeps, or health/lease clocks.
+    with (
+        mock.patch("exp.runtime.gateway.native_bridge.time", deadline_clock),
+        mock.patch("exp.runtime.gateway.native_accounting.time", deadline_clock),
+        mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0),
+    ):
+        abandoned = _admit_started(control, raw_key, _chat_body())
+        request_id = str(abandoned["request_id"])
+        entry = control._accounting.entry(request_id)  # noqa: SLF001
+        assert entry is not None and entry.active_attempt_id == abandoned["attempt_id"]
+        assert deadline_clock.monotonic() < entry.deadline_monotonic
+        deadline_clock.monotonic.return_value = entry.deadline_monotonic - 0.001
+        control._accounting.sweep_expired()  # noqa: SLF001
+        assert control._accounting.entry(request_id) is entry  # noqa: SLF001
+        deadline_clock.monotonic.return_value = entry.deadline_monotonic + 0.001
         second = _admit(control, raw_key, _chat_body())
-    assert control._accounting.entry(str(abandoned["request_id"])) is None  # noqa: SLF001
-    assert control._accounting.entry(str(second["request_id"])) is not None  # noqa: SLF001
-    report = json.loads(control.usage_json("{}"))
-    assert report["totals"]["requests"] == 2
+        assert control._accounting.entry(request_id) is None  # noqa: SLF001
+        assert control._accounting.entry(str(second["request_id"])) is not None  # noqa: SLF001
+        control._accounting.sweep_expired()  # noqa: SLF001
+        report = json.loads(control.usage_json("{}"))
+        assert report["totals"]["requests"] == 2
+        assert report["totals"]["terminal_counts"] == [{"state": "cancelled", "attempts": 1}]
+        metrics = control.metrics_snapshot()["control_plane"]
+        assert isinstance(metrics, dict)
+        assert metrics["sweep_abandoned_attempts_cancelled"] == 1
 
 
 @pytest.mark.parametrize(
