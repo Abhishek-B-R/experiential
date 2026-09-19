@@ -490,6 +490,7 @@ class SQLiteAttemptLedger:
         ratelimit_limit_tokens: int | None = None,
         ratelimit_remaining_tokens: int | None = None,
         upstream_provider: str | None = None,
+        web_search_requests: int = 0,
     ) -> None:
         """Idempotently settle one attempt with normalized content-free fields.
 
@@ -507,6 +508,8 @@ class SQLiteAttemptLedger:
             ratelimit_remaining_tokens: Provider-stated tokens remaining.
             upstream_provider: The upstream an aggregator rung (OpenRouter)
                 named as having served the attempt, when its response said.
+            web_search_requests: Gateway-executed web searches billed to the attempt;
+                priced by the hosted ledger, not yet persisted or priced locally.
         """
         with self._transaction() as connection:
             self.apply_finish_attempt(
@@ -522,6 +525,7 @@ class SQLiteAttemptLedger:
                 ratelimit_limit_tokens=ratelimit_limit_tokens,
                 ratelimit_remaining_tokens=ratelimit_remaining_tokens,
                 upstream_provider=upstream_provider,
+                web_search_requests=web_search_requests,
             )
 
     def apply_finish_attempt(
@@ -539,6 +543,7 @@ class SQLiteAttemptLedger:
         ratelimit_limit_tokens: int | None = None,
         ratelimit_remaining_tokens: int | None = None,
         upstream_provider: str | None = None,
+        web_search_requests: int = 0,
     ) -> None:
         """Run the attempt settlement inside the caller's open write transaction.
 
@@ -557,7 +562,10 @@ class SQLiteAttemptLedger:
             ratelimit_remaining_tokens: Provider-stated tokens remaining.
             upstream_provider: The upstream an aggregator rung (OpenRouter)
                 named as having served the attempt, when its response said.
+            web_search_requests: Accepted for the shared settle signature; not
+                persisted or priced locally yet (see ``finish_attempt``).
         """
+        del web_search_requests  # Priced by the hosted ledger; local pricing is a follow-up.
         state, normalized_failure, failure_message, usage = _terminal_values(
             terminal_event, failure
         )

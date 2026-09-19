@@ -186,6 +186,7 @@ def terminal_from_settlement(
     usage = _usage_from_payload(
         raw_usage if isinstance(raw_usage, dict) else None,
         [str(name) for name in raw_tool_names] if isinstance(raw_tool_names, list) else [],
+        web_search_requests=web_search_requests_from_settlement(data),
     )
     failure_payload = data.get("failure")
     failure = None
@@ -279,6 +280,45 @@ def upstream_provider_kwarg(
     return {"upstream_provider": upstream_provider}
 
 
+def web_search_requests_kwarg(
+    settle: Callable[..., object], web_search_requests: int
+) -> dict[str, int]:
+    """The ``web_search_requests`` settle keyword for ``settle``, empty at zero or when unknown.
+
+    Same seam as :func:`upstream_provider_kwarg`: a host whose ledger predates
+    the keyword never sees it. A zero count is also withheld, so an attempt
+    that ran no search settles byte-for-byte as before the field existed.
+    """
+    if web_search_requests <= 0 or not accepts_keyword(settle, "web_search_requests"):
+        return {}
+    return {"web_search_requests": web_search_requests}
+
+
+def web_search_requests_from_settlement(data: JsonObject | None) -> int:
+    """Return the gateway-executed web searches the settlement bills to the attempt.
+
+    The native data plane puts ``web_search_requests`` at the top level of the
+    settle argument, beside (not inside) ``usage``, and omits it at zero. A
+    missing, non-integer, boolean, or negative value reads as zero so an
+    engine that never searched settles exactly as before.
+
+    Args:
+        data: Parsed native settlement payload; ``None`` (a cancelled sweep) bills none.
+
+    Returns:
+        The non-negative search count, zero when the payload names none.
+    """
+    count = None if data is None else _optional_count(data.get("web_search_requests"))
+    return count if count is not None and count > 0 else 0
+
+
+def web_search_requests_from_terminal(terminal: GatewayEvent | None) -> int:
+    """Return the web-search count the settled usage carries, zero without usage."""
+    if terminal is None or terminal.usage is None:
+        return 0
+    return terminal.usage.web_search_requests
+
+
 """Longest upstream label the settlement carries; anything longer is not a name."""
 
 
@@ -367,12 +407,16 @@ def _credible_usage(kind: GatewayEventKind, usage: GatewayUsage | None) -> Gatew
 def _usage_from_payload(
     payload: JsonObject | None,
     tool_names: list[str],
+    *,
+    web_search_requests: int = 0,
 ) -> GatewayUsage | None:
     """Build normalized usage without inventing absent token or TTL evidence.
 
     Args:
         payload: Native settlement usage object, or None.
         tool_names: Observed tool names in invocation order.
+        web_search_requests: Gateway-executed searches billed to this attempt; rides on
+            whichever usage shape the payload yields (a bare count is not usage and is dropped).
 
     Returns:
         Typed token or tool-only usage, or None when neither was observed.
@@ -382,7 +426,9 @@ def _usage_from_payload(
     """
     names = tuple(str(name) for name in tool_names)
     if payload is None or payload.get("input_tokens") is None:
-        return GatewayUsage(tool_names=names) if names else None
+        if not names:
+            return None
+        return GatewayUsage(tool_names=names, web_search_requests=web_search_requests)
     return GatewayUsage(
         input_tokens=_optional_count(payload.get("input_tokens")),
         output_tokens=_optional_count(payload.get("output_tokens")),
@@ -393,6 +439,7 @@ def _usage_from_payload(
         ),
         reasoning_tokens=_optional_count(payload.get("reasoning_tokens")),
         tool_names=names,
+        web_search_requests=web_search_requests,
     )
 
 
