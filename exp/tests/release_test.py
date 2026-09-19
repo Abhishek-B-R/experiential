@@ -368,9 +368,9 @@ def test_anyio_security_requirement_is_mandatory_in_source() -> None:
     _assert_anyio_security_requirement(metadata)
 
 
-@pytest.mark.parametrize(
-    "requirement",
-    [
+def test_anyio_security_requirement_rejects_missing_or_conditional_floor() -> None:
+    """A package name, optional marker or weaker specifier cannot claim the security contract."""
+    for requirement in (
         "",
         "anyio",
         "anyio>=4.14.1",
@@ -382,14 +382,11 @@ def test_anyio_security_requirement_is_mandatory_in_source() -> None:
         "anyio[trio]>=4.14.2",
         "anyio @ https://example.test/anyio.whl",
         "anyio>=4.14.2\nRequires-Dist: anyio>=4.14.2",
-    ],
-)
-def test_anyio_security_requirement_rejects_missing_or_conditional_floor(requirement: str) -> None:
-    """A package name, optional marker or weaker specifier cannot claim the security contract."""
-    with pytest.raises(AssertionError):
-        _assert_anyio_security_requirement(
-            "" if not requirement else f"Requires-Dist: {requirement}\n"
-        )
+    ):
+        with pytest.raises(AssertionError):
+            _assert_anyio_security_requirement(
+                "" if not requirement else f"Requires-Dist: {requirement}\n"
+            )
 
 
 def _assert_release_requirements(metadata: str) -> None:
@@ -3397,6 +3394,16 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
             str(installed_python),
             *(str(wheel) for wheel in wheels),
             "openai==3.0.0",
+        ],
+        cwd=execution,
+        environment=environment,
+    )
+    _run_checked(
+        [
+            str(installed_python),
+            "-I",
+            "-c",
+            "import importlib.util; assert importlib.util.find_spec('pytest') is None",
         ],
         cwd=execution,
         environment=environment,

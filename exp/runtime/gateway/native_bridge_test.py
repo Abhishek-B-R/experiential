@@ -1819,27 +1819,74 @@ def test_sweep_replays_the_original_completed_settlement(tmp_path: Path) -> None
     assert report["totals"]["terminal_counts"] == [{"state": "completed", "attempts": 1}]
 
 
-def test_abandoned_inflight_attempts_are_swept_after_the_deadline(tmp_path: Path) -> None:
-    """Start before the deadline, then advance only the deadline clock to sweep once."""
-    control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.01)
-    deadline_clock = mock.Mock(wraps=time)
-    deadline_clock.monotonic.return_value = time.monotonic()
-    # Replace each module's time reference, not the shared time module used by
-    # SQLite group commits, real sleeps, or health/lease clocks.
+@pytest.mark.parametrize("setup_elapsed", [0.0, 60.0])
+def test_abandoned_inflight_attempts_are_swept_after_the_deadline(
+    tmp_path: Path, setup_elapsed: float, request: pytest.FixtureRequest
+) -> None:
+    """Share one clock across authority, ledger and native deadlines, including late setup."""
+    from datetime import UTC, datetime, timedelta
+    from types import SimpleNamespace
+
+    from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
+    from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
+
+    class DeadlineClock:
+        """Advance both time domains together without changing shared system time or sleeping."""
+
+        elapsed = 0.0
+        epoch = datetime(2026, 9, 19, tzinfo=UTC)
+
+        def now(self) -> datetime:
+            """Return the deterministic wall time paired with the current monotonic instant."""
+            return self.epoch + timedelta(seconds=self.elapsed)
+
+        def monotonic(self) -> float:
+            """Use a distinct epoch so any accidental system-clock comparison fails immediately."""
+            return 100.0 + self.elapsed
+
+    clock = DeadlineClock()
+    manager, raw_key = _configured_gateway(tmp_path)
+    loaded = load_gateway_components(
+        tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+    )
+    ledger = SQLiteAttemptLedger(manager.database_path, clock=clock)
+    writer = GroupCommitAttemptLedger(ledger)
+    request.addfinalizer(writer.close)
+    request.addfinalizer(loaded.write_ledger.close)
+    components = cast(
+        NativeGatewayComponents,
+        SimpleNamespace(
+            store=SQLiteGatewayStore(manager.database_path, clock=clock),
+            ledger=ledger,
+            write_ledger=writer,
+            routes=loaded.routes,
+            runtime_catalogs=loaded.runtime_catalogs,
+            organization_id=manager.organization_id,
+            reconciled_expired_requests=loaded.reconciled_expired_requests,
+            reconciled_unknown_attempts=loaded.reconciled_unknown_attempts,
+        ),
+    )
+    control = NativeControlPlane(components, request_timeout_seconds=0.01)
+    native_time = mock.Mock(wraps=time)
+    native_time.monotonic.side_effect = clock.monotonic
+    # Only these module references are replaced. SQLite auth and settlement use
+    # their constructor clock; shared timer, health and group-commit time stays real.
     with (
-        mock.patch("exp.runtime.gateway.native_bridge.time", deadline_clock),
-        mock.patch("exp.runtime.gateway.native_accounting.time", deadline_clock),
+        mock.patch("exp.runtime.gateway.native_bridge.time", native_time),
+        mock.patch("exp.runtime.gateway.native_accounting.time", native_time),
         mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0),
     ):
+        clock.elapsed += setup_elapsed
         abandoned = _admit_started(control, raw_key, _chat_body())
         request_id = str(abandoned["request_id"])
         entry = control._accounting.entry(request_id)  # noqa: SLF001
         assert entry is not None and entry.active_attempt_id == abandoned["attempt_id"]
-        assert deadline_clock.monotonic() < entry.deadline_monotonic
-        deadline_clock.monotonic.return_value = entry.deadline_monotonic - 0.001
+        assert clock.monotonic() < entry.deadline_monotonic
+        clock.elapsed += 0.009
         control._accounting.sweep_expired()  # noqa: SLF001
         assert control._accounting.entry(request_id) is entry  # noqa: SLF001
-        deadline_clock.monotonic.return_value = entry.deadline_monotonic + 0.001
+        clock.elapsed += 0.002 + setup_elapsed
+        assert clock.monotonic() > entry.deadline_monotonic
         second = _admit(control, raw_key, _chat_body())
         assert control._accounting.entry(request_id) is None  # noqa: SLF001
         assert control._accounting.entry(str(second["request_id"])) is not None  # noqa: SLF001
@@ -1850,6 +1897,15 @@ def test_abandoned_inflight_attempts_are_swept_after_the_deadline(tmp_path: Path
         metrics = control.metrics_snapshot()["control_plane"]
         assert isinstance(metrics, dict)
         assert metrics["sweep_abandoned_attempts_cancelled"] == 1
+        with sqlite3.connect(manager.database_path) as connection:
+            rows = connection.execute(
+                "SELECT accepted_at,deadline_at FROM gateway_requests ORDER BY accepted_at"
+            ).fetchall()
+        assert len(rows) == 2
+        for accepted_at, deadline_at in rows:
+            assert (datetime.fromisoformat(deadline_at) - datetime.fromisoformat(accepted_at)) == (
+                timedelta(milliseconds=10)
+            )
 
 
 @pytest.mark.parametrize(
