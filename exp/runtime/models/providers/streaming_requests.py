@@ -11,6 +11,7 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
+from exp.runtime.gateway.tool_search.contracts import gateway_tool_search_name
 from exp.runtime.models.providers.codex_tools import (
     NativeToolMapping,
     convert_native_history,
@@ -617,17 +618,12 @@ def route_generation_parameter_requests(
         if content_marker not in ignored:
             ignored.append(content_marker)
 
-    # LiteLLM stamps ``provider_specific_fields`` on every assistant message it
-    # returns, and naive agent loops echo the dump back verbatim. No wire takes
-    # the object, so it is dropped on every route with disclosure, never a
-    # rejection (the 400 wedged whole Terminus-2 sessions, 2026-09-05).
+    # LiteLLM's echoed provider_specific_fields: no wire takes it; dropped with disclosure.
     if any(message.provider_specific_fields for message in request.messages):
         if "messages.provider_specific_fields" not in ignored:
             ignored.append("messages.provider_specific_fields")
 
-    # Anthropic-native tool-definition annotations exist only on that wire;
-    # every other rung drops each one with a per-field disclosure, never a
-    # rejection (Claude Code sends eager_input_streaming conditionally).
+    # Anthropic tool annotations (and Responses defer_loading) drop elsewhere with disclosure.
     if not all(profile.dialect == "anthropic_messages" for profile in profiles):
         tool_annotation_paths = (
             (
@@ -639,7 +635,11 @@ def route_generation_parameter_requests(
                 "tools.eager_input_streaming",
                 any(tool.eager_input_streaming is not None for tool in request.tools),
             ),
-            ("tools.defer_loading", any(tool.defer_loading is not None for tool in request.tools)),
+            (
+                "tools.defer_loading",
+                any(tool.defer_loading is not None for tool in request.tools)
+                and not all(profile.dialect == "openai_responses" for profile in profiles),
+            ),
             (
                 "tools.allowed_callers",
                 any(tool.allowed_callers is not None for tool in request.tools),
@@ -808,13 +808,11 @@ def route_generation_parameter_requests(
             param=parameter,
             code="invalid_parameter",
         )
-    # Codex CLI native Responses tool declarations and history items only serve
-    # verbatim on a native OpenAI Responses rung. On a foreign wire, translate
-    # them into ordinary function tools (hoisting namespaced functions,
-    # converting freeform custom tools to a single-``input`` function) and drop
-    # the hosted web_search/tool_search with disclosure, instead of rejecting.
-    # The inverse mapping rides on the provider request so the response path
-    # re-shapes tool calls into the native items the caller declared.
+    # Codex native Responses tool declarations/history serve verbatim only on a
+    # native Responses rung; a foreign wire gets them translated to function
+    # tools (namespaces hoisted, custom tools as one ``input`` function; hosted
+    # web_search/tool_search dropped with disclosure). The inverse mapping rides
+    # on the provider request so the response path re-shapes tool calls back.
     native_history_present = any(
         message.provider_native_item is not None for message in request.messages
     )
@@ -842,7 +840,9 @@ def route_generation_parameter_requests(
                 "Sequence[GatewayMessage]", provider_updates.get("messages", request.messages)
             )
             converted, history_disclosures = convert_native_history(
-                current_messages, native_mapping
+                current_messages,
+                native_mapping,
+                tool_search_name=gateway_tool_search_name(tool.name for tool in request.tools),
             )
             provider_updates["messages"] = converted
             for disclosure in history_disclosures:
