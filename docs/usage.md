@@ -24,7 +24,10 @@ The root surface is deliberately small:
 
 ## Direct provider capture on macOS
 
-Run `exp capture` in a terminal and leave it open while using your AI applications. It reuses
+Run `exp capture` in a terminal, choose **OpenAI / Codex**, **Anthropic / Claude Code**, or both,
+then leave it open while using your AI applications. Use arrow keys to move, Space to toggle
+providers, and Enter on **Complete** to start. Nothing is selected automatically; cancelling
+exits before login or networking setup. Capture reuses
 the normal Experiential login, or opens the same login flow when no credential exists. The
 Capture tab under API Keys shows the run and its upload statistics. No application attribution,
 separate capture credential, or background capture daemon is required.
@@ -34,8 +37,9 @@ continue to support Python 3.12. In a checkout, use `uv run --python 3.13 exp ca
 The temporary networking helper uses Apple's system Python and requires the macOS Command Line
 Tools; run `xcode-select --install` if they are missing.
 
-The default domains are `api.openai.com`, `chatgpt.com`, and `api.anthropic.com`. Repeat
-`--domain HOST` to select another explicit set. Hosts overrides apply to all applications using
+OpenAI / Codex selects `api.openai.com` and `chatgpt.com`; Anthropic / Claude Code selects
+`api.anthropic.com`. Advanced users can repeat `--domain HOST` to supply an explicit set and skip
+the chooser, including for noninteractive use. Hosts overrides apply to all applications using
 the system resolver for those domains. Only supported model request paths produce uploaded
 traces; authentication and unrelated web requests are forwarded without retaining their bodies.
 Captured traces include prompts, responses, and tool content. Credential headers are never

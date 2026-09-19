@@ -11,13 +11,19 @@ import typer
 from rich.console import Console
 
 from exp.cli.shared.options import ROOT_OPTION
+from exp.cli.shared.picker import PickerOption, choose_many
 from exp.cli.shared.theme import EXP_THEME
 from exp.runtime.capture.system import reset_capture_system
 from exp.runtime.capture.system_helper import CaptureSystemError, validate_domains
 
-DEFAULT_DOMAINS = ("api.openai.com", "chatgpt.com", "api.anthropic.com")
+_PROVIDER_DOMAINS = {
+    "openai": ("api.openai.com", "chatgpt.com"),
+    "anthropic": ("api.anthropic.com",),
+}
 DOMAIN_OPTION = typer.Option(
-    None, "--domain", help="Exact provider hostname to capture; repeat to select several."
+    None,
+    "--domain",
+    help="Advanced: capture exact hostnames instead of choosing providers; repeat for several.",
 )
 capture_app = typer.Typer(
     help="Capture direct AI provider traffic to Experiential.",
@@ -37,7 +43,7 @@ def capture(
         return
     console = Console(theme=EXP_THEME)
     _require_macos()
-    domains = _domains(domain)
+    domains = _domains(domain) if domain else _select_domains(console)
     try:
         _capture(console, domains=domains, root=root)
     except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
@@ -68,11 +74,45 @@ def _require_macos() -> None:
         raise typer.BadParameter("Run exp capture as your normal user; only its helper needs sudo.")
 
 
-def _domains(values: list[str] | None) -> tuple[str, ...]:
-    """Validate exact DNS names before login, certificate setup, or networking changes."""
-    domains = tuple(
-        dict.fromkeys(value.lower().rstrip(".") for value in (values or DEFAULT_DOMAINS))
+def _select_domains(console: Console) -> tuple[str, ...]:
+    """Let users choose supported providers before login or system setup.
+
+    Args:
+        console: Terminal used to explain scope and choose one or more providers.
+
+    Returns:
+        Validated hosts belonging only to the explicitly selected providers.
+
+    Raises:
+        typer.Exit: The user cancelled without starting capture.
+        typer.BadParameter: Input ended before a selection was submitted.
+    """
+    console.print("Captures supported requests from any app using the selected provider.")
+    options = (
+        PickerOption(value="openai", label="OpenAI / Codex"),
+        PickerOption(value="anthropic", label="Anthropic / Claude Code"),
     )
+    try:
+        selected = choose_many(
+            console, title="What would you like to capture?", options=options, minimum=1
+        )
+    except EOFError:
+        raise typer.BadParameter(
+            "Run exp capture in a terminal to choose providers, or pass --domain HOST."
+        ) from None
+    if selected.action is not None:
+        console.print("Capture cancelled.")
+        raise typer.Exit()
+    console.print(
+        "Selected: "
+        + ", ".join(option.label for option in options if option.value in selected.values)
+    )
+    return _domains([host for provider in selected.values for host in _PROVIDER_DOMAINS[provider]])
+
+
+def _domains(values: list[str]) -> tuple[str, ...]:
+    """Validate exact DNS names before login, certificate setup, or networking changes."""
+    domains = tuple(dict.fromkeys(value.lower().rstrip(".") for value in values))
     try:
         validate_domains(domains)
     except CaptureSystemError:

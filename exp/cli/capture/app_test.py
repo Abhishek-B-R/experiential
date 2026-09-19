@@ -10,8 +10,19 @@ from exp.cli.app import app
 from exp.cli.capture import app as capture_module
 
 
-def test_capture_without_subcommand_runs_foreground(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The capture command invokes the foreground owner with default domains."""
+@pytest.mark.parametrize(
+    ("selection", "domains"),
+    [
+        ("1\n\n", ("api.openai.com", "chatgpt.com")),
+        ("2\n\n", ("api.anthropic.com",)),
+        ("all\n\n", ("api.openai.com", "chatgpt.com", "api.anthropic.com")),
+        ("\n1\n\n", ("api.openai.com", "chatgpt.com")),
+    ],
+)
+def test_capture_asks_which_providers_to_capture(
+    monkeypatch: pytest.MonkeyPatch, selection: str, domains: tuple[str, ...]
+) -> None:
+    """Only providers explicitly chosen in the picker reach foreground capture."""
     calls: list[tuple[str, ...]] = []
 
     def run_capture(console: Console, *, domains: tuple[str, ...], root: Path) -> None:
@@ -20,9 +31,47 @@ def test_capture_without_subcommand_runs_foreground(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(capture_module, "_require_macos", lambda: None)
     monkeypatch.setattr(capture_module, "_capture", run_capture)
-    result = CliRunner().invoke(app, ["capture"])
+    result = CliRunner().invoke(app, ["capture"], input=selection)
     assert result.exit_code == 0, result.output
-    assert calls == [capture_module.DEFAULT_DOMAINS]
+    assert "What would you like to capture?" in result.output
+    assert "OpenAI / Codex" in result.output
+    assert "Anthropic / Claude Code" in result.output
+    assert calls == [domains]
+
+
+@pytest.mark.parametrize(("selection", "exit_code"), [("q\n", 0), ("b\n", 0), ("", 2)])
+def test_capture_without_selection_never_starts_setup(
+    monkeypatch: pytest.MonkeyPatch, selection: str, exit_code: int
+) -> None:
+    """Cancellation or unavailable input cannot silently capture every provider."""
+
+    def unexpected_capture(console: Console, *, domains: tuple[str, ...], root: Path) -> None:
+        """Reject any attempt to start login or interception without a selection."""
+        raise AssertionError("unselected capture must not start setup")
+
+    monkeypatch.setattr(capture_module, "_require_macos", lambda: None)
+    monkeypatch.setattr(capture_module, "_capture", unexpected_capture)
+    result = CliRunner().invoke(app, ["capture"], input=selection)
+    assert result.exit_code == exit_code, result.output
+    assert "Capture cancelled" in result.output if selection else "--domain HOST" in result.output
+
+
+def test_explicit_domains_bypass_picker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Advanced overrides retain exactly their normalized hosts without prompting."""
+    calls: list[tuple[str, ...]] = []
+
+    def run_capture(console: Console, *, domains: tuple[str, ...], root: Path) -> None:
+        """Record selected hosts without starting the capture runner."""
+        calls.append(domains)
+
+    monkeypatch.setattr(capture_module, "_require_macos", lambda: None)
+    monkeypatch.setattr(capture_module, "_capture", run_capture)
+    result = CliRunner().invoke(
+        app, ["capture", "--domain", "API.OPENAI.COM.", "--domain", "api.openai.com"]
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == [("api.openai.com",)]
+    assert "What would you like to capture?" not in result.output
 
 
 def test_reset_does_not_login_or_start_capture(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -40,6 +89,7 @@ def test_reset_does_not_login_or_start_capture(monkeypatch: pytest.MonkeyPatch) 
     assert result.exit_code == 0, result.output
     assert reset_calls == ["reset"]
     assert "networking restored" in result.output
+    assert "What would you like to capture?" not in result.output
 
 
 @pytest.mark.parametrize(
@@ -83,6 +133,7 @@ def test_help_never_attempts_setup(monkeypatch: pytest.MonkeyPatch) -> None:
     result = CliRunner().invoke(app, ["capture", "--help"])
     assert result.exit_code == 0
     assert "reset" in result.output
+    assert "What would you like to capture?" not in result.output
 
 
 def test_capture_requires_supported_python_before_launch(monkeypatch: pytest.MonkeyPatch) -> None:
