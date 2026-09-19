@@ -28,7 +28,6 @@ from exp.common.models.gateway_chains import (
     GatewayModelReferenceRung,
 )
 from exp.runtime.gateway.catalog_authority import (
-    snapshot_current_catalog,
     upsert_certified_pool,
     upsert_connection,
     upsert_singleton_deployment,
@@ -182,20 +181,16 @@ def test_decisions_never_enter_authored_model_reference_stages(tmp_path: Path) -
             }
         ),
     )
-    _, normalized, path = snapshot_current_catalog(tmp_path)
-    manager = GatewayManagement(tmp_path)
-    manager.activate_direct_alias(
-        alias_id="decisions",
-        alias_name="decisions",
-        revision_id="revision-chain",
-        pool_id="decision-0",
-        snapshot_ref=f"catalog-snapshots/{path.name}",
-        catalog_sha256=normalized.identity_sha256(),
+    from exp.runtime.gateway.tests.chain_authority_fixture_test import (
+        chain_components,
+        publish_authored_chain_fixture,
+    )
+
+    publish_authored_chain_fixture(
+        tmp_path, alias_id="decisions", revision_id="revision-chain", pool_id="decision-0"
     )
     control = NativeControlPlane(
-        load_gateway_components(
-            tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
-        )
+        chain_components(tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"})
     )
     admitted = _admit(control, key)
     wires = admitted["route"]

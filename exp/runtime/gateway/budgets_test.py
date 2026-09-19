@@ -66,6 +66,11 @@ from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.model_plan import model_execution_snapshot
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
+from exp.runtime.gateway.tests.chain_authority_fixture_test import (
+    ChainAttemptLedger,
+    ChainControlStore,
+    publish_chain_fixture,
+)
 
 
 def _catalog() -> NormalizedGatewayCatalog:
@@ -152,8 +157,8 @@ def _authority(
 ) -> tuple[SQLiteGatewayStore, SQLiteAttemptLedger, SQLiteBudgetStore, str]:
     """Create real SQLite authority, ledger, budget store, and one granted key."""
     path = tmp_path / "gateway.db"
-    store = SQLiteGatewayStore(path, clock=clock)
-    ledger = SQLiteAttemptLedger(path, clock=clock)
+    store = ChainControlStore(path, clock=clock)
+    ledger = ChainAttemptLedger(path, clock=clock)
     budgets = SQLiteBudgetStore(path, clock=clock)
     store.create_organization(organization_id="org", slug="org", display_name="Org")
     store.create_identity(organization_id="org", identity_id="identity", display_name="Identity")
@@ -248,19 +253,14 @@ def _activate_chain(
     snapshot_ref = f"chain-snapshot-{organization_id}"
     if not (tmp_path / snapshot_ref).exists():
         (tmp_path / snapshot_ref).write_bytes(canonical_json_bytes(catalog.model_dump(mode="json")))
-        store.register_catalog_snapshot(
-            organization_id=organization_id,
-            snapshot_ref=snapshot_ref,
-            catalog_sha256=catalog.identity_sha256(),
-        )
-    store.activate_alias_revision(
+    publish_chain_fixture(
+        store,
+        catalog,
         organization_id=organization_id,
         alias_id=alias_id,
-        alias_name=alias_id,
         revision_id=revision_id,
-        target=DirectTarget(pool_id=pool_id),
+        pool_id=pool_id,
         snapshot_ref=snapshot_ref,
-        catalog_sha256=catalog.identity_sha256(),
     )
     return catalog
 

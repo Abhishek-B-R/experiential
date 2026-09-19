@@ -48,6 +48,7 @@ from exp.runtime.gateway.guardrails.native import (
     enforce_native_output_segment,
     native_output_mode,
 )
+from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
@@ -316,6 +317,7 @@ class NativeControlPlane(
                 app_title=optional_text(data.get("app_title")),
                 client_ip=optional_text(data.get("client_ip")),
             )
+            authorization = authorize_serving_model_chains(self._components, authorization)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             mapped = _authority_error(exc)
             pointer = self._batch_pointer_error(alias=decoded.alias, mapped=mapped)
@@ -853,6 +855,7 @@ class NativeControlPlane(
                 app_referer=optional_text(data.get("app_referer")),
                 app_title=optional_text(data.get("app_title")),
             )
+            authorization = authorize_serving_model_chains(self._components, authorization)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
         if isinstance(authorization.target, DirectTarget):

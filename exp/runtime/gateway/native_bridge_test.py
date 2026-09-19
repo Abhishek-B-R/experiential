@@ -65,6 +65,10 @@ from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_recovery import session_cache_key
 from exp.runtime.gateway.native_stage_admission_test import Host
 from exp.runtime.gateway.routing import GatewayRoutingError
+from exp.runtime.gateway.tests.chain_authority_fixture_test import (
+    chain_components,
+    publish_authored_chain_fixture,
+)
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.instruction_turns import (
     HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE,
@@ -1010,16 +1014,8 @@ def test_authenticated_child_reasoning_start_requires_fresh_host_authorization(
             }
         ),
     )
-    _, normalized, snapshot = snapshot_current_catalog(tmp_path)
-    manager.activate_direct_alias(
-        alias_id="coding",
-        alias_name="coding",
-        revision_id="revision-child-carrier",
-        pool_id="alpha",
-        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
-        catalog_sha256=normalized.identity_sha256(),
-    )
-    components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "test-secret"})
+    publish_authored_chain_fixture(tmp_path, revision_id="revision-child-carrier", pool_id="alpha")
+    components = chain_components(tmp_path, environment={"TEST_PROVIDER_KEY": "test-secret"})
     control = NativeControlPlane(components)
     initial = _admit(control, raw_key, _chat_body())
     first = _start_first(control, initial)
@@ -1127,8 +1123,7 @@ def test_authenticated_child_reasoning_start_requires_fresh_host_authorization(
         assert database.execute(
             "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched','running')"
         ).fetchone() == (0,)
-    assert isinstance(components.store, _ReadyControlStore)
-    host_store = components.store.store
+    host_store = components.store
     original = host_store.authorize_request
 
     def authorize_child_start(
@@ -2398,15 +2393,7 @@ def test_responses_native_tools_use_released_adaptation_on_stage_and_root_wires(
                 }
             ),
         )
-        _, normalized, snapshot = snapshot_current_catalog(tmp_path)
-        manager.activate_direct_alias(
-            alias_id="coding",
-            alias_name="coding",
-            revision_id="tools-stage",
-            pool_id="alpha",
-            snapshot_ref=f"catalog-snapshots/{snapshot.name}",
-            catalog_sha256=normalized.identity_sha256(),
-        )
+        publish_authored_chain_fixture(tmp_path, revision_id="tools-stage", pool_id="alpha")
     original = OpenAICompatibleClient.gateway_wire_profile
 
     def profile(client: OpenAICompatibleClient) -> GatewayWireProfile:
@@ -2419,9 +2406,12 @@ def test_responses_native_tools_use_released_adaptation_on_stage_and_root_wires(
         )
 
     monkeypatch.setattr(OpenAICompatibleClient, "gateway_wire_profile", profile)
-    control = NativeControlPlane(
-        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "test-only"})
+    components = (
+        chain_components(tmp_path, environment={"TEST_PROVIDER_KEY": "test-only"})
+        if staged
+        else load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "test-only"})
     )
+    control = NativeControlPlane(components)
     body: JsonObject = {
         "model": "coding",
         "input": "continue",

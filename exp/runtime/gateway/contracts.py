@@ -26,6 +26,7 @@ from exp.common.models.gateway_catalog import (
 )
 from exp.common.models.gateway_chains import ModelExecutionStage, ModelTraversalEvent
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort, ToolCall
+from exp.runtime.gateway.model_chain_authority import ModelChainAuthority
 from exp.runtime.gateway.reasoning_blocks import (
     EncryptedReasoningBlock as EncryptedReasoningBlock,
 )
@@ -886,6 +887,8 @@ class AuthorizationSnapshot(ContractModel):
     catalog_sha256: Sha256
     canonical_request_sha256: Sha256
     caller_operation_sha256: Sha256 | None = None
+    model_chain_authority: ModelChainAuthority | None = None
+    """Backend-issued binding, revalidated by the host at acceptance and every reservation."""
     refusal_failover: bool = False
     deadline_monotonic: float = Field(gt=0)
     app_referer: str | None = Field(default=None, max_length=2_048)

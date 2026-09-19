@@ -26,8 +26,8 @@ from exp.common.models.gateway_chains import (
     GatewayModelChain,
     GatewayModelReferenceRung,
 )
-from exp.runtime.gateway.catalog_authority import snapshot_current_catalog
 from exp.runtime.gateway.native_bridge_test import _configured_pool_gateway
+from exp.runtime.gateway.tests.chain_authority_fixture_test import publish_authored_chain_fixture
 from exp.runtime.gateway.tests.native_waterfall_test import (
     _DRIVER_SOURCE,
     _attempt_rows,
@@ -207,17 +207,13 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
         }
     )
     write_model_catalog(tmp_path / "models.toml", authored)
-    _, normalized, snapshot = snapshot_current_catalog(tmp_path)
-    manager.activate_direct_alias(
-        alias_id="coding",
-        alias_name="coding",
-        revision_id="revision-stage",
-        pool_id="alpha",
-        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
-        catalog_sha256=normalized.identity_sha256(),
-    )
+    publish_authored_chain_fixture(tmp_path, revision_id="revision-stage", pool_id="alpha")
     driver = tmp_path / "driver.py"
-    source = _DRIVER_SOURCE
+    source = _DRIVER_SOURCE.replace(
+        "from exp.runtime.gateway.lifecycle import load_gateway_components",
+        "from exp.runtime.gateway.tests.chain_authority_fixture_test import "
+        "chain_components as load_gateway_components",
+    )
     if mapping_isolation or child_collision:
         source = source.replace(
             "    control_plane = NativeControlPlane(",

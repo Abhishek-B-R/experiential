@@ -880,6 +880,13 @@ def test_attempt_wrapper_returns_precise_reservation_and_settlement(
 def test_child_stage_reservation_replays_without_replacing_root_authority(tmp_path: Path) -> None:
     """A child attempt persists destination facts once and retains its tenant-owned root."""
     platform = _platform(tmp_path)
+    from exp.runtime.gateway.tests.chain_authority_fixture_test import (
+        ChainAttemptLedger,
+        ChainControlStore,
+    )
+
+    platform.control = ChainControlStore(platform.database_path)
+    platform.attempts = ChainAttemptLedger(platform.database_path)
     platform.control.create_identity(
         organization_id="org-one",
         identity_id="builders",
@@ -909,6 +916,16 @@ def test_child_stage_reservation_replays_without_replacing_root_authority(tmp_pa
         identity_id="builders",
         key_id="builders-key",
     )
+    with platform.control._transaction() as connection:
+        connection.execute(
+            """CREATE TABLE test_chain_floors (organization_id TEXT, alias_id TEXT,
+            revision_id TEXT, digest TEXT, epoch INTEGER NOT NULL, catalog TEXT NOT NULL,
+            PRIMARY KEY(organization_id,alias_id))"""
+        )
+        connection.execute(
+            "INSERT INTO test_chain_floors VALUES(?,?,?,?,?,?)",
+            ("org-one", "coding", "alias-revision-one", _DIGEST, 1, "{}"),
+        )
     authorization = platform.control.authorize_request(
         raw_key=key.raw_key,
         alias="coding",

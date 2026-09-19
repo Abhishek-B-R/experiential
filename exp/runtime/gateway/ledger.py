@@ -50,6 +50,10 @@ from exp.runtime.gateway.ledger_usage import (
     identity_usage_rows,
 )
 from exp.runtime.gateway.ledger_valuation import frozen_usage_cost, optional_int
+from exp.runtime.gateway.model_chain_authority import (
+    ModelChainAuthorityError,
+    refuse_sqlite_chain_authorization,
+)
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
 from exp.runtime.gateway.sqlite.store import SystemGatewayClock
 
@@ -75,6 +79,20 @@ class SQLiteAttemptLedger:
         self._clock = SystemGatewayClock() if clock is None else clock
         self._busy_timeout_ms = busy_timeout_ms
         initialize_database(database_path, busy_timeout_ms=busy_timeout_ms)
+
+    def _require_chain_authority(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        authorization: AuthorizationSnapshot,
+        staged: bool = False,
+    ) -> None:
+        """Keep the generic local ledger fail-closed at its atomic write boundary."""
+        if staged or authorization.model_chain_authority is not None:
+            raise ModelChainAuthorityError("local SQLite cannot reserve model-chain attempts")
+        refuse_sqlite_chain_authorization(
+            connection, authorization.organization_id, authorization.alias_revision_id
+        )
 
     @property
     def busy_timeout_ms(self) -> int:
@@ -110,6 +128,7 @@ class SQLiteAttemptLedger:
             IdempotencyConflictError: The caller operation exists for another request.
             IdempotencyReplayUnavailableError: The matching operation already exists.
         """
+        self._require_chain_authority(connection, authorization=authorization)
         now = self._clock.now()
         remaining = max(0.0, authorization.deadline_monotonic - self._clock.monotonic())
         deadline_at = now + timedelta(seconds=remaining)
@@ -269,6 +288,9 @@ class SQLiteAttemptLedger:
         Returns:
             Stable new attempt ID.
         """
+        self._require_chain_authority(
+            connection, authorization=snapshot.authorization, staged=bool(snapshot.model_stages)
+        )
         # The in-process SQLite mirror carries no promo / rate-limit token
         # columns, so the reservations are accepted for Protocol parity and
         # dropped here; the platform's Postgres ledger stores and counts them.

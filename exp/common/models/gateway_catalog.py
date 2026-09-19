@@ -200,6 +200,26 @@ class NormalizedGatewayCatalog(ContractModel):
                 expand_model_chain(model_id, complete)
         return self
 
+    def requires_model_chain_authority(self, *, pool_id: str) -> bool:
+        """Classify one authoritative selected pool, including explicitly unavailable chains.
+
+        Unrelated chains in a shared document do not change this pool's serving
+        semantics. Hosts separately enforce the selected alias's retained floor.
+        Unknown pools and a chain attached to another same-model pool are errors,
+        never evidence of an independently plain route.
+        """
+        pool = next((item for item in self.pools if item.pool_id == pool_id), None)
+        if pool is None:
+            raise ValueError("authorized pool is absent from the exact catalog")
+        chain = next(
+            (item for item in self.model_chains if item.model_id == pool.exact_model_id), None
+        )
+        if chain is None:
+            return False
+        if chain.pool_id != pool.pool_id:
+            raise ValueError("authorized chain root does not match its exact pool")
+        return True
+
     def chains_by_model(self) -> dict[str, GatewayModelChain]:
         """Index authored chains, filling unambiguous direct-only model defaults."""
         chains = {chain.model_id: chain for chain in self.model_chains}

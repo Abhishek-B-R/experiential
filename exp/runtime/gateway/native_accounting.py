@@ -28,6 +28,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.ledger import AttemptRejectedError
+from exp.runtime.gateway.model_chain_authority import require_bound_model_chain_authority
 from exp.runtime.gateway.native_accounting_errors import (
     NativeBridgeError,
     authority_error,
@@ -344,6 +345,10 @@ class NativeAttemptAccounting:
         if entry is None or int(data["attempt_ordinal"]) != entry.total_attempts:
             raise NativeBridgeError(internal_protocol_error())
         route = entry.route
+        if entry.authorization.model_chain_authority is not None:
+            # The host refreshes an expired receipt inside reservation before
+            # binding it to the durable attempt; identity and mode cannot drift.
+            require_bound_model_chain_authority(entry.authorization, require_current=False)
         keys = tuple(
             deployment_health_key(entry.authorization, deployment)
             for deployment in route.deployments

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Protocol
 
-from exp.common.core.artifacts import ArtifactId, ContractModel, stable_id
+from exp.common.core.artifacts import ContractModel
 from exp.common.models import ModelRequest
 from exp.common.models.gateway_catalog import (
     ExactModelDeployment,
@@ -37,6 +37,9 @@ from exp.runtime.gateway.model_plan import (
     model_execution_snapshot,
     project_stage_selection,
     stage_start_authorized,
+)
+from exp.runtime.gateway.project_episode_identity import (
+    project_episode_identity as project_episode_identity,
 )
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded, RequestDeadline
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
@@ -361,6 +364,19 @@ class CatalogRouteResolver:
             route_reason="learned_router",
             fallback_reason=selection.fallback_reason,
         )
+
+    def requires_model_chain_authority(self, authorization: AuthorizationSnapshot) -> bool:
+        """Classify the exact selected root, not unrelated models in the shared catalog."""
+        view = self._catalogs.get((authorization.alias_revision_id, authorization.catalog_sha256))
+        if view is None:
+            raise GatewayRoutingError("authorized catalog snapshot is not active for this revision")
+        if isinstance(authorization.target, ProjectTarget):
+            if authorization.target.catalog_sha256 != authorization.catalog_sha256:
+                raise GatewayRoutingError(
+                    "project target catalog differs from authorized authority"
+                )
+            return False
+        return view.catalog.requires_model_chain_authority(pool_id=authorization.target.pool_id)
 
     def resolve_direct(self, authorization: AuthorizationSnapshot) -> GatewayRoute:
         """Resolve one direct-target authorization without event-loop work.
@@ -973,26 +989,3 @@ def _consume_abandoned_selection[SelectionT](wrapped: asyncio.Future[SelectionT]
     """Retrieve a detached selection outcome so late failures are not logged as leaks."""
     if not wrapped.cancelled():
         wrapped.exception()
-
-
-def project_episode_identity(
-    namespace: tuple[ArtifactId, ArtifactId, ArtifactId, str],
-) -> str:
-    """Encode tenant-scoped episode components without delimiter collisions.
-
-    Args:
-        namespace: Organization, identity, alias revision, and caller episode key.
-
-    Returns:
-        Stable content-addressed identity with explicit component boundaries.
-    """
-    organization_id, identity_id, alias_revision_id, episode_key = namespace
-    return stable_id(
-        "gateway-project-episode",
-        {
-            "organization_id": organization_id,
-            "identity_id": identity_id,
-            "alias_revision_id": alias_revision_id,
-            "episode_key": episode_key,
-        },
-    )

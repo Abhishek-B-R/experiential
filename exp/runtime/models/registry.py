@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import Literal, Protocol
 
 from exp.common.core.artifacts import JsonObject, sha256_json
@@ -14,8 +15,10 @@ from exp.common.models import (
     ModelCatalog,
     ModelClient,
     ModelSnapshot,
+    NormalizedGatewayCatalog,
     ReasoningEffort,
     known_model_metadata,
+    normalize_gateway_catalog,
 )
 from exp.runtime.models.credentials import (
     DispatchCredentialReceipt,
@@ -162,6 +165,15 @@ class RuntimeModelCatalog:
         self._tinker_sampler_factory = tinker_sampler_factory
         self._bedrock_runtime_factory = bedrock_runtime_factory
         self._vertex_token_provider_factory = vertex_token_provider_factory
+
+    def requires_model_chain_authority(self, *, pool_id: str) -> bool:
+        """Classify the selected authored root through exact normalized pool/model membership."""
+        return self._gateway_catalog.requires_model_chain_authority(pool_id=pool_id)
+
+    @cached_property
+    def _gateway_catalog(self) -> NormalizedGatewayCatalog:
+        """Normalize immutable authored serving membership once, without provider or file access."""
+        return normalize_gateway_catalog(self._catalog)
 
     def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
         """Resolve static identity and exact capability evidence without provider access.

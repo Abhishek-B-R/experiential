@@ -19,12 +19,15 @@ from exp.common.models.gateway_chains import (
     GatewayModelChain,
     GatewayModelReferenceRung,
 )
-from exp.runtime.gateway.catalog_authority import snapshot_current_catalog
 from exp.runtime.gateway.guardrails.config import engine_from_document
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.native_server import serve_native_gateway
+from exp.runtime.gateway.tests.chain_authority_fixture_test import (
+    chain_components,
+    publish_authored_chain_fixture,
+)
 from exp.runtime.gateway.tests.native_waterfall_test import (
     _content_chunk,
     _sse_frame,
@@ -104,15 +107,7 @@ def test_native_regex_redacts_before_delivery(
                 }
             ),
         )
-        _, normalized, snapshot = snapshot_current_catalog(tmp_path)
-        manager.activate_direct_alias(
-            alias_id="coding",
-            alias_name="coding",
-            revision_id="guarded-chain",
-            pool_id="coding",
-            snapshot_ref=f"catalog-snapshots/{snapshot.name}",
-            catalog_sha256=normalized.identity_sha256(),
-        )
+        publish_authored_chain_fixture(tmp_path, revision_id="guarded-chain", pool_id="coding")
     engine = engine_from_document(
         {
             "adapters": [{"kind": "regex", "adapter_id": "email", "builtin_patterns": ["email"]}],
@@ -138,7 +133,9 @@ def test_native_regex_redacts_before_delivery(
         }
     )
     control = NativeControlPlane(
-        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "synthetic"}),
+        (chain_components if staged_failure else load_gateway_components)(
+            tmp_path, environment={"TEST_PROVIDER_KEY": "synthetic"}
+        ),
         guardrails=engine,
     )
     with socket.socket() as probe:

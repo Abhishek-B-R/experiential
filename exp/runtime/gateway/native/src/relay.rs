@@ -352,7 +352,7 @@ impl UpstreamRelay {
         // the caller's tools, so it never counts toward one-call-per-turn
         // serialization and never reaches the Codex inversion or the caller.
         let Some(mut event) = self.tool_search.filter(event) else {
-            return true;
+            return Ok(true);
         };
         if let Some(serializer) = self.tool_serializer.as_mut() {
             let Some(kept) = serializer.filter(event) else {

@@ -46,6 +46,7 @@ FORBIDDEN_REQUIREMENTS = frozenset(
 )
 REQUIRED_CORE_REQUIREMENTS = frozenset(
     {
+        "anyio",
         "boto3",
         "botocore",
         "click",
@@ -344,16 +345,67 @@ def test_native_companion_metadata_rejects_unreviewed_resolution() -> None:
             _assert_exact_native_requirement(f"Requires-Dist: {requirement}\n", "0.3.88")
 
 
+def _assert_anyio_security_requirement(metadata: str) -> None:
+    """Require the unconditional registry security floor for the async HTTP transport."""
+    requirements = [
+        Requirement(value)
+        for value in Parser().parsestr(metadata, headersonly=True).get_all("Requires-Dist", [])
+    ]
+    anyio = [item for item in requirements if canonicalize_name(item.name) == "anyio"]
+    assert len(anyio) == 1, "release must name exactly one AnyIO security requirement"
+    requirement = anyio[0]
+    assert requirement.marker is None and requirement.url is None and not requirement.extras
+    assert str(requirement.specifier) == ">=4.14.2", (
+        "release must preserve the AnyIO security floor"
+    )
+
+
+def test_anyio_security_requirement_is_mandatory_in_source() -> None:
+    """The security floor must ship in all runtime installs, not only an optional extra."""
+    repository = Path(__file__).resolve().parent.parent.parent
+    project = tomllib.loads((repository / "pyproject.toml").read_text())["project"]
+    metadata = "\n".join(f"Requires-Dist: {value}" for value in project["dependencies"])
+    _assert_anyio_security_requirement(metadata)
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    [
+        "",
+        "anyio",
+        "anyio>=4.14.1",
+        "anyio==4.14.*",
+        "anyio~=4.14.2",
+        'anyio>=4.14.2; extra == "dev"',
+        'anyio>=4.14.2; sys_platform == "linux"',
+        'anyio>=4.14.2; extra == "dev" or python_version >= "3.12"',
+        "anyio[trio]>=4.14.2",
+        "anyio @ https://example.test/anyio.whl",
+        "anyio>=4.14.2\nRequires-Dist: anyio>=4.14.2",
+    ],
+)
+def test_anyio_security_requirement_rejects_missing_or_conditional_floor(requirement: str) -> None:
+    """A package name, optional marker or weaker specifier cannot claim the security contract."""
+    with pytest.raises(AssertionError):
+        _assert_anyio_security_requirement(
+            "" if not requirement else f"Requires-Dist: {requirement}\n"
+        )
+
+
 def _assert_release_requirements(metadata: str) -> None:
     """Require the independently declared core dependency contract."""
     _assert_allowed_requirements(metadata)
     core = _validated_release_core_names(metadata)
     assert core == _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
+    _assert_anyio_security_requirement(metadata)
 
 
 def test_release_requirement_contract_distinguishes_sanctioned_dev_extra() -> None:
     """Allow the SDK drift-check extra without allowing it into runtime installs."""
-    core = "\n".join(f"Requires-Dist: {name}" for name in REQUIRED_CORE_REQUIREMENTS)
+    core = "\n".join(
+        f"Requires-Dist: {name}{'>=4.14.2' if name == 'anyio' else ''}"
+        for name in REQUIRED_CORE_REQUIREMENTS
+    )
     _assert_release_requirements(core + '\nRequires-Dist: anthropic>=1.2; extra == "dev"')
     _assert_release_requirements(core + "\nRequires-Dist: anthropic>=1.2; extra == 'dev'")
     for requirement in (
