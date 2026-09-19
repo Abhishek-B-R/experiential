@@ -212,3 +212,34 @@ def test_caller_provider_preferences_are_dropped_on_wires_without_the_field() ->
     payload = entry["upstream_payload"]
     assert isinstance(payload, dict)
     assert "provider" not in payload
+
+
+def test_every_anthropic_fallback_freezes_us_constraint_before_dispatch() -> None:
+    """Primary and fallback bodies carry the policy into the retryable native dispatch."""
+    primary, fallback = _deployment("primary", "anthropic"), _deployment("fallback", "anthropic")
+    route = _route((primary, fallback))
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        stream=True,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        inference_geo="global",
+    )
+    profile = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://api.anthropic.com/v1/messages",
+        model_id="claude-opus-5",
+        inference_geo="us",
+    )
+    for deployment in route.deployments:
+        entry = build_rung_dispatch(
+            route,
+            deployment,
+            profile,
+            _NoSigningClient(),
+            provider_request=request,
+            public_request=request,
+            authorization=_AUTHORIZATION,
+        ).wire_entry
+        payload = entry["upstream_payload"]
+        assert isinstance(payload, dict)
+        assert payload["inference_geo"] == "us"

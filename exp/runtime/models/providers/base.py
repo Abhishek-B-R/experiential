@@ -108,6 +108,9 @@ class GatewayWireProfile:
     headers: Mapping[str, str] = field(default_factory=dict, repr=False)
     """Authenticated request headers for every dispatch, excluded from diagnostics."""
 
+    inference_geo: Literal["us"] | None = field(default=None, kw_only=True)
+    """Operator constraint applied after caller payload shaping on each Anthropic attempt."""
+
     model_id: str = ""
     """Exact provider model identifier."""
 
