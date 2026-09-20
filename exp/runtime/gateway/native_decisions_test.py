@@ -154,8 +154,8 @@ def _admit(control: NativeControlPlane, raw_key: str, body: JsonObject | None = 
     )
 
 
-def test_decisions_never_enter_authored_model_reference_stages(tmp_path: Path) -> None:
-    """A decision alias remains exact-model even when its catalog also authors a child chain."""
+def test_decisions_refuse_selected_model_chain_before_acceptance(tmp_path: Path) -> None:
+    """A host receipt cannot authorize unsupported decision semantics for a selected chain root."""
     _control, key = _control_plane(tmp_path)
     catalog = load_model_catalog(tmp_path / "models.toml")
     root = catalog.models["decision-0"]
@@ -192,16 +192,13 @@ def test_decisions_never_enter_authored_model_reference_stages(tmp_path: Path) -
     control = NativeControlPlane(
         chain_components(tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"})
     )
-    admitted = _admit(control, key)
-    wires = admitted["route"]
-    assert isinstance(wires, list)
-    assert [wire["deployment_id"] for wire in wires] == ["decision-0"]
-    entry = control._accounting.entry(str(admitted["request_id"]))
-    assert entry is not None
-    assert entry.route.snapshot.model_stages == ()
-    assert entry.route.snapshot.exact_model_id == "systemone-exact"
-    assert entry.route.snapshot.deployment_ids == ("decision-0",)
-    control.abandon(json.dumps({"request_id": admitted["request_id"]}))
+    with pytest.raises(NativeBridgeError) as error:
+        _admit(control, key)
+    assert _public_error(error.value)["code"] == "model_chain_authority_unavailable"
+    assert _rows(control) == []
+    ledger = cast(SQLiteAttemptLedger, control._components.ledger)
+    with sqlite3.connect(ledger.database_path) as connection:
+        assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()[0] == 0
 
 
 def _rows(control: NativeControlPlane) -> list[tuple[str, str | None]]:

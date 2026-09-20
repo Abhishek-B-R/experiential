@@ -7,7 +7,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Literal, cast
 from uuid import uuid4
 
 import pytest
@@ -49,6 +49,310 @@ def _binding(**updates: object) -> ModelChainAuthority:
     )
     data.update(updates)
     return ModelChainAuthority.model_validate(data)
+
+
+def _nonchat_components(
+    root: Path,
+    surface: Literal["embeddings", "images", "decisions"],
+    chain_policy: Literal["absent", "empty", "available", "unavailable", "unrelated"],
+) -> tuple[NativeGatewayComponents, str, dict[str, object]]:
+    """Compose stock public SQLite components with a metadata-only remote snapshot reference."""
+    from exp.common.models import (
+        BillingSource,
+        ConnectionConfig,
+        GatewayDeploymentCapabilities,
+        GatewayDeploymentMetadata,
+        GatewayTokenPrices,
+        ModelCapabilities,
+        ModelCatalog,
+        ModelRecord,
+        ModelRoles,
+    )
+    from exp.runtime.gateway.contracts import DirectTarget
+    from exp.runtime.gateway.ledger import SQLiteAttemptLedger
+    from exp.runtime.gateway.management import GatewayManagement
+    from exp.runtime.gateway.routing import CatalogRouteResolver
+    from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
+    from exp.runtime.models import RuntimeModelCatalog
+
+    manager = GatewayManagement(root)
+    manager.initialize()
+    provider = "typesafe" if surface == "decisions" else "openai-compatible"
+    record = ModelRecord(
+        connection="provider",
+        model="fixture-model",
+        billing_source=BillingSource.HOST_MANAGED,
+        capabilities=ModelCapabilities(
+            supports_embeddings=surface == "embeddings",
+            supports_image_generation=surface == "images",
+        ),
+        gateway=GatewayDeploymentMetadata(
+            exact_model_id="root-model",
+            capabilities=GatewayDeploymentCapabilities(supports_decisions=surface == "decisions"),
+            prices=GatewayTokenPrices(
+                input_nano_usd_per_million_tokens=1_000_000,
+                output_nano_usd_per_million_tokens=0,
+            ),
+        ),
+    )
+    models = {"root": record}
+    chains: dict[str, GatewayModelChain] = {}
+    if chain_policy in ("available", "unavailable"):
+        chains["root-model"] = GatewayModelChain(
+            model_id="root-model",
+            pool_id="root",
+            revision="chain",
+            available=chain_policy == "available",
+            rungs=(GatewayDeploymentRung(deployment_id="root"),),
+        )
+    elif chain_policy == "unrelated":
+        assert record.gateway is not None
+        models["other"] = record.model_copy(
+            update={"gateway": record.gateway.model_copy(update={"exact_model_id": "other-model"})}
+        )
+        chains["other-model"] = GatewayModelChain(
+            model_id="other-model",
+            pool_id="other",
+            revision="chain",
+            available=False,
+            rungs=(GatewayDeploymentRung(deployment_id="other"),),
+        )
+    authored = ModelCatalog(
+        connections={
+            "provider": ConnectionConfig(
+                provider=provider,
+                api_key_env="TEST_PROVIDER_KEY",
+                base_url=None if surface == "decisions" else "http://127.0.0.1:9/v1",
+            )
+        },
+        models=models,
+        roles=ModelRoles(candidates=("root",), incumbent="root"),
+        gateway_model_chains=chains,
+    )
+    authored = ModelCatalog.model_validate_json(authored.model_dump_json())
+    normalized = normalize_gateway_catalog(authored)
+    digest = normalized.identity_sha256()
+    reference = "remote/plain.json"
+    if chain_policy == "empty":
+        snapshot = manager.state_dir / reference
+        snapshot.parent.mkdir()
+        snapshot.write_text(normalized.model_dump_json())
+    else:
+        assert not (manager.state_dir / reference).exists()
+    store = manager.require_initialized()
+    store.register_catalog_snapshot(
+        organization_id=manager.organization_id,
+        snapshot_ref=reference,
+        catalog_sha256=digest,
+    )
+    store.activate_alias_revision(
+        organization_id=manager.organization_id,
+        alias_id="alias",
+        alias_name="public",
+        revision_id="remote-revision",
+        target=DirectTarget(pool_id="root"),
+        snapshot_ref=reference,
+        catalog_sha256=digest,
+    )
+    manager.create_identity(identity_id="caller", display_name="Caller")
+    manager.add_grant(identity_id="caller", alias_id="alias")
+    issued = manager.issue_key(identity_id="caller", key_id="key")
+    ledger = SQLiteAttemptLedger(manager.database_path)
+    routes = CatalogRouteResolver({("remote-revision", digest): normalized})
+    runtime = RuntimeModelCatalog(authored, environment={"TEST_PROVIDER_KEY": "test-only"})
+    assert type(store) is SQLiteGatewayStore
+    assert type(ledger) is SQLiteAttemptLedger
+    assert type(routes) is CatalogRouteResolver
+    assert type(runtime) is RuntimeModelCatalog
+    body: dict[str, object] = {"model": "public"}
+    if surface == "embeddings":
+        body["input"] = "hello"
+    elif surface == "images":
+        body["prompt"] = "a cat"
+    else:
+        body.update(
+            {
+                "state": {"value": "hello"},
+                "questions": {
+                    "safe": {
+                        "type": "noul",
+                        "instructions": "Classify",
+                        "criteria": {"true": "yes", "false": "no"},
+                    }
+                },
+            }
+        )
+    return (
+        cast(
+            NativeGatewayComponents,
+            SimpleNamespace(
+                store=store,
+                ledger=ledger,
+                routes=routes,
+                write_ledger=None,
+                runtime_catalogs={("remote-revision", digest): runtime},
+                organization_id=manager.organization_id,
+            ),
+        ),
+        issued.raw_key,
+        body,
+    )
+
+
+@pytest.mark.parametrize("surface", ["embeddings", "images", "decisions"])
+@pytest.mark.parametrize("chain_policy", ["available", "unavailable"])
+def test_nonchat_remote_chain_refuses_before_stock_acceptance(
+    tmp_path: Path,
+    surface: Literal["embeddings", "images", "decisions"],
+    chain_policy: Literal["available", "unavailable"],
+) -> None:
+    """In-memory protected roots cannot lose their authority through non-chat direct projection."""
+    from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
+
+    components, key, body = _nonchat_components(tmp_path, surface, chain_policy)
+    control = NativeControlPlane(components)
+    argument = json.dumps({"raw_key": key, "body": json.dumps(body), "idempotency_key": "same"})
+    for _ in range(2):
+        with pytest.raises(NativeBridgeError) as error:
+            getattr(control, f"admit_{surface}")(argument)
+        assert (
+            json.loads(error.value.public_error_json)["code"] == "model_chain_authority_unavailable"
+        )
+    from exp.runtime.gateway.ledger import SQLiteAttemptLedger
+
+    ledger = cast(SQLiteAttemptLedger, components.ledger)
+    with sqlite3.connect(ledger.database_path) as connection:
+        assert connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("surface", ["embeddings", "images", "decisions"])
+@pytest.mark.parametrize("chain_policy", ["absent", "empty", "unrelated"])
+@pytest.mark.parametrize("configured_host", [False, True])
+def test_nonchat_plain_remote_and_mixed_catalog_keep_exact_model_serving(
+    tmp_path: Path,
+    surface: Literal["embeddings", "images", "decisions"],
+    chain_policy: Literal["absent", "empty", "unrelated"],
+    configured_host: bool,
+) -> None:
+    """Ordinary roots dispatch once per call, with fresh host checks when configured."""
+    from exp.runtime.gateway.ledger import SQLiteAttemptLedger
+    from exp.runtime.gateway.model_chain_authority import ModelChainAuthorityMode
+    from exp.runtime.gateway.native_bridge import NativeControlPlane
+    from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
+
+    components, key, body = _nonchat_components(tmp_path, surface, chain_policy)
+    ledger = cast(SQLiteAttemptLedger, components.ledger)
+
+    class PlainHost(SQLiteGatewayStore):
+        """Check current plain authority without pretending to support protected aliases."""
+
+        calls = 0
+
+        def authorize_model_chain(
+            self,
+            *,
+            authorization: AuthorizationSnapshot,
+            mode: ModelChainAuthorityMode = "dispatch",
+        ) -> AuthorizationSnapshot:
+            """Read the selected revision and grant before confirming the unchanged plain root."""
+            self.calls += 1
+            with self._connect() as connection:
+                row = connection.execute(
+                    """SELECT r.revision_id,r.catalog_sha256,r.pool_id FROM gateway_aliases a
+                    JOIN alias_revisions r ON r.organization_id=a.organization_id
+                      AND r.revision_id=a.active_revision_id
+                    JOIN identity_alias_grants g ON g.organization_id=a.organization_id
+                      AND g.alias_id=a.alias_id WHERE a.organization_id=? AND a.alias_name=?
+                      AND g.identity_id=? AND a.active=1""",
+                    (authorization.organization_id, authorization.alias, authorization.identity_id),
+                ).fetchone()
+            assert row is not None
+            assert tuple(row) == (
+                authorization.alias_revision_id,
+                authorization.catalog_sha256,
+                "root",
+            )
+            assert not components.routes.requires_model_chain_authority(authorization)
+            return authorization
+
+    host = PlainHost(ledger.database_path)
+    if configured_host:
+        components = cast(
+            NativeGatewayComponents, SimpleNamespace(**{**vars(components), "store": host})
+        )
+    control = NativeControlPlane(components)
+    argument = json.dumps({"raw_key": key, "body": json.dumps(body), "idempotency_key": "same"})
+    for index in range(2):
+        admitted = json.loads(getattr(control, f"admit_{surface}")(argument))
+        entry = control._accounting.entry(admitted["request_id"])
+        assert entry is not None and not entry.route.snapshot.model_stages
+        assert entry.route.snapshot.exact_model_id == "root-model"
+        assert entry.route.snapshot.deployment_ids == ("root",)
+        started = json.loads(
+            control.start_attempt(
+                json.dumps(
+                    {
+                        "request_id": admitted["request_id"],
+                        "attempt_ordinal": 0,
+                    }
+                )
+            )
+        )
+        assert started["route_depth"] == 0
+        control.abandon(json.dumps({"request_id": admitted["request_id"]}))
+        assert host.calls == (index + 1 if configured_host else 0)
+    with sqlite3.connect(ledger.database_path) as connection:
+        assert connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0] == 2
+        assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()[0] == 2
+
+
+@pytest.mark.parametrize("surface", ["embeddings", "images", "decisions"])
+def test_nonchat_cached_receiptless_plain_authority_still_checks_host_floor(
+    tmp_path: Path,
+    surface: Literal["embeddings", "images", "decisions"],
+) -> None:
+    """A configured host refusal is terminal before any non-chat acceptance or reservation."""
+    from exp.runtime.gateway.ledger import SQLiteAttemptLedger
+    from exp.runtime.gateway.model_chain_authority import ModelChainAuthorityMode
+    from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
+    from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
+
+    components, key, body = _nonchat_components(tmp_path, surface, "absent")
+    ledger = cast(SQLiteAttemptLedger, components.ledger)
+
+    class ProtectedHost(SQLiteGatewayStore):
+        """A retained floor refuses plain metadata returned by the first authorization step."""
+
+        calls = 0
+
+        def authorize_model_chain(
+            self,
+            *,
+            authorization: AuthorizationSnapshot,
+            mode: ModelChainAuthorityMode = "dispatch",
+        ) -> AuthorizationSnapshot:
+            """Propagate unavailable protected authority instead of silently passing plain data."""
+            self.calls += 1
+            assert authorization.model_chain_authority is None
+            raise ModelChainAuthorityError("retained protected alias floor refuses this revision")
+
+    host = ProtectedHost(ledger.database_path)
+    components = cast(
+        NativeGatewayComponents, SimpleNamespace(**{**vars(components), "store": host})
+    )
+    control = NativeControlPlane(components)
+    argument = json.dumps({"raw_key": key, "body": json.dumps(body)})
+    for _ in range(2):
+        with pytest.raises(NativeBridgeError) as error:
+            getattr(control, f"admit_{surface}")(argument)
+        assert (
+            json.loads(error.value.public_error_json)["code"] == "model_chain_authority_unavailable"
+        )
+    assert host.calls == 2
+    with sqlite3.connect(ledger.database_path) as connection:
+        assert connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()[0] == 0
 
 
 def test_plain_authority_does_not_require_an_optional_chain_backend() -> None:

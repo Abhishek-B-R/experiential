@@ -1,6 +1,6 @@
 # Ordered model chains
 
-A direct Chat Completions, Responses, or Messages alias can reference another model's provider chain. Image generation, embeddings, and project selection keep their direct exact-model semantics. Provider pools still certify only one exact model; a model reference is not equivalence certification.
+A direct Chat Completions, Responses, or Messages alias can reference another model's provider chain. Image generation, embeddings, decisions, and project selection do not gain cross-model traversal. Image, embedding, and decision requests whose selected root carries chain policy are refused before acceptance, including explicitly unavailable chains; independent plain roots in the same catalog keep exact-model serving. Provider pools still certify only one exact model; a model reference is not equivalence certification.
 
 ## Configuration
 
