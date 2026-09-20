@@ -138,6 +138,15 @@ class RungShed:
     it; the durable disclosure column stays the bare reason code. A float
     because the ceiling can sit below one request per minute per worker.
     """
+    default_bound: bool = False
+    """Whether the bound that shed was the worker's default lane share.
+
+    A ``queue_bound`` shed by a bound the rung never authored (the worker's
+    default in-flight share, ``exp.runtime.gateway.lane_saturation``) is never
+    force-admitted when the ladder is exhausted: the default exists to keep
+    one lane from holding every admission permit, so overflowing it would
+    protect nothing. An authored bound keeps its authored ``saturation``.
+    """
 
 
 @dataclass
@@ -194,18 +203,25 @@ class RungLoadRegistry:
         *,
         activity_window_seconds: float = ACTIVITY_WINDOW_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        default_bound: int | None = None,
     ) -> None:
         """Initialize empty counters with an injectable clock for tests.
 
         Args:
             activity_window_seconds: Recency horizon for share reservations.
             clock: Monotonic clock.
+            default_bound: The per-worker in-flight cap applied to every rung
+                that authors no ``concurrency_bound`` (the worker's default
+                lane share); ``None`` leaves unauthored rungs unbounded.
 
         Raises:
             ValueError: The activity window is not positive.
         """
         if activity_window_seconds <= 0:
             raise ValueError("activity window must be positive")
+        if default_bound is not None and default_bound < 1:
+            raise ValueError("default_bound must be at least one")
+        self.default_bound = default_bound
         self._window = activity_window_seconds
         self._clock = clock
         self._rungs: dict[RungLoadKey, _RungLoad] = {}
@@ -228,6 +244,8 @@ class RungLoadRegistry:
         warm_session: bool = True,
         fresh_spill_fraction: float | None = None,
         force: bool = False,
+        hard_bound: bool = False,
+        rate_retry: bool = False,
     ) -> str | RungShed:
         """Reserve one slot on a policy-bounded rung, or shed with a reason.
 
@@ -249,8 +267,9 @@ class RungLoadRegistry:
                 here); fresh sessions shed at the early threshold.
             fresh_spill_fraction: Fraction of the bound where fresh sessions
                 shed early; ``None`` disables the early threshold.
-            force: Admit past every policy limit (the caller proved no other
-                rung can serve; policy must never manufacture a failure).
+            force: Admit past soft policy limits when the caller permits overflow.
+            hard_bound: Recheck the capacity ceiling even on a forced rate-window retry.
+            rate_retry: Skip rate windows, not capacity, fairness or fresh-session checks.
 
         Returns:
             An opaque ticket on admission, else the shed disclosure.
@@ -265,7 +284,9 @@ class RungLoadRegistry:
             organization.weight = weight
             self._prune(key, rung, now)
             self._prune_window(rung, now)
-            if not force:
+            if hard_bound and bound is not None and rung.total >= bound:
+                return RungShed("queue_bound")
+            if not force or rate_retry:
                 shed = self._shed_reason(
                     rung,
                     organization,
@@ -278,6 +299,7 @@ class RungLoadRegistry:
                     reserved_tokens=reserved_tokens,
                     warm_session=warm_session,
                     fresh_spill_fraction=fresh_spill_fraction,
+                    skip_rate=rate_retry,
                 )
                 if shed is not None:
                     return shed
@@ -353,6 +375,7 @@ class RungLoadRegistry:
         reserved_tokens: int,
         warm_session: bool,
         fresh_spill_fraction: float | None,
+        skip_rate: bool = False,
     ) -> RungShed | None:
         """Decide one reservation under the registry lock; ``None`` admits.
 
@@ -386,7 +409,7 @@ class RungLoadRegistry:
             ):
                 return RungShed("fresh_session_spill")
         working_rpm = self._working_rpm(rung, requests_per_minute, now)
-        if working_rpm is not None and rung.window_requests + 1 > working_rpm:
+        if not skip_rate and working_rpm is not None and rung.window_requests + 1 > working_rpm:
             return RungShed("rate_limit", learned_requests_per_minute=rung.learned_rpm)
         # Burst allowance: a single request whose worst-case reservation alone
         # exceeds the token cap must still be admissible into an EMPTY window
@@ -395,7 +418,8 @@ class RungLoadRegistry:
         # rate limiting. It then occupies the window and blocks further
         # dispatches until it slides out.
         if (
-            tokens_per_minute is not None
+            not skip_rate
+            and tokens_per_minute is not None
             and rung.window_tokens > 0
             and rung.window_tokens + reserved_tokens > tokens_per_minute
         ):

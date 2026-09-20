@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     GatewayEventKind,
+    GatewayFailure,
     GatewayFailureClass,
     GatewayRefusalReason,
     GatewayUsage,
@@ -16,6 +18,7 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.native_settlement import (
     _usage_from_payload,  # noqa: PLC2701 - direct unit coverage for normalization.
     accepts_keyword,
+    exhausted_attempt_payload,
     first_token_at_from_settlement,
     settlement_metadata,
     settlement_rate_limit,
@@ -29,6 +32,26 @@ from exp.runtime.gateway.native_settlement import (
     web_search_requests_from_terminal,
     web_search_requests_kwarg,
 )
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_exhausted_attempt_payload_preserves_exact_optional_boundary_fields(full: bool) -> None:
+    """Exhausted selection preserves native wire fields without adding absent values."""
+    fields: JsonObject = {"failure_class": "refusal", "safe_message": "request refused"}
+    if full:
+        fields.update(
+            {
+                "customer_owned": True,
+                "rejected_parameter": "tools",
+                "provider_detail": "provider rejected tools",
+                "refusal_reason": "cyber_policy",
+                "retry_after_seconds": 5,
+            }
+        )
+    failure = GatewayFailure.model_validate(fields)
+    assert exhausted_attempt_payload(failure) == json.dumps(
+        {"exhausted": True, "failure": fields}, separators=(",", ":")
+    )
 
 
 def test_settlement_metadata_is_exact_content_free_and_host_capability_bound() -> None:

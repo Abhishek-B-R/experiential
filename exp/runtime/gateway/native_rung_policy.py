@@ -17,6 +17,7 @@ waiting on before the first throttle arrives.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 
@@ -48,6 +49,7 @@ def reserve_rung_slot(
     *,
     reserved_tokens: int,
     force: bool,
+    rate_retry: bool = False,
 ) -> str | RungShed | None:
     """Reserve one policy-bounded slot on a rung, or report the shed.
 
@@ -58,20 +60,24 @@ def reserve_rung_slot(
         deployment: The claimed rung about to dispatch.
         reserved_tokens: Worst-case tokens this dispatch reserves, counted
             against the rung's token window when one is authored.
-        force: Admit past every policy limit because no other rung can
-            serve.
+        force: Admit past soft policy limits when overflow is explicitly allowed.
+        rate_retry: Skip only rate-window checks after scheduled backoff.
 
     Returns:
         An opaque reservation ticket, the shed disclosure, or ``None``
         when the rung authors no admission policy (the untouched default).
     """
     policy = deployment.gateway.dispatch
-    if policy is None or (
-        policy.concurrency_bound is None
-        and policy.requests_per_minute is None
-        and policy.tokens_per_minute is None
-    ):
+    authored = policy is not None and (
+        policy.concurrency_bound is not None
+        or policy.requests_per_minute is not None
+        or policy.tokens_per_minute is not None
+    )
+    if not authored and loads.default_bound is None:
         return None
+    # An unauthored bound falls back to the worker's default lane share.
+    applies_default = policy is None or policy.concurrency_bound is None
+    bound = loads.default_bound if applies_default else policy.concurrency_bound
     # Scoped routes carry admission-verified warmth for THIS rung. Ordinary
     # direct affinity routes instead read their live conversation binding. Never
     # let that unscoped binding stand in for tenant/prefix/credential evidence.
@@ -82,7 +88,8 @@ def reserve_rung_slot(
     # (embeddings, images) must never be classed fresh wholesale.
     fresh_fraction = (
         policy.fresh_session_spill_fraction
-        if entry.route.snapshot.stage_for_depth(
+        if policy is not None
+        and entry.route.snapshot.stage_for_depth(
             entry.route.snapshot.deployment_ids.index(deployment.deployment_id)
         ).failover_mode
         == "maximize_cache_affinity"
@@ -97,20 +104,25 @@ def reserve_rung_slot(
             if entry.recovery_scoped
             else sticky.bound_deployment(entry.affinity_fingerprint) == deployment.deployment_id
         )
+    tokens_per_minute = None if policy is None else policy.tokens_per_minute
     result = loads.reserve(
         rung_load_key(deployment),
         organization_id=entry.authorization.organization_id,
         weight=entry.authorization.fair_share_weight,
-        bound=policy.concurrency_bound,
-        fair_share=policy.fair_share,
-        requests_per_minute=policy.requests_per_minute,
-        tokens_per_minute=policy.tokens_per_minute,
-        cache_priority_alpha=policy.cache_priority_alpha,
-        reserved_tokens=reserved_tokens if policy.tokens_per_minute is not None else 0,
+        bound=bound,
+        fair_share=policy is not None and policy.fair_share,
+        requests_per_minute=None if policy is None else policy.requests_per_minute,
+        tokens_per_minute=tokens_per_minute,
+        cache_priority_alpha=None if policy is None else policy.cache_priority_alpha,
+        reserved_tokens=reserved_tokens if tokens_per_minute is not None else 0,
         warm_session=warm_session,
         fresh_spill_fraction=fresh_fraction,
         force=force,
+        hard_bound=applies_default or (policy is not None and policy.saturation == "refuse"),
+        rate_retry=rate_retry,
     )
+    if isinstance(result, RungShed) and applies_default and result.reason == "queue_bound":
+        result = dataclasses.replace(result, default_bound=True)
     if isinstance(result, RungShed) and result.reason == "rate_limit":
         _logger.debug(
             "gateway rate-limit shed on deployment %r (learned ceiling %s/min)",
@@ -118,6 +130,26 @@ def reserve_rung_slot(
             result.learned_requests_per_minute,
         )
     return result
+
+
+def bind_sticky_dispatch(
+    sticky: StickySpillRegistry,
+    entry: InflightRequest,
+    deployment: ExactModelDeployment,
+) -> None:
+    """Refresh ordinary direct affinity placement, never scoped cache evidence."""
+    if entry.route.snapshot.model_stages or entry.affinity_fingerprint is None:
+        return
+    if entry.route.snapshot.failover_mode != "maximize_cache_affinity":
+        return
+    policy = deployment.gateway.dispatch
+    if policy is None or policy.sticky_spill_seconds is None:
+        return
+    sticky.bind(
+        entry.affinity_fingerprint,
+        deployment.deployment_id,
+        ttl_seconds=float(policy.sticky_spill_seconds),
+    )
 
 
 def failed_dispatch_candidate(

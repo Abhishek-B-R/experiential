@@ -490,6 +490,44 @@ def test_unknown_frozen_region_does_not_record_settled_cache_evidence(swept: boo
     assert terminal.usage.cache_creation_input_tokens == 10
 
 
+def test_operator_us_inference_constraint_cannot_inherit_global_recovery() -> None:
+    """The operator selector still applies without reusing unscoped global cache evidence."""
+    from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
+
+    route = _route()
+    host = Host()
+    profile = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://api.anthropic.com/v1/messages",
+        model_id=route.deployment.provider_model,
+        credential_receipt=DispatchCredentialReceipt(uuid4()),
+        inference_geo="us",
+    )
+    scoped = bind_recovery_profiles(
+        (route.deployment,),
+        ((profile, cast(NativeWireClient, object())),),
+        route.snapshot.authorization.organization_id,
+        host,
+    )[0][0]
+    assert scoped.recovery_binding is None and not host.observed
+    assert dialect_stream_payload(profile, request())["inference_geo"] == "us"
+    global_profile = bind_recovery_profiles(
+        (route.deployment,),
+        ((replace(profile, inference_geo=None), cast(NativeWireClient, object())),),
+        route.snapshot.authorization.organization_id,
+        host,
+    )[0][0]
+    assert global_profile.recovery_binding is not None
+    assert (
+        validated_recovery_binding(
+            route.deployment,
+            replace(global_profile, inference_geo="us"),
+            route.snapshot.authorization.organization_id,
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize("region", ["us", "eu", "future-region"])
 def test_request_geography_never_becomes_global_recovery(region: str) -> None:
     """A payload region not proven by the wire cannot inherit global transport recovery."""

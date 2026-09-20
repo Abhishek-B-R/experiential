@@ -438,3 +438,34 @@ def test_server_tool_hour_cost_cannot_bypass_root_reservation(
     assert rejected.value.binding.application == ("shared" if destination == "primary" else "root")
     with ledger._connect() as connection:
         assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()[0] == 0
+
+
+def test_every_anthropic_fallback_freezes_us_constraint_before_dispatch() -> None:
+    """Primary and fallback bodies carry the policy into the retryable native dispatch."""
+    primary, fallback = _deployment("primary", "anthropic"), _deployment("fallback", "anthropic")
+    route = _route((primary, fallback))
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        stream=True,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        inference_geo="global",
+    )
+    profile = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://api.anthropic.com/v1/messages",
+        model_id="claude-opus-5",
+        inference_geo="us",
+    )
+    for deployment in route.deployments:
+        entry = build_rung_dispatch(
+            route,
+            deployment,
+            profile,
+            _NoSigningClient(),
+            provider_request=request,
+            public_request=request,
+            authorization=_AUTHORIZATION,
+        ).wire_entry
+        payload = entry["upstream_payload"]
+        assert isinstance(payload, dict)
+        assert payload["inference_geo"] == "us"

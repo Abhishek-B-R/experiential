@@ -810,6 +810,381 @@ def _bounded_pair(
     )
 
 
+class TestLaneSaturation:
+    """The worker's default lane bound and refuse-instead-of-overflow (lane_saturation)."""
+
+    def test_default_lane_bound_spills_an_unauthored_rung_sideways(self) -> None:
+        """A rung with no authored policy still sheds at the worker's default share."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+        deployments = (
+            _deployment("deployment-a", connection_sha256="b" * 64),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        _admit(registry, deployments, request_id="request-1")
+        _admit(registry, deployments, request_id="request-2")
+        assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
+        spilled = _start(registry, ordinal=0, request_id="request-2")
+        assert spilled["route_depth"] == 1
+        assert ledger.started[1]["dispatch_reason"] == "queue_bound"
+        assert ledger.started[1]["preferred_deployment_id"] == "deployment-a"
+        assert registry.rung_admission_counters() == (1, 0, 0)
+
+    def test_default_lane_bound_refuses_fast_instead_of_overflowing(self) -> None:
+        """Every unauthored rung at its default share: a retryable 429, no dispatch."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+        only = (_deployment("deployment-a", connection_sha256="b" * 64),)
+        _admit(registry, only, request_id="request-1")
+        _admit(registry, only, request_id="request-2")
+        assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
+        refused = _start(registry, ordinal=0, request_id="request-2")
+        assert refused["exhausted"] is True
+        failure = cast("JsonObject", refused["failure"])
+        assert failure["failure_class"] == "throttled"
+        assert failure["retry_after_seconds"] == 5
+        assert "in-flight bound" in str(failure["safe_message"])
+        assert len(ledger.started) == 1
+        assert registry.rung_admission_counters() == (1, 0, 1)
+        # The refused request is finished, so the slot it never took frees nothing
+        # and the next request after a settle admits again.
+        started = ledger.started[0]
+        _settle(
+            registry,
+            attempt_id=str(started["attempt_id"]),
+            outcome="completed",
+            finalize=True,
+            request_id="request-1",
+        )
+        _admit(registry, only, request_id="request-3")
+        assert _start(registry, ordinal=0, request_id="request-3")["route_depth"] == 0
+
+    @pytest.mark.parametrize("authored", [False, True])
+    @pytest.mark.parametrize("staged", [False, True])
+    def test_reasoning_pin_never_bypasses_a_refusing_lane_bound(
+        self, authored: bool, staged: bool
+    ) -> None:
+        """Pinned reasoning cannot force a default or explicitly refusing lane past its bound."""
+        from exp.common.models.gateway_chains import ModelExecutionStage
+
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+        policy = (
+            GatewayRungDispatchPolicy(concurrency_bound=1, saturation="refuse")
+            if authored
+            else None
+        )
+        only = (_deployment("deployment-a", connection_sha256="b" * 64, dispatch=policy),)
+        _admit(registry, only, request_id="occupied")
+        assert _start(registry, ordinal=0, request_id="occupied")["route_depth"] == 0
+        pinned = _admit(
+            registry, only, request_id="pinned", reasoning_pinned_deployment_id="deployment-a"
+        )
+        if staged:
+            snapshot = pinned.route.snapshot.model_copy(
+                update={
+                    "model_stages": (
+                        ModelExecutionStage(
+                            stage_index=0,
+                            exact_model_id="exact-one",
+                            pool_id="pool-one",
+                            deployment_ids=("deployment-a",),
+                        ),
+                    )
+                }
+            )
+            pinned.route = pinned.route.model_copy(update={"snapshot": snapshot})
+        refused = _start(registry, ordinal=0, request_id="pinned")
+        assert refused["exhausted"] is True
+        assert cast("JsonObject", refused["failure"])["failure_class"] == "throttled"
+        assert registry.rung_admission_counters() == (1, 0, 1)
+        assert len(ledger.started) == 1
+
+    @pytest.mark.parametrize("authored", [False, True])
+    @pytest.mark.parametrize("conditional_child", [False, True])
+    def test_root_child_capacity_refusal_preserves_existing_reservations(
+        self, authored: bool, conditional_child: bool
+    ) -> None:
+        """A full staged ladder cannot overflow or promote a failure-only child after a shed."""
+        from exp.common.models.gateway_chains import ModelExecutionStage
+        from exp.runtime.gateway.native_execution import rung_load_key
+
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+        policy = (
+            GatewayRungDispatchPolicy(concurrency_bound=1, saturation="refuse")
+            if authored
+            else None
+        )
+        root = _deployment("deployment-a", connection_sha256="b" * 64, dispatch=policy)
+        child_policy = GatewayRungDispatchPolicy(
+            concurrency_bound=1 if authored else None,
+            saturation="refuse" if authored else "overflow",
+        )
+        child = _deployment(
+            "deployment-b", connection_sha256="c" * 64, dispatch=child_policy
+        ).model_copy(update={"exact_model_id": "child-model"})
+        if conditional_child:
+            child = child.model_copy(
+                update={
+                    "gateway": child.gateway.model_copy(
+                        update={
+                            "capabilities": child.gateway.capabilities.model_copy(
+                                update={
+                                    "failover_only_on": frozenset({"throttled"}),
+                                }
+                            ),
+                        }
+                    )
+                }
+            )
+        for index, deployment in enumerate((root, child)):
+            _admit(registry, (deployment,), request_id=f"occupied-{index}")
+            # Occupy only ordinary candidates; a conditional child is never a fresh first dial.
+            if not (conditional_child and index == 1):
+                assert (
+                    _start(registry, ordinal=0, request_id=f"occupied-{index}")["route_depth"] == 0
+                )
+        before = len(ledger.started)
+        entry = _admit(registry, (root, child), request_id="full-chain")
+        snapshot = entry.route.snapshot.model_copy(
+            update={
+                "model_stages": (
+                    ModelExecutionStage(
+                        stage_index=0,
+                        exact_model_id=root.exact_model_id,
+                        pool_id="pool-one",
+                        deployment_ids=(root.deployment_id,),
+                    ),
+                    ModelExecutionStage(
+                        stage_index=1,
+                        exact_model_id=child.exact_model_id,
+                        pool_id="child-pool",
+                        deployment_ids=(child.deployment_id,),
+                    ),
+                )
+            }
+        )
+        entry.route = entry.route.model_copy(update={"snapshot": snapshot})
+        entry.verified_warm_deployment_id = child.deployment_id
+        entry.verified_warm_until_monotonic = time.monotonic() + 30
+        entry.recovery_scoped = True
+        refused = _start(registry, ordinal=0, request_id="full-chain")
+        assert refused["exhausted"] is True
+        assert len(ledger.started) == before
+        assert registry.entry("full-chain") is None
+        assert registry.loads.inflight(rung_load_key(root)) == 1
+        assert registry.loads.inflight(rung_load_key(child)) == int(not conditional_child)
+        assert registry.rung_admission_counters()[1:] == (0, 1)
+
+    @pytest.mark.parametrize("competing_fill", [False, True])
+    def test_ordinary_rate_overflow_uses_latest_hard_shed(
+        self, monkeypatch: pytest.MonkeyPatch, competing_fill: bool
+    ) -> None:
+        """A competing capacity fill replaces the old rate shed and terminates without spinning."""
+        from exp.runtime.gateway.native_execution import rung_load_key
+        from exp.runtime.gateway.rung_admission import RungShed
+
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+        deployment = _deployment(
+            "deployment-a",
+            connection_sha256="b" * 64,
+            dispatch=GatewayRungDispatchPolicy(requests_per_minute=1),
+        )
+        key = rung_load_key(deployment)
+        _admit(registry, (deployment,), request_id="spent-rate")
+        first = _start(registry, ordinal=0, request_id="spent-rate")
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="completed",
+            finalize=True,
+            request_id="spent-rate",
+        )
+        assert registry.loads.inflight(key) == 0
+        entry = _admit(registry, (deployment,), request_id="ordinary-overflow")
+        reserve = registry._reserve_rung_slot
+        calls: list[tuple[bool, bool, str]] = []
+        competitor: list[str] = []
+
+        def interleaved_reserve(
+            request_entry: InflightRequest,
+            selected: ExactModelDeployment,
+            *,
+            reserved_tokens: int,
+            force: bool,
+            rate_retry: bool = False,
+        ) -> str | RungShed | None:
+            """Fill capacity after the initial rate decision and fail on a repeated hard refusal."""
+            assert len(calls) < 2, "stale shed retried a hard-refused overflow target"
+            result = reserve(
+                request_entry,
+                selected,
+                reserved_tokens=reserved_tokens,
+                force=force,
+                rate_retry=rate_retry,
+            )
+            calls.append(
+                (force, rate_retry, result.reason if isinstance(result, RungShed) else "admitted")
+            )
+            if len(calls) == 1 and competing_fill:
+                assert isinstance(result, RungShed) and result.reason == "rate_limit"
+                ticket = registry.loads.reserve(
+                    key,
+                    organization_id="competitor",
+                    weight=1,
+                    bound=1,
+                    fair_share=False,
+                )
+                assert isinstance(ticket, str)
+                competitor.append(ticket)
+            return result
+
+        monkeypatch.setattr(registry, "_reserve_rung_slot", interleaved_reserve)
+        result = _start(registry, ordinal=0, request_id=entry.authorization.request_id)
+        assert calls == [
+            (False, False, "rate_limit"),
+            (True, False, "queue_bound" if competing_fill else "admitted"),
+        ]
+        if competing_fill:
+            assert result["exhausted"] is True
+            assert cast("JsonObject", result["failure"])["failure_class"] == "throttled"
+            assert len(ledger.started) == 1 and len(ledger.finished_requests) == 1
+            assert registry.entry(entry.authorization.request_id) is None
+            assert registry.rung_admission_counters() == (2, 0, 1)
+            assert registry.loads.inflight(key) == 1
+            registry.loads.release_ticket(competitor[0])
+            assert registry.loads.inflight(key) == 0
+            calls.clear()
+            monkeypatch.setattr(registry, "_reserve_rung_slot", reserve)
+            _admit(registry, (deployment,), request_id="after-release")
+            accepted = _start(registry, ordinal=0, request_id="after-release")
+            assert accepted["route_depth"] == 0 and len(ledger.started) == 2
+            assert registry.rung_admission_counters() == (3, 1, 1)
+            _settle(
+                registry,
+                attempt_id=str(accepted["attempt_id"]),
+                outcome="completed",
+                finalize=True,
+                request_id="after-release",
+            )
+        else:
+            assert result["route_depth"] == 0 and len(ledger.started) == 2
+            assert registry.rung_admission_counters() == (1, 1, 0)
+            _settle(
+                registry,
+                attempt_id=str(result["attempt_id"]),
+                outcome="completed",
+                finalize=True,
+                request_id=entry.authorization.request_id,
+            )
+        assert registry.loads.inflight(key) == 0
+
+    @pytest.mark.parametrize("interruption", ["deadline", "cancel"])
+    def test_lane_reselection_observes_request_interruption(
+        self, monkeypatch: pytest.MonkeyPatch, interruption: str
+    ) -> None:
+        """A request ending after its initial shed cannot dispatch through a later selection."""
+        from exp.runtime.gateway.rung_admission import RungShed
+
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployment = _deployment(
+            "deployment-a",
+            connection_sha256="b" * 64,
+            dispatch=GatewayRungDispatchPolicy(requests_per_minute=1),
+        )
+        _admit(registry, (deployment,), request_id="spent-rate")
+        first = _start(registry, ordinal=0, request_id="spent-rate")
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="completed",
+            finalize=True,
+            request_id="spent-rate",
+        )
+        entry = _admit(registry, (deployment,), request_id="interrupted")
+        reserve = registry._reserve_rung_slot
+        calls = 0
+
+        def interrupt_after_shed(
+            request_entry: InflightRequest,
+            selected: ExactModelDeployment,
+            *,
+            reserved_tokens: int,
+            force: bool,
+            rate_retry: bool = False,
+        ) -> str | RungShed | None:
+            """Advance the deadline or durably abandon before the next selection."""
+            nonlocal calls
+            calls += 1
+            assert calls == 1, "interrupted request retried its reservation"
+            result = reserve(
+                request_entry,
+                selected,
+                reserved_tokens=reserved_tokens,
+                force=force,
+                rate_retry=rate_retry,
+            )
+            assert isinstance(result, RungShed)
+            if interruption == "deadline":
+                entry.deadline_monotonic = time.monotonic() - 1
+            else:
+                registry.abandon(json.dumps({"request_id": entry.authorization.request_id}))
+            return result
+
+        monkeypatch.setattr(registry, "_reserve_rung_slot", interrupt_after_shed)
+        result = _start(registry, ordinal=0, request_id=entry.authorization.request_id)
+        assert result["exhausted"] is True
+        assert cast("JsonObject", result["failure"])["failure_class"] == (
+            "timeout" if interruption == "deadline" else "cancelled"
+        )
+        assert calls == 1 and len(ledger.started) == 1
+        assert len(ledger.finished_requests) == 1
+        assert registry.entry(entry.authorization.request_id) is None
+
+    def test_authored_bound_keeps_the_default_on_its_unauthored_sibling(self) -> None:
+        """The authored bound wins on its rung; the sibling gets the worker default."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+        deployments = (
+            _deployment(
+                "deployment-a",
+                connection_sha256="b" * 64,
+                dispatch=GatewayRungDispatchPolicy(concurrency_bound=2),
+            ),
+            _deployment("deployment-b", connection_sha256="c" * 64),
+        )
+        for request_id in ("request-1", "request-2", "request-3"):
+            _admit(registry, deployments, request_id=request_id)
+        assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
+        assert _start(registry, ordinal=0, request_id="request-2")["route_depth"] == 0
+        # Both slots of the authored bound are held; the third spills to the
+        # sibling, whose own (default) bound of one is still free.
+        assert _start(registry, ordinal=0, request_id="request-3")["route_depth"] == 1
+        assert registry.rung_admission_counters() == (1, 0, 0)
+
+    def test_authored_refuse_saturation_replaces_the_overflow(self) -> None:
+        """``saturation="refuse"`` on a single authored rung refuses rather than overflows."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        only = (
+            _deployment(
+                "deployment-a",
+                connection_sha256="b" * 64,
+                dispatch=GatewayRungDispatchPolicy(concurrency_bound=1, saturation="refuse"),
+            ),
+        )
+        _admit(registry, only, request_id="request-1")
+        _admit(registry, only, request_id="request-2")
+        assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
+        refused = _start(registry, ordinal=0, request_id="request-2")
+        assert refused["exhausted"] is True
+        assert cast("JsonObject", refused["failure"])["failure_class"] == "throttled"
+        assert registry.rung_admission_counters() == (1, 0, 1)
+
+
 class TestRungDispatchPolicy:
     """Bounded-queue spill, fair-share sheds, overflow, and their disclosures."""
 
@@ -828,7 +1203,7 @@ class TestRungDispatchPolicy:
         assert spilled["route_depth"] == 1
         assert ledger.started[1]["dispatch_reason"] == "queue_bound"
         assert ledger.started[1]["preferred_deployment_id"] == "deployment-a"
-        assert registry.rung_admission_counters() == (1, 0)
+        assert registry.rung_admission_counters() == (1, 0, 0)
 
     def test_settle_frees_the_bounded_slot(self) -> None:
         """A settled dispatch returns its slot so the next request is not shed."""
@@ -847,7 +1222,7 @@ class TestRungDispatchPolicy:
         )
         follow = _start(registry, ordinal=0, request_id="request-2")
         assert follow["route_depth"] == 0
-        assert registry.rung_admission_counters() == (0, 0)
+        assert registry.rung_admission_counters() == (0, 0, 0)
 
     def test_saturated_overflow_never_manufactures_a_failure(self) -> None:
         """A single-rung pool at its bound still dispatches, disclosed as such."""
@@ -867,7 +1242,7 @@ class TestRungDispatchPolicy:
         assert overflow["route_depth"] == 0
         assert ledger.started[1]["dispatch_reason"] == "saturated_overflow"
         assert ledger.started[1]["preferred_deployment_id"] is None
-        assert registry.rung_admission_counters() == (1, 1)
+        assert registry.rung_admission_counters() == (1, 1, 0)
 
     def test_fair_share_shed_discloses_and_spills(self) -> None:
         """An over-share organization spills while the under-share one admits."""
@@ -991,7 +1366,7 @@ class TestRungDispatchPolicy:
         assert all(row["dispatch_reason"] is None for row in ledger.started)
         assert all(row["preferred_deployment_id"] is None for row in ledger.started)
         assert registry.loads.inflight(("deployment-a", "b" * 64)) == 0
-        assert registry.rung_admission_counters() == (0, 0)
+        assert registry.rung_admission_counters() == (0, 0, 0)
 
     def test_budget_skip_releases_the_reserved_slot(self) -> None:
         """A deployment-budget rejection frees the rung's bounded reservation."""
@@ -1270,7 +1645,7 @@ class TestRateLimitSheds:
         assert spilled["route_depth"] == 1
         assert ledger.started[1]["dispatch_reason"] == "rate_limit"
         assert ledger.started[1]["preferred_deployment_id"] == "deployment-a"
-        assert registry.rung_admission_counters() == (1, 0)
+        assert registry.rung_admission_counters() == (1, 0, 0)
         assert registry.rung_rate_counters() == (1, 0)
 
     def test_rate_shed_force_admits_a_reasoning_pinned_rung_until_a_real_failure(self) -> None:
@@ -1299,7 +1674,7 @@ class TestRateLimitSheds:
         assert ledger.started[1]["deployment_id"] == "deployment-a"
         assert ledger.started[1]["dispatch_reason"] == "saturated_overflow"
         assert ledger.started[1]["route_reason"] == "reasoning_continuation"
-        assert registry.rung_admission_counters() == (1, 1)
+        assert registry.rung_admission_counters() == (1, 1, 0)
         throttled: JsonObject = {
             "failure_class": "throttled",
             "safe_message": "provider throttled the request",
@@ -1357,7 +1732,7 @@ class TestRateLimitSheds:
         overflow = _start(registry, ordinal=0, request_id="request-2")
         assert overflow["route_depth"] == 0
         assert ledger.started[1]["dispatch_reason"] == "saturated_overflow"
-        assert registry.rung_admission_counters() == (1, 1)
+        assert registry.rung_admission_counters() == (1, 1, 0)
 
     def test_whole_ladder_fresh_spill_limited_still_force_admits(self) -> None:
         """A narrow ladder blocked only by the fresh threshold never mints a 429.
@@ -1398,7 +1773,7 @@ class TestRateLimitSheds:
         overflow = _start(registry, ordinal=0, request_id="request-2")
         assert overflow["route_depth"] == 0
         assert ledger.started[1]["dispatch_reason"] == "saturated_overflow"
-        assert registry.rung_admission_counters() == (1, 1)
+        assert registry.rung_admission_counters() == (1, 1, 0)
         assert registry.rung_rate_counters() == (0, 1)
 
     def test_throttled_settle_teaches_the_rungs_learned_ceiling(self) -> None:
@@ -1964,7 +2339,7 @@ def test_recovery_placement_reason_does_not_replace_forced_overflow() -> None:
     entry.recovery_reason = "retained_warm_fallback"
     assert _start(registry, ordinal=0, request_id="overflow")["route_depth"] == 0
     assert ledger.started[-1]["dispatch_reason"] == "saturated_overflow"
-    assert registry.rung_admission_counters() == (1, 1)
+    assert registry.rung_admission_counters() == (1, 1, 0)
     for request_id in ("holder", "overflow"):
         registry.abandon(json.dumps({"request_id": request_id}))
 
@@ -2295,7 +2670,7 @@ class TestThrottleRedial:
         assert ledger.started[1]["preferred_deployment_id"] is None
         # The rate shed happened and is counted as one; the forced admission is
         # a backoff redial, not a saturated overflow.
-        assert registry.rung_admission_counters() == (1, 0)
+        assert registry.rung_admission_counters() == (1, 0, 0)
         assert registry.rung_rate_counters() == (1, 0)
         assert registry.throttle_cache_counters() == (0, 0, 1, 1)
         _settle(
@@ -2381,7 +2756,7 @@ class TestThrottleRedial:
         assert ledger.started[3]["deployment_id"] == "deployment-c"
         assert ledger.started[3]["dispatch_reason"] == "throttle_failover_cold"
         assert ledger.started[3]["preferred_deployment_id"] == "deployment-a"
-        assert registry.rung_admission_counters() == (1, 0)
+        assert registry.rung_admission_counters() == (1, 0, 0)
         assert registry.rung_rate_counters() == (1, 0)
         assert registry.throttle_cache_counters() == (0, 1, 1, 0)
 
@@ -2428,7 +2803,7 @@ class TestThrottleRedial:
             catalog_sha256="f" * 64,
         )
         assert _start(registry, ordinal=0, request_id="request-other")["route_depth"] == 0
-        sheds_before, overflows_before = registry.rung_admission_counters()
+        sheds_before, overflows_before, _ = registry.rung_admission_counters()
         redial = _start(
             registry,
             ordinal=1,
@@ -2441,7 +2816,7 @@ class TestThrottleRedial:
         assert ledger.started[2]["deployment_id"] == "deployment-b"
         assert ledger.started[2]["dispatch_reason"] == "queue_bound"
         assert ledger.started[2]["preferred_deployment_id"] == "deployment-a"
-        sheds_after, overflows_after = registry.rung_admission_counters()
+        sheds_after, overflows_after, _ = registry.rung_admission_counters()
         assert (sheds_after - sheds_before, overflows_after - overflows_before) == (1, 0)
         assert registry.throttle_cache_counters() == (0, 0, 0, 0)
 
@@ -2505,7 +2880,7 @@ class TestThrottleRedial:
         assert ledger.started[2]["deployment_id"] == "deployment-c"
         assert ledger.started[2]["dispatch_reason"] != "saturated_overflow"
         assert ledger.started[2]["dispatch_reason"] != "throttle_backoff"
-        assert registry.rung_admission_counters() == (2, 0)
+        assert registry.rung_admission_counters() == (2, 0, 0)
         assert registry.rung_rate_counters() == (2, 0)
         assert registry.throttle_cache_counters() == (0, 0, 0, 0)
         assert registry.loads.inflight(("deployment-b", "c" * 64)) == 1

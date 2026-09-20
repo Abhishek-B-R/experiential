@@ -136,37 +136,6 @@ impl SettledAttempt {
     }
 }
 
-fn is_semantic(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::TextDelta(_)
-            | Event::RefusalDelta(_)
-            | Event::ProviderTextDelta { .. }
-            | Event::ProviderRefusalDelta { .. }
-            | Event::ProviderOutputItemStarted { .. }
-            | Event::ProviderOutputItemCompleted { .. }
-            | Event::ReasoningSummaryDelta { .. }
-            | Event::ThinkingDelta { .. }
-            | Event::ThinkingSignature { .. }
-            | Event::RedactedThinking { .. }
-            | Event::EncryptedReasoning { .. }
-            | Event::ReasoningContentDelta { .. }
-            | Event::ToolCallStarted { .. }
-            | Event::ToolArgumentsDelta { .. }
-            | Event::ToolCallCompleted { .. }
-            | Event::TextBlockStarted { .. }
-            | Event::CitationDelta { .. }
-            | Event::ServerToolUseStarted { .. }
-            | Event::ServerToolArgumentsDelta { .. }
-            | Event::ServerToolUseCompleted { .. }
-            | Event::ServerToolResult { .. }
-            | Event::HostedToolItemStarted { .. }
-            | Event::HostedToolItemProgress { .. }
-            | Event::HostedToolItemCompleted { .. }
-            | Event::ProviderTextAnnotation { .. }
-    )
-}
-
 /// The control plane's answer to one `start_attempt` callback.
 #[derive(Debug, Deserialize)]
 pub(crate) struct StartResponse {
@@ -600,6 +569,18 @@ async fn run_attempt(
         )
     };
     let mut first_byte_deadline = Instant::now() + first_byte_allowance_for();
+    // The first-token bound the relay enforces once the headers are in: its
+    // own base (thinking models on a chat wire stream nothing for a minute
+    // and more), the same input slope, absolute from the same dial.
+    let first_token_allowance_for = || {
+        first_token_allowance(
+            wire,
+            ctx.time_to_first_token,
+            ctx.time_to_first_byte_slope_seconds_per_million_input_tokens,
+            ctx.approximate_input_tokens,
+        )
+    };
+    let mut first_token_deadline = Instant::now() + first_token_allowance_for();
     // What is already known repairs the first dial: the payload this request
     // stripped on an earlier dial of the rung, else the payloads this worker
     // remembers the caller's provider refusing.
@@ -640,6 +621,7 @@ async fn run_attempt(
                     // redial; the refused open must not eat into it.
                     redialed = true;
                     first_byte_deadline = Instant::now() + first_byte_allowance_for();
+                    first_token_deadline = Instant::now() + first_token_allowance_for();
                     continue 'dial;
                 }
                 return AttemptEnd::Ladder {
@@ -668,10 +650,10 @@ async fn run_attempt(
             Some(route_sha256) => UpstreamRelay::new_with_reasoning_content_route(
                 response,
                 dialect,
-                first_byte_deadline,
+                first_token_deadline,
                 Some(route_sha256),
             ),
-            None => UpstreamRelay::new(response, dialect, first_byte_deadline),
+            None => UpstreamRelay::new(response, dialect, first_token_deadline),
         };
         relay.set_carried_usage(carried_usage.take());
         relay.set_stop_sequences(wire.stop_sequences.iter().cloned());
@@ -745,6 +727,7 @@ async fn run_attempt(
                         let mut prefix = std::mem::take(&mut withheld);
                         prefix.push(event);
                         let tool_search_dropped_after_output = relay.withheld_search_call_seen();
+                        relay.commit();
                         return AttemptEnd::Committed(Box::new(CommittedAttempt {
                             depth,
                             prefix,
@@ -775,6 +758,7 @@ async fn run_attempt(
                 // A search call withheld in the same turn is dropped: the
                 // rung is frozen on this output, and the caller is told.
                 let tool_search_dropped_after_output = relay.withheld_search_call_seen();
+                relay.commit();
                 return AttemptEnd::Committed(Box::new(CommittedAttempt {
                     depth,
                     prefix,
@@ -801,6 +785,7 @@ async fn run_attempt(
                         redialed = true;
                         carried_usage = usage.take();
                         first_byte_deadline = Instant::now() + first_byte_allowance_for();
+                        first_token_deadline = Instant::now() + first_token_allowance_for();
                         continue 'dial;
                     }
                     let typed_refusal = failure.failure_class == FailureClass::Refusal;
@@ -942,9 +927,11 @@ async fn run_attempt(
     }
 }
 
+mod commit;
+pub(crate) use commit::is_semantic;
 mod fallback_rules;
 mod wire;
-pub(crate) use wire::{first_byte_allowance, open_phase_bound};
+pub(crate) use wire::{first_byte_allowance, first_token_allowance, open_phase_bound};
 pub use wire::{DeploymentWire, RoutePolicy, WaterfallContext};
 
 mod empty;

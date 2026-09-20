@@ -231,7 +231,6 @@ class InflightRequest:
     recovery_bindings: dict[str, FrozenRecoveryBinding] = field(default_factory=dict, repr=False)
     recovery_recorded_attempts: set[str] = field(default_factory=set)
     recovery_reason: str | None = None
-    overflow_used: bool = False
     denied_destination_pools: set[str] = field(default_factory=set)
     # Rebuild material for gateway tool-search rounds: the admitted wires and
     # the public request ``build_rung_dispatch`` needs again, plus the search
@@ -931,6 +930,7 @@ def deployment_wire_entry(
         "time_to_first_byte_seconds_per_million_input_tokens": (
             capabilities.time_to_first_byte_seconds_per_million_input_tokens
         ),
+        "time_to_first_token_base_seconds": capabilities.time_to_first_token_base_seconds,
         # A failover-only rung's tokens (`native_fallback_rules`): the data
         # plane never counts it as a first-dial or unmatched successor.
         "failover_only_on": (

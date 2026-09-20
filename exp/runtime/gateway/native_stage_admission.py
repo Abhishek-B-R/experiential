@@ -175,10 +175,10 @@ def stage_affinity_ordered_rungs(
         """Require actual local concurrency, rate and fair-share headroom for a trial."""
         deployment = by_id[deployment_id]
         policy = deployment.gateway.dispatch
-        if policy is None:
+        if policy is None and accounting.loads.default_bound is None:
             return True
         reserved_tokens = 0
-        if policy.tokens_per_minute is not None:
+        if policy is not None and policy.tokens_per_minute is not None:
             # History can arrive after the preflight. Defer its elective trial
             # rather than checking a token window with an underestimated prompt.
             if input_tokens is None:
@@ -188,11 +188,13 @@ def stage_affinity_ordered_rungs(
             (deployment.deployment_id, deployment.connection_sha256),
             organization_id=authorization.organization_id,
             weight=authorization.fair_share_weight,
-            bound=policy.concurrency_bound,
-            fair_share=policy.fair_share,
-            requests_per_minute=policy.requests_per_minute,
-            tokens_per_minute=policy.tokens_per_minute,
-            cache_priority_alpha=policy.cache_priority_alpha,
+            bound=accounting.loads.default_bound
+            if policy is None or policy.concurrency_bound is None
+            else policy.concurrency_bound,
+            fair_share=policy is not None and policy.fair_share,
+            requests_per_minute=None if policy is None else policy.requests_per_minute,
+            tokens_per_minute=None if policy is None else policy.tokens_per_minute,
+            cache_priority_alpha=None if policy is None else policy.cache_priority_alpha,
             reserved_tokens=reserved_tokens,
         )
 

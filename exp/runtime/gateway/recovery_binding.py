@@ -66,7 +66,9 @@ def bind_recovery_profiles(
 
 
 def _resolved_region(profile: GatewayWireProfile) -> str | None:
-    """Use declared wire geography or the existing authoritative global-service scope."""
+    """Use declared geography only when no unproven operator selector changes execution scope."""
+    if profile.inference_geo is not None:
+        return None
     if profile.operational_region:
         return profile.operational_region
     if (

@@ -65,7 +65,10 @@ from exp.common.models.nano_usd_upgrade import (
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AZURE_API_VERSION = re.compile(r"^(?:v1|\d{4}-\d{2}-\d{2}(?:-preview)?)$")
 _AWS_REGION_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
-_VERTEX_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-)?aiplatform\.googleapis\.com")
+_VERTEX_HOST = re.compile(
+    r"(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-)?aiplatform\.googleapis\.com"
+    r"|aiplatform\.(?:us|eu)\.rep\.googleapis\.com)"
+)
 _FIXED_ORIGIN_PROVIDERS = frozenset(
     {"anthropic", "gemini", "openai", "openrouter", "tinker", "typesafe"}
 )
@@ -173,6 +176,8 @@ class ConnectionConfig(ContractModel):
     api_version: str | None = Field(default=None, max_length=64)
     azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
     region: str | None = Field(default=None, max_length=64)
+    inference_geo: Literal["us"] | None = None
+    """Operator-enforced Anthropic inference geography, independent of caller input."""
     aws_access_key_id_env: str | None = Field(default=None, max_length=256)
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
     # Opt-in: native provider via a trusted https base_url in its own dialect (default-off).
@@ -202,6 +207,8 @@ class ConnectionConfig(ContractModel):
 
     @model_validator(mode="after")
     def _require_secret_free_connection_metadata(self) -> ConnectionConfig:
+        if self.inference_geo is not None and self.provider != "anthropic":
+            raise ValueError("inference_geo is only accepted for provider='anthropic'")
         if self.provider != "azure" and self.azure_api_surface is not None:
             raise ValueError("azure_api_surface is only accepted for provider='azure'")
         if self.provider != "bedrock" and (
@@ -322,6 +329,8 @@ class ConnectionConfig(ContractModel):
             # contract that predates this discriminator. Only the genuinely
             # different Foundry surface needs a new credential binding.
             identity["azure_api_surface"] = "model_inference"
+        if self.inference_geo is not None:
+            identity["inference_geo"] = self.inference_geo
         if self.region is not None:
             identity["region"] = self.region
         if self.trusted_custom_origin:  # endpoint identity; added only when set
@@ -356,6 +365,8 @@ class ConnectionConfig(ContractModel):
     ) -> dict[str, object]:
         """Preserve pre-Bedrock canonical bytes on every supported Pydantic version."""
         serialized: dict[str, object] = handler(self)
+        if self.inference_geo is None:
+            serialized.pop("inference_geo", None)
         if self.aws_access_key_id_env is None:
             serialized.pop("aws_access_key_id_env", None)
         if self.bedrock_auth_mode is None:
@@ -495,7 +506,8 @@ class GatewayDeploymentCapabilities(ContractModel):
     ``None`` uses the serving configuration's default. The effective bound on
     the wait for a provider's response headers is this base plus the
     input-scaled allowance below, so very large prompts are not misread as a
-    dead lane.
+    dead lane. The wait for the first TOKEN has its own base
+    (``time_to_first_token_base_seconds``) and shares the slope.
     """
     time_to_first_byte_seconds_per_million_input_tokens: float | None = Field(default=None, ge=0)
     """Deployment override for the input-scaled time-to-first-byte allowance.
@@ -504,6 +516,16 @@ class GatewayDeploymentCapabilities(ContractModel):
     bytes divided by four; an allowance heuristic, never a billing quantity).
     ``None`` uses the serving configuration's default; ``0`` disables scaling
     for this deployment.
+    """
+    time_to_first_token_base_seconds: float | None = Field(default=None, gt=0)
+    """Deployment override for the lane's flat time-to-first-TOKEN allowance.
+
+    ``None`` uses the serving configuration's default (two minutes). The
+    effective bound on the wait from the dial to the first semantic event
+    (content, reasoning, a tool call; keepalive comments and role-only frames
+    do not count) is this base plus the input-scaled allowance above. A stall
+    past it fails over to the next rung. Author it above the lane's observed
+    first-token p99 on a thinking model, below the stall you want caught.
     """
     failover_only_on: tuple[FailoverToken, ...] | None = None
     """Failure tokens this rung serves as a failover for, or ``None`` for an unrestricted rung.

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import json
 import math
 from collections.abc import Callable
 from datetime import datetime
@@ -42,6 +43,25 @@ _TERMINAL_KINDS = {
     "incomplete": GatewayEventKind.INCOMPLETE,
     "failed": GatewayEventKind.FAILED,
 }
+
+
+def exhausted_attempt_payload(failure: GatewayFailure) -> str:
+    """Serialize one sanitized terminal attempt-selection failure for the native boundary."""
+    payload: JsonObject = {
+        "failure_class": failure.failure_class.value,
+        "safe_message": failure.safe_message,
+    }
+    if failure.customer_owned:
+        payload["customer_owned"] = True
+    if failure.rejected_parameter is not None:
+        payload["rejected_parameter"] = failure.rejected_parameter
+    if failure.provider_detail is not None:
+        payload["provider_detail"] = failure.provider_detail
+    if failure.refusal_reason is not None:
+        payload["refusal_reason"] = failure.refusal_reason.value
+    if failure.retry_after_seconds is not None:
+        payload["retry_after_seconds"] = failure.retry_after_seconds
+    return json.dumps({"exhausted": True, "failure": payload}, separators=(",", ":"))
 
 
 def budget_quota_failure() -> GatewayFailure:

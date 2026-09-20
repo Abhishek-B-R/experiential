@@ -121,6 +121,9 @@ class GatewayWireProfile:
     operational_region: str | None = None
     """Verified region or named global service scope of this exact wire endpoint."""
 
+    inference_geo: Literal["us"] | None = field(default=None, kw_only=True)
+    """Operator constraint applied after caller payload shaping on each Anthropic attempt."""
+
     model_id: str = ""
     """Exact provider model identifier."""
 

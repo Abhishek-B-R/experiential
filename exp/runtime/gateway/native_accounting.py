@@ -27,6 +27,7 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.gateway.health import DeploymentHealthRegistry
+from exp.runtime.gateway.lane_saturation import lane_saturated_failure, overflow_target
 from exp.runtime.gateway.ledger import AttemptRejectedError
 from exp.runtime.gateway.model_chain_authority import require_bound_model_chain_authority
 from exp.runtime.gateway.native_accounting_errors import (
@@ -54,6 +55,7 @@ from exp.runtime.gateway.native_recovery import (
     record_session_outcome,
 )
 from exp.runtime.gateway.native_rung_policy import (
+    bind_sticky_dispatch,
     failed_dispatch_candidate,
     reserve_rung_slot,
     shed_keeps_rung,
@@ -63,6 +65,7 @@ from exp.runtime.gateway.native_settlement import (
     all_routes_unavailable_failure,
     budget_quota_failure,
     budget_quota_protocol_error,
+    exhausted_attempt_payload,
     failure_from_boundary_payload,
     ledger_failure,
     settlement_metadata,
@@ -104,6 +107,7 @@ class NativeAttemptAccounting:
         budget_error_factory: Callable[[str], NativeBridgeError] | None = None,
         cache_sample_gate: Callable[[str], bool] | None = None,
         recovery_host: RecoveryHost | None = None,
+        default_lane_bound: int | None = None,
     ) -> None:
         """Bind the durable ledger and start the settlement sweep.
 
@@ -111,6 +115,7 @@ class NativeAttemptAccounting:
             write_ledger: Blocking durable request and attempt ledger.
             budget_error_factory: Optional hosted mapping for a rejected
                 reservation.
+            default_lane_bound: Per-worker cap for rungs authoring no bound (lane_saturation).
             cache_sample_gate: Optional hosted predicate deciding whether one
                 settled attempt (by attempt id) may feed the cache-priority
                 EWMA. The hosted store knows which attempts are promo-funded;
@@ -127,8 +132,7 @@ class NativeAttemptAccounting:
         self.recovery_host = recovery_host
         self.recovery = SessionRecoveryRegistry()
         self._health = DeploymentHealthRegistry()
-        # Physical-lane admission counters survive catalog rolls.
-        self._loads = RungLoadRegistry()
+        self._loads = RungLoadRegistry(default_bound=default_lane_bound)
         # Cache-affinity spills stay on the rung holding the warmed conversation.
         self._sticky = StickySpillRegistry()
         self._inflight: dict[str, InflightRequest] = {}
@@ -148,6 +152,7 @@ class NativeAttemptAccounting:
         # could serve. The per-reason counters split the aggregate.
         self._rung_admission_sheds = 0
         self._rung_saturated_overflows = 0
+        self._rung_saturation_refusals = 0
         self._rung_rate_limit_sheds = 0
         self._rung_fresh_session_spills = 0
         # Cache-stakes throttle dispositions on pools authoring a
@@ -194,6 +199,7 @@ class NativeAttemptAccounting:
         *,
         reserved_tokens: int,
         force: bool,
+        rate_retry: bool = False,
     ) -> str | RungShed | None:
         """Reserve one policy-bounded slot on a rung, or report the shed.
 
@@ -202,8 +208,8 @@ class NativeAttemptAccounting:
             deployment: The claimed rung about to dispatch.
             reserved_tokens: Worst-case tokens this dispatch reserves, counted
                 against the rung's token window when one is authored.
-            force: Admit past every policy limit because no other rung can
-                serve.
+            force: Admit past soft policy limits when overflow is explicitly allowed.
+            rate_retry: Skip only rate-window checks after scheduled backoff.
 
         Returns:
             An opaque reservation ticket, the shed disclosure, or ``None``
@@ -216,6 +222,7 @@ class NativeAttemptAccounting:
             deployment,
             reserved_tokens=reserved_tokens,
             force=force,
+            rate_retry=rate_retry,
         )
         if isinstance(result, RungShed):
             with self._lock:
@@ -226,10 +233,11 @@ class NativeAttemptAccounting:
                     self._rung_fresh_session_spills += 1
         return result
 
-    def rung_admission_counters(self) -> tuple[int, int]:
-        """Return ``(sheds, saturated_overflows)`` for the metrics snapshot."""
+    def rung_admission_counters(self) -> tuple[int, int, int]:
+        """Return ``(sheds, saturated_overflows, saturation_refusals)`` for metrics."""
         with self._lock:
-            return (self._rung_admission_sheds, self._rung_saturated_overflows)
+            sheds, overflows = self._rung_admission_sheds, self._rung_saturated_overflows
+            return (sheds, overflows, self._rung_saturation_refusals)
 
     def rung_rate_counters(self) -> tuple[int, int]:
         """Return ``(rate_limit_sheds, fresh_session_spills)`` for metrics."""
@@ -368,7 +376,7 @@ class NativeAttemptAccounting:
         # Rung dispatch policies shed a claimed rung SIDEWAYS to the next
         # claimable one instead of queueing on it. Each shed is remembered so
         # the dispatched attempt can disclose the bypassed rung, and so a ladder
-        # exhausted ONLY by sheds can force-admit past the bound, never fail.
+        # exhausted only by sheds applies the selected rung's saturation policy.
         policy_sheds: list[tuple[int, str]] = []
         disposition: ThrottleDisposition | None = None
         redial_depth: int | None = None  # The rung a post-backoff redial re-dials.
@@ -407,20 +415,34 @@ class NativeAttemptAccounting:
             )
             last_failure = None
         forced_overflow = False
+        shed_records: dict[int, RungShed] = {}
         # The input half of the reservation tokenizes the whole prompt, so it
         # is computed once per ladder walk and shared with every candidate.
         reserved_input_tokens = worst_case_input_tokens(entry.request)
         while True:
+            with self._lock:
+                active = self._inflight.get(request_id) is entry
+            if not active or time.monotonic() >= entry.deadline_monotonic:
+                if candidate is not None:
+                    self._health.release_probe(keys[candidate])
+                last_failure = GatewayFailure(
+                    failure_class=GatewayFailureClass.TIMEOUT
+                    if active
+                    else GatewayFailureClass.CANCELLED,
+                    safe_message="gateway execution deadline exceeded"
+                    if active
+                    else "gateway request was cancelled",
+                )
+                break
             if candidate is None:
-                if (
-                    policy_sheds
-                    and last_failure is None
-                    and not forced_overflow
-                    and not entry.overflow_used
-                ):
-                    forced_overflow = True
-                    entry.overflow_used = True
-                    candidate = policy_sheds[0][0]
+                if policy_sheds and last_failure is None and not forced_overflow:
+                    candidate = overflow_target(route, policy_sheds, shed_records)
+                    forced_overflow = candidate is not None
+                    if candidate is None:
+                        last_failure = lane_saturated_failure()
+                        with self._lock:
+                            self._rung_saturation_refusals += 1
+                        break
                 else:
                     break
             if route.snapshot.stage_for_depth(candidate).pool_id in entry.denied_destination_pools:
@@ -446,16 +468,27 @@ class NativeAttemptAccounting:
                 deployment,
                 reserved_tokens=reserved_input_tokens + reserved_output_tokens,
                 force=forced_overflow,
+                rate_retry=forced_overflow and candidate == redial_depth,
             )
             if isinstance(ticket, RungShed):
                 record_departure(
                     self.recovery, self.recovery_host, entry, deployment, "local_capacity"
                 )
                 policy_sheds.append((candidate, ticket.reason))
+                shed_records[candidate] = ticket
                 self._health.release_probe(keys[candidate])
                 forced_overflow = shed_keeps_rung(
                     route, candidate, redial_depth, last_failure, ticket.reason
                 )
+                if (
+                    forced_overflow
+                    and overflow_target(route, [(candidate, ticket.reason)], {candidate: ticket})
+                    is None
+                ):
+                    last_failure = lane_saturated_failure()
+                    with self._lock:
+                        self._rung_saturation_refusals += 1
+                    break
                 if not forced_overflow:
                     candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
                 continue
@@ -519,9 +552,9 @@ class NativeAttemptAccounting:
                     if candidate == len(route.deployments) - 1
                     else all_routes_unavailable_failure()
                 )
-                if candidate == redial_depth:
-                    # The forced admission belonged to the redialed rung alone.
-                    forced_overflow = False
+                # A forced reservation belongs only to the selected rung, never
+                # a later destination reached after this one's budget rejection.
+                forced_overflow = False
                 candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
                 continue
             except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
@@ -551,7 +584,8 @@ class NativeAttemptAccounting:
                 self._count_throttle_disposition(disposition)
             elif throttle_backoff:
                 self._count_throttle_disposition(THROTTLE_BACKOFF)
-            self._bind_sticky_dispatch(entry, deployment)
+            if self.recovery_host is None:
+                bind_sticky_dispatch(self._sticky, entry, deployment)
             observe_reserved_attempt(self.recovery_host, entry, attempt_id, deployment)
             with self._lock:
                 if forced_overflow and not throttle_backoff:
@@ -579,56 +613,11 @@ class NativeAttemptAccounting:
                 if throttled_remaining is not None
                 else all_routes_unavailable_failure()
             )
-        self.finish_request_quietly(entry.authorization, ledger_failure(exhaustion))
+        if active:
+            self.finish_request_quietly(entry.authorization, ledger_failure(exhaustion))
         with self._lock:
             self._inflight.pop(request_id, None)
-        failure_payload: JsonObject = {
-            "failure_class": exhaustion.failure_class.value,
-            "safe_message": exhaustion.safe_message,
-        }
-        if exhaustion.customer_owned:
-            # Echoed back so the data plane renders the caller's 400, not the
-            # house 502, from the failure that ended the ladder.
-            failure_payload["customer_owned"] = True
-        if exhaustion.rejected_parameter is not None:
-            failure_payload["rejected_parameter"] = exhaustion.rejected_parameter
-        if exhaustion.provider_detail is not None:
-            failure_payload["provider_detail"] = exhaustion.provider_detail
-        if exhaustion.refusal_reason is not None:
-            # Echoed back so an exhausted refusal ladder re-renders with its
-            # bounded category on the caller-facing 400.
-            failure_payload["refusal_reason"] = exhaustion.refusal_reason.value
-        if exhaustion.retry_after_seconds is not None:
-            failure_payload["retry_after_seconds"] = exhaustion.retry_after_seconds
-        return json.dumps(
-            {"exhausted": True, "failure": failure_payload},
-            separators=(",", ":"),
-        )
-
-    def _bind_sticky_dispatch(
-        self,
-        entry: InflightRequest,
-        deployment: ExactModelDeployment,
-    ) -> None:
-        """Refresh placement only on direct affinity routes without scoped recovery.
-
-        Placement is not proof of successful cache use. Scoped recovery and model
-        plans record their cache evidence at successful settlement instead.
-        """
-        if self.recovery_host is not None or entry.route.snapshot.model_stages:
-            return
-        if entry.affinity_fingerprint is None:
-            return
-        if entry.route.snapshot.failover_mode != "maximize_cache_affinity":
-            return
-        policy = deployment.gateway.dispatch
-        if policy is None or policy.sticky_spill_seconds is None:
-            return
-        self._sticky.bind(
-            entry.affinity_fingerprint,
-            deployment.deployment_id,
-            ttl_seconds=float(policy.sticky_spill_seconds),
-        )
+        return exhausted_attempt_payload(exhaustion)
 
     def settle(self, argument: str) -> str:
         """Durably settle one previously reserved attempt exactly once.

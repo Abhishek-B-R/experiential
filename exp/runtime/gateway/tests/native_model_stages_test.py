@@ -140,6 +140,7 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
     primary = ThreadingHTTPServer(("127.0.0.1", 0), _PrimaryUpstream)
     child_cancel = getattr(request, "param", None) == "tool-child-cancel"
     child_collision = getattr(request, "param", None) == "tool-child-collision"
+    first_token_stall = getattr(request, "param", None) == "first-token-stall"
     secondary_handler = _StageSecondaryUpstream
     if child_cancel or child_collision:
         from exp.runtime.gateway.tests.native_responses_tool_translation_test import _ToolUpstream
@@ -174,6 +175,8 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
         rule = (
             "provider_internal"
             if mapping_isolation or child_cancel or child_collision
+            else "timeout"
+            if first_token_stall
             else request.param
         )
         capabilities = capabilities.model_copy(update={"failover_only_on": (rule,)})
@@ -262,6 +265,7 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
                     {
                         "root": str(tmp_path),
                         "request_timeout_seconds": 10,
+                        "time_to_first_token_seconds": 1.0 if first_token_stall else 120.0,
                         "child_origin": f"http://127.0.0.1:{secondary.server_port}/v1",
                     }
                 ),
@@ -304,6 +308,28 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
                 server.shutdown()
                 server.server_close()
             assert process.returncode == 0, log_path.read_text()
+
+
+@pytest.mark.parametrize("engine", ["first-token-stall"], indirect=True)
+def test_semantic_first_token_stall_enters_only_the_timeout_eligible_child(
+    engine: _ServingEngine,
+) -> None:
+    """Root headers and keepalives cannot consume the deadline without reaching the child model."""
+    started = time.monotonic()
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "messages": [{"role": "user", "content": "stall-after-headers"}]},
+        timeout=15,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["choices"][0]["message"]["content"] == "from-secondary"
+    assert response.headers["x-gateway-canonical-model"] == "secondary-exact"
+    assert time.monotonic() - started < 6
+    assert _attempt_rows(engine, response.headers["x-request-id"]) == [
+        (0, 0, "failed"),
+        (1, 1, "completed"),
+    ]
 
 
 @pytest.mark.parametrize("stream", [False, True])

@@ -176,6 +176,7 @@ mod tests {
             idempotency_key: "op".to_string(),
             time_to_first_byte_base_seconds: None,
             time_to_first_byte_seconds_per_million_input_tokens: None,
+            time_to_first_token_base_seconds: None,
             throttle_redial_budget: 0,
             throttle_redial: None,
             failover_only_on: tokens.map(|set| set.iter().map(|t| t.to_string()).collect()),

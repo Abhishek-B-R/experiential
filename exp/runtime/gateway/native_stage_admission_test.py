@@ -642,10 +642,10 @@ def test_verified_session_warmth_survives_capacity_admission_without_scope_leaks
         assert accounting.rung_rate_counters() == (0, 0)
         assert accounting.sticky.size() == 0
     else:
-        # Every cold lane sheds, so the bounded emergency overflow is the only
-        # admission. A stale sticky binding must not silently admit any lane.
+        # Authored bounds retain their explicit overflow policy. A stale sticky
+        # binding must not silently admit any lane before that disclosed overflow.
         assert accounting.rung_rate_counters() == (0, 3)
-        assert entry.overflow_used
+        assert accounting.rung_admission_counters() == (3, 1, 0)
 
 
 @pytest.mark.parametrize("non_affinity", ["maximize_availability", "maximize_cache"])
@@ -869,6 +869,66 @@ def test_recovery_tokenizes_only_retained_history_with_token_headroom_policy(
         "renewed": "retained_warm_fallback" if with_token_window else "cache_expired",
     }
     assert placement.recovery_reason == expected[history]
+
+
+def test_recovery_return_requires_default_lane_headroom() -> None:
+    """An unauthored saturated lane cannot gain an elective recovery trial past the worker cap."""
+    route, wires = _affinity_fixture()
+    deployments = tuple(
+        d.model_copy(update={"gateway": d.gateway.model_copy(update={"dispatch": None})})
+        for d in route.deployments
+    )
+    route = route.model_copy(
+        update={"deployment": deployments[0], "fallback_deployments": deployments[1:]}
+    )
+    authorization = route.snapshot.authorization
+    request = GatewayRequest(
+        surface=authorization.surface,
+        messages=(GatewayMessage(role="user", content="prefix"),),
+        prompt_cache_key="session",
+        provider_prompt_cache_key="xpl-session",
+    )
+    host = Host()
+    clock = Clock()
+    accounting = NativeAttemptAccounting(
+        _RecordingLedger(), recovery_host=host, default_lane_bound=1
+    )
+    accounting.recovery = SessionRecoveryRegistry(clock=clock)
+    ordered, _, _ = stage_affinity_ordered_rungs(
+        route, wires, request, accounting=accounting, authorization=authorization, continuation=None
+    )
+    key = session_cache_key(InflightRequest(authorization, ordered, request, 10))
+    assert key is not None
+    lead, retained, _last = ordered.deployments
+    for deployment in (lead, retained):
+        accounting.recovery.record_success(
+            key,
+            deployment.deployment_id,
+            host.scope_for(deployment, authorization.organization_id),
+            cached_tokens=80,
+            cache_write_tokens=0,
+            retention_seconds=100,
+            sticky_seconds=60,
+        )
+    accounting.recovery.depart(
+        key,
+        lead.deployment_id,
+        host.scope_for(lead, authorization.organization_id),
+        "local_capacity",
+    )
+    clock.now += 6
+    assert isinstance(
+        accounting.loads.reserve(
+            rung_load_key(lead), organization_id="other", weight=1, bound=1, fair_share=False
+        ),
+        str,
+    )
+    _, _, placement = stage_affinity_ordered_rungs(
+        route, wires, request, accounting=accounting, authorization=authorization, continuation=None
+    )
+    assert placement.recovery_reason == "retained_warm_fallback"
+    assert placement.verified_warm_deployment_id == retained.deployment_id
+    assert accounting.loads.inflight(rung_load_key(lead)) == 1
 
 
 def test_no_recovery_host_skips_prefix_digest(monkeypatch: pytest.MonkeyPatch) -> None:
