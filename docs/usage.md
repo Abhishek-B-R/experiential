@@ -35,9 +35,10 @@ Only one Capture process can run per macOS user, including across different prev
 Capture requires Python 3.13 or newer. Other SDK and CLI commands continue to support Python 3.12.
 In a checkout, use `uv run --python 3.13 exp capture`. The first run installs the bundled, signed
 Mitmproxy Redirector app at `/Applications/Mitmproxy Redirector.app`. Approve its Network Extension
-when macOS asks. Capture checks the packaged backend, supported macOS version, and installation
-access before login. If your account cannot install or update the app in `/Applications`, ask
-your administrator for installation access, then retry as your normal user.
+when macOS asks. Before login, Capture verifies the packaged app and extension signatures against
+mitmproxy's expected signing identity, verifies any installed copy it will reuse, and checks the
+supported macOS version and installation access. If your account cannot install or update the app
+in `/Applications`, ask your administrator for installation access, then retry as your normal user.
 
 Advanced users can repeat `--domain HOST` to replace the defaults with an exact set, for example
 `exp capture --domain api.openai.com`. The filter applies across applications. Only supported

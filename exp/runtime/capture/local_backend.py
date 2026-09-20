@@ -7,23 +7,32 @@ import platform
 import plistlib
 import re
 import stat
+import subprocess
 import sys
 import tarfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from xml.parsers.expat import ExpatError
 
 from filelock import FileLock, Timeout
 
+if sys.platform == "win32":
+    pwd = None
+else:
+    import pwd
+
 _APPLICATIONS = Path("/Applications")
 _APP_NAME = "Mitmproxy Redirector.app"
+_APP_IDENTIFIER = "org.mitmproxy.macos-redirector"
+_EXTENSION_IDENTIFIER = f"{_APP_IDENTIFIER}.network-extension"
+_EXTENSION_PATH = f"Contents/Library/SystemExtensions/{_EXTENSION_IDENTIFIER}.systemextension"
 _APP_PLIST = f"{_APP_NAME}/Contents/Info.plist"
-_EXTENSION_PLIST = (
-    f"{_APP_NAME}/Contents/Library/SystemExtensions/"
-    "org.mitmproxy.macos-redirector.network-extension.systemextension/Contents/Info.plist"
-)
+_EXTENSION_PLIST = f"{_APP_NAME}/{_EXTENSION_PATH}/Contents/Info.plist"
+_ARCHIVE_MAX_BYTES = 32 * 1024 * 1024
+_ARCHIVE_MAX_MEMBERS = 256
 _REINSTALL = (
     "Capture's macOS redirector package is missing or invalid. "
     "Reinstall Experiential with Python 3.13 or newer to restore its mitmproxy-macos dependency."
@@ -34,9 +43,10 @@ _REINSTALL = (
 def capture_instance() -> Iterator[None]:
     """Hold one foreground Capture session per user, including startup and shutdown.
 
-    This location deliberately ignores profile roots and XDG settings: every session
-    controls the same macOS redirector. The OS releases the lock when a process exits
-    or crashes. Keeping the file preserves its inode for other waiting processes.
+    This location uses the OS account's home, ignoring HOME, profile roots, and XDG
+    settings: every session controls the same macOS redirector. The OS releases the
+    lock when a process exits or crashes. Keeping the file preserves its inode for
+    other waiting processes.
 
     Yields:
         None while this process owns the user's Capture session.
@@ -66,7 +76,7 @@ def capture_instance() -> Iterator[None]:
 
 def _foreground_lock_path() -> Path:
     """Create only user-owned directories and reject redirected or shared lock paths."""
-    home = Path.home()
+    home = _account_home()
     for ancestor in reversed(home.parents):
         if not stat.S_ISDIR(ancestor.lstat().st_mode):
             raise RuntimeError(f"Capture's home directory has an unsafe ancestor: {ancestor}")
@@ -98,6 +108,22 @@ def _foreground_lock_path() -> Path:
             "only by your user, then rerun exp capture."
         )
     return path
+
+
+def _account_home() -> Path:
+    """Resolve the effective OS account without trusting environment-selected profiles."""
+    if pwd is None:
+        raise RuntimeError("System Capture currently supports macOS only.")
+    try:
+        home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+    except (KeyError, OSError) as exc:
+        raise RuntimeError(
+            "Capture could not resolve your macOS account home. Check your account's "
+            "home directory with your administrator, then rerun exp capture."
+        ) from exc
+    if not home.is_absolute():
+        raise RuntimeError("Capture requires an absolute home directory for your macOS account.")
+    return home
 
 
 def _require_owned_directory(path: Path) -> None:
@@ -138,6 +164,7 @@ def require_local_backend() -> None:
             "Unset MITMPROXY_KEEP_REDIRECTOR and rerun exp capture so mitmproxy can manage "
             "its packaged redirector."
         )
+    _verify_packaged_app(archive)
     _require_install_access(archive)
 
 
@@ -146,7 +173,7 @@ def _packaged_archive() -> Path:
     try:
         package = distribution("mitmproxy-macos")
         archive = Path(str(package.locate_file(f"mitmproxy_macos/{_APP_NAME}.tar")))
-        if not archive.is_file():
+        if not archive.is_file() or archive.stat().st_size > _ARCHIVE_MAX_BYTES:
             raise RuntimeError(_REINSTALL)
         return archive
     except (PackageNotFoundError, OSError) as exc:
@@ -195,6 +222,113 @@ def _minimum_macos(archive: Path) -> tuple[int, int, int]:
     return minimum
 
 
+def _verify_packaged_app(archive: Path) -> None:
+    """Verify a bounded private copy before mitmproxy can install or execute this archive.
+
+    The native installer only copies the packaged archive and sets a plist
+    timestamp; it has no install-only or pre-execution hook. Validating its source
+    bundle covers fresh installs without replacing that installer or patching native
+    methods. The separate installed-bundle check covers its timestamp-based reuse path.
+    """
+    try:
+        if archive.stat().st_size > _ARCHIVE_MAX_BYTES:
+            raise ValueError("redirector archive is too large")
+        with TemporaryDirectory(prefix="exp-capture-verify-") as temporary:
+            destination = Path(temporary)
+            _extract_verification_bundle(archive, destination)
+            _verify_bundle_signature(destination / _APP_NAME)
+    except (OSError, ValueError, tarfile.TarError) as exc:
+        raise RuntimeError(_REINSTALL) from exc
+
+
+def _extract_verification_bundle(archive: Path, destination: Path) -> None:
+    """Extract only bounded plain files and directories inside the single expected app."""
+    names: set[str] = set()
+    total_size = 0
+    with tarfile.open(archive, "r:") as bundle:
+        for member in bundle:
+            name = member.name.rstrip("/")
+            parts = name.split("/")
+            if (
+                len(names) >= _ARCHIVE_MAX_MEMBERS
+                or name in names
+                or parts[0] != _APP_NAME
+                or any(part in ("", ".", "..") for part in parts)
+                or "\\" in name
+                or not (member.isdir() or member.isreg())
+                or member.issparse()
+                or member.mode & 0o6022
+                or (len(parts) == 1 and not member.isdir())
+                or member.size < 0
+            ):
+                raise ValueError("unsafe redirector archive member")
+            names.add(name)
+            total_size += member.size
+            if total_size > _ARCHIVE_MAX_BYTES:
+                raise ValueError("redirector archive contents are too large")
+            target = destination.joinpath(*parts)
+            if member.isdir():
+                target.mkdir(mode=0o700, parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            source = bundle.extractfile(member)
+            if source is None:
+                raise ValueError("missing redirector archive member")
+            with source, target.open("xb") as output:
+                remaining = member.size
+                while remaining:
+                    chunk = source.read(min(remaining, 1024 * 1024))
+                    if not chunk:
+                        raise ValueError("truncated redirector archive member")
+                    output.write(chunk)
+                    remaining -= len(chunk)
+            target.chmod(0o600 | (member.mode & 0o100))
+
+
+def _verify_bundle_signature(app: Path) -> None:
+    """Require intact app and extension signatures from mitmproxy's Apple Developer ID."""
+    for bundle, identifier in (
+        (app, _APP_IDENTIFIER),
+        (app / _EXTENSION_PATH, _EXTENSION_IDENTIFIER),
+    ):
+        requirement = (
+            "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists "
+            "and certificate leaf[field.1.2.840.113635.100.6.1.13] exists "
+            'and certificate leaf[subject.OU] = "S8XHQB96PW" '
+            f'and identifier "{identifier}"'
+        )
+        try:
+            result = subprocess.run(
+                [
+                    "/usr/bin/codesign",
+                    "--verify",
+                    "--strict",
+                    "--deep",
+                    "--all-architectures",
+                    "--test-requirement",
+                    requirement,
+                    str(bundle),
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(
+                "Capture could not verify the Mitmproxy Redirector signature. "
+                "Check that /usr/bin/codesign works, then rerun exp capture."
+            ) from exc
+        if result.returncode:
+            raise RuntimeError(
+                "Capture rejected the Mitmproxy Redirector app or extension signature. "
+                "Reinstall Experiential; if the installed app is damaged, ask an administrator "
+                "to remove /Applications/Mitmproxy Redirector.app before retrying."
+            )
+
+
 def _require_install_access(archive: Path) -> None:
     """Match mitmproxy's mtime reuse rule before requiring app replacement permissions."""
     app = _APPLICATIONS / _APP_NAME
@@ -203,6 +337,7 @@ def _require_install_access(archive: Path) -> None:
     try:
         if plist.is_file() and plist.stat().st_mtime_ns == archive.stat().st_mtime_ns:
             if executable.is_file() and os.access(executable, os.X_OK):
+                _verify_bundle_signature(app)
                 return
             raise RuntimeError(
                 "The installed Mitmproxy Redirector app is incomplete. Ask an administrator "

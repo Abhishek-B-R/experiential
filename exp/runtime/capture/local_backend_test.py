@@ -12,6 +12,8 @@ import sys
 import tarfile
 from importlib.metadata import Distribution, PackageNotFoundError
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -38,7 +40,15 @@ def _archive(
 
 
 @pytest.fixture
-def backend_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+def codesign(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    """Record signature verification commands without invoking macOS tools in unit tests."""
+    command = Mock(return_value=subprocess.CompletedProcess(["codesign"], 0, "", ""))
+    monkeypatch.setattr(local_backend.subprocess, "run", command)
+    return command
+
+
+@pytest.fixture
+def backend_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, codesign: Mock) -> Path:
     """Limit every preflight path to the test directory and report a normal macOS user."""
     applications = tmp_path / "Applications"
     applications.mkdir()
@@ -213,13 +223,242 @@ def test_matching_timestamp_without_executable_fails(
         local_backend.require_local_backend()
 
 
+def test_signature_verification_requires_exact_developer_and_bundles(
+    tmp_path: Path, codesign: Mock
+) -> None:
+    """The verifier checks cryptographic identity, integrity, and both binary architectures."""
+    app = tmp_path / local_backend._APP_NAME
+    local_backend._verify_bundle_signature(app)
+    assert codesign.call_count == 2
+    for call, bundle, identifier in zip(
+        codesign.call_args_list,
+        (app, app / local_backend._EXTENSION_PATH),
+        (local_backend._APP_IDENTIFIER, local_backend._EXTENSION_IDENTIFIER),
+        strict=True,
+    ):
+        command = call.args[0]
+        assert command[:6] == [
+            "/usr/bin/codesign",
+            "--verify",
+            "--strict",
+            "--deep",
+            "--all-architectures",
+            "--test-requirement",
+        ]
+        assert command[6] == (
+            "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists "
+            "and certificate leaf[field.1.2.840.113635.100.6.1.13] exists "
+            'and certificate leaf[subject.OU] = "S8XHQB96PW" '
+            f'and identifier "{identifier}"'
+        )
+        assert command[7] == str(bundle)
+        assert call.kwargs["timeout"] == 15
+        assert call.kwargs["env"] == {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+        assert call.kwargs["stdin"] == subprocess.DEVNULL
+
+
+@pytest.mark.parametrize("exit_code", [1, 3])
+def test_tampered_or_wrong_identity_bundle_stops_preflight(
+    backend_environment: Path, tmp_path: Path, codesign: Mock, exit_code: int
+) -> None:
+    """A damaged signature or valid signature from the wrong identity cannot reach install."""
+    _archive(tmp_path)
+    codesign.return_value = subprocess.CompletedProcess(["codesign"], exit_code, "", "invalid")
+    with pytest.raises(RuntimeError, match="rejected.*signature"):
+        local_backend.require_local_backend()
+    assert codesign.call_count == 1
+    assert list(backend_environment.iterdir()) == []
+    assert not Path(codesign.call_args.args[0][-1]).exists()
+
+
+def test_extension_identity_mismatch_is_rejected(tmp_path: Path, codesign: Mock) -> None:
+    """A valid outer app does not excuse a nested extension signed by another developer."""
+    codesign.side_effect = [
+        subprocess.CompletedProcess(["codesign"], 0, "", ""),
+        subprocess.CompletedProcess(["codesign"], 3, "", "requirement failed"),
+    ]
+    with pytest.raises(RuntimeError, match="rejected.*signature"):
+        local_backend._verify_bundle_signature(tmp_path / local_backend._APP_NAME)
+    assert codesign.call_count == 2
+
+
+@pytest.mark.parametrize("failure", [OSError("missing"), subprocess.TimeoutExpired("codesign", 15)])
+def test_verifier_unavailable_fails_with_remedy(
+    tmp_path: Path, codesign: Mock, failure: Exception
+) -> None:
+    """Missing or stalled OS verification cannot count as a successful authenticity check."""
+    codesign.side_effect = failure
+    with pytest.raises(RuntimeError, match="Check that /usr/bin/codesign works"):
+        local_backend._verify_bundle_signature(tmp_path / local_backend._APP_NAME)
+
+
+def test_fresh_install_verifies_private_archive_copy(
+    backend_environment: Path, tmp_path: Path, codesign: Mock
+) -> None:
+    """Verification precedes the native installer without publishing an app ourselves."""
+    _archive(tmp_path)
+    local_backend.require_local_backend()
+    assert codesign.call_count == 2
+    staged = Path(codesign.call_args_list[0].args[0][-1])
+    assert staged.name == local_backend._APP_NAME
+    assert staged.parent.name.startswith("exp-capture-verify-")
+    assert not staged.parent.exists()
+    assert list(backend_environment.iterdir()) == []
+
+
+def test_reused_install_is_verified_even_with_matching_timestamp(
+    backend_environment: Path, tmp_path: Path, codesign: Mock
+) -> None:
+    """A correct timestamp is only an upstream reuse hint, never proof of authenticity."""
+    archive = _archive(tmp_path)
+    app = _installed_app(backend_environment, archive, current=True)
+    codesign.side_effect = [
+        subprocess.CompletedProcess(["codesign"], 0, "", ""),
+        subprocess.CompletedProcess(["codesign"], 0, "", ""),
+        subprocess.CompletedProcess(["codesign"], 1, "", "modified executable"),
+    ]
+    with pytest.raises(RuntimeError, match="rejected.*signature"):
+        local_backend.require_local_backend()
+    assert codesign.call_count == 3
+    assert codesign.call_args.args[0][-1] == str(app)
+    assert app.exists()
+
+
+def _member_archive(path: Path, members: list[tarfile.TarInfo]) -> Path:
+    """Create a small archive with explicit entries for adversarial extraction tests."""
+    with tarfile.open(path, "w:") as bundle:
+        for member in members:
+            bundle.addfile(member, io.BytesIO(b"x" * member.size))
+    return path
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "/tmp/escape",
+        "../escape",
+        "Other.app/Contents/file",
+        f"{local_backend._APP_NAME}/../escape",
+        f"{local_backend._APP_NAME}/./file",
+        f"{local_backend._APP_NAME}//file",
+        f"{local_backend._APP_NAME}/dir\\file",
+        local_backend._APP_NAME,
+    ],
+)
+def test_archive_rejects_paths_outside_single_app(
+    tmp_path: Path, codesign: Mock, name: str
+) -> None:
+    """Traversal, ambiguous paths, and unexpected app roots fail before signature checks."""
+    archive = _member_archive(tmp_path / "unsafe.tar", [tarfile.TarInfo(name)])
+    with pytest.raises(RuntimeError, match="package is missing or invalid"):
+        local_backend._verify_packaged_app(archive)
+    codesign.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "kind", [tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.FIFOTYPE, tarfile.CHRTYPE, tarfile.BLKTYPE]
+)
+def test_archive_rejects_links_and_special_files(
+    tmp_path: Path, codesign: Mock, kind: bytes
+) -> None:
+    """Plain-file verification cannot be redirected through filesystem links or devices."""
+    member = tarfile.TarInfo(f"{local_backend._APP_NAME}/Contents/file")
+    member.type = kind
+    member.linkname = "/tmp/escape"
+    archive = _member_archive(tmp_path / "unsafe.tar", [member])
+    with pytest.raises(RuntimeError, match="package is missing or invalid"):
+        local_backend._verify_packaged_app(archive)
+    codesign.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", [0o666, 0o775, 0o4755, 0o2755])
+def test_archive_rejects_shared_or_privileged_modes(
+    tmp_path: Path, codesign: Mock, mode: int
+) -> None:
+    """Native installation must not later publish group-writable or set-ID executables."""
+    member = tarfile.TarInfo(f"{local_backend._APP_NAME}/Contents/file")
+    member.mode = mode
+    archive = _member_archive(tmp_path / "unsafe.tar", [member])
+    with pytest.raises(RuntimeError, match="package is missing or invalid"):
+        local_backend._verify_packaged_app(archive)
+    codesign.assert_not_called()
+
+
+def test_archive_rejects_duplicate_entries(tmp_path: Path, codesign: Mock) -> None:
+    """Extraction cannot conceal a later payload behind an earlier file of the same name."""
+    member = tarfile.TarInfo(f"{local_backend._APP_NAME}/Contents/file")
+    archive = _member_archive(tmp_path / "duplicates.tar", [member, member])
+    with pytest.raises(RuntimeError, match="package is missing or invalid"):
+        local_backend._verify_packaged_app(archive)
+    codesign.assert_not_called()
+
+
+def test_archive_member_count_is_bounded(
+    tmp_path: Path, codesign: Mock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Many tiny entries cannot bypass the extraction work limit."""
+    monkeypatch.setattr(local_backend, "_ARCHIVE_MAX_MEMBERS", 2)
+    members = [tarfile.TarInfo(f"{local_backend._APP_NAME}/{index}") for index in range(3)]
+    archive = _member_archive(tmp_path / "many.tar", members)
+    with pytest.raises(RuntimeError, match="package is missing or invalid"):
+        local_backend._verify_packaged_app(archive)
+    codesign.assert_not_called()
+
+
+def test_archive_bytes_are_bounded(
+    tmp_path: Path, codesign: Mock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Oversized packaged archives fail without unpacking or running the verifier."""
+    archive = _archive(tmp_path)
+    monkeypatch.setattr(local_backend, "_ARCHIVE_MAX_BYTES", archive.stat().st_size - 1)
+    with pytest.raises(RuntimeError, match="package is missing or invalid"):
+        local_backend._verify_packaged_app(archive)
+    codesign.assert_not_called()
+
+
+def test_verification_copy_is_private_and_preserves_executable_bits(tmp_path: Path) -> None:
+    """Temporary inspection uses owner-only permissions without changing source contents."""
+    member = tarfile.TarInfo(f"{local_backend._APP_NAME}/Contents/MacOS/redirector")
+    member.mode = 0o755
+    member.size = 4
+    archive = _member_archive(tmp_path / "app.tar", [member])
+    destination = tmp_path / "staging"
+    destination.mkdir(mode=0o700)
+    local_backend._extract_verification_bundle(archive, destination)
+    executable = destination / member.name
+    assert executable.read_bytes() == b"xxxx"
+    assert stat.S_IMODE(executable.stat().st_mode) == 0o700
+    assert stat.S_IMODE(executable.parent.stat().st_mode) == 0o700
+
+
 @pytest.fixture
 def capture_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """Replace only the lock's home with a private synthetic directory."""
     home = tmp_path.resolve() / "home"
     home.mkdir(mode=0o700)
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(local_backend, "_account_home", lambda: home)
     return home
+
+
+def test_account_home_ignores_environment_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only the effective UID's account database determines the foreground lock home."""
+    home = tmp_path / "account-home"
+    lookup = Mock(return_value=SimpleNamespace(pw_dir=str(home)))
+    monkeypatch.setattr(local_backend, "pwd", SimpleNamespace(getpwuid=lookup))
+    monkeypatch.setenv("HOME", str(tmp_path / "environment-home"))
+    assert local_backend._account_home() == home
+    lookup.assert_called_once_with(os.geteuid())
+    assert not home.exists()
+
+
+def test_missing_account_home_is_actionable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing account record cannot fall back to an environment-controlled home."""
+    lookup = Mock(side_effect=KeyError("account does not exist"))
+    monkeypatch.setattr(local_backend, "pwd", SimpleNamespace(getpwuid=lookup))
+    with pytest.raises(RuntimeError, match="could not resolve.*account home"):
+        local_backend._account_home()
 
 
 def test_foreground_lock_is_private_and_reused(capture_home: Path) -> None:
@@ -249,7 +488,7 @@ from pathlib import Path
 from unittest.mock import patch
 from exp.runtime.capture.local_backend import capture_instance
 
-with patch.object(Path, 'home', return_value=Path(sys.argv[1])):
+with patch('exp.runtime.capture.local_backend._account_home', return_value=Path(sys.argv[1])):
     try:
         with capture_instance():
             sys.stdout.write('locked\\n')
@@ -262,15 +501,16 @@ with patch.object(Path, 'home', return_value=Path(sys.argv[1])):
 """
 
 
+@pytest.mark.parametrize("variable", ["HOME", "XDG_DATA_HOME"])
 def test_foreground_lock_rejects_other_process_and_profile(
-    capture_home: Path, tmp_path: Path
+    capture_home: Path, tmp_path: Path, variable: str
 ) -> None:
-    """Different XDG profiles still contend for the same user's actual OS lock."""
+    """HOME and XDG overrides still contend for the same account's actual OS lock."""
     with local_backend.capture_instance():
         child = subprocess.run(
             [sys.executable, "-c", _LOCK_CHILD, str(capture_home), "attempt"],
             cwd=Path(local_backend.__file__).parents[3],
-            env={**os.environ, "XDG_DATA_HOME": str(tmp_path / "another-profile")},
+            env={**os.environ, variable: str(tmp_path / "another-profile")},
             capture_output=True,
             text=True,
             timeout=10,
@@ -332,7 +572,7 @@ def test_foreground_lock_rejects_symlink_home_ancestor(
     """Checking the leaf home alone cannot permit an ancestor that redirects its path."""
     link = tmp_path / "redirected"
     link.symlink_to(capture_home.parent, target_is_directory=True)
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: link / "home"))
+    monkeypatch.setattr(local_backend, "_account_home", lambda: link / "home")
     with pytest.raises(RuntimeError, match="unsafe ancestor"):
         with local_backend.capture_instance():
             pytest.fail("symlink ancestor was accepted")
