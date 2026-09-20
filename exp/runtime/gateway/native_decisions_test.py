@@ -44,6 +44,10 @@ from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_accounting import NativeBridgeError
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.native_decisions import _admit_accepted
+from exp.runtime.gateway.tests.chain_authority_fixture_test import (
+    chain_components,
+    publish_authored_chain_fixture,
+)
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.typesafe import TypeSafeClient
 
@@ -180,10 +184,6 @@ def test_decisions_refuse_selected_model_chain_before_acceptance(tmp_path: Path)
                 "gateway_model_chains": {"systemone-exact": chain},
             }
         ),
-    )
-    from exp.runtime.gateway.tests.chain_authority_fixture_test import (
-        chain_components,
-        publish_authored_chain_fixture,
     )
 
     publish_authored_chain_fixture(

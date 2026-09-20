@@ -17,6 +17,7 @@ from exp.common.models.catalog import (
 )
 from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
+from exp.common.models.gateway_chains import ModelExecutionStage
 from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -35,11 +36,16 @@ from exp.runtime.gateway.native_accounting import (
     NativeBridgeError,
 )
 from exp.runtime.gateway.native_components import SyncWriteLedger
-from exp.runtime.gateway.native_execution import InflightRequest, deployment_health_key
+from exp.runtime.gateway.native_execution import (
+    InflightRequest,
+    deployment_health_key,
+    rung_load_key,
+)
 from exp.runtime.gateway.native_recovery_test import RecoveryHostFake
 from exp.runtime.gateway.native_settlement import failure_from_boundary_payload, ledger_failure
 from exp.runtime.gateway.recovery import FrozenRecoveryBinding
 from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.rung_admission import RungShed
 from exp.runtime.openai_protocol.errors import (
     THROTTLED_RETRY_AFTER_SECONDS,
     public_failure_error,
@@ -865,7 +871,6 @@ class TestLaneSaturation:
         self, authored: bool, staged: bool
     ) -> None:
         """Pinned reasoning cannot force a default or explicitly refusing lane past its bound."""
-        from exp.common.models.gateway_chains import ModelExecutionStage
 
         ledger = _RecordingLedger()
         registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
@@ -906,8 +911,6 @@ class TestLaneSaturation:
         self, authored: bool, conditional_child: bool
     ) -> None:
         """A full staged ladder cannot overflow or promote a failure-only child after a shed."""
-        from exp.common.models.gateway_chains import ModelExecutionStage
-        from exp.runtime.gateway.native_execution import rung_load_key
 
         ledger = _RecordingLedger()
         registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
@@ -982,8 +985,6 @@ class TestLaneSaturation:
         self, monkeypatch: pytest.MonkeyPatch, competing_fill: bool
     ) -> None:
         """A competing capacity fill replaces the old rate shed and terminates without spinning."""
-        from exp.runtime.gateway.native_execution import rung_load_key
-        from exp.runtime.gateway.rung_admission import RungShed
 
         ledger = _RecordingLedger()
         registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
@@ -1086,7 +1087,6 @@ class TestLaneSaturation:
         self, monkeypatch: pytest.MonkeyPatch, interruption: str
     ) -> None:
         """A request ending after its initial shed cannot dispatch through a later selection."""
-        from exp.runtime.gateway.rung_admission import RungShed
 
         ledger = _RecordingLedger()
         registry = NativeAttemptAccounting(ledger)

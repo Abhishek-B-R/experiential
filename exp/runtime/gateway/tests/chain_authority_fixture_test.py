@@ -21,13 +21,22 @@ import pytest
 
 from exp.common.core.artifacts import canonical_json_bytes
 from exp.common.models import (
+    ExactModelPool,
+    GatewayDeploymentMetadata,
     ModelCatalog,
     NormalizedGatewayCatalog,
     load_model_catalog,
     normalize_gateway_catalog,
 )
+from exp.common.models.gateway_chains import GatewayDeploymentRung, GatewayModelChain
 from exp.runtime.gateway.auth import utc_text
-from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
+    DirectTarget,
+    GatewayEvent,
+    GatewayEventKind,
+    GatewayUsage,
+)
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.management import GatewayManagement
@@ -35,6 +44,7 @@ from exp.runtime.gateway.model_chain_authority import (
     ModelChainAuthority,
     ModelChainAuthorityError,
     ModelChainAuthorityMode,
+    authorize_serving_model_chains,
     require_bound_model_chain_authority,
 )
 from exp.runtime.gateway.native_components import NativeGatewayComponents
@@ -42,6 +52,7 @@ from exp.runtime.gateway.replay_identity import canonical_request_sha256
 from exp.runtime.gateway.routing import CatalogRouteResolver
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 from exp.runtime.models import RuntimeModelCatalog
+from exp.runtime.openai_protocol import decode_chat
 
 _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS test_chain_floors (organization_id TEXT, alias_id TEXT,
@@ -428,11 +439,8 @@ def test_mixed_catalog_classifies_exact_selected_alias_and_retains_floor(
     tmp_path: Path, unavailable: bool
 ) -> None:
     """Shared catalogs preserve plain aliases without waiving protected chain policy."""
-    from exp.common.models import ExactModelPool, GatewayDeploymentMetadata
-    from exp.common.models.gateway_chains import GatewayDeploymentRung, GatewayModelChain
-    from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
+    # Native bridge tests import this fixture, so defer the reciprocal test-helper import.
     from exp.runtime.gateway.native_bridge_test import _chat_body, _configured_pool_gateway
-    from exp.runtime.openai_protocol import decode_chat
 
     manager, key = _configured_pool_gateway(tmp_path)
     authored = load_model_catalog(tmp_path / "models.toml")
@@ -608,10 +616,9 @@ def test_mixed_catalog_classifies_exact_selected_alias_and_retains_floor(
 
 def test_test_host_receipt_checks_are_durable_and_epoch_bound(tmp_path: Path) -> None:
     """The positive chain fixture cannot accept copied, stale, expired or retargeted authority."""
-    import pytest
 
+    # Native bridge tests import this fixture, so defer the reciprocal test-helper import.
     from exp.runtime.gateway.native_bridge_test import _chat_body, _configured_pool_gateway
-    from exp.runtime.openai_protocol import decode_chat
 
     manager, key = _configured_pool_gateway(tmp_path)
     catalog = normalize_gateway_catalog(load_model_catalog(tmp_path / "models.toml"))
@@ -688,9 +695,8 @@ def test_test_host_revalidates_first_and_retry_reservations(
     tmp_path: Path, mutation: str, after_first_attempt: bool
 ) -> None:
     """Authority changes after acceptance block even free retries, but never prevent settlement."""
-    from exp.runtime.gateway.contracts import GatewayEvent, GatewayEventKind, GatewayUsage
+    # Native bridge tests import this fixture, so defer the reciprocal test-helper import.
     from exp.runtime.gateway.native_bridge_test import _chat_body, _configured_pool_gateway
-    from exp.runtime.openai_protocol import decode_chat
 
     manager, key = _configured_pool_gateway(tmp_path)
     catalog = normalize_gateway_catalog(load_model_catalog(tmp_path / "models.toml"))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,20 +13,51 @@ from uuid import uuid4
 
 import pytest
 
-from exp.common.models import load_model_catalog, normalize_gateway_catalog, write_model_catalog
+from exp.common.core.artifacts import JsonObject
+from exp.common.models import (
+    BillingSource,
+    ConnectionConfig,
+    GatewayDeploymentCapabilities,
+    GatewayDeploymentMetadata,
+    GatewayTokenPrices,
+    ModelCapabilities,
+    ModelCatalog,
+    ModelRecord,
+    ModelRoles,
+    load_model_catalog,
+    normalize_gateway_catalog,
+    write_model_catalog,
+)
 from exp.common.models.gateway_chains import GatewayDeploymentRung, GatewayModelChain
-from exp.runtime.gateway.catalog_authority import snapshot_current_catalog
-from exp.runtime.gateway.contracts import AuthorizationSnapshot
+from exp.runtime.gateway.catalog_authority import authored_snapshot_path, snapshot_current_catalog
+from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget
+from exp.runtime.gateway.embeddings_contracts import ServingRequest
+from exp.runtime.gateway.ledger import SQLiteAttemptLedger
+from exp.runtime.gateway.lifecycle import GatewayLifecycleError, load_gateway_components
+from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.model_chain_authority import (
     ModelChainAuthority,
     ModelChainAuthorityError,
+    ModelChainAuthorityMode,
     authorize_model_chain,
     refuse_local_chain_snapshot,
     require_bound_model_chain_authority,
 )
-from exp.runtime.gateway.native_bridge_test import _configured_pool_gateway
+from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
+from exp.runtime.gateway.native_bridge_test import _chat_body, _configured_pool_gateway
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_execution_test import _route
+from exp.runtime.gateway.platform import ActivateAliasRevisionCommand
+from exp.runtime.gateway.routing import CatalogRouteResolver
+from exp.runtime.gateway.sqlite.platform import SQLiteGatewayPlatform
+from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
+from exp.runtime.gateway.tests.chain_authority_fixture_test import (
+    ChainControlStore,
+    chain_components,
+    publish_chain_fixture,
+)
+from exp.runtime.models import RuntimeModelCatalog
+from exp.runtime.openai_protocol import decode_chat
 
 
 def _binding(**updates: object) -> ModelChainAuthority:
@@ -55,25 +87,8 @@ def _nonchat_components(
     root: Path,
     surface: Literal["embeddings", "images", "decisions"],
     chain_policy: Literal["absent", "empty", "available", "unavailable", "unrelated"],
-) -> tuple[NativeGatewayComponents, str, dict[str, object]]:
+) -> tuple[NativeGatewayComponents, str, JsonObject]:
     """Compose stock public SQLite components with a metadata-only remote snapshot reference."""
-    from exp.common.models import (
-        BillingSource,
-        ConnectionConfig,
-        GatewayDeploymentCapabilities,
-        GatewayDeploymentMetadata,
-        GatewayTokenPrices,
-        ModelCapabilities,
-        ModelCatalog,
-        ModelRecord,
-        ModelRoles,
-    )
-    from exp.runtime.gateway.contracts import DirectTarget
-    from exp.runtime.gateway.ledger import SQLiteAttemptLedger
-    from exp.runtime.gateway.management import GatewayManagement
-    from exp.runtime.gateway.routing import CatalogRouteResolver
-    from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
-    from exp.runtime.models import RuntimeModelCatalog
 
     manager = GatewayManagement(root)
     manager.initialize()
@@ -164,7 +179,7 @@ def _nonchat_components(
     assert type(ledger) is SQLiteAttemptLedger
     assert type(routes) is CatalogRouteResolver
     assert type(runtime) is RuntimeModelCatalog
-    body: dict[str, object] = {"model": "public"}
+    body: JsonObject = {"model": "public"}
     if surface == "embeddings":
         body["input"] = "hello"
     elif surface == "images":
@@ -207,7 +222,6 @@ def test_nonchat_remote_chain_refuses_before_stock_acceptance(
     chain_policy: Literal["available", "unavailable"],
 ) -> None:
     """In-memory protected roots cannot lose their authority through non-chat direct projection."""
-    from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
 
     components, key, body = _nonchat_components(tmp_path, surface, chain_policy)
     control = NativeControlPlane(components)
@@ -218,7 +232,6 @@ def test_nonchat_remote_chain_refuses_before_stock_acceptance(
         assert (
             json.loads(error.value.public_error_json)["code"] == "model_chain_authority_unavailable"
         )
-    from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 
     ledger = cast(SQLiteAttemptLedger, components.ledger)
     with sqlite3.connect(ledger.database_path) as connection:
@@ -236,10 +249,6 @@ def test_nonchat_plain_remote_and_mixed_catalog_keep_exact_model_serving(
     configured_host: bool,
 ) -> None:
     """Ordinary roots dispatch once per call, with fresh host checks when configured."""
-    from exp.runtime.gateway.ledger import SQLiteAttemptLedger
-    from exp.runtime.gateway.model_chain_authority import ModelChainAuthorityMode
-    from exp.runtime.gateway.native_bridge import NativeControlPlane
-    from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 
     components, key, body = _nonchat_components(tmp_path, surface, chain_policy)
     ledger = cast(SQLiteAttemptLedger, components.ledger)
@@ -313,10 +322,6 @@ def test_nonchat_cached_receiptless_plain_authority_still_checks_host_floor(
     surface: Literal["embeddings", "images", "decisions"],
 ) -> None:
     """A configured host refusal is terminal before any non-chat acceptance or reservation."""
-    from exp.runtime.gateway.ledger import SQLiteAttemptLedger
-    from exp.runtime.gateway.model_chain_authority import ModelChainAuthorityMode
-    from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
-    from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 
     components, key, body = _nonchat_components(tmp_path, surface, "absent")
     ledger = cast(SQLiteAttemptLedger, components.ledger)
@@ -367,20 +372,6 @@ def test_cached_receiptless_authority_checks_retained_host_floor_before_serving(
     tmp_path: Path, operation: str, protected_then_plain: bool
 ) -> None:
     """Native admission and replay cannot use a cached last-good revision to skip the host."""
-    import time
-
-    from exp.runtime.gateway.embeddings_contracts import ServingRequest
-    from exp.runtime.gateway.ledger import SQLiteAttemptLedger
-    from exp.runtime.gateway.model_chain_authority import ModelChainAuthorityMode
-    from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
-    from exp.runtime.gateway.native_bridge_test import _chat_body
-    from exp.runtime.gateway.routing import CatalogRouteResolver
-    from exp.runtime.gateway.tests.chain_authority_fixture_test import (
-        ChainControlStore,
-        publish_chain_fixture,
-    )
-    from exp.runtime.models import RuntimeModelCatalog
-    from exp.runtime.openai_protocol import decode_chat
 
     manager, key = _configured_pool_gateway(tmp_path)
     authored = load_model_catalog(tmp_path / "models.toml")
@@ -491,13 +482,6 @@ def test_native_plain_authorization_works_with_or_without_concrete_host(
     tmp_path: Path, with_host: bool, operation: str
 ) -> None:
     """The mandatory host check preserves ordinary plain replay and admission without receipts."""
-    from exp.runtime.gateway.ledger import SQLiteAttemptLedger
-    from exp.runtime.gateway.model_chain_authority import ModelChainAuthorityMode
-    from exp.runtime.gateway.native_bridge import NativeControlPlane
-    from exp.runtime.gateway.native_bridge_test import _chat_body
-    from exp.runtime.gateway.routing import CatalogRouteResolver
-    from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
-    from exp.runtime.models import RuntimeModelCatalog
 
     manager, key = _configured_pool_gateway(tmp_path)
     authored = load_model_catalog(tmp_path / "models.toml")
@@ -569,7 +553,6 @@ def test_concrete_host_cannot_drop_required_or_existing_receipt(
     prior_receipt: bool, required: bool
 ) -> None:
     """Only a confirmed independently plain result may be returned without a receipt."""
-    from exp.runtime.gateway.model_chain_authority import ModelChainAuthorityMode
 
     auth = _route().snapshot.authorization
     if prior_receipt:
@@ -601,7 +584,6 @@ def test_concrete_host_cannot_drop_required_or_existing_receipt(
 
 def test_plain_concrete_host_callback_is_mandatory_and_errors_are_terminal() -> None:
     """Receiptless plain authority passes only after the configured host confirms it unchanged."""
-    from exp.runtime.gateway.model_chain_authority import ModelChainAuthorityMode
 
     auth = _route().snapshot.authorization
 
@@ -770,16 +752,6 @@ def test_preexisting_unsafe_chain_cannot_reenter_local_serving(
     tmp_path: Path, entrypoint: str
 ) -> None:
     """Even a legacy-written active chain is not served through last-good or direct APIs."""
-    from exp.runtime.gateway.catalog_authority import authored_snapshot_path
-    from exp.runtime.gateway.contracts import DirectTarget
-    from exp.runtime.gateway.ledger import SQLiteAttemptLedger
-    from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
-    from exp.runtime.gateway.native_bridge_test import _chat_body
-    from exp.runtime.gateway.tests.chain_authority_fixture_test import (
-        chain_components,
-        publish_chain_fixture,
-    )
-    from exp.runtime.openai_protocol import decode_chat
 
     manager, raw_key = _configured_pool_gateway(tmp_path)
     store = manager.require_initialized()
@@ -844,8 +816,6 @@ def test_preexisting_unsafe_chain_cannot_reenter_local_serving(
                 authorization=old_authorization
             )
     elif entrypoint == "attempt":
-        from exp.runtime.gateway.routing import CatalogRouteResolver
-
         prior_catalog = normalize_gateway_catalog(catalog)
         route = CatalogRouteResolver(
             {(old_authorization.alias_revision_id, old_authorization.catalog_sha256): prior_catalog}
@@ -874,9 +844,6 @@ def test_preexisting_unsafe_chain_cannot_reenter_local_serving(
                 catalog_sha256=normalized.identity_sha256(),
             )
     elif entrypoint.startswith("platform"):
-        from exp.runtime.gateway.platform import ActivateAliasRevisionCommand
-        from exp.runtime.gateway.sqlite.platform import SQLiteGatewayPlatform
-
         if entrypoint == "platform_reactivate":
             store.disable_alias(organization_id=manager.organization_id, alias_id="coding")
         with pytest.raises(ModelChainAuthorityError):
@@ -927,8 +894,6 @@ def test_model_chain_contract_marker_is_an_exact_integer(value: object) -> None:
 
 def test_local_lifecycle_never_falls_back_past_populated_active_policy(tmp_path: Path) -> None:
     """A known chain on the active revision cannot expose a prior direct alias after refusal."""
-    from exp.runtime.gateway.lifecycle import GatewayLifecycleError, load_gateway_components
-    from exp.runtime.gateway.tests.chain_authority_fixture_test import publish_chain_fixture
 
     manager, _key = _configured_pool_gateway(tmp_path)
     catalog = load_model_catalog(tmp_path / "models.toml")

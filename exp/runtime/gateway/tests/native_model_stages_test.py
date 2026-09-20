@@ -28,6 +28,11 @@ from exp.common.models.gateway_chains import (
 )
 from exp.runtime.gateway.native_bridge_test import _configured_pool_gateway
 from exp.runtime.gateway.tests.chain_authority_fixture_test import publish_authored_chain_fixture
+from exp.runtime.gateway.tests.native_responses_tool_translation_test import (
+    _assert_collision_response,
+    _collision_request,
+    _ToolUpstream,
+)
 from exp.runtime.gateway.tests.native_waterfall_test import (
     _DRIVER_SOURCE,
     _attempt_rows,
@@ -143,8 +148,6 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
     first_token_stall = getattr(request, "param", None) == "first-token-stall"
     secondary_handler = _StageSecondaryUpstream
     if child_cancel or child_collision:
-        from exp.runtime.gateway.tests.native_responses_tool_translation_test import _ToolUpstream
-
         secondary_handler = _ToolUpstream
     secondary = ThreadingHTTPServer(("127.0.0.1", 0), secondary_handler)
     for server in (primary, secondary):
@@ -598,10 +601,6 @@ def test_actual_child_collision_uses_its_own_declared_and_inverse_names(
     engine: _ServingEngine, stream: bool
 ) -> None:
     """Failed-root inverse metadata cannot rename any selected child's colliding tool."""
-    from exp.runtime.gateway.tests.native_responses_tool_translation_test import (
-        _assert_collision_response,
-        _collision_request,
-    )
 
     response = httpx.post(
         f"{engine.base}/v1/responses",

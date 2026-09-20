@@ -8,9 +8,13 @@ import logging
 import sqlite3
 import threading
 import time
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal, cast
 from unittest import mock
+from uuid import uuid4
 
 import pytest
 
@@ -47,6 +51,7 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
+from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle import (
     LocalGatewayComponents,
@@ -64,16 +69,22 @@ from exp.runtime.gateway.native_bridge_errors import capability_param as _public
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_recovery import session_cache_key
 from exp.runtime.gateway.native_stage_admission_test import Host
+from exp.runtime.gateway.replay_identity import canonical_request_sha256
 from exp.runtime.gateway.routing import GatewayRoutingError
+from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 from exp.runtime.gateway.tests.chain_authority_fixture_test import (
     chain_components,
     publish_authored_chain_fixture,
 )
+from exp.runtime.models.credentials import CredentialResolution, DispatchCredentialReceipt
+from exp.runtime.models.credentials_test import AtomicEnvironment
+from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.instruction_turns import (
     HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE,
     SYSTEM_FOLD_DISCLOSURE,
 )
+from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
@@ -1824,11 +1835,6 @@ def test_abandoned_inflight_attempts_are_swept_after_the_deadline(
     tmp_path: Path, setup_elapsed: float, request: pytest.FixtureRequest
 ) -> None:
     """Share one clock across authority, ledger and native deadlines, including late setup."""
-    from datetime import UTC, datetime, timedelta
-    from types import SimpleNamespace
-
-    from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
-    from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 
     class DeadlineClock:
         """Advance both time domains together without changing shared system time or sleeping."""
@@ -2403,11 +2409,6 @@ def test_responses_native_tools_use_released_adaptation_on_stage_and_root_wires(
     tmp_path: Path, staged: bool, native_root: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Actual admission freezes tool inversion alongside unchanged stage and replay authority."""
-    from dataclasses import replace
-
-    from exp.runtime.gateway.replay_identity import canonical_request_sha256
-    from exp.runtime.models.providers.base import GatewayWireProfile
-    from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 
     declared = GatewayDeploymentCapabilities(
         supports_streaming=True, supports_streaming_tool_arguments=True
@@ -6165,13 +6166,6 @@ def test_bridge_carries_scoped_verified_warmth_to_registered_request(
     tmp_path: Path, trial: bool, known_region: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Real admission preserves proven warmth but unknown geography only serves normally."""
-    from dataclasses import replace
-    from uuid import uuid4
-
-    from exp.runtime.models.credentials import CredentialResolution, DispatchCredentialReceipt
-    from exp.runtime.models.credentials_test import AtomicEnvironment
-    from exp.runtime.models.providers.base import GatewayWireProfile
-    from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 
     original_profile = OpenAICompatibleClient.gateway_wire_profile
 

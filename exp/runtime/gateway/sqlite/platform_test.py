@@ -70,6 +70,10 @@ from exp.runtime.gateway.sqlite.store import (
     OperationConflictError,
     OperationReplayUnavailableError,
 )
+from exp.runtime.gateway.tests.chain_authority_fixture_test import (
+    ChainAttemptLedger,
+    ChainControlStore,
+)
 
 _DIGEST = "a" * 64
 
@@ -880,10 +884,6 @@ def test_attempt_wrapper_returns_precise_reservation_and_settlement(
 def test_child_stage_reservation_replays_without_replacing_root_authority(tmp_path: Path) -> None:
     """A child attempt persists destination facts once and retains its tenant-owned root."""
     platform = _platform(tmp_path)
-    from exp.runtime.gateway.tests.chain_authority_fixture_test import (
-        ChainAttemptLedger,
-        ChainControlStore,
-    )
 
     platform.control = ChainControlStore(platform.database_path)
     platform.attempts = ChainAttemptLedger(platform.database_path)

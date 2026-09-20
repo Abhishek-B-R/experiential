@@ -37,6 +37,7 @@ from exp.runtime.gateway.recovery_test import Clock
 from exp.runtime.models.credentials import CredentialResolution, DispatchCredentialReceipt
 from exp.runtime.models.credentials_test import AtomicEnvironment
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
 from exp.runtime.models.providers.messages_payloads import anthropic_messages_stream_payload
 from exp.runtime.models.providers.protocol import NativeWireClient
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -492,7 +493,6 @@ def test_unknown_frozen_region_does_not_record_settled_cache_evidence(swept: boo
 
 def test_operator_us_inference_constraint_cannot_inherit_global_recovery() -> None:
     """The operator selector still applies without reusing unscoped global cache evidence."""
-    from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
 
     route = _route()
     host = Host()
