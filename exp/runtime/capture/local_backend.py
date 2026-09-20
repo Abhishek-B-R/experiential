@@ -1,4 +1,4 @@
-"""Read-only checks for mitmproxy's packaged macOS local redirector."""
+"""Preflight checks and per-user ownership of the macOS local redirector."""
 
 from __future__ import annotations
 
@@ -6,11 +6,16 @@ import os
 import platform
 import plistlib
 import re
+import stat
 import sys
 import tarfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 from xml.parsers.expat import ExpatError
+
+from filelock import FileLock, Timeout
 
 _APPLICATIONS = Path("/Applications")
 _APP_NAME = "Mitmproxy Redirector.app"
@@ -23,6 +28,90 @@ _REINSTALL = (
     "Capture's macOS redirector package is missing or invalid. "
     "Reinstall Experiential with Python 3.13 or newer to restore its mitmproxy-macos dependency."
 )
+
+
+@contextmanager
+def capture_instance() -> Iterator[None]:
+    """Hold one foreground Capture session per user, including startup and shutdown.
+
+    This location deliberately ignores profile roots and XDG settings: every session
+    controls the same macOS redirector. The OS releases the lock when a process exits
+    or crashes. Keeping the file preserves its inode for other waiting processes.
+
+    Yields:
+        None while this process owns the user's Capture session.
+
+    Raises:
+        RuntimeError: Another session is active or the lock path is unsafe or inaccessible.
+    """
+    try:
+        path = _foreground_lock_path()
+        lock = FileLock(path, timeout=0, mode=0o600)
+        lock.acquire()
+    except Timeout as exc:
+        raise RuntimeError(
+            "Capture is already running for this macOS user. Stop that session before "
+            "starting another one."
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            "Capture could not acquire its foreground lock. Check access to "
+            "~/Library/Application Support/exp/capture and rerun exp capture."
+        ) from exc
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def _foreground_lock_path() -> Path:
+    """Create only user-owned directories and reject redirected or shared lock paths."""
+    home = Path.home()
+    for ancestor in reversed(home.parents):
+        if not stat.S_ISDIR(ancestor.lstat().st_mode):
+            raise RuntimeError(f"Capture's home directory has an unsafe ancestor: {ancestor}")
+    _require_owned_directory(home)
+    directory = home
+    for name in ("Library", "Application Support", "exp", "capture"):
+        directory /= name
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        _require_owned_directory(directory)
+    # Older installations may have created this application-owned directory with 0755.
+    # Normalize this narrow directory only, never the user's Library or home directory.
+    directory.chmod(0o700)
+    path = directory / "foreground.lock"
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return path
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or metadata.st_mode & 0o022
+    ):
+        raise RuntimeError(
+            f"Capture's foreground lock is unsafe: {path}. Restore a regular file owned "
+            "only by your user, then rerun exp capture."
+        )
+    return path
+
+
+def _require_owned_directory(path: Path) -> None:
+    """Reject symlinks, foreign ownership, and directories writable by other users."""
+    metadata = path.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o022
+    ):
+        raise RuntimeError(
+            f"Capture's foreground lock directory is unsafe: {path}. Use a directory "
+            "owned by your user that other users cannot modify, then rerun exp capture."
+        )
 
 
 def require_local_backend() -> None:

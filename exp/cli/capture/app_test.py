@@ -25,7 +25,7 @@ def test_capture_defaults_to_supported_providers_without_input(
     monkeypatch.setattr(capture_module, "_capture", run_capture)
     result = CliRunner().invoke(app, ["capture"], input="")
     assert result.exit_code == 0, result.output
-    assert "What would you like to capture?" not in result.output
+    assert "What would you like to capture?" not in unstyle(result.output)
     assert calls == [("api.openai.com", "chatgpt.com", "api.anthropic.com")]
 
 
@@ -44,7 +44,7 @@ def test_explicit_domains_replace_defaults(monkeypatch: pytest.MonkeyPatch) -> N
     )
     assert result.exit_code == 0, result.output
     assert calls == [("api.openai.com",)]
-    assert "What would you like to capture?" not in result.output
+    assert "What would you like to capture?" not in unstyle(result.output)
 
 
 @pytest.mark.parametrize("command", ["reset", "status", "stop", "start"])
@@ -85,7 +85,7 @@ def test_domain_limit_precedes_setup(monkeypatch: pytest.MonkeyPatch) -> None:
         arguments.extend(("--domain", f"provider{index}.example.com"))
     result = CliRunner().invoke(app, arguments)
     assert result.exit_code == 2
-    assert "1 to 32" in result.output
+    assert "1 to 32" in unstyle(result.output)
 
 
 def test_help_never_attempts_setup(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -96,13 +96,20 @@ def test_help_never_attempts_setup(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError("help must not inspect or change system state")
 
     monkeypatch.setattr(capture_module, "_require_macos", reject_setup)
-    result = CliRunner().invoke(app, ["capture", "--help"])
+    result = CliRunner().invoke(
+        app,
+        ["capture", "--help"],
+        env={"TERM": "xterm-256color", "FORCE_COLOR": "1"},
+        color=True,
+    )
     assert result.exit_code == 0
-    assert "reset" not in result.output
-    assert "--domain" in result.output
-    assert "all apps" in result.output
-    assert "COMMAND" not in result.output
-    assert "What would you like to capture?" not in result.output
+    assert "\x1b[" in result.output
+    output = unstyle(result.output)
+    assert "reset" not in output
+    assert "--domain" in output
+    assert "all apps" in output
+    assert "COMMAND" not in output
+    assert "What would you like to capture?" not in output
 
 
 def test_capture_failure_reports_backend_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -116,8 +123,9 @@ def test_capture_failure_reports_backend_error(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(capture_module, "_capture", failed_capture)
     result = CliRunner().invoke(app, ["capture"])
     assert result.exit_code == 1, result.output
-    assert "Install Mitmproxy Redirector" in result.output
-    assert "reset" not in result.output
+    output = unstyle(result.output)
+    assert "Install Mitmproxy Redirector" in output
+    assert "reset" not in output
 
 
 def test_capture_requires_supported_python_before_launch(monkeypatch: pytest.MonkeyPatch) -> None:

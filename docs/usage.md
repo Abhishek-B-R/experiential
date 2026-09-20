@@ -30,6 +30,7 @@ reuses the normal Experiential login, or opens the same login flow when no crede
 tab under API Keys shows the run and its statistics for Platform administrators. A run represents
 one foreground Capture process, rather than one application conversation. No separate capture
 credential or background capture daemon is required.
+Only one Capture process can run per macOS user, including across different preview profiles.
 
 Capture requires Python 3.13 or newer. Other SDK and CLI commands continue to support Python 3.12.
 In a checkout, use `uv run --python 3.13 exp capture`. The first run installs the bundled, signed

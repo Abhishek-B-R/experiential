@@ -27,7 +27,7 @@ from exp.runtime.capture.certificates import (
     trust_certificate,
 )
 from exp.runtime.capture.control import CaptureCloudError, CaptureRun, CaptureRunClient
-from exp.runtime.capture.local_backend import require_local_backend
+from exp.runtime.capture.local_backend import capture_instance, require_local_backend
 from exp.runtime.capture.upload import CaptureUploader, UploadStats
 
 
@@ -49,8 +49,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
 def _capture(console: Console, *, domains: tuple[str, ...], root: Path) -> None:
     """Prepare normal authentication and certificates, then own one foreground run."""
     require_local_backend()
-    credentials = capture_credentials(console=console, environment=os.environ, root=root)
-    asyncio.run(_capture_authenticated(console, domains=domains, credentials=credentials))
+    with capture_instance():
+        credentials = capture_credentials(console=console, environment=os.environ, root=root)
+        asyncio.run(_capture_authenticated(console, domains=domains, credentials=credentials))
 
 
 async def _capture_authenticated(
