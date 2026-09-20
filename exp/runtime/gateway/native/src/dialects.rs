@@ -38,6 +38,7 @@ pub enum Dialect {
     OpenAiCompatible,
     GeminiGenerateContent,
     BedrockConverseStream,
+    TypesafeSystemone,
 }
 
 impl Dialect {
@@ -48,6 +49,7 @@ impl Dialect {
             "openai_compatible" => Some(Dialect::OpenAiCompatible),
             "gemini_generate_content" => Some(Dialect::GeminiGenerateContent),
             "bedrock_converse_stream" => Some(Dialect::BedrockConverseStream),
+            "typesafe_systemone" => Some(Dialect::TypesafeSystemone),
             _ => None,
         }
     }
@@ -59,12 +61,14 @@ impl Dialect {
 pub enum FrameDecoder {
     Sse(SseDecoder),
     EventStream(EventStreamDecoder),
+    Unsupported,
 }
 
 impl FrameDecoder {
     pub fn new(dialect: Dialect) -> Self {
         match dialect {
             Dialect::BedrockConverseStream => FrameDecoder::EventStream(EventStreamDecoder::new()),
+            Dialect::TypesafeSystemone => FrameDecoder::Unsupported,
             Dialect::OpenAiResponses
             | Dialect::AnthropicMessages
             | Dialect::OpenAiCompatible
@@ -77,6 +81,7 @@ impl FrameDecoder {
         match self {
             FrameDecoder::Sse(decoder) => decoder.feed(chunk),
             FrameDecoder::EventStream(decoder) => decoder.feed(chunk),
+            FrameDecoder::Unsupported => Err("decision models do not stream".to_string()),
         }
     }
 
@@ -85,6 +90,7 @@ impl FrameDecoder {
         match self {
             FrameDecoder::Sse(decoder) => decoder.finish(),
             FrameDecoder::EventStream(decoder) => decoder.finish(),
+            FrameDecoder::Unsupported => Err("decision models do not stream".to_string()),
         }
     }
 }
@@ -410,6 +416,7 @@ pub struct Normalizer {
     output_tokens: u64,
     cache_read: u64,
     cache_write: u64,
+    cache_write_1h: Option<u64>,
     stop_reason: Option<String>,
     // OpenAI-compatible and Gemini accumulation.
     usage: Option<Usage>,
@@ -431,7 +438,15 @@ pub struct Normalizer {
     // A call the provider cut mid-fragment was dropped under an ending that
     // did not declare truncation; the terminal then settles Incomplete.
     dropped_cut_call: bool,
+    // The upstream an aggregator named as serving this stream: OpenRouter
+    // stamps `provider` on every Chat Completions chunk once the request
+    // opted into its response metadata. First non-empty value wins; a label
+    // only (bounded, printable ASCII), never content.
+    upstream_provider: Option<String>,
 }
+
+/// Longest upstream label kept from a stream (mirrors the python settlement bound).
+pub const UPSTREAM_PROVIDER_MAX_CHARS: usize = 128;
 
 impl Normalizer {
     pub fn new(dialect: Dialect) -> Self {
@@ -458,6 +473,7 @@ impl Normalizer {
             output_tokens: 0,
             cache_read: 0,
             cache_write: 0,
+            cache_write_1h: None,
             stop_reason: None,
             usage: None,
             finish_reason: None,
@@ -466,7 +482,29 @@ impl Normalizer {
             request_words: Vec::new(),
             deferred_tool_failure: None,
             dropped_cut_call: false,
+            upstream_provider: None,
         }
+    }
+
+    /// The upstream an aggregator named as serving this stream, if any chunk said.
+    pub fn upstream_provider(&self) -> Option<&str> {
+        self.upstream_provider.as_deref()
+    }
+
+    /// Keep the first upstream label a chunk names; garbage (empty, over-long,
+    /// or non-printable-ASCII) is ignored rather than recorded.
+    pub(in crate::dialects) fn note_upstream_provider(&mut self, label: &str) {
+        if self.upstream_provider.is_some() {
+            return;
+        }
+        let trimmed = label.trim();
+        if trimmed.is_empty()
+            || trimmed.len() > UPSTREAM_PROVIDER_MAX_CHARS
+            || !trimmed.bytes().all(|byte| (0x20..0x7f).contains(&byte))
+        {
+            return;
+        }
+        self.upstream_provider = Some(trimmed.to_string());
     }
 
     /// Reserve retained-output budget for accumulated tool-argument text.
@@ -631,6 +669,9 @@ impl Normalizer {
             Dialect::OpenAiCompatible => self.feed_openai_compatible(frame),
             Dialect::GeminiGenerateContent => self.feed_gemini(frame),
             Dialect::BedrockConverseStream => self.feed_bedrock(frame),
+            Dialect::TypesafeSystemone => {
+                Err(malformed("decision models do not serve chat streams"))
+            }
         }?;
         if events.iter().any(Event::is_output_token) {
             self.emitted_output = true;

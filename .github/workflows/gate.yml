@@ -106,11 +106,10 @@ jobs:
           workspaces: exp/runtime/gateway/native
       - name: Install the minimum-version SDK without capture engine dependencies
         run: uv sync --extra dev
-      - name: SDK command help and offline recovery remain available
+      - name: SDK and Capture command help remain available
         run: |
           uv run exp --help
           uv run exp capture --help
-          uv run exp capture reset --help
           uv run pytest -q exp/cli/app_test.py exp/cli/capture exp/runtime/capture \
             exp/tests/release_test.py -k "not installed_wheel"
 
@@ -124,7 +123,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install the project and its dev extras
         run: uv sync --extra dev
-      - name: Capture streaming and macOS metadata recovery
+      - name: Capture selective TLS streaming and local redirector lifecycle
         run: uv run pytest -q exp/runtime/capture exp/cli/capture
       - name: W16 router and bounded local-process evidence
         env:

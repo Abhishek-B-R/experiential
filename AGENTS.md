@@ -130,7 +130,7 @@ uv run pytest -q
   in `fit/`, and evaluation preparation in `evaluation/`. The durable judgment ledger remains at
   `judgment_budget.py`.
 - The root CLI is locked to `build`, `capture`, `login`, `optimize`, `config`, and `run`. Capture runs
-  in the foreground and exposes only the `reset` recovery subcommand. The optimize group is locked
+  in the foreground with no management subcommands. The optimize group is locked
   to `router` and `model`; the config group is locked to `budget`, `gateway`, `judge`, `providers`,
   and `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag, is a
   deliberate change to the locked surface and needs the same scrutiny as a public API change.
@@ -155,7 +155,7 @@ uv run pytest -q
 ## Python
 
 - Use Python 3.13+ for whole-repository development and quality gates so Capture's conditional
-  dependencies are installed. Published SDK and offline recovery support remains Python 3.12;
+  dependencies are installed. Published SDK and Capture command help support remains Python 3.12;
   CI checks that minimum separately.
 - Every Python file must have a module docstring.
 - Every class, function, and method uses a Google-style docstring, including private helpers,

@@ -113,6 +113,17 @@ pub fn transport_failure(status: Option<u16>) -> Failure {
     Failure::new(class, message).with_retry(retryable, failover)
 }
 
+/// Pin TypeSafe rejection evidence to the received status, never an inferred class.
+pub(crate) fn decision_http_failure(mut failure: Failure, status: u16) -> Failure {
+    failure.decision_provider_rejected = matches!(status, 400 | 401 | 403 | 404 | 422);
+    // Zero-work accounting evidence does not itself authorize another call.
+    // Only a rejected credential may try an independently credentialed rung;
+    // every other status ends this request without automatic dispatch.
+    failure.retryable_same_deployment = false;
+    failure.failover_eligible = status == 401;
+    failure
+}
+
 /// Classify a lead that connected but never completed the request/response-header
 /// phase within `phase_timeout`. A deployment that accepted the connection but
 /// stalled awaiting response headers is the same dead-lane signal as a stalled
@@ -155,7 +166,11 @@ pub async fn open_stream(
         }
         request = request.header(name, value);
     }
-    request = request.header("Idempotency-Key", idempotency_key);
+    // SystemOne defines no idempotency contract, so neither configured nor
+    // synthesized replay keys may imply protection against duplicate billing.
+    if dialect != Dialect::TypesafeSystemone {
+        request = request.header("Idempotency-Key", idempotency_key);
+    }
     let send = match raw_body {
         Some(body) => request.body(body.to_string()).send(),
         None => request.json(payload).send(),
@@ -202,6 +217,12 @@ pub async fn open_stream(
         } else {
             failure.with_provider_detail(Some(status_detail(status)))
         };
+        if dialect == Dialect::TypesafeSystemone {
+            // This non-conversational wire has no documented chat error
+            // envelope. Its actual HTTP status, not provider prose or a
+            // guessed error class, establishes pre-execution rejection.
+            return Err(decision_http_failure(failure, status));
+        }
         if failure.failure_class != FailureClass::InvalidRequest
             && status != 403
             && status != 404

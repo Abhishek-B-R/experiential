@@ -11,12 +11,13 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
+from exp.runtime.gateway.sqlite.cache_write_migration import migrate_cache_write
 from exp.runtime.gateway.sqlite.nano_usd_migration import (
     NanoUsdMigrationError,
     migrate_money_to_nano_usd,
 )
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 23
 
 
 class GatewaySchemaError(RuntimeError):
@@ -27,7 +28,6 @@ MigrationStep = str | Callable[[sqlite3.Connection], None]
 """One forward-migration step: a plain SQL statement, or a callable for a step
 that must read before it writes (the v20 money-unit move guards every amount
 before scaling it)."""
-
 
 _MIGRATION_1 = (
     """
@@ -578,12 +578,8 @@ _GATEWAY_REQUESTS_V10_SQL = """CREATE TABLE gateway_requests (
     ) STRICT"""
 
 _MIGRATION_10 = (
-    # SQLite cannot alter a CHECK constraint in place, and gateway_requests is
-    # the foreign-key parent of gateway_attempts, so the copy-and-rename
-    # rebuild used by migration 6 would trip immediate foreign keys inside
-    # this exclusive transaction. A CHECK-only change does not affect the
-    # on-disk record format, so the documented lightweight procedure rewrites
-    # the stored schema text in place instead.
+    # A CHECK-only schema rewrite preserves row layout and avoids rebuilding
+    # gateway_requests while gateway_attempts holds immediate foreign keys.
     "PRAGMA writable_schema = ON",
     (
         "UPDATE sqlite_master SET sql = '"
@@ -615,10 +611,9 @@ _MIGRATION_12 = (
     """,
 )
 
-# Long-context tier rates freeze on the attempt exactly like the base
-# rates, so settlement prices with the schedule that was live at dispatch.
-# The threshold column selects the schedule once provider-reported input
-# tokens reach it; NULL means the deployment had no tier.
+# Long-context rates freeze on the attempt like base rates. Settlement selects
+# the frozen tier once reported input tokens reach its threshold; NULL means
+# the deployment had no tier.
 _MIGRATION_13 = (
     """
     ALTER TABLE gateway_attempts
@@ -744,6 +739,17 @@ _MIGRATIONS: dict[int, tuple[MigrationStep, ...]] = {
     18: _MIGRATION_18,
     19: _MIGRATION_19,
     20: (migrate_money_to_nano_usd,),
+    21: (
+        "PRAGMA writable_schema = ON",
+        "UPDATE sqlite_master SET sql = replace(sql, "
+        "'''embeddings'', ''images'')', '''embeddings'', ''images'', ''decisions'')') "
+        "WHERE type = 'table' AND name = 'gateway_requests'",
+        "PRAGMA writable_schema = RESET",
+        "CREATE TABLE gateway_schema_refresh_v21 (noop INTEGER) STRICT",
+        "DROP TABLE gateway_schema_refresh_v21",
+    ),
+    22: ("ALTER TABLE gateway_attempts ADD COLUMN upstream_provider TEXT",),  # aggregator label
+    23: (migrate_cache_write,),
 }
 
 

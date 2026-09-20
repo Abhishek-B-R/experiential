@@ -29,8 +29,10 @@ from exp.common.models.content import (
 )
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
+from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.gateway.replay_identity import provider_replay_authority
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 
@@ -116,6 +118,7 @@ def worst_case_attempt_tokens(
     Embeddings and image requests consume no completion output, so they reserve
     their estimated input and zero output; a completion reserves its estimated
     input (prompt, tools, media, replayed carriers) and its clamped max output.
+    Decisions reserve their own per-question input and output allowances.
     """
     return worst_case_input_tokens(request), worst_case_output_tokens(request, deployment)
 
@@ -128,8 +131,11 @@ def worst_case_input_tokens(request: ServingRequest) -> int:
     once and pairs it with each candidate's cheap output clamp. The result is
     the tokenized prompt text plus per-message and per-tool framing, media
     planning constants, and decoded-length proxies for opaque carriers, all
-    scaled by :data:`INPUT_TOKEN_HEADROOM_PERCENT`.
+    scaled by :data:`INPUT_TOKEN_HEADROOM_PERCENT`. Decisions instead use their
+    byte-based per-question reservation, which already includes protocol overhead.
     """
+    if isinstance(request, DecisionRequest):
+        return request.input_token_reservation
     return _prompt_counter(request).total()
 
 
@@ -141,7 +147,8 @@ def counted_input_tokens(request: ServingRequest) -> int:
     ``message_start`` placeholder for an OpenAI-wire upstream, the
     ``count_tokens`` answer). It is the gateway's own tokenizer estimate,
     never a provider report, and it never reaches the ledger: the reservation
-    keeps its headroom and settlement keeps the provider's meters.
+    keeps its headroom and settlement keeps the provider's meters. Decisions
+    expose their byte-based planning count here, never a provider usage report.
     """
     return _prompt_counter(request).counted()
 
@@ -150,6 +157,8 @@ def _prompt_counter(request: ServingRequest) -> _PromptCounter:
     """Walk one request's prompt into a counter, once."""
     counter = _PromptCounter()
     match request:
+        case DecisionRequest():
+            counter.fixed(request.input_token_reservation)
         case EmbeddingsRequest():
             for text in request.inputs:
                 counter.text(text)
@@ -187,6 +196,11 @@ def _count_completion_prompt(request: GatewayRequest, counter: _PromptCounter) -
         if tool.description is not None:
             counter.text(tool.description)
         counter.json(tool.parameters)
+    if request.json_object_output:
+        # Every wire receives the object instruction, including native JSON
+        # modes whose provider requires JSON to be named in the input.
+        counter.fixed(MESSAGE_FRAMING_TOKENS)
+        counter.text(JSON_OBJECT_SYSTEM_INSTRUCTION)
     if request.structured_text is not None:
         counter.text(request.structured_text.name)
         if request.structured_text.description is not None:
@@ -315,6 +329,8 @@ def worst_case_output_tokens(
     match request:
         case EmbeddingsRequest() | ImagesRequest():
             return 0
+        case DecisionRequest():
+            return request.output_token_reservation
         case GatewayRequest():
             output_tokens = request.maximum_output_tokens
             deployment_ceiling = (

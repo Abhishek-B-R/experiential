@@ -17,6 +17,12 @@ from exp.common.models.catalog import (
     GatewayTokenPrices,
 )
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.runtime.gateway.budgets import (
+    BudgetReservationRejected,
+    BudgetScope,
+    BudgetScopeKind,
+    SQLiteBudgetStore,
+)
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -30,6 +36,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.gateway.decisions_contracts import DecisionRequest, NoulQuestion
 from exp.runtime.gateway.ledger import (
     GatewayLedgerError,
     IdempotencyConflictError,
@@ -157,6 +164,260 @@ def _execution(authorization: AuthorizationSnapshot) -> ExecutionSnapshot:
         pool_id="pool-one",
         deployment_ids=("deployment-one",),
     )
+
+
+@pytest.mark.parametrize(
+    "failure_class",
+    [
+        GatewayFailureClass.TIMEOUT,
+        GatewayFailureClass.TRANSPORT,
+        GatewayFailureClass.MALFORMED_RESPONSE,
+        GatewayFailureClass.CANCELLED,
+        GatewayFailureClass.INTERNAL,
+        GatewayFailureClass.THROTTLED,
+    ],
+)
+@pytest.mark.parametrize("strict", [False, True])
+def test_unknown_decision_keeps_budget_held_without_inventing_charge_or_usage(
+    tmp_path: Path,
+    failure_class: GatewayFailureClass,
+    strict: bool,
+) -> None:
+    """Uncertain decisions retain durable liability and prevent another funded dispatch."""
+    clock = FakeLedgerClock()
+    store, ledger, key = _authority_fixture(tmp_path, clock)
+    budgets = SQLiteBudgetStore(store.database_path, clock=clock)
+    request = DecisionRequest(
+        state="state", questions={"check": NoulQuestion(instructions="Valid?")}
+    )
+    budgets.set_limit(
+        organization_id="org-one",
+        period="2026-08",
+        scope=BudgetScope(kind=BudgetScopeKind.TEAM),
+        limit_nano_usd=100,
+        strict_unknown_cost=strict,
+    )
+    authorization = store.authorize_request(
+        raw_key=key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+        maximum_cost_nano_usd=100,
+    )
+    failure = GatewayFailure(failure_class=failure_class, safe_message="decision outcome unknown")
+    event = GatewayEvent(kind=GatewayEventKind.FAILED, sequence_number=0, failure=failure)
+    ledger.finish_attempt(attempt_id=attempt_id, terminal_event=event, failure=failure)
+    ledger.finish_attempt(attempt_id=attempt_id, terminal_event=event, failure=failure)
+    remaining = budgets.remaining(organization_id="org-one", period="2026-08")[0]
+    assert remaining.reserved_nano_usd == 100
+    assert remaining.settled_nano_usd == 0
+    assert remaining.remaining_nano_usd == 0
+    assert remaining.unknown_cost_attempts == 0  # The held amount is known, actual cost is not.
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute(
+            "SELECT input_tokens, output_tokens, estimated_cost_nano_usd, "
+            "budget_settled_nano_usd, usage_source FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone() == (None, None, None, None, "unknown")
+        assert connection.execute(
+            "SELECT reserved_nano_usd, settled_nano_usd FROM gateway_attempt_budget_charges"
+        ).fetchone() == (100, None)
+    second = store.authorize_request(
+        raw_key=key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=second)
+    with pytest.raises(BudgetReservationRejected):
+        ledger.start_attempt(
+            snapshot=_execution(second),
+            deployment=_deployment(),
+            attempt_ordinal=0,
+            route_depth=0,
+            maximum_cost_nano_usd=1,
+        )
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM gateway_attempts").fetchone() == (1,)
+    assert ledger.usage(organization_id="org-one")[0].unknown_cost_attempts == 1
+    ledger.reconcile_decision_liability(attempt_id=attempt_id, assigned_cost_nano_usd=40)
+    ledger.reconcile_decision_liability(attempt_id=attempt_id, assigned_cost_nano_usd=40)
+    with pytest.raises(GatewayLedgerError, match="another cost"):
+        ledger.reconcile_decision_liability(attempt_id=attempt_id, assigned_cost_nano_usd=0)
+    reconciled = budgets.remaining(organization_id="org-one", period="2026-08")[0]
+    assert reconciled.reserved_nano_usd == 0
+    assert reconciled.settled_nano_usd == 40
+    assert reconciled.remaining_nano_usd == 60
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute(
+            "SELECT input_tokens, output_tokens, estimated_cost_nano_usd, "
+            "budget_settled_nano_usd, usage_source FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone() == (None, None, None, 40, "unknown")
+    ledger.start_attempt(
+        snapshot=_execution(second),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+        maximum_cost_nano_usd=60,
+    )
+
+
+@pytest.mark.parametrize(
+    "failure_class",
+    [
+        GatewayFailureClass.PROVIDER_AUTHENTICATION,
+        GatewayFailureClass.THROTTLED,
+        GatewayFailureClass.PROVIDER_INTERNAL,
+    ],
+)
+def test_witnessed_decision_http_rejection_releases_without_observed_tokens(
+    tmp_path: Path,
+    failure_class: GatewayFailureClass,
+) -> None:
+    """HTTP rejection evidence, not the failure class, proves no unknown paid work remains."""
+    clock = FakeLedgerClock()
+    store, ledger, key = _authority_fixture(tmp_path, clock)
+    budgets = SQLiteBudgetStore(store.database_path, clock=clock)
+    budgets.set_limit(
+        organization_id="org-one",
+        period="2026-08",
+        scope=BudgetScope(kind=BudgetScopeKind.TEAM),
+        limit_nano_usd=100,
+    )
+    request = DecisionRequest(
+        state="state", questions={"check": NoulQuestion(instructions="Valid?")}
+    )
+    authorization = store.authorize_request(
+        raw_key=key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+        maximum_cost_nano_usd=100,
+    )
+    failure = GatewayFailure(failure_class=failure_class, safe_message="provider rejected request")
+    event = GatewayEvent(
+        kind=GatewayEventKind.FAILED,
+        sequence_number=0,
+        failure=failure,
+        decision_provider_rejected=True,
+    )
+    ledger.finish_attempt(attempt_id=attempt_id, terminal_event=event, failure=failure)
+    ledger.finish_attempt(attempt_id=attempt_id, terminal_event=event, failure=failure)
+    remaining = budgets.remaining(organization_id="org-one", period="2026-08")[0]
+    assert remaining.reserved_nano_usd == remaining.settled_nano_usd == 0
+    assert remaining.remaining_nano_usd == 100
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute(
+            "SELECT input_tokens, output_tokens, estimated_cost_nano_usd, "
+            "budget_settled_nano_usd, usage_source FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone() == (None, None, None, 0, "unknown")
+    second = store.authorize_request(
+        raw_key=key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=second)
+    ledger.start_attempt(
+        snapshot=_execution(second),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+        maximum_cost_nano_usd=100,
+    )
+
+
+def test_decision_liability_zero_assignment_and_active_attempt_guard(tmp_path: Path) -> None:
+    """Only terminal decision holds can be explicitly released at an assigned zero cost."""
+    clock = FakeLedgerClock()
+    store, ledger, key = _authority_fixture(tmp_path, clock)
+    budgets = SQLiteBudgetStore(store.database_path, clock=clock)
+    budgets.set_limit(
+        organization_id="org-one",
+        period="2026-08",
+        scope=BudgetScope(kind=BudgetScopeKind.TEAM),
+        limit_nano_usd=100,
+    )
+    request = DecisionRequest(
+        state="state", questions={"check": NoulQuestion(instructions="Valid?")}
+    )
+    authorization = store.authorize_request(
+        raw_key=key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+        maximum_cost_nano_usd=100,
+    )
+    with pytest.raises(GatewayLedgerError, match="no terminal decision"):
+        ledger.reconcile_decision_liability(attempt_id=attempt_id, assigned_cost_nano_usd=0)
+    for invalid in (-1, 2**63):
+        with pytest.raises(ValueError, match="nonnegative SQLite integer"):
+            ledger.reconcile_decision_liability(
+                attempt_id=attempt_id, assigned_cost_nano_usd=invalid
+            )
+    failure = GatewayFailure(failure_class=GatewayFailureClass.CANCELLED, safe_message="cancelled")
+    ledger.finish_attempt(attempt_id=attempt_id, terminal_event=None, failure=failure)
+    ledger.reconcile_decision_liability(attempt_id=attempt_id, assigned_cost_nano_usd=0)
+    ledger.reconcile_decision_liability(attempt_id=attempt_id, assigned_cost_nano_usd=0)
+    remaining = budgets.remaining(organization_id="org-one", period="2026-08")[0]
+    assert remaining.reserved_nano_usd == remaining.settled_nano_usd == 0
+    assert remaining.remaining_nano_usd == 100
+
+
+def test_conversational_unknown_usage_keeps_its_existing_settlement(tmp_path: Path) -> None:
+    """Decision-specific liability does not alter unknown-usage charging on chat."""
+    clock = FakeLedgerClock()
+    store, ledger, key = _authority_fixture(tmp_path, clock)
+    authorization = store.authorize_request(
+        raw_key=key,
+        alias="coding",
+        request=_request("chat"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+        maximum_cost_nano_usd=100,
+    )
+    failure = GatewayFailure(failure_class=GatewayFailureClass.TIMEOUT, safe_message="timeout")
+    event = GatewayEvent(
+        kind=GatewayEventKind.FAILED,
+        sequence_number=0,
+        failure=failure,
+        decision_provider_rejected=True,
+    )
+    ledger.finish_attempt(attempt_id=attempt_id, terminal_event=event, failure=failure)
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute(
+            "SELECT budget_settled_nano_usd FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone() == (100,)
 
 
 def test_attempt_usage_and_integer_cost_are_content_free(tmp_path: Path) -> None:
@@ -1432,3 +1693,319 @@ def test_dispatch_reason_must_be_display_safe(tmp_path: Path) -> None:
             dispatch_reason="queue\nbound",
             preferred_deployment=preferred,
         )
+
+
+def test_web_search_requests_are_accepted_and_not_yet_priced_by_the_local_ledger(
+    tmp_path: Path,
+) -> None:
+    """The shared settle signature carries the search meter; SQLite pricing is a follow-up.
+
+    The hosted ledger prices ``web_search_requests`` per attempt. Locally the
+    keyword is accepted on both ``finish_attempt`` and ``apply_finish_attempt``
+    so the engine's facades can hand it over, but the row, the attributed
+    integer cost and the schema are exactly what an unmetered settle yields.
+    """
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    usage = GatewayUsage(
+        input_tokens=1_000,
+        cached_input_tokens=100,
+        output_tokens=500,
+        reasoning_tokens=50,
+        web_search_requests=2,
+    )
+    attempts: list[str] = []
+    for label, apply_directly in (("searching", False), ("searching-applied", True)):
+        authorization = store.authorize_request(
+            raw_key=raw_key,
+            alias="coding",
+            request=_request(label),
+            deadline_monotonic=clock.monotonic() + 30,
+        )
+        ledger.accept_request(authorization=authorization)
+        attempt_id = ledger.start_attempt(
+            snapshot=_execution(authorization),
+            deployment=_deployment(),
+            attempt_ordinal=0,
+            route_depth=0,
+            route_reason="direct_alias",
+            fallback_reason=None,
+        )
+        attempts.append(attempt_id)
+        terminal = GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=3, usage=usage)
+        if apply_directly:
+            with ledger._transaction() as connection:  # noqa: SLF001 - the host hook seam.
+                ledger.apply_finish_attempt(
+                    connection,
+                    attempt_id=attempt_id,
+                    terminal_event=terminal,
+                    failure=None,
+                    web_search_requests=2,
+                )
+        else:
+            ledger.finish_attempt(
+                attempt_id=attempt_id, terminal_event=terminal, failure=None, web_search_requests=2
+            )
+
+    report = ledger.usage(organization_id="org-one")
+    assert len(report) == 1
+    assert report[0].attempts == 2
+    # Token pricing only: 2 x the 3_950 nano-USD an identical unmetered settle attributes.
+    assert report[0].known_estimated_cost_nano_usd == 7_900
+    assert report[0].unknown_cost_attempts == 0
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(gateway_attempts)")}
+        states = connection.execute(
+            "SELECT state FROM gateway_attempts WHERE attempt_id IN (?, ?)", tuple(attempts)
+        ).fetchall()
+    finally:
+        connection.close()
+    assert "web_search_requests" not in columns
+    assert states == [("completed",), ("completed",)]
+
+
+def test_tool_search_requests_are_accepted_and_not_yet_priced_by_the_local_ledger(
+    tmp_path: Path,
+) -> None:
+    """The shared settle signature carries the tool-search meter; SQLite pricing is a follow-up.
+
+    Mirror of the ``web_search_requests`` seam: the hosted ledger prices
+    ``tool_search_requests`` per attempt, and locally both ``finish_attempt``
+    and ``apply_finish_attempt`` accept the keyword (beside the web-search one)
+    while the row, the attributed integer cost and the schema stay exactly what
+    an unmetered settle yields.
+    """
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    usage = GatewayUsage(
+        input_tokens=1_000,
+        cached_input_tokens=100,
+        output_tokens=500,
+        reasoning_tokens=50,
+        web_search_requests=1,
+        tool_search_requests=2,
+    )
+    attempts: list[str] = []
+    for label, apply_directly in (("tool-searching", False), ("tool-searching-applied", True)):
+        authorization = store.authorize_request(
+            raw_key=raw_key,
+            alias="coding",
+            request=_request(label),
+            deadline_monotonic=clock.monotonic() + 30,
+        )
+        ledger.accept_request(authorization=authorization)
+        attempt_id = ledger.start_attempt(
+            snapshot=_execution(authorization),
+            deployment=_deployment(),
+            attempt_ordinal=0,
+            route_depth=0,
+            route_reason="direct_alias",
+            fallback_reason=None,
+        )
+        attempts.append(attempt_id)
+        terminal = GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=3, usage=usage)
+        if apply_directly:
+            with ledger._transaction() as connection:  # noqa: SLF001 - the host hook seam.
+                ledger.apply_finish_attempt(
+                    connection,
+                    attempt_id=attempt_id,
+                    terminal_event=terminal,
+                    failure=None,
+                    web_search_requests=1,
+                    tool_search_requests=2,
+                )
+        else:
+            ledger.finish_attempt(
+                attempt_id=attempt_id,
+                terminal_event=terminal,
+                failure=None,
+                web_search_requests=1,
+                tool_search_requests=2,
+            )
+
+    report = ledger.usage(organization_id="org-one")
+    assert len(report) == 1
+    assert report[0].attempts == 2
+    # Token pricing only: 2 x the 3_950 nano-USD an identical unmetered settle attributes.
+    assert report[0].known_estimated_cost_nano_usd == 7_900
+    assert report[0].unknown_cost_attempts == 0
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(gateway_attempts)")}
+        states = connection.execute(
+            "SELECT state FROM gateway_attempts WHERE attempt_id IN (?, ?)", tuple(attempts)
+        ).fetchall()
+    finally:
+        connection.close()
+    assert "tool_search_requests" not in columns
+    assert states == [("completed",), ("completed",)]
+
+
+def test_cache_write_bills_at_frozen_surcharge_and_persists_count(tmp_path: Path) -> None:
+    """A cache-write leg bills disjointly and persists its observed count."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    deployment = _deployment().model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                prices=GatewayTokenPrices(
+                    input_nano_usd_per_million_tokens=3_000_000,
+                    cached_input_nano_usd_per_million_tokens=300_000,
+                    cache_creation_input_nano_usd_per_million_tokens=3_750_000,
+                    output_nano_usd_per_million_tokens=15_000_000,
+                ),
+                pricing_source="operator-authored",
+                pricing_effective_at=datetime(2026, 8, 18, tzinfo=UTC),
+            )
+        }
+    )
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("cache-write-surcharge"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=deployment,
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=1,
+            usage=GatewayUsage(
+                input_tokens=1_000,
+                cached_input_tokens=200,
+                cache_creation_input_tokens=300,
+                cache_creation_1h_input_tokens=0,
+                output_tokens=10,
+            ),
+        ),
+        failure=None,
+    )
+    usage = ledger.usage(organization_id="org-one")
+    # 500 fresh @ 3/M + 200 cached @ 0.3/M + 300 creation @ 3.75/M + 10 output @ 15/M = 2_835.
+    assert usage[0].known_estimated_cost_nano_usd == 2_835
+    assert usage[0].unknown_cost_attempts == 0
+    with ledger._connect() as connection:
+        row = connection.execute(
+            "SELECT cache_creation_input_rate, cache_creation_input_tokens "
+            "FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+    assert row["cache_creation_input_rate"] == 3_750_000
+    assert row["cache_creation_input_tokens"] == 300
+
+
+def test_long_context_cache_write_reprices_at_tier_rate(tmp_path: Path) -> None:
+    """Above threshold the tier cache-write rate replaces the base rate."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    deployment = _deployment().model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                prices=GatewayTokenPrices(
+                    input_nano_usd_per_million_tokens=1_250_000,
+                    cached_input_nano_usd_per_million_tokens=125_000,
+                    cache_creation_input_nano_usd_per_million_tokens=1_500_000,
+                    output_nano_usd_per_million_tokens=10_000_000,
+                    long_context=GatewayLongContextTier(
+                        input_threshold_tokens=200_000,
+                        input_nano_usd_per_million_tokens=2_500_000,
+                        cached_input_nano_usd_per_million_tokens=250_000,
+                        cache_creation_input_nano_usd_per_million_tokens=3_000_000,
+                        output_nano_usd_per_million_tokens=15_000_000,
+                    ),
+                ),
+                pricing_source="operator-authored",
+                pricing_effective_at=datetime(2026, 8, 18, tzinfo=UTC),
+            )
+        }
+    )
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("long-context-cache-write"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=deployment,
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=1,
+            usage=GatewayUsage(
+                input_tokens=200_000,
+                cached_input_tokens=10_000,
+                cache_creation_input_tokens=20_000,
+                cache_creation_1h_input_tokens=0,
+                output_tokens=1_000,
+            ),
+        ),
+        failure=None,
+    )
+    usage = ledger.usage(organization_id="org-one")
+    # Tier active: 170k fresh @ 2.5/M + 10k cached @ 0.25/M + 20k creation @ 3/M + 1k output @ 15/M.
+    expected = (
+        170_000 * 2_500_000 + 10_000 * 250_000 + 20_000 * 3_000_000 + 1_000 * 15_000_000 + 500_000
+    ) // 1_000_000
+    assert usage[0].known_estimated_cost_nano_usd == expected
+    assert usage[0].unknown_cost_attempts == 0
+
+
+def test_cache_write_without_rate_stays_unknown(tmp_path: Path) -> None:
+    """A reported cache-write without a rate keeps the attempt unpriced."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    deployment = _deployment().model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                prices=GatewayTokenPrices(
+                    input_nano_usd_per_million_tokens=3_000_000,
+                    output_nano_usd_per_million_tokens=15_000_000,
+                ),
+                pricing_source="operator-authored",
+            )
+        }
+    )
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("cache-write-unknown"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=deployment,
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=1,
+            usage=GatewayUsage(
+                input_tokens=100,
+                cache_creation_input_tokens=10,
+                cache_creation_1h_input_tokens=0,
+                output_tokens=5,
+            ),
+        ),
+        failure=None,
+    )
+    usage = ledger.usage(organization_id="org-one")
+    assert usage[0].known_estimated_cost_nano_usd == 0
+    assert usage[0].unknown_cost_attempts == 1

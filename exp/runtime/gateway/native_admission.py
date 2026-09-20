@@ -33,6 +33,7 @@ from exp.runtime.gateway.native_execution import (
     request_carries_cache_markers,
     select_route_deployments,
 )
+from exp.runtime.gateway.native_fallback_rules import require_unrestricted_rung
 from exp.runtime.gateway.native_reasoning import rung_provider_request
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.prompt_cache_affinity import provider_prompt_cache_key
@@ -150,6 +151,19 @@ def admitted_route_requests(
     # provider call (the provider would only 400 it back, after a round trip,
     # with an opaque message); the request falls to a rung that can hold it
     # and is refused only when none can.
+    chat_indexes = tuple(
+        index
+        for index, (profile, _client) in enumerate(resolved_wires)
+        if profile.dialect != "typesafe_systemone"
+    )
+    if not chat_indexes:
+        raise ProviderCapabilityError(
+            capability="completions",
+            detail="This model serves typed decisions. Send state and questions to /v1/systemone.",
+        )
+    if len(chat_indexes) != len(route.deployments):
+        route = select_route_deployments(route, chat_indexes)
+        resolved_wires = tuple(resolved_wires[index] for index in chat_indexes)
     window_indexes = context_window_compatible_indexes(
         route, request, output_floors=_output_floors(resolved_wires)
     )
@@ -343,6 +357,9 @@ def admitted_route_requests(
         authorization=authorization,
         continuation=continuation,
     )
+    # Every surviving rung failover-only would leave nothing to dial first:
+    # fail closed here, named, instead of exhausting a ladder that dialed nothing.
+    require_unrestricted_rung(route)
     return route, resolved_wires, public_request, provider_request, placement
 
 
@@ -402,7 +419,7 @@ def _prefer_cache_capable_rungs(
     marker_capable = tuple(
         index
         for index, (profile, _client) in enumerate(resolved_wires)
-        if profile.dialect == "anthropic_messages"
+        if profile.preserves_cache_control
     )
     if not marker_capable or len(marker_capable) == len(resolved_wires):
         return route, resolved_wires
@@ -495,7 +512,7 @@ def _affinity_ordered_rungs(
         marker_capable = frozenset(
             index
             for index, (profile, _client) in enumerate(resolved_wires)
-            if profile.dialect == "anthropic_messages"
+            if profile.preserves_cache_control
         )
         if marker_capable and len(marker_capable) < len(resolved_wires):
             order = (

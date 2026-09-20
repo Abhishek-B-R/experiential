@@ -27,6 +27,7 @@ from exp.runtime.capture.certificates import (
     trust_certificate,
 )
 from exp.runtime.capture.control import CaptureCloudError, CaptureRun, CaptureRunClient
+from exp.runtime.capture.local_backend import require_local_backend
 from exp.runtime.capture.upload import CaptureUploader, UploadStats
 
 
@@ -41,13 +42,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
         _capture(console, domains=tuple(args.domain), root=args.root)
     except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
         console.print(f"Capture could not continue: {exc}", markup=False)
-        console.print("If provider requests are failing, run exp capture reset.")
         return 1
     return 0
 
 
 def _capture(console: Console, *, domains: tuple[str, ...], root: Path) -> None:
     """Prepare normal authentication and certificates, then own one foreground run."""
+    require_local_backend()
     credentials = capture_credentials(console=console, environment=os.environ, root=root)
     asyncio.run(_capture_authenticated(console, domains=domains, credentials=credentials))
 
@@ -74,7 +75,8 @@ async def _capture_authenticated(
         console.print(f"Organization: {organization.org_name}", markup=False)
         console.print(f"Provider domains: {', '.join(domains)}", markup=False)
         console.print("Captures model prompts, responses, and tool content from these domains.")
-        console.print("macOS administrator authorization is needed for temporary routing.")
+        console.print("Approve Mitmproxy Redirector if macOS requests network extension access.")
+        console.print("Other traffic passes through without capture. DNS settings stay unchanged.")
         data_dir = provider_data_dir() / "capture"
         ca_directory = data_dir / "ca"
         origin_namespace = hashlib.sha256(credentials.api_url.encode()).hexdigest()[:16]
@@ -100,7 +102,7 @@ async def _capture_authenticated(
         )
 
         def started() -> None:
-            """Show active capture only after both proxy and hosts redirection are ready."""
+            """Show active capture only after network interception is ready."""
             console.print(
                 "[green]Capturing.[/green] Use your AI apps normally. Press Ctrl+C to stop."
             )
@@ -137,7 +139,7 @@ async def _capture_authenticated(
         )
         progress(stats)
         live.stop()
-        console.print("[green]Capture stopped. Networking restored.[/green]")
+        console.print("[green]Capture stopped. Interception disabled.[/green]")
         if stats.pending_batches:
             console.print(
                 f"{stats.pending_batches} batches pending; the next exp capture retries them."

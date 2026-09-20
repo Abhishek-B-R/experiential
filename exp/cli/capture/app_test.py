@@ -1,4 +1,4 @@
-"""Capture exposes only foreground collection and independent network reset."""
+"""Capture starts foreground collection across supported providers without a picker."""
 
 from pathlib import Path
 
@@ -11,19 +11,10 @@ from exp.cli.app import app
 from exp.cli.capture import app as capture_module
 
 
-@pytest.mark.parametrize(
-    ("selection", "domains"),
-    [
-        ("1\n\n", ("api.openai.com", "chatgpt.com")),
-        ("2\n\n", ("api.anthropic.com",)),
-        ("all\n\n", ("api.openai.com", "chatgpt.com", "api.anthropic.com")),
-        ("\n1\n\n", ("api.openai.com", "chatgpt.com")),
-    ],
-)
-def test_capture_asks_which_providers_to_capture(
-    monkeypatch: pytest.MonkeyPatch, selection: str, domains: tuple[str, ...]
+def test_capture_defaults_to_supported_providers_without_input(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only providers explicitly chosen in the picker reach foreground capture."""
+    """Plain capture starts the foreground runner without a provider selection prompt."""
     calls: list[tuple[str, ...]] = []
 
     def run_capture(console: Console, *, domains: tuple[str, ...], root: Path) -> None:
@@ -32,40 +23,14 @@ def test_capture_asks_which_providers_to_capture(
 
     monkeypatch.setattr(capture_module, "_require_macos", lambda: None)
     monkeypatch.setattr(capture_module, "_capture", run_capture)
-    result = CliRunner().invoke(app, ["capture"], input=selection)
+    result = CliRunner().invoke(app, ["capture"], input="")
     assert result.exit_code == 0, result.output
-    assert "What would you like to capture?" in result.output
-    assert "OpenAI / Codex" in result.output
-    assert "Anthropic / Claude Code" in result.output
-    assert calls == [domains]
+    assert "What would you like to capture?" not in result.output
+    assert calls == [("api.openai.com", "chatgpt.com", "api.anthropic.com")]
 
 
-@pytest.mark.parametrize(("selection", "exit_code"), [("q\n", 0), ("b\n", 0), ("", 2)])
-def test_capture_without_selection_never_starts_setup(
-    monkeypatch: pytest.MonkeyPatch, selection: str, exit_code: int
-) -> None:
-    """Cancellation or unavailable input cannot silently capture every provider."""
-
-    def unexpected_capture(console: Console, *, domains: tuple[str, ...], root: Path) -> None:
-        """Reject any attempt to start login or interception without a selection."""
-        raise AssertionError("unselected capture must not start setup")
-
-    monkeypatch.setattr(capture_module, "_require_macos", lambda: None)
-    monkeypatch.setattr(capture_module, "_capture", unexpected_capture)
-    result = CliRunner().invoke(
-        app,
-        ["capture"],
-        input=selection,
-        env={"TERM": "xterm-256color", "FORCE_COLOR": "1"},
-    )
-    assert result.exit_code == exit_code, result.output
-    output = " ".join(unstyle(result.output).replace("│", " ").split())
-    expected = "Capture cancelled" if selection else "--domain HOST"
-    assert expected in output
-
-
-def test_explicit_domains_bypass_picker(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Advanced overrides retain exactly their normalized hosts without prompting."""
+def test_explicit_domains_replace_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Advanced overrides retain exactly their normalized hosts, excluding other defaults."""
     calls: list[tuple[str, ...]] = []
 
     def run_capture(console: Console, *, domains: tuple[str, ...], root: Path) -> None:
@@ -82,22 +47,18 @@ def test_explicit_domains_bypass_picker(monkeypatch: pytest.MonkeyPatch) -> None
     assert "What would you like to capture?" not in result.output
 
 
-def test_reset_does_not_login_or_start_capture(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Offline reset only invokes the networking recovery helper."""
-    reset_calls: list[str] = []
+@pytest.mark.parametrize("command", ["reset", "status", "stop", "start"])
+def test_no_management_commands(monkeypatch: pytest.MonkeyPatch, command: str) -> None:
+    """Unsupported management verbs fail before starting login or interception."""
 
     def unexpected_capture(console: Console, *, domains: tuple[str, ...], root: Path) -> None:
-        """Fail if offline reset attempts to invoke the capture lifetime."""
-        raise AssertionError("reset must never read a login or start capture")
+        """Reject setup for an invalid capture invocation."""
+        raise AssertionError("an unknown subcommand must not start capture")
 
     monkeypatch.setattr(capture_module, "_require_macos", lambda: None)
     monkeypatch.setattr(capture_module, "_capture", unexpected_capture)
-    monkeypatch.setattr(capture_module, "reset_capture_system", lambda: reset_calls.append("reset"))
-    result = CliRunner().invoke(app, ["capture", "reset"])
-    assert result.exit_code == 0, result.output
-    assert reset_calls == ["reset"]
-    assert "networking restored" in result.output
-    assert "What would you like to capture?" not in result.output
+    result = CliRunner().invoke(app, ["capture", command])
+    assert result.exit_code == 2, result.output
 
 
 @pytest.mark.parametrize(
@@ -106,13 +67,18 @@ def test_reset_does_not_login_or_start_capture(monkeypatch: pytest.MonkeyPatch) 
 def test_domain_validation_precedes_login(monkeypatch: pytest.MonkeyPatch, domain: str) -> None:
     """Invalid domain arguments are rejected before authentication."""
     monkeypatch.setattr(capture_module, "_require_macos", lambda: None)
-    result = CliRunner().invoke(app, ["capture", "--domain", domain])
+    result = CliRunner().invoke(
+        app,
+        ["capture", "--domain", domain],
+        env={"TERM": "xterm-256color", "FORCE_COLOR": "1"},
+    )
     assert result.exit_code == 2
-    assert "exact DNS hostname" in result.output
+    output = " ".join(unstyle(result.output).replace("│", " ").split())
+    assert "exact DNS hostname" in output
 
 
 def test_domain_limit_precedes_setup(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The CLI enforces the helper's finite target limit before starting capture."""
+    """The CLI enforces a finite exact-host filter before starting capture."""
     monkeypatch.setattr(capture_module, "_require_macos", lambda: None)
     arguments = ["capture"]
     for index in range(33):
@@ -122,16 +88,8 @@ def test_domain_limit_precedes_setup(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "1 to 32" in result.output
 
 
-def test_no_background_management_commands() -> None:
-    """Background management verbs are outside the public command surface."""
-    runner = CliRunner()
-    for command in ("status", "stop", "start"):
-        result = runner.invoke(app, ["capture", command])
-        assert result.exit_code == 2
-
-
 def test_help_never_attempts_setup(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Reading command help cannot trigger privileged setup."""
+    """Reading command help cannot inspect or change network interception state."""
 
     def reject_setup() -> None:
         """Fail if help attempts to inspect or change system state."""
@@ -140,8 +98,26 @@ def test_help_never_attempts_setup(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(capture_module, "_require_macos", reject_setup)
     result = CliRunner().invoke(app, ["capture", "--help"])
     assert result.exit_code == 0
-    assert "reset" in result.output
+    assert "reset" not in result.output
+    assert "--domain" in result.output
+    assert "all apps" in result.output
+    assert "COMMAND" not in result.output
     assert "What would you like to capture?" not in result.output
+
+
+def test_capture_failure_reports_backend_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Runtime failures retain actionable backend guidance without an unavailable reset command."""
+
+    def failed_capture(console: Console, *, domains: tuple[str, ...], root: Path) -> None:
+        """Simulate a backend precondition failure without touching networking."""
+        raise RuntimeError("Install Mitmproxy Redirector in /Applications and retry.")
+
+    monkeypatch.setattr(capture_module, "_require_macos", lambda: None)
+    monkeypatch.setattr(capture_module, "_capture", failed_capture)
+    result = CliRunner().invoke(app, ["capture"])
+    assert result.exit_code == 1, result.output
+    assert "Install Mitmproxy Redirector" in result.output
+    assert "reset" not in result.output
 
 
 def test_capture_requires_supported_python_before_launch(monkeypatch: pytest.MonkeyPatch) -> None:

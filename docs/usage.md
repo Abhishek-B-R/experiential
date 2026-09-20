@@ -6,8 +6,7 @@ The root surface is deliberately small:
 |---|---|---|
 | `exp` | Open the branded home screen. `Run Gateway` is the first option and runs setup when needed. | Interactive gateway menu, or the default gateway in a non-interactive terminal. |
 | `exp login [--root ROOT]` | Sign in to Experiential Cloud through the Platform browser approval flow, save the returned organization key, and synchronize the authenticated account's model identities. | User-local credential plus secret-free hosted provider/model records in `.exp/models.toml`. |
-| `exp capture [--domain HOST ...]` | Capture direct provider HTTPS traffic on macOS until Ctrl+C, reusing `exp login`. | Cloud traces and bounded private retry batches, with managed hosts overrides while running. |
-| `exp capture reset` | Repair Capture's hosts overrides offline, without login. | Restored networking; existing login, captured traces, and local CA remain. |
+| `exp capture [--domain HOST ...]` | Capture supported OpenAI and Anthropic traffic across macOS apps until Ctrl+C, reusing `exp login`. | Cloud traces and bounded private retry batches. |
 | `exp run [PROJECT] [--root ROOT] [--check]` | Start the local gateway directly, optionally with one project-backed alias. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
 | `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Launch the guided end-to-end build when traces are omitted, or use one explicit local source for automation. | Simulation, serving RAG, fit RAG, syllabus, evaluation evidence, and a runnable automatic router. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
@@ -24,24 +23,25 @@ The root surface is deliberately small:
 
 ## Direct provider capture on macOS
 
-Run `exp capture` in a terminal, choose **OpenAI / Codex**, **Anthropic / Claude Code**, or both,
-then leave it open while using your AI applications. Use arrow keys to move, Space to toggle
-providers, and Enter on **Complete** to start. Nothing is selected automatically; cancelling
-exits before login or networking setup. Capture reuses
-the normal Experiential login, or opens the same login flow when no credential exists. The
-Capture tab under API Keys shows the run and its upload statistics. No application attribution,
-separate capture credential, or background capture daemon is required.
+Run `exp capture` in a terminal and leave it open while using your AI applications. It captures
+supported traffic across apps using `api.openai.com`, `chatgpt.com`, and `api.anthropic.com`,
+including Codex and Claude Code, without a provider picker or changing provider base URLs. Capture
+reuses the normal Experiential login, or opens the same login flow when no credential exists. The Capture
+tab under API Keys shows the run and its statistics for Platform administrators. A run represents
+one foreground Capture process, rather than one application conversation. No separate capture
+credential or background capture daemon is required.
 
-Capture requires Python 3.13 or newer. Other SDK and CLI commands, including `exp capture reset`,
-continue to support Python 3.12. In a checkout, use `uv run --python 3.13 exp capture`.
-The temporary networking helper uses Apple's system Python and requires the macOS Command Line
-Tools; run `xcode-select --install` if they are missing.
+Capture requires Python 3.13 or newer. Other SDK and CLI commands continue to support Python 3.12.
+In a checkout, use `uv run --python 3.13 exp capture`. The first run installs the bundled, signed
+Mitmproxy Redirector app at `/Applications/Mitmproxy Redirector.app`. Approve its Network Extension
+when macOS asks. Capture checks the packaged backend, supported macOS version, and installation
+access before login. If your account cannot install or update the app in `/Applications`, ask
+your administrator for installation access, then retry as your normal user.
 
-OpenAI / Codex selects `api.openai.com` and `chatgpt.com`; Anthropic / Claude Code selects
-`api.anthropic.com`. Advanced users can repeat `--domain HOST` to supply an explicit set and skip
-the chooser, including for noninteractive use. Hosts overrides apply to all applications using
-the system resolver for those domains. Only supported model request paths produce uploaded
-traces; authentication and unrelated web requests are forwarded without retaining their bodies.
+Advanced users can repeat `--domain HOST` to replace the defaults with an exact set, for example
+`exp capture --domain api.openai.com`. The filter applies across applications. Only supported
+model request paths produce uploaded traces; authentication and unrelated web requests are
+forwarded without retaining their bodies.
 Captured traces include prompts, responses, and tool content. Credential headers are never
 copied into uploaded traces. This is separate from anonymous aggregate product telemetry.
 
@@ -55,21 +55,15 @@ directory that owns the saved login. On macOS this defaults to
 `~/Library/Application Support/exp/capture/ca/mitmproxy-ca-cert.pem`. Never share the adjacent
 `mitmproxy-ca.pem`, which contains the private signing key.
 
-An administrator prompt authorizes the temporary networking helper. Certificate trust is stored
-for the current macOS user, without installing a system-wide root.
-Run the CLI as your normal user, not `sudo exp capture`. The helper journals its own marked
-hosts entries and relays loopback port 443 to the unprivileged proxy. Ctrl+C removes the overrides
-before the proxy exits. The helper also restores networking if the foreground process disappears.
-Existing intercepted connections can fail during shutdown, and application DNS caches may require
-an application restart. No system Network Extension or permanent privileged service is installed.
-Capture forwards TCP HTTPS on port 443. Clients using QUIC or HTTP/3 over UDP must fall back to
-TCP HTTPS; UDP traffic is not collected.
-
-If the machine loses power, the helper is killed, or provider requests fail after capture ends,
-run `exp capture reset`. Reset works offline without login, requests administrator authorization
-when needed, and removes only Capture's recorded hosts changes. It preserves unrelated hosts
-edits, the existing login, local CA trust, and trace retry files. If someone edits Capture's
-marked block, reset reports the conflict instead of overwriting their changes.
+Run the CLI as your normal user, without `sudo`. Mitmproxy Redirector's Network Extension provides
+system-wide interception while the foreground backend is running. Ctrl+C ends that interception;
+Capture does not edit `/etc/hosts`, DNS settings, or system proxy settings. There is no reset
+command or separate Capture service to stop. The signed app and its macOS approval remain
+installed, and the local CA trust remains in the current user's trust store between runs.
+Existing intercepted connections may close when Capture stops. Restart an application if its
+existing connections prevent a new run from observing requests. Certificate-pinned apps and
+unsupported model protocols are not collected. UDP traffic, including QUIC/HTTP3 and DNS,
+passes through without inspection; model trace collection currently supports HTTPS over TCP.
 
 Upload failures do not stall model responses. The collector retains bounded private retry files
 under the origin-and-organization-specific `capture/spool` directory. The next capture run with
@@ -87,8 +81,7 @@ bound to their endpoint, so a production login is not silently sent to a preview
 login belongs to another endpoint, Capture opens normal login for the configured environment;
 successful login replaces the saved CLI login. To keep a preview's login and catalog separate,
 set `XDG_DATA_HOME` to a dedicated preview data directory and pass a separate `--root` to Capture.
-Keep that data directory selected when using `exp capture reset` for the preview.
-Capture checks the cloud API before installing hosts overrides. Live Codex and Claude Code
+Capture checks the cloud API before starting interception. Live Codex and Claude Code
 compatibility remains part of local acceptance; existing open connections may need to be
 restarted to enter capture.
 

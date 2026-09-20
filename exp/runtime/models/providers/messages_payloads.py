@@ -12,6 +12,7 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
+from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.models.providers.anthropic_tool_compat import (
     anthropic_input_schema,
     anthropic_rejects_forced_tool_choice,
@@ -123,6 +124,10 @@ def anthropic_messages_stream_payload(
             existing.extend(blocks)
         else:
             messages.append({"role": role, "content": blocks})
+    if request.json_object_output:
+        # Anthropic has no schema-free JSON mode, so the caller's intent rides
+        # the system prompt as a trailing instruction.
+        system_parts.append((JSON_OBJECT_SYSTEM_INSTRUCTION, ()))
     payload: JsonObject = {
         "model": model_id,
         "messages": messages,
@@ -457,6 +462,7 @@ def gemini_generate_content_stream_payload(
             response_json_schema=(
                 request.structured_text.json_schema if request.structured_text is not None else None
             ),
+            json_object_output=request.json_object_output,
         )
     except (ProviderParameterError, ProviderCapabilityError):
         raise
@@ -475,9 +481,8 @@ def bedrock_converse_stream_payload(
 ) -> JsonObject:
     """Translate one canonical request to the native ConverseStream REST body.
 
-    The body is built by the exact converter the Bedrock provider client
-    uses (canonical request through the shared model adapter, then the shared
-    Converse body builder), so both engines send one identical document. On
+    The body uses the shared Converse builder directly, retaining canonical
+    cache markers instead of losing them in a model-client projection. On
     the REST route the model travels in the URL path, never the body, and
     streaming is selected by the ``converse-stream`` route itself.
 
@@ -500,7 +505,7 @@ def bedrock_converse_stream_payload(
     del model_id
     try:
         return converse_body(
-            gateway_model_request(request),
+            request,
             supports_temperature=supports_temperature,
             supports_top_p=supports_top_p,
             supports_top_k=supports_top_k,
@@ -516,6 +521,9 @@ def bedrock_converse_stream_payload(
                 request.structured_text.json_schema if request.structured_text is not None else None
             ),
             strict_tool_names=tuple(tool.name for tool in request.tools if tool.strict),
+            json_object_instruction=(
+                JSON_OBJECT_SYSTEM_INSTRUCTION if request.json_object_output else None
+            ),
         )
     except (ProviderParameterError, ProviderCapabilityError):
         raise

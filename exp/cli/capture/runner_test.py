@@ -21,10 +21,10 @@ def test_runner_receives_public_arguments(monkeypatch: pytest.MonkeyPatch) -> No
     assert invocations == [(("api.openai.com",), Path("/tmp/project"))]
 
 
-def test_runner_reports_recovery_on_failure(
+def test_runner_reports_startup_failure(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A failed foreground capture returns failure and an offline recovery command."""
+    """A failed foreground capture returns its actionable startup diagnostic."""
 
     def capture(console: Console, *, domains: tuple[str, ...], root: Path) -> None:
         """Simulate a content-free setup error before interception begins."""
@@ -32,4 +32,18 @@ def test_runner_reports_recovery_on_failure(
 
     monkeypatch.setattr(runner, "_capture", capture)
     assert runner.main(["--root", "/tmp/project", "--domain", "api.openai.com"]) == 1
-    assert "exp capture reset" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "Synthetic startup failure" in output
+    assert "exp capture reset" not in output
+
+
+def test_preflight_runs_before_login_or_cloud_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Missing backend prerequisites cannot open login or create a cloud run."""
+
+    def unavailable() -> None:
+        """Reject backend setup before authentication is allowed."""
+        raise RuntimeError("Synthetic missing redirector")
+
+    monkeypatch.setattr(runner, "require_local_backend", unavailable)
+    with pytest.raises(RuntimeError, match="Synthetic missing redirector"):
+        runner._capture(Console(), domains=("api.openai.com",), root=Path("/tmp/project"))

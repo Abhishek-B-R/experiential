@@ -466,6 +466,7 @@ BEDROCK_GOLDEN_EVENTS: tuple[JsonObject, ...] = (
         "input_tokens": 12,
         "output_tokens": 4,
         "cached_input_tokens": 2,
+        "cache_creation_input_tokens": 1,
         "reasoning_tokens": None,
     },
     {"kind": "completed"},
@@ -1049,7 +1050,7 @@ def test_native_responses_preserves_multi_message_status_phase_and_idless_call()
         native.completed_responses_fixture(
             "request-official",
             "gpt-5.6-sol",
-            1_700_000_000.0,
+            1_700_000_000,
             "{}",
             events_json,
         )
@@ -1074,7 +1075,7 @@ def test_native_responses_preserves_multi_message_status_phase_and_idless_call()
     frames = native.encode_responses_fixture(
         "request-official",
         "gpt-5.6-sol",
-        1_700_000_000.0,
+        1_700_000_000,
         "{}",
         events_json,
     )
@@ -1231,7 +1232,7 @@ def test_native_responses_serves_hosted_tool_items_end_to_end() -> None:
         native.completed_responses_fixture(
             "request-hosted",
             "gpt-5.6-sol",
-            1_700_000_000.0,
+            1_700_000_000,
             "{}",
             events_json,
         )
@@ -1248,7 +1249,7 @@ def test_native_responses_serves_hosted_tool_items_end_to_end() -> None:
     frames = native.encode_responses_fixture(
         "request-hosted",
         "gpt-5.6-sol",
-        1_700_000_000.0,
+        1_700_000_000,
         "{}",
         events_json,
     )
@@ -1355,7 +1356,7 @@ def test_native_responses_serves_a_budget_truncated_function_call_as_incomplete(
         native.completed_responses_fixture(
             "request-astra",
             "gpt-6-astra",
-            1_700_000_000.0,
+            1_700_000_000,
             "{}",
             events_json,
         )

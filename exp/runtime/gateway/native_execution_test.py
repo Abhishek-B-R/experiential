@@ -679,6 +679,28 @@ def test_wire_entry_carries_emulated_stop_sequences_for_the_data_plane() -> None
     assert default["stop_sequences"] == []
 
 
+def test_wire_entry_carries_the_rungs_failover_only_on_tokens() -> None:
+    """A failover-only rung's entry lists its tokens; an unrestricted rung carries null."""
+    route = _route()
+    profile = GatewayWireProfile(dialect="openai_responses", url="https://provider.test")
+    assert deployment_wire_entry(route, route.deployment, profile, {})["failover_only_on"] is None
+    restricted = route.deployment.model_copy(
+        update={
+            "gateway": route.deployment.gateway.model_copy(
+                update={
+                    "capabilities": route.deployment.gateway.capabilities.model_copy(
+                        update={"failover_only_on": ("refusal:cyber_policy", "throttled")}
+                    )
+                }
+            )
+        }
+    )
+    assert deployment_wire_entry(route, restricted, profile, {})["failover_only_on"] == [
+        "refusal:cyber_policy",
+        "throttled",
+    ]
+
+
 def test_wire_entry_names_customer_managed_billing_for_the_data_plane() -> None:
     """A BYOK rung's entry says so, so the data plane re-owns credential failures."""
     route = _route()
@@ -1048,4 +1070,40 @@ def test_wire_entry_carries_the_throttle_redial_budget() -> None:
             "throttle_redial_budget"
         ]
         == 3
+    )
+
+
+def test_route_narrowing_and_reordering_keep_the_zdr_constraint_flags() -> None:
+    """The snapshot's constrained ids survive every route rebuild the admission does."""
+    route = _route()
+    flagged = route.model_copy(
+        update={
+            "snapshot": route.snapshot.model_copy(
+                update={"zdr_constrained_deployment_ids": ("two",)}
+            )
+        }
+    )
+
+    narrowed = select_route_deployments(flagged, (1, 2))
+    reordered = reorder_route_deployments(flagged, (2, 0, 1))
+
+    assert narrowed.snapshot.zdr_constrained_deployment_ids == ("two",)
+    assert reordered.snapshot.zdr_constrained_deployment_ids == ("two",)
+    assert route.snapshot.zdr_constrained_deployment_ids == ()
+
+
+def test_wire_entry_carries_the_codex_native_tool_translation_map() -> None:
+    """A translated Codex request carries the inversion map to the data plane."""
+    route = _route()
+    profile = GatewayWireProfile(dialect="openai_compatible", url="https://provider.test")
+    mapping = {"multi_agent_v1__close_agent": ("close_agent", "multi_agent_v1", False)}
+    entry = deployment_wire_entry(
+        route, route.deployment, profile, {}, native_tool_translation=mapping
+    )
+    # Tuples serialize to JSON arrays for the Rust `(String, Option<String>, bool)`.
+    assert entry["native_tool_translation"] == {
+        "multi_agent_v1__close_agent": ["close_agent", "multi_agent_v1", False]
+    }
+    assert (
+        deployment_wire_entry(route, route.deployment, profile, {})["native_tool_translation"] == {}
     )

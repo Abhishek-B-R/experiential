@@ -11,6 +11,12 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
+from exp.runtime.gateway.tool_search.contracts import gateway_tool_search_name
+from exp.runtime.models.providers.codex_tools import (
+    NativeToolMapping,
+    convert_native_history,
+    translate_native_tools,
+)
 from exp.runtime.models.providers.dialect_dispatch import (
     CACHE_CONTROL_NOT_FORWARDED_SUFFIX,
     THINKING_HISTORY_DROP_DISCLOSURE,
@@ -112,6 +118,16 @@ Messages-surface requests below the floor are raised to it with disclosure.
 _STRICT_STRUCTURED_OUTPUT_DIALECTS = frozenset(
     {"anthropic_messages", "gemini_generate_content", "bedrock_converse_stream"}
 )
+_JSON_OBJECT_OUTPUT_DIALECTS = frozenset(
+    {
+        "openai_responses",
+        "openai_compatible",
+        "anthropic_messages",
+        "gemini_generate_content",
+        "bedrock_converse_stream",
+    }
+)
+"""Dialects that honor schema-free JSON mode, natively or via a system instruction."""
 _NO_PARALLEL_TOOL_CONTROL_DIALECTS = frozenset(
     {"gemini_generate_content", "bedrock_converse_stream"}
 )
@@ -443,6 +459,25 @@ def route_generation_parameter_requests(
             param=path,
             code="unsupported_parameter",
         )
+    if request.json_object_output and any(
+        profile.dialect not in _JSON_OBJECT_OUTPUT_DIALECTS for profile in profiles
+    ):
+        raise ProviderParameterError(
+            message=(
+                "The parameter 'response_format.type' value 'json_object' is not "
+                "supported by every deployment in this model route. Use "
+                "'json_schema' or choose a different model."
+            ),
+            param="response_format.type",
+            code="unsupported_parameter",
+        )
+
+    if request.json_object_output and any(
+        profile.dialect in {"anthropic_messages", "bedrock_converse_stream"} for profile in profiles
+    ):
+        disclosure = "response_format->instruction(json_object)"
+        if disclosure not in ignored:
+            ignored.append(disclosure)
 
     # Every dialect carries a tool-result image: natively inside the tool
     # result on Anthropic (tool_result image blocks), native Responses (the SDK
@@ -498,7 +533,7 @@ def route_generation_parameter_requests(
     # from the winning Anthropic rung too, billing every turn's full context
     # uncached (~10x on input for a large system prompt).
     if request.provider_cache_control is not None and not any(
-        profile.dialect == "anthropic_messages" for profile in profiles
+        profile.preserves_cache_control for profile in profiles
     ):
         ignore("provider_cache_control", f"cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}")
     if request.inference_geo is not None and not all(
@@ -542,17 +577,14 @@ def route_generation_parameter_requests(
         if not (effort_only and request.reasoning_effort is not None):
             ignore("provider_output_config", "output_config")
 
-    # Client telemetry and the verbosity hint are native Responses surface;
-    # elsewhere they are dropped with disclosure (Codex sends both by
-    # default), never a rejection.
-    if request.client_metadata is not None and not all(
-        profile.dialect == "openai_responses" for profile in profiles
-    ):
+    # Native Responses routes carry client metadata and verbosity. Other routes
+    # omit them with disclosures that use the caller's spelling of each field.
+    native_only = all(profile.dialect == "openai_responses" for profile in profiles)
+    if request.client_metadata is not None and not native_only:
         ignore("client_metadata")
-    if request.text_verbosity is not None and not all(
-        profile.dialect == "openai_responses" for profile in profiles
-    ):
-        ignore("text_verbosity", "text.verbosity")
+    if request.text_verbosity is not None and not native_only:
+        chat = request.surface == GatewayApiSurface.CHAT_COMPLETIONS
+        ignore("text_verbosity", "verbosity" if chat else "text.verbosity")
 
     # A tool-call cache hint is honored only on the Anthropic wire; any other
     # rung silently cannot cache, so the omission is disclosed, never a
@@ -561,7 +593,7 @@ def route_generation_parameter_requests(
         call.cache_control is not None
         for message in request.messages
         for call in message.tool_calls
-    ) and not all(profile.dialect == "anthropic_messages" for profile in profiles):
+    ) and not all(profile.preserves_cache_control for profile in profiles):
         tool_call_marker = f"messages.tool_calls.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}"
         if tool_call_marker not in ignored:
             ignored.append(tool_call_marker)
@@ -573,35 +605,41 @@ def route_generation_parameter_requests(
     # them. Claude Code marks its system prompt and conversation
     # breakpoints on every request.
     if any(
-        message.provider_text_blocks or message.cache_control is not None
+        message.provider_text_blocks
+        or message.cache_control is not None
+        or any(
+            part.cache_control is not None
+            for part in message.content_parts
+            if part.kind == "text" or part.kind == "image" or part.kind == "document"
+        )
         for message in request.messages
-    ) and not any(profile.dialect == "anthropic_messages" for profile in profiles):
+    ) and not any(profile.preserves_cache_control for profile in profiles):
         content_marker = f"messages.content.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}"
         if content_marker not in ignored:
             ignored.append(content_marker)
 
-    # LiteLLM stamps ``provider_specific_fields`` on every assistant message it
-    # returns, and naive agent loops echo the dump back verbatim. No wire takes
-    # the object, so it is dropped on every route with disclosure, never a
-    # rejection (the 400 wedged whole Terminus-2 sessions, 2026-09-05).
+    # LiteLLM's echoed provider_specific_fields: no wire takes it; dropped with disclosure.
     if any(message.provider_specific_fields for message in request.messages):
         if "messages.provider_specific_fields" not in ignored:
             ignored.append("messages.provider_specific_fields")
 
-    # Anthropic-native tool-definition annotations exist only on that wire;
-    # every other rung drops each one with a per-field disclosure, never a
-    # rejection (Claude Code sends eager_input_streaming conditionally).
+    # Anthropic tool annotations (and Responses defer_loading) drop elsewhere with disclosure.
     if not all(profile.dialect == "anthropic_messages" for profile in profiles):
         tool_annotation_paths = (
             (
                 f"tools.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}",
-                any(tool.cache_control is not None for tool in request.tools),
+                any(tool.cache_control is not None for tool in request.tools)
+                and not all(profile.preserves_cache_control for profile in profiles),
             ),
             (
                 "tools.eager_input_streaming",
                 any(tool.eager_input_streaming is not None for tool in request.tools),
             ),
-            ("tools.defer_loading", any(tool.defer_loading is not None for tool in request.tools)),
+            (
+                "tools.defer_loading",
+                any(tool.defer_loading is not None for tool in request.tools)
+                and not all(profile.dialect == "openai_responses" for profile in profiles),
+            ),
             (
                 "tools.allowed_callers",
                 any(tool.allowed_callers is not None for tool in request.tools),
@@ -746,19 +784,6 @@ def route_generation_parameter_requests(
         provider_updates["provider_server_tools"] = ()
         if clear_tool_choice:
             provider_updates["tool_choice"] = None
-    if any(message.provider_native_item is not None for message in request.messages) and not all(
-        profile.dialect == "openai_responses" for profile in profiles
-    ):
-        raise ProviderParameterError(
-            message=(
-                "The request carries native Responses input items (tool namespaces, "
-                "custom tool calls, or hosted tool items such as web_search_call and "
-                "mcp_call echoes) that only a native OpenAI Responses route can serve. "
-                "Choose a different model alias."
-            ),
-            param="input",
-            code="unsupported_parameter",
-        )
     outbound_maximum_output_tokens = provider_updates.get(
         "maximum_output_tokens", request.maximum_output_tokens
     )
@@ -783,19 +808,48 @@ def route_generation_parameter_requests(
             param=parameter,
             code="invalid_parameter",
         )
-    if request.provider_native_tools and not all(
+    # Codex native Responses tool declarations/history serve verbatim only on a
+    # native Responses rung; a foreign wire gets them translated to function
+    # tools (namespaces hoisted, custom tools as one ``input`` function; hosted
+    # web_search/tool_search dropped with disclosure). The inverse mapping rides
+    # on the provider request so the response path re-shapes tool calls back.
+    native_history_present = any(
+        message.provider_native_item is not None for message in request.messages
+    )
+    if (request.provider_native_tools or native_history_present) and not all(
         profile.dialect == "openai_responses" for profile in profiles
     ):
-        raise ProviderParameterError(
-            message=(
-                "The request carries native Responses tool declarations (custom, "
-                "namespace, web_search, or tool_search entries) that only a native "
-                "OpenAI Responses route can serve. Remove those tools or choose a "
-                "different model alias."
-            ),
-            param="tools",
-            code="unsupported_parameter",
-        )
+        native_mapping = NativeToolMapping()
+        if request.provider_native_tools:
+            translation = translate_native_tools(request)
+            native_mapping = translation.mapping
+            provider_updates["tools"] = translation.tools
+            provider_updates["provider_native_tools"] = ()
+            for disclosure in translation.disclosures:
+                if disclosure not in ignored:
+                    ignored.append(disclosure)
+            if not translation.tools and (
+                request.tool_choice == "required"
+                or isinstance(request.tool_choice, GatewayNamedToolChoice)
+            ):
+                provider_updates["tool_choice"] = None
+                if "tool_choice->cleared(no_serviceable_tool)" not in ignored:
+                    ignored.append("tool_choice->cleared(no_serviceable_tool)")
+        if native_history_present:
+            current_messages = cast(
+                "Sequence[GatewayMessage]", provider_updates.get("messages", request.messages)
+            )
+            converted, history_disclosures = convert_native_history(
+                current_messages,
+                native_mapping,
+                tool_search_name=gateway_tool_search_name(tool.name for tool in request.tools),
+            )
+            provider_updates["messages"] = converted
+            for disclosure in history_disclosures:
+                if disclosure not in ignored:
+                    ignored.append(disclosure)
+        if native_mapping:
+            provider_updates["native_tool_translation"] = native_mapping.as_dict()
 
     if any(profile.dialect == "anthropic_messages" for profile in profiles) and any(
         message.role == "user"

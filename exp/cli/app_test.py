@@ -9,7 +9,7 @@ from typer.main import get_group
 from exp.cli.app import app
 
 EXPECTED_SUBCOMMANDS = {
-    "capture": {"reset"},
+    "capture": set(),
     "config": {"budget", "gateway", "judge", "providers", "telemetry"},
     "optimize": {"model", "router"},
 }

@@ -14,9 +14,11 @@ on the exact release checkout.
   written to the project.
 - `exp capture` is a foreground macOS HTTPS collector on Python 3.13+ with normal Platform login, streamed
   OpenAI/Anthropic protocol capture, asynchronous trace uploads, and bounded private retry files.
-  A separate temporary administrator helper owns only the selected hosts overrides and loopback
-  forwarding. `exp capture reset` repairs owned routing offline. Certificate trust persists
-  between runs. Synthetic provider and temporary hosts tests are separate from real client testing.
+  It defaults to supported provider hosts across all apps, with an optional exact-host override.
+  The signed Mitmproxy Redirector app and its approved Network Extension own interception for the
+  foreground backend's lifetime. Capture does not edit hosts, DNS, or system proxy settings and
+  has no reset subcommand. Certificate trust persists between runs. Synthetic provider and
+  backend lifecycle tests are separate from real client testing.
 - The local gateway supports explicit provider references, identities, virtual keys, grants,
   singleton and certified ordered exact-model pools, frozen-project aliases, bounded precommit
   provider fallback, Chat Completions, Responses (over HTTP and as the Responses-over-WebSocket
@@ -25,6 +27,14 @@ on the exact release checkout.
   and usage views, and optional identity-scoped guardrails that stay off until a policy is
   assigned. The bundled standard classifier pack is also default-off and is enabled only
   when one organization and identity opts in and binds an adapter for every capability.
+- Native `POST /v1/systemone` serves TypeSafe decision requests with `noul`, `choice`, and
+  `score` questions and typed answers, independently of conversational APIs. Admission requires
+  a direct exact-model pool, explicit `gateway.capabilities.supports_decisions`, a known
+  nonnegative input token rate, and output token rate zero. Requests are bounded to 32 questions,
+  64 choice or 10 score criteria, and 262,144 bytes. Accounting reserves bounded per-question
+  estimates, not provider-enforced output limits, and settles only provider-reported usage.
+  Real Rust HTTP and SQLite tests cover all answer types, authentication, unsupported inputs,
+  missing or invalid usage, certified 401 fallback, cancellation, timeout, and content-free accounting.
 - The no-subcommand default gateway launch, the direct `exp run [PROJECT]` form, and the
   `exp --project PROJECT [--ghost]` compatibility form are installed-wheel surfaces. Gateway
   startup is provider-idle and requires explicit authority.
@@ -70,19 +80,22 @@ credentials. `Not run` means exactly that; it is not inferred from fixture cover
 | OpenRouter | Compatible-adapter fixtures for text, tool arguments, usage, cancellation, and refusal | Not run; requires OpenRouter credential |
 | Gemini | Native fixtures for text, structured complete function arguments, usage, cancellation, and refusal | Not run; requires Gemini credential |
 | Amazon Bedrock | Native EventStream fixtures for text, incremental tool arguments, usage, bounded cancellation, refusal, and single dispatch | Not run; requires an authorized AWS account and region |
+| TypeSafe SystemOne | Real Rust HTTP listener and SQLite with a synthetic loopback upstream; three typed answer forms, exact token settlement, error validation, certified 401 authentication fallback, cancellation, and timeout | Direct TypeSafe API smoke with synthetic input succeeded for all three question types on 2026-09-16; no hosted-gateway or deployed-fleet verification |
 
-The machine-readable dated matrix is
-`exp/runtime/gateway/provider_certification.py`. Its live cells are
-`not_run_requires_credentials`. Gemini complete structured function arguments are explicitly not
-labeled as provider-byte incremental tool-argument streaming.
+The machine-readable dated conversational matrix is
+`exp/runtime/gateway/provider_certification.py`. Its live cells remain
+`not_run_requires_credentials`; the separate TypeSafe smoke above does not certify those cells.
+Gemini complete structured function arguments are explicitly not labeled as provider-byte
+incremental tool-argument streaming. A direct TypeSafe success verifies that request and its
+reported usage, not account limits, price-invoice agreement, production availability, or latency.
 
 ## Explicitly excluded
 
-- DNS Capture has not been certified against live Codex or Claude Code sessions. Their process
-  trust stores, existing connections, and DNS caches may require configuration or a restart.
-  No automatic reboot recovery is installed: after a power loss or a killed helper, run
-  `exp capture reset`. The feature does not bypass certificate pinning or claim complete capture
-  of applications using independent DNS, unselected domains, or unsupported protocols.
+- System-wide Capture has not been certified against live Codex or Claude Code sessions. Their
+  process trust stores and existing connections may require configuration or a restart. The
+  signed macOS Network Extension requires user approval; synthetic tests do not establish that
+  a real machine has approved it. The feature does not bypass certificate pinning or claim
+  complete capture of unselected domains or unsupported protocols.
 
 - There is no budgets dashboard. Monthly allocation management and remaining-allocation reporting
   are explicit interactive or non-interactive CLI operations.
@@ -94,11 +107,19 @@ labeled as provider-byte incremental tool-argument streaming.
   has a finite positive ceiling and its backend supplies a conservative full-schedule estimate.
 - No trained-versus-base behavioral comparison ran because this release produced no paid training
   artifact. It makes no trained-model quality-improvement claim.
-- No hosted model, judge, embedding, telemetry, environment, credential, or `.env` path was used by
-  release evidence. The deterministic W16 evidence reports exactly $0.00 observed service spend.
-- Deterministic gateway certification uses a real loopback upstream and local SQLite. No live
-  provider matrix cell ran, so hosted availability, account limits, billing, and service-specific
-  behavior are not claimed.
+- The deterministic W16 evidence used no hosted model, judge, embedding, telemetry, environment,
+  credential, or `.env` path and reports exactly $0.00 observed service spend. The separately
+  authorized TypeSafe direct API smoke is not part of that provider-free evidence.
+- Deterministic gateway certification uses a real loopback upstream and local SQLite. The
+  conversational provider matrix's live cells did not run. Neither these fixtures nor the one
+  direct TypeSafe smoke establishes hosted-gateway availability, account limits, or invoice accuracy.
+- SystemOne has no chat or Responses conversion, streaming, tools, generation controls, project
+  selection, chat guardrail processing, continuation, or idempotency replay. An inbound
+  `Idempotency-Key` is ignored, so a repeat submission is a new request. Execution is capped at
+  eight certified deployments and one dispatch each, with no same-rung or throttle redials;
+  HTTP 402/429/529, ambiguous transport outcomes, and malformed answers are terminal unknown outcomes
+  that keep their monetary hold rather than automatically retrying or failing over. Only HTTP
+  400/401/403/404/422 establish a known rejection eligible to release that hold.
 
 These exclusions are product boundaries, not evidence that the corresponding hosted services are
 unsafe or unsupported forever. Any future claim requires separately authorized, finite-budget,

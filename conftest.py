@@ -11,10 +11,10 @@ import sys
 os.environ.pop("FORCE_COLOR", None)
 os.environ.pop("CLICOLOR_FORCE", None)
 
-# The SDK and offline Capture recovery support Python 3.12. Only the TLS capture
+# The SDK and Capture command help support Python 3.12. Only the TLS capture
 # engine requires 3.13, matching its conditional distribution dependencies. Ignore
-# these exact engine tests before import; auth, resolver, control, CLI help, and
-# networking recovery tests still run on the minimum supported SDK interpreter.
+# these exact engine tests before import; auth, policy, control, CLI help, and
+# read-only backend checks still run on the minimum supported SDK interpreter.
 collect_ignore = (
     [
         "exp/cli/capture/runner_test.py",
@@ -22,6 +22,7 @@ collect_ignore = (
         "exp/runtime/capture/certificates_test.py",
         "exp/runtime/capture/normalization_test.py",
         "exp/runtime/capture/proxy_test.py",
+        "exp/runtime/capture/redirector_test.py",
         "exp/runtime/capture/upload_test.py",
     ]
     if sys.version_info < (3, 13)

@@ -6,7 +6,7 @@ import errno
 import os
 import pty
 import re
-import select
+import selectors
 import shutil
 import signal
 import subprocess
@@ -16,25 +16,37 @@ import termios
 import time
 import tomllib
 import zipfile
+from email.parser import Parser
 from pathlib import Path, PurePosixPath
 from typing import cast
 
 from click import unstyle
 
+if sys.platform != "win32":
+    import fcntl
+    import resource
+
 if os.environ.get("EXP_INSTALLED_RELEASE_EVIDENCE") != "1":
     import pytest
 
 BUILT_DIST_ENV = "EXP_BUILT_DIST_DIR"
-FORBIDDEN_REQUIREMENT = re.compile(
-    r"(?mi)^Requires-Dist:\s*(?:anthropic|environment-capture|gepa|mlx-lm|"
-    r"opentelemetry-proto|scikit-learn|transformers)(?:\s|[<>=;~!])"
+FORBIDDEN_REQUIREMENTS = frozenset(
+    {
+        "anthropic",
+        "environment-capture",
+        "gepa",
+        "mlx-lm",
+        "opentelemetry-proto",
+        "scikit-learn",
+        "transformers",
+    }
 )
 REQUIRED_CORE_REQUIREMENTS = frozenset(
     {
+        "anyio",
         "boto3",
         "botocore",
         "click",
-        "dnspython",
         "exp-gateway-native",
         "filelock",
         "google-auth",
@@ -183,18 +195,64 @@ def _sdist_metadata(archive: tarfile.TarFile) -> str:
     return extracted.read().decode("utf-8")
 
 
+def _metadata_requirements(metadata: str) -> tuple[tuple[str, str], ...]:
+    """Return normalized dependency names and markers from metadata headers only.
+
+    Args:
+        metadata: Complete wheel METADATA or sdist PKG-INFO text.
+
+    Returns:
+        Dependency names paired with their environment-marker text.
+    """
+    requirements: list[tuple[str, str]] = []
+    headers = Parser().parsestr(metadata, headersonly=True)
+    for requirement in headers.get_all("Requires-Dist", []):
+        name = re.split(r"[<>=;~!\[\s(]", requirement, maxsplit=1)[0]
+        name = re.sub(r"[-_.]+", "-", name).casefold()
+        marker = requirement.partition(";")[2].strip()
+        requirements.append((name, marker))
+    return tuple(requirements)
+
+
+def _assert_allowed_requirements(metadata: str) -> None:
+    """Reject forbidden dependencies, permitting Anthropic solely in the dev extra.
+
+    Args:
+        metadata: Complete wheel METADATA or sdist PKG-INFO text.
+
+    Raises:
+        AssertionError: A forbidden dependency appears outside the sole dev SDK exception.
+    """
+    for name, marker in _metadata_requirements(metadata):
+        allowed_dev_sdk = name == "anthropic" and re.fullmatch(r"extra\s*==\s*(['\"])dev\1", marker)
+        assert name not in FORBIDDEN_REQUIREMENTS or allowed_dev_sdk, (
+            f"forbidden release requirement: {name}; {marker}"
+        )
+
+
+def _core_requirement_names(metadata: str) -> frozenset[str]:
+    """Return dependencies unless gated solely by one named extra equality.
+
+    Args:
+        metadata: Complete wheel METADATA or sdist PKG-INFO text.
+
+    Returns:
+        Normalized names, conservatively retaining mixed or runtime-capable markers.
+    """
+    return frozenset(
+        name
+        for name, marker in _metadata_requirements(metadata)
+        if not re.fullmatch(r"extra\s*==\s*(['\"])[A-Za-z0-9][A-Za-z0-9._-]*\1", marker)
+    )
+
+
 def _assert_core_requirements(metadata: str) -> None:
     """Check unconditional SDK dependencies and Python-gated Capture dependencies."""
+    _assert_allowed_requirements(metadata)
     requirements: dict[str, str] = {}
-    for line in metadata.splitlines():
-        if not line.startswith("Requires-Dist:"):
+    for name, marker in _metadata_requirements(metadata):
+        if re.fullmatch(r"extra\s*==\s*(['\"])[A-Za-z0-9][A-Za-z0-9._-]*\1", marker):
             continue
-        requirement = line.removeprefix("Requires-Dist:").strip()
-        requirement, _, marker = requirement.partition(";")
-        if re.search(r"\bextra\s*==", marker):
-            continue
-        assert FORBIDDEN_REQUIREMENT.search(line) is None, f"forbidden core dependency: {line}"
-        name = re.split(r"[<>=;~!\s]", requirement, maxsplit=1)[0].casefold()
         assert name not in requirements, f"duplicate core dependency: {name}"
         requirements[name] = re.sub(r"\s+", "", marker).replace("'", '"')
     assert frozenset(requirements) == REQUIRED_CORE_REQUIREMENTS | REQUIRED_CAPTURE_REQUIREMENTS
@@ -210,9 +268,10 @@ def test_core_dependency_markers_preserve_sdk_python_312() -> None:
     assert project["requires-python"] == ">=3.12"
     metadata = "\n".join(f"Requires-Dist: {requirement}" for requirement in project["dependencies"])
     _assert_core_requirements(metadata)
+    _assert_core_requirements(metadata + "\n\nRequires-Dist: anthropic>=1.2")
     _assert_core_requirements(metadata + '\nRequires-Dist: anthropic>=1.2; extra == "dev"')
     for marker in ("", '; python_version >= "3.13"'):
-        with pytest.raises(AssertionError, match="forbidden core dependency"):
+        with pytest.raises(AssertionError, match="forbidden release requirement"):
             _assert_core_requirements(metadata + f"\nRequires-Dist: anthropic>=1.2{marker}")
 
 
@@ -382,9 +441,11 @@ def _run_tty_child(
     completion_seen = completion_marker is None
     terminal_closed = False
     deadline = time.monotonic() + timeout
+    selector = selectors.DefaultSelector()
     try:
+        selector.register(master, selectors.EVENT_READ)
         while process.poll() is None and time.monotonic() < deadline:
-            readable, _, _ = select.select([master], [], [], 0.1)
+            readable = selector.select(timeout=0.1)
             if readable:
                 try:
                     chunk = os.read(master, 65_536)
@@ -440,7 +501,7 @@ def _run_tty_child(
             raise AssertionError(f"interactive CLI timed out:\n{transcript}")
         if not terminal_closed:
             while True:
-                readable, _, _ = select.select([master], [], [], 0)
+                readable = selector.select(timeout=0)
                 if not readable:
                     break
                 try:
@@ -453,6 +514,7 @@ def _run_tty_child(
                     break
                 transcript += chunk.decode(errors="replace")
     finally:
+        selector.close()
         os.close(master)
     assert process.returncode == 0, transcript
     assert not pending, f"unanswered prompts {pending}:\n{transcript}"
@@ -3024,6 +3086,47 @@ def test_tty_child_exit_survives_terminal_close_races(tmp_path: Path) -> None:
     assert all("COMPLETE" in transcript for transcript in transcripts)
 
 
+def test_tty_child_supports_descriptors_above_select_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drive a real pseudo-terminal whose master is above select's descriptor ceiling.
+
+    Args:
+        tmp_path: Isolated child working directory.
+        monkeypatch: Fixture replacing only pseudo-terminal descriptor allocation.
+    """
+    if sys.platform == "win32":
+        pytest.skip("High-numbered pseudo-terminal descriptors require POSIX.")
+
+    soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit != resource.RLIM_INFINITY and soft_limit <= 1024:
+        pytest.skip("The process descriptor limit does not allow a high-numbered terminal.")
+    openpty = pty.openpty
+
+    def high_descriptor_pty() -> tuple[int, int]:
+        """Duplicate the real terminal master above FD_SETSIZE without opening many files."""
+        master, slave = openpty()
+        try:
+            high_master = fcntl.fcntl(master, fcntl.F_DUPFD, 1024)
+        except OSError:
+            os.close(slave)
+            raise
+        finally:
+            os.close(master)
+        return high_master, slave
+
+    monkeypatch.setattr(pty, "openpty", high_descriptor_pty)
+    transcript = _run_tty_child(
+        [sys.executable, "-c", "assert input('Prompt: ') == 'yes'; print('COMPLETE', flush=True)"],
+        cwd=tmp_path,
+        environment=os.environ.copy(),
+        answers=[("Prompt:", "yes")],
+        completion_marker="COMPLETE",
+        timeout=5,
+    )
+    assert "COMPLETE" in transcript
+
+
 def test_gateway_canary_scanner_covers_every_persistent_and_observable_channel(
     tmp_path: Path,
 ) -> None:
@@ -3147,6 +3250,65 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
         environment=driver_environment,
         timeout=600,
     )
+
+
+def test_release_requirements_allow_anthropic_only_in_the_dev_extra() -> None:
+    """Permit the SDK drift check without admitting Anthropic to installed runtime extras."""
+    for marker in ('extra == "dev"', "extra == 'dev'"):
+        _assert_allowed_requirements(f"Requires-Dist: anthropic<2,>=1.2; {marker}\n\n")
+    for marker in (
+        "",
+        'extra == "sft"',
+        'extra == "dev" or extra == "sft"',
+        'extra == "dev" or python_version >= "3.12"',
+        'extra != "dev"',
+    ):
+        metadata = f"Requires-Dist: anthropic<2,>=1.2{'; ' + marker if marker else ''}\n\n"
+        with pytest.raises(AssertionError, match="forbidden release requirement: anthropic"):
+            _assert_allowed_requirements(metadata)
+
+
+def test_release_requirements_keep_other_forbidden_dependencies_out_of_extras() -> None:
+    """The dev SDK exception never admits other removed dependencies or spelling aliases."""
+    for name in FORBIDDEN_REQUIREMENTS - {"anthropic"}:
+        for spelling in (name, name.replace("-", "_").upper()):
+            for marker in ("", '; extra == "dev"', '; extra == "sft"'):
+                metadata = f"Requires-Dist: {spelling}>=1{marker}\n\n"
+                with pytest.raises(AssertionError, match="forbidden release requirement"):
+                    _assert_allowed_requirements(metadata)
+
+
+def test_release_requirement_headers_ignore_description_body() -> None:
+    """Folded headers count as dependencies while README text never changes the contract."""
+    metadata = (
+        "Metadata-Version: 2.5\n"
+        "Requires-Dist: google_auth>=2\n"
+        'Requires-Dist: click>=8; python_version >= "3.12"\n'
+        "Requires-Dist: anthropic<2,>=1.2;\n"
+        ' extra == "dev"\n'
+        "\nRequires-Dist: transformers>=4\n"
+        "Requires-Dist: imaginary-core-package>=1\n"
+    )
+    _assert_allowed_requirements(metadata)
+    assert _core_requirement_names(metadata) == {"google-auth", "click"}
+
+
+def test_release_core_requirements_retain_runtime_capable_extra_markers() -> None:
+    """Runtime-active OR and empty-extra markers cannot hide a new core dependency."""
+    core_headers = "\n".join(f"Requires-Dist: {name}" for name in REQUIRED_CORE_REQUIREMENTS)
+    for marker in (
+        'extra == "dev" or python_version >= "3.12"',
+        'python_version >= "3.12" or extra == "dev"',
+        'extra == ""',
+        'extra != "dev"',
+    ):
+        metadata = f"{core_headers}\nRequires-Dist: unexpected-runtime-package; {marker}\n\n"
+        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS | {
+            "unexpected-runtime-package"
+        }
+    for marker in ('extra == "dev"', "extra == 'sft'"):
+        metadata = f"{core_headers}\nRequires-Dist: optional-package; {marker}\n\n"
+        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
 
 
 def test_built_archives_match_current_package_contract() -> None:

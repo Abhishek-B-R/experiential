@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from collections import deque
 from collections.abc import Callable
@@ -11,12 +12,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from mitmproxy import http, options, tls
-from mitmproxy.proxy.server_hooks import ServerConnectionHookData
+from mitmproxy import http, options, tcp
+from mitmproxy.addons.errorcheck import ErrorCheck
+from mitmproxy.addons.proxyserver import Proxyserver
+from mitmproxy.proxy import layer, layers
 from mitmproxy.tools.dump import DumpMaster
 
 from exp.runtime.capture.normalization import CapturedExchange, CaptureProtocol, capture_protocol
-from exp.runtime.capture.resolver import UpstreamResolver
+from exp.runtime.capture.policy import validate_domains
+from exp.runtime.capture.redirector import stop_capture_servers
 
 logger = logging.getLogger(__name__)
 
@@ -78,141 +82,132 @@ class CaptureProxy:
         *,
         sink: Callable[[CapturedExchange], bool],
         domains: tuple[str, ...],
-        resolver: UpstreamResolver,
         max_body_bytes: int = 8 * 1024 * 1024,
         max_active_flows: int = 16,
-        upstream_port: int = 443,
         upstream_ca_file: Path | None = None,
     ) -> None:
         """Configure finite capture state and a nonblocking exchange sink."""
         if not domains or max_body_bytes < 1 or max_active_flows < 1:
             raise ValueError("capture needs domains and positive memory limits")
-        self._domains = frozenset(domain.lower().rstrip(".") for domain in domains)
-        self._resolver = resolver
+        self._domains = frozenset(validate_domains(domains))
         self._sink = sink
         self._max_body_bytes = max_body_bytes
         self._max_active_flows = max_active_flows
-        self._upstream_port = upstream_port
         self._upstream_ca_file = upstream_ca_file
         self._captures: dict[str, _Capture] = {}
         self._master: DumpMaster | None = None
-        self._ready: Callable[[], None] | None = None
         self.dropped_exchanges = 0
 
-    async def serve(self, *, port: int, ca_directory: Path, ready: Callable[[], None]) -> None:
-        """Serve an unprivileged loopback TLS port until shutdown is requested.
+    async def serve(self, *, ca_directory: Path, ready: Callable[[], None]) -> None:
+        """Inspect selected hosts through the operating system's local redirector.
 
-        The caller owns privileged relaying, trust installation, and host overrides.
-        Upstream verification remains enabled; neither API credentials nor flow dumps
-        are logged or persisted by mitmproxy.
+        The redirector preserves each connection's original destination and excludes
+        this process, including provider forwarding and cloud uploads. No hostname
+        resolution or system DNS changes are performed by Capture.
         """
-        self._ready = ready
-        opts = options.Options(
-            listen_host="127.0.0.1",
-            listen_port=port,
-            confdir=str(ca_directory),
-            mode=["reverse:https://capture.invalid:443"],
-            ssl_insecure=False,
-            upstream_cert=False,
-        )
+        opts = _capture_options(tuple(self._domains), ca_directory)
         master = DumpMaster(opts, with_termlog=False, with_dumper=False)
         self._master = master
-        master.addons.add(self)
+        # Embedded callers own startup errors and cleanup, rather than sys.exit.
+        errorcheck = master.addons.get("errorcheck")
+        if isinstance(errorcheck, ErrorCheck):
+            errorcheck.finish()
+            master.addons.remove(errorcheck)
+        nextlayer = master.addons.get("nextlayer")
+        master.addons.remove(nextlayer)
+        master.addons.add(self, nextlayer)
         opts.update(
             keep_host_header=True,
-            keep_alt_svc_header=False,
+            keep_alt_svc_header=True,
             connection_strategy="lazy",
             http3=False,
-            block_global=True,
+            block_global=False,
         )
         if self._upstream_ca_file is not None:
             opts.update(ssl_verify_upstream_trusted_ca=str(self._upstream_ca_file))
+        proxyserver = master.addons.get("proxyserver")
+        assert isinstance(proxyserver, Proxyserver)
         try:
-            await master.run()
+            if not await proxyserver.setup_servers():
+                raise RuntimeError(
+                    "Capture could not start the network extension. Approve Mitmproxy "
+                    "Redirector in macOS System Settings, then run exp capture again."
+                )
+            if master.should_exit.is_set():
+                return
+            await master.running()
+            ready()
+            await master.should_exit.wait()
         finally:
-            self._master = None
-            for flow_id, capture in tuple(self._captures.items()):
-                if capture.websocket:
-                    for request in capture.websocket_requests:
-                        self._submit(
-                            CapturedExchange(
-                                protocol="responses",
-                                host=capture.host,
-                                path=capture.path,
-                                started_ns=request.started_ns,
-                                ended_ns=time.time_ns(),
-                                request=request.body,
-                                response=b"",
-                                status=0,
-                                failed=True,
-                            )
-                        )
-                else:
-                    capture.failed = True
-                    capture.request_done = capture.response_done = True
-                    self._finish(flow_id, capture)
-            self._captures.clear()
+            try:
+                # Stop redirection before releasing the proxy and upload lifetime.
+                # master.done() alone does not stop mitmproxy's local redirector.
+                await stop_capture_servers(proxyserver)
+            finally:
+                try:
+                    await master.done()
+                finally:
+                    self._master = None
+                    self._finish_pending()
 
-    def running(self) -> None:
-        """Notify orchestration only after mitmproxy has initialized its listeners."""
-        if self._ready is not None:
-            self._ready()
+    def _finish_pending(self) -> None:
+        """Account for interrupted captures even when backend cleanup reports failure."""
+        for flow_id, capture in tuple(self._captures.items()):
+            if capture.websocket:
+                for request in capture.websocket_requests:
+                    self._submit(
+                        CapturedExchange(
+                            protocol="responses",
+                            host=capture.host,
+                            path=capture.path,
+                            started_ns=request.started_ns,
+                            ended_ns=time.time_ns(),
+                            request=request.body,
+                            response=b"",
+                            status=0,
+                            failed=True,
+                        )
+                    )
+            else:
+                capture.failed = True
+                capture.request_done = capture.response_done = True
+                self._finish(flow_id, capture)
+        self._captures.clear()
 
     def shutdown(self) -> None:
         """Request bounded server shutdown without blocking the caller's event loop."""
         if self._master is not None:
             self._master.shutdown()
 
-    async def tls_clienthello(self, data: tls.ClientHelloData) -> None:
-        """Bind the original allowlisted SNI to a directly resolved upstream."""
-        host = (data.client_hello.sni or "").lower().rstrip(".")
-        if host not in self._domains:
-            data.context.server.error = "capture only forwards configured TLS hosts"
-            return
-        try:
-            address = await self._resolver.resolve(host)
-        except (ValueError, OSError):
-            data.context.server.error = "capture upstream DNS resolution failed"
-            return
-        data.context.server.address = (address, self._upstream_port)
-        data.context.server.sni = host
-        data.establish_server_tls_first = False
+    def next_layer(self, nextlayer: layer.NextLayer) -> None:
+        """Pass UDP, including QUIC and DNS, through without decrypting or recording it.
 
-    async def server_connect(self, data: ServerConnectionHookData) -> None:
-        """Avoid hosts-file recursion while retaining hostname certificate validation."""
-        host = (data.client.sni or "").lower().rstrip(".")
-        if host not in self._domains:
-            data.server.error = "capture only forwards configured TLS hosts"
-            return
-        try:
-            address = await self._resolver.resolve(host)
-        except (ValueError, OSError):
-            data.server.error = "capture upstream DNS resolution failed"
-            return
-        data.server.address = (address, self._upstream_port)
-        data.server.sni = host
+        This hook runs before mitmproxy's protocol selection. HTTPS over TCP is
+        selected by allow_hosts before its TLS layer is created; HTTP/3 is outside
+        this capture engine's supported protocols and must remain usable unchanged.
+        """
+        if nextlayer.context.client.transport_protocol == "udp":
+            nextlayer.layer = layers.UDPLayer(nextlayer.context, ignore=True)
+
+    def tcp_message(self, flow: tcp.TCPFlow) -> None:
+        """Release opaque TCP history while mitmproxy forwards the current chunk unchanged."""
+        flow.messages.clear()
 
     async def requestheaders(self, flow: http.HTTPFlow) -> None:
-        """Route by DNS without changing authority, then tee only inference bodies."""
+        """Tee supported HTTPS requests without rewriting their original destination."""
+        flow.request.stream = True
         try:
             host = (
                 (urlsplit(f"//{flow.request.host_header or ''}").hostname or "").lower().rstrip(".")
             )
         except ValueError:
-            host = ""
-        if host not in self._domains or host != (flow.client_conn.sni or "").lower().rstrip("."):
-            flow.response = http.Response.make(421, b"Capture host does not match TLS SNI")
             return
-        try:
-            address = await self._resolver.resolve(host)
-        except (ValueError, OSError):
-            flow.response = http.Response.make(502, b"Capture upstream DNS resolution failed")
+        if (
+            host not in self._domains
+            or flow.request.scheme != "https"
+            or host != (flow.client_conn.sni or "").lower().rstrip(".")
+        ):
             return
-        authority = flow.request.host_header
-        flow.request.host = address
-        flow.request.port = self._upstream_port
-        flow.request.host_header = authority
-        flow.request.stream = True
         protocol = capture_protocol(flow.request.method, flow.request.path)
         if protocol is None:
             return
@@ -382,3 +377,15 @@ class CaptureProxy:
         except Exception:  # noqa: BLE001
             self.dropped_exchanges += 1
             logger.warning("Capture queue rejected an exchange; inference is unaffected")
+
+
+def _capture_options(domains: tuple[str, ...], ca_directory: Path) -> options.Options:
+    """Select exact provider names before TLS inspection, ignoring all other hosts."""
+    return options.Options(
+        confdir=str(ca_directory),
+        mode=["local"],
+        allow_hosts=[rf"^{re.escape(domain)}\.?:[0-9]+$" for domain in domains],
+        show_ignored_hosts=False,
+        ssl_insecure=False,
+        upstream_cert=False,
+    )
