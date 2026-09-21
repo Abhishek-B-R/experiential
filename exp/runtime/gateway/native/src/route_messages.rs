@@ -680,15 +680,22 @@ async fn stream_messages(
                 {
                     Ok(Some(event)) => event,
                     Ok(None) => {
+                        usage = committed.relay.usage_before_failure(usage.take());
                         fail_stream!(Failure::new(
                             FailureClass::MalformedResponse,
                             "provider stream ended without a terminal event",
                         ))
                     }
-                    Err(failure) => fail_stream!(failure),
+                    Err(failure) => {
+                        usage = committed.relay.usage_before_failure(usage.take());
+                        fail_stream!(failure)
+                    }
                 }
             };
             track_event(&event, &mut usage, &mut tool_names);
+            if matches!(event, Event::Failed(_)) {
+                usage = committed.relay.usage_before_failure(usage.take());
+            }
             // Mirror the relay's first-token time onto the guard as tokens stream.
             guard.record_first_token(committed.relay.first_token_at());
             let outward = outward_event(&event, &mut visible_refusal);

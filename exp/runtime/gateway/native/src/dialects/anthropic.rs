@@ -19,6 +19,25 @@ use crate::events::{
 };
 
 impl Normalizer {
+    /// One cumulative report, including the input re-read by server tools.
+    fn anthropic_usage_snapshot(&self) -> Result<Usage, Failure> {
+        let input = bounded_ledger_sum(
+            &[self.input_tokens, self.cache_read, self.cache_write],
+            "Anthropic input",
+        )
+        .map_err(|message| malformed(&message))?;
+        Ok(Usage {
+            input_tokens: Some(input),
+            output_tokens: Some(self.output_tokens),
+            cached_input_tokens: Some(self.cache_read),
+            // Cache-less streams omit writes. Thinking is inside output;
+            // its unreported subset must remain unknown.
+            cache_creation_input_tokens: (self.cache_write > 0).then_some(self.cache_write),
+            cache_creation_1h_input_tokens: self.cache_write_1h.filter(|_| self.cache_write > 0),
+            reasoning_tokens: None,
+        })
+    }
+
     pub(super) fn feed_anthropic(
         &mut self,
         frame: &crate::sse::SseEvent,
@@ -69,21 +88,9 @@ impl Normalizer {
                 // as the best known count until the terminal report, which
                 // supersedes them at `message_stop` (server-tool turns re-read
                 // fetched results as input, so the start count undercounts).
-                let input_tokens = bounded_ledger_sum(
-                    &[self.input_tokens, self.cache_read, self.cache_write],
-                    "Anthropic input",
-                )
-                .map_err(|message| malformed(&message))?;
-                events.push(Event::Usage(Usage {
-                    input_tokens: Some(input_tokens),
-                    output_tokens: Some(self.output_tokens),
-                    cached_input_tokens: Some(self.cache_read),
-                    cache_creation_input_tokens: (self.cache_write > 0).then_some(self.cache_write),
-                    cache_creation_1h_input_tokens: self
-                        .cache_write_1h
-                        .filter(|_| self.cache_write > 0),
-                    reasoning_tokens: None,
-                }));
+                let usage = self.anthropic_usage_snapshot()?;
+                self.usage = Some(usage.clone());
+                events.push(Event::Usage(usage));
             }
             "content_block_start" => {
                 let index = require_u64(&payload, "index", "Anthropic content index")
@@ -305,6 +312,7 @@ impl Normalizer {
                 {
                     self.cache_write_1h = cache_write::hour_subset(usage, self.cache_write)?;
                 }
+                self.usage = Some(self.anthropic_usage_snapshot()?);
                 if self.stop_reason.as_deref() == Some("refusal") && !self.refusal_seen {
                     self.refusal_seen = true;
                     events.push(Event::RefusalDelta(String::new()));
@@ -318,26 +326,7 @@ impl Normalizer {
                 } else {
                     finish_open_tools(&mut self.tools)?
                 });
-                let input_tokens = bounded_ledger_sum(
-                    &[self.input_tokens, self.cache_read, self.cache_write],
-                    "Anthropic input",
-                )
-                .map_err(|message| malformed(&message))?;
-                events.push(Event::Usage(Usage {
-                    input_tokens: Some(input_tokens),
-                    output_tokens: Some(self.output_tokens),
-                    cached_input_tokens: Some(self.cache_read),
-                    // Present only when nonzero so cache-less streams keep
-                    // their exact pre-field usage shape.
-                    cache_creation_input_tokens: (self.cache_write > 0).then_some(self.cache_write),
-                    cache_creation_1h_input_tokens: self
-                        .cache_write_1h
-                        .filter(|_| self.cache_write > 0),
-                    // Anthropic reports thinking inside output_tokens and
-                    // publishes no separate count, so the reasoning subset
-                    // stays unknown instead of being invented.
-                    reasoning_tokens: None,
-                }));
+                events.push(Event::Usage(self.anthropic_usage_snapshot()?));
                 if self.refusal_seen || self.stop_reason.as_deref() == Some("refusal") {
                     events.push(Event::Failed(refusal_failure()));
                 } else if self.stop_reason.as_deref() == Some("max_tokens") {

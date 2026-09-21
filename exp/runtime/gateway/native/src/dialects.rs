@@ -507,6 +507,11 @@ impl Normalizer {
         self.upstream_provider = Some(trimmed.to_string());
     }
 
+    /// Latest provider usage retained for a terminal that may never arrive.
+    pub(crate) fn observed_usage(&self) -> Option<&Usage> {
+        self.usage.as_ref().filter(|usage| usage.has_token_counts())
+    }
+
     /// Reserve retained-output budget for accumulated tool-argument text.
     fn reserve_tool_bytes(&mut self, additional: usize) -> Result<(), Failure> {
         self.accumulated_tool_bytes = self.accumulated_tool_bytes.saturating_add(additional);
