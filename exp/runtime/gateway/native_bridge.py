@@ -367,6 +367,7 @@ class NativeControlPlane(
             )
         except GuardrailRejected as exc:
             raise NativeBridgeError(public_failure_error(exc.failure)) from exc
+        captured_request = request
         retention_request = strip_stale_reasoning_history(request)
         try:
             request, verified_reasoning_route = unseal_reasoning_history(
@@ -415,7 +416,7 @@ class NativeControlPlane(
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
 
-        begin_capture(self._capture, authorization, retention_request)
+        begin_capture(self._capture, authorization, captured_request)
         # Escalation finishes the accepted request quietly before returning, so it is
         # accounted content-free and never billed. Routing failures found by
         # the probe are raised against the accepted request below.

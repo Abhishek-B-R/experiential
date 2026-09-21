@@ -210,6 +210,7 @@ pub struct UpstreamRelay {
     /// the reservation settles both dials' tokens as one.
     carried_usage: Option<Usage>,
     observation: Option<crate::settlement::Observation>,
+    capture_reasoning: Option<crate::capture::reasoning::Observer>,
 }
 
 impl UpstreamRelay {
@@ -275,11 +276,16 @@ impl UpstreamRelay {
             tool_search: ToolSearchWithholder::default(),
             carried_usage: None,
             observation: None,
+            capture_reasoning: None,
         }
     }
 
     pub(crate) fn set_observation(&mut self, observation: crate::settlement::Observation) {
         self.observation = Some(observation);
+    }
+
+    pub(crate) fn set_capture_reasoning(&mut self, observer: crate::capture::reasoning::Observer) {
+        self.capture_reasoning = Some(observer);
     }
 
     /// Close the network body before any settlement callback is awaited.
@@ -589,6 +595,9 @@ impl UpstreamRelay {
                     observation.record_effective_terminal(&event);
                 }
                 self.yielded_at = Some(Instant::now());
+                if let Some(observer) = &self.capture_reasoning {
+                    observer.observe(&event);
+                }
                 return Ok(Some(event));
             }
             if self.guard_next_pending() {

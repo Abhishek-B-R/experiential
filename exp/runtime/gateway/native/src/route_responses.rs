@@ -229,6 +229,7 @@ pub(crate) async fn responses(
     };
     let mut won = acquire_attempt(&context, &mut guard).await;
     adopt_outcome(&mut admission, &mut won);
+    crate::capture::reasoning::observe_winner(state.capture.clone(), &admission, &mut won);
 
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)

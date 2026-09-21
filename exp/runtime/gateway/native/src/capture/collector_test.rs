@@ -47,6 +47,7 @@ fn response() -> Response {
     Response::Json {
         status: 200,
         body: json!({"id":"completion","choices":[]}),
+        source_json: None,
     }
 }
 
@@ -149,6 +150,29 @@ fn failed_host_requests_keep_only_the_permitted_prompt() {
     let records = drain(&collector, receiver);
     assert_eq!(records.len(), 1);
     assert!(records[0].response.is_none());
+}
+
+#[test]
+fn provider_reasoning_is_lossless_bounded_and_requires_response_eligibility() {
+    let (collector, receiver) = collector(config());
+    assert!(collector.begin(request("kept")));
+    collector.reasoning("kept", "first\0");
+    collector.reasoning("kept", "second雪");
+    collector.finish("kept", Some(response()), None);
+    collector.settle("kept", true, true);
+    assert!(collector.begin(request("discarded")));
+    collector.reasoning("discarded", "must not persist");
+    collector.settle("discarded", true, false);
+    assert!(collector.begin(request("overflow")));
+    collector.reasoning("overflow", &"x".repeat(4097));
+    collector.finish("overflow", Some(response()), None);
+    collector.settle("overflow", true, true);
+    let records = drain(&collector, receiver);
+    assert_eq!(records.len(), 2);
+    let restored: String =
+        serde_json::from_str(records[0].provider_reasoning_source_json.as_ref().unwrap()).unwrap();
+    assert_eq!(restored, "first\0second雪");
+    assert!(records[1].provider_reasoning.is_none());
 }
 
 #[test]

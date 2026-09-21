@@ -41,12 +41,15 @@ pub(crate) enum Response {
     Json {
         status: u16,
         body: Value,
+        /// Escaped exact JSON when the query projection contains unstorable text.
+        source_json: Option<String>,
     },
     Sse {
         status: u16,
         frames: Vec<Value>,
         truncated: bool,
         client_disconnected: bool,
+        source_json: Option<String>,
     },
 }
 
@@ -57,6 +60,9 @@ pub(crate) struct Record {
     pub schema_version: u32,
     pub request: Request,
     pub response: Option<Response>,
+    /// Provider-returned plaintext from an explicitly exposure-enabled winning rung.
+    pub provider_reasoning: Option<String>,
+    pub provider_reasoning_source_json: Option<String>,
     pub deployment_id: Option<String>,
     pub captured_at: f64,
 }
@@ -94,7 +100,18 @@ impl Record {
         {
             return None;
         }
-        let encoded = serde_json::to_string(self).ok()?;
+        let encoded = if let Some(text) = self
+            .provider_reasoning
+            .as_ref()
+            .filter(|text| text.contains('\0'))
+        {
+            let mut projected = self.clone();
+            projected.provider_reasoning_source_json = Some(serde_json::to_string(text).ok()?);
+            projected.provider_reasoning = Some(text.replace('\0', "\u{fffd}"));
+            serde_json::to_string(&projected).ok()?
+        } else {
+            serde_json::to_string(self).ok()?
+        };
         (encoded.len() <= maximum_bytes).then_some(encoded)
     }
 }

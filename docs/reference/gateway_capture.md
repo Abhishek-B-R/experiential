@@ -43,6 +43,23 @@ prove that an end user consumed every byte. `truncated` and
 Output and settlement may arrive in either order. Keyed replays do not attach a
 second response tap. WebSocket and batch response capture are not added here.
 
+The winning rung's provider-returned plaintext reasoning is retained separately
+in `provider_reasoning` when that rung explicitly permits reasoning exposure.
+This preserves reasoning even when the public Responses representation carries
+only an opaque continuation. Private provider reasoning is not decrypted for
+capture. Capture permission never grants permission to expose hidden reasoning.
+Chat tool turns on exposure-enabled routes return plaintext without appending
+an opaque token to the same delta field; private routes retain authenticated tokens.
+
+Postgres cannot represent NUL or lone UTF-16 surrogates. Affected request contexts
+and responses include `source_json`, an escaped JSON string containing the exact
+source value alongside the normalized query projection. Consumers recover the
+request with `restore_capture_context`; response consumers decode `source_json`
+when present. Reasoning uses `provider_reasoning_source_json` for the same case.
+The escaped sidecars count toward all record limits. Oversize evidence is excluded,
+not silently advertised as lossless. Historical reasoning stays in captured input
+even when provider execution must omit it at a new user boundary.
+
 Delivery limits bound record count, each encoded record and all queued string
 capacity, including a record currently held by a slow destination. Separate bounds
 cover in-flight entry count, encoded pending content, total response-buffer capacity

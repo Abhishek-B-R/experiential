@@ -119,6 +119,8 @@ impl Collector {
             schema_version: SCHEMA_VERSION,
             request,
             response: None,
+            provider_reasoning: None,
+            provider_reasoning_source_json: None,
             deployment_id: None,
             captured_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -217,6 +219,7 @@ impl Collector {
         }
         if !keep_response {
             entry.record.response = None;
+            entry.record.provider_reasoning = None;
             self.emit(&entry.record);
             return;
         }
@@ -252,6 +255,9 @@ impl Collector {
             return;
         }
         entry.record.response = response;
+        if entry.record.response.is_none() {
+            entry.record.provider_reasoning = None;
+        }
         entry.record.deployment_id = deployment_id;
         entry.output_finished = true;
         entry.bytes = entry.bytes.saturating_add(response_bytes);
@@ -271,6 +277,47 @@ impl Collector {
         } else {
             self.skip();
         }
+    }
+
+    /// Append only authorized winning-rung reasoning, charging allocated capacity.
+    /// Overflow excludes the exchange instead of silently publishing partial evidence.
+    pub(crate) fn reasoning(&self, request_id: &str, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        self.expire(&mut pending);
+        let Some(mut entry) = pending.entries.remove(request_id) else {
+            return;
+        };
+        pending.bytes -= entry.bytes;
+        let text = entry
+            .record
+            .provider_reasoning
+            .get_or_insert_with(String::new);
+        let previous = text.capacity();
+        let required = text.len().saturating_add(delta.len());
+        if required > self.config.maximum_response_bytes
+            || pending
+                .bytes
+                .saturating_add(entry.bytes)
+                .saturating_add(delta.len())
+                > self.config.maximum_pending_bytes
+            || text.try_reserve_exact(delta.len()).is_err()
+        {
+            self.skip();
+            return;
+        }
+        entry.bytes += text.capacity() - previous;
+        if pending.bytes.saturating_add(entry.bytes) > self.config.maximum_pending_bytes {
+            self.skip();
+            return;
+        }
+        text.push_str(delta);
+        pending.bytes += entry.bytes;
+        pending.entries.insert(request_id.to_owned(), entry);
     }
 
     fn expire(&self, pending: &mut Pending) {
