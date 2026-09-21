@@ -97,6 +97,65 @@ fn sse_parser_preserves_multiline_crlf_done_and_ignores_unfinished_event() {
     assert_eq!(frames, vec![json!({"ok":true}), json!("[DONE]")]);
 }
 
+#[test]
+fn ordinary_frames_and_literal_escape_text_need_no_lossless_sidecar() {
+    let mut value = json!([{"text":"café 雪", "literal":"\\u0000", "nested":[false,3,null]}]);
+    let original = value.clone();
+    assert!(lossless_projection(&mut value).is_none());
+    assert_eq!(value, original);
+}
+
+#[test]
+fn nested_nul_keys_and_values_preserve_exact_source_and_do_not_merge_keys() {
+    let mut value = json!([{"nested":{"a\0":1,"a\u{fffd}":2,"text":"x\0y"}}]);
+    let original = value.clone();
+    let source = lossless_projection(&mut value).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&source).unwrap(), original);
+    assert_eq!(value[0]["nested"]["a\u{fffd}"], 2);
+    assert_eq!(value[0]["nested"]["a\u{fffd}~1"], 1);
+    assert_eq!(value[0]["nested"]["text"], "x\u{fffd}y");
+}
+
+#[tokio::test]
+async fn encoded_sse_budget_includes_lossless_sidecar_and_keeps_exact_prefix() {
+    let prefix = CapturedResponse::Sse {
+        status: 200,
+        frames: vec![json!({"text":"first\u{fffd}"})],
+        truncated: true,
+        client_disconnected: false,
+        source_json: Some(serde_json::to_string(&vec![json!({"text":"first\0"})]).unwrap()),
+    };
+    let limit = serde_json::to_string(&prefix).unwrap().len();
+    let (collector, receiver) = collector(limit);
+    let data = b"data: {\"text\":\"first\\u0000\"}\n\ndata: {\"text\":\"second\\u0000\"}\n\ndata: {\"text\":\"third\\u0000\"}\n\n";
+    let response = Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from(data.as_slice()))
+        .unwrap();
+    let actual = capture_response(Some(collector.clone()), "request", response)
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(actual.as_ref(), data);
+    let response = record(&collector, receiver).response.unwrap();
+    assert_eq!(serde_json::to_string(&response).unwrap().len(), limit);
+    let CapturedResponse::Sse {
+        frames,
+        source_json,
+        truncated,
+        ..
+    } = response
+    else {
+        panic!()
+    };
+    assert!(truncated);
+    let restored: Vec<Value> = serde_json::from_str(&source_json.unwrap()).unwrap();
+    assert_eq!(restored, vec![json!({"text":"first\0"})]);
+    assert_eq!(frames, vec![json!({"text":"first\u{fffd}"})]);
+}
+
 #[tokio::test]
 async fn content_length_json_is_complete_even_when_consumer_never_polls_eof() {
     let (collector, receiver) = collector(4096);

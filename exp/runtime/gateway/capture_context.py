@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.core.durable_json import normalize_durable_object
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.replay_identity import provider_replay_authority
+
+_UNSTORABLE_ESCAPE = re.compile(r"\\u(?:0000|d[89a-f][0-9a-f]{2})")
 
 
 def capture_request_context(
@@ -30,11 +33,14 @@ def capture_request_context(
     encoded = json.dumps(document, ensure_ascii=True, separators=(",", ":"))
     if len(encoded) > maximum_bytes:
         return None
+    if not _UNSTORABLE_ESCAPE.search(encoded):
+        return document
     cleaned, replacements = normalize_durable_object(document)
-    if replacements:
-        # JSONB cannot represent NUL or lone surrogates. Keep a queryable
-        # projection and the exact escaped JSON, rather than destroy evidence.
-        cleaned["source_json"] = encoded
+    if not replacements:
+        return document
+    # JSONB cannot represent NUL or lone surrogates. Keep a queryable
+    # projection and the exact escaped JSON, rather than destroy evidence.
+    cleaned["source_json"] = encoded
     return (
         cleaned
         if len(json.dumps(cleaned, ensure_ascii=True, separators=(",", ":"))) <= maximum_bytes

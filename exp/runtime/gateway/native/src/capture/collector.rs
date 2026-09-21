@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 
 use super::delivery::{Delivery, Limits, Sink};
-use super::record::{Record, Request, Response, SCHEMA_VERSION};
+use super::record::{EncodedResponse, Record, Request, SCHEMA_VERSION};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,7 +39,8 @@ impl Configuration {
 }
 
 struct Entry {
-    record: Record,
+    record: Record<EncodedResponse>,
+    request_bytes: usize,
     expires: Instant,
     bytes: usize,
     attached: bool,
@@ -149,6 +150,7 @@ impl Collector {
             record.request.request_id.clone(),
             Entry {
                 record,
+                request_bytes: encoded.len(),
                 expires: Instant::now() + Duration::from_secs(self.config.ttl_seconds),
                 bytes,
                 attached: false,
@@ -171,14 +173,17 @@ impl Collector {
             };
             pending.bytes -= entry.bytes;
             if entry.record.request.model_id.is_none() && !entry.attached {
+                let Ok(encoded_model) = serde_json::to_string(model_id) else {
+                    self.skip();
+                    return;
+                };
+                // Replace the original JSON null, including escapes in the selected id.
+                entry.request_bytes = entry.request_bytes - 4 + encoded_model.len();
+                entry.bytes = entry.bytes - 4 + encoded_model.len();
                 entry.record.request.model_id = Some(model_id.to_owned());
-                entry.bytes += model_id.len() + 2;
             }
             if pending.bytes.saturating_add(entry.bytes) > self.config.maximum_pending_bytes
-                || entry
-                    .record
-                    .encode(self.config.maximum_request_bytes)
-                    .is_none()
+                || entry.request_bytes > self.config.maximum_request_bytes
             {
                 self.skip();
                 return;
@@ -237,13 +242,10 @@ impl Collector {
     pub(crate) fn finish(
         &self,
         request_id: &str,
-        response: Option<Response>,
+        response: Option<EncodedResponse>,
         deployment_id: Option<String>,
     ) {
-        let response_bytes = response
-            .as_ref()
-            .and_then(|value| serde_json::to_string(value).ok())
-            .map_or(0, |encoded| encoded.len());
+        let response_bytes = response.as_ref().map_or(0, EncodedResponse::len);
         let Ok(mut pending) = self.pending.lock() else {
             return;
         };
@@ -274,7 +276,7 @@ impl Collector {
         }
     }
 
-    fn emit(&self, record: &Record) {
+    fn emit(&self, record: &Record<EncodedResponse>) {
         if let Some(encoded) = record.encode(self.config.delivery.maximum_record_bytes) {
             self.delivery.submit(encoded);
         } else {

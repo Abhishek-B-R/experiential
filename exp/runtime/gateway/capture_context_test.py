@@ -1,10 +1,36 @@
 """Effective context capture preserves tools and never mutates serving input."""
 
 import json
+from unittest.mock import patch
 
 from exp.runtime.gateway.capture_context import capture_request_context, restore_capture_context
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.openai_protocol.requests import decode_chat
+
+
+def test_storable_context_is_encoded_once_without_a_normalization_copy() -> None:
+    """Ordinary traffic never pays for exceptional-text projection or a second size pass."""
+    request = decode_chat(
+        {"model": "coding", "messages": [{"role": "user", "content": "café 雪"}]}
+    ).request
+    with (
+        patch("exp.runtime.gateway.capture_context.json.dumps", wraps=json.dumps) as dumps,
+        patch("exp.runtime.gateway.capture_context.normalize_durable_object") as normalize,
+    ):
+        assert capture_request_context(request) is not None
+    assert dumps.call_count == 1
+    normalize.assert_not_called()
+
+
+def test_valid_surrogate_pair_and_literal_escape_do_not_need_a_second_encoding() -> None:
+    """A fast-path candidate that normalizes unchanged retains the original size check."""
+    request = decode_chat(
+        {"model": "coding", "messages": [{"role": "user", "content": "😀 literal \\u0000"}]}
+    ).request
+    with patch("exp.runtime.gateway.capture_context.json.dumps", wraps=json.dumps) as dumps:
+        context = capture_request_context(request)
+    assert context is not None and "source_json" not in context
+    assert dumps.call_count == 1
 
 
 def test_capture_context_preserves_tools_and_generation_settings() -> None:
