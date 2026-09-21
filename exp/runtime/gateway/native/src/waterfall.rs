@@ -600,7 +600,14 @@ async fn run_attempt(
     // reservation settles every token this attempt was charged for.
     let mut carried_usage: Option<Usage> = None;
     'dial: loop {
+        let observation = guard.begin_dial_observation();
+        if carried_usage.is_some() {
+            // A new dispatch makes the earlier dial only a subtotal until
+            // this dial supplies its own meter, including before headers.
+            observation.record_dial_total(Usage::default());
+        }
         let open_bound = open_phase_bound(remaining(ctx.deadline), remaining(first_byte_deadline));
+        guard.mark_dispatched();
         let response = match open_stream(
             ctx.http,
             &wire.url,
@@ -655,6 +662,7 @@ async fn run_attempt(
             ),
             None => UpstreamRelay::new(response, dialect, first_token_deadline),
         };
+        relay.set_observation(observation);
         relay.set_carried_usage(carried_usage.take());
         relay.set_stop_sequences(wire.stop_sequences.iter().cloned());
         relay.set_serialize_tool_calls(wire.serialize_tool_calls);
@@ -791,7 +799,7 @@ async fn run_attempt(
                         // encrypted reasoning on its first frame: the same repair
                         // as a pre-stream 4xx, nothing outward was committed.
                         redialed = true;
-                        carried_usage = usage.take();
+                        carried_usage = Some(usage.take().unwrap_or_default());
                         first_byte_deadline = Instant::now() + first_byte_allowance_for();
                         first_token_deadline = Instant::now() + first_token_allowance_for();
                         continue 'dial;

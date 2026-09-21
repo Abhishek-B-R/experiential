@@ -209,6 +209,7 @@ pub struct UpstreamRelay {
     /// folded once into each cumulative usage snapshot this relay yields so
     /// the reservation settles both dials' tokens as one.
     carried_usage: Option<Usage>,
+    observation: Option<crate::settlement::Observation>,
 }
 
 impl UpstreamRelay {
@@ -273,7 +274,77 @@ impl UpstreamRelay {
             native_tool_inverter: NativeToolInverter::default(),
             tool_search: ToolSearchWithholder::default(),
             carried_usage: None,
+            observation: None,
         }
+    }
+
+    pub(crate) fn set_observation(&mut self, observation: crate::settlement::Observation) {
+        self.observation = Some(observation);
+    }
+
+    /// Close the network body before any settlement callback is awaited.
+    /// Already normalized usage and terminals remain in the guard snapshot.
+    pub(crate) fn close_transport(&mut self) {
+        self.stream = futures_util::stream::empty().boxed();
+        self.eof = true;
+        // Drain only already decoded events through effective stop/tool rules.
+        // This never polls the provider and retains a stop-adjusted terminal.
+        while self.guard_next_pending() {}
+        if let Some(observation) = &self.observation {
+            for event in &self.ready {
+                // queue_events already recorded the newest meter, folded
+                // across dials. A raw buffered report can be older or partial.
+                if !matches!(event, Event::Usage(_)) {
+                    observation.record(event);
+                }
+                observation.record_effective_terminal(event);
+            }
+        }
+    }
+
+    fn queue_events(&mut self, events: Vec<Event>) {
+        if let Some(observation) = &self.observation {
+            // Several dialects retain a parsed meter until terminal encoding.
+            // Accounting observes it now, even when this frame yields no event.
+            if let Some(usage) = self.normalizer.observed_usage() {
+                let usage = match self.carried_usage.as_ref() {
+                    Some(carried) => fold_usage(carried, usage.clone()),
+                    None => usage.clone(),
+                };
+                if self.carried_usage.is_some() {
+                    observation.record_dial_total(usage);
+                } else {
+                    observation.record(&Event::Usage(usage));
+                }
+            }
+            if self.normalizer.observed_usage().is_none()
+                && self.carried_usage.is_some()
+                && events.iter().any(Event::is_terminal)
+            {
+                observation.record_dial_total(Usage::default());
+            }
+            for event in &events {
+                match (event, self.carried_usage.as_ref()) {
+                    (Event::Usage(usage), Some(carried)) => {
+                        observation.record_dial_total(fold_usage(carried, usage.clone()));
+                    }
+                    (Event::Usage(_), _) => observation.record(event),
+                    (Event::Failed(failure), _) => {
+                        let failure = match self.customer_managed_provider.as_deref() {
+                            Some(provider) => crate::stream_errors::customer_credential_failure(
+                                failure.clone(),
+                                provider,
+                            ),
+                            None => failure.clone(),
+                        };
+                        observation.record(&Event::Failed(failure));
+                    }
+                    _ if event.is_terminal() => observation.record(event),
+                    _ => {}
+                }
+            }
+        }
+        self.pending.extend(events);
     }
 
     /// Pin the attempt. Structural output can commit before generation, so
@@ -327,7 +398,9 @@ impl UpstreamRelay {
                 None => observed.clone(),
             })
             .or(reported)
-            .or_else(|| self.carried_usage.clone())
+            // The current dial was dispatched too. Without its report, the
+            // earlier dial is only a subtotal, never the attempt's full meter.
+            .or_else(|| self.carried_usage.as_ref().map(|_| Usage::default()))
     }
 
     /// The wall-clock time this relay yielded its first output token, or
@@ -405,6 +478,9 @@ impl UpstreamRelay {
     /// Carry the tokens a refused earlier dial of this attempt was billed
     /// for; they join each cumulative usage report once.
     pub fn set_carried_usage(&mut self, carried: Option<Usage>) {
+        if let (Some(observation), Some(_)) = (&self.observation, &carried) {
+            observation.record_dial_total(Usage::default());
+        }
         self.carried_usage = carried;
     }
 
@@ -471,7 +547,7 @@ impl UpstreamRelay {
     fn recover_or_fail(&mut self, failure: Failure) -> Result<(), Failure> {
         self.eof = true;
         let events = self.normalizer.recover_abnormal_end(failure)?;
-        self.pending.extend(events);
+        self.queue_events(events);
         Ok(())
     }
 
@@ -499,13 +575,18 @@ impl UpstreamRelay {
                 // whether it is later replayed from a prefix or drained live.
                 if self.first_token_at.is_none() && event.is_output_token() {
                     self.first_token_at = Some(SystemTime::now());
+                    if let Some(observation) = &self.observation {
+                        observation.record_first_token(self.first_token_at);
+                    }
                 }
                 if let (Event::Usage(usage), Some(carried)) =
                     (&mut event, self.carried_usage.as_ref())
                 {
-                    if usage.has_token_counts() {
-                        *usage = fold_usage(carried, usage.clone());
-                    }
+                    *usage = fold_usage(carried, usage.clone());
+                }
+                if let Some(observation) = &self.observation {
+                    observation.record(&event);
+                    observation.record_effective_terminal(&event);
                 }
                 self.yielded_at = Some(Instant::now());
                 return Ok(Some(event));
@@ -573,7 +654,7 @@ impl UpstreamRelay {
                     };
                     if let Some(frame) = tail {
                         match self.normalizer.feed(&frame) {
-                            Ok(events) => self.pending.extend(events),
+                            Ok(events) => self.queue_events(events),
                             Err(failure) => {
                                 self.recover_or_fail(failure)?;
                                 continue;
@@ -591,7 +672,7 @@ impl UpstreamRelay {
                     // terminal-less and the caller still synthesizes
                     // `ended_without_terminal`.
                     match self.normalizer.on_stream_end() {
-                        Ok(events) => self.pending.extend(events),
+                        Ok(events) => self.queue_events(events),
                         Err(failure) => {
                             self.recover_or_fail(failure)?;
                         }
@@ -626,7 +707,7 @@ impl UpstreamRelay {
             };
             for frame in frames {
                 match self.normalizer.feed(&frame) {
-                    Ok(events) => self.pending.extend(events),
+                    Ok(events) => self.queue_events(events),
                     Err(failure) => {
                         self.recover_or_fail(failure)?;
                         break;
@@ -634,6 +715,12 @@ impl UpstreamRelay {
                 }
             }
         }
+    }
+}
+
+impl Drop for UpstreamRelay {
+    fn drop(&mut self) {
+        self.close_transport();
     }
 }
 
@@ -690,6 +777,10 @@ pub async fn collect_committed(
 mod progress_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "relay_disconnect_tests.rs"]
+mod disconnect_tests;
 
 #[cfg(test)]
 mod h2_abort_tests {
@@ -813,9 +904,13 @@ fn fold_usage(carried: &Usage, current: Usage) -> Usage {
         (Some(a), None) | (None, Some(a)) => Some(a),
         (None, None) => None,
     };
+    // Across physical dials, an absent leg means the total is unknown, not
+    // that this dial contributed zero. Cumulative reports within one dial use
+    // Usage::merge_observed instead of this sum.
+    let total = |a: Option<u64>, b: Option<u64>| a.zip(b).map(|(a, b)| a + b);
     Usage {
-        input_tokens: add(carried.input_tokens, current.input_tokens),
-        output_tokens: add(carried.output_tokens, current.output_tokens),
+        input_tokens: total(carried.input_tokens, current.input_tokens),
+        output_tokens: total(carried.output_tokens, current.output_tokens),
         cached_input_tokens: add(carried.cached_input_tokens, current.cached_input_tokens),
         cache_creation_input_tokens: add(
             carried.cache_creation_input_tokens,
