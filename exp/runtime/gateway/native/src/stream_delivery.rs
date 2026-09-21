@@ -52,6 +52,12 @@ impl Delivery {
         }
     }
 
+    /// An overflowed capture cannot outlive its subscriber, even with a key.
+    /// The caller retains the replay lease until the attempt has settled.
+    pub(crate) fn retain_replay(&mut self, replayable: bool) {
+        self.keyed &= replayable;
+    }
+
     fn heartbeat(&mut self) {
         // Heartbeats never block the provider reader behind a full channel.
         // Public frame sends remain bounded by the original request deadline.
@@ -116,6 +122,40 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(receiver.try_recv().unwrap().unwrap(), HEARTBEAT);
+    }
+
+    #[tokio::test]
+    async fn replay_overflow_stops_detached_work_but_not_connected_delivery() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let mut delivery = Delivery::new(sender, true);
+        let mut capture = Vec::new();
+        assert!(super::super::capture_frame_bounded(
+            &mut capture,
+            b"abcd",
+            true,
+            4
+        ));
+        let replayable = super::super::capture_frame_bounded(&mut capture, b"e", true, 4);
+        assert!(!replayable);
+        delivery.retain_replay(replayable);
+        assert!(
+            delivery
+                .send(
+                    Instant::now() + Duration::from_secs(1),
+                    Bytes::from_static(b"connected")
+                )
+                .await
+        );
+        assert_eq!(receiver.recv().await.unwrap().unwrap(), b"connected"[..]);
+        drop(receiver);
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            delivery.next(std::future::pending::<()>())
+        )
+        .await
+        .expect("overflowed owner stops on loss")
+        .is_none());
+        assert_eq!(capture.capacity(), 0);
     }
 
     #[tokio::test]

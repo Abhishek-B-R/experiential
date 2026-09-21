@@ -335,10 +335,17 @@ def anthropic_messages_stream_payload(
                 model_id, effective_reasoning_effort
             )
     elif budgeted_only and effective_reasoning_effort not in (None, "none"):
-        # No legal budget under the output ceiling means thinking stays off;
-        # the model still answers, and route narrowing already disclosed any
-        # sampling interplay. output_config.effort is never emitted here.
         budget = anthropic_thinking_budget_tokens(output_limit)
+        if budget is None and request.reasoning_effort not in (None, "none"):
+            raise ProviderParameterError(
+                message=(
+                    "The requested reasoning effort needs a thinking budget of at least 1024 "
+                    f"tokens, below the output limit of {output_limit}. Raise max_tokens above "
+                    "1024 or explicitly disable thinking."
+                ),
+                param=request.caller_effort_parameter,
+                code="invalid_parameter",
+            )
         if budget is not None:
             payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
     elif supports_reasoning and not budgeted_only and effective_reasoning_effort is not None:

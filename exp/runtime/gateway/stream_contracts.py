@@ -125,10 +125,12 @@ class GatewayEvent(ContractModel):
     usage: GatewayUsage | None = None
     failure: GatewayFailure | None = None
     usage_incomplete_due_to_disconnect: bool = Field(default=False, exclude=True, strict=True)
-    """Trusted internal evidence that dispatched work lost its caller before a final meter.
+    """Trusted evidence of caller loss after dispatch but before an observed provider terminal.
 
     Observed usage remains evidence, not a claim that the provider's bill is
-    complete. The ledger retains the unsettled reservation pending resolution.
+    complete. Hosted ledgers retain unresolved exposure for later resolution;
+    the local monthly budget uses the full reserved bound as an unknown-cost
+    estimate. Neither policy treats the partial meter as a final provider bill.
     This marker never joins public serialized events or replay identity.
     """
     decision_provider_rejected: bool = Field(default=False, exclude=True, strict=True)

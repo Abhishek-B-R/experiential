@@ -106,6 +106,96 @@ fn partial_usage_wire_reports_coalesce_without_inventing_counts() {
 }
 
 #[test]
+fn malformed_frame_preserves_previous_meter_after_sparse_usage() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    normalizer
+        .feed(&SseEvent {
+            event: None,
+            data: json!({"choices":[],"usage":{"prompt_tokens":13,"completion_tokens":7}})
+                .to_string(),
+        })
+        .unwrap();
+    assert!(normalizer
+        .feed(&SseEvent {
+            event: None,
+            data: json!({"choices":"bad","usage":{}}).to_string()
+        })
+        .is_err());
+    let usage = normalizer.observed_usage().unwrap();
+    assert_eq!(usage.input_tokens, Some(13));
+    assert_eq!(usage.output_tokens, Some(7));
+}
+
+#[test]
+fn sparse_usage_rejects_cache_subsets_above_the_coalesced_input() {
+    for reports in [
+        vec![
+            json!({"prompt_tokens":100,"completion_tokens":1}),
+            json!({"prompt_tokens_details":{"cached_tokens":200}}),
+        ],
+        vec![
+            json!({"prompt_tokens":100,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":100}}),
+            json!({"prompt_tokens":100,"prompt_tokens_details":{"cache_write_tokens":100}}),
+        ],
+    ] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+        normalizer
+            .feed(&SseEvent {
+                event: None,
+                data: json!({"choices":[],"usage":reports[0]}).to_string(),
+            })
+            .unwrap();
+        let failure = normalizer
+            .feed(&SseEvent {
+                event: None,
+                data: json!({"choices":[],"usage":reports[1]}).to_string(),
+            })
+            .expect_err("coalesced cache subsets exceed input");
+        assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+        assert!(
+            normalizer
+                .observed_usage()
+                .unwrap()
+                .cached_input_tokens
+                .unwrap_or(0)
+                <= 100
+        );
+    }
+}
+
+#[test]
+fn sparse_additive_reasoning_matches_full_usage_without_double_folding() {
+    let full = json!({"prompt_tokens":100,"completion_tokens":10,"completion_tokens_details":{"reasoning_tokens":5},"total_tokens":115});
+    for reports in [
+        vec![full.clone()],
+        vec![
+            json!({"prompt_tokens":100}),
+            json!({"completion_tokens":10,"completion_tokens_details":{"reasoning_tokens":5},"total_tokens":115}),
+        ],
+        vec![
+            json!({"completion_tokens":10}),
+            json!({"completion_tokens_details":{"reasoning_tokens":5}}),
+            json!({"prompt_tokens":100,"total_tokens":115}),
+        ],
+        vec![full.clone(), json!({"total_tokens":115}), full],
+    ] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+        for usage in reports {
+            normalizer
+                .feed(&SseEvent {
+                    event: None,
+                    data: json!({"choices":[],"usage":usage}).to_string(),
+                })
+                .unwrap();
+        }
+        let usage = normalizer.observed_usage().unwrap();
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(15));
+        assert_eq!(usage.reasoning_tokens, Some(5));
+    }
+}
+
+#[test]
 fn azure_annotations_preserve_text_finish_and_trailing_usage() {
     for after_stop in [false, true] {
         let mut frames = vec![

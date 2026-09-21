@@ -46,7 +46,6 @@ from exp.runtime.models.providers.reasoning_compat import (
     anthropic_budgeted_enabled_only,
     anthropic_thinking_budget_tokens,
     efforts_by_nearness,
-    thinking_config_reasoning_effort,
 )
 from exp.runtime.models.providers.streaming_requests import (
     TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
@@ -99,10 +98,9 @@ THINKING_EFFORT_DISCLOSURE_PREFIX = "thinking->reasoning_effort:"
 a reasoning route speaks; the effective tier and the source that named it
 follow, rendered by :func:`thinking_effort_disclosure`."""
 
-ThinkingEffortSource = Literal["budget_tokens", "lane_default", "gateway_default", "disabled"]
+ThinkingEffortSource = Literal["lane_default", "gateway_default", "disabled"]
 """What named the depth a thinking config translated to.
 
-``budget_tokens``: the caller's own budget through the documented tier table.
 ``lane_default``: a budget-less config (``adaptive``, or the bare ``enabled``
 Claude Code sends) read as the rung's catalog default depth
 (``reasoning_default_effort``). ``gateway_default``: the same config on a
@@ -281,8 +279,7 @@ def _requested_thinking_tier(
 ) -> tuple[ReasoningEffort, ThinkingEffortSource]:
     """Resolve the depth one thinking config asks for on a route of effort rungs.
 
-    An explicit ``budget_tokens`` names the depth through the documented tier
-    table (:func:`thinking_config_reasoning_effort`). A budget-less config
+    Numerical budgets cannot translate to advisory effort. A budget-less config
     (``adaptive``, or the bare ``enabled`` Claude Code sends in think mode)
     asks the MODEL to pick its depth, and on an effort rung the model's own
     depth is its catalog default (``reasoning_default_effort``, carried on the
@@ -302,9 +299,6 @@ def _requested_thinking_tier(
     """
     if config.get("type") == "disabled":
         return "none", "disabled"
-    budget = config.get("budget_tokens")
-    if isinstance(budget, int) and not isinstance(budget, bool):
-        return thinking_config_reasoning_effort(config), "budget_tokens"
     default = lane_default_reasoning_effort(profiles)
     if default is not None:
         # Membership in REASONING_EFFORTS is checked by the resolver; the
@@ -329,8 +323,8 @@ def _coerce_thinking_to_effort(
     declined too, for the config or for another control), the config
     translates to the nearest effort the route actually serves, disclosed as
     ``thinking->reasoning_effort:<tier>(<source>)``. The requested tier comes
-    from :func:`_requested_thinking_tier`: an explicit budget through the tier
-    table, a budget-less config from the lane's catalog default depth (medium
+    from :func:`_requested_thinking_tier`: a budget-less config from the lane's
+    catalog default depth (medium
     when no rung pins one). The combined ladder is a union of per-rung
     ladders, so the naive nearest tier may be served only by rungs that reject
     some other control; candidates are therefore tried in nearness order (ties
@@ -584,16 +578,16 @@ def coerce_generation_parameters(
     # and the snap is the closest level that actually admits a rung.
     permitted = set(REASONING_EFFORTS[: REASONING_EFFORTS.index(request.reasoning_effort) + 1])
     for candidate in efforts_by_nearness(request.reasoning_effort, ladder & permitted):
-        updates: dict[str, object] = {"reasoning_effort": candidate}
+        snap_updates: JsonObject = {"reasoning_effort": candidate}
         if (
             request.provider_output_config is not None
             and "effort" in request.provider_output_config
         ):
-            updates["provider_output_config"] = {
+            snap_updates["provider_output_config"] = {
                 **request.provider_output_config,
                 "effort": candidate,
             }
-        snapped_request = request.model_copy(update=updates)
+        snapped_request = request.model_copy(update=snap_updates)
         try:
             indexes = compatible_generation_parameter_profile_indexes(profiles, snapped_request)
             # Per-rung admission is not enough: the narrowed rung set changes

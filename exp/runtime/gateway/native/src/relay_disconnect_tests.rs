@@ -183,6 +183,31 @@ fn close_does_not_merge_raw_current_usage_into_an_across_dial_total() {
 }
 
 #[tokio::test]
+async fn malformed_sparse_frame_retains_meter_through_relay_failure() {
+    let wire = concat!(
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":7}}\n\n",
+        "data: {\"choices\":\"bad\",\"usage\":{}}\n\n"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut relay = UpstreamRelay::from_stream(
+        futures_util::stream::iter([Ok(Bytes::from_static(wire.as_bytes()))]).boxed(),
+        Dialect::OpenAiCompatible,
+        deadline,
+    );
+    let observed = Observation::default();
+    relay.set_observation(observed.clone());
+    assert!(relay
+        .next_event(deadline, Duration::from_secs(2), Instant::now())
+        .await
+        .is_err());
+    let usage = relay.usage_before_failure(None).unwrap();
+    assert_eq!(usage.input_tokens, Some(13));
+    assert_eq!(usage.output_tokens, Some(7));
+    relay.close_transport();
+    assert_eq!(observed.snapshot().usage.unwrap().output_tokens, Some(7));
+}
+
+#[tokio::test]
 async fn parsed_compatible_meter_survives_before_its_deferred_usage_event() {
     let wire = concat!(
         "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":19,\"completion_tokens\":7}}\n\n",

@@ -2,6 +2,56 @@ use super::*;
 use pyo3::prelude::*;
 
 #[tokio::test]
+async fn parsed_usage_wins_stale_consumer_usage_on_local_failure() {
+    Python::initialize();
+    let plane = Python::attach(|py| {
+        pyo3::types::PyModule::from_code(py, c"import json\nclass Plane:\n def __init__(self): self.writes = []\n def settle(self, argument):\n  self.writes.append(json.loads(argument))\n  return '{}'\n def close_thread_resources(self, argument): return '{}'\n", c"stale_plane.py", c"stale_plane")
+            .unwrap().getattr("Plane").unwrap().call0().unwrap().unbind()
+    });
+    let bridge = Arc::new(Bridge::new(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
+    for (ordinal, fresh) in [Some(7), None].into_iter().enumerate() {
+        let mut guard = AttemptGuard::new(
+            bridge.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            format!("request-{ordinal}"),
+            Instant::now(),
+        );
+        guard.rebind(format!("attempt-{ordinal}"));
+        guard.mark_opened();
+        guard.begin_dial_observation().record_dial_total(Usage {
+            input_tokens: Some(13),
+            output_tokens: fresh,
+            ..Usage::default()
+        });
+        let stale = Usage {
+            input_tokens: Some(13),
+            output_tokens: Some(0),
+            ..Usage::default()
+        };
+        let failure = Failure::new(
+            FailureClass::MalformedResponse,
+            "provider response exceeded the allowed size",
+        );
+        assert!(
+            guard
+                .settle("failed", Some(&stale), &[], Some(&failure), true)
+                .await
+        );
+    }
+    let writes: String = Python::attach(|py| {
+        py.import("json")
+            .unwrap()
+            .call_method1("dumps", (plane.bind(py).getattr("writes").unwrap(),))
+            .unwrap()
+            .extract()
+            .unwrap()
+    });
+    let writes: Value = serde_json::from_str(&writes).unwrap();
+    assert_eq!(writes[0]["usage"]["output_tokens"], 7);
+    assert!(writes[1]["usage"]["output_tokens"].is_null());
+}
+
+#[tokio::test]
 async fn observed_terminal_wins_disconnect_once_and_rebind_clears_facts() {
     Python::initialize();
     let plane = Python::attach(|py| {

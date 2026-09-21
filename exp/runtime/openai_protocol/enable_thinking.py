@@ -71,7 +71,8 @@ def _reasoning_object_intent(request: _ChatRequest) -> bool | None:
 def translate_enable_thinking(request: _ChatRequest) -> _EnableThinkingResult:
     """Resolve the effective reasoning control from the flat and alternate fields.
 
-    The explicit flat ``reasoning_effort`` always wins; a level-less enable defers
+    The explicit flat ``reasoning_effort`` selects depth when enable controls agree;
+    contradictory on/off controls are refused. A level-less enable defers
     to the model default (``thinking_default_enable``). Alternate fields that
     disagree on enable-vs-disable are a caller error and rejected by name.
     Numerical thinking budgets have no enforceable Chat adapter representation
@@ -125,9 +126,18 @@ def translate_enable_thinking(request: _ChatRequest) -> _EnableThinkingResult:
         ("enable_thinking", flat_enable_present),
     )
 
-    # Explicit flat reasoning_effort wins: every present alternate field is a no-op
-    # the caller is told about, and the flat value is passed through unchanged.
+    # Flat effort selects depth, but cannot override an explicit on/off constraint.
     if request.reasoning_effort is not None:
+        if any(
+            vote != (request.reasoning_effort != "none")
+            for vote in (reasoning_intent, thinking_enable, cck_enable, request.enable_thinking)
+            if vote is not None
+        ):
+            raise invalid_field(
+                "reasoning_effort",
+                "reasoning_effort conflicts with an enable-thinking control. "
+                "Use agreeing on/off settings or remove the conflicting control.",
+            )
         # Each alternate object is ignored WHOLE, so its inner fields are not
         # separately reported as translated or dropped.
         disclosures = [_IGNORED.format(path=path) for path, present in alternates if present]

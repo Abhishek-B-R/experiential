@@ -520,15 +520,14 @@ def test_haiku_bare_effort_realizes_as_a_token_budget_at_the_payload_seam() -> N
     )
     assert "thinking" not in off
 
-    # A ceiling too small for any legal budget keeps thinking off rather than
-    # emitting an illegal budget the provider would reject.
-    tight = anthropic_messages_stream_payload(
-        "claude-haiku-4-5",
-        request.model_copy(update={"maximum_output_tokens": 1_024}),
-        supports_reasoning=True,
-        maximum_output_tokens=128_000,
-    )
-    assert "thinking" not in tight
+    # An explicit depth cannot silently disappear under an incompatible ceiling.
+    with pytest.raises(ProviderParameterError, match="Raise max_tokens above 1024"):
+        anthropic_messages_stream_payload(
+            "claude-haiku-4-5",
+            request.model_copy(update={"maximum_output_tokens": 1_024}),
+            supports_reasoning=True,
+            maximum_output_tokens=128_000,
+        )
 
 
 def test_haiku_caller_output_config_effort_is_stripped_at_the_payload_seam() -> None:

@@ -6,6 +6,7 @@ from __future__ import annotations
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -15,6 +16,32 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
 from exp.runtime.models.providers.messages_payloads import anthropic_messages_stream_payload
+
+
+@pytest.mark.parametrize(
+    "controls",
+    (
+        {"reasoning": {"effort": "high"}},
+        {"output_config": {"effort": "high"}},
+        {"reasoning": {"enabled": True}},
+    ),
+)
+def test_budgeted_model_refuses_effort_when_no_thinking_budget_fits(controls: JsonObject) -> None:
+    """Every public active-effort spelling must fit or receive a named refusal."""
+    request = decode_messages(
+        {
+            "model": "claude-haiku-4-5",
+            "max_tokens": 512,
+            "messages": [{"role": "user", "content": "hi"}],
+            **controls,
+        }
+    ).request
+    with pytest.raises(ProviderParameterError) as error:
+        anthropic_messages_stream_payload(
+            "claude-haiku-4-5", request, supports_reasoning=True, maximum_output_tokens=64_000
+        )
+    assert error.value.param == request.caller_effort_parameter
+    assert error.value.code == "invalid_parameter"
 
 
 def test_anthropic_builder_refuses_to_invent_a_missing_cap() -> None:

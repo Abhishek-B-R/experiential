@@ -120,6 +120,7 @@ pub(super) async fn stream_response(
             let data = Bytes::from(frame);
             if lease.is_some() {
                 replayable = capture_frame(&mut capture, &data, replayable);
+                delivery.retain_replay(replayable);
             }
             if !delivery.send(deadline, data).await {
                 committed.relay.close_transport();
@@ -259,6 +260,7 @@ pub(super) async fn stream_response(
                     let data = Bytes::from(data);
                     if lease.is_some() {
                         replayable = capture_frame(&mut capture, &data, replayable);
+                        delivery.retain_replay(replayable);
                     }
                     if !delivery.send(deadline, data).await {
                         committed.relay.close_transport();

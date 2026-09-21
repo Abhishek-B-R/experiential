@@ -799,7 +799,7 @@ async fn run_attempt(
                         // encrypted reasoning on its first frame: the same repair
                         // as a pre-stream 4xx, nothing outward was committed.
                         redialed = true;
-                        carried_usage = usage.take();
+                        carried_usage = Some(usage.take().unwrap_or_default());
                         first_byte_deadline = Instant::now() + first_byte_allowance_for();
                         first_token_deadline = Instant::now() + first_token_allowance_for();
                         continue 'dial;

@@ -415,7 +415,7 @@ impl AttemptGuard {
             return true;
         };
         let observed = self.observation.snapshot();
-        let usage = usage.or(observed.usage.as_ref());
+        let usage = observed.usage.as_ref().or(usage);
         self.record_first_token(observed.first_token_at);
         // An opened attempt's headers live on the guard; an attempt that
         // failed at open carries them on its failure instead.

@@ -111,6 +111,7 @@ class _Fixtures:
 
 
 def _configure(root: Path, base_url: str) -> str:
+    """Configure the streaming fixture alias and return its authorized client key."""
     manager = GatewayManagement(root)
     manager.initialize()
     upsert_connection(

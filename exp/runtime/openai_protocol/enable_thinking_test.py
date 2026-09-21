@@ -106,6 +106,22 @@ def test_explicit_flat_reasoning_effort_wins_over_translate_fields() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "off_fields",
+    (
+        {"thinking": {"type": "disabled"}},
+        {"reasoning": {"enabled": False}},
+        {"chat_template_kwargs": {"enable_thinking": False}},
+        {"enable_thinking": False},
+    ),
+)
+def test_flat_effort_cannot_override_an_explicit_off_setting(off_fields: JsonObject) -> None:
+    """An active flat effort conflicts with any caller's explicit off switch."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        _decode(reasoning_effort="high", **off_fields)
+    assert error.value.detail.param == "reasoning_effort"
+
+
 def test_conflicting_enable_and_disable_fields_are_rejected() -> None:
     with pytest.raises(OpenAIProtocolError):
         _decode(thinking={"type": "enabled"}, chat_template_kwargs={"enable_thinking": False})

@@ -55,11 +55,28 @@ impl Normalizer {
                         self.openai_close_unfinished_items(ProviderOutputItemStatus::Incomplete),
                     );
                 }
-                // EOF is not proof that an argument-free call finished. Keep
-                // its already emitted start, but never manufacture {} here.
-                for tool in self.tools.values_mut() {
+                // A stopped block plus an explicit normal final reason is
+                // sufficient evidence for a zero-argument call, even if the
+                // final trailer is missing. The whole turn remains incomplete.
+                let normal_stop = !self.refusal_seen
+                    && matches!(
+                        self.stop_reason.as_deref(),
+                        Some("end_turn" | "stop_sequence" | "tool_use" | "pause_turn")
+                    );
+                for (index, tool) in &mut self.tools {
                     if !tool.custom && tool.raw_arguments.is_empty() {
-                        tool.completed = true;
+                        let stopped = match self.dialect {
+                            Dialect::AnthropicMessages => {
+                                self.anthropic_stopped_tools.contains(index)
+                            }
+                            Dialect::BedrockConverseStream => {
+                                self.bedrock_empty_stopped_tools.contains(index)
+                            }
+                            _ => false,
+                        };
+                        if !(normal_stop && stopped) {
+                            tool.completed = true;
+                        }
                     }
                 }
                 let (tool_events, _dropped) =
@@ -97,6 +114,54 @@ impl Normalizer {
 mod tests {
     use super::*;
     use crate::events::ToolAccumulator;
+
+    #[test]
+    fn eof_after_a_normal_reason_keeps_stopped_empty_tools_but_stays_incomplete() {
+        for dialect in [Dialect::AnthropicMessages, Dialect::BedrockConverseStream] {
+            let mut normalizer = Normalizer::new(dialect);
+            let frames = match dialect {
+                Dialect::AnthropicMessages => vec![
+                    (
+                        None,
+                        serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"lookup","input":{}}}),
+                    ),
+                    (
+                        None,
+                        serde_json::json!({"type":"content_block_stop","index":0}),
+                    ),
+                    (
+                        None,
+                        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":0}}),
+                    ),
+                ],
+                _ => vec![
+                    (
+                        Some("contentBlockStart"),
+                        serde_json::json!({"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"call_1","name":"lookup"}}}),
+                    ),
+                    (
+                        Some("contentBlockStop"),
+                        serde_json::json!({"contentBlockIndex":0}),
+                    ),
+                    (
+                        Some("messageStop"),
+                        serde_json::json!({"stopReason":"tool_use"}),
+                    ),
+                ],
+            };
+            for (event, payload) in frames {
+                normalizer
+                    .feed(&crate::sse::SseEvent {
+                        event: event.map(str::to_string),
+                        data: payload.to_string(),
+                    })
+                    .unwrap();
+            }
+            let events = normalizer.on_stream_end().unwrap();
+            assert!(events.iter().any(|event| matches!(event, Event::ToolCallCompleted { call, .. } if call.raw_arguments == "{}")), "{dialect:?}: {events:?}");
+            assert!(matches!(events.last(), Some(Event::Incomplete)));
+        }
+    }
 
     #[test]
     fn eof_without_a_final_reason_never_seeds_missing_tool_arguments() {

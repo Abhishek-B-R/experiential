@@ -19,6 +19,8 @@ from exp.runtime.gateway.contracts import (
     ThinkingBlock,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.errors import ProviderParameterError
+from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 from exp.runtime.models.providers.wire_messages import anthropic_blocks
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
@@ -1768,9 +1770,6 @@ def test_a_failed_tool_result_serves_on_an_openai_route() -> None:
 
 def test_the_claude_code_model_probe_refuses_an_incompatible_provider_floor() -> None:
     """A one-token probe is refused rather than secretly raised to sixteen."""
-    from exp.runtime.models.providers.errors import ProviderParameterError
-    from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
-
     decoded = decode_messages(_body(max_tokens=1, messages=[{"role": "user", "content": "hi"}]))
     profile = _openai_reasoning_profile()
     with pytest.raises(ProviderParameterError) as rejected:

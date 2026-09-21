@@ -113,6 +113,7 @@ class _Provider:
 
 
 def _configure(root: Path, base_url: str) -> str:
+    """Configure the tool-capable fixture alias and return its authorized client key."""
     manager = GatewayManagement(root)
     manager.initialize()
     upsert_connection(

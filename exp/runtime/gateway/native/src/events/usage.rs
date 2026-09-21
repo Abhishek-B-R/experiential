@@ -142,6 +142,7 @@ fn fold_openai_shaped_reasoning(
 /// omitted object is unknown usage, while a malformed one fails the stream.
 /// `output_tokens_details.reasoning_tokens` folds into `output_tokens` when
 /// the provider's `total_tokens` shows it was reported additively.
+#[cfg(test)]
 pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
     let value = match value {
         None | Some(Value::Null) => return Ok(None),
@@ -150,77 +151,165 @@ pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "OpenAI usage must be an object".to_string())?;
-    let input_tokens = count_if_present(object, "input_tokens", "OpenAI usage")?;
-    let reported_output = count_if_present(object, "output_tokens", "OpenAI usage")?;
-    let reasoning_tokens = optional_usage_detail(
-        object,
-        "output_tokens_details",
-        "reasoning_tokens",
-        "OpenAI reasoning_tokens",
-    )?;
-    let total_tokens = count_if_present(object, "total_tokens", "OpenAI usage")?;
-    let output_tokens = reported_output
-        .map(|output| {
-            fold_openai_shaped_reasoning(
-                input_tokens,
-                output,
-                reasoning_tokens,
-                total_tokens,
-                "OpenAI output",
+    OpenAiUsageAccumulator::default()
+        .update(object, false)
+        .map(Some)
+}
+
+/// Raw per-dial counters retained before additive reasoning normalization.
+/// Sparse reports must be combined before deciding whether reasoning is extra.
+#[derive(Clone, Default)]
+pub(crate) struct OpenAiUsageAccumulator {
+    reported: Usage,
+    total_tokens: Option<u64>,
+}
+
+impl OpenAiUsageAccumulator {
+    pub(crate) fn update_chat(&mut self, value: &Value) -> Result<Usage, String> {
+        let object = value
+            .as_object()
+            .ok_or("OpenAI-compatible usage must be an object")?;
+        self.update(object, true)
+    }
+
+    pub(crate) fn update_responses(
+        &mut self,
+        value: Option<&Value>,
+    ) -> Result<Option<Usage>, String> {
+        match value {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => {
+                let object = value.as_object().ok_or("OpenAI usage must be an object")?;
+                self.update(object, false).map(Some)
+            }
+        }
+    }
+
+    fn update(&mut self, object: &Map<String, Value>, chat: bool) -> Result<Usage, String> {
+        let (input_key, output_key, input_details, output_details) = if chat {
+            (
+                "prompt_tokens",
+                "completion_tokens",
+                "prompt_tokens_details",
+                "completion_tokens_details",
             )
-        })
-        .transpose()?;
-    let (cached_input_tokens, cache_creation_input_tokens) =
-        cache_subsets(object, "input_tokens_details", input_tokens)?;
-    Ok(Some(Usage {
-        input_tokens,
-        output_tokens,
-        cached_input_tokens,
-        cache_creation_input_tokens,
-        cache_creation_1h_input_tokens: None,
-        reasoning_tokens,
-    }))
+        } else {
+            (
+                "input_tokens",
+                "output_tokens",
+                "input_tokens_details",
+                "output_tokens_details",
+            )
+        };
+        let input_tokens = count_if_present(object, input_key, "OpenAI usage")?;
+        let output_tokens = count_if_present(object, output_key, "OpenAI usage")?;
+        let reasoning_tokens = optional_usage_detail(
+            object,
+            output_details,
+            "reasoning_tokens",
+            "OpenAI reasoning_tokens",
+        )?;
+        let total_tokens = count_if_present(object, "total_tokens", "OpenAI usage")?;
+        let (cached_input_tokens, cache_creation_input_tokens) =
+            cache_subsets(object, input_details, input_tokens)?;
+        let mut candidate = self.clone();
+        candidate.reported.merge_observed(&Usage {
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+            cache_creation_1h_input_tokens: None,
+            reasoning_tokens,
+        });
+        candidate.total_tokens = candidate.total_tokens.max(total_tokens);
+        let mut normalized = candidate.reported.clone();
+        validate_cache_subsets(&normalized)?;
+        normalized.output_tokens = normalized
+            .output_tokens
+            .map(|output| {
+                fold_openai_shaped_reasoning(
+                    normalized.input_tokens,
+                    output,
+                    normalized.reasoning_tokens,
+                    candidate.total_tokens,
+                    "OpenAI output",
+                )
+            })
+            .transpose()?;
+        *self = candidate;
+        Ok(normalized)
+    }
+}
+
+#[cfg(test)]
+mod sparse_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn responses_sparse_raw_counters_match_whole_report_and_never_fold_twice() {
+        let full = json!({"input_tokens":100,"output_tokens":10,"output_tokens_details":{"reasoning_tokens":5},"total_tokens":115});
+        let expected = openai_usage(Some(&full)).unwrap().unwrap();
+        let mut accumulator = OpenAiUsageAccumulator::default();
+        for report in [
+            json!({"input_tokens":100}),
+            json!({"output_tokens":10}),
+            json!({"output_tokens_details":{"reasoning_tokens":5},"total_tokens":115}),
+            full.clone(),
+            full,
+        ] {
+            let result = accumulator
+                .update_responses(Some(&report))
+                .unwrap()
+                .unwrap();
+            if report.get("total_tokens").is_some() {
+                assert_eq!(result.input_tokens, expected.input_tokens);
+                assert_eq!(result.output_tokens, expected.output_tokens);
+                assert_eq!(result.reasoning_tokens, expected.reasoning_tokens);
+            }
+        }
+        assert_eq!(expected.output_tokens, Some(15));
+    }
+
+    #[test]
+    fn sparse_response_cache_is_checked_when_input_arrives_later() {
+        let mut accumulator = OpenAiUsageAccumulator::default();
+        accumulator
+            .update_responses(Some(&json!({"input_tokens_details":{"cached_tokens":200}})))
+            .unwrap();
+        assert!(accumulator
+            .update_responses(Some(&json!({"input_tokens":100,"output_tokens":1})))
+            .is_err());
+        let valid = accumulator
+            .update_responses(Some(&json!({"input_tokens":250,"output_tokens":1})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(valid.input_tokens, Some(250));
+        assert_eq!(valid.cached_input_tokens, Some(200));
+    }
+}
+
+fn validate_cache_subsets(usage: &Usage) -> Result<(), String> {
+    let subsets = bounded_ledger_sum(
+        &[
+            usage.cached_input_tokens.unwrap_or(0),
+            usage.cache_creation_input_tokens.unwrap_or(0),
+        ],
+        "cache subsets",
+    )?;
+    if usage.input_tokens.is_some_and(|input| subsets > input) {
+        return Err("cache read and write tokens exceed total input tokens".into());
+    }
+    Ok(())
 }
 
 /// Parse a Chat Completions usage object: a malformed object fails the stream
 /// instead of silently dropping token accounting.
 /// `completion_tokens_details.reasoning_tokens` folds into `output_tokens`
 /// when the provider's `total_tokens` shows it was reported additively.
+#[cfg(test)]
 pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| "OpenAI-compatible usage must be an object".to_string())?;
-    let input_tokens = count_if_present(object, "prompt_tokens", "OpenAI-compatible usage")?;
-    let completion_tokens =
-        count_if_present(object, "completion_tokens", "OpenAI-compatible usage")?;
-    let reasoning_tokens = optional_usage_detail(
-        object,
-        "completion_tokens_details",
-        "reasoning_tokens",
-        "reasoning_tokens",
-    )?;
-    let total_tokens = count_if_present(object, "total_tokens", "OpenAI-compatible usage")?;
-    let output_tokens = completion_tokens
-        .map(|output| {
-            fold_openai_shaped_reasoning(
-                input_tokens,
-                output,
-                reasoning_tokens,
-                total_tokens,
-                "OpenAI-compatible output",
-            )
-        })
-        .transpose()?;
-    let (cached_input_tokens, cache_creation_input_tokens) =
-        cache_subsets(object, "prompt_tokens_details", input_tokens)?;
-    Ok(Usage {
-        input_tokens,
-        output_tokens,
-        cached_input_tokens,
-        cache_creation_input_tokens,
-        cache_creation_1h_input_tokens: None,
-        reasoning_tokens,
-    })
+    OpenAiUsageAccumulator::default().update_chat(value)
 }
 
 /// Cache reads and writes are disjoint subsets of OpenAI-shaped total input.

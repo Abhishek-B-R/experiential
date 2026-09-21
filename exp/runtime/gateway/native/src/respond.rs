@@ -266,7 +266,17 @@ pub(crate) fn cached_response(cached: &CachedResponse) -> Response {
 /// Append one frame while it remains within the replay capture ceiling,
 /// mirroring the python engine's `capture_frame`.
 pub(crate) fn capture_frame(buffer: &mut Vec<u8>, data: &[u8], replayable: bool) -> bool {
-    if !replayable || buffer.len() + data.len() > STREAM_REPLAY_CAPTURE_BYTES {
+    capture_frame_bounded(buffer, data, replayable, STREAM_REPLAY_CAPTURE_BYTES)
+}
+
+fn capture_frame_bounded(
+    buffer: &mut Vec<u8>,
+    data: &[u8],
+    replayable: bool,
+    limit: usize,
+) -> bool {
+    if !replayable || buffer.len().saturating_add(data.len()) > limit {
+        *buffer = Vec::new();
         return false;
     }
     buffer.extend_from_slice(data);

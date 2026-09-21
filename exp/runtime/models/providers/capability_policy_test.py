@@ -8,6 +8,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.model import ReasoningEffort
+from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -777,8 +778,6 @@ def test_public_messages_numeric_budget_never_becomes_advisory_effort(
     effort: ReasoningEffort | None,
 ) -> None:
     """A public 1024-token budget cannot become high or a default-on request."""
-    from exp.runtime.anthropic_protocol.requests import decode_messages
-
     body: JsonObject = {
         "model": "reasoner",
         "messages": [{"role": "user", "content": "Solve this."}],

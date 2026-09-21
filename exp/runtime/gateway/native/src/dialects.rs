@@ -418,6 +418,7 @@ pub struct Normalizer {
     stop_reason: Option<String>,
     // OpenAI-compatible and Gemini accumulation.
     usage: Option<Usage>,
+    openai_usage: crate::events::OpenAiUsageAccumulator,
     finish_reason: Option<String>,
     // Gemini accumulation: whole function calls arrive in one part, so the
     // provider supplies no tool index; assignment order mirrors the python
@@ -436,6 +437,7 @@ pub struct Normalizer {
     // Bedrock removes finished blocks from `tools`; only empty stopped blocks
     // stay pending until the final reason authorizes completion or truncation.
     bedrock_empty_stopped_tools: BTreeSet<u32>,
+    anthropic_stopped_tools: BTreeSet<u32>,
     // A call the provider cut mid-fragment was dropped under an ending that
     // did not declare truncation; the terminal then settles Incomplete.
     dropped_cut_call: bool,
@@ -477,12 +479,14 @@ impl Normalizer {
             cache_write_1h: None,
             stop_reason: None,
             usage: None,
+            openai_usage: crate::events::OpenAiUsageAccumulator::default(),
             finish_reason: None,
             gemini_tool_index: 0,
             reasoning_content_route_sha256,
             request_words: Vec::new(),
             deferred_tool_failure: None,
             bedrock_empty_stopped_tools: BTreeSet::new(),
+            anthropic_stopped_tools: BTreeSet::new(),
             dropped_cut_call: false,
             upstream_provider: None,
         }
@@ -673,7 +677,7 @@ impl Normalizer {
             return Ok(Vec::new());
         }
         let previous_usage = self.usage.clone();
-        let mut events = match self.dialect {
+        let result = match self.dialect {
             Dialect::OpenAiResponses => self.feed_openai_responses(frame),
             Dialect::AnthropicMessages => self.feed_anthropic(frame),
             Dialect::OpenAiCompatible => self.feed_openai_compatible(frame),
@@ -682,13 +686,17 @@ impl Normalizer {
             Dialect::TypesafeSystemone => {
                 Err(malformed("decision models do not serve chat streams"))
             }
-        }?;
+        };
         let mut observed = previous_usage;
         for usage in self.usage.iter() {
             observed
                 .get_or_insert_with(Usage::default)
                 .merge_observed(usage);
         }
+        // A later malformed field must not discard meters already decoded in
+        // this frame or an earlier one. Preserve them before propagating error.
+        self.usage = observed.clone();
+        let mut events = result?;
         for event in &mut events {
             if let Event::Usage(usage) = event {
                 let merged = observed.get_or_insert_with(Usage::default);

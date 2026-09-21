@@ -99,6 +99,54 @@ def test_explicit_effort_supersedes_the_anthropic_channels_with_disclosure() -> 
     assert alone.output_config is None
 
 
+@pytest.mark.parametrize(
+    "reasoning",
+    (
+        ReasoningConfig(exclude=True),
+        ReasoningConfig(),
+        ReasoningConfig(enabled=False),
+        ReasoningConfig(enabled=False, effort="high"),
+        ReasoningConfig(enabled=False, max_tokens=1024),
+        ReasoningConfig(enabled=True, effort="none"),
+    ),
+)
+def test_explicit_thinking_off_survives_visibility_only_reasoning(
+    reasoning: ReasoningConfig,
+) -> None:
+    """An extension without active depth cannot enable explicitly disabled thinking."""
+    channels = resolve_reasoning_channels(
+        reasoning,
+        max_tokens=4096,
+        thinking={"type": "disabled"},
+        output_config=None,
+    )
+    assert channels.thinking_config == {"type": "disabled"}
+    assert channels.effort is None
+    assert REASONING_SUPERSEDES_THINKING_DISCLOSURE not in channels.disclosures
+
+
+@pytest.mark.parametrize(
+    "reasoning",
+    (
+        ReasoningConfig(effort="high"),
+        ReasoningConfig(enabled=True),
+        ReasoningConfig(max_tokens=1024),
+    ),
+)
+def test_explicit_thinking_off_refuses_an_active_reasoning_extension(
+    reasoning: ReasoningConfig,
+) -> None:
+    """Contradictory caller controls are refused instead of choosing a paid depth."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        resolve_reasoning_channels(
+            reasoning,
+            max_tokens=4096,
+            thinking={"type": "disabled"},
+            output_config=None,
+        )
+    assert error.value.detail.param == "thinking.type"
+
+
 def test_effort_extension_cannot_erase_an_explicit_thinking_budget() -> None:
     """A separate advisory channel cannot override a hard numerical bound."""
     with pytest.raises(OpenAIProtocolError) as error:

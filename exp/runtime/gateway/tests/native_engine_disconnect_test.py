@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import os
-import resource
 import selectors
 import signal
 import socket
@@ -49,6 +48,9 @@ from exp.runtime.gateway.lifecycle_test import (
     _configured_gateway,
 )
 from exp.runtime.gateway.management import GatewayManagement
+
+if sys.platform != "win32":
+    import resource
 
 pytest.importorskip("exp_gateway_native")
 
@@ -652,6 +654,7 @@ def test_hidden_thinking_has_heartbeats_and_retains_input_meter(
     assert "private canary" not in logs
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor limits are unavailable")
 def test_provider_close_observation_handles_file_descriptors_above_select_limit(
     engine: _ServingEngine,
 ) -> None:
