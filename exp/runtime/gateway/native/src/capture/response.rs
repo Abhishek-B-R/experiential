@@ -77,17 +77,20 @@ impl Tap {
             loop {
                 let mut frame_value = Value::Array(frames);
                 let source_json = lossless_projection(&mut frame_value);
-                frames = frame_value.as_array().expect("frame array").clone();
+                let Value::Array(moved_frames) = frame_value else {
+                    unreachable!()
+                };
                 let response = CapturedResponse::Sse {
                     status: self.status,
-                    frames,
+                    frames: moved_frames,
                     truncated,
                     client_disconnected: disconnected,
                     source_json,
                 };
-                let size = serde_json::to_vec(&response).map_or(usize::MAX, |value| value.len());
-                if size <= self.collector.config.maximum_response_bytes {
-                    break Some(response);
+                if let Some(encoded) = response.encode() {
+                    if encoded.len() <= self.collector.config.maximum_response_bytes {
+                        break Some(encoded);
+                    }
                 }
                 let CapturedResponse::Sse {
                     frames: mut reduced,
@@ -110,13 +113,14 @@ impl Tap {
         } else if !self.truncated && !disconnected {
             serde_json::from_slice::<Value>(&self.bytes)
                 .ok()
-                .map(|mut body| {
+                .and_then(|mut body| {
                     let source_json = lossless_projection(&mut body);
                     CapturedResponse::Json {
                         status: self.status,
                         body,
                         source_json,
                     }
+                    .encode()
                 })
         } else {
             None
@@ -238,12 +242,24 @@ fn data_frames(bytes: &[u8]) -> Vec<Value> {
 
 /// Preserve exact JSON text whenever storage requires a normalized projection.
 fn lossless_projection(value: &mut Value) -> Option<String> {
-    let source = serde_json::to_string(value).ok()?;
-    if !source.contains("\\u0000") {
+    if !contains_nul(value) {
         return None;
     }
+    let source = serde_json::to_string(value).ok()?;
     normalize(value);
     Some(source)
+}
+
+/// Inspect decoded text without allocating a complete JSON representation.
+fn contains_nul(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.contains('\0'),
+        Value::Array(values) => values.iter().any(contains_nul),
+        Value::Object(object) => object
+            .iter()
+            .any(|(key, value)| key.contains('\0') || contains_nul(value)),
+        _ => false,
+    }
 }
 
 /// Storage normalization never touches forwarded bytes. Preserve colliding object keys.

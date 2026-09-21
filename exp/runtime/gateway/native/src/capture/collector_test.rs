@@ -1,5 +1,5 @@
 use super::*;
-use crate::capture::record::{Protocol, Scope};
+use crate::capture::record::{Protocol, Response, Scope};
 use serde_json::json;
 use std::sync::{mpsc, Arc};
 
@@ -43,12 +43,14 @@ fn request(id: &str) -> Request {
     }
 }
 
-fn response() -> Response {
+fn response() -> EncodedResponse {
     Response::Json {
         status: 200,
         body: json!({"id":"completion","choices":[]}),
         source_json: None,
     }
+    .encode()
+    .unwrap()
 }
 
 fn collector(config: Configuration) -> (Arc<Collector>, mpsc::Receiver<Record>) {
@@ -98,6 +100,55 @@ fn collector_forwards_destination_cleanup_failure_without_losing_write_success()
     assert!(collector.close_until(Instant::now() + Duration::from_secs(1)));
     assert_eq!(collector.counts(), [0, 0, 1, 0, 0, 0]);
     assert_eq!(collector.maintenance_failures(), 1);
+}
+
+#[test]
+fn selected_model_uses_cached_request_size_including_json_escapes() {
+    let mut configuration = config();
+    configuration.maximum_request_bytes = 1024;
+    let (collector, receiver) = collector(configuration);
+    let mut input = request("request");
+    input.model_id = None;
+    assert!(collector.begin(input));
+    collector.select_model("request", "snow-雪-\"quoted\"");
+    {
+        let pending = collector.pending.lock().unwrap();
+        let entry = &pending.entries["request"];
+        assert_eq!(
+            entry.request_bytes,
+            entry.record.encode(4096).unwrap().len()
+        );
+        assert_eq!(entry.bytes, entry.request_bytes + 512);
+    }
+    collector.settle("request", true, false);
+    let mut input = request("overflow");
+    input.model_id = None;
+    assert!(collector.begin(input));
+    collector.select_model("overflow", &"\"".repeat(512));
+    collector.settle("overflow", true, false);
+    assert_eq!(drain(&collector, receiver).len(), 1);
+    assert_eq!(collector.counts()[5], 1);
+}
+
+#[test]
+fn encoded_response_size_is_reused_and_enforced_at_collector_boundary() {
+    let mut configuration = config();
+    let exact = response().len();
+    configuration.maximum_response_bytes = exact;
+    let (collector, receiver) = collector(configuration);
+    assert!(collector.begin(request("request")));
+    collector.finish("request", Some(response()), None);
+    collector.settle("request", true, true);
+    assert_eq!(drain(&collector, receiver).len(), 1);
+
+    let mut configuration = config();
+    configuration.maximum_response_bytes = exact - 1;
+    let (collector, receiver) = self::collector(configuration);
+    assert!(collector.begin(request("request")));
+    collector.finish("request", Some(response()), None);
+    collector.settle("request", true, true);
+    assert!(drain(&collector, receiver).is_empty());
+    assert_eq!(collector.counts()[5], 1);
 }
 
 #[test]
