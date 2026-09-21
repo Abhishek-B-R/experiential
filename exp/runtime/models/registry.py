@@ -49,6 +49,7 @@ from exp.runtime.models.providers.tinker_sampling import (
     create_tinker_sampler,
 )
 from exp.runtime.models.providers.transport import JsonHttpTransport
+from exp.runtime.models.providers.typesafe import TYPESAFE_BASE_URL, TypeSafeClient
 from exp.runtime.models.providers.vertex import (
     VertexClient,
     VertexOpenAIClient,
@@ -541,6 +542,8 @@ class RuntimeModelCatalog:
             http_kwargs["system_messages_leading_only"] = _supports_flag(
                 capabilities, "system_messages_leading_only"
             )
+        if provider == "anthropic":
+            http_kwargs["inference_geo"] = connection.inference_geo
         http_client = factory(**http_kwargs)
         embedding_client = (
             http_client
@@ -629,6 +632,7 @@ _HTTP_PROVIDERS: Mapping[str, tuple[_HttpClientFactory, str | None]] = {
     "gemini": (GeminiClient, GEMINI_BASE_URL),
     "openai-compatible": (OpenAICompatibleClient, None),
     "openrouter": (OpenRouterClient, OPENROUTER_BASE_URL),
+    "typesafe": (TypeSafeClient, TYPESAFE_BASE_URL),
 }
 
 SUPPORTED_PROVIDERS = frozenset(_HTTP_PROVIDERS) | {

@@ -42,8 +42,10 @@ from exp.runtime.gateway.contracts import (
     GatewayToolDefinition,
     StructuredTextFormat,
 )
+from exp.runtime.gateway.decisions_contracts import DecisionRequest, NoulQuestion
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
+from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.gateway.reasoning_blocks import EncryptedReasoningBlock
 from exp.runtime.gateway.replay_identity import provider_replay_authority
 from exp.runtime.gateway.reservation_tokenizer import RESERVATION_ENCODING, reservation_encoder
@@ -637,6 +639,32 @@ def test_embeddings_and_image_prompts_count_their_text() -> None:
     assert 0 < worst_case_input_tokens(images) < 20
 
 
+@pytest.mark.parametrize(
+    "state",
+    ["plain text", "你好日本語" * 100, {"nested": ["日本語", 7]}],
+    ids=["ascii", "unicode", "nested-json"],
+)
+def test_decisions_reserve_utf8_state_for_every_question(state: str | JsonObject) -> None:
+    """Decision planning retains the byte bound and counts repeated state per question."""
+    question = NoulQuestion(instructions="Is this valid?")
+    single = DecisionRequest(state=state, questions={"first": question})
+    repeated = DecisionRequest(state=state, questions={"first": question, "second": question})
+    expected = (
+        len(json.dumps(state, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+        + len(
+            json.dumps(
+                question.model_dump(mode="json", exclude_none=True), ensure_ascii=False
+            ).encode("utf-8")
+        )
+        + 1024
+    )
+    assert worst_case_input_tokens(single) == single.input_token_reservation == expected
+    assert worst_case_input_tokens(repeated) == repeated.input_token_reservation == 2 * expected
+    assert counted_input_tokens(single) == expected
+    if isinstance(state, str):
+        assert expected >= len(state.encode("utf-8")) + 1024
+
+
 def test_encoder_is_loaded_once_and_the_estimate_stays_cheap() -> None:
     """One cached BPE; a fifty-thousand-token, fifteen-tool request estimates in milliseconds.
 
@@ -765,3 +793,17 @@ def test_messages_estimate_counts_system_every_turn_and_the_tools() -> None:
     # reservation BPE); twelve tools plus the fixed tool-use preamble.
     assert full - without_system > 1_200, (full, without_system)
     assert full - without_tools > TOOLS_PRESENT_TOKENS + 12 * 30, (full, without_tools)
+
+
+def test_json_object_estimate_covers_the_provider_instruction() -> None:
+    """JSON mode reserves the full system instruction sent to every provider."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="Give one value."),),
+    )
+    json_request = request.model_copy(update={"json_object_output": True})
+    instruction_tokens = len(reservation_encoder().encode(JSON_OBJECT_SYSTEM_INSTRUCTION))
+
+    assert counted_input_tokens(json_request) - counted_input_tokens(request) >= (
+        MESSAGE_FRAMING_TOKENS + instruction_tokens
+    )

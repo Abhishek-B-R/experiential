@@ -21,7 +21,9 @@ from exp.common.models.gateway_catalog import (
 )
 from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
 from exp.runtime.gateway.auth import utc_text
+from exp.runtime.gateway.cache_write import requests_hour_cache
 from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.gateway.embeddings_contracts import (
     EmbeddingsRequest,
     ServingRequest,
@@ -577,23 +579,26 @@ def maximum_attempt_cost_nano_usd(
                 input_rate=deployment.gateway.prices.input_nano_usd_per_million_tokens,
                 output_rate=deployment.gateway.prices.output_nano_usd_per_million_tokens,
             )
-        case GatewayRequest():
-            return _completion_attempt_cost_nano_usd(request, deployment, input_tokens)
+        case GatewayRequest() | DecisionRequest():
+            return _token_attempt_cost_nano_usd(request, deployment, input_tokens)
         case _:  # pragma: no cover - exhaustive over the ServingRequest union.
             assert_never(request)
 
 
-def _completion_attempt_cost_nano_usd(
-    request: GatewayRequest,
+def _token_attempt_cost_nano_usd(
+    request: GatewayRequest | DecisionRequest,
     deployment: ExactModelDeployment,
     input_tokens: int,
 ) -> int | None:
-    """Return a conservative nano-USD ceiling for one chat/responses call.
+    """Reserve the maximum applicable rate for each surface-specific token bound.
 
-    The input estimate carries its own headroom; the output ceiling is the
-    caller's, else the frozen deployment limit, else a reservation-only default
-    bounded by the context window. Cached and reasoning tokens are subsets of the
-    totals, so the worst case charges the higher rate for the whole leg.
+    Args:
+        request: Canonical request including forwarded cache TTL markers.
+        deployment: Frozen capabilities and base, tier, and cache-write prices.
+        input_tokens: Input estimate including the configured headroom.
+
+    Returns:
+        Nano-USD ceiling, or None when an applicable rate is unknown.
     """
     output_tokens = worst_case_output_tokens(request, deployment)
     prices = deployment.gateway.prices
@@ -616,6 +621,10 @@ def _completion_attempt_cost_nano_usd(
         ]
         if capabilities.reports_cached_input_tokens:
             required_rates.append(schedule.cached_input_nano_usd_per_million_tokens)
+        if capabilities.reports_cache_creation_input_tokens:
+            required_rates.append(schedule.cache_creation_input_nano_usd_per_million_tokens)
+            if requests_hour_cache(request):
+                required_rates.append(schedule.cache_creation_1h_input_nano_usd_per_million_tokens)
         if capabilities.reports_reasoning_tokens:
             required_rates.append(schedule.reasoning_nano_usd_per_million_tokens)
         if any(rate is None for rate in required_rates):
@@ -626,6 +635,12 @@ def _completion_attempt_cost_nano_usd(
         for rate in (
             schedule.input_nano_usd_per_million_tokens,
             schedule.cached_input_nano_usd_per_million_tokens,
+            schedule.cache_creation_input_nano_usd_per_million_tokens
+            if capabilities.reports_cache_creation_input_tokens
+            else None,
+            schedule.cache_creation_1h_input_nano_usd_per_million_tokens
+            if capabilities.reports_cache_creation_input_tokens and requests_hour_cache(request)
+            else None,
         )
         if rate is not None
     )

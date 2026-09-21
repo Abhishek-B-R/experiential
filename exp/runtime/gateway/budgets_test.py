@@ -15,6 +15,7 @@ from exp.common.models import ModelCapabilities
 from exp.common.models.catalog import (
     MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS,
     GatewayDeploymentMetadata,
+    GatewayLongContextTier,
     GatewayTokenPrices,
 )
 from exp.common.models.gateway_catalog import (
@@ -24,7 +25,6 @@ from exp.common.models.gateway_catalog import (
 )
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.runtime.gateway.attempt_tokens import (
-    DEFAULT_RESERVATION_OUTPUT_TOKENS,
     worst_case_attempt_tokens,
     worst_case_input_tokens,
 )
@@ -48,10 +48,17 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.gateway.decisions_contracts import (
+    ChoiceQuestion,
+    DecisionRequest,
+    NoulQuestion,
+    ScoreQuestion,
+)
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
+from exp.runtime.models.providers.errors import ProviderParameterError
 
 
 def _catalog() -> NormalizedGatewayCatalog:
@@ -233,45 +240,105 @@ def test_maximum_attempt_cost_is_integer_conservative_and_unknown_prices_fail_cl
     assert all_dimensions is not None and all_dimensions > known
 
 
-def test_missing_output_ceiling_reserves_against_the_default_instead_of_failing_closed() -> None:
-    """A priced route with no output ceiling anywhere stays priceable.
+@pytest.mark.parametrize("output_rate", [0, 1_000_037])
+def test_decision_ceiling_prices_both_reservations_with_integer_rounding(output_rate: int) -> None:
+    """Zero output price is known money, not zero observed or reserved output tokens."""
+    request = DecisionRequest(
+        state="你好", questions={"valid": NoulQuestion(instructions="Accept?")}
+    )
+    deployment = _deployment()
+    deployment = deployment.model_copy(
+        update={
+            "gateway": deployment.gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=13,
+                        output_nano_usd_per_million_tokens=output_rate,
+                    )
+                }
+            )
+        }
+    )
+    input_tokens, output_tokens = worst_case_attempt_tokens(request, deployment)
+    assert input_tokens == request.input_token_reservation
+    assert output_tokens == request.output_token_reservation == 2048
+    assert deployment.capabilities is not None
+    assert deployment.capabilities.maximum_output_tokens is not None
+    assert output_tokens > deployment.capabilities.maximum_output_tokens
+    expected = (input_tokens * 13 + output_tokens * output_rate + 999_999) // 1_000_000
+    assert maximum_attempt_cost_nano_usd(request, deployment) == expected
+    assert maximum_attempt_cost_nano_usd(request, deployment, input_tokens=input_tokens) == expected
+    assert maximum_attempt_cost_nano_usd(request, _deployment(priced=False)) is None
 
-    An output bound is a token count, not a price, so its absence must not
-    unprice the route: when the caller omits ``maximum_output_tokens`` and the
-    deployment declares none, the reservation uses
-    ``DEFAULT_RESERVATION_OUTPUT_TOKENS``, bounded by a smaller declared context
-    window. Unknown required prices still fail closed.
-    """
+
+@pytest.mark.parametrize(
+    "prices",
+    [
+        GatewayTokenPrices(input_nano_usd_per_million_tokens=13),
+        GatewayTokenPrices(output_nano_usd_per_million_tokens=0),
+    ],
+)
+def test_decision_ceiling_requires_both_explicit_prices(prices: GatewayTokenPrices) -> None:
+    """An absent output price cannot be silently treated as a free output leg."""
+    request = DecisionRequest(
+        state="state", questions={"valid": NoulQuestion(instructions="Accept?")}
+    )
+    deployment = _deployment()
+    deployment = deployment.model_copy(
+        update={"gateway": deployment.gateway.model_copy(update={"prices": prices})}
+    )
+    assert maximum_attempt_cost_nano_usd(request, deployment) is None
+
+
+@pytest.mark.parametrize(("choice_count", "score_count"), [(2, 2), (64, 10)])
+def test_decision_output_reservation_sums_each_question_and_criterion(
+    choice_count: int,
+    score_count: int,
+) -> None:
+    """Mixed question batches preserve their full output allowance, not a chat ceiling."""
+    criteria = tuple(f"criterion-{index}" for index in range(choice_count))
+    request = DecisionRequest(
+        state={"record": "你好"},
+        questions={
+            "truth": NoulQuestion(instructions="Is this valid?"),
+            "choice": ChoiceQuestion(instructions="Select", criteria=dict.fromkeys(criteria)),
+            "score": ScoreQuestion(instructions="Rate", criteria=criteria[:score_count]),
+        },
+    )
+    input_tokens, output_tokens = worst_case_attempt_tokens(request, _deployment())
+    assert input_tokens == request.input_token_reservation
+    assert output_tokens == 2048 + 2 * 1024 + 512 * (choice_count + score_count)
+    assert output_tokens == request.output_token_reservation
+
+
+def test_missing_output_metadata_requires_an_explicit_budget() -> None:
+    """A price does not authorize unbounded generation or a guessed reservation."""
     request = _request("four bytes").model_copy(update={"maximum_output_tokens": None})
     no_ceiling = _deployment().model_copy(update={"capabilities": ModelCapabilities()})
-
-    default_bound = maximum_attempt_cost_nano_usd(request, no_ceiling)
-    assert default_bound is not None and isinstance(default_bound, int) and default_bound > 0
-    explicit_default = maximum_attempt_cost_nano_usd(
-        request.model_copy(update={"maximum_output_tokens": DEFAULT_RESERVATION_OUTPUT_TOKENS}),
-        no_ceiling,
-    )
-    # The fallback reserves exactly the default when nothing bounds it lower.
-    assert explicit_default is not None
-    assert abs(default_bound - explicit_default) < 100
-
-    small_window = _deployment().model_copy(
-        update={"capabilities": ModelCapabilities(context_window_tokens=1_024)}
-    )
-    windowed = maximum_attempt_cost_nano_usd(request, small_window)
-    explicit_window = maximum_attempt_cost_nano_usd(
-        request.model_copy(update={"maximum_output_tokens": 1_024}),
-        small_window,
-    )
-    # A smaller declared context window bounds the default.
-    assert windowed is not None and explicit_window is not None
-    assert abs(windowed - explicit_window) < 100
-
-    # A missing required price still fails closed regardless of the default.
+    with pytest.raises(ProviderParameterError, match="Supply an explicit max_tokens"):
+        maximum_attempt_cost_nano_usd(request, no_ceiling)
     assert (
         maximum_attempt_cost_nano_usd(
-            request,
-            _deployment(priced=False).model_copy(update={"capabilities": ModelCapabilities()}),
+            request.model_copy(update={"maximum_output_tokens": 100_000}), no_ceiling
+        )
+        is not None
+    )
+
+
+@pytest.mark.parametrize("window", (1_024, 128_000))
+def test_missing_output_ceiling_reserves_the_full_declared_window(window: int) -> None:
+    """An optional provider cap stays omitted while its full bound is reserved."""
+    request = _request("four bytes").model_copy(update={"maximum_output_tokens": None})
+    deployment = _deployment().model_copy(
+        update={"capabilities": ModelCapabilities(context_window_tokens=window)}
+    )
+    assert worst_case_attempt_tokens(request, deployment)[1] == window
+    assert maximum_attempt_cost_nano_usd(request, deployment) == maximum_attempt_cost_nano_usd(
+        request.model_copy(update={"maximum_output_tokens": window}), deployment
+    )
+    assert (
+        maximum_attempt_cost_nano_usd(
+            request.model_copy(update={"maximum_output_tokens": 1_024}), _deployment(priced=False)
         )
         is None
     )
@@ -340,6 +407,83 @@ def test_concurrent_identity_reservations_never_exceed_hard_limit(tmp_path: Path
     remaining = budgets.remaining(organization_id="org", period="2026-08")[0]
     assert remaining.reserved_nano_usd == 500
     assert remaining.remaining_nano_usd == 0
+
+
+def test_decision_ledger_settles_zero_output_price_without_discarding_usage(tmp_path: Path) -> None:
+    """SQLite reserves decision money then preserves both observed token counts at settlement."""
+    clock = _Clock()
+    store, ledger, budgets, key = _authority(tmp_path, clock)
+    request = DecisionRequest(
+        state="decision-content-canary", questions={"valid": NoulQuestion(instructions="Accept?")}
+    )
+    authorization = store.authorize_request(
+        raw_key=key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    snapshot = ExecutionSnapshot(
+        authorization=authorization,
+        exact_model_id="exact-one",
+        pool_id="pool",
+        deployment_ids=("primary",),
+    )
+    deployment = _deployment()
+    deployment = deployment.model_copy(
+        update={
+            "gateway": deployment.gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=1_000_000,
+                        output_nano_usd_per_million_tokens=0,
+                    )
+                }
+            )
+        }
+    )
+    maximum = maximum_attempt_cost_nano_usd(request, deployment)
+    assert maximum is not None
+    assert maximum == request.input_token_reservation
+    budgets.set_limit(
+        organization_id="org",
+        period="2026-08",
+        scope=BudgetScope(kind=BudgetScopeKind.TEAM),
+        limit_nano_usd=maximum,
+        strict_unknown_cost=True,
+    )
+    attempt = ledger.start_attempt(
+        snapshot=snapshot,
+        deployment=deployment,
+        attempt_ordinal=0,
+        route_depth=0,
+        maximum_cost_nano_usd=maximum,
+        reserved_input_tokens=request.input_token_reservation,
+        reserved_output_tokens=request.output_token_reservation,
+    )
+    assert (
+        budgets.remaining(organization_id="org", period="2026-08")[0].reserved_nano_usd == maximum
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=0,
+            usage=GatewayUsage(input_tokens=17, output_tokens=5),
+        ),
+        failure=None,
+    )
+    remaining = budgets.remaining(organization_id="org", period="2026-08")[0]
+    assert remaining.reserved_nano_usd == 0
+    assert remaining.settled_nano_usd == 17
+    assert remaining.unknown_cost_attempts == 0
+    with sqlite3.connect(store.database_path) as connection:
+        row = connection.execute(
+            "SELECT input_tokens, output_tokens, budget_settled_nano_usd "
+            "FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt,),
+        ).fetchone()
+        assert row == (17, 5, 17)
 
 
 def test_configured_optional_prices_are_reserved_even_when_reporting_hints_are_false(
@@ -966,7 +1110,6 @@ def test_reservation_prices_the_long_context_tier_conservatively() -> None:
     reservation, below it base rates reserve, and a reachable tier missing a
     required rate unprices the route entirely.
     """
-    from exp.common.models.catalog import GatewayLongContextTier
 
     def tiered(tier: GatewayLongContextTier | None) -> ExactModelDeployment:
         base = _deployment()
@@ -1119,3 +1262,142 @@ def test_worst_case_attempt_tokens_matches_over_the_serving_request_union() -> N
     img_in, img_out = worst_case_attempt_tokens(images, deployment)
     assert img_in == worst_case_input_tokens(images) and img_in > 0
     assert img_out == 0
+
+
+def test_cache_write_surcharge_raises_reservation_ceiling() -> None:
+    """A cache-write surcharge raises the conservative reservation ceiling."""
+    base = _deployment()
+    surcharged = base.model_copy(
+        update={
+            "gateway": base.gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=1_000_000,
+                        cache_creation_input_nano_usd_per_million_tokens=5_000_000,
+                        output_nano_usd_per_million_tokens=2_000_000,
+                    ),
+                    "capabilities": base.gateway.capabilities.model_copy(
+                        update={"reports_cache_creation_input_tokens": True}
+                    ),
+                }
+            )
+        }
+    )
+    request = _request("cache-write-ceiling")
+    surcharged_cost = maximum_attempt_cost_nano_usd(request, surcharged)
+    base_cost = maximum_attempt_cost_nano_usd(request, base)
+    assert surcharged_cost is not None
+    assert base_cost is not None
+    assert surcharged_cost > base_cost
+
+
+def test_cache_write_capability_requires_its_rate() -> None:
+    """A deployment reporting cache creation without a rate fails closed."""
+    missing = _deployment().model_copy(
+        update={
+            "gateway": _deployment()
+            .gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=1_000_000,
+                        output_nano_usd_per_million_tokens=2_000_000,
+                    )
+                }
+            )
+            .model_copy(
+                update={
+                    "capabilities": _deployment().gateway.capabilities.model_copy(
+                        update={"reports_cache_creation_input_tokens": True}
+                    )
+                }
+            )
+        }
+    )
+    assert maximum_attempt_cost_nano_usd(_request("needs-cache-write-rate"), missing) is None
+
+
+@pytest.mark.parametrize(
+    "ttl, hour_rate, reports, expected_rate",
+    [
+        ("5m", None, True, 3_750_000_000),
+        ("1h", None, True, None),
+        ("1h", 6_000_000_000, True, 6_000_000_000),
+        ("1h", 6_000_000_000, False, 3_000_000_000),
+    ],
+)
+def test_cache_write_reservation_requires_only_applicable_ttl_rates(
+    ttl: str, hour_rate: int | None, reports: bool, expected_rate: int | None
+) -> None:
+    """One-hour requests reserve the higher observed-capability rate or fail unpriced."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        maximum_output_tokens=16,
+        provider_cache_control={"type": "ephemeral", "ttl": ttl},
+    )
+    deployment = _deployment()
+    deployment = deployment.model_copy(
+        update={
+            "gateway": deployment.gateway.model_copy(
+                update={
+                    "capabilities": deployment.gateway.capabilities.model_copy(
+                        update={"reports_cache_creation_input_tokens": reports}
+                    ),
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=3_000_000_000,
+                        output_nano_usd_per_million_tokens=15_000_000_000,
+                        cache_creation_input_nano_usd_per_million_tokens=3_750_000_000,
+                        cache_creation_1h_input_nano_usd_per_million_tokens=hour_rate,
+                    ),
+                }
+            )
+        }
+    )
+    cost = maximum_attempt_cost_nano_usd(request, deployment)
+    assert cost == (
+        None
+        if expected_rate is None
+        else (worst_case_input_tokens(request) * expected_rate + 16 * 15_000_000_000 + 999_999)
+        // 1_000_000
+    )
+
+
+def test_long_context_cache_write_surcharge_governs_above_threshold() -> None:
+    """Above threshold the worst-case rate includes the tier cache-write surcharge."""
+    tier = GatewayLongContextTier(
+        input_threshold_tokens=10,
+        input_nano_usd_per_million_tokens=1_000_000,
+        cache_creation_input_nano_usd_per_million_tokens=9_000_000,
+        output_nano_usd_per_million_tokens=2_000_000,
+    )
+    base = _deployment().model_copy(
+        update={
+            "gateway": _deployment()
+            .gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=1_000_000,
+                        cache_creation_input_nano_usd_per_million_tokens=1_500_000,
+                        output_nano_usd_per_million_tokens=2_000_000,
+                        long_context=tier,
+                    )
+                }
+            )
+            .model_copy(
+                update={
+                    "capabilities": _deployment().gateway.capabilities.model_copy(
+                        update={"reports_cache_creation_input_tokens": True}
+                    )
+                }
+            )
+        }
+    )
+    # Short input stays below threshold: base surcharge governs.
+    short = _request("x")
+    # Long input crosses the threshold: tier surcharge governs the worst case.
+    long = _request("x" * 2_048)
+    short_cost = maximum_attempt_cost_nano_usd(short, base)
+    long_cost = maximum_attempt_cost_nano_usd(long, base)
+    assert short_cost is not None
+    assert long_cost is not None
+    assert long_cost > short_cost

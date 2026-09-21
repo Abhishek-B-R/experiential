@@ -16,6 +16,7 @@ from exp.common.models.catalog import (
     ModelRecord,
 )
 from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
+from exp.common.models.failover_tokens import FailoverToken
 from exp.common.models.gateway_catalog import (
     ExactModelDeployment,
     FailoverMode,
@@ -31,6 +32,7 @@ from exp.runtime.gateway.contracts import (
     GatewayFailure,
     GatewayFailureClass,
     GatewayMessage,
+    GatewayRefusalReason,
     GatewayRequest,
 )
 from exp.runtime.gateway.health import DeploymentHealthRegistry
@@ -52,6 +54,7 @@ def _deployment(
     *,
     connection_sha256: str,
     dispatch: GatewayRungDispatchPolicy | None = None,
+    failover_only_on: tuple[FailoverToken, ...] | None = None,
 ) -> ExactModelDeployment:
     """Build one deployment in the shared certified exact-model pool."""
     return ExactModelDeployment(
@@ -64,7 +67,9 @@ def _deployment(
         connection_sha256=connection_sha256,
         capabilities_sha256="d" * 64,
         gateway=GatewayDeploymentMetadata(
-            capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+            capabilities=GatewayDeploymentCapabilities(
+                supports_streaming=True, failover_only_on=failover_only_on
+            ),
             dispatch=dispatch,
         ),
     )
@@ -141,6 +146,50 @@ def test_reserve_rung_slot_is_inert_without_an_admission_policy() -> None:
     assert loads.inflight(("deployment-a", "b" * 64)) == 0
 
 
+def test_reserve_rung_slot_applies_the_workers_default_bound_to_an_unauthored_rung() -> None:
+    """A policy-less rung reserves under the registry default and its shed is marked default."""
+    loads = RungLoadRegistry(default_bound=1)
+    deployment = _deployment("deployment-a", connection_sha256="b" * 64)
+    entry = _entry((deployment,))
+    ticket = reserve_rung_slot(
+        loads, StickySpillRegistry(), entry, deployment, reserved_tokens=10, force=False
+    )
+    assert isinstance(ticket, str)
+    assert loads.inflight(("deployment-a", "b" * 64)) == 1
+    shed = reserve_rung_slot(
+        loads, StickySpillRegistry(), entry, deployment, reserved_tokens=10, force=False
+    )
+    assert shed == RungShed("queue_bound", default_bound=True)
+
+
+def test_reserve_rung_slot_lets_an_authored_bound_replace_the_default() -> None:
+    """An authored concurrency_bound is the rung's bound, and its shed is not a default shed."""
+    loads = RungLoadRegistry(default_bound=1)
+    deployment = _deployment(
+        "deployment-a",
+        connection_sha256="b" * 64,
+        dispatch=GatewayRungDispatchPolicy(concurrency_bound=2),
+    )
+    entry = _entry((deployment,))
+    for _ in range(2):
+        assert isinstance(
+            reserve_rung_slot(
+                loads, StickySpillRegistry(), entry, deployment, reserved_tokens=10, force=False
+            ),
+            str,
+        )
+    shed = reserve_rung_slot(
+        loads, StickySpillRegistry(), entry, deployment, reserved_tokens=10, force=False
+    )
+    assert shed == RungShed("queue_bound")
+
+
+def test_registry_refuses_a_default_bound_below_one() -> None:
+    """A default bound of zero would shed every reservation; it is a programming error."""
+    with pytest.raises(ValueError):
+        RungLoadRegistry(default_bound=0)
+
+
 def test_reserve_rung_slot_sheds_fresh_sessions_early_only_with_warm_standing_absent() -> None:
     """Under affinity a fingerprint without a live binding sheds at the early threshold."""
     loads = RungLoadRegistry()
@@ -204,6 +253,33 @@ def test_failed_dispatch_candidate_reads_the_organizations_cache_on_the_failed_r
     plain = _entry(deployments, failover_mode="maximize_cache")
     assert failed_dispatch_candidate(
         health=health, loads=loads, keys=keys, entry=plain, failure=_THROTTLE, current_depth=0
+    ) == (None, None)
+
+
+def test_failed_dispatch_candidate_dials_a_failover_only_rung_on_its_named_failure() -> None:
+    """The rung's own `failover_only_on` set decides, not the alias revision's refusal opt-in."""
+    deployments = (
+        _deployment("deployment-a", connection_sha256="b" * 64),
+        _deployment(
+            "deployment-b", connection_sha256="c" * 64, failover_only_on=("refusal:cyber_policy",)
+        ),
+    )
+    entry = _entry(deployments)
+    health = DeploymentHealthRegistry()
+    keys = tuple(deployment_health_key(entry.authorization, item) for item in deployments)
+    loads = RungLoadRegistry()
+    cyber = GatewayFailure(
+        failure_class=GatewayFailureClass.REFUSAL,
+        safe_message="provider refused the request: cybersecurity policy",
+        refusal_reason=GatewayRefusalReason.CYBER_POLICY,
+    )
+    assert not entry.authorization.refusal_failover
+    assert failed_dispatch_candidate(
+        health=health, loads=loads, keys=keys, entry=entry, failure=cyber, current_depth=0
+    ) == (1, None)
+    # A throttle has no unrestricted rung left to advance to.
+    assert failed_dispatch_candidate(
+        health=health, loads=loads, keys=keys, entry=entry, failure=_THROTTLE, current_depth=0
     ) == (None, None)
 
 

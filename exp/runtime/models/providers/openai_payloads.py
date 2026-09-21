@@ -11,6 +11,7 @@ from __future__ import annotations
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ChatMaxTokensField
 from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.models.providers.deepseek import is_deepseek_model_id
 from exp.runtime.models.providers.errors import (
     ProviderResponseError,
@@ -136,6 +137,10 @@ def openai_responses_stream_payload(
             for role, content in zip(instruction_roles, instructions, strict=True)
         ]
         instructions = []
+    if request.json_object_output:
+        # JSON mode requires an instruction in input itself; the top-level
+        # instructions field alone does not satisfy the provider's check.
+        items.insert(0, {"role": "system", "content": JSON_OBJECT_SYSTEM_INSTRUCTION})
     # Upstream storage stays disabled regardless of the caller's `store`
     # selector: continuation state is gateway-owned, the gateway never
     # references a provider-stored response, and disabled storage is what
@@ -171,6 +176,8 @@ def openai_responses_stream_payload(
         if request.structured_text.description is not None:
             format_payload["description"] = request.structured_text.description
         text_payload["format"] = format_payload
+    elif request.json_object_output:
+        text_payload["format"] = {"type": "json_object"}
     if text_payload:
         payload["text"] = text_payload
     if request.maximum_output_tokens is not None:
@@ -238,6 +245,7 @@ def openai_compatible_stream_payload(
     system_messages_leading_only: bool = False,
     forwards_service_tier: bool = False,
     forwards_prompt_cache_key: bool = False,
+    forwards_cache_control: bool = False,
 ) -> JsonObject:
     """Translate one canonical request to streaming Chat Completions JSON.
 
@@ -285,23 +293,31 @@ def openai_compatible_stream_payload(
         # The rung's template 400s on any system turn past the first; the
         # text stays where the caller put it, as user text.
         messages = fold_instruction_turns_after_the_first(messages)
+    wire_messages = [
+        openai_chat_message(
+            message,
+            reasoning_route_sha256=reasoning_route_sha256,
+            reasoning_output_exposed=reasoning_output_exposed,
+            deepseek_reasoning_history=deepseek_reasoning_history,
+            forwards_cache_control=forwards_cache_control,
+        )
+        for message in messages
+    ]
+    if request.json_object_output:
+        _instruct_json_object(wire_messages)
     payload: JsonObject = {
         "model": model_id,
-        "messages": [
-            openai_chat_message(
-                message,
-                reasoning_route_sha256=reasoning_route_sha256,
-                reasoning_output_exposed=reasoning_output_exposed,
-                deepseek_reasoning_history=deepseek_reasoning_history,
-            )
-            for message in messages
-        ],
+        "messages": wire_messages,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
     if active_reasoning and fireworks_reasoning_route_sha256 is not None:
         payload["reasoning_history"] = "interleaved"
-    add_openai_tools(payload, request, responses=False)
+    add_openai_tools(
+        payload, request, responses=False, forwards_cache_control=forwards_cache_control
+    )
+    if forwards_cache_control and request.provider_cache_control is not None:
+        payload["cache_control"] = request.provider_cache_control
     if request.parallel_tool_calls is not None:
         payload["parallel_tool_calls"] = request.parallel_tool_calls
     if request.structured_text is not None:
@@ -313,6 +329,8 @@ def openai_compatible_stream_payload(
         if request.structured_text.description is not None:
             schema["description"] = request.structured_text.description
         payload["response_format"] = {"type": "json_schema", "json_schema": schema}
+    elif request.json_object_output:
+        payload["response_format"] = {"type": "json_object"}
     if request.maximum_output_tokens is not None:
         payload[token_limit_key] = request.maximum_output_tokens
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
@@ -352,3 +370,19 @@ def openai_compatible_stream_payload(
                 model_id, effective_reasoning_effort
             )
     return payload
+
+
+def _instruct_json_object(messages: list[JsonObject]) -> None:
+    """Add the JSON-mode instruction without a second system turn on strict templates."""
+    if messages and messages[0].get("role") == "system":
+        content = messages[0].get("content")
+        if isinstance(content, str):
+            messages[0]["content"] = f"{content}\n\n{JSON_OBJECT_SYSTEM_INSTRUCTION}"
+            return
+        if isinstance(content, list):
+            messages[0]["content"] = [
+                *content,
+                {"type": "text", "text": JSON_OBJECT_SYSTEM_INSTRUCTION},
+            ]
+            return
+    messages.insert(0, {"role": "system", "content": JSON_OBJECT_SYSTEM_INSTRUCTION})

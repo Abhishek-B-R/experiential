@@ -21,6 +21,7 @@ fn output_tokens_lead_a_turn_but_control_frames_do_not() {
     .is_output_token());
     // A tool-only turn's first token is the tool call itself.
     assert!(Event::ToolCallStarted {
+        custom: false,
         namespace: None,
         caller: None,
         index: 0,
@@ -60,12 +61,126 @@ fn output_tokens_lead_a_turn_but_control_frames_do_not() {
 }
 
 #[test]
-fn openai_compatible_usage_counts_absent_fields_as_zero() {
+fn openai_compatible_usage_preserves_unknown_primary_counts() {
     let usage = openai_compatible_usage(&json!({"prompt_tokens": 7})).expect("valid usage");
     assert_eq!(usage.input_tokens, Some(7));
-    assert_eq!(usage.output_tokens, Some(0));
+    assert_eq!(usage.output_tokens, None);
     assert_eq!(usage.cached_input_tokens, None);
     assert_eq!(usage.reasoning_tokens, None);
+}
+
+#[test]
+fn openai_and_bedrock_usage_preserve_primary_absence_and_explicit_zero() {
+    for usage in [
+        openai_usage(Some(&json!({}))).unwrap().unwrap(),
+        openai_compatible_usage(&json!({})).unwrap(),
+        bedrock_usage(Some(&json!({}))).unwrap(),
+    ] {
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, None);
+    }
+    for usage in [
+        openai_usage(Some(&json!({"output_tokens":0})))
+            .unwrap()
+            .unwrap(),
+        openai_compatible_usage(&json!({"completion_tokens":0})).unwrap(),
+        bedrock_usage(Some(&json!({"outputTokens":0}))).unwrap(),
+    ] {
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, Some(0));
+    }
+    assert_eq!(
+        bedrock_usage(Some(&json!({"cacheReadInputTokens":5})))
+            .unwrap()
+            .input_tokens,
+        None
+    );
+    assert_eq!(
+        openai_usage(Some(
+            &json!({"input_tokens_details":{"cache_write_tokens":5}})
+        ))
+        .unwrap()
+        .unwrap()
+        .input_tokens,
+        None
+    );
+}
+
+#[test]
+fn observed_usage_merge_is_cumulative_and_clears_unknown_cache_ttl() {
+    let mut usage = Usage {
+        input_tokens: Some(13),
+        output_tokens: Some(7),
+        cache_creation_input_tokens: Some(5),
+        cache_creation_1h_input_tokens: Some(3),
+        ..Usage::default()
+    };
+    usage.merge_observed(&Usage::default());
+    assert_eq!(usage.output_tokens, Some(7));
+    assert_eq!(usage.cache_creation_1h_input_tokens, Some(3));
+    usage.merge_observed(&Usage {
+        output_tokens: Some(2),
+        cache_creation_input_tokens: Some(6),
+        ..Usage::default()
+    });
+    assert_eq!(usage.output_tokens, Some(7));
+    assert_eq!(usage.cache_creation_input_tokens, Some(6));
+    assert_eq!(usage.cache_creation_1h_input_tokens, None);
+}
+
+#[test]
+fn observed_ttl_only_tracks_the_current_covering_write_total() {
+    let mut usage = Usage {
+        cache_creation_input_tokens: Some(20),
+        ..Usage::default()
+    };
+    // A stale snapshot cannot restore a breakdown of only the old allocation.
+    usage.merge_observed(&Usage {
+        cache_creation_input_tokens: Some(10),
+        cache_creation_1h_input_tokens: Some(5),
+        ..Usage::default()
+    });
+    assert_eq!(usage.cache_creation_input_tokens, Some(20));
+    assert_eq!(usage.cache_creation_1h_input_tokens, None);
+    // An equal total can refine its previously unknown breakdown.
+    usage.merge_observed(&Usage {
+        cache_creation_input_tokens: Some(20),
+        cache_creation_1h_input_tokens: Some(7),
+        ..Usage::default()
+    });
+    usage.merge_observed(&Usage {
+        cache_creation_input_tokens: Some(20),
+        ..Usage::default()
+    });
+    assert_eq!(usage.cache_creation_1h_input_tokens, Some(7));
+    // Neither a lower total nor its larger TTL subset revises current facts.
+    usage.merge_observed(&Usage {
+        cache_creation_input_tokens: Some(10),
+        cache_creation_1h_input_tokens: Some(9),
+        ..Usage::default()
+    });
+    assert_eq!(usage.cache_creation_1h_input_tokens, Some(7));
+    usage.merge_observed(&Usage {
+        cache_creation_input_tokens: Some(30),
+        ..Usage::default()
+    });
+    assert_eq!(usage.cache_creation_1h_input_tokens, None);
+    // A TTL-only refinement needs a known covering total and must fit it.
+    for (total, hour, expected) in [
+        (Some(30), 12, Some(12)),
+        (Some(30), 31, None),
+        (None, 12, None),
+    ] {
+        let mut partial = Usage {
+            cache_creation_input_tokens: total,
+            ..Usage::default()
+        };
+        partial.merge_observed(&Usage {
+            cache_creation_1h_input_tokens: Some(hour),
+            ..Usage::default()
+        });
+        assert_eq!(partial.cache_creation_1h_input_tokens, expected);
+    }
 }
 
 #[test]
@@ -116,6 +231,8 @@ fn bedrock_usage_folds_cache_legs_and_rejects_unrepresentable_totals() {
     .expect("valid usage");
     assert_eq!(usage.input_tokens, Some(12));
     assert_eq!(usage.cached_input_tokens, Some(2));
+    assert_eq!(usage.cache_creation_input_tokens, Some(1));
+    assert_eq!(usage.cache_creation_1h_input_tokens, None);
     // A leg beyond the persistable ledger range fails at the parser.
     assert!(bedrock_usage(Some(&json!({
         "inputTokens": MAXIMUM_LEDGER_COUNT + 1,
@@ -543,4 +660,50 @@ fn custom_tool_input_passes_through_the_hold_back_untouched() {
         tool.complete().expect("freeform").raw_arguments,
         "{}\"\" ls -la"
     );
+}
+
+#[test]
+fn openai_cache_write_subsets_survive_normalization() {
+    let chat = openai_compatible_usage(&json!({
+        "prompt_tokens": 105, "completion_tokens": 3,
+        "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 100}
+    }))
+    .expect("valid cache write");
+    assert_eq!(chat.input_tokens, Some(105));
+    assert_eq!(chat.cache_creation_input_tokens, Some(100));
+    let responses = openai_usage(Some(&json!({
+        "input_tokens": 105, "output_tokens": 3,
+        "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 100}
+    })))
+    .expect("valid cache write")
+    .expect("usage");
+    assert_eq!(responses.input_tokens, chat.input_tokens);
+    assert_eq!(responses.cache_creation_input_tokens, Some(100));
+    assert!(openai_compatible_usage(&json!({
+        "prompt_tokens": 105, "prompt_tokens_details": {"cache_write_tokens": -1}
+    }))
+    .is_err());
+}
+
+#[test]
+fn cache_subsets_cannot_exceed_openai_total_input() {
+    for (reads, writes) in [(0, 11), (6, 5), (11, 0)] {
+        assert!(openai_compatible_usage(&json!({
+            "prompt_tokens": 10, "completion_tokens": 1,
+            "prompt_tokens_details": {"cached_tokens": reads, "cache_write_tokens": writes}
+        }))
+        .is_err());
+        assert!(openai_usage(Some(&json!({
+            "input_tokens": 10, "output_tokens": 1,
+            "input_tokens_details": {"cached_tokens": reads, "cache_write_tokens": writes}
+        })))
+        .is_err());
+    }
+    let usage = openai_compatible_usage(&json!({
+        "prompt_tokens": 10, "completion_tokens": 1,
+        "prompt_tokens_details": {"cached_tokens": 6, "cache_write_tokens": 4}
+    }))
+    .unwrap();
+    assert_eq!(usage.cached_input_tokens, Some(6));
+    assert_eq!(usage.cache_creation_input_tokens, Some(4));
 }

@@ -31,6 +31,7 @@ from exp.runtime.models.providers.tinker_sampling import (
     TinkerSampler,
 )
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
+from exp.runtime.models.providers.typesafe import TYPESAFE_BASE_URL, TypeSafeClient
 from exp.runtime.models.registry import ModelConnectionError, RuntimeModelCatalog
 
 _DEFAULT_CAPABILITIES = ModelCapabilities(
@@ -88,6 +89,51 @@ def _catalog(
         },
         roles=ModelRoles(candidates=("fixture-model",), incumbent="fixture-model"),
     )
+
+
+def test_typesafe_resolves_native_client_without_changing_capability_identity() -> None:
+    """The registry adds a decision client, not conversational or embedding support."""
+    declared = ModelCapabilities(supports_completions=False, supports_embeddings=False)
+    runtime = RuntimeModelCatalog(
+        _catalog(provider="typesafe", capabilities=declared),
+        environment={"FIXTURE_API_KEY": "provider-secret-canary"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    resolved = runtime.resolve("fixture-model")
+    assert isinstance(resolved.client, TypeSafeClient)
+    assert resolved.client.gateway_wire_profile().url == f"{TYPESAFE_BASE_URL}/systemone"
+    assert resolved.embedding_client is None
+    assert resolved.capabilities == declared
+    assert resolved.snapshot.capabilities_sha256 == declared.identity_sha256()
+    assert "provider-secret-canary" not in repr(resolved)
+
+
+def test_typesafe_preserves_fixed_origin_policy_and_trusted_https_override() -> None:
+    """Custom endpoints stay denied unless the existing explicit trust opt-in is present."""
+    with pytest.raises(ValueError, match="built-in official endpoint"):
+        _catalog(provider="typesafe", base_url="https://example.test/v1")
+    with pytest.raises(ValueError, match="https base_url"):
+        ConnectionConfig(
+            provider="typesafe",
+            base_url="http://127.0.0.1:9/v1",
+            api_key_env="FIXTURE_API_KEY",
+            trusted_custom_origin=True,
+        )
+    catalog = _catalog(provider="typesafe")
+    connection = ConnectionConfig(
+        provider="typesafe",
+        base_url="https://example.test/v1",
+        api_key_env="FIXTURE_API_KEY",
+        trusted_custom_origin=True,
+    )
+    runtime = RuntimeModelCatalog(
+        catalog.model_copy(update={"connections": {"primary": connection}}),
+        environment={"FIXTURE_API_KEY": "provider-secret-canary"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    client = runtime.resolve("fixture-model").client
+    assert isinstance(client, TypeSafeClient)
+    assert client.gateway_wire_profile().url == "https://example.test/v1/systemone"
 
 
 def test_snapshot_is_credential_free_and_records_capability_digest() -> None:
@@ -576,3 +622,27 @@ def test_resolution_threads_system_messages_leading_only_to_compatible_rungs() -
     resolved = catalog.resolve("fixture-model")
     assert isinstance(resolved.client, OpenAICompatibleClient)
     assert resolved.client.gateway_wire_profile().system_messages_leading_only is True
+
+
+def test_anthropic_connection_geography_reaches_both_client_paths() -> None:
+    """Catalog construction supplies both gateway and ordinary completion constraints."""
+    catalog = _catalog(provider="anthropic")
+    catalog = catalog.model_copy(
+        update={
+            "connections": {
+                "primary": ConnectionConfig(
+                    provider="anthropic", api_key_env="FIXTURE_API_KEY", inference_geo="us"
+                )
+            }
+        }
+    )
+    runtime = RuntimeModelCatalog(
+        catalog, environment={"FIXTURE_API_KEY": "fixture"}, transport_factory=ScriptedJsonTransport
+    )
+    resolved = runtime.resolve(next(iter(catalog.models)))
+    assert isinstance(resolved.client, AnthropicClient)
+    assert resolved.client.gateway_wire_profile().inference_geo == "us"
+    payload = resolved.client._build_request(
+        ModelRequest(messages=(ModelMessage(role="user", content="hi"),))
+    )
+    assert payload["inference_geo"] == "us"

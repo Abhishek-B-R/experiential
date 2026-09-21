@@ -123,6 +123,7 @@ GEMINI_PROMPT_BLOCK_EVENTS: tuple[JsonObject, ...] = (
     {
         "kind": "usage",
         "input_tokens": 42,
+        # Gemini's present usageMetadata follows proto3 scalar-zero omission.
         "output_tokens": 0,
         "cached_input_tokens": 0,
         "reasoning_tokens": None,
@@ -466,6 +467,7 @@ BEDROCK_GOLDEN_EVENTS: tuple[JsonObject, ...] = (
         "input_tokens": 12,
         "output_tokens": 4,
         "cached_input_tokens": 2,
+        "cache_creation_input_tokens": 1,
         "reasoning_tokens": None,
     },
     {"kind": "completed"},
@@ -619,7 +621,9 @@ ANTHROPIC_THINKING_EVENTS: tuple[JsonObject, ...] = (
 )
 
 
-def _anthropic_start_usage(input_tokens: int, output_tokens: int, cached: int) -> dict[str, object]:
+def _anthropic_start_usage(
+    input_tokens: int, output_tokens: int | None, cached: int
+) -> dict[str, object]:
     """The usage event an Anthropic ``message_start`` now surfaces before content.
 
     The start-frame meters reach the Messages encoder's own ``message_start``
@@ -639,7 +643,8 @@ def test_native_anthropic_normalizer_emits_thinking_events() -> None:
     """Extended-thinking frames normalize to dedicated events, never silence."""
     result = _native_normalized("anthropic_messages", ANTHROPIC_THINKING_CHUNKS)
     assert result["failure"] is None
-    assert result["events"] == [_anthropic_start_usage(8, 0, 2), *ANTHROPIC_THINKING_EVENTS]
+    # message_start omits output_tokens; only message_delta reports its total.
+    assert result["events"] == [_anthropic_start_usage(8, None, 2), *ANTHROPIC_THINKING_EVENTS]
 
 
 # Captured from a live api.anthropic.com tool_use stream (2026-08-28,
@@ -1049,7 +1054,7 @@ def test_native_responses_preserves_multi_message_status_phase_and_idless_call()
         native.completed_responses_fixture(
             "request-official",
             "gpt-5.6-sol",
-            1_700_000_000.0,
+            1_700_000_000,
             "{}",
             events_json,
         )
@@ -1074,7 +1079,7 @@ def test_native_responses_preserves_multi_message_status_phase_and_idless_call()
     frames = native.encode_responses_fixture(
         "request-official",
         "gpt-5.6-sol",
-        1_700_000_000.0,
+        1_700_000_000,
         "{}",
         events_json,
     )
@@ -1231,7 +1236,7 @@ def test_native_responses_serves_hosted_tool_items_end_to_end() -> None:
         native.completed_responses_fixture(
             "request-hosted",
             "gpt-5.6-sol",
-            1_700_000_000.0,
+            1_700_000_000,
             "{}",
             events_json,
         )
@@ -1248,7 +1253,7 @@ def test_native_responses_serves_hosted_tool_items_end_to_end() -> None:
     frames = native.encode_responses_fixture(
         "request-hosted",
         "gpt-5.6-sol",
-        1_700_000_000.0,
+        1_700_000_000,
         "{}",
         events_json,
     )
@@ -1355,7 +1360,7 @@ def test_native_responses_serves_a_budget_truncated_function_call_as_incomplete(
         native.completed_responses_fixture(
             "request-astra",
             "gpt-6-astra",
-            1_700_000_000.0,
+            1_700_000_000,
             "{}",
             events_json,
         )
