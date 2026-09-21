@@ -12,7 +12,7 @@ The served request is unchanged. See [the hosting contract](gateway_capture.md).
 
 ## Local collection
 
-Normal local gateway startup captures completed Chat Completions and Responses
+Normal local gateway startup captures completed Chat Completions, Responses and Messages
 exchanges for its authenticated identity grants. No hosted account or existing
 router project is required. Traffic using your own provider keys is included.
 
@@ -63,7 +63,7 @@ Missing context or unsupported output is excluded with a reason, not repaired.
 Unrelated chats are not joined by matching their prompt text. The first bounded
 page contains up to 1,000 retained records, the build's existing corpus ceiling.
 
-This collection path covers JSON and SSE on Chat Completions and Responses.
-Messages, WebSocket, batch, image and embedding traffic are not captured by this
+This collection path covers JSON and SSE on Chat Completions, Responses and Messages.
+WebSocket, batch, image and embedding traffic are not captured by this
 local collector. An exchange is not a complete external-agent episode: tool
 implementations and effects absent from subsequent traffic cannot be reconstructed.
