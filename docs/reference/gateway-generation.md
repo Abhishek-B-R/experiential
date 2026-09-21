@@ -94,10 +94,12 @@ comments are not retained as replay content. Requests without an operation key a
 submissions even when their prompts match; the gateway does not deduplicate unrelated callers
 by transcript contents.
 
-Some providers supply usage only at the end. A disconnected request without a final provider
-meter carries the internal `usage_incomplete_due_to_disconnect` accounting signal even when
-partial counts are known. A host must reconcile that unresolved liability separately from
-settled spend. Stopping generation is not evidence that its unreported usage was free.
+Some providers supply usage only at the end. A dispatched request canceled before a provider
+terminal is observed carries the internal `usage_incomplete_due_to_disconnect` accounting signal
+even when partial counts are known. A host must reconcile that unresolved liability separately
+from settled spend. An observed terminal with missing usage retains the host's unknown-terminal
+policy; this marker does not broaden that policy. Stopping generation is not evidence that its
+unreported usage was free.
 
 Meter parsing follows the provider's wire contract. Missing primary counts on partial
 OpenAI, Anthropic, or Bedrock reports remain unknown. Gemini's present `usageMetadata` uses
