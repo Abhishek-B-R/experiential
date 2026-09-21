@@ -11,6 +11,12 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
+from exp.runtime.gateway.tool_search.contracts import gateway_tool_search_name
+from exp.runtime.models.providers.codex_tools import (
+    NativeToolMapping,
+    convert_native_history,
+    translate_native_tools,
+)
 from exp.runtime.models.providers.dialect_dispatch import (
     CACHE_CONTROL_NOT_FORWARDED_SUFFIX,
     THINKING_HISTORY_DROP_DISCLOSURE,
@@ -89,8 +95,6 @@ from exp.runtime.models.providers.server_tools import (
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
 
-_ANTHROPIC_REQUIRED_MAX_TOKENS_DEFAULT = 4096
-
 TOOL_ERROR_FOLD_DISCLOSURE = "messages.content.is_error->content"
 """Disclosure recorded when a tool-result error flag folds into result text.
 
@@ -102,11 +106,9 @@ silent drop would misstate that the invocation failed.
 """
 
 OPENAI_MINIMUM_OUTPUT_TOKENS = 16
-"""Smallest ``max_output_tokens`` the OpenAI wires accept.
+"""Smallest ``max_output_tokens`` the OpenAI Responses wire accepts.
 
-The provider rejects lower values by name ("Expected a value >= 16"), while
-the Anthropic surface legally carries ``max_tokens`` down to 1, so
-Messages-surface requests below the floor are raised to it with disclosure.
+A smaller explicit caller ceiling is refused, never increased during translation.
 """
 
 _STRICT_STRUCTURED_OUTPUT_DIALECTS = frozenset(
@@ -186,74 +188,27 @@ def route_generation_parameter_requests(
                 param=param,
                 code="invalid_parameter",
             )
-        # Two floors, one rewrite. The OpenAI wire floor is a TRANSLATION
-        # fact: Anthropic and Chat Completions accept output ceilings down to
-        # 1 (Claude Code probes with exactly that after a /model switch) while
-        # OpenAI rejects max_output_tokens below 16, so a Messages or Chat
-        # value translated onto an OpenAI Responses rung rides the provider
-        # floor with disclosure instead of surfacing a provider 400 the
-        # caller cannot act on (2026-09-05 stragglers). A Chat value keeps
-        # native semantics on a chat wire (some compatible providers accept
-        # an output ceiling of 1); only the TRANSLATED Responses wire imposes
-        # OpenAI's minimum. A native Responses caller keeps the named
-        # admission rejection below: sub-16 is invalid on its own surface.
-        translated_onto_openai_wire = (
-            request.surface == GatewayApiSurface.MESSAGES
-            and any(
-                profile.dialect in {"openai_responses", "openai_compatible"} for profile in profiles
-            )
-        ) or (
-            request.surface == GatewayApiSurface.CHAT_COMPLETIONS
-            and any(profile.dialect == "openai_responses" for profile in profiles)
-        )
-        # The declared floor is a LANE fact the catalog stamps per rung
-        # (``GatewayWireProfile.minimum_output_tokens``): a provider that
-        # refuses small ceilings on a wire that natively carries them
-        # (Perplexity sonar and Sakana fugu via OpenRouter, grok-4.6 on
-        # Bedrock: "max_tokens must be at least 16"). It floors on EVERY
-        # surface, because the refusal is the provider's, not the wire's.
-        # The route floors to the LARGEST minimum any rung declares, so no
-        # rung of the waterfall dispatches a value it would refuse. A native
-        # Responses request on an all-Responses route is the one exception:
-        # sub-16 is invalid on its own surface and keeps the named admission
-        # rejection below, whatever a rung declares.
-        native_responses_route = request.surface == GatewayApiSurface.RESPONSES and all(
-            profile.dialect == "openai_responses" for profile in profiles
-        )
+        # A ceiling is caller authority, not a sampling preference. A rung
+        # that cannot accept it narrows out instead of increasing the budget.
         output_floor = max(
-            (
-                OPENAI_MINIMUM_OUTPUT_TOKENS if translated_onto_openai_wire else 0,
-                *(
-                    profile.minimum_output_tokens
-                    for profile in profiles
-                    if profile.minimum_output_tokens is not None and not native_responses_route
-                ),
+            max(
+                profile.minimum_output_tokens or 0,
+                OPENAI_MINIMUM_OUTPUT_TOKENS if profile.dialect == "openai_responses" else 0,
             )
-        )
-        if (
-            request.maximum_output_tokens < output_floor
-            # The floored value must stay within every rung's declared output
-            # ceiling; a route capped below the floor keeps the caller value
-            # and the provider's own rejection.
-            and (not route_limits or min(route_limits) >= output_floor)
-        ):
-            provider_updates["maximum_output_tokens"] = output_floor
-            parameter = request.maximum_output_tokens_parameter or "max_tokens"
-            path = f"{parameter}->{output_floor}"
-            if path not in ignored:
-                ignored.append(path)
-    elif any(profile.dialect == "anthropic_messages" for profile in profiles):
-        # Anthropic requires max_tokens even when the public surface does not.
-        # Pin one route-wide default so every waterfall rung sees the same
-        # output budget, bounded by the smallest known model ceiling.
-        route_limits = tuple(
-            profile.maximum_output_tokens
             for profile in profiles
-            if profile.maximum_output_tokens is not None
         )
-        provider_updates["maximum_output_tokens"] = min(
-            (_ANTHROPIC_REQUIRED_MAX_TOKENS_DEFAULT, *route_limits)
-        )
+        if request.maximum_output_tokens < output_floor:
+            parameter = request.maximum_output_tokens_parameter or "max_tokens"
+            raise ProviderParameterError(
+                message=(
+                    f"The parameter {parameter!r} must be at least {output_floor} on this "
+                    "model route. Raise the value or choose a model that accepts this ceiling."
+                ),
+                param=parameter,
+                code="invalid_parameter",
+            )
+    # Omission stays on the shared request. A required wire derives its own
+    # ceiling at payload build, never from the tightest fallback's limit.
     # The rejection names the field the CALLER sent (the request knows which
     # of its surface's effort fields carried the value; see the property).
     effort_path = request.caller_effort_parameter
@@ -527,7 +482,7 @@ def route_generation_parameter_requests(
     # from the winning Anthropic rung too, billing every turn's full context
     # uncached (~10x on input for a large system prompt).
     if request.provider_cache_control is not None and not any(
-        profile.dialect == "anthropic_messages" for profile in profiles
+        profile.preserves_cache_control for profile in profiles
     ):
         ignore("provider_cache_control", f"cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}")
     if request.inference_geo is not None and not all(
@@ -587,7 +542,7 @@ def route_generation_parameter_requests(
         call.cache_control is not None
         for message in request.messages
         for call in message.tool_calls
-    ) and not all(profile.dialect == "anthropic_messages" for profile in profiles):
+    ) and not all(profile.preserves_cache_control for profile in profiles):
         tool_call_marker = f"messages.tool_calls.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}"
         if tool_call_marker not in ignored:
             ignored.append(tool_call_marker)
@@ -599,35 +554,41 @@ def route_generation_parameter_requests(
     # them. Claude Code marks its system prompt and conversation
     # breakpoints on every request.
     if any(
-        message.provider_text_blocks or message.cache_control is not None
+        message.provider_text_blocks
+        or message.cache_control is not None
+        or any(
+            part.cache_control is not None
+            for part in message.content_parts
+            if part.kind == "text" or part.kind == "image" or part.kind == "document"
+        )
         for message in request.messages
-    ) and not any(profile.dialect == "anthropic_messages" for profile in profiles):
+    ) and not any(profile.preserves_cache_control for profile in profiles):
         content_marker = f"messages.content.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}"
         if content_marker not in ignored:
             ignored.append(content_marker)
 
-    # LiteLLM stamps ``provider_specific_fields`` on every assistant message it
-    # returns, and naive agent loops echo the dump back verbatim. No wire takes
-    # the object, so it is dropped on every route with disclosure, never a
-    # rejection (the 400 wedged whole Terminus-2 sessions, 2026-09-05).
+    # LiteLLM's echoed provider_specific_fields: no wire takes it; dropped with disclosure.
     if any(message.provider_specific_fields for message in request.messages):
         if "messages.provider_specific_fields" not in ignored:
             ignored.append("messages.provider_specific_fields")
 
-    # Anthropic-native tool-definition annotations exist only on that wire;
-    # every other rung drops each one with a per-field disclosure, never a
-    # rejection (Claude Code sends eager_input_streaming conditionally).
+    # Anthropic tool annotations (and Responses defer_loading) drop elsewhere with disclosure.
     if not all(profile.dialect == "anthropic_messages" for profile in profiles):
         tool_annotation_paths = (
             (
                 f"tools.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}",
-                any(tool.cache_control is not None for tool in request.tools),
+                any(tool.cache_control is not None for tool in request.tools)
+                and not all(profile.preserves_cache_control for profile in profiles),
             ),
             (
                 "tools.eager_input_streaming",
                 any(tool.eager_input_streaming is not None for tool in request.tools),
             ),
-            ("tools.defer_loading", any(tool.defer_loading is not None for tool in request.tools)),
+            (
+                "tools.defer_loading",
+                any(tool.defer_loading is not None for tool in request.tools)
+                and not all(profile.dialect == "openai_responses" for profile in profiles),
+            ),
             (
                 "tools.allowed_callers",
                 any(tool.allowed_callers is not None for tool in request.tools),
@@ -772,56 +733,48 @@ def route_generation_parameter_requests(
         provider_updates["provider_server_tools"] = ()
         if clear_tool_choice:
             provider_updates["tool_choice"] = None
-    if any(message.provider_native_item is not None for message in request.messages) and not all(
-        profile.dialect == "openai_responses" for profile in profiles
-    ):
-        raise ProviderParameterError(
-            message=(
-                "The request carries native Responses input items (tool namespaces, "
-                "custom tool calls, or hosted tool items such as web_search_call and "
-                "mcp_call echoes) that only a native OpenAI Responses route can serve. "
-                "Choose a different model alias."
-            ),
-            param="input",
-            code="unsupported_parameter",
-        )
-    outbound_maximum_output_tokens = provider_updates.get(
-        "maximum_output_tokens", request.maximum_output_tokens
+    # Codex native Responses tool declarations/history serve verbatim only on a
+    # native Responses rung; a foreign wire gets them translated to function
+    # tools (namespaces hoisted, custom tools as one ``input`` function; hosted
+    # web_search/tool_search dropped with disclosure). The inverse mapping rides
+    # on the provider request so the response path re-shapes tool calls back.
+    native_history_present = any(
+        message.provider_native_item is not None for message in request.messages
     )
-    if (
-        isinstance(outbound_maximum_output_tokens, int)
-        and outbound_maximum_output_tokens < OPENAI_MINIMUM_OUTPUT_TOKENS
-        and all(profile.dialect == "openai_responses" for profile in profiles)
-    ):
-        # The provider's own 400 for this is post-dispatch and opaque on some
-        # relays; the documented Responses minimum is a request fact, so it is
-        # rejected at admission with the bound named. The value judged is the
-        # one that would dispatch: a Messages-surface probe already floored
-        # with disclosure above never reaches this rejection, while a route
-        # whose declared ceiling sits below the floor cannot ride it and gets
-        # the named minimum instead of the provider's opaque 400.
-        parameter = request.maximum_output_tokens_parameter or "max_output_tokens"
-        raise ProviderParameterError(
-            message=(
-                f"The parameter {parameter!r} must be at least 16 on this model route "
-                "(the OpenAI Responses minimum). Raise the value and resend the request."
-            ),
-            param=parameter,
-            code="invalid_parameter",
-        )
-    if request.provider_native_tools and not all(
+    if (request.provider_native_tools or native_history_present) and not all(
         profile.dialect == "openai_responses" for profile in profiles
     ):
-        raise ProviderParameterError(
-            message=(
-                "The request carries native Responses tool declarations (custom, "
-                "namespace, web_search, or tool_search entries) that only a native "
-                "OpenAI Responses route can serve. Remove those tools or choose a "
-                "different model alias."
-            ),
-            param="tools",
-            code="unsupported_parameter",
-        )
+        native_mapping = NativeToolMapping()
+        if request.provider_native_tools:
+            translation = translate_native_tools(request)
+            native_mapping = translation.mapping
+            provider_updates["tools"] = translation.tools
+            provider_updates["provider_native_tools"] = ()
+            for disclosure in translation.disclosures:
+                if disclosure not in ignored:
+                    ignored.append(disclosure)
+            if not translation.tools and (
+                request.tool_choice == "required"
+                or isinstance(request.tool_choice, GatewayNamedToolChoice)
+            ):
+                provider_updates["tool_choice"] = None
+                if "tool_choice->cleared(no_serviceable_tool)" not in ignored:
+                    ignored.append("tool_choice->cleared(no_serviceable_tool)")
+        if native_history_present:
+            current_messages = cast(
+                "Sequence[GatewayMessage]", provider_updates.get("messages", request.messages)
+            )
+            converted, history_disclosures = convert_native_history(
+                current_messages,
+                native_mapping,
+                tool_search_name=gateway_tool_search_name(tool.name for tool in request.tools),
+            )
+            provider_updates["messages"] = converted
+            for disclosure in history_disclosures:
+                if disclosure not in ignored:
+                    ignored.append(disclosure)
+        if native_mapping:
+            provider_updates["native_tool_translation"] = native_mapping.as_dict()
 
     if any(profile.dialect == "anthropic_messages" for profile in profiles) and any(
         message.role == "user"

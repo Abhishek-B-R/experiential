@@ -108,6 +108,9 @@ class GatewayWireProfile:
     headers: Mapping[str, str] = field(default_factory=dict, repr=False)
     """Authenticated request headers for every dispatch, excluded from diagnostics."""
 
+    inference_geo: Literal["us"] | None = field(default=None, kw_only=True)
+    """Operator constraint applied after caller payload shaping on each Anthropic attempt."""
+
     model_id: str = ""
     """Exact provider model identifier."""
 
@@ -153,6 +156,16 @@ class GatewayWireProfile:
     charges while the gateway bills catalog rates, so the field never
     reaches the provider there.
     """
+
+    forwards_cache_control: bool = False
+    """Whether this Chat adapter accepts explicit Anthropic cache markers."""
+
+    @property
+    def preserves_cache_control(self) -> bool:
+        """Whether this adapter can carry or translate explicit cache checkpoints."""
+        return self.dialect in {"anthropic_messages", "bedrock_converse_stream"} or (
+            self.dialect == "openai_compatible" and self.forwards_cache_control
+        )
 
     minimum_temperature: float = 0.0
     """Smallest temperature value accepted by this provider wire."""
@@ -271,11 +284,9 @@ class GatewayWireProfile:
     minimum_output_tokens: int | None = None
     """Smallest output-token ceiling this rung's provider accepts, when declared.
 
-    Catalog-declared (``GatewayDeploymentCapabilities.minimum_output_tokens``),
-    never derived from the dialect: a caller ceiling below it is floored with
-    disclosure on every surface instead of dispatching a value the provider
-    400s (Perplexity sonar and Sakana fugu via OpenRouter, grok-4.6 on
-    Bedrock all refuse ``max_tokens < 16`` on the Chat wire)."""
+    Catalog-declared (``GatewayDeploymentCapabilities.minimum_output_tokens``).
+    A smaller explicit caller ceiling is refused before dispatch, never raised.
+    Route selection may keep another rung that accepts the caller's ceiling."""
 
     signs_request_body: bool = False
     """Whether dispatch headers are computed per request over the exact

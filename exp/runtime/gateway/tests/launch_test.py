@@ -633,7 +633,9 @@ def _configure_gateway(
         provider_model="provider-model-exact",
         exact_model_id="model-revision-exact",
         revision=None,
-        capabilities=ModelCapabilities(supports_tools=supports_tools),
+        capabilities=ModelCapabilities(
+            supports_tools=supports_tools, maximum_output_tokens=128_000
+        ),
         gateway_capabilities=GatewayDeploymentCapabilities(
             supports_streaming=True, supports_streaming_tool_arguments=supports_tools
         ),
