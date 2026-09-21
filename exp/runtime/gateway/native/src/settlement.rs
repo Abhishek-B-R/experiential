@@ -219,6 +219,8 @@ pub struct AttemptGuard {
     /// diverge from the recorded metric.
     decided_settlement: Option<String>,
     pub started: Instant,
+    /// Credible usage from a fully buffered decision response, independent of answer validity.
+    decision_usage: Option<Usage>,
     /// Wall-clock time the winning attempt streamed its first output token,
     /// reported in the finalizing settlement so the control plane can derive
     /// time-to-first-token. `None` until an attempt observes a first token.
@@ -284,6 +286,7 @@ impl AttemptGuard {
             opened: false,
             decided_settlement: None,
             started,
+            decision_usage: None,
             first_token_at: None,
             rate_limit_headers: None,
             upstream_provider: None,
@@ -308,6 +311,7 @@ impl AttemptGuard {
     pub fn rebind(&mut self, attempt_id: String) {
         self.attempt_id = Some(attempt_id);
         self.opened = false;
+        self.decision_usage = None;
         self.decided_settlement = None;
         // Each physical attempt observes its own first token; a prior failed
         // attempt's timing never carries into its successor. The same holds
@@ -342,6 +346,11 @@ impl AttemptGuard {
     /// serving it (an aggregator's per-chunk provider label), for settlement.
     pub fn record_upstream_provider(&mut self, provider: Option<String>) {
         self.upstream_provider = provider;
+    }
+
+    /// Preserve independently validated decision usage even if answer validation fails.
+    pub fn record_decision_usage(&mut self, usage: Usage) {
+        self.decision_usage = Some(usage);
     }
 
     /// Record this request's terminal outcome and duration exactly once, at
@@ -385,7 +394,7 @@ impl AttemptGuard {
             &self.request_id,
             &attempt_id,
             outcome,
-            usage,
+            usage.or(self.decision_usage.as_ref()),
             tool_names,
             failure,
             finalize,
@@ -493,7 +502,7 @@ impl Drop for AttemptGuard {
                             &self.request_id,
                             &attempt_id,
                             "failed",
-                            None,
+                            self.decision_usage.as_ref(),
                             &[],
                             Some(&Failure::new(
                                 FailureClass::Cancelled,

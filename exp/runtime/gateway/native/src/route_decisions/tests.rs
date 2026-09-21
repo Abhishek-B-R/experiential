@@ -586,12 +586,32 @@ fn buffered_success_reports_opened_and_both_exact_usage_counts() {
 }
 
 #[test]
-fn malformed_buffer_is_failed_without_inventing_billable_usage() {
+fn malformed_buffer_preserves_credible_usage_without_inventing_missing_counts() {
     let mut zero_usage = payload();
     zero_usage["usage"] = json!({"input_tokens": 0, "output_tokens": 0});
     let mut wrong_choice = payload();
     wrong_choice["answers"]["department"]["choice"] = json!("technical");
-    for malformed_payload in [json!({"answers": {}}), zero_usage, wrong_choice] {
+    let mut wrong_score = payload();
+    wrong_score["answers"]["quantity"]["score"] = json!(1.9);
+    let mut wrong_distribution = payload();
+    wrong_distribution["answers"]["quantity"]["probabilities"]["2"] = json!(0.8);
+    let mut partial_usage = wrong_choice.clone();
+    partial_usage["usage"]
+        .as_object_mut()
+        .unwrap()
+        .remove("output_tokens");
+    let mut negative_usage = wrong_choice.clone();
+    negative_usage["usage"]["input_tokens"] = json!(-1);
+    for malformed_payload in [
+        json!({"answers": {}}),
+        zero_usage,
+        wrong_choice,
+        wrong_score,
+        wrong_distribution,
+        partial_usage,
+        negative_usage,
+    ] {
+        let expected_usage = decision_usage(&malformed_payload).ok();
         block_on(async {
             let (mut guard, observer, _) = guarded();
             let response = response(serde_json::to_vec(&malformed_payload).unwrap());
@@ -616,7 +636,19 @@ fn malformed_buffer_is_failed_without_inventing_billable_usage() {
             assert_eq!(written[0]["outcome"], "failed");
             assert_eq!(written[0]["failure"]["failure_class"], "malformed_response");
             assert_eq!(written[0]["decision_provider_rejected"], false);
-            assert_eq!(written[0]["usage"], Value::Null);
+            match &expected_usage {
+                Some(usage) => {
+                    assert_eq!(
+                        written[0]["usage"]["input_tokens"],
+                        usage.input_tokens.unwrap()
+                    );
+                    assert_eq!(
+                        written[0]["usage"]["output_tokens"],
+                        usage.output_tokens.unwrap()
+                    );
+                }
+                None => assert_eq!(written[0]["usage"], Value::Null),
+            }
             assert_eq!(written[0]["finalize"], true);
         });
     }
@@ -683,4 +715,36 @@ fn bounded_reader_enforces_phase_deadline_and_size_without_content_length() {
         assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
         assert_eq!(failure.safe_message, OUTPUT_OVERFLOW_MESSAGE);
     });
+}
+
+#[test]
+fn independently_observed_usage_survives_cancellation_but_not_rebinding() {
+    for rebind in [false, true] {
+        block_on(async {
+            let (mut guard, observer, pending) = guarded();
+            guard.mark_opened();
+            guard.record_decision_usage(decision_usage(&payload()).unwrap());
+            if rebind {
+                guard.rebind("attempt-2".into());
+            }
+            drop(guard);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while pending.load(Ordering::SeqCst) != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancellation settlement drains");
+            let written = calls(&observer);
+            assert_eq!(written.as_array().unwrap().len(), 1);
+            assert_eq!(written[0]["failure"]["failure_class"], "cancelled");
+            if rebind {
+                assert_eq!(written[0]["usage"], Value::Null);
+                assert_eq!(written[0]["attempt_id"], "attempt-2");
+            } else {
+                assert_eq!(written[0]["usage"]["input_tokens"], 451);
+                assert_eq!(written[0]["usage"]["output_tokens"], 68);
+            }
+        });
+    }
 }
