@@ -30,6 +30,7 @@ from exp.runtime.gateway.contracts import (
     GatewayTarget,
     ProjectTarget,
 )
+from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.interfaces import GatewayClock
@@ -58,6 +59,10 @@ class GatewayStoreError(ValueError):
 
 class InvalidVirtualKeyError(GatewayStoreError):
     """A virtual key is unknown, expired, revoked, or attached to disabled authority."""
+
+
+class ZdrRoutingUnavailableError(GatewayStoreError):
+    """A request demanded zero-data-retention routing this gateway cannot judge."""
 
 
 class AliasNotGrantedError(GatewayStoreError):
@@ -677,13 +682,20 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                 catalog_sha256=str(row["catalog_sha256"]),
             )
         match request:
-            case EmbeddingsRequest() | ImagesRequest():
-                # Keyed replay is deferred for the embeddings and images
-                # surfaces: they carry no idempotency key and never claim a
-                # caller-operation scope.
+            case EmbeddingsRequest() | ImagesRequest() | DecisionRequest():
+                # These native surfaces carry no idempotency key and never
+                # claim a caller-operation scope.
                 caller_operation = None
             case GatewayRequest():
                 caller_operation = _caller_operation_sha256(request)
+                if request.zdr_requested:
+                    # This gateway publishes no provider data-retention
+                    # postures, so a zero-data-retention demand cannot be
+                    # judged; refusing is the only honest answer.
+                    raise ZdrRoutingUnavailableError(
+                        "provider.zdr demands zero-data-retention routing, which this "
+                        "gateway cannot judge: it publishes no provider data-retention postures"
+                    )
             case _:  # pragma: no cover - exhaustive over the ServingRequest union.
                 assert_never(request)
         return AuthorizationSnapshot(

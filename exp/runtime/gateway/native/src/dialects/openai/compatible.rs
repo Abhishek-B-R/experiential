@@ -8,7 +8,7 @@ use super::super::{
     finish_open_tools_relay, finish_open_tools_truncated, malformed, parse_object, Normalizer,
 };
 use crate::errors::Failure;
-use crate::events::{openai_compatible_usage, require_u64, Event, ToolAccumulator};
+use crate::events::{require_u64, Event, ToolAccumulator};
 
 /// One optional wire text: absent or null reads as `None`, text as itself,
 /// and any other JSON type is the malformed shape it always was.
@@ -159,10 +159,19 @@ impl Normalizer {
             ))]);
         }
         let mut events = Vec::new();
+        // An aggregator names the upstream that serves the stream on each
+        // chunk (OpenRouter `provider`, opted in by its metadata header); the
+        // first label is kept for settlement so a zero-data-retention
+        // dispatch records which retention-free endpoint answered.
+        if let Some(Value::String(provider)) = payload.get("provider") {
+            self.note_upstream_provider(provider);
+        }
         if let Some(raw_usage) = payload.get("usage") {
             if !raw_usage.is_null() {
                 self.usage = Some(
-                    openai_compatible_usage(raw_usage).map_err(|message| malformed(&message))?,
+                    self.openai_usage
+                        .update_chat(raw_usage)
+                        .map_err(|message| malformed(&message))?,
                 );
             }
         }
@@ -277,6 +286,7 @@ impl Normalizer {
                                 tool.name = repeated_name;
                                 tool.started = true;
                                 events.push(Event::ToolCallStarted {
+                                    custom: false,
                                     index,
                                     call_id: tool.call_id.clone(),
                                     name: tool.name.clone(),
@@ -315,6 +325,7 @@ impl Normalizer {
                         tool.started = !name.is_empty();
                         if tool.started {
                             events.push(Event::ToolCallStarted {
+                                custom: false,
                                 index,
                                 call_id,
                                 name,

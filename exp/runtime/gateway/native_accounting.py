@@ -17,11 +17,11 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from typing import Final
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
-from exp.runtime.gateway.boundary import boundary_protocol_error
 from exp.runtime.gateway.budgets import (
     BudgetReservationRejected,
     BudgetScopeKind,
@@ -36,6 +36,12 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.gateway.health import DeploymentHealthRegistry
+from exp.runtime.gateway.lane_saturation import lane_saturated_failure, overflow_target
+from exp.runtime.gateway.native_accounting_errors import (
+    NativeBridgeError,
+    authority_error,
+    internal_protocol_error,
+)
 from exp.runtime.gateway.native_components import SyncWriteLedger
 from exp.runtime.gateway.native_execution import (
     THROTTLE_BACKOFF,
@@ -49,6 +55,7 @@ from exp.runtime.gateway.native_execution import (
     dispatch_disclosure,
     rung_load_key,
 )
+from exp.runtime.gateway.native_fallback_rules import eligible_ladder, rule_fallback_reason
 from exp.runtime.gateway.native_rung_policy import (
     failed_dispatch_candidate,
     reserve_rung_slot,
@@ -64,14 +71,16 @@ from exp.runtime.gateway.native_settlement import (
     ledger_failure,
     settlement_rate_limit,
     terminal_from_settlement,
+    tool_search_requests_from_terminal,
+    tool_search_requests_kwarg,
+    upstream_provider_from_settlement,
+    upstream_provider_kwarg,
+    web_search_requests_from_terminal,
+    web_search_requests_kwarg,
 )
-from exp.runtime.gateway.rate_limit_headers import RateLimitObservation
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
-from exp.runtime.openai_protocol.errors import (
-    OpenAIProtocolError,
-    public_failure_error,
-)
+from exp.runtime.openai_protocol.errors import public_failure_error
 
 _SWEEP_GRACE_SECONDS = 5.0
 _SWEEP_INTERVAL_SECONDS = 5.0
@@ -79,49 +88,8 @@ _SWEEP_BATCH = 16
 _logger = logging.getLogger(__name__)
 
 
-class NativeBridgeError(Exception):
-    """One sanitized boundary failure delivered to the native data plane."""
-
-    def __init__(self, error: OpenAIProtocolError) -> None:
-        """Retain the public error as the JSON payload the data plane returns.
-
-        Args:
-            error: Sanitized protocol error carrying its HTTP representation.
-        """
-        super().__init__(error.detail.message)
-        self.public_error_json = json.dumps(
-            {
-                "status_code": error.status_code,
-                "code": error.detail.code,
-                "message": error.detail.message,
-                "error_type": error.detail.type,
-                "param": error.detail.param,
-                "retry_after_seconds": error.retry_after_seconds,
-            },
-            separators=(",", ":"),
-        )
-
-
-def authority_error(exception: Exception) -> NativeBridgeError:
-    """Map boundary failures through the shared service-layer mapper.
-
-    Args:
-        exception: Store, grant, routing, or execution failure.
-
-    Returns:
-        A boundary error carrying the matching public OpenAI error.
-    """
-    return NativeBridgeError(boundary_protocol_error(exception))
-
-
-def internal_protocol_error() -> OpenAIProtocolError:
-    """Return the public internal error for a broken data-plane wire contract."""
-    return OpenAIProtocolError(
-        status_code=500,
-        code="internal_error",
-        message="The gateway request failed.",
-        error_type="api_error",
-    )
+TOOL_SEARCH_ROUND: Final = "tool_search_round"
+"""Dispatch reason of a same-rung re-dial after a gateway tool-search round."""
 
 
 class NativeAttemptAccounting:
@@ -140,6 +108,7 @@ class NativeAttemptAccounting:
         *,
         budget_error_factory: Callable[[str], NativeBridgeError] | None = None,
         cache_sample_gate: Callable[[str], bool] | None = None,
+        default_lane_bound: int | None = None,
     ) -> None:
         """Bind the durable ledger and start the settlement sweep.
 
@@ -147,6 +116,7 @@ class NativeAttemptAccounting:
             write_ledger: Blocking durable request and attempt ledger.
             budget_error_factory: Optional hosted mapping for a rejected
                 reservation.
+            default_lane_bound: Per-worker cap for rungs authoring no bound (lane_saturation).
             cache_sample_gate: Optional hosted predicate deciding whether one
                 settled attempt (by attempt id) may feed the cache-priority
                 EWMA. The hosted store knows which attempts are promo-funded;
@@ -157,19 +127,13 @@ class NativeAttemptAccounting:
                 skips the sample (fails closed).
         """
         self._write_ledger = write_ledger
+        self._finish_attempt: Callable[..., None] = write_ledger.finish_attempt
         self._budget_error_factory = budget_error_factory
         self._cache_sample_gate = cache_sample_gate
-        # The native waterfall's deployment-health circuits, revision-scoped
-        # to the traffic this plane serves.
+        # Revision-scoped deployment health; physical-lane load survives catalog rolls.
         self._health = DeploymentHealthRegistry()
-        # Per-worker in-flight counters and rate windows for rungs that author
-        # a dispatch policy (concurrency bound, rate caps, weighted fair
-        # share); pure in-memory arithmetic, physical-lane scoped so counters
-        # survive catalog rolls.
-        self._loads = RungLoadRegistry()
-        # Worker-local conversation-to-rung bindings under
-        # maximize_cache_affinity, so a spilled conversation keeps serving off
-        # the rung holding its warm cache instead of bouncing back.
+        self._loads = RungLoadRegistry(default_bound=default_lane_bound)
+        # Cache-affinity spills stay on the rung holding the warmed conversation.
         self._sticky = StickySpillRegistry()
         self._inflight: dict[str, InflightRequest] = {}
         self._lock = threading.Lock()
@@ -188,6 +152,7 @@ class NativeAttemptAccounting:
         # could serve. The per-reason counters split the aggregate.
         self._rung_admission_sheds = 0
         self._rung_saturated_overflows = 0
+        self._rung_saturation_refusals = 0
         self._rung_rate_limit_sheds = 0
         self._rung_fresh_session_spills = 0
         # Cache-stakes throttle dispositions on pools authoring a
@@ -267,10 +232,11 @@ class NativeAttemptAccounting:
                     self._rung_fresh_session_spills += 1
         return result
 
-    def rung_admission_counters(self) -> tuple[int, int]:
-        """Return ``(sheds, saturated_overflows)`` for the metrics snapshot."""
+    def rung_admission_counters(self) -> tuple[int, int, int]:
+        """Return ``(sheds, saturated_overflows, saturation_refusals)`` for metrics."""
         with self._lock:
-            return (self._rung_admission_sheds, self._rung_saturated_overflows)
+            sheds, overflows = self._rung_admission_sheds, self._rung_saturated_overflows
+            return (sheds, overflows, self._rung_saturation_refusals)
 
     def rung_rate_counters(self) -> tuple[int, int]:
         """Return ``(rate_limit_sheds, fresh_session_spills)`` for metrics."""
@@ -401,6 +367,7 @@ class NativeAttemptAccounting:
             raise NativeBridgeError(public_failure_error(failure))
         failure = failure_from_boundary_payload(data.get("failure"))
         current_depth = data.get("current_depth")
+        ladder = eligible_ladder(route, failure)  # The depths this walk may claim at all.
         # Rung dispatch policies shed a claimed rung SIDEWAYS to the next
         # claimable one instead of queueing on it. Each shed is remembered so
         # the dispatched attempt can disclose the bypassed rung, and so a ladder
@@ -408,6 +375,7 @@ class NativeAttemptAccounting:
         policy_sheds: list[tuple[int, str]] = []
         disposition: ThrottleDisposition | None = None
         redial_depth: int | None = None  # The rung a post-backoff redial re-dials.
+        tool_search_round = False
         if failure is not None and isinstance(current_depth, int):
             candidate, disposition = failed_dispatch_candidate(
                 health=self._health,
@@ -431,17 +399,31 @@ class NativeAttemptAccounting:
                 policy_sheds.append((current_depth, THROTTLE_FAILOVER_COLD))
             last_failure: GatewayFailure | None = failure
         else:
-            candidate = claim_route_from(self._health, keys, 0)
+            # A gateway tool-search round re-dials the rung that just served
+            # the withheld search call (its conversation now extended); the
+            # claim starts there and only moves on if that rung went unhealthy.
+            tool_search_round = data.get("tool_search_round") is True and isinstance(
+                current_depth, int
+            )
+            candidate = claim_route_from(
+                self._health, keys, current_depth if tool_search_round else 0, ladder
+            )
             last_failure = None
         forced_overflow = False
+        shed_records: dict[int, RungShed] = {}
         # The input half of the reservation tokenizes the whole prompt, so it
         # is computed once per ladder walk and shared with every candidate.
         reserved_input_tokens = worst_case_input_tokens(entry.request)
         while True:
             if candidate is None:
                 if policy_sheds and last_failure is None and not forced_overflow:
-                    forced_overflow = True
-                    candidate = policy_sheds[0][0]
+                    candidate = overflow_target(route, policy_sheds, shed_records)
+                    forced_overflow = candidate is not None
+                    if candidate is None:
+                        last_failure = lane_saturated_failure()
+                        with self._lock:
+                            self._rung_saturation_refusals += 1
+                        break
                 else:
                     break
             deployment = deployment_priced_for_service_tier(
@@ -452,12 +434,13 @@ class NativeAttemptAccounting:
                     and entry.tier_forwarded_by_depth[candidate]
                 ),
             )
-            # Reserve the worst-case in-flight tokens alongside the worst-case
-            # cost. The platform's token windows (promo free-tier, strict; org
-            # rate limits, soft) count these dispatched reservations, and the
-            # rung's own authored token window counts the same conservative
-            # bound, so a concurrent burst binds instead of leaking past caps.
-            reserved_output_tokens = worst_case_output_tokens(entry.request, deployment)
+            reservation_request = entry.request
+            if entry.reserved_output_tokens_by_depth:
+                frozen_bound = entry.reserved_output_tokens_by_depth[candidate]
+                reservation_request = entry.request.model_copy(
+                    update={"maximum_output_tokens": frozen_bound}
+                )
+            reserved_output_tokens = worst_case_output_tokens(reservation_request, deployment)
             ticket = self._reserve_rung_slot(
                 entry,
                 deployment,
@@ -466,12 +449,13 @@ class NativeAttemptAccounting:
             )
             if isinstance(ticket, RungShed):
                 policy_sheds.append((candidate, ticket.reason))
+                shed_records.setdefault(candidate, ticket)
                 self._health.release_probe(keys[candidate])
                 forced_overflow = shed_keeps_rung(
                     route, candidate, redial_depth, last_failure, ticket.reason
                 )
                 if not forced_overflow:
-                    candidate = claim_route_from(self._health, keys, candidate + 1)
+                    candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
                 continue
             throttle_backoff = candidate == redial_depth
             dispatch_reason, preferred_deployment = dispatch_disclosure(
@@ -482,6 +466,8 @@ class NativeAttemptAccounting:
                 sticky_preferred=entry.sticky_preferred,
                 throttle_backoff=throttle_backoff,
             )
+            if tool_search_round:
+                dispatch_reason = TOOL_SEARCH_ROUND
             try:
                 attempt_id = self._write_ledger.start_attempt(
                     snapshot=route.snapshot,
@@ -489,12 +475,12 @@ class NativeAttemptAccounting:
                     attempt_ordinal=entry.total_attempts,
                     route_depth=candidate,
                     maximum_cost_nano_usd=maximum_attempt_cost_nano_usd(
-                        entry.request, deployment, input_tokens=reserved_input_tokens
+                        reservation_request, deployment, input_tokens=reserved_input_tokens
                     ),
                     reserved_input_tokens=reserved_input_tokens,
                     reserved_output_tokens=reserved_output_tokens,
                     route_reason=route.attempt_route_reason(route.deployments[candidate]),
-                    fallback_reason=route.fallback_reason,
+                    fallback_reason=rule_fallback_reason(route, candidate, current_depth, failure),
                     dispatch_reason=dispatch_reason,
                     preferred_deployment=preferred_deployment,
                 )
@@ -522,7 +508,7 @@ class NativeAttemptAccounting:
                 if candidate == redial_depth:
                     # The forced admission belonged to the redialed rung alone.
                     forced_overflow = False
-                candidate = claim_route_from(self._health, keys, candidate + 1)
+                candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
                 continue
             except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
                 # A reservation that raised before returning an attempt id
@@ -668,11 +654,12 @@ class NativeAttemptAccounting:
         attempt_id = str(data["attempt_id"])
         finalize = bool(data.get("finalize", True))
         opened = bool(data.get("opened", False))
-        terminal, failure = terminal_from_settlement(data)
+        terminal, failure = terminal_from_settlement(data, surface=entry.authorization.surface)
         first_token_at = first_token_at_from_settlement(data)
         rate_limit = settlement_rate_limit(data)
+        upstream = upstream_provider_from_settlement(data)
         try:
-            self._write_ledger.finish_attempt(
+            self._finish_attempt(
                 attempt_id=attempt_id,
                 terminal_event=terminal,
                 failure=failure,
@@ -683,6 +670,13 @@ class NativeAttemptAccounting:
                 ratelimit_remaining_requests=rate_limit.remaining_requests,
                 ratelimit_limit_tokens=rate_limit.limit_tokens,
                 ratelimit_remaining_tokens=rate_limit.remaining_tokens,
+                **upstream_provider_kwarg(self._finish_attempt, upstream),
+                **web_search_requests_kwarg(
+                    self._finish_attempt, web_search_requests_from_terminal(terminal)
+                ),
+                **tool_search_requests_kwarg(
+                    self._finish_attempt, tool_search_requests_from_terminal(terminal)
+                ),
             )
         except Exception as exc:  # noqa: BLE001 - the data plane retries.
             # The exact settlement is retained so a retry (from the data
@@ -903,7 +897,9 @@ class NativeAttemptAccounting:
             settlement = entry.pending_settlement
             if settlement is None:
                 continue
-            terminal, failure = terminal_from_settlement(settlement)
+            terminal, failure = terminal_from_settlement(
+                settlement, surface=entry.authorization.surface
+            )
             if self._settle_swept(
                 request_id,
                 entry,
@@ -911,7 +907,7 @@ class NativeAttemptAccounting:
                 terminal=terminal,
                 failure=failure,
                 finalize=bool(settlement.get("finalize", True)),
-                rate_limit=settlement_rate_limit(settlement),
+                settlement=settlement,
             ):
                 with self._lock:
                     entry.pending_settlement = None
@@ -959,16 +955,17 @@ class NativeAttemptAccounting:
         terminal: GatewayEvent,
         failure: GatewayFailure | None,
         finalize: bool,
-        rate_limit: RateLimitObservation | None = None,
+        settlement: JsonObject | None = None,
     ) -> bool:
-        """Land one swept settlement; keep the entry for retry on failure.
+        """Land one swept settlement from its retained payload; keep the entry to retry on failure.
 
         Returns:
             Whether the swept terminal write reached the ledger.
         """
-        observation = RateLimitObservation() if rate_limit is None else rate_limit
+        observation = settlement_rate_limit(settlement)
+        upstream = upstream_provider_from_settlement(settlement)
         try:
-            self._write_ledger.finish_attempt(
+            self._finish_attempt(
                 attempt_id=attempt_id,
                 terminal_event=terminal,
                 failure=failure,
@@ -978,6 +975,13 @@ class NativeAttemptAccounting:
                 ratelimit_remaining_requests=observation.remaining_requests,
                 ratelimit_limit_tokens=observation.limit_tokens,
                 ratelimit_remaining_tokens=observation.remaining_tokens,
+                **upstream_provider_kwarg(self._finish_attempt, upstream),
+                **web_search_requests_kwarg(
+                    self._finish_attempt, web_search_requests_from_terminal(terminal)
+                ),
+                **tool_search_requests_kwarg(
+                    self._finish_attempt, tool_search_requests_from_terminal(terminal)
+                ),
             )
         except Exception:  # noqa: BLE001 - keep the entry; the sweep retries.
             self._accounting_healthy = False

@@ -851,6 +851,7 @@ def _responses_engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Ser
             supports_reasoning=True,
             supports_tools=True,
             supports_temperature=False,
+            maximum_output_tokens=128_000,
         ),
         gateway_capabilities=GatewayDeploymentCapabilities(
             supports_streaming=True,
@@ -1890,12 +1891,11 @@ def test_messages_silent_stop_is_a_max_tokens_stop(engine: _ServingEngine) -> No
 def test_replayed_thinking_history_serves_with_disclosure_on_a_foreign_route(
     engine: _ServingEngine,
 ) -> None:
-    """Replayed Anthropic thinking HISTORY serves on a non-Anthropic route with
-    the drop disclosed and the blocks omitted upstream (Claude Code carries
-    Claude's signed blocks into every later turn of a session, so the old
-    pre-dispatch 400 killed every session that switched models); a live
-    thinking CONFIG likewise serves through the admission coercion (dropped
-    with disclosure on this non-reasoning OpenAI-compatible route)."""
+    """Preserve replayable history while refusing an unenforceable numeric budget.
+
+    Thinking history is disclosed and omitted on a non-Anthropic wire. A live
+    numeric thinking budget is a constraint, not permission to drop the field.
+    """
     with _SseUpstream.payloads_lock:
         dispatched_before = len(_SseUpstream.payloads)
 
@@ -1904,19 +1904,16 @@ def test_replayed_thinking_history_serves_with_disclosure_on_a_foreign_route(
         headers={"x-api-key": engine.raw_key},
         json={
             **_messages_body("thinking-config-serves"),
-            # Below the 64-token ceiling: a budget at or above max_tokens is
-            # refused at the boundary (Anthropic's own rule), while one under
-            # Anthropic's 1024 minimum is only a depth hint on this route.
+            # This wire cannot enforce a numeric thinking budget, even one
+            # below the caller's total output ceiling.
             "thinking": {"type": "enabled", "budget_tokens": 32},
         },
         timeout=10.0,
     )
-    assert config.status_code == 200
+    assert config.status_code == 400
+    assert "thinking" in config.json()["error"]["message"]
     with _SseUpstream.payloads_lock:
-        dispatched_config = _SseUpstream.payloads[dispatched_before:]
-        dispatched_before = len(_SseUpstream.payloads)
-    assert len(dispatched_config) == 1
-    assert "thinking" not in dispatched_config[0]
+        assert len(_SseUpstream.payloads) == dispatched_before
 
     history = httpx.post(
         f"{engine.base}/v1/messages",
@@ -2362,3 +2359,97 @@ def test_hosted_web_search_serves_and_continues_through_the_native_responses_lan
     message_echo = cast(JsonObject, replay[hosted_position + 1])
     assert message_echo["type"] == "message"
     assert message_echo["id"] == "msg_cited"
+
+
+@pytest.mark.parametrize("stream", (False, True))
+def test_chat_verbosity_reaches_the_native_responses_provider(
+    responses_engine: _ServingEngine, stream: bool
+) -> None:
+    """Serve Chat verbosity through the gateway and retain it on the provider wire."""
+    with _ResponsesUpstream.payloads_lock:
+        before = len(_ResponsesUpstream.payloads)
+    response = httpx.post(
+        f"{responses_engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={
+            "model": "responses",
+            "messages": [{"role": "user", "content": "look up a result"}],
+            "verbosity": "high",
+            "stream": stream,
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "data: [DONE]" in response.text
+    else:
+        assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+    assert "x-experiential-ignored-parameters" not in response.text
+    with _ResponsesUpstream.payloads_lock:
+        dispatched = _ResponsesUpstream.payloads[before:]
+    assert len(dispatched) == 1
+    assert dispatched[0]["text"] == {"verbosity": "high"}
+    assert "verbosity" not in dispatched[0]
+
+
+@pytest.mark.parametrize("stream", (False, True))
+def test_chat_verbosity_serves_with_disclosure_on_a_compatible_provider(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """Serve an unsupported hint without forwarding it or losing its public disclosure."""
+    with _SseUpstream.payloads_lock:
+        before = len(_SseUpstream.payloads)
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "fast-token"}],
+            "verbosity": "low",
+            "stream": stream,
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        chunks = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert any(
+            chunk.get("x-experiential-ignored-parameters") == ["verbosity"] for chunk in chunks
+        )
+        assert "data: [DONE]" in response.text
+    else:
+        assert response.json()["choices"][0]["message"]["content"] == "hello world"
+        assert response.json()["x-experiential-ignored-parameters"] == ["verbosity"]
+    with _SseUpstream.payloads_lock:
+        dispatched = _SseUpstream.payloads[before:]
+    assert len(dispatched) == 1
+    assert "verbosity" not in dispatched[0]
+    assert "text" not in dispatched[0]
+
+
+def test_invalid_chat_verbosity_is_rejected_before_provider_dispatch(
+    engine: _ServingEngine,
+) -> None:
+    """Reject an invalid hint as a named client error without paying for an attempt."""
+    with _SseUpstream.payloads_lock:
+        before = len(_SseUpstream.payloads)
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "fast-token"}],
+            "verbosity": "verbose",
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "verbosity"
+    assert response.json()["error"]["code"] == "invalid_parameter"
+    with _SseUpstream.payloads_lock:
+        assert len(_SseUpstream.payloads) == before

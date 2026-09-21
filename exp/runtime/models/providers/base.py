@@ -105,8 +105,11 @@ class GatewayWireProfile:
     url: str
     """Full endpoint URL, including provider-specific query parameters."""
 
-    headers: Mapping[str, str] = field(default_factory=dict)
-    """Authenticated request headers for every dispatch."""
+    headers: Mapping[str, str] = field(default_factory=dict, repr=False)
+    """Authenticated request headers for every dispatch, excluded from diagnostics."""
+
+    inference_geo: Literal["us"] | None = field(default=None, kw_only=True)
+    """Operator constraint applied after caller payload shaping on each Anthropic attempt."""
 
     model_id: str = ""
     """Exact provider model identifier."""
@@ -153,6 +156,16 @@ class GatewayWireProfile:
     charges while the gateway bills catalog rates, so the field never
     reaches the provider there.
     """
+
+    forwards_cache_control: bool = False
+    """Whether this Chat adapter accepts explicit Anthropic cache markers."""
+
+    @property
+    def preserves_cache_control(self) -> bool:
+        """Whether this adapter can carry or translate explicit cache checkpoints."""
+        return self.dialect in {"anthropic_messages", "bedrock_converse_stream"} or (
+            self.dialect == "openai_compatible" and self.forwards_cache_control
+        )
 
     minimum_temperature: float = 0.0
     """Smallest temperature value accepted by this provider wire."""
@@ -271,11 +284,9 @@ class GatewayWireProfile:
     minimum_output_tokens: int | None = None
     """Smallest output-token ceiling this rung's provider accepts, when declared.
 
-    Catalog-declared (``GatewayDeploymentCapabilities.minimum_output_tokens``),
-    never derived from the dialect: a caller ceiling below it is floored with
-    disclosure on every surface instead of dispatching a value the provider
-    400s (Perplexity sonar and Sakana fugu via OpenRouter, grok-4.6 on
-    Bedrock all refuse ``max_tokens < 16`` on the Chat wire)."""
+    Catalog-declared (``GatewayDeploymentCapabilities.minimum_output_tokens``).
+    A smaller explicit caller ceiling is refused before dispatch, never raised.
+    Route selection may keep another rung that accepts the caller's ceiling."""
 
     signs_request_body: bool = False
     """Whether dispatch headers are computed per request over the exact
@@ -287,6 +298,9 @@ class GatewayWireProfile:
     """Full OpenAI-wire ``/embeddings`` endpoint for this connection, sharing
     ``headers``; ``None`` when the connection speaks no embeddings wire, so the
     embeddings surface excludes the rung instead of dispatching a chat URL."""
+
+    decisions_url: str | None = None
+    """Full TypeSafe SystemOne endpoint, absent on non-decision connections."""
 
     images_url: str | None = None
     """Full OpenAI-wire ``/images/generations`` endpoint for this connection,
@@ -311,6 +325,7 @@ class GatewayWireProfile:
             "openai_compatible",
             "gemini_generate_content",
             "bedrock_converse_stream",
+            "typesafe_systemone",
         }:
             raise ValueError("gateway wire dialect is not implemented")
         if self.reasoning_wire_format not in {

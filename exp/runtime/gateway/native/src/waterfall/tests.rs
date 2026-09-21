@@ -1,9 +1,12 @@
 //! Unit tests for the waterfall's pure successor and allowance rules.
 
+use std::collections::HashMap;
+
 use super::*;
 
 fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
     DeploymentWire {
+        native_tool_translation: Default::default(),
         provider: "openai".to_string(),
         deployment_id: "d".to_string(),
         dialect: "openai_compatible".to_string(),
@@ -23,8 +26,16 @@ fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         idempotency_key: "op".to_string(),
         time_to_first_byte_base_seconds: base,
         time_to_first_byte_seconds_per_million_input_tokens: slope,
+        time_to_first_token_base_seconds: None,
         throttle_redial_budget: 0,
+        failover_only_on: None,
+        zdr_constrained: false,
     }
+}
+
+/// `length` unrestricted rungs: the historical route shape.
+fn plain(length: usize) -> Vec<DeploymentWire> {
+    (0..length).map(|_| wire(None, None)).collect()
 }
 
 #[test]
@@ -94,7 +105,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
     // Same-deployment retry within the per-deployment cap.
     assert!(successor_possible(
         policy(false),
-        1,
+        &plain(1),
         far_deadline(),
         1,
         1,
@@ -105,7 +116,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
     // The per-deployment cap forbids a redial but failover still runs.
     assert!(successor_possible(
         policy(false),
-        2,
+        &plain(2),
         far_deadline(),
         2,
         2,
@@ -116,7 +127,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
     // A single-deployment route with the redial cap reached is exhausted.
     assert!(!successor_possible(
         policy(false),
-        1,
+        &plain(1),
         far_deadline(),
         2,
         2,
@@ -127,7 +138,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
     // The hard total cap ends the ladder regardless of class.
     assert!(!successor_possible(
         policy(false),
-        4,
+        &plain(4),
         far_deadline(),
         8,
         1,
@@ -138,7 +149,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
     // An expired deadline ends the ladder.
     assert!(!successor_possible(
         policy(false),
-        4,
+        &plain(4),
         Instant::now(),
         1,
         1,
@@ -153,7 +164,7 @@ fn ineligible_classes_never_advance_without_refusal_opt_in() {
     let invalid = Failure::new(FailureClass::InvalidRequest, "bad request");
     assert!(!successor_possible(
         policy(false),
-        4,
+        &plain(4),
         far_deadline(),
         1,
         1,
@@ -164,7 +175,7 @@ fn ineligible_classes_never_advance_without_refusal_opt_in() {
     let refusal = Failure::new(FailureClass::Refusal, "provider refused the request");
     assert!(!successor_possible(
         policy(false),
-        4,
+        &plain(4),
         far_deadline(),
         1,
         1,
@@ -175,7 +186,7 @@ fn ineligible_classes_never_advance_without_refusal_opt_in() {
     // The refusal advances only when the alias revision opted in.
     assert!(successor_possible(
         policy(true),
-        4,
+        &plain(4),
         far_deadline(),
         1,
         1,
@@ -186,7 +197,7 @@ fn ineligible_classes_never_advance_without_refusal_opt_in() {
     // Refusal failover cannot pass the last deployment.
     assert!(!successor_possible(
         policy(true),
-        1,
+        &plain(1),
         far_deadline(),
         1,
         1,
@@ -201,7 +212,7 @@ fn failover_only_classes_skip_the_redial_and_advance() {
     let throttled = Failure::new(FailureClass::Throttled, "throttled").with_retry(false, true);
     assert!(successor_possible(
         policy(false),
-        2,
+        &plain(2),
         far_deadline(),
         1,
         1,
@@ -211,7 +222,7 @@ fn failover_only_classes_skip_the_redial_and_advance() {
     ));
     assert!(!successor_possible(
         policy(false),
-        1,
+        &plain(1),
         far_deadline(),
         1,
         1,
@@ -227,6 +238,7 @@ fn usage(output_tokens: Option<u64>, reasoning_tokens: Option<u64>) -> Usage {
         output_tokens,
         cached_input_tokens: None,
         cache_creation_input_tokens: None,
+        cache_creation_1h_input_tokens: None,
         reasoning_tokens,
     }
 }
@@ -318,4 +330,23 @@ fn an_image_output_rung_answers_its_empty_completion_without_redial_or_ladder() 
     let text = wire(None, None);
     let failure = empty_completion_failure(&text);
     assert!(failure.retryable_same_deployment && failure.failover_eligible);
+}
+
+#[test]
+fn first_token_allowance_has_its_own_base_and_shares_the_input_slope() {
+    // The first-token base is independent of the header base (a thinking
+    // model on a chat wire answers its headers at once and its first token a
+    // minute later), and the deployment override on it wins; the slope is
+    // the header allowance's, override or default.
+    let plain = wire(None, None);
+    let allowance = first_token_allowance(&plain, Duration::from_secs(120), 240.0, 1_000_000.0);
+    assert_eq!(allowance, Duration::from_secs_f64(360.0));
+    let mut overridden = wire(None, Some(0.0));
+    overridden.time_to_first_token_base_seconds = Some(30.0);
+    let allowance =
+        first_token_allowance(&overridden, Duration::from_secs(120), 240.0, 1_000_000.0);
+    assert_eq!(allowance, Duration::from_secs_f64(30.0));
+    // The header allowance is untouched by the token base.
+    let header = first_byte_allowance(&overridden, Duration::from_secs(15), 240.0, 0.0);
+    assert_eq!(header, Duration::from_secs_f64(15.0));
 }

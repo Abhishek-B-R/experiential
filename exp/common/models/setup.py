@@ -10,6 +10,7 @@ from pydantic import Field, SerializerFunctionWrapHandler, model_serializer, mod
 
 from exp.common.core.artifacts import ContractModel
 from exp.common.core.locks import file_write_lock
+from exp.common.models.bedrock_connection import require_bedrock_connection_shape
 from exp.common.models.catalog import (
     MODEL_CATALOG_SCHEMA_VERSION,
     ConnectionConfig,
@@ -17,7 +18,6 @@ from exp.common.models.catalog import (
     ModelRecord,
     ModelRoles,
     load_model_catalog,
-    require_bedrock_connection_shape,
     write_model_catalog,
 )
 from exp.common.models.model import BillingSource, ModelCapabilities, ReasoningEffort
@@ -31,6 +31,7 @@ SETUP_PROVIDERS = frozenset(
         "openai",
         "openai-compatible",
         "openrouter",
+        "typesafe",
         "vertex",
     }
 )
