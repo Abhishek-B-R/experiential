@@ -147,7 +147,10 @@ def _restore_linked_reasoning(
         if not isinstance(context, dict):
             return lineage, parent_id
         request = GatewayRequest.model_validate(restore_capture_context(context).get("request"))
-        for position, output in enumerate(_output_messages(parent), start=len(request.messages)):
+        outputs = [
+            output for output in _output_messages(parent) if not _empty_reasoning_item(output)
+        ]
+        for position, output in enumerate(outputs, start=len(request.messages)):
             if position >= len(messages):
                 raise ValueError("response lineage exceeds expanded history")
             target = messages[position]
@@ -157,6 +160,19 @@ def _restore_linked_reasoning(
                     target["reasoning_content"] = reasoning
         parent_id = parent.parent_response_id
     return lineage, None
+
+
+def _empty_reasoning_item(message: JsonObject) -> bool:
+    """Empty public reasoning lifecycle items are not retained conversation turns."""
+    item = message.get("provider_native_item")
+    return (
+        isinstance(item, dict)
+        and item.get("type") == "reasoning"
+        and item.get("summary") == []
+        and not item.get("encrypted_content")
+        and not message.get("content")
+        and not message.get("tool_calls")
+    )
 
 
 def _visible_turn(message: JsonObject) -> JsonObject:

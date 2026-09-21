@@ -262,7 +262,14 @@ def test_explicit_response_lineage_restores_reasoning_without_prefix_joining(
                 "exp_context": capture_request_context(parent_request),
                 "exp_capture_output": {"provider_reasoning": "observed parent reasoning"},
             },
-            "response": {"id": "parent", "status": "completed", "output": [call]},
+            "response": {
+                "id": "parent",
+                "status": "completed",
+                "output": [
+                    {"type": "reasoning", "id": "rs_empty", "summary": [], "status": "completed"},
+                    call,
+                ],
+            },
         }
     )
     continued_request = decode_responses(
