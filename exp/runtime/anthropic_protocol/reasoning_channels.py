@@ -22,7 +22,6 @@ from exp.runtime.anthropic_protocol.media_blocks import AnthropicWireModel
 from exp.runtime.models.providers.reasoning_compat import (
     MINIMUM_THINKING_BUDGET_TOKENS,
     REASONING_EFFORTS,
-    thinking_config_reasoning_effort,
 )
 from exp.runtime.openai_protocol.errors import invalid_field
 
@@ -157,6 +156,18 @@ def resolve_reasoning_channels(
             output_config=output_config,
             disclosures=(),
         )
+    if thinking is not None and "budget_tokens" in thinking:
+        same_budget = (
+            reasoning.max_tokens == thinking.get("budget_tokens")
+            and reasoning.enabled is not False
+            and reasoning.effort is None
+        )
+        if not same_budget:
+            raise invalid_field(
+                "thinking.budget_tokens",
+                "The reasoning extension cannot override an explicit thinking budget. "
+                "Send one budget-bearing thinking channel or explicitly remove the budget.",
+            )
     disclosures: list[str] = []
     effort: ReasoningEffort | None
     if reasoning.enabled is False or reasoning.effort == "none":
@@ -172,7 +183,7 @@ def resolve_reasoning_channels(
                 "after thinking.",
             )
         budget: JsonObject = {"type": "enabled", "budget_tokens": reasoning.max_tokens}
-        effort = thinking_config_reasoning_effort(budget)
+        effort = None
         resolved_thinking = budget
     else:
         effort = (

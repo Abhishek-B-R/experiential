@@ -20,6 +20,17 @@ use crate::relay::remaining;
 use crate::replay::{CachedResponse, OwnerLease};
 use crate::settlement::AttemptGuard;
 
+/// Log a content-free local reason whenever a live stream ends short.
+pub(crate) fn log_stream_exit(request_id: &str, reason: &'static str) {
+    let line = serde_json::json!({
+        "event": "stream_delivery_end", "request_id": request_id, "reason": reason,
+    });
+    eprintln!("exp-gateway-native: {line}");
+}
+
+#[path = "stream_delivery.rs"]
+pub(crate) mod stream_delivery;
+
 /// Build a chat encoder's sanitized failure frame and done sentinel when the
 /// stream has not already reached a terminal.
 pub(crate) fn failure_frames(encoder: &mut ChatSseEncoder, failure: &Failure) -> Vec<Bytes> {
@@ -376,6 +387,11 @@ pub(crate) async fn finish_stream_terminal(
     cached_headers: &[(String, String)],
     frames: Vec<Bytes>,
 ) {
+    let request_id = cached_headers
+        .iter()
+        .find(|(name, _)| name == "x-request-id")
+        .map(|(_, value)| value.as_str())
+        .unwrap_or_default();
     if lease.is_some() {
         for data in &frames {
             replayable = capture_frame(capture, data, replayable);
@@ -390,15 +406,18 @@ pub(crate) async fn finish_stream_terminal(
                 body: std::mem::take(capture),
             };
             if owner.complete(cached).await.is_err() {
+                log_stream_exit(request_id, "replay_publication_failed");
                 return;
             }
         } else {
             owner.abandon().await;
+            log_stream_exit(request_id, "replay_capture_overflow");
             return;
         }
     }
     for data in frames {
         if !send_bounded(sender, deadline, data).await {
+            log_stream_exit(request_id, "terminal_delivery_closed_or_deadline");
             return;
         }
     }

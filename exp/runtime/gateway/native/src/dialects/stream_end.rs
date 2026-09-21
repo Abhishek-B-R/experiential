@@ -55,6 +55,13 @@ impl Normalizer {
                         self.openai_close_unfinished_items(ProviderOutputItemStatus::Incomplete),
                     );
                 }
+                // EOF is not proof that an argument-free call finished. Keep
+                // its already emitted start, but never manufacture {} here.
+                for tool in self.tools.values_mut() {
+                    if !tool.custom && tool.raw_arguments.is_empty() {
+                        tool.completed = true;
+                    }
+                }
                 let (tool_events, _dropped) =
                     finish_open_tools_relay(&mut self.tools, "stream_end")?;
                 events.extend(tool_events);
@@ -83,6 +90,44 @@ impl Normalizer {
             "verdict": verdict,
         });
         eprintln!("exp-gateway-native: {line}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::ToolAccumulator;
+
+    #[test]
+    fn eof_without_a_final_reason_never_seeds_missing_tool_arguments() {
+        for dialect in [
+            Dialect::AnthropicMessages,
+            Dialect::BedrockConverseStream,
+            Dialect::OpenAiCompatible,
+            Dialect::OpenAiResponses,
+        ] {
+            for arguments in ["", "{}", "{\"city\":\"Paris\"}"] {
+                let mut normalizer = Normalizer::new(dialect);
+                // Seed the state reached after a tool start and its deltas;
+                // every dialect shares this EOF path, not a provider stop.
+                normalizer.emitted_output = true;
+                let mut tool = ToolAccumulator::new("call_1".into(), "lookup".into());
+                tool.raw_arguments = arguments.into();
+                normalizer.tools.insert(0, tool);
+                let events = normalizer.on_stream_end().unwrap();
+                assert!(matches!(events.last(), Some(Event::Incomplete)));
+                assert!(!events
+                    .iter()
+                    .any(|event| matches!(event, Event::ToolArgumentsDelta { .. })));
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, Event::ToolCallCompleted { .. }))
+                        .count(),
+                    usize::from(!arguments.is_empty())
+                );
+            }
+        }
     }
 }
 

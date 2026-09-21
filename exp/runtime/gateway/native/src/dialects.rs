@@ -339,7 +339,7 @@ fn complete_streamed_tool(
 /// Complete one streamed tool call the provider itself marked truncated.
 ///
 /// A call whose accumulated arguments still parse as a JSON object completes
-/// normally; one left mid-fragment by the output budget is DROPPED (marked
+/// normally; one left empty or mid-fragment by the output budget is DROPPED (marked
 /// completed without a `ToolCallCompleted`), because the provider never
 /// finished it and the caller's remedy is a larger budget, not a retry of a
 /// "malformed" provider. Only a provider-declared truncation (a Chat
@@ -351,9 +351,7 @@ fn complete_streamed_tool_truncated(
     tool: &mut ToolAccumulator,
     events: &mut Vec<Event>,
 ) -> Result<(), Failure> {
-    let parses = tool.custom
-        || tool.raw_arguments.is_empty()
-        || require_json_object_text(&tool.raw_arguments).is_ok();
+    let parses = tool.custom || require_json_object_text(&tool.raw_arguments).is_ok();
     if parses {
         complete_streamed_tool(index, tool, events)
     } else {
@@ -412,8 +410,8 @@ pub struct Normalizer {
     openai_hosted_items: BTreeMap<u32, OpenAiHostedItem>,
     openai_completed_output_items: BTreeSet<u32>,
     // Anthropic accumulation.
-    input_tokens: u64,
-    output_tokens: u64,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
     cache_read: u64,
     cache_write: u64,
     cache_write_1h: Option<u64>,
@@ -435,6 +433,9 @@ pub struct Normalizer {
     // `messageStop` both follow the block): a budget truncation drops the
     // call and ends Incomplete; any other ending surfaces this failure.
     deferred_tool_failure: Option<Failure>,
+    // Bedrock removes finished blocks from `tools`; only empty stopped blocks
+    // stay pending until the final reason authorizes completion or truncation.
+    bedrock_empty_stopped_tools: BTreeSet<u32>,
     // A call the provider cut mid-fragment was dropped under an ending that
     // did not declare truncation; the terminal then settles Incomplete.
     dropped_cut_call: bool,
@@ -469,8 +470,8 @@ impl Normalizer {
             openai_output_items: BTreeMap::new(),
             openai_hosted_items: BTreeMap::new(),
             openai_completed_output_items: BTreeSet::new(),
-            input_tokens: 0,
-            output_tokens: 0,
+            input_tokens: None,
+            output_tokens: None,
             cache_read: 0,
             cache_write: 0,
             cache_write_1h: None,
@@ -481,6 +482,7 @@ impl Normalizer {
             reasoning_content_route_sha256,
             request_words: Vec::new(),
             deferred_tool_failure: None,
+            bedrock_empty_stopped_tools: BTreeSet::new(),
             dropped_cut_call: false,
             upstream_provider: None,
         }
@@ -489,6 +491,13 @@ impl Normalizer {
     /// The upstream an aggregator named as serving this stream, if any chunk said.
     pub fn upstream_provider(&self) -> Option<&str> {
         self.upstream_provider.as_deref()
+    }
+
+    /// Latest decoded provider meters, including reports held until terminal.
+    /// The relay snapshots these before waiting for another provider frame so
+    /// cancellation retains usage that has not yet become an outward event.
+    pub(crate) fn observed_usage(&self) -> Option<&Usage> {
+        self.usage.as_ref()
     }
 
     /// Keep the first upstream label a chunk names; garbage (empty, over-long,
@@ -505,11 +514,6 @@ impl Normalizer {
             return;
         }
         self.upstream_provider = Some(trimmed.to_string());
-    }
-
-    /// Latest provider usage retained for a terminal that may never arrive.
-    pub(crate) fn observed_usage(&self) -> Option<&Usage> {
-        self.usage.as_ref().filter(|usage| usage.has_token_counts())
     }
 
     /// Reserve retained-output budget for accumulated tool-argument text.
@@ -668,7 +672,8 @@ impl Normalizer {
         if self.terminal {
             return Ok(Vec::new());
         }
-        let events = match self.dialect {
+        let previous_usage = self.usage.clone();
+        let mut events = match self.dialect {
             Dialect::OpenAiResponses => self.feed_openai_responses(frame),
             Dialect::AnthropicMessages => self.feed_anthropic(frame),
             Dialect::OpenAiCompatible => self.feed_openai_compatible(frame),
@@ -678,6 +683,20 @@ impl Normalizer {
                 Err(malformed("decision models do not serve chat streams"))
             }
         }?;
+        let mut observed = previous_usage;
+        for usage in self.usage.iter() {
+            observed
+                .get_or_insert_with(Usage::default)
+                .merge_observed(usage);
+        }
+        for event in &mut events {
+            if let Event::Usage(usage) = event {
+                let merged = observed.get_or_insert_with(Usage::default);
+                merged.merge_observed(usage);
+                *usage = merged.clone();
+            }
+        }
+        self.usage = observed;
         if events.iter().any(Event::is_output_token) {
             self.emitted_output = true;
         }

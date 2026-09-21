@@ -627,7 +627,7 @@ async fn failure_usage_prefers_latest_cumulative_counts_and_adds_redial_once() {
 }
 
 #[test]
-fn failure_without_current_usage_preserves_only_the_known_repaired_dial() {
+fn failure_without_current_usage_keeps_the_attempt_total_unknown() {
     let mut relay = UpstreamRelay::from_stream(
         stream::pending().boxed(),
         Dialect::OpenAiCompatible,
@@ -639,12 +639,14 @@ fn failure_without_current_usage_preserves_only_the_known_repaired_dial() {
         output_tokens: Some(20),
         ..Default::default()
     }));
-    let known = relay.usage_before_failure(None).unwrap();
-    assert_eq!(known.input_tokens, Some(10));
-    assert_eq!(known.output_tokens, Some(20));
-    let again = relay.usage_before_failure(Some(known)).unwrap();
-    assert_eq!(again.input_tokens, Some(10));
-    assert_eq!(again.output_tokens, Some(20));
+    // A repaired dial has also dispatched: its missing meter cannot be
+    // replaced by the earlier dial's subtotal as if that were a full total.
+    let unknown = relay.usage_before_failure(None).unwrap();
+    assert_eq!(unknown.input_tokens, None);
+    assert_eq!(unknown.output_tokens, None);
+    let again = relay.usage_before_failure(Some(unknown)).unwrap();
+    assert_eq!(again.input_tokens, None);
+    assert_eq!(again.output_tokens, None);
     assert!(again.cached_input_tokens.is_none());
 }
 

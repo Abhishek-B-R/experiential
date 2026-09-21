@@ -332,6 +332,32 @@ fn a_remembered_refused_payload_is_stripped_before_the_first_dial() {
 }
 
 #[test]
+fn repaired_dial_open_failure_does_not_settle_prior_usage_as_the_full_total() {
+    block_on(async {
+        let harness = Harness::new();
+        let rung = spawn_rung(vec![
+            Answer::ResponsesFailed(RESPONSES_FAILED_ENCRYPTED_FRAME),
+            Answer::Rejected(INVALID_ENCRYPTED_CONTENT_BODY),
+        ])
+        .await;
+        let route = [responses_wire(
+            "a",
+            &rung.url,
+            &["rsn_repaired_open_unknown_hA=="],
+        )];
+        let (won, guard) = harness.run(&route, None, Duration::from_secs(60)).await;
+        assert!(matches!(finish(guard, won).await, Won::Failed(_)));
+        assert_eq!(rung.bodies.lock().unwrap().len(), 2);
+        let story = harness.story().await;
+        let settles = story["settles"].as_array().unwrap();
+        assert_eq!(settles.len(), 1);
+        assert!(settles[0]["usage"]["input_tokens"].is_null());
+        assert!(settles[0]["usage"]["output_tokens"].is_null());
+        assert_eq!(settles[0]["usage_incomplete_due_to_disconnect"], false);
+    });
+}
+
+#[test]
 fn an_in_stream_refusal_of_encrypted_reasoning_is_repaired_like_a_pre_stream_one() {
     block_on(async {
         // The relay answers 200 and fails the stream on its first frame with

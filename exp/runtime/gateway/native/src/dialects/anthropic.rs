@@ -19,19 +19,24 @@ use crate::events::{
 };
 
 impl Normalizer {
-    /// One cumulative report, including the input re-read by server tools.
-    fn anthropic_usage_snapshot(&self) -> Result<Usage, Failure> {
-        let input = bounded_ledger_sum(
-            &[self.input_tokens, self.cache_read, self.cache_write],
-            "Anthropic input",
-        )
-        .map_err(|message| malformed(&message))?;
+    /// Fold the latest decoded Anthropic counters into the shared usage shape.
+    fn anthropic_usage(&self) -> Result<Usage, Failure> {
+        let input_tokens = self
+            .input_tokens
+            .map(|fresh| {
+                bounded_ledger_sum(
+                    &[fresh, self.cache_read, self.cache_write],
+                    "Anthropic input",
+                )
+            })
+            .transpose()
+            .map_err(|message| malformed(&message))?;
         Ok(Usage {
-            input_tokens: Some(input),
-            output_tokens: Some(self.output_tokens),
+            input_tokens,
+            output_tokens: self.output_tokens,
             cached_input_tokens: Some(self.cache_read),
-            // Cache-less streams omit writes. Thinking is inside output;
-            // its unreported subset must remain unknown.
+            // Keep the cache-less wire shape; thinking is billed inside output
+            // and has no provider-reported subset to expose here.
             cache_creation_input_tokens: (self.cache_write > 0).then_some(self.cache_write),
             cache_creation_1h_input_tokens: self.cache_write_1h.filter(|_| self.cache_write > 0),
             reasoning_tokens: None,
@@ -62,9 +67,9 @@ impl Normalizer {
                     .get("usage")
                     .and_then(Value::as_object)
                     .ok_or_else(|| malformed("Anthropic message_start.usage must be an object"))?;
-                // Absent usage fields count as zero (require_integer parity);
-                // present malformed values fail the stream.
-                self.input_tokens = count_or_zero(usage, "input_tokens", "Anthropic input_tokens")
+                // Primary omissions are unknown. Optional cache legs use the
+                // provider's zero-when-omitted convention.
+                self.input_tokens = count_if_present(usage, "input_tokens", "Anthropic usage")
                     .map_err(|message| malformed(&message))?;
                 self.cache_read = count_or_zero(
                     usage,
@@ -79,16 +84,17 @@ impl Normalizer {
                 )
                 .map_err(|message| malformed(&message))?;
                 self.cache_write_1h = cache_write::hour_subset(usage, self.cache_write)?;
-                self.output_tokens =
-                    count_or_zero(usage, "output_tokens", "Anthropic output_tokens")
-                        .map_err(|message| malformed(&message))?;
+                self.output_tokens = self.output_tokens.max(
+                    count_if_present(usage, "output_tokens", "Anthropic usage")
+                        .map_err(|message| malformed(&message))?,
+                );
                 // Surface the start-frame meters at once: the Messages encoder
                 // mirrors them on its own `message_start` (Claude Code reads
                 // the input legs there), and the settlement tracker holds them
                 // as the best known count until the terminal report, which
                 // supersedes them at `message_stop` (server-tool turns re-read
                 // fetched results as input, so the start count undercounts).
-                let usage = self.anthropic_usage_snapshot()?;
+                let usage = self.anthropic_usage()?;
                 self.usage = Some(usage.clone());
                 events.push(Event::Usage(usage));
             }
@@ -289,15 +295,19 @@ impl Normalizer {
                     .get("usage")
                     .and_then(Value::as_object)
                     .ok_or_else(|| malformed("Anthropic message_delta.usage must be an object"))?;
-                self.output_tokens =
-                    count_or_zero(usage, "output_tokens", "Anthropic output_tokens")
-                        .map_err(|message| malformed(&message))?;
+                self.output_tokens = self.output_tokens.max(
+                    count_if_present(usage, "output_tokens", "Anthropic usage")
+                        .map_err(|message| malformed(&message))?,
+                );
                 // The terminal usage report supersedes message_start when its
                 // input legs are present: server-tool turns re-read fetched
                 // results as input, so the start-frame count undercounts the
                 // billed total severely (verified live 2026-08-31).
+                self.input_tokens = self.input_tokens.max(
+                    count_if_present(usage, "input_tokens", "Anthropic message_delta")
+                        .map_err(|message| malformed(&message))?,
+                );
                 for (key, slot) in [
-                    ("input_tokens", &mut self.input_tokens),
                     ("cache_read_input_tokens", &mut self.cache_read),
                     ("cache_creation_input_tokens", &mut self.cache_write),
                 ] {
@@ -312,7 +322,9 @@ impl Normalizer {
                 {
                     self.cache_write_1h = cache_write::hour_subset(usage, self.cache_write)?;
                 }
-                self.usage = Some(self.anthropic_usage_snapshot()?);
+                // The relay may be cancelled before message_stop arrives.
+                // Retain these decoded meters without changing event timing.
+                self.usage = Some(self.anthropic_usage()?);
                 if self.stop_reason.as_deref() == Some("refusal") && !self.refusal_seen {
                     self.refusal_seen = true;
                     events.push(Event::RefusalDelta(String::new()));
@@ -321,12 +333,26 @@ impl Normalizer {
             "message_stop" => {
                 let truncated = self.stop_reason.as_deref() == Some("max_tokens");
                 self.resolve_deferred_tool_failure(truncated)?;
+                if self.refusal_seen
+                    || !matches!(
+                        self.stop_reason.as_deref(),
+                        Some("end_turn" | "stop_sequence" | "tool_use" | "pause_turn")
+                    )
+                {
+                    // No successful final reason authorized a zero-argument
+                    // call. Preserve the start, without inventing its input.
+                    for tool in self.tools.values_mut() {
+                        if !tool.custom && tool.raw_arguments.is_empty() {
+                            tool.completed = true;
+                        }
+                    }
+                }
                 events.extend(if truncated {
                     finish_open_tools_truncated(&mut self.tools)?
                 } else {
                     finish_open_tools(&mut self.tools)?
                 });
-                events.push(Event::Usage(self.anthropic_usage_snapshot()?));
+                events.push(Event::Usage(self.anthropic_usage()?));
                 if self.refusal_seen || self.stop_reason.as_deref() == Some("refusal") {
                     events.push(Event::Failed(refusal_failure()));
                 } else if self.stop_reason.as_deref() == Some("max_tokens") {
@@ -382,6 +408,57 @@ mod tests {
         SseEvent {
             event: None,
             data: payload.to_string(),
+        }
+    }
+
+    #[test]
+    fn anthropic_partial_usage_never_resets_or_invents_primary_counts() {
+        for (start, delta, expected) in [
+            (serde_json::json!({}), serde_json::json!({}), (None, None)),
+            (
+                serde_json::json!({"input_tokens":13}),
+                serde_json::json!({}),
+                (Some(13), None),
+            ),
+            (
+                serde_json::json!({"input_tokens":13,"output_tokens":7}),
+                serde_json::json!({}),
+                (Some(13), Some(7)),
+            ),
+            (
+                serde_json::json!({"input_tokens":13}),
+                serde_json::json!({"output_tokens":7}),
+                (Some(13), Some(7)),
+            ),
+            (
+                serde_json::json!({"cache_creation_input_tokens":5}),
+                serde_json::json!({"output_tokens":0}),
+                (None, Some(0)),
+            ),
+        ] {
+            let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
+            normalizer
+                .feed(&frame(
+                    serde_json::json!({"type":"message_start","message":{"usage":start}}),
+                ))
+                .unwrap();
+            normalizer.feed(&frame(serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":delta}))).unwrap();
+            let observed = normalizer.observed_usage().unwrap();
+            assert_eq!((observed.input_tokens, observed.output_tokens), expected);
+            let events = normalizer
+                .feed(&frame(serde_json::json!({"type":"message_stop"})))
+                .unwrap();
+            let final_usage = events
+                .iter()
+                .find_map(|event| match event {
+                    Event::Usage(usage) => Some(usage),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                (final_usage.input_tokens, final_usage.output_tokens),
+                expected
+            );
         }
     }
 
@@ -546,6 +623,11 @@ mod tests {
             },
         }));
         assert!(normalizer.feed(&message_delta).expect("delta").is_empty());
+        // A disconnect here still settles the just-decoded terminal meters.
+        let observed = normalizer.observed_usage().expect("delta usage retained");
+        assert_eq!(observed.input_tokens, Some(12294));
+        assert_eq!(observed.output_tokens, Some(103));
+        assert_eq!(observed.cache_creation_input_tokens, Some(6));
         let stop_message = frame(serde_json::json!({"type": "message_stop"}));
         let events = normalizer.feed(&stop_message).expect("message stop");
         match events.as_slice() {
@@ -589,6 +671,188 @@ mod tests {
             })),
             frame(serde_json::json!({"type": "message_stop"})),
         ]
+    }
+
+    fn chat_projection(events: &[Event]) -> (Vec<serde_json::Value>, serde_json::Value) {
+        let mut encoder =
+            crate::encode::ChatSseEncoder::new_with_ignored("request", "alias", 0, true, vec![]);
+        let mut wire = encoder.start().expect("chat starts");
+        for event in events {
+            wire.extend(encoder.feed(event).expect("chat event encodes"));
+        }
+        let chunks = wire
+            .iter()
+            .filter_map(|frame| frame.strip_prefix("data: "))
+            .filter(|data| data.trim() != "[DONE]")
+            .map(|data| serde_json::from_str(data).expect("chat chunk JSON"))
+            .collect();
+        let aggregate = crate::encode::completed_chat_body_with_ignored(
+            "request",
+            "alias",
+            0,
+            events,
+            &[],
+            false,
+        )
+        .expect("nonstream chat aggregates");
+        assert!(aggregate.failure.is_none());
+        (chunks, aggregate.body)
+    }
+
+    #[test]
+    fn empty_tool_max_tokens_never_invents_arguments_or_a_completed_call() {
+        // The empty input in a start frame is a placeholder, not evidence that
+        // a zero-argument call finished. Block stop precedes the stop reason.
+        for block_stop in [true, false] {
+            for empty_delta in [true, false] {
+                let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
+                let mut events = Vec::new();
+                for frame in tool_argument_stream("max_tokens", "") {
+                    let payload: serde_json::Value = serde_json::from_str(&frame.data).unwrap();
+                    if (!block_stop && payload["type"] == "content_block_stop")
+                        || (!empty_delta && payload["type"] == "content_block_delta")
+                    {
+                        continue;
+                    }
+                    events.extend(normalizer.feed(&frame).expect("empty truncated tool"));
+                    assert!(!events.iter().any(|event| match event {
+                        Event::ToolCallCompleted { .. } => true,
+                        Event::ToolArgumentsDelta { delta, .. } => !delta.is_empty(),
+                        _ => false,
+                    }));
+                }
+                assert!(matches!(events.last(), Some(Event::Incomplete)));
+                let (chunks, body) = chat_projection(&events);
+                assert!(chunks
+                    .iter()
+                    .any(|chunk| chunk["choices"][0]["finish_reason"] == "length"));
+                assert!(chunks.iter().all(|chunk| {
+                    chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                        .as_str()
+                        .is_none_or(str::is_empty)
+                }));
+                assert_eq!(body["choices"][0]["finish_reason"], "length");
+                assert!(body["choices"][0]["message"].get("tool_calls").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn zero_argument_tool_completes_only_after_a_normal_final_reason() {
+        for reason in ["tool_use", "end_turn", "stop_sequence"] {
+            let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
+            let mut events = Vec::new();
+            for frame in tool_argument_stream(reason, "") {
+                let payload: serde_json::Value = serde_json::from_str(&frame.data).unwrap();
+                let next = normalizer.feed(&frame).expect("zero-argument tool");
+                if payload["type"] == "content_block_stop" {
+                    assert!(
+                        next.is_empty(),
+                        "empty completion must wait for stop reason"
+                    );
+                }
+                events.extend(next);
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event, Event::ToolCallCompleted { call, .. } if call.raw_arguments == "{}"
+                    ))
+                    .count(),
+                1
+            );
+            assert!(matches!(events.last(), Some(Event::Completed)));
+            let (chunks, body) = chat_projection(&events);
+            assert!(chunks
+                .iter()
+                .any(|chunk| chunk["choices"][0]["finish_reason"] == "tool_calls"));
+            assert_eq!(
+                body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+                "{}"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_argument_objects_still_finish_at_block_stop_without_buffering() {
+        // An explicit {} is real provider output. Required-field validation
+        // belongs to the caller's schema, not the JSON-shape normalizer.
+        for arguments in ["{}", "{\"city\": \"Paris\"}"] {
+            for reason in ["tool_use", "max_tokens"] {
+                let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
+                let mut events = Vec::new();
+                for frame in tool_argument_stream(reason, arguments) {
+                    let payload: serde_json::Value = serde_json::from_str(&frame.data).unwrap();
+                    let next = normalizer.feed(&frame).expect("complete argument object");
+                    if payload["type"] == "content_block_stop" {
+                        assert!(
+                            matches!(next.as_slice(), [Event::ToolCallCompleted { call, .. }]
+                            if call.raw_arguments == arguments)
+                        );
+                    }
+                    events.extend(next);
+                }
+                let (_, body) = chat_projection(&events);
+                assert_eq!(
+                    body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+                    arguments
+                );
+                assert_eq!(
+                    body["choices"][0]["finish_reason"],
+                    if reason == "max_tokens" {
+                        "length"
+                    } else {
+                        "tool_calls"
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partial_argument_bytes_reach_chat_immediately_and_remain_verbatim_on_length() {
+        let partial = "{\"city\": \"Par";
+        for block_stop in [true, false] {
+            let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
+            let mut events = Vec::new();
+            let mut encoder = crate::encode::ChatSseEncoder::new_with_ignored(
+                "request",
+                "alias",
+                0,
+                false,
+                vec![],
+            );
+            encoder.start().unwrap();
+            for frame in tool_argument_stream("max_tokens", partial) {
+                let payload: serde_json::Value = serde_json::from_str(&frame.data).unwrap();
+                if !block_stop && payload["type"] == "content_block_stop" {
+                    continue;
+                }
+                let next = normalizer.feed(&frame).expect("partial tool");
+                for event in &next {
+                    let wire = encoder.feed(event).expect("encodes immediately");
+                    if payload["type"] == "content_block_delta" {
+                        assert!(
+                            matches!(event, Event::ToolArgumentsDelta { delta, .. } if delta == partial)
+                        );
+                        let chunk: serde_json::Value =
+                            serde_json::from_str(wire[0].strip_prefix("data: ").unwrap()).unwrap();
+                        assert_eq!(
+                            chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+                            partial
+                        );
+                    }
+                }
+                events.extend(next);
+            }
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, Event::ToolCallCompleted { .. })));
+            let (_, body) = chat_projection(&events);
+            assert_eq!(body["choices"][0]["finish_reason"], "length");
+            assert!(body["choices"][0]["message"].get("tool_calls").is_none());
+        }
     }
 
     #[test]
