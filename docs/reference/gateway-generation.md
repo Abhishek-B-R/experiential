@@ -96,8 +96,12 @@ by transcript contents.
 
 Some providers supply usage only at the end. A dispatched request canceled before a provider
 terminal is observed carries the internal `usage_incomplete_due_to_disconnect` accounting signal
-even when partial counts are known. A host must reconcile that unresolved liability separately
-from settled spend. An observed terminal with missing usage retains the host's unknown-terminal
+even when partial counts are known. Hosted monetary accounting retains unresolved authorization
+separately from settled spend for later resolution. The local gateway's monthly allocation uses
+its existing conservative policy instead: the full reserved bound consumes budget, the provider
+cost stays unknown, and observed partial counts remain available. That local allocation is shown
+under settled budget and is not automatically reconciled; it is not a provider bill or a hosted
+customer-account debit. An observed terminal with missing usage retains the host's unknown-terminal
 policy; this marker does not broaden that policy. Stopping generation is not evidence that its
 unreported usage was free.
 
