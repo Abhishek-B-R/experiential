@@ -41,11 +41,13 @@ pub struct Usage {
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     /// Cache-write tokens inside the input total, present only when the
-    /// provider reported a nonzero count (Anthropic-only today). The ledger
-    /// keeps billing the folded input total; this leg exists so callers see
-    /// their prompt being cached (Claude Code displays it).
+    /// provider reported a nonzero count. Cache reads and writes are
+    /// disjoint subsets of input and have separately configured prices.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
+    /// Observed one-hour subset; absent when no complete TTL breakdown exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h_input_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
 }
 
@@ -206,6 +208,8 @@ pub enum Event {
         delta: String,
     },
     ToolCallStarted {
+        /// Whether the public call carries freeform custom input.
+        custom: bool,
         index: u32,
         call_id: String,
         name: String,
@@ -328,6 +332,30 @@ impl Event {
                 | Event::PausedTurn
                 | Event::Failed(_)
         )
+    }
+
+    /// Whether this event advances generation rather than keeping transport
+    /// alive. Private reasoning is progress even when its text stays hidden.
+    /// Item-open scaffolding, empty deltas and usage alone do not renew idle.
+    pub fn is_generation_progress(&self) -> bool {
+        if self.is_output_token() {
+            return true;
+        }
+        match self {
+            Event::ThinkingSignature { signature, .. } => !signature.is_empty(),
+            Event::RedactedThinking { data, .. } => !data.is_empty(),
+            Event::EncryptedReasoning {
+                encrypted_content, ..
+            } => !encrypted_content.is_empty(),
+            Event::ToolCallCompleted { .. }
+            | Event::ServerToolUseCompleted { .. }
+            | Event::ServerToolResult { .. }
+            | Event::HostedToolItemProgress { .. }
+            | Event::HostedToolItemCompleted { .. }
+            | Event::CitationDelta { .. }
+            | Event::ProviderTextAnnotation { .. } => true,
+            _ => false,
+        }
     }
 
     /// Whether this event carries the first visible model output, used to
@@ -475,6 +503,7 @@ pub fn simplified_event(event: &Event) -> Value {
             "text": delta,
         }),
         Event::ToolCallStarted {
+            custom,
             index,
             call_id,
             name,
@@ -487,6 +516,9 @@ pub fn simplified_event(event: &Event) -> Value {
                 "call_id": call_id,
                 "name": name,
             });
+            if *custom {
+                payload["custom"] = Value::Bool(true);
+            }
             if let Some(namespace) = namespace {
                 payload["namespace"] = Value::String(namespace.clone());
             }
@@ -614,6 +646,9 @@ pub fn simplified_event(event: &Event) -> Value {
             });
             if let Some(creation) = usage.cache_creation_input_tokens {
                 payload["cache_creation_input_tokens"] = serde_json::json!(creation);
+            }
+            if let Some(hour) = usage.cache_creation_1h_input_tokens {
+                payload["cache_creation_1h_input_tokens"] = serde_json::json!(hour);
             }
             payload
         }

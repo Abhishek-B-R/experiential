@@ -108,6 +108,16 @@ CHAT_MANIFEST = CompatibilityManifest(
         # Both API surfaces share the native Responses output-length hint;
         # other routes omit it with disclosure. Values remain validated.
         _field("verbosity", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "verbosity"),
+        # Pre-answer web search. OpenAI's ``web_search_options`` and the
+        # OpenRouter ``plugins: [{"id": "web"}]`` extension (and the ``:online``
+        # model suffix) normalize to one gateway search: a route with no
+        # provider-native search gets the gateway's own (results injected, sources
+        # cited, one search counted); without a configured backend the request
+        # still serves and the drop is disclosed.
+        _field(
+            "web_search_options", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "web_search"
+        ),
+        _field("plugins", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "web_search"),
         # Audio INPUT rides ``messages`` as an ``input_audio`` content part and
         # is admitted per route; ``audio`` and ``modalities`` request audio
         # OUTPUT, which no route serves.
@@ -124,7 +134,6 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "prompt_cache_options",
                 "prompt_cache_retention",
                 "seed",
-                "web_search_options",
             )
         ),
     ),
@@ -284,8 +293,8 @@ RESPONSES_INPUT_ITEM_FIELDS_REJECTED: dict[str, frozenset[str]] = {
 
 
 CHAT_CACHE_CONTROL_PLACEMENTS: dict[str, str] = {
-    "messages": "validated_and_dropped",
-    "messages.content": "validated_and_dropped",
+    "messages": "validated_and_forwarded_to_cache_capable_adapters",
+    "messages.content": "validated_and_forwarded_to_cache_capable_adapters",
     "messages.tool_calls": "validated_and_forwarded_to_anthropic_tool_use",
 }
 """Every Chat-surface ``cache_control`` placement and its conscious decision.
@@ -295,9 +304,8 @@ last content part of recent messages for Claude-family model ids; depending
 on that part's shape the hint lands on the message, a text part, or inside a
 ``tool_calls`` entry. Placements are classified here so a new placement is a
 recorded decision (this table plus its behavior test), never a silent 400.
-Only the tool-call placement forwards: Anthropic defines tool_use-block
-caching natively, and non-Anthropic routes disclose the omission through
-``ignored_parameters``.
+Validated placements ride canonical cache carriers. Anthropic, Bedrock and
+OpenRouter adapters forward or translate them; other routes disclose omission.
 """
 
 

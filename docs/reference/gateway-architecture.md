@@ -306,15 +306,14 @@ as a plain request; a single-rung pool has no fallback and surfaces the failure 
 First-party CLI compatibility is capture-driven: the fields real Claude Code and Codex send by
 default are accepted and preserved. On the Messages surface, `output_config` forwards verbatim on
 Anthropic rungs (a canonical `effort` also rides `reasoning_effort`, caller keys always win over
-engine-derived ones); OpenRouter's `reasoning` object (`effort`, or a `max_tokens` budget, plus
-`enabled` / `exclude`) is accepted as a second effort channel, mapped onto the same canonical
-effort (a budget becomes a budgeted `thinking` config on Anthropic rungs and the nearest tier
-elsewhere), and when it is present it wins: a `thinking` config beside it and a disagreeing
-`output_config.effort` drop with disclosure, `exclude` is disclosed rather than honored, and an
-effort the route cannot serve is rejected as `reasoning.effort`. The Chat surface admits the
-same OpenRouter object (`effort`, `enabled`, `max_tokens` snapped to the nearest tier, `exclude`
-disclosed) beside the other enable-thinking spellings (`thinking`, `chat_template_kwargs`,
-DashScope's top-level `enable_thinking`), all translated to the one canonical effort, and
+engine-derived ones); OpenRouter's `reasoning` object supplies an alternate effort or enable
+channel. On Messages, a numeric `max_tokens` reasoning budget becomes an exact budgeted
+`thinking` configuration on budget-capable wires; it cannot become an advisory effort or
+replace another explicit numeric budget. Unsupported hard constraints are refused before
+dispatch. `exclude` retains its disclosed omission policy. The Chat surface accepts effort
+and enable controls beside `thinking`, `chat_template_kwargs`, and DashScope's top-level
+`enable_thinking`; numeric reasoning budgets receive a named compatibility refusal instead
+of a nearest-tier approximation. See [generation controls](gateway-generation.md). Chat also
 replays OpenRouter's `reasoning` / `reasoning_details` (the `reasoning.text` blocks) as the
 same caller-owned plaintext history a `reasoning_content` echo is; mid-conversation `system` turns keep their position on wires that express
 them (instruction-hoisting rungs narrow out), and `thinking.display` rides the verbatim thinking
@@ -460,8 +459,10 @@ month. Management and remaining-allocation reports are CLI surfaces only. There 
 dashboard.
 
 Normalized usage follows OpenAI subset semantics on every wire: `reasoning_tokens` counts a subset
-of `output_tokens` and `cached_input_tokens` a subset of `input_tokens`, and settlement prices the
-subset at its own rate and the remainder at the base rate. Wires that report reasoning outside
+of `output_tokens`; cache reads and writes are disjoint subsets of `input_tokens`.
+`cache_creation_input_tokens` crosses the hosted settlement callback; Chat exposes it as
+`prompt_tokens_details.cache_write_tokens`. Hosted settlement prices each observed subset at
+its own rate; the local SQLite cost estimate still lacks a separate cache-write rate. Wires that report reasoning outside
 their output total are folded by the native usage mappers before the counts leave the data plane:
 Gemini `thoughtsTokenCount` is additive by Google's definition and always folds into
 `output_tokens`; on the OpenAI-shaped wires (Chat Completions and Responses) the provider's own
@@ -536,37 +537,30 @@ byte-for-byte together with its required `anthropic-beta` token, while non-Anthr
 it with `ignored_parameters` disclosure) (thinking history rides an
 opaque provider-reasoning carrier with byte-exact signatures, and a caller `thinking`
 configuration is forwarded verbatim on models that honor it, overriding the catalog's
-adaptive default; on the adaptive-only generation, which rejects `enabled`/`disabled`
-configs outright, an `enabled` config translates to adaptive with the dropped
-`thinking.budget_tokens` disclosed as ignored, and `disabled` is rejected by name
-because those models cannot turn thinking off; a bare `{type: enabled}` with no budget, which
-Claude Code sends, is legal at the gateway boundary: an Anthropic rung receives the gateway's
-derived budget (`thinking.budget_tokens->derived`, or `thinking->dropped(no_legal_budget)` when
-none fits under `max_tokens`) and an effort route reads it as the LANE's default depth: the
-rung's catalog `reasoning_default_effort`, medium when no rung pins one; a budget at or above
-`max_tokens` is refused on `thinking.budget_tokens` at the boundary, Anthropic's own rule, while a
-budget under Anthropic's 1024 minimum is only a depth hint and is carried), requires
+adaptive default. Budgeted-thinking support and support for disabling thinking are separate
+model capabilities: a valid explicit off setting is preserved, and an unsupported off setting
+is refused before dispatch. A numeric thinking budget is never silently replaced with an
+advisory effort. A bare `{type: enabled}` without a numeric budget can use a disclosed derived
+budget that fits the effective per-rung output cap, or an admissible effort on an effort wire;
+an impossible requested configuration is refused instead of disabling thinking. An explicit
+budget at or above `max_tokens` is refused on `thinking.budget_tokens`. See
+[generation limits and interrupted streams](gateway-generation.md) for output-cap provenance,
+partial tool calls, connection-loss handling, and the accounting boundary), requires
 `max_tokens` (a ceiling under 1024 with no reasoning signal of the caller's own, on a route whose
 every rung reasons by default and offers a `none` tier, dispatches at `reasoning_effort: none`
 disclosed as `reasoning_effort->none(max_tokens_headroom)`, so the reply is text rather than
-thinking cut off at the ceiling), validates `cache_control` (carrying it everywhere the Anthropic wire caches
-natively: `tool_use` blocks, tool definitions, the top-level automatic marker, and block-level
-markers on system and message text runs and on `tool_result` breakpoints all forward verbatim.
-Marked runs re-emit the caller's exact block structure while the flattened string stays the
-canonical content for every other wire and for digests; markerless payloads stay byte-identical.
-This is what makes Claude Code sessions cacheable at all: it marks its system blocks and
-conversation breakpoints on every request, and flattening them once billed whole sessions
-uncached at ~10x. Responses report both cache legs back out of the folded ledger total, so
-callers see `cache_creation_input_tokens` on the writing turn and `cache_read_input_tokens` on
-later turns. Routes with no Anthropic rung have no field for the markers and disclose them as
-`<path>.cache_control->not_forwarded(provider_decides_caching; cache reads reported in
-usage.cache_read_input_tokens)`: the wording never says "ignored", never claims caching is on or
-off (OpenAI-family and most OpenAI-compatible providers cache the prefix implicitly, without
-breakpoints, and the ledger bills those reads at the cached rate; a generic endpoint may never
-cache), and names where whatever the provider does shows up, because the disclosure rides in
-`x-experiential-ignored-parameters` and a bare "not forwarded" beside a billed cache read was
-read as "caching is ignored" (Harbor, 2026-09-11: `cache_read_input_tokens: 256` on a Tencent
-rung under the old wording; a provider that never caches reports the leg as 0),
+thinking cut off at the ceiling), and validates `cache_control`. Both Messages and Chat
+Completions retain message/text breakpoints on canonical carriers. Anthropic (including Claude
+on Azure Foundry) forwards them, Bedrock translates them into `cachePoint` blocks, and OpenRouter
+forwards them on its Chat wire. Generic Chat adapters disclose marker omission in
+`x-experiential-ignored-parameters`; a provider label or cached price does not prove support.
+`maximize_cache` prefers marker-preserving adapters but may fall back to another provider or
+an adapter that drops markers; it is not a cache-capability requirement or hit guarantee.
+Cache markers retain their requested TTL. Gateway reservations require the corresponding
+five-minute or one-hour price; settlement uses provider-observed TTL counts, never the request
+marker. Missing rates or incomplete TTL evidence remain unknown rather than using another rate.
+Responses expose observed cache reads and writes; absent write counts remain unknown.
+The decoder also
 carries the provider-native tool annotations (`strict`,
 `eager_input_streaming`, `defer_loading`, `allowed_callers`, `input_examples`; each accepted
 bare by the live API, verified 2026-08-30) and `inference_geo` verbatim on Anthropic rungs with
@@ -594,6 +588,9 @@ Code recovers on its own once WebSearch is simply absent while a 400 kills the t
 production turns on 2026-09-11). The terminal `message_delta` usage
 report supersedes the `message_start` input legs when present, because server-tool turns re-read
 fetched results as input and the start-frame count severely undercounts the billed total.
+
+Gateway-executed web search is documented in [gateway-web-search.md](gateway-web-search.md);
+gateway-executed tool search in [gateway-tool-search.md](gateway-tool-search.md).
 
 OpenAI-family prefix caches are keyed per cache node behind the provider's load balancer, so
 an identical prompt hits but the same stem with a new tail (every turn of an agent loop) is
@@ -887,23 +884,13 @@ When a coercion APPLIES but none SERVES (every candidate dies one layer later, o
 unrelated to the coerced field), admission carries the unprobed coercion forward so the stage
 that actually refuses names the caller's remedy: an image on a text-only reasoning route is
 refused on `messages`, never as an unsupported `thinking` field that merely rode along.
-The thinking vocabulary names the outcome, never a bare field:
-`thinking->reasoning_effort:<tier>(<source>)` (the config was TRANSLATED onto the route's effort
-ladder and applies at that tier; the source names what asked for it: `budget_tokens` for an
-explicit budget through the tier table, `lane_default` for a budget-less `enabled` or `adaptive`
-config read as the rung's catalog `reasoning_default_effort`, `gateway_default` for the same
-config on a route whose rungs pin no default (medium), `disabled` for the off switch),
-`thinking->dropped(superseded_by_effort)` (the caller's own `output_config.effort` or
-`reasoning.effort` already states the depth, which is what serves),
-`thinking->dropped(unsupported_by_route)` (no rung can reason at any depth), and
-`thinking->dropped(no_servable_tier)` (the route reasons, but no tier of its ladder serves this
-request beside its other controls, so the rung answers at its own default depth). The translation
-runs on every route with a non-Anthropic rung once every rung has declined the config verbatim, a
-mixed route included (its Anthropic rung, when it can honor the config, is kept by narrowing before
-this layer is consulted); only an all-Anthropic route leaves the config to Anthropic shaping. The
-named `thinking` rejection therefore never reaches a caller whose route carries a reasoning rung.
-A caller reading a bare `thinking` as "my depth was stripped" is the misreading this vocabulary
-exists to prevent.
+Thinking disclosures name an applied translation, not consent to drop a cost constraint.
+A numeric thinking budget and an explicit off setting must be enforceable on the selected
+wire; otherwise admission refuses the named field before dispatch. A budget-less enable can
+translate onto an admissible effort ladder with a `thinking->reasoning_effort` disclosure.
+A valid native thinking configuration is kept by narrowing the route before considering a
+translation. A route that offers reasoning but cannot honor the requested control is not
+silently served at its default depth. See [generation controls](gateway-generation.md).
 
 On the Messages stream, `message_start.message.usage` is a PRE-DISPATCH figure and
 `message_delta.usage` is the authoritative one. Every Messages usage object (`message_start`,
@@ -913,8 +900,8 @@ On the Messages stream, `message_start.message.usage` is a PRE-DISPATCH figure a
 folded total the ledger bills: an Anthropic rung's own `cache_read_input_tokens` /
 `cache_creation_input_tokens`, an OpenAI-wire rung's `prompt_tokens_details.cached_tokens`
 (Chat) or `input_tokens_details.cached_tokens` (Responses), Gemini's `cachedContentTokenCount`,
-Bedrock's `cacheReadInputTokens`; only the Anthropic wire reports cache writes, every other
-rung carries `cache_creation_input_tokens: 0`. The start frame carries what the upstream already
+Bedrock's `cacheReadInputTokens`; Anthropic and Bedrock report cache writes. Other rungs
+carry `cache_creation_input_tokens: 0`. The start frame carries what the upstream already
 reported before content — an Anthropic upstream's own start-frame input and cache meters,
 mirrored — and otherwise the control plane's pre-dispatch count of the prompt (the reservation
 estimator without its headroom, carried on the admission as `input_token_estimate`, the same

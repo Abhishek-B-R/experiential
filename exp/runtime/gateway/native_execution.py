@@ -43,9 +43,11 @@ from exp.runtime.gateway.native_settlement import deployment_operation_key
 from exp.runtime.gateway.reasoning_carrier import ReasoningCarrierAuthority
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.rung_admission import RungLoadKey
+from exp.runtime.gateway.tool_search.plan import ToolSearchState
 from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.cache_policy import cache_markers
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 
@@ -203,13 +205,12 @@ class InflightRequest:
     signers: tuple[GatewayDispatchSigner | None, ...] = ()
     dispatch_bindings: tuple[FrozenDispatchBinding | None, ...] = ()
     reasoning_carrier_authorities: tuple[ReasoningCarrierAuthority | None, ...] = ()
-    # Whether each route depth actually FORWARDS the requested service tier to
-    # its provider (``GatewayWireProfile.forwards_tier``), captured at admission
-    # where the resolved wire profiles exist. The accounting reprice gates on
-    # this so it applies the per-tier card ONLY on a depth that emits the tier —
-    # forward and bill stay consistent even if a card sits on a lane that would
-    # strip it. Empty on surfaces without a service tier (images, embeddings).
+    # Whether each route depth FORWARDS the requested service tier to its provider
+    # (``GatewayWireProfile.forwards_tier``), so the reprice applies the per-tier
+    # card only on a depth that emits the tier. Empty on tier-less surfaces.
     tier_forwarded_by_depth: tuple[bool, ...] = ()
+    # Exact finite output bound frozen alongside each admitted provider payload.
+    reserved_output_tokens_by_depth: tuple[int, ...] = ()
     # The request's tenant-isolated affinity fingerprint on a
     # ``maximize_cache_affinity`` pool (None elsewhere), captured at admission
     # so dispatch reservation can read and refresh the worker-local sticky
@@ -223,6 +224,12 @@ class InflightRequest:
     # Whether the route's depth 0 was chosen by a live sticky binding rather
     # than rendezvous order, for the ``affinity_sticky`` disclosure.
     sticky_preferred: bool = False
+    # Rebuild material for gateway tool-search rounds: the admitted wires and
+    # the public request ``build_rung_dispatch`` needs again, plus the search
+    # state; ``None`` on requests the gateway runs no tool search for.
+    resolved_wires: tuple[tuple[GatewayWireProfile, NativeWireClient], ...] | None = None
+    public_request: GatewayRequest | None = None
+    tool_search: ToolSearchState | None = None
 
     def __post_init__(self) -> None:
         """Size the per-deployment attempt counters to the frozen route."""
@@ -763,22 +770,8 @@ def select_route_deployments(
 
 
 def request_carries_cache_markers(request: GatewayRequest) -> bool:
-    """Whether any prompt-cache marker rides this request.
-
-    Markers live on the top-level automatic carrier, tool definitions,
-    assistant tool calls, message text runs, and tool-result breakpoints;
-    every one of them is honored only by the Anthropic Messages wire.
-    """
-    return (
-        request.provider_cache_control is not None
-        or any(tool.cache_control is not None for tool in request.tools)
-        or any(
-            message.provider_text_blocks
-            or message.cache_control is not None
-            or any(call.cache_control is not None for call in message.tool_calls)
-            for message in request.messages
-        )
-    )
+    """Whether a supported text, media, tool, or automatic marker rides the request."""
+    return bool(cache_markers(request))
 
 
 def reorder_route_deployments(
@@ -831,6 +824,7 @@ def deployment_wire_entry(
     serialize_tool_calls: bool = False,
     throttle_redial_budget: int = 0,
     zdr_constrained: bool = False,
+    native_tool_translation: Mapping[str, tuple[str, str | None, bool]] | None = None,
 ) -> JsonObject:
     """Build one deployment's wire configuration for the admitted route.
 
@@ -891,6 +885,13 @@ def deployment_wire_entry(
         # whose payload already carries the caller's stop field.
         "stop_sequences": list(stop_sequences),
         "serialize_tool_calls": serialize_tool_calls,
+        # Codex native tools translated to function tools on a foreign wire;
+        # the data plane inverts the tool-call responses back to the native
+        # (namespaced / custom) shape the caller declared. Empty on native
+        # Responses routes and every non-Codex request.
+        "native_tool_translation": {
+            mangled: list(origin) for mangled, origin in (native_tool_translation or {}).items()
+        },
         # An image-emitting lane (the platform projects `emits_images` from the
         # model's output modalities): the data plane answers an empty
         # completion there at once instead of redialing a second whole image.
@@ -912,6 +913,7 @@ def deployment_wire_entry(
         "time_to_first_byte_seconds_per_million_input_tokens": (
             capabilities.time_to_first_byte_seconds_per_million_input_tokens
         ),
+        "time_to_first_token_base_seconds": capabilities.time_to_first_token_base_seconds,
         # A failover-only rung's tokens (`native_fallback_rules`): the data
         # plane never counts it as a first-dial or unmatched successor.
         "failover_only_on": (
