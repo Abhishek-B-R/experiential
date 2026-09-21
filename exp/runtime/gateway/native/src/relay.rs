@@ -3,6 +3,8 @@
 //! classify what the relay yields. The waterfall commits a relay to one
 //! deployment; the HTTP surfaces then drain it live or to completion.
 
+mod progress;
+
 use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -176,16 +178,23 @@ pub struct UpstreamRelay {
     /// still stall for minutes before its first token (2026-09-19, ~2 min
     /// medians on a lane whose first byte was instant).
     first_byte_recorded: bool,
-    /// Whether the fail-fast first-token bound still applies. Armed until the
-    /// waterfall COMMITS the attempt (`commit`, called at the moment the
-    /// first semantic event -- content, reasoning, a tool call, an output
-    /// item -- makes this attempt the answer); from then on reads are paced
-    /// by the deployment's per-chunk timeout, so a slow reasoning model
-    /// streams for as long as it needs once it has started answering. Armed
-    /// exactly until commit keeps the stall failover-safe: a refusal delta
-    /// the waterfall WITHHOLDS under refusal failover is semantic but not a
-    /// commit, and a provider that stalls behind it still trips the bound.
+    /// Whether the first-token allowance still applies. Committed genuine
+    /// output or a private token begins generation; withheld refusals do not.
+    /// Generation uses a progress-idle deadline, independent of whether the
+    /// waterfall can still safely fail over.
     stall_bound_armed: bool,
+    /// Commitment prevents failover; it does not itself prove generation.
+    committed: bool,
+    /// Irreversible provider tool work has its own phase: byte-idle and the
+    /// hard deadline still apply, but generation may legitimately be silent.
+    provider_tools: progress::ProviderTools,
+    /// Last genuine normalized generation progress, never the arrival of
+    /// transport bytes or protocol scaffolding. The connection timeout bounds
+    /// the gap from this instant once generation has begun.
+    last_progress_at: Option<Instant>,
+    /// Time handed to the consumer is not provider-idle time. Only generation
+    /// idle pauses here; first-token and total deadlines remain absolute.
+    yielded_at: Option<Instant>,
     /// Fail-fast bound for the provider's first token, absolute from the dial
     /// (`waterfall::first_token_allowance`: the first-token base plus the
     /// input slope; the header phase has its own, shorter first-byte bound).
@@ -197,8 +206,8 @@ pub struct UpstreamRelay {
     /// stamped on the first event that carries visible model output.
     first_token_at: Option<SystemTime>,
     /// Tokens an earlier, refused dial of the same attempt was billed for,
-    /// folded into the first usage report this relay yields so the
-    /// reservation settles both dials' tokens as one.
+    /// folded once into each cumulative usage snapshot this relay yields so
+    /// the reservation settles both dials' tokens as one.
     carried_usage: Option<Usage>,
 }
 
@@ -255,6 +264,10 @@ impl UpstreamRelay {
             eof: false,
             first_byte_recorded: false,
             stall_bound_armed: true,
+            committed: false,
+            provider_tools: progress::ProviderTools::default(),
+            last_progress_at: None,
+            yielded_at: None,
             first_token_deadline,
             first_token_at: None,
             native_tool_inverter: NativeToolInverter::default(),
@@ -263,13 +276,58 @@ impl UpstreamRelay {
         }
     }
 
-    /// The waterfall committed the attempt on this relay: the first-token
-    /// bound is disarmed and every later read is paced by the deployment's
-    /// per-chunk timeout. Called at the commit point and nowhere else, so a
-    /// semantic event the waterfall withholds (a refusal delta under refusal
-    /// failover) leaves the bound armed.
+    /// Pin the attempt. Structural output can commit before generation, so
+    /// it keeps the full first-token allowance until genuine progress arrives.
     pub fn commit(&mut self) {
+        self.committed = true;
+        if self.last_progress_at.is_some() {
+            self.stall_bound_armed = false;
+        }
+    }
+
+    /// A private token starts generation without committing the attempt.
+    /// Its buffered carrier has not escaped, so a later stall can fail over.
+    pub fn private_progress(&mut self) {
         self.stall_bound_armed = false;
+    }
+
+    /// Absolute expiry checks are required even when the stream is always
+    /// ready: Tokio's timeout polls a ready future before its timer.
+    fn read_failure(&self, deadline: Instant, phase_timeout: Duration) -> Option<Failure> {
+        if remaining(deadline).is_zero() {
+            return Some(stream_timeout_failure(deadline));
+        }
+        if self.provider_tools.active() {
+            return None;
+        }
+        if self.stall_bound_armed {
+            return remaining(self.first_token_deadline)
+                .is_zero()
+                .then(first_byte_timeout_failure);
+        }
+        self.last_progress_at
+            .filter(|last| last.elapsed() >= phase_timeout)
+            .map(|_| {
+                Failure::new(
+                    FailureClass::Transport,
+                    "provider stopped making progress; retry the request",
+                )
+                .with_retry(false, true)
+            })
+    }
+
+    /// Prefer the normalizer's latest cumulative report on an abnormal end.
+    /// Add the earlier dial exactly once, never to an already folded report.
+    /// Dialects that yield usage directly keep their last yielded report.
+    pub fn usage_before_failure(&self, reported: Option<Usage>) -> Option<Usage> {
+        self.normalizer
+            .observed_usage()
+            .map(|observed| match self.carried_usage.as_ref() {
+                Some(carried) => fold_usage(carried, observed.clone()),
+                None => observed.clone(),
+            })
+            .or(reported)
+            .or_else(|| self.carried_usage.clone())
     }
 
     /// The wall-clock time this relay yielded its first output token, or
@@ -345,7 +403,7 @@ impl UpstreamRelay {
     }
 
     /// Carry the tokens a refused earlier dial of this attempt was billed
-    /// for; they join the first usage report this relay yields, once.
+    /// for; they join each cumulative usage report once.
     pub fn set_carried_usage(&mut self, carried: Option<Usage>) {
         self.carried_usage = carried;
     }
@@ -373,6 +431,16 @@ impl UpstreamRelay {
                 failure.clone(),
                 provider,
             ));
+        }
+        // Progress belongs to the provider, not the outward projection. A
+        // stop-sequence match suppresses later text while still draining the
+        // provider's genuine generation to its terminal usage report.
+        self.provider_tools.observe(&event);
+        if event.is_generation_progress() {
+            self.last_progress_at = Some(Instant::now());
+            if self.committed {
+                self.stall_bound_armed = false;
+            }
         }
         // The gateway's own search tool is withheld first: it is not one of
         // the caller's tools, so it never counts toward one-call-per-turn
@@ -417,6 +485,11 @@ impl UpstreamRelay {
         phase_timeout: Duration,
         request_started: Instant,
     ) -> Result<Option<Event>, Failure> {
+        if let (Some(yielded), Some(last)) =
+            (self.yielded_at.take(), self.last_progress_at.as_mut())
+        {
+            *last += yielded.elapsed();
+        }
         loop {
             if let Some(mut event) = self.ready.pop_front() {
                 // Every yielded event exits here, so this is the one place that
@@ -432,9 +505,9 @@ impl UpstreamRelay {
                 {
                     if usage.has_token_counts() {
                         *usage = fold_usage(carried, usage.clone());
-                        self.carried_usage = None;
                     }
                 }
+                self.yielded_at = Some(Instant::now());
                 return Ok(Some(event));
             }
             if self.guard_next_pending() {
@@ -443,17 +516,23 @@ impl UpstreamRelay {
             if self.eof {
                 return Ok(None);
             }
-            // Until the first semantic event the fail-fast first-token bound
-            // applies -- absolute from the dial, so keepalive comments,
-            // pings and role-only frames buy the provider nothing; after it,
-            // each chunk is paced by the deployment's own per-chunk timeout
-            // so long-running generation is never capped.
-            let waiting_for_first_token = self.stall_bound_armed;
-            let bound = if waiting_for_first_token {
-                remaining(deadline).min(remaining(self.first_token_deadline))
+            // Already decoded events, especially a terminal with usage, are
+            // drained first. A slow downstream consumer cannot turn a received
+            // terminal into a provider stall. No fresh read may bypass expiry.
+            if let Some(failure) = self.read_failure(deadline, phase_timeout) {
+                return Err(failure);
+            }
+            // Bytes never renew either bound. Genuine progress renews the
+            // generation idle window, while the total request deadline stays
+            // fixed across progress and all physical attempts.
+            let progress_deadline = if self.provider_tools.active() {
+                Instant::now() + phase_timeout
+            } else if self.stall_bound_armed {
+                self.first_token_deadline
             } else {
-                remaining(deadline).min(phase_timeout)
+                self.last_progress_at.expect("generation has begun") + phase_timeout
             };
+            let bound = remaining(deadline).min(remaining(progress_deadline));
             let chunk = match tokio::time::timeout(bound, self.stream.next()).await {
                 Ok(Some(Ok(chunk))) => chunk,
                 Ok(Some(Err(error))) => {
@@ -520,15 +599,9 @@ impl UpstreamRelay {
                     continue;
                 }
                 Err(_) => {
-                    // A first-token stall while the request deadline still has
-                    // budget is the fail-fast case: classify it as a
-                    // failover-eligible transient so the next rung is tried at
-                    // once. A later chunk stall, or an exhausted request
-                    // deadline, keeps the existing transport/deadline mapping.
-                    if waiting_for_first_token && !remaining(deadline).is_zero() {
-                        return Err(first_byte_timeout_failure());
-                    }
-                    return Err(stream_timeout_failure(deadline));
+                    return Err(self
+                        .read_failure(deadline, phase_timeout)
+                        .unwrap_or_else(|| stream_timeout_failure(deadline)));
                 }
             };
             if !self.first_byte_recorded {
@@ -592,11 +665,14 @@ pub async fn collect_committed(
         return Ok(events);
     }
     loop {
-        match committed
+        let next = committed
             .relay
             .next_event(deadline, phase_timeout, request_started)
-            .await?
-        {
+            .await;
+        if matches!(next, Err(_) | Ok(None) | Ok(Some(Event::Failed(_)))) {
+            committed.usage = committed.relay.usage_before_failure(committed.usage.take());
+        }
+        match next? {
             Some(event) => {
                 track_event(&event, &mut committed.usage, &mut committed.tool_names);
                 let terminal = event.is_terminal();
@@ -610,6 +686,8 @@ pub async fn collect_committed(
     }
 }
 
+#[cfg(test)]
+mod progress_tests;
 #[cfg(test)]
 mod tests;
 
