@@ -82,6 +82,25 @@ fn routing_provenance_is_optional_until_selected_and_then_immutable() {
 }
 
 #[test]
+fn collector_forwards_destination_cleanup_failure_without_losing_write_success() {
+    struct CleanupFailure;
+    impl Sink for CleanupFailure {
+        fn write(&mut self, _: &str) -> Result<(), ()> {
+            Ok(())
+        }
+        fn take_maintenance_failures(&mut self) -> u64 {
+            1
+        }
+    }
+    let collector = Collector::new(config(), CleanupFailure).unwrap();
+    assert!(collector.begin(request("saved")));
+    collector.settle("saved", true, false);
+    assert!(collector.close_until(Instant::now() + Duration::from_secs(1)));
+    assert_eq!(collector.counts(), [0, 0, 1, 0, 0, 0]);
+    assert_eq!(collector.maintenance_failures(), 1);
+}
+
+#[test]
 fn idle_maintenance_expires_pending_content_without_another_request() {
     let (collector, receiver) = collector(config());
     assert!(collector.begin(request("request")));

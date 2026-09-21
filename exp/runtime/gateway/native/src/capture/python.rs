@@ -117,4 +117,9 @@ impl CaptureCollector {
         let [pending, bytes, persisted, failed, dropped, skipped] = self.inner.counts();
         (pending, bytes, persisted, failed, dropped, skipped)
     }
+
+    /// Retention or WAL cleanup failures, separate from durable-write failures.
+    fn maintenance_failures(&self) -> u64 {
+        self.inner.maintenance_failures()
+    }
 }

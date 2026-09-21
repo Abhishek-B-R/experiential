@@ -43,7 +43,10 @@ Native capture uses a bounded asynchronous writer, seven-day expiry, at most
 10,000 records and 256 MiB of serialized payloads per identity, with a 1 MiB
 per-record ceiling. SQLite indexes/journals add disk overhead. Oversize,
 interrupted and non-successful responses are not reproducible completed records.
-The collector's content-free counters report delivery and collection failures. Readers exclude
+The collector's content-free counters report delivery and collection failures.
+`maintenance_failures()` reports retention/WAL cleanup failures separately: a busy
+reader cannot turn an already-committed capture into a reported write failure.
+Cleanup retries during periodic maintenance. Readers exclude
 expired records even after the gateway stops.
 
 Bindings reflect active identities and aliases at startup. Restart after changing

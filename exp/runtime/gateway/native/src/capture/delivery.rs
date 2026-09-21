@@ -12,6 +12,11 @@ pub(crate) trait Sink: Send + 'static {
     /// Persist one versioned record. Errors are deliberately content-free.
     fn write(&mut self, record: &str) -> Result<(), ()>;
 
+    /// Drain cleanup failures discovered after a successful durable write.
+    fn take_maintenance_failures(&mut self) -> u64 {
+        0
+    }
+
     /// Run retention maintenance without adding storage work to serving.
     fn maintain(&mut self) -> Result<(), ()> {
         Ok(())
@@ -46,6 +51,7 @@ struct Counters {
     dropped: AtomicU64,
     persisted: AtomicU64,
     failed: AtomicU64,
+    maintenance_failed: AtomicU64,
 }
 
 struct Pending {
@@ -94,7 +100,9 @@ impl Delivery {
                     }
                     if maintained.elapsed() >= Duration::from_secs(1) {
                         if sink.maintain().is_err() {
-                            worker_counters.failed.fetch_add(1, Ordering::Relaxed);
+                            worker_counters
+                                .maintenance_failed
+                                .fetch_add(1, Ordering::Relaxed);
                         }
                         maintained = Instant::now();
                     }
@@ -106,6 +114,9 @@ impl Delivery {
                                 &worker_counters.failed
                             };
                             counter.fetch_add(1, Ordering::Relaxed);
+                            worker_counters
+                                .maintenance_failed
+                                .fetch_add(sink.take_maintenance_failures(), Ordering::Relaxed);
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -195,6 +206,10 @@ impl Delivery {
             self.counters.failed.load(Ordering::Relaxed),
             self.counters.dropped.load(Ordering::Relaxed),
         ]
+    }
+
+    pub(crate) fn maintenance_failures(&self) -> u64 {
+        self.counters.maintenance_failed.load(Ordering::Relaxed)
     }
 }
 

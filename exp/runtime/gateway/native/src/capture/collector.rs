@@ -65,6 +65,10 @@ impl<S: Sink> Sink for MaintainedSink<S> {
         self.sink.write(record)
     }
 
+    fn take_maintenance_failures(&mut self) -> u64 {
+        self.sink.take_maintenance_failures()
+    }
+
     fn maintain(&mut self) -> Result<(), ()> {
         if let Ok(mut pending) = self.pending.lock() {
             expire_pending(&mut pending, &self.skipped);
@@ -418,6 +422,10 @@ impl Collector {
             dropped,
             self.skipped.load(Ordering::Relaxed),
         ]
+    }
+
+    pub(crate) fn maintenance_failures(&self) -> u64 {
+        self.delivery.maintenance_failures()
     }
 }
 

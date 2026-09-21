@@ -103,6 +103,31 @@ fn failed_destination_releases_budget_and_records_no_sensitive_error() {
 }
 
 #[test]
+fn committed_write_and_cleanup_failures_have_separate_counters() {
+    struct CleanupFailure;
+    impl Sink for CleanupFailure {
+        fn write(&mut self, _: &str) -> Result<(), ()> {
+            Ok(())
+        }
+        fn take_maintenance_failures(&mut self) -> u64 {
+            1
+        }
+        fn maintain(&mut self) -> Result<(), ()> {
+            Err(())
+        }
+    }
+    let delivery = Delivery::new(limits(), CleanupFailure).unwrap();
+    assert!(delivery.submit("saved".into()));
+    let until = Instant::now() + Duration::from_secs(5);
+    while delivery.maintenance_failures() < 2 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(delivery.close_until(until));
+    assert_eq!(delivery.counts(), [0, 0, 1, 0, 0]);
+    assert!(delivery.maintenance_failures() >= 2);
+}
+
+#[test]
 fn shutdown_returns_while_sink_is_blocked_and_expires_queued_records() {
     let (delivery, entered, resume) = paused(limits(), false);
     assert!(delivery.submit("active".to_owned()));

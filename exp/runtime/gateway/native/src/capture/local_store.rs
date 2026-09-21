@@ -13,6 +13,11 @@ pub(super) struct Pending {
     pub captured_at: u64,
 }
 
+/// A committed write remains successful even when journal cleanup must retry.
+pub(super) struct Persisted {
+    pub maintenance_failed: bool,
+}
+
 fn safe_error(_: rusqlite::Error) -> String {
     "CLaaS capture database operation failed".into()
 }
@@ -99,7 +104,7 @@ pub(super) fn open_database(path: &Path) -> Result<Connection, String> {
     Ok(connection)
 }
 
-pub(super) fn persist(connection: &mut Connection, item: Pending) -> rusqlite::Result<()> {
+pub(super) fn persist(connection: &mut Connection, item: Pending) -> rusqlite::Result<Persisted> {
     let transaction = connection.transaction()?;
     transaction.execute(
         "INSERT INTO claas_experiences
@@ -111,10 +116,9 @@ pub(super) fn persist(connection: &mut Connection, item: Pending) -> rusqlite::R
     )?;
     let removed = prune_rows(&transaction, &item.policy, now())?;
     transaction.commit()?;
-    if removed > 0 {
-        truncate_wal(connection)?;
-    }
-    Ok(())
+    Ok(Persisted {
+        maintenance_failed: removed > 0 && truncate_wal(connection).is_err(),
+    })
 }
 
 pub(super) fn prune(

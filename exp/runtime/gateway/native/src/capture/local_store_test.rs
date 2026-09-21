@@ -131,6 +131,21 @@ fn expired_content_is_removed_from_database_and_wal_after_readers_release() {
         })
         .unwrap();
     assert!(prune(&writer, &policy(), now() + 61).is_err());
+    // The reader still holds the original pages. A new committed capture must
+    // report WAL cleanup separately from the successful database insertion.
+    let mut single = policy();
+    single.maximum_experiences = 1;
+    persist(&mut writer, pending("fresh-one", single.clone())).unwrap();
+    let outcome = persist(&mut writer, pending("fresh-two", single)).unwrap();
+    assert!(outcome.maintenance_failed);
+    let count: i64 = writer
+        .query_row(
+            "SELECT COUNT(*) FROM claas_experiences WHERE response_id='fresh-two'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
     reader.execute_batch("ROLLBACK").unwrap();
     prune(&writer, &policy(), now() + 61).unwrap();
     for artifact in [

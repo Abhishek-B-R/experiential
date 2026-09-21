@@ -43,6 +43,7 @@ pub(crate) struct CaptureConfiguration {
 pub(crate) struct SqliteSink {
     connection: rusqlite::Connection,
     policies: Vec<Policy>,
+    maintenance_failed: u64,
 }
 
 impl SqliteSink {
@@ -61,6 +62,7 @@ impl SqliteSink {
         let mut sink = Self {
             connection,
             policies,
+            maintenance_failed: 0,
         };
         sink.maintain()
             .map_err(|_| "cannot prune local capture database".to_owned())?;
@@ -127,7 +129,7 @@ impl Sink for SqliteSink {
         if payload.len() > policy.maximum_experience_bytes {
             return Err(());
         }
-        local_store::persist(
+        let persisted = local_store::persist(
             &mut self.connection,
             local_store::Pending {
                 policy: policy.clone(),
@@ -137,7 +139,13 @@ impl Sink for SqliteSink {
                 captured_at: record.captured_at as u64,
             },
         )
-        .map_err(|_| ())
+        .map_err(|_| ())?;
+        self.maintenance_failed += u64::from(persisted.maintenance_failed);
+        Ok(())
+    }
+
+    fn take_maintenance_failures(&mut self) -> u64 {
+        std::mem::take(&mut self.maintenance_failed)
     }
 
     fn maintain(&mut self) -> Result<(), ()> {
