@@ -418,6 +418,7 @@ impl ChatSseEncoder {
                 let mut frames = Vec::new();
                 if matches!(event, Event::Completed | Event::StoppedAtSequence(_))
                     && self.reasoning.candidate()?.is_some()
+                    && !self.reasoning_output_exposed
                 {
                     let carrier = self.reasoning_content_carrier.as_ref().ok_or_else(|| {
                         invalid_provider_stream(
@@ -698,6 +699,7 @@ pub fn completed_chat_body_with_carrier(
     if matches!(terminal, Event::Completed | Event::StoppedAtSequence(_))
         && has_tool_calls
         && reasoning.is_some()
+        && !reasoning_output_exposed
     {
         // A tool turn's reasoning round-trips as the sealed opaque carrier
         // (never raw plaintext — that would be a CoT-injection vector on the

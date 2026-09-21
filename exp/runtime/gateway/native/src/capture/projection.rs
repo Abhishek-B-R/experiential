@@ -5,14 +5,16 @@ use std::collections::BTreeMap;
 
 pub(super) fn completed_response(record: &Record) -> Option<Value> {
     let protocol = &record.request.protocol;
-    if !matches!(protocol, Protocol::ChatCompletions | Protocol::Responses) {
-        return None;
-    }
     match record.response.as_ref()? {
         Response::Json {
             status: 200..=299,
             body,
+            source_json,
         } => {
+            let restored = source_json
+                .as_ref()
+                .and_then(|source| serde_json::from_str::<Value>(source).ok());
+            let body = restored.as_ref().unwrap_or(body);
             if body.get("error").is_some_and(|value| !value.is_null()) {
                 return None;
             }
@@ -20,6 +22,13 @@ pub(super) fn completed_response(record: &Record) -> Option<Value> {
                 let choices = body.get("choices")?.as_array()?;
                 if choices.is_empty()
                     || choices.iter().any(|value| value["finish_reason"].is_null())
+                {
+                    return None;
+                }
+            } else if matches!(protocol, Protocol::Messages) {
+                if body.get("type").and_then(Value::as_str) != Some("message")
+                    || !body.get("content").is_some_and(Value::is_array)
+                    || !body.get("stop_reason").is_some_and(Value::is_string)
                 {
                     return None;
                 }
@@ -36,7 +45,12 @@ pub(super) fn completed_response(record: &Record) -> Option<Value> {
             frames,
             truncated: false,
             client_disconnected: false,
+            source_json,
         } => {
+            let restored = source_json
+                .as_ref()
+                .and_then(|source| serde_json::from_str::<Vec<Value>>(source).ok());
+            let frames = restored.as_ref().unwrap_or(frames);
             if frames.iter().any(|value| {
                 value.get("error").is_some_and(|value| !value.is_null())
                     || matches!(
@@ -59,6 +73,8 @@ pub(super) fn completed_response(record: &Record) -> Option<Value> {
                     .get("response")
                     .filter(|value| value.is_object())
                     .cloned()
+            } else if matches!(protocol, Protocol::Messages) {
+                super::messages::assemble(frames)
             } else {
                 if frames.last().and_then(Value::as_str) != Some("[DONE]") {
                     return None;

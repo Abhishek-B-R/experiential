@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from pydantic import JsonValue
 
 from exp.common.claas import ClaasScope, Experience
 from exp.common.core.artifacts import JsonObject, SourceIdentity, sha256_json
+from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.claas.store import ExperienceStore
+from exp.runtime.gateway.capture_context import restore_capture_context
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.local_capture import GATEWAY_CAPTURE_APPLICATION
+from exp.runtime.gateway.replay_identity import provider_replay_authority
 from exp.runtime.openai_protocol.requests import decode_responses
 from exp.simulation.ingest.chat_json import CHAT_JSON_SOURCE
 from exp.simulation.ingest.otlp import TraceNormalizationIssue, TraceNormalizationResult
@@ -27,11 +31,12 @@ def load_gateway_capture(
     """
     scope = ClaasScope(user_id=identity_id, application_id=GATEWAY_CAPTURE_APPLICATION)
     rows = ExperienceStore(path, scope).read_after(limit=limit)
+    by_response_id = {row.experience.response_id: row.experience for row in rows}
     documents: list[JsonValue] = []
     issues: list[TraceNormalizationIssue] = []
     for row in rows:
         try:
-            documents.append(_conversation(row.experience))
+            documents.append(_conversation(row.experience, by_response_id))
         except ValueError:
             issues.append(
                 TraceNormalizationIssue(
@@ -51,18 +56,18 @@ def load_gateway_capture(
     )
 
 
-def _conversation(experience: Experience) -> JsonObject:
+def _conversation(experience: Experience, by_response_id: dict[str, Experience]) -> JsonObject:
     """Retain the full source exchange and expose observed messages and tool schemas."""
     context = experience.request.get("exp_context")
     if not isinstance(context, dict) or context.get("schema_version") != 1:
         raise ValueError("effective capture context is required")
+    context = restore_capture_context(context)
     raw_request = context.get("request")
     if not isinstance(raw_request, dict):
         raise ValueError("effective request is required")
     request = GatewayRequest.model_validate(raw_request)
-    messages: list[JsonObject] = [
-        message.model_dump(mode="json", exclude_none=True) for message in request.messages
-    ]
+    messages = _request_messages(request, context.get("provider_context"))
+    lineage, missing_parent = _restore_linked_reasoning(messages, experience, by_response_id)
     messages.extend(_output_messages(experience))
     tool_names: dict[str, str] = {}
     for message in messages:
@@ -90,20 +95,83 @@ def _conversation(experience: Experience) -> JsonObject:
         }
         for tool in request.tools
     ]
-    return {
+    document: JsonObject = {
         "id": experience.experience_id,
         "messages": list(messages),
         "exp.request.tools": tools,
         "exp.request.context": {
             "gateway_request": context,
             "gateway_response": experience.response,
+            "capture_output": experience.request.get("exp_capture_output"),
             "identity_id": experience.scope.user_id,
             "captured_at": experience.captured_at.isoformat(),
             "response_id": experience.response_id,
             "parent_response_id": experience.parent_response_id,
             "deployment_id": experience.provenance.deployment_id,
             "model_id": experience.provenance.model_id,
+            "linked_response_ids": lineage,
+            "missing_parent_response_id": missing_parent,
         },
+    }
+    if experience.episode_id:
+        document["exp.conversation.id"] = experience.episode_id
+    elif experience.protocol == "responses":
+        document["exp.conversation.id"] = (
+            f"response:{missing_parent or (lineage[-1] if lineage else experience.response_id)}"
+        )
+    return document
+
+
+def _restore_linked_reasoning(
+    messages: list[JsonObject], experience: Experience, by_response_id: dict[str, Experience]
+) -> tuple[list[JsonValue], str | None]:
+    """Recover observed reasoning only through explicit, identity-scoped response links.
+
+    Expanded history fixes each parent's output position. A changed post-guardrail
+    visible turn is never overwritten. Missing links remain explicit evidence gaps.
+    """
+    seen = {experience.response_id}
+    lineage: list[JsonValue] = []
+    parent_id = experience.parent_response_id
+    while parent_id:
+        if parent_id in seen:
+            raise ValueError("cyclic response lineage")
+        seen.add(parent_id)
+        parent = by_response_id.get(parent_id)
+        if parent is None:
+            return lineage, parent_id
+        if parent.scope != experience.scope or parent.protocol != "responses":
+            raise ValueError("response lineage scope mismatch")
+        lineage.append(parent_id)
+        context = parent.request.get("exp_context")
+        if not isinstance(context, dict):
+            return lineage, parent_id
+        request = GatewayRequest.model_validate(restore_capture_context(context).get("request"))
+        for position, output in enumerate(_output_messages(parent), start=len(request.messages)):
+            if position >= len(messages):
+                raise ValueError("response lineage exceeds expanded history")
+            target = messages[position]
+            if _visible_turn(target) == _visible_turn(output):
+                reasoning = output.get("reasoning_content")
+                if isinstance(reasoning, str):
+                    target["reasoning_content"] = reasoning
+        parent_id = parent.parent_response_id
+    return lineage, None
+
+
+def _visible_turn(message: JsonObject) -> JsonObject:
+    """Compare linked output without letting serialization-only carriers change identity."""
+    calls = message.get("tool_calls")
+    return {
+        "role": message.get("role"),
+        "content": message.get("content"),
+        "tool_calls": [
+            {key: call.get(key) for key in ("call_id", "name", "arguments")}
+            for call in calls
+            if isinstance(call, dict)
+        ]
+        if isinstance(calls, list)
+        else [],
     }
 
 
@@ -114,10 +182,40 @@ def _output_messages(experience: Experience) -> list[JsonObject]:
         if not isinstance(output, list) or not output:
             raise ValueError("response has no observed output")
         decoded = decode_responses({"model": "captured", "input": output})
-        return [
-            message.model_dump(mode="json", exclude_none=True)
-            for message in decoded.request.messages
-        ]
+        messages = _request_messages(decoded.request, provider_replay_authority(decoded.request))
+    elif experience.protocol == "messages":
+        content = experience.response.get("content")
+        if not isinstance(content, list) or not content:
+            raise ValueError("message has no observed output")
+        decoded = decode_messages(
+            {
+                "model": "captured",
+                "max_tokens": 1,
+                "messages": [{"role": "assistant", "content": content}],
+            }
+        )
+        messages = _request_messages(decoded.request, provider_replay_authority(decoded.request))
+    else:
+        messages = _chat_output(experience)
+    output = experience.request.get("exp_capture_output")
+    if isinstance(output, dict):
+        reasoning = output.get("provider_reasoning")
+        source = output.get("provider_reasoning_source_json")
+        if isinstance(source, str):
+            reasoning = json.loads(source)
+        if isinstance(reasoning, str):
+            assistant = next(
+                (message for message in reversed(messages) if message.get("role") == "assistant"),
+                None,
+            )
+            if assistant is None:
+                raise ValueError("reasoning has no assistant output")
+            assistant["reasoning_content"] = reasoning
+    return messages
+
+
+def _chat_output(experience: Experience) -> list[JsonObject]:
+    """Read exactly one complete public Chat assistant turn."""
     choices = experience.response.get("choices")
     if not isinstance(choices, list) or len(choices) != 1:
         raise ValueError("capture needs exactly one observed choice")
@@ -125,3 +223,51 @@ def _output_messages(experience: Experience) -> list[JsonObject]:
     if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
         raise ValueError("capture has no complete assistant message")
     return [choice["message"]]
+
+
+def _request_messages(request: GatewayRequest, provider: JsonValue) -> list[JsonObject]:
+    """Restore serialization-excluded reasoning, tool failures, and raw arguments."""
+    messages: list[JsonObject] = [
+        message.model_dump(mode="json", exclude_none=True) for message in request.messages
+    ]
+    replay = provider.get("provider_replay") if isinstance(provider, dict) else None
+    if isinstance(replay, list):
+        for entry in replay:
+            if not isinstance(entry, dict):
+                raise ValueError("invalid provider capture context")
+            index = entry.get("message_index")
+            if not isinstance(index, int) or not 0 <= index < len(messages):
+                raise ValueError("invalid provider message index")
+            message = messages[index]
+            for key, value in entry.items():
+                if key not in {"message_index", "tool_calls"}:
+                    message[key] = value
+            calls = message.get("tool_calls")
+            retained = entry.get("tool_calls")
+            if isinstance(calls, list) and isinstance(retained, list):
+                for call in retained:
+                    if not isinstance(call, dict):
+                        raise ValueError("invalid retained tool call")
+                    position = call.get("tool_call_index")
+                    if not isinstance(position, int) or not 0 <= position < len(calls):
+                        raise ValueError("invalid retained tool index")
+                    target = calls[position]
+                    if not isinstance(target, dict) or target.get("call_id") != call.get("call_id"):
+                        raise ValueError("retained tool identity mismatch")
+                    raw = call.get("raw_arguments")
+                    if isinstance(raw, str):
+                        target["arguments"] = raw
+                    target["provider_context"] = call
+    for message in messages:
+        blocks = message.get("provider_reasoning")
+        if isinstance(blocks, list):
+            text = "".join(
+                block["content"]
+                for block in blocks
+                if isinstance(block, dict)
+                and block.get("kind") == "exposed_reasoning_content"
+                and isinstance(block.get("content"), str)
+            )
+            if text:
+                message["reasoning_content"] = text
+    return messages

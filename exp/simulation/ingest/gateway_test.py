@@ -7,8 +7,9 @@ from pathlib import Path
 import pytest
 
 from exp.common.claas import ClaasScope, Experience, ExperienceProvenance
+from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.capture_context import capture_request_context
-from exp.runtime.openai_protocol.requests import decode_chat
+from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
 from exp.simulation.ingest.gateway import load_gateway_capture
 from exp.simulation.ingest.sources import TraceSourceError, load_trace_source
 
@@ -120,3 +121,192 @@ def test_identity_is_required_and_not_accepted_for_unscoped_sources(tmp_path: Pa
         load_trace_source("gateway", tmp_path / "unused")
     with pytest.raises(TraceSourceError, match="only with"):
         load_trace_source("chat-json", tmp_path / "unused", identity_id="developer")
+
+
+def test_reasoning_raw_arguments_and_environment_bytes_reach_semantic_spans(tmp_path: Path) -> None:
+    """Full submitted history survives storage projection and canonical ingestion."""
+    environment = "  ENV\r\nalpha\0beta\t雪✓\r\nEND  \n"
+    arguments = '{ "id" : "A" }'
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "system", "content": "exact system\n"},
+                {"role": "user", "content": "Find record A"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "first reasoning\n",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": arguments},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": environment},
+                {"role": "user", "content": "Now summarize"},
+            ],
+        }
+    ).request
+    experience = _experience().model_copy(
+        update={
+            "request": {
+                "exp_context": capture_request_context(request),
+                "exp_capture_output": {"provider_reasoning": "final reasoning\n"},
+            }
+        }
+    )
+    path = tmp_path / "traffic.db"
+    _database(path, (experience,))
+    result = load_gateway_capture(path, identity_id="developer")
+    assert not result.issues
+    trace = result.traces[0]
+    assert any(span.attributes.get("gen_ai.tool.message") == environment for span in trace.spans)
+    outputs = [span.attributes.get("gen_ai.output.messages") for span in trace.spans]
+    assert any(
+        isinstance(messages, list)
+        and any(
+            isinstance(message, dict) and message.get("reasoning_content") == "first reasoning\n"
+            for message in messages
+        )
+        for messages in outputs
+    )
+    assert any(
+        isinstance(messages, list)
+        and any(
+            isinstance(message, dict) and message.get("reasoning_content") == "final reasoning\n"
+            for message in messages
+        )
+        for messages in outputs
+    )
+    assert any(
+        span.attributes.get("gen_ai.tool.call.arguments") == arguments for span in trace.spans
+    )
+
+
+def test_messages_tool_error_and_thinking_are_preserved(tmp_path: Path) -> None:
+    """Messages tool failures and signed thinking remain evidence, not success claims."""
+    request = decode_messages(
+        {
+            "model": "coding",
+            "max_tokens": 128,
+            "messages": [
+                {"role": "user", "content": "Find record A"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {"id": "A"}}
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "is_error": True,
+                            "content": "  tool failed\n",
+                        }
+                    ],
+                },
+            ],
+        }
+    ).request
+    experience = _experience().model_copy(
+        update={
+            "protocol": "messages",
+            "request": {"exp_context": capture_request_context(request)},
+            "response": {
+                "id": "msg",
+                "type": "message",
+                "role": "assistant",
+                "stop_reason": "end_turn",
+                "content": [
+                    {"type": "thinking", "thinking": "exact thinking\n", "signature": "signed"},
+                    {"type": "text", "text": "The lookup failed"},
+                ],
+            },
+        }
+    )
+    path = tmp_path / "traffic.db"
+    _database(path, (experience,))
+    result = load_gateway_capture(path, identity_id="developer")
+    assert not result.issues
+    trace = result.traces[0]
+    errors = [span for span in trace.spans if span.attributes.get("gen_ai.tool.is_error")]
+    assert errors and errors[0].attributes["gen_ai.tool.message"] == "  tool failed\n"
+    outputs = [span.attributes.get("gen_ai.output.messages") for span in trace.spans]
+    assert "exact thinking\\n" in str(outputs) and "signed" in str(outputs)
+    assert trace.outcome is None
+
+
+def test_explicit_response_lineage_restores_reasoning_without_prefix_joining(
+    tmp_path: Path,
+) -> None:
+    """A parent link supplies plaintext evidence without decrypting or guessing a session."""
+    call = {
+        "type": "function_call",
+        "id": "fc1",
+        "call_id": "call-1",
+        "name": "lookup",
+        "arguments": '{ "id" : "A" }',
+    }
+    parent_request = decode_responses({"model": "coding", "input": "Find record A"}).request
+    parent = _experience().model_copy(
+        update={
+            "protocol": "responses",
+            "response_id": "parent",
+            "request": {
+                "exp_context": capture_request_context(parent_request),
+                "exp_capture_output": {"provider_reasoning": "observed parent reasoning"},
+            },
+            "response": {"id": "parent", "status": "completed", "output": [call]},
+        }
+    )
+    continued_request = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"role": "user", "content": "Find record A"},
+                call,
+                {"type": "function_call_output", "call_id": "call-1", "output": "Record A"},
+            ],
+        }
+    ).request
+    child = parent.model_copy(
+        update={
+            "experience_id": "child",
+            "response_id": "child",
+            "parent_response_id": "parent",
+            "request": {"exp_context": capture_request_context(continued_request)},
+            "response": {
+                "id": "child",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "msg",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Found", "annotations": []}],
+                    }
+                ],
+            },
+        }
+    )
+    path = tmp_path / "traffic.db"
+    _database(path, (parent, child))
+    result = load_gateway_capture(path, identity_id="developer")
+    assert not result.issues
+    assert {trace.conversation_id for trace in result.traces} == {"response:parent"}
+    trace = next(
+        trace for trace in result.traces if trace.initial_context["response_id"] == "child"
+    )
+    assert "observed parent reasoning" in str(
+        [span.attributes.get("gen_ai.output.messages") for span in trace.spans]
+    )
+    missing = tmp_path / "missing.db"
+    _database(missing, (child,))
+    incomplete = load_gateway_capture(missing, identity_id="developer")
+    assert incomplete.traces[0].initial_context["missing_parent_response_id"] == "parent"

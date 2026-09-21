@@ -30,9 +30,26 @@ def capture_request_context(
     encoded = json.dumps(document, ensure_ascii=True, separators=(",", ":"))
     if len(encoded) > maximum_bytes:
         return None
-    cleaned, _ = normalize_durable_object(document)
+    cleaned, replacements = normalize_durable_object(document)
+    if replacements:
+        # JSONB cannot represent NUL or lone surrogates. Keep a queryable
+        # projection and the exact escaped JSON, rather than destroy evidence.
+        cleaned["source_json"] = encoded
     return (
         cleaned
         if len(json.dumps(cleaned, ensure_ascii=True, separators=(",", ":"))) <= maximum_bytes
         else None
     )
+
+
+def restore_capture_context(context: JsonObject) -> JsonObject:
+    """Recover exact captured strings from the explicitly lossless JSON sidecar."""
+    source = context.get("source_json")
+    if source is None:
+        return context
+    if not isinstance(source, str):
+        raise ValueError("capture source_json must be text")
+    document = json.loads(source)
+    if not isinstance(document, dict) or document.get("schema_version") != 1:
+        raise ValueError("invalid lossless capture context")
+    return document

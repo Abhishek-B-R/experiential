@@ -2,7 +2,8 @@
 
 import json
 
-from exp.runtime.gateway.capture_context import capture_request_context
+from exp.runtime.gateway.capture_context import capture_request_context, restore_capture_context
+from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.openai_protocol.requests import decode_chat
 
 
@@ -63,7 +64,24 @@ def test_capture_context_is_storable_and_omits_transport_replay_key() -> None:
     context = capture_request_context(request)
     assert context is not None
     serialized = json.dumps(context)
-    assert "\\u0000" not in serialized
-    assert "\\ud800" not in serialized
+    assert "\x00" not in serialized
+    restored = restore_capture_context(context)
+    assert GatewayRequest.model_validate(restored["request"]).messages[0].content == "a\x00b\ud800"
+    # Escapes inside source_json are ordinary text after JSONB decodes the envelope.
+    source = context["source_json"]
+    assert isinstance(source, str) and "\x00" not in source
     assert "private-header" not in serialized
     assert request.model_dump() == before
+
+
+def test_lossless_context_retains_colliding_keys_and_enforces_total_budget() -> None:
+    """A lossless sidecar never bypasses the admission memory ceiling."""
+    request = decode_chat(
+        {"model": "coding", "messages": [{"role": "user", "content": "a\0b"}]}
+    ).request
+    context = capture_request_context(request)
+    assert context is not None
+    size = len(json.dumps(context, ensure_ascii=True, separators=(",", ":")))
+    assert capture_request_context(request, maximum_bytes=size - 1) is None
+    restored = GatewayRequest.model_validate(restore_capture_context(context)["request"])
+    assert restored.messages[0].content == "a\0b"

@@ -81,6 +81,7 @@ class CaptureJsonResponse(ContractModel):
     kind: Literal["json"] = "json"
     status: int = Field(ge=100, le=599)
     body: JsonValue
+    source_json: str | None = None
 
 
 class CaptureSseResponse(ContractModel):
@@ -91,6 +92,7 @@ class CaptureSseResponse(ContractModel):
     frames: tuple[JsonValue, ...]
     truncated: bool
     client_disconnected: bool
+    source_json: str | None = None
 
 
 class CaptureRecord(ContractModel):
@@ -102,6 +104,8 @@ class CaptureRecord(ContractModel):
         Annotated[CaptureJsonResponse | CaptureSseResponse, Field(discriminator="kind")] | None
     )
     deployment_id: str | None
+    provider_reasoning: str | None = None
+    provider_reasoning_source_json: str | None = None
     captured_at: float = Field(ge=0, allow_inf_nan=False)
 
 

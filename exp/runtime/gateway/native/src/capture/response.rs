@@ -75,11 +75,15 @@ impl Tap {
             let mut frames = data_frames(&self.bytes);
             let mut truncated = self.truncated;
             loop {
+                let mut frame_value = Value::Array(frames);
+                let source_json = lossless_projection(&mut frame_value);
+                frames = frame_value.as_array().expect("frame array").clone();
                 let response = CapturedResponse::Sse {
                     status: self.status,
                     frames,
                     truncated,
                     client_disconnected: disconnected,
+                    source_json,
                 };
                 let size = serde_json::to_vec(&response).map_or(usize::MAX, |value| value.len());
                 if size <= self.collector.config.maximum_response_bytes {
@@ -87,11 +91,15 @@ impl Tap {
                 }
                 let CapturedResponse::Sse {
                     frames: mut reduced,
+                    source_json,
                     ..
                 } = response
                 else {
                     unreachable!()
                 };
+                if let Some(source) = source_json {
+                    reduced = serde_json::from_str(&source).unwrap_or(reduced);
+                }
                 if reduced.is_empty() {
                     break None;
                 }
@@ -103,10 +111,11 @@ impl Tap {
             serde_json::from_slice::<Value>(&self.bytes)
                 .ok()
                 .map(|mut body| {
-                    normalize(&mut body);
+                    let source_json = lossless_projection(&mut body);
                     CapturedResponse::Json {
                         status: self.status,
                         body,
+                        source_json,
                     }
                 })
         } else {
@@ -214,10 +223,9 @@ fn data_frames(bytes: &[u8]) -> Vec<Value> {
         if line.is_empty() {
             if !data.is_empty() {
                 let payload = data.join(&b'\n');
-                let mut value = serde_json::from_slice(&payload).unwrap_or_else(|_| {
+                let value = serde_json::from_slice(&payload).unwrap_or_else(|_| {
                     Value::String(String::from_utf8_lossy(&payload).into_owned())
                 });
-                normalize(&mut value);
                 frames.push(value);
                 data.clear();
             }
@@ -226,6 +234,16 @@ fn data_frames(bytes: &[u8]) -> Vec<Value> {
         }
     }
     frames
+}
+
+/// Preserve exact JSON text whenever storage requires a normalized projection.
+fn lossless_projection(value: &mut Value) -> Option<String> {
+    let source = serde_json::to_string(value).ok()?;
+    if !source.contains("\\u0000") {
+        return None;
+    }
+    normalize(value);
+    Some(source)
 }
 
 /// Storage normalization never touches forwarded bytes. Preserve colliding object keys.

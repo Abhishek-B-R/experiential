@@ -81,11 +81,14 @@ def test_real_gateway_traffic_reopens_as_scoped_build_evidence(
     worker.start()
     try:
         _wait_ready(port, worker)
-        for surface in ("chat/completions", "responses"):
+        for surface in ("chat/completions", "responses", "messages"):
             for stream in (False, True):
                 body: dict[str, object] = {"model": "coding", "stream": stream}
                 if surface == "responses":
                     body["input"] = "hello capture"
+                elif surface == "messages":
+                    body["messages"] = [{"role": "user", "content": "hello capture"}]
+                    body["max_tokens"] = 128
                 else:
                     body["messages"] = [{"role": "user", "content": "hello capture"}]
                     body["tools"] = [
@@ -132,7 +135,7 @@ def test_real_gateway_traffic_reopens_as_scoped_build_evidence(
     else:
         result = load_gateway_capture(database, identity_id="default")
         assert not result.issues
-        assert len(result.traces) == 5
+        assert len(result.traces) == 7
         assert sum(bool(trace.tools) for trace in result.traces) == 2
         continuations = [
             trace for trace in result.traces if trace.initial_context["parent_response_id"]

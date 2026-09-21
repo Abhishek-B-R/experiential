@@ -102,11 +102,18 @@ impl Sink for SqliteSink {
         );
         let request = json!({
             "exp_context": record.request.context,
+            "exp_capture_output": {
+                "response": record.response,
+                "provider_reasoning": record.provider_reasoning,
+                "provider_reasoning_source_json": record.provider_reasoning_source_json,
+            },
             "previous_response_id": record.request.context["request"]["previous_response_id"]
         });
         let experience = json!({
             "schema_version": 1, "experience_id": experience_id, "response_id": response_id,
-            "episode_id": null, "parent_response_id": request["previous_response_id"],
+            "episode_id": record.request.context["request"]["metadata"]["conversation_id"]
+                .as_str().filter(|value| !value.trim().is_empty() && value.len() <= 512),
+            "parent_response_id": request["previous_response_id"],
             "scope": {"user_id": scope.identity_id, "application_id": scope.application_id},
             "protocol": protocol, "captured_at": record.captured_at, "request": request,
             "response": response,

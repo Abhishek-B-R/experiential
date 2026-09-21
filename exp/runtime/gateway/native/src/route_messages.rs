@@ -225,6 +225,7 @@ pub(crate) async fn messages(
     };
     let mut won = acquire_attempt(&context, &mut guard).await;
     adopt_outcome(&mut admission, &mut won);
+    crate::capture::reasoning::observe_winner(state.capture.clone(), &admission, &mut won);
 
     let capture = state.capture.clone();
     let capture_request_id = admission.request_id.clone();

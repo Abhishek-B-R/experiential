@@ -43,6 +43,23 @@ prove that an end user consumed every byte. `truncated` and
 Output and settlement may arrive in either order. Keyed replays do not attach a
 second response tap. WebSocket and batch response capture are not added here.
 
+The winning rung's provider-returned plaintext reasoning is retained separately
+in `provider_reasoning` when that rung explicitly permits reasoning exposure.
+This preserves reasoning even when the public Responses representation carries
+only an opaque continuation. Private provider reasoning is not decrypted for
+capture. Capture permission never grants permission to expose hidden reasoning.
+Chat tool turns on exposure-enabled routes return plaintext without appending
+an opaque token to the same delta field; private routes retain authenticated tokens.
+
+Postgres cannot represent NUL or lone UTF-16 surrogates. Affected request contexts
+and responses include `source_json`, an escaped JSON string containing the exact
+source value alongside the normalized query projection. Consumers recover the
+request with `restore_capture_context`; response consumers decode `source_json`
+when present. Reasoning uses `provider_reasoning_source_json` for the same case.
+The escaped sidecars count toward all record limits. Oversize evidence is excluded,
+not silently advertised as lossless. Historical reasoning stays in captured input
+even when provider execution must omit it at a new user boundary.
+
 Delivery limits bound record count, each encoded record and all queued string
 capacity, including a record currently held by a slow destination. Separate bounds
 cover in-flight entry count, encoded pending content, total response-buffer capacity
@@ -60,3 +77,15 @@ admission policy is a performance gate, not a replacement for those checks. Capt
 does not alter user-visible content, provider attribution, billing or the content-free
 accounting ledger. The local CLI integration supplies the same collector with
 identity/application bindings and a SQLite sink, without a hosted settlement gate.
+
+The local sink captures completed Chat, Responses, and Messages exchanges, including
+Messages SSE thinking signatures, tool blocks, and stop reasons. The stored exchange
+also retains the original captured output frames and loss indicators. The canonical
+trace exposes exact input/output messages, reasoning, raw tool arguments, and tool
+error flags; tool failure is not evidence of whole-task failure or success.
+
+Each exchange includes the full submitted or explicitly expanded history. Responses
+parent links can recover earlier observed reasoning within the same identity. Missing
+parents are labeled; unrelated Chat requests are never joined by matching prefixes.
+Callers may optionally use the standard request `metadata.conversation_id` to label
+an episode. No proprietary field is required to capture a full submitted conversation.

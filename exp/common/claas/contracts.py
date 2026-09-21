@@ -106,7 +106,7 @@ class Experience(ContractModel):
     episode_id: Identifier | None = None
     parent_response_id: Identifier | None = None
     scope: ClaasScope
-    protocol: Literal["chat_completions", "responses"]
+    protocol: Literal["chat_completions", "responses", "messages"]
     captured_at: AwareDatetime
     request: JsonObject
     response: JsonObject

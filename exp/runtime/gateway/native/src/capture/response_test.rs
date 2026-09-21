@@ -74,12 +74,19 @@ async fn json_capture_preserves_wire_bytes_and_normalizes_only_the_stored_copy()
     let actual = captured.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(actual.as_ref(), original);
     let record = record(&collector, receiver);
-    let Some(CapturedResponse::Json { body, .. }) = record.response else {
+    let Some(CapturedResponse::Json {
+        body, source_json, ..
+    }) = record.response
+    else {
         panic!()
     };
     assert_eq!(body["a\u{fffd}"], 2);
     assert_eq!(body["a\u{fffd}~1"], 1);
     assert_eq!(body["text"], "a\u{fffd}b");
+    assert_eq!(
+        serde_json::from_str::<Value>(&source_json.unwrap()).unwrap(),
+        serde_json::from_slice::<Value>(original).unwrap()
+    );
 }
 
 #[test]
