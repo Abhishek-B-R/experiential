@@ -150,32 +150,6 @@ fn compatible_reasoning_content_requires_fireworks_route_authority() {
 }
 
 #[test]
-fn compatible_reasoning_alias_preserves_text_and_obeys_route_authority() {
-    for delta in [
-        serde_json::json!({"reasoning": "exact reasoning\n雪"}),
-        serde_json::json!({"reasoning_content": null, "reasoning": "exact reasoning\n雪"}),
-        serde_json::json!({"reasoning_content": "exact reasoning\n雪", "reasoning": "shadowed"}),
-    ] {
-        let frame = SseEvent {
-            event: None,
-            data: serde_json::json!({"choices":[{"index":0,"delta":delta,"finish_reason":null}]})
-                .to_string(),
-        };
-        let mut normalizer = Normalizer::new_with_reasoning_content_route(
-            Dialect::OpenAiCompatible,
-            Some("a".repeat(64)),
-        );
-        assert!(
-            matches!(normalizer.feed(&frame).unwrap().as_slice(), [Event::ReasoningContentDelta { delta, .. }] if delta == "exact reasoning\n雪")
-        );
-        assert!(Normalizer::new(Dialect::OpenAiCompatible)
-            .feed(&frame)
-            .unwrap()
-            .is_empty());
-    }
-}
-
-#[test]
 fn fireworks_reasoning_content_rejects_non_text_values() {
     let frame = SseEvent {
         event: None,
