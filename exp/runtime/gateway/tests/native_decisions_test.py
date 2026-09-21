@@ -574,7 +574,21 @@ def test_missing_usage_and_invalid_typed_answers_fail_closed(engine: _ServingEng
         assert attempt["state"] == "failed"
         assert attempt["failure_class"] == "malformed_response"
         assert attempt["route_depth"] == 0
-        _assert_unknown_liability(engine, attempt)
+        if selector == "missing-usage":
+            _assert_unknown_liability(engine, attempt)
+        else:
+            assert attempt["input_tokens"] == 451
+            assert attempt["output_tokens"] == 68
+            assert attempt["usage_source"] == "observed"
+            assert attempt["estimated_cost_nano_usd"] == _COST_NANO_USD
+            assert attempt["budget_settled_nano_usd"] == _COST_NANO_USD
+            with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+                assert connection.execute(
+                    "SELECT settled_nano_usd FROM gateway_attempt_budget_charges "
+                    "WHERE attempt_id = ?",
+                    (attempt["attempt_id"],),
+                ).fetchall() == [(_COST_NANO_USD,)]
+            _assert_budget_accounted(engine)
 
 
 def test_authentication_wrong_model_and_chat_misuse_stop_before_dispatch(

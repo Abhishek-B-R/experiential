@@ -134,7 +134,11 @@ The gateway reserves a bounded estimate for each dispatch: serialized state is c
 question, question instructions and criteria add to input, and per-question protocol allowances
 cover input and output. This is an accounting estimate, not a provider-enforced token limit;
 no synthetic `max_tokens` field is sent. Settlement uses only TypeSafe's reported token counts,
-including reported output tokens even though their configured price is zero. Unknown outcomes
+including reported output tokens even though their configured price is zero. The native adapter
+validates and retains those counts independently before checking the answers: a malformed answer
+still fails, but credible complete usage is settled rather than discarded. The cancellation guard
+retains that evidence for the same attempt and clears it when binding another attempt. Missing,
+partial, invalid, or zero-only counts remain unknown. Unknown outcomes
 retain a content-free unknown-cost attempt record and keep the monetary reservation held, with
 no invented usage, settled charge, or automatic retry. Only HTTP 400, 401, 403, 404, and 422
 establish a known rejection that releases the reservation without inventing zero-token usage.
