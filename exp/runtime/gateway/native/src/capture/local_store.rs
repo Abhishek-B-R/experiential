@@ -109,8 +109,12 @@ pub(super) fn persist(connection: &mut Connection, item: Pending) -> rusqlite::R
             item.response_id, item.captured_at as i64, (item.captured_at + item.policy.retention_seconds) as i64,
             item.payload.len() as i64, item.payload],
     )?;
-    prune(&transaction, &item.policy, now())?;
-    transaction.commit()
+    let removed = prune_rows(&transaction, &item.policy, now())?;
+    transaction.commit()?;
+    if removed > 0 {
+        truncate_wal(connection)?;
+    }
+    Ok(())
 }
 
 pub(super) fn prune(
@@ -118,7 +122,26 @@ pub(super) fn prune(
     policy: &Policy,
     timestamp: u64,
 ) -> rusqlite::Result<()> {
-    connection.execute(
+    prune_rows(connection, policy, timestamp)?;
+    // Retry even when no rows were deleted: a prior checkpoint may have been
+    // blocked by a reader. Idle destination maintenance calls this again.
+    truncate_wal(connection)
+}
+
+fn truncate_wal(connection: &Connection) -> rusqlite::Result<()> {
+    let busy: i64 =
+        connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    if busy != 0 {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn prune_rows(connection: &Connection, policy: &Policy, timestamp: u64) -> rusqlite::Result<usize> {
+    let expired = connection.execute(
         "DELETE FROM claas_experiences WHERE user_id=?1 AND application_id=?2 AND expires_at<=?3",
         params![
             policy.scope.user_id,
@@ -126,7 +149,7 @@ pub(super) fn prune(
             timestamp as i64
         ],
     )?;
-    connection.execute(
+    let evicted = connection.execute(
         "DELETE FROM claas_experiences WHERE sequence IN (
            SELECT sequence FROM (
              SELECT sequence, ROW_NUMBER() OVER (ORDER BY sequence DESC) AS rank,
@@ -140,7 +163,7 @@ pub(super) fn prune(
             policy.maximum_storage_bytes as i64
         ],
     )?;
-    Ok(())
+    Ok(expired + evicted)
 }
 
 #[cfg(test)]

@@ -89,3 +89,9 @@ parent links can recover earlier observed reasoning within the same identity. Mi
 parents are labeled; unrelated Chat requests are never joined by matching prefixes.
 Callers may optionally use the standard request `metadata.conversation_id` to label
 an episode. No proprietary field is required to capture a full submitted conversation.
+
+Local retention enables SQLite secure deletion and checkpoints/truncates its WAL
+after pruning. A concurrent reader can temporarily prevent WAL truncation; this is
+reported as a maintenance failure and retried on idle maintenance, not claimed as
+successful physical erasure. OS snapshots, backups, and storage-device remanence are
+outside this database lifecycle. Expired rows are never returned by the reader API.

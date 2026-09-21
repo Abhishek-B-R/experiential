@@ -84,7 +84,13 @@ pub(super) fn assemble(frames: &[Value]) -> Option<Value> {
                     return None;
                 }
                 if let Some(arguments) = &block.arguments {
-                    block.value["input"] = serde_json::from_str(arguments).ok()?;
+                    if !arguments.is_empty() {
+                        let input: Value = serde_json::from_str(arguments).ok()?;
+                        if !input.is_object() {
+                            return None;
+                        }
+                        block.value["input"] = input;
+                    }
                 }
                 block.closed = true;
             }
@@ -153,5 +159,19 @@ mod tests {
         assert_eq!(result["content"][0]["signature"], "signed");
         assert_eq!(result["content"][1]["input"], json!({"x":1}));
         assert!(assemble(&frames[..frames.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn empty_argument_delta_keeps_the_declared_zero_argument_input() {
+        let frames = vec![
+            json!({"type":"message_start","message":{"type":"message","id":"msg","role":"assistant","content":[],"usage":{},"stop_reason":null}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call","name":"lookup","input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+            json!({"type":"message_stop"}),
+        ];
+        let message = assemble(&frames).unwrap();
+        assert_eq!(message["content"][0]["input"], json!({}));
     }
 }

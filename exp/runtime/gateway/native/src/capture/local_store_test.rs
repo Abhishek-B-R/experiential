@@ -107,3 +107,42 @@ fn conflicting_alias_policies_are_rejected_before_any_pruning() {
     };
     assert!(validate(&config).is_err());
 }
+
+#[test]
+fn expired_content_is_removed_from_database_and_wal_after_readers_release() {
+    let path = std::env::temp_dir().join(format!(
+        "capture-erasure-{}-{}.db",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut writer = open_database(&path).unwrap();
+    let marker = "synthetic-expiring-tool-output-unique-marker";
+    let mut item = pending("expired", policy());
+    item.payload = marker.into();
+    persist(&mut writer, item).unwrap();
+    let reader = Connection::open(&path).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: String = reader
+        .query_row("SELECT payload FROM claas_experiences", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(prune(&writer, &policy(), now() + 61).is_err());
+    reader.execute_batch("ROLLBACK").unwrap();
+    prune(&writer, &policy(), now() + 61).unwrap();
+    for artifact in [
+        &path,
+        &std::path::PathBuf::from(format!("{}-wal", path.display())),
+    ] {
+        let data = std::fs::read(artifact).unwrap();
+        assert!(!data
+            .windows(marker.len())
+            .any(|bytes| bytes == marker.as_bytes()));
+    }
+    drop(reader);
+    drop(writer);
+    std::fs::remove_file(path).unwrap();
+}
