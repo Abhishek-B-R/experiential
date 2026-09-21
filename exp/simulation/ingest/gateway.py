@@ -215,6 +215,7 @@ def _output_messages(experience: Experience) -> list[JsonObject]:
         messages = _chat_output(experience)
     output = experience.request.get("exp_capture_output")
     if isinstance(output, dict):
+        _restore_output_tools(messages, output)
         reasoning = output.get("provider_reasoning")
         source = output.get("provider_reasoning_source_json")
         if isinstance(source, str):
@@ -228,6 +229,35 @@ def _output_messages(experience: Experience) -> list[JsonObject]:
                 raise ValueError("reasoning has no assistant output")
             assistant["reasoning_content"] = reasoning
     return messages
+
+
+def _restore_output_tools(messages: list[JsonObject], output: JsonObject) -> None:
+    """Restore exact provider argument text by call identity, not by tool position."""
+    source = output.get("provider_tool_calls_json")
+    if source is None:
+        return
+    if not isinstance(source, str):
+        raise ValueError("invalid captured provider tools")
+    calls = json.loads(source)
+    if not isinstance(calls, list):
+        raise ValueError("invalid captured provider tools")
+    for captured in calls:
+        if not isinstance(captured, dict) or not isinstance(captured.get("raw_arguments"), str):
+            raise ValueError("invalid captured provider tool")
+        for message in messages:
+            tools = message.get("tool_calls")
+            if not isinstance(tools, list):
+                continue
+            for tool in tools:
+                if not isinstance(tool, dict):
+                    continue
+                function = tool.get("function", tool)
+                if (
+                    isinstance(function, dict)
+                    and tool.get("id", tool.get("call_id")) == captured.get("call_id")
+                    and function.get("name") == captured.get("name")
+                ):
+                    function["arguments"] = captured["raw_arguments"]
 
 
 def _chat_output(experience: Experience) -> list[JsonObject]:

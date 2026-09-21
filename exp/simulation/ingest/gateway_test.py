@@ -1,5 +1,6 @@
 """Durable local traffic supplies scoped canonical build evidence."""
 
+import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -317,3 +318,45 @@ def test_explicit_response_lineage_restores_reasoning_without_prefix_joining(
     _database(missing, (child,))
     incomplete = load_gateway_capture(missing, identity_id="developer")
     assert incomplete.traces[0].initial_context["missing_parent_response_id"] == "parent"
+
+
+def test_messages_output_keeps_exact_provider_argument_text(tmp_path: Path) -> None:
+    """Messages JSON objects do not erase the source provider's raw argument text."""
+    request = decode_messages(
+        {
+            "model": "coding",
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": "Find record A"}],
+        }
+    ).request
+    arguments = '{  "id" : "A"  }'
+    experience = _experience().model_copy(
+        update={
+            "protocol": "messages",
+            "request": {
+                "exp_context": capture_request_context(request),
+                "exp_capture_output": {
+                    "provider_tool_calls_json": json.dumps(
+                        [{"call_id": "call-1", "name": "lookup", "raw_arguments": arguments}]
+                    )
+                },
+            },
+            "response": {
+                "id": "msg",
+                "type": "message",
+                "role": "assistant",
+                "stop_reason": "tool_use",
+                "content": [
+                    {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {"id": "A"}}
+                ],
+            },
+        }
+    )
+    path = tmp_path / "traffic.db"
+    _database(path, (experience,))
+    result = load_gateway_capture(path, identity_id="developer")
+    assert not result.issues
+    assert any(
+        span.attributes.get("gen_ai.tool.call.arguments") == arguments
+        for span in result.traces[0].spans
+    )

@@ -63,6 +63,8 @@ pub(crate) struct Record {
     /// Provider-returned plaintext from an explicitly exposure-enabled winning rung.
     pub provider_reasoning: Option<String>,
     pub provider_reasoning_source_json: Option<String>,
+    /// Exact completed tool calls, escaped once so JSONB cannot alter their text.
+    pub provider_tool_calls_json: Option<String>,
     pub deployment_id: Option<String>,
     pub captured_at: f64,
 }

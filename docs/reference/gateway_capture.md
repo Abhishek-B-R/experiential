@@ -48,6 +48,8 @@ in `provider_reasoning` when that rung explicitly permits reasoning exposure.
 This preserves reasoning even when the public Responses representation carries
 only an opaque continuation. Private provider reasoning is not decrypted for
 capture. Capture permission never grants permission to expose hidden reasoning.
+`provider_tool_calls_json` retains completed calls as escaped JSON, including exact
+argument text even when Messages presents the arguments as a parsed input object.
 Chat tool turns on exposure-enabled routes return plaintext without appending
 an opaque token to the same delta field; private routes retain authenticated tokens.
 

@@ -176,6 +176,43 @@ fn provider_reasoning_is_lossless_bounded_and_requires_response_eligibility() {
 }
 
 #[test]
+fn raw_tool_arguments_survive_projection_but_never_response_denial() {
+    let (collector, receiver) = collector(config());
+    let mut call = crate::events::CompletedToolCall {
+        call_id: "call-1".into(),
+        name: "lookup".into(),
+        namespace: None,
+        caller: None,
+        provider_item_id: None,
+        provider_status: None,
+        raw_arguments: "{  \"x\" : \"雪\"  }".into(),
+        custom: false,
+    };
+    assert!(collector.begin(request("kept")));
+    collector.tool_call("kept", &call);
+    call.call_id = "call-2".into();
+    call.raw_arguments = "freeform\0text".into();
+    call.custom = true;
+    collector.tool_call("kept", &call);
+    collector.finish("kept", Some(response()), None);
+    collector.settle("kept", true, true);
+    assert!(collector.begin(request("denied")));
+    collector.tool_call("denied", &call);
+    collector.settle("denied", true, false);
+    assert!(collector.begin(request("overflow")));
+    call.raw_arguments = "x".repeat(4096);
+    collector.tool_call("overflow", &call);
+    collector.settle("overflow", true, true);
+    let records = drain(&collector, receiver);
+    assert_eq!(records.len(), 2);
+    let calls: serde_json::Value =
+        serde_json::from_str(records[0].provider_tool_calls_json.as_ref().unwrap()).unwrap();
+    assert_eq!(calls[0]["raw_arguments"], "{  \"x\" : \"雪\"  }");
+    assert_eq!(calls[1]["raw_arguments"], "freeform\0text");
+    assert!(records[1].provider_tool_calls_json.is_none());
+}
+
+#[test]
 fn unscoped_unknown_duplicate_and_expired_content_is_not_persisted() {
     let (collector, receiver) = collector(config());
     let mut invalid = request("invalid");

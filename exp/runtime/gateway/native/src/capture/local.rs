@@ -106,6 +106,7 @@ impl Sink for SqliteSink {
                 "response": record.response,
                 "provider_reasoning": record.provider_reasoning,
                 "provider_reasoning_source_json": record.provider_reasoning_source_json,
+                "provider_tool_calls_json": record.provider_tool_calls_json,
             },
             "previous_response_id": record.request.context["request"]["previous_response_id"]
         });
