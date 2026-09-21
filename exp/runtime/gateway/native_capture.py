@@ -106,6 +106,7 @@ class CaptureRecord(ContractModel):
     deployment_id: str | None
     provider_reasoning: str | None = None
     provider_reasoning_source_json: str | None = None
+    provider_tool_calls_json: str | None = None
     captured_at: float = Field(ge=0, allow_inf_nan=False)
 
 

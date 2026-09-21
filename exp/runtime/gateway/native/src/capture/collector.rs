@@ -121,6 +121,7 @@ impl Collector {
             response: None,
             provider_reasoning: None,
             provider_reasoning_source_json: None,
+            provider_tool_calls_json: None,
             deployment_id: None,
             captured_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -220,6 +221,7 @@ impl Collector {
         if !keep_response {
             entry.record.response = None;
             entry.record.provider_reasoning = None;
+            entry.record.provider_tool_calls_json = None;
             self.emit(&entry.record);
             return;
         }
@@ -257,6 +259,7 @@ impl Collector {
         entry.record.response = response;
         if entry.record.response.is_none() {
             entry.record.provider_reasoning = None;
+            entry.record.provider_tool_calls_json = None;
         }
         entry.record.deployment_id = deployment_id;
         entry.output_finished = true;
@@ -322,6 +325,57 @@ impl Collector {
 
     fn expire(&self, pending: &mut Pending) {
         expire_pending(pending, &self.skipped);
+    }
+
+    /// Retain provider-order argument text even when a public protocol parses it.
+    pub(crate) fn tool_call(&self, request_id: &str, call: &crate::events::CompletedToolCall) {
+        let Ok(encoded) = serde_json::to_string(&serde_json::json!({
+            "call_id": call.call_id, "name": call.name, "raw_arguments": call.raw_arguments,
+            "namespace": call.namespace, "caller": call.caller, "custom": call.custom,
+            "provider_item_id": call.provider_item_id,
+            "provider_status": call.provider_status.map(|status| status.as_str()),
+        })) else {
+            return;
+        };
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        self.expire(&mut pending);
+        let Some(mut entry) = pending.entries.remove(request_id) else {
+            return;
+        };
+        pending.bytes -= entry.bytes;
+        let text = entry
+            .record
+            .provider_tool_calls_json
+            .get_or_insert_with(|| "[]".to_owned());
+        let previous = text.capacity();
+        let extra = encoded.len() + 1;
+        if text.len().saturating_add(extra) > self.config.maximum_response_bytes
+            || pending
+                .bytes
+                .saturating_add(entry.bytes)
+                .saturating_add(extra + 2)
+                > self.config.maximum_pending_bytes
+            || text.try_reserve_exact(extra).is_err()
+        {
+            self.skip();
+            return;
+        }
+        // Charge the initial [] as well as actual allocator growth.
+        entry.bytes += text.capacity() - previous + if text == "[]" { previous } else { 0 };
+        if pending.bytes.saturating_add(entry.bytes) > self.config.maximum_pending_bytes {
+            self.skip();
+            return;
+        }
+        text.pop();
+        if text.len() > 1 {
+            text.push(',');
+        }
+        text.push_str(&encoded);
+        text.push(']');
+        pending.bytes += entry.bytes;
+        pending.entries.insert(request_id.to_owned(), entry);
     }
 
     pub(crate) fn skip(&self) -> bool {

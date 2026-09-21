@@ -1,4 +1,4 @@
-//! Capture authorized provider reasoning before public protocol projection.
+//! Capture authorized provider evidence before public protocol projection.
 
 use std::sync::Arc;
 
@@ -10,12 +10,19 @@ use crate::waterfall::Won;
 pub(crate) struct Observer {
     collector: Arc<Collector>,
     request_id: String,
+    reasoning_exposed: bool,
 }
 
 impl Observer {
     pub(crate) fn observe(&self, event: &Event) {
-        if let Event::ReasoningContentDelta { delta, .. } = event {
-            self.collector.reasoning(&self.request_id, delta);
+        match event {
+            Event::ReasoningContentDelta { delta, .. } if self.reasoning_exposed => {
+                self.collector.reasoning(&self.request_id, delta);
+            }
+            Event::ToolCallCompleted { call, .. } => {
+                self.collector.tool_call(&self.request_id, call)
+            }
+            _ => {}
         }
     }
 }
@@ -33,12 +40,10 @@ pub(crate) fn observe_winner(
         Won::Settled(attempt) => attempt.depth,
         Won::Failed(_) => return,
     };
-    if !admission.reasoning_exposed_at(depth) {
-        return;
-    }
     let observer = Observer {
         collector,
         request_id: admission.request_id.clone(),
+        reasoning_exposed: admission.reasoning_exposed_at(depth),
     };
     match won {
         Won::Committed(attempt) => {
