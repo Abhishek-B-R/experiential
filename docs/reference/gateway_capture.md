@@ -119,8 +119,10 @@ error flags; tool failure is not evidence of whole-task failure or success.
 Each exchange includes the full submitted or explicitly expanded history. Responses
 parent links can recover earlier observed reasoning within the same identity. Missing
 parents are labeled; unrelated Chat requests are never joined by matching prefixes.
-Callers may optionally use the standard request `metadata.conversation_id` to label
-an episode. No proprietary field is required to capture a full submitted conversation.
+Callers may optionally use request `metadata.conversation_id` to label an episode;
+it takes precedence over `X-Session-Id`. Otherwise the captured session header
+becomes the episode ID. Both remain scoped to authenticated identity and application.
+Neither is required to capture a full submitted conversation.
 
 Local retention enables SQLite secure deletion and checkpoints/truncates its WAL
 after pruning. A concurrent reader can temporarily prevent WAL truncation; this is

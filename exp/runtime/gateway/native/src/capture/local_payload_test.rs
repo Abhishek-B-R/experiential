@@ -78,3 +78,24 @@ fn completed_responses_event_is_borrowed_from_retained_frames() {
     assert!(matches!(response, Cow::Borrowed(_)));
     assert_eq!(response["id"], "response");
 }
+
+#[test]
+fn episode_uses_explicit_body_identity_then_optional_session_header() {
+    let mut record = record();
+    record.provider_reasoning = None;
+    let context = Arc::make_mut(&mut record.request.context);
+    context["session_id"] = json!("harness-session");
+    let response = json!({"id":"response","status":"completed","output":[]});
+    let payload = encode(&record, &response, "experience-id", 8192).unwrap();
+    let actual: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(actual["episode_id"], "episode");
+    assert!(actual["request"]["exp_capture_output"]["provider_reasoning"].is_null());
+    Arc::make_mut(&mut record.request.context)["request"]["metadata"] = json!({});
+    let payload = encode(&record, &response, "experience-id", 8192).unwrap();
+    let actual: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(actual["episode_id"], "harness-session");
+    Arc::make_mut(&mut record.request.context)["session_id"] = Value::Null;
+    let payload = encode(&record, &response, "experience-id", 8192).unwrap();
+    let actual: Value = serde_json::from_str(&payload).unwrap();
+    assert!(actual["episode_id"].is_null());
+}

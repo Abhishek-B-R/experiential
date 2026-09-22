@@ -73,7 +73,8 @@ pub(super) fn encode(
         response_id: response["id"].as_str()?,
         episode_id: context["request"]["metadata"]["conversation_id"]
             .as_str()
-            .filter(|value| !value.trim().is_empty() && value.len() <= 512),
+            .filter(|value| !value.trim().is_empty() && value.len() <= 512)
+            .or_else(|| context["session_id"].as_str()),
         parent_response_id: parent,
         scope: Scope {
             user_id: &scope.identity_id,

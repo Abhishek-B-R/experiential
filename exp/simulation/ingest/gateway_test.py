@@ -156,6 +156,25 @@ def test_missing_effective_context_is_excluded_not_guessed(tmp_path: Path) -> No
     assert len(result.issues) == 1
 
 
+def test_same_episode_label_never_exposes_another_identity(tmp_path: Path) -> None:
+    """Caller session labels cannot override the authenticated storage scope."""
+    path = tmp_path / "traffic.db"
+    _database(
+        path,
+        tuple(
+            _experience(identity).model_copy(update={"episode_id": "same-harness-session"})
+            for identity in ("developer", "other")
+        ),
+    )
+    for identity in ("developer", "other"):
+        result = load_gateway_capture(path, identity_id=identity)
+        assert not result.issues
+        assert len(result.traces) == 1
+        assert result.traces[0].conversation_id == "same-harness-session"
+        assert result.traces[0].initial_context["identity_id"] == identity
+        assert result.traces[0].initial_context["response_id"] == f"response-{identity}"
+
+
 def test_identity_is_required_and_not_accepted_for_unscoped_sources(tmp_path: Path) -> None:
     """An omitted scope never means all local identities."""
     with pytest.raises(TraceSourceError, match="explicit --identity"):
