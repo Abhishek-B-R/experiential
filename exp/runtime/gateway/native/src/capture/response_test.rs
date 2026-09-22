@@ -11,9 +11,10 @@ use std::time::{Duration, Instant};
 
 struct MemorySink(mpsc::Sender<Record>);
 impl Sink for MemorySink {
-    fn write(&mut self, encoded: &str) -> Result<(), ()> {
+    fn write(&mut self, record: &Record, maximum_bytes: usize) -> Result<(), ()> {
+        let encoded = record.encode(maximum_bytes).ok_or(())?;
         self.0
-            .send(serde_json::from_str(encoded).map_err(|_| ())?)
+            .send(serde_json::from_str(&encoded).map_err(|_| ())?)
             .map_err(|_| ())
     }
 }
@@ -48,7 +49,7 @@ fn collector(maximum_response_bytes: usize) -> (Arc<Collector>, mpsc::Receiver<R
         },
         protocol: Protocol::ChatCompletions,
         model_id: Some("model".into()),
-        context: json!({"schema_version":1,"request":{"messages":[]}}),
+        context: Arc::new(json!({"schema_version":1,"request":{"messages":[]}})),
     }));
     (collector, receiver)
 }

@@ -62,9 +62,17 @@ The escaped sidecars count toward all record limits. Oversize evidence is exclud
 not silently advertised as lossless. Historical reasoning stays in captured input
 even when provider execution must omit it at a new user boundary.
 
-Delivery limits bound record count, each encoded record and all queued string
-capacity, including a record currently held by a slow destination. Separate bounds
-cover in-flight entry count, encoded pending content, total response-buffer capacity
+The native queue carries structured records, not serialized JSON. Prompt updates
+share immutable request context. JSON sizing counts fields and escapes without
+encoding response buffers; the destination performs bounded final encoding. A
+hosted Python destination receives that encoded record. Native destinations consume
+the structure directly. Request admission still crosses the Python/Rust boundary
+as JSON; exceptional lossless sidecars and raw tool-call strings also use JSON.
+
+Delivery limits bound record count, each final encoded payload and retained record
+memory, including a record currently held by a slow destination. String/vector
+capacity and conservative object-node charges are included; shared trees are charged
+in every owning queue. Separate bounds cover in-flight entry count and memory, total response-buffer capacity
 and request lifetime. Expiration runs on collector operations and once per second
 on an idle destination worker; a blocked destination delays idle maintenance but
 does not remove the memory caps. Saturation drops capture without delaying provider work.

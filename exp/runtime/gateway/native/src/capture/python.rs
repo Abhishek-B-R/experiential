@@ -8,16 +8,23 @@ use pyo3::prelude::*;
 
 use super::collector::{Collector, Configuration};
 use super::delivery::Sink;
-use super::record::Request;
+use super::record::{Record, Request};
 
 struct PythonSink(Py<PyAny>);
 
 impl Sink for PythonSink {
-    fn write(&mut self, record: &str) -> Result<(), ()> {
+    fn write(&mut self, record: &Record, maximum_bytes: usize) -> Result<(), ()> {
+        let encoded = record.encode(maximum_bytes).ok_or(())?;
         // This is the dedicated delivery worker, never a serving or bridge thread.
         // Exception text can contain SQL parameters or content, so only count failure.
-        Python::try_attach(|py| self.0.bind(py).call1((record,)).map(|_| ()).map_err(|_| ()))
-            .unwrap_or(Err(()))
+        Python::try_attach(|py| {
+            self.0
+                .bind(py)
+                .call1((encoded,))
+                .map(|_| ())
+                .map_err(|_| ())
+        })
+        .unwrap_or(Err(()))
     }
 }
 

@@ -87,10 +87,8 @@ impl Tap {
                     client_disconnected: disconnected,
                     source_json,
                 };
-                if let Some(encoded) = response.encode() {
-                    if encoded.len() <= self.collector.config.maximum_response_bytes {
-                        break Some(encoded);
-                    }
+                if response.json_bytes() <= self.collector.config.maximum_response_bytes {
+                    break Some(response);
                 }
                 let CapturedResponse::Sse {
                     frames: mut reduced,
@@ -113,14 +111,13 @@ impl Tap {
         } else if !self.truncated && !disconnected {
             serde_json::from_slice::<Value>(&self.bytes)
                 .ok()
-                .and_then(|mut body| {
+                .map(|mut body| {
                     let source_json = lossless_projection(&mut body);
                     CapturedResponse::Json {
                         status: self.status,
                         body,
                         source_json,
                     }
-                    .encode()
                 })
         } else {
             None

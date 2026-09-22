@@ -6,9 +6,10 @@ use std::sync::{mpsc, Arc};
 struct MemorySink(mpsc::Sender<Record>);
 
 impl Sink for MemorySink {
-    fn write(&mut self, encoded: &str) -> Result<(), ()> {
+    fn write(&mut self, record: &Record, maximum_bytes: usize) -> Result<(), ()> {
+        let encoded = record.encode(maximum_bytes).ok_or(())?;
         self.0
-            .send(serde_json::from_str(encoded).map_err(|_| ())?)
+            .send(serde_json::from_str(&encoded).map_err(|_| ())?)
             .map_err(|_| ())
     }
 }
@@ -39,18 +40,18 @@ fn request(id: &str) -> Request {
         },
         protocol: Protocol::ChatCompletions,
         model_id: Some("model".into()),
-        context: json!({"schema_version":1,"request":{"messages":[{"role":"user","content":"task"}],"tools":[{"name":"search"}]}}),
+        context: Arc::new(
+            json!({"schema_version":1,"request":{"messages":[{"role":"user","content":"task"}],"tools":[{"name":"search"}]}}),
+        ),
     }
 }
 
-fn response() -> EncodedResponse {
+fn response() -> Response {
     Response::Json {
         status: 200,
         body: json!({"id":"completion","choices":[]}),
         source_json: None,
     }
-    .encode()
-    .unwrap()
 }
 
 fn collector(config: Configuration) -> (Arc<Collector>, mpsc::Receiver<Record>) {
@@ -97,9 +98,12 @@ fn selected_model_uses_cached_request_size_including_json_escapes() {
         let entry = &pending.entries["request"];
         assert_eq!(
             entry.request_bytes,
-            entry.record.encode(4096).unwrap().len()
+            serde_json::to_string(&entry.record.request).unwrap().len()
         );
-        assert_eq!(entry.bytes, entry.request_bytes + 512);
+        assert_eq!(
+            entry.bytes,
+            entry.record.heap_bytes() + "request".len() + 512
+        );
     }
     collector.settle("request", true, false);
     let mut input = request("overflow");
@@ -112,9 +116,9 @@ fn selected_model_uses_cached_request_size_including_json_escapes() {
 }
 
 #[test]
-fn encoded_response_size_is_reused_and_enforced_at_collector_boundary() {
+fn structured_response_size_is_enforced_at_collector_boundary() {
     let mut configuration = config();
-    let exact = response().len();
+    let exact = response().json_bytes();
     configuration.maximum_response_bytes = exact;
     let (collector, receiver) = collector(configuration);
     assert!(collector.begin(request("request")));

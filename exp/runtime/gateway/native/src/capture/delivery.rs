@@ -7,10 +7,12 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use super::record::Record;
+
 /// Local SQLite and hosted persistence implement the same off-path destination.
 pub(crate) trait Sink: Send + 'static {
     /// Persist one versioned record. Errors are deliberately content-free.
-    fn write(&mut self, record: &str) -> Result<(), ()>;
+    fn write(&mut self, record: &Record, maximum_bytes: usize) -> Result<(), ()>;
 
     /// Run retention maintenance without adding storage work to serving.
     fn maintain(&mut self) -> Result<(), ()> {
@@ -49,15 +51,14 @@ struct Counters {
 }
 
 struct Pending {
-    value: String,
+    value: Record,
+    bytes: usize,
     counters: Arc<Counters>,
 }
 
 impl Drop for Pending {
     fn drop(&mut self) {
-        self.counters
-            .bytes
-            .fetch_sub(self.value.capacity(), Ordering::AcqRel);
+        self.counters.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
         self.counters.pending.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -76,6 +77,7 @@ impl Delivery {
         let (sender, receiver) = mpsc::sync_channel::<Pending>(limits.maximum_records);
         let counters = Arc::new(Counters::default());
         let worker_counters = counters.clone();
+        let maximum_record_bytes = limits.maximum_record_bytes;
         let deadline = Arc::new(Mutex::new(None::<Instant>));
         let worker_deadline = deadline.clone();
         let worker = std::thread::Builder::new()
@@ -100,7 +102,7 @@ impl Delivery {
                     }
                     match receiver.recv_timeout(Duration::from_millis(100)) {
                         Ok(item) => {
-                            let counter = if sink.write(&item.value).is_ok() {
+                            let counter = if sink.write(&item.value, maximum_record_bytes).is_ok() {
                                 &worker_counters.persisted
                             } else {
                                 &worker_counters.failed
@@ -123,11 +125,8 @@ impl Delivery {
     }
 
     /// Drop on saturation. The budget includes the record a slow sink is writing.
-    pub(crate) fn submit(&self, value: String) -> bool {
-        if value.len() > self.limits.maximum_record_bytes {
-            return self.dropped();
-        }
-        let bytes = value.capacity();
+    pub(crate) fn submit(&self, value: Record) -> bool {
+        let bytes = value.heap_bytes();
         if self
             .counters
             .bytes
@@ -142,6 +141,7 @@ impl Delivery {
         let previous = self.counters.pending.fetch_add(1, Ordering::AcqRel);
         let item = Pending {
             value,
+            bytes,
             counters: self.counters.clone(),
         };
         if previous >= self.limits.maximum_records {
