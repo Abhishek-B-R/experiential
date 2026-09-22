@@ -5,7 +5,7 @@ from typing import cast
 
 import pytest
 
-from exp.common.models import AssistantAction, ModelRequest, ModelResponse, NumericMeasurement
+from exp.common.models import AssistantAction, ModelRequest, ModelResponse
 from exp.common.project import write_project_config
 from exp.common.rollouts import RolloutArtifact
 from exp.optimize.evaluation.contracts import EvaluationBudget
@@ -35,13 +35,6 @@ def test_native_continuation_keeps_prefix_costs_and_excludes_incomplete_judgment
     def complete(client: _CompletionClient, request: ModelRequest) -> ModelResponse:
         """Keep worlds nonterminal until the next explicitly authorized execution."""
         response = original(client, request)
-        response = response.model_copy(
-            update={
-                "economics": response.economics.model_copy(
-                    update={"cost_usd": NumericMeasurement(value=0.01, provenance="observed")}
-                )
-            }
-        )
         if client._alias == "world":
             return response.model_copy(
                 update={
@@ -126,11 +119,13 @@ def test_native_continuation_keeps_prefix_costs_and_excludes_incomplete_judgment
     ]
     assert len(children) == 6
     assert all(item.continuation_of is not None for item in children)
-    assert all(
-        item.candidate_economics.cost_usd is not None
-        and item.candidate_economics.cost_usd.value == pytest.approx(0.02)
-        for item in children
-    )
+    for item in children:
+        assert item.continuation_of is not None
+        parent = RolloutArtifact.model_validate_json(parent_bytes[item.continuation_of.artifact_id])
+        parent_cost = parent.candidate_economics.cost_usd
+        child_cost = item.candidate_economics.cost_usd
+        assert parent_cost is not None and child_cost is not None
+        assert child_cost.value == pytest.approx(2 * parent_cost.value)
     assert resumed.simulation_cost_usd > result.simulation_cost_usd > 0
     assert all(
         item.candidate_economics.usage is not None
