@@ -62,14 +62,14 @@ def test_redirected_output_reports_changes_without_heartbeat_spam(
     )
     display.progress(captured)
     first = output.getvalue()
-    assert "1 request captured · 12,400 in / 3,100 out tokens · last just now · 1 pending" in first
+    assert "1 request captured · 12.4K in / 3.1K out tokens · last just now · 1 pending" in first
     now[0] = 108.0
     display.progress(captured)
     assert output.getvalue() == first
 
     display.progress(replace(captured, pending_batches=0, uploaded_batches=1))
     delivered = output.getvalue()[len(first) :]
-    assert "1 request captured · 12,400 in / 3,100 out tokens · last 8s ago" in delivered
+    assert "1 request captured · 12.4K in / 3.1K out tokens · last 8s ago" in delivered
     assert "batches uploaded" not in delivered
     assert "pending" not in delivered
     assert len(output.getvalue().splitlines()) == 3
@@ -128,7 +128,7 @@ def test_terminal_refreshes_activity_and_releases_rendering_between_phases(
             )
         )
         refreshed = Text.from_ansi(output.getvalue()[prior_length:]).plain
-        assert "2 requests captured · 1,100 in / 30 out tokens · last just now" in refreshed
+        assert "2 requests captured · 1.1K in / 30 out tokens · last just now" in refreshed
     finally:
         display.close()
         display.close()
@@ -217,15 +217,17 @@ def test_successful_stop_is_one_short_receipt() -> None:
         UploadStats(0, 0, 0, 97, 95, input_tokens=12_400, output_tokens=3_100, usage_exchanges=97)
     )
     assert output.getvalue().splitlines() == [
-        "Capture stopped. 97 requests captured · 12,400 in / 3,100 out tokens."
+        "Capture stopped. 97 requests captured · 12.4K in / 3.1K out tokens."
     ]
 
 
 @pytest.mark.parametrize(
     ("captured", "usage_exchanges", "input_tokens", "output_tokens", "expected"),
     [
-        (3, 3, 12_400, 3_100, "12,400 in / 3,100 out tokens"),
-        (3, 1, 12_400, 3_100, "12,400 in / 3,100 out tokens (partial)"),
+        (3, 3, 12_400, 3_100, "12.4K in / 3.1K out tokens"),
+        (3, 1, 12_400, 3_100, "12.4K in / 3.1K out tokens (partial)"),
+        (3, 3, 1_752_000, 2_340_000_000, "1.75M in / 2.34B out tokens"),
+        (3, 1, 999_995, 999_995_000, "1M in / 1B out tokens (partial)"),
         (3, 0, 0, 0, "tokens unavailable"),
         (3, 3, 0, 0, "0 in / 0 out tokens"),
         (0, 0, 0, 0, ""),
@@ -281,3 +283,31 @@ def test_redirected_output_reports_token_updates_without_resetting_activity(
         "1 request captured · 800 in / 20 out tokens · last 7s ago"
         in output.getvalue()[len(before) :]
     )
+
+
+@pytest.mark.parametrize(
+    ("count", "expected"),
+    [
+        (0, "0"),
+        (999, "999"),
+        (1_000, "1K"),
+        (1_005, "1.01K"),
+        (12_400, "12.4K"),
+        (999_994, "999.99K"),
+        (999_995, "1M"),
+        (1_000_000, "1M"),
+        (1_752_000, "1.75M"),
+        (999_994_999, "999.99M"),
+        (999_995_000, "1B"),
+        (1_000_000_000, "1B"),
+        (2_345_000_000, "2.35B"),
+        (999_995_000_000, "1T"),
+        (1_000_000_000_000, "1T"),
+        (123_456_789_012_345_678_901, "123456789.01T"),
+    ],
+)
+def test_token_units_round_without_precision_loss_or_scientific_notation(
+    count: int, expected: str
+) -> None:
+    """Readable token totals trim zeros and promote rounded thousands and millions."""
+    assert display_module._format_tokens(count) == expected

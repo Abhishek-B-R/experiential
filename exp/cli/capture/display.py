@@ -12,6 +12,20 @@ from rich.text import Text
 from exp.runtime.capture.upload import UploadStats
 
 
+def _format_tokens(count: int) -> str:
+    """Compact token totals to two decimal places, promoting rounded unit boundaries."""
+    if count < 1_000:
+        return str(count)
+    divisor = 1_000
+    for suffix in ("K", "M", "B", "T"):
+        hundredths = (count * 100 + divisor // 2) // divisor
+        if hundredths < 100_000 or suffix == "T":
+            break
+        divisor *= 1_000
+    number = f"{hundredths // 100}.{hundredths % 100:02d}".rstrip("0").rstrip(".")
+    return f"{number}{suffix}"
+
+
 class CaptureDisplay:
     """Separate pending startup from active collection and visibly changing counters."""
 
@@ -90,12 +104,15 @@ class CaptureDisplay:
 
     @staticmethod
     def _token_summary(stats: UploadStats) -> str:
-        """Show exact reported totals while distinguishing missing or partial usage."""
+        """Show compact reported totals while distinguishing missing or partial usage."""
         if not stats.captured_exchanges:
             return ""
         if not stats.usage_exchanges:
             return "tokens unavailable"
-        tokens = f"{stats.input_tokens:,} in / {stats.output_tokens:,} out tokens"
+        tokens = (
+            f"{_format_tokens(stats.input_tokens)} in / "
+            f"{_format_tokens(stats.output_tokens)} out tokens"
+        )
         if stats.usage_exchanges < stats.captured_exchanges:
             tokens += " (partial)"
         return tokens

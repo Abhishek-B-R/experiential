@@ -33,6 +33,7 @@ credential or background capture daemon is required.
 Only one Capture process can run per macOS user, including across different preview profiles.
 
 The terminal shows setup progress, live capture counts, and provider-reported input/output tokens.
+Token totals use K, M, B, and T with up to two decimals, such as 1.75M for 1,752,000 tokens.
 Totals include cached input; missing usage is marked partial or unavailable. Use
 `exp capture --verbose` (or `-v`) for provider hosts, setup explanations, and the public CA certificate
 path. Approval requests and errors remain visible without verbose output. When macOS reports the
