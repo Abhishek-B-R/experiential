@@ -3253,10 +3253,27 @@ def test_rust_failure_taxonomy_matches_public_failure_error() -> None:
 
 
 def test_rust_chat_fixture_preserves_the_incomplete_tool_diagnostic() -> None:
-    """Keep the cause distinct from a provider-declared output limit."""
+    """Keep the cause distinct from a provider limit with shared Python/Rust parity."""
     native = pytest.importorskip("exp_gateway_native")
+    from exp.runtime.gateway.contracts import GatewayEvent, GatewayEventKind
+    from exp.runtime.openai_protocol.streaming import ChatSseEncoder
+
     fixture = json.dumps([{"kind": "incomplete", "incomplete_reason": "tool_arguments_incomplete"}])
     frames = native.encode_chat_fixture("request-cut", "coding", 1, False, fixture)
+    encoder = ChatSseEncoder(
+        request_id="request-cut", model="coding", created_at=1, include_usage=False
+    )
+    expected = [
+        *encoder.start(),
+        *encoder.feed(
+            GatewayEvent(
+                kind=GatewayEventKind.INCOMPLETE,
+                sequence_number=0,
+                incomplete_reason="tool_arguments_incomplete",
+            )
+        ),
+    ]
+    assert frames == expected
     payloads = [
         json.loads(frame.removeprefix("data: ").strip())
         for frame in frames
