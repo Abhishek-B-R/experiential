@@ -171,6 +171,7 @@ pub(crate) async fn messages(
         "surface": "messages",
         "anthropic_beta": anthropic_beta,
         "client_ip": client_ip(&headers),
+        "capture_session_id": crate::capture::session_id(&headers),
     }));
     let admission_text = match state.bridge.call("admit", admit_argument).await {
         Ok(text) => text,

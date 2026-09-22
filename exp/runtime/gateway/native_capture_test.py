@@ -215,7 +215,11 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
                     payload["max_tokens"] = 128
                 response = httpx.post(
                     f"http://127.0.0.1:{port}/v1/{surface}",
-                    headers={"authorization": f"Bearer {raw_key}"},
+                    headers={
+                        "authorization": f"Bearer {raw_key}",
+                        "X-Session-Id": "real-harness-session",
+                        "X-Other-Private-Header": "do-not-capture-me",
+                    },
                     json=payload,
                     timeout=10,
                 )
@@ -269,6 +273,8 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     assert all(record.request.scope.identity_id == "default" for record in completed)
     assert all(record.request.model_id is not None for record in completed)
     for record in completed:
+        assert record.request.context["session_id"] == "real-harness-session"
+        assert record.provider_reasoning is None
         assert record.metrics is not None
         assert record.metrics.terminal_at is not None
         assert record.metrics.terminal_at >= record.metrics.started_at
@@ -281,3 +287,4 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
         assert record.metrics.usage.output_tokens is not None
     assert "provider-secret" not in "".join(records)
     assert raw_key not in "".join(records)
+    assert "do-not-capture-me" not in "".join(records)

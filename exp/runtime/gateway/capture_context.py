@@ -16,13 +16,14 @@ _UNSTORABLE_ESCAPE = re.compile(r"\\u(?:0000|d[89a-f][0-9a-f]{2})")
 
 
 def capture_request_context(
-    request: GatewayRequest, *, maximum_bytes: int = 1_048_576
+    request: GatewayRequest, *, maximum_bytes: int = 1_048_576, session_id: str | None = None
 ) -> JsonObject | None:
     """Snapshot post-guardrail, expanded context without changing the served request.
 
     Provider-significant carriers excluded from normal model serialization are
-    retained separately. No transport headers, resolved credentials, or provider
-    connection configuration enters this document. A prompt can itself contain
+    retained separately. Only the optional X-Session-Id correlation header is
+    retained, never other headers, credentials, or provider connection configuration.
+    A prompt can itself contain
     sensitive text; this function does not promise content redaction.
     """
     if maximum_bytes < 1:
@@ -32,6 +33,8 @@ def capture_request_context(
         "request": request.model_dump(mode="json", exclude_none=True, exclude={"idempotency_key"}),
         "provider_context": _captured_provider_context(request),
     }
+    if session_id and len(session_id) <= 512 and all("!" <= char <= "~" for char in session_id):
+        document["session_id"] = session_id
     encoded = json.dumps(document, ensure_ascii=True, separators=(",", ":"))
     if len(encoded) > maximum_bytes:
         return None

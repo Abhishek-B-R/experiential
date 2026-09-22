@@ -27,6 +27,14 @@ generation settings and semantic provider context after input guardrails. Transp
 replay keys and resolved provider credentials are excluded. Prompts may themselves
 contain sensitive information; this is not content redaction or encryption.
 
+Callers may send `X-Session-Id` with their actual harness session identifier.
+Capture stores it as `request.context.session_id`, separate from the effective
+provider request. It changes neither routing, authorization nor idempotency, and
+is not forwarded to the provider. A single nonempty visible-ASCII value of at most
+512 bytes is accepted; malformed or repeated values are ignored without rejecting
+inference. No session is guessed from a prompt, cache key, user or request ID.
+Other transport headers are never included in the capture document.
+
 The synchronous `write_record(str)` destination runs on a dedicated Rust-owned
 worker. Validate its input with `CaptureRecord.model_validate_json`. Schema version
 1 includes the authenticated scope, effective request, optional response, model and
@@ -51,6 +59,8 @@ in `provider_reasoning` when that rung explicitly permits reasoning exposure.
 This preserves reasoning even when the public Responses representation carries
 only an opaque continuation. Private provider reasoning is not decrypted for
 capture. Capture permission never grants permission to expose hidden reasoning.
+Reasoning is optional for every provider, including open models. Its absence never
+rejects capture or inference; preserve returned evidence without inventing it.
 `provider_tool_calls_json` retains completed calls as escaped JSON, including exact
 argument text even when Messages presents the arguments as a parsed input object.
 Chat tool turns on exposure-enabled routes return plaintext without appending

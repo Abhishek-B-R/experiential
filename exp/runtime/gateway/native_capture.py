@@ -177,7 +177,12 @@ class CaptureController:
         self._maximum_request_bytes = maximum_request_bytes
 
     def begin(
-        self, authorization: AuthorizationSnapshot, request: GatewayRequest, model_id: str | None
+        self,
+        authorization: AuthorizationSnapshot,
+        request: GatewayRequest,
+        model_id: str | None,
+        *,
+        session_id: str | None = None,
     ) -> bool:
         """Prepare only an allowed identity's post-guardrail, expanded request."""
         application_id = self._application_for(authorization)
@@ -187,7 +192,9 @@ class CaptureController:
             "messages",
         }:
             return True
-        context = capture_request_context(request, maximum_bytes=self._maximum_request_bytes)
+        context = capture_request_context(
+            request, maximum_bytes=self._maximum_request_bytes, session_id=session_id
+        )
         if context is None:
             return False
         record = CaptureRequest.model_validate(
@@ -211,12 +218,14 @@ def begin_capture(
     authorization: AuthorizationSnapshot,
     request: GatewayRequest,
     model_id: str | None = None,
+    *,
+    session_id: str | None = None,
 ) -> bool:
     """Reject unavailable required capture without exposing customer content or exceptions."""
     if controller is None:
         return True
     try:
-        return controller.begin(authorization, request, model_id)
+        return controller.begin(authorization, request, model_id, session_id=session_id)
     except Exception:  # noqa: BLE001 - sanitize policy and collector failures at admission.
         _LOGGER.warning("capture.admission_failed request_id=%s", authorization.request_id)
         return False

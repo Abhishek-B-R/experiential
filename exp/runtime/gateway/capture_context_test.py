@@ -12,6 +12,34 @@ from exp.runtime.gateway.replay_identity import canonical_request_sha256, provid
 from exp.runtime.openai_protocol.requests import decode_chat
 
 
+@pytest.mark.parametrize("session_id", [None, "harness-session-123"])
+def test_session_correlation_is_capture_only_and_reasoning_is_optional(
+    session_id: str | None,
+) -> None:
+    """Capture accepts absent reasoning and never changes the provider request or replay key."""
+    request = decode_chat(
+        {"model": "open-model", "messages": [{"role": "user", "content": "hello"}]}
+    ).request
+    before = request.model_dump_json()
+    digest = canonical_request_sha256(request)
+    context = capture_request_context(request, session_id=session_id)
+    assert context is not None
+    assert context.get("session_id") == session_id
+    assert context["request"] == request.model_dump(mode="json", exclude_none=True)
+    assert request.model_dump_json() == before
+    assert canonical_request_sha256(request) == digest
+
+
+@pytest.mark.parametrize("session_id", ["", " ", "bad\nvalue", "bad\x00value", "雪", "x" * 513])
+def test_invalid_optional_session_never_rejects_capture(session_id: str) -> None:
+    """Malformed correlation is not required evidence and cannot break serving."""
+    request = decode_chat(
+        {"model": "coding", "messages": [{"role": "user", "content": "hello"}]}
+    ).request
+    context = capture_request_context(request, session_id=session_id)
+    assert context is not None and "session_id" not in context
+
+
 @pytest.mark.parametrize("visible", ["Compare α and 雪.\n", "line one\x00line two\t"])
 def test_sealed_messages_history_retains_visible_reasoning_only_for_capture(visible: str) -> None:
     """Visible history survives capture without joining authenticated provider replay."""

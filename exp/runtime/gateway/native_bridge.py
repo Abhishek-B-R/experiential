@@ -417,7 +417,12 @@ class NativeControlPlane(
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
 
-        if not begin_capture(self._capture, authorization, captured_request):
+        if not begin_capture(
+            self._capture,
+            authorization,
+            captured_request,
+            session_id=optional_text(data.get("capture_session_id")),
+        ):
             message = "Traffic capture is unavailable or at capacity. Restore capacity and retry."
             self._accounting.finish_request_quietly(
                 authorization,
