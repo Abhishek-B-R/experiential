@@ -52,7 +52,19 @@ from exp.simulation.world_model.runtime import load_grounded_world_model_artifac
 
 
 class ModelEvaluationOptions(ContractModel):
-    """Bounded execution controls independent of router fitting and activation."""
+    """Bounded execution controls independent of router fitting and activation.
+
+    Attributes:
+        maximum_steps: Positive turn ceiling, default 100.
+        maximum_rollout_output_tokens: Total generation ceiling, default one million tokens.
+        maximum_concurrency: Positive simultaneous-rollout limit, default eight.
+        repeats: Positive independent repeats per scenario/model pair, default one.
+        maximum_output_tokens: Optional positive per-call limit; omission uses model capabilities.
+        maximum_judge_input_tokens: Positive judge context reservation, default 32,768.
+        maximum_judge_output_tokens: Positive judge output reservation, default 8,192.
+        maximum_retrieval_query_tokens: Positive per-query embedding limit, default 32,768.
+        seed: Reproducible scenario seed, default zero.
+    """
 
     maximum_steps: int = Field(default=100, ge=1)
     maximum_rollout_output_tokens: int = Field(default=1_000_000, gt=0)

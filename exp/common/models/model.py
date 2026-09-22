@@ -318,22 +318,22 @@ class AssistantAction(ContractModel):
 
 
 class ModelMessage(ContractModel):
-    """One request-visible message exchanged with a model."""
+    """One request-visible message exchanged with a model.
+
+    Attributes:
+        role: Required system, developer, user, assistant, or tool author role.
+        content: Optional visible text; required unless an assistant action is supplied.
+        tool_call_id: Optional tool-result linkage, allowed only for tool messages.
+        assistant_action: Optional structured output, allowed only for assistant messages.
+        content_parts: Ordered text/media content, empty by default and excluded from serialization.
+            Text parts concatenate to content; supported providers retain the exact interleaving.
+    """
 
     role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | None = None
     tool_call_id: str | None = None
     assistant_action: AssistantAction | None = None
     content_parts: tuple[MessageContentPart, ...] = Field(default=(), exclude=True)
-    """Ordered caller content parts when a user or tool message carries attachments.
-
-    Empty on every text-only message. The text parts concatenate to
-    ``content``, so selectors, simulators, and persisted artifacts keep
-    seeing exactly the text they saw before media existed; provider clients
-    that can carry media read the parts and emit the caller's exact
-    interleaving. Excluded from serialization so identities of text-only
-    requests are byte-identical to pre-media traffic.
-    """
 
     @model_validator(mode="after")
     def _require_message_payload(self) -> ModelMessage:

@@ -16,7 +16,27 @@ from exp.simulation.specs import WorldModelSettings
 
 
 class EvaluationSetup(ContractModel):
-    """Frozen worker, environment, judge and execution inputs independent of router fitting."""
+    """Frozen worker, environment, judge and execution inputs independent of router fitting.
+
+    Attributes:
+        candidates: Nonempty tuple of pinned worker identities.
+        observed_cells: Optional production evidence, empty by default.
+        production_protocol: Frozen interpretation of production evidence.
+        simulation_protocol: Frozen simulated-evaluation protocol.
+        fit_rag_input: Exact fit-only grounding artifact.
+        pricing_snapshot_id: Frozen catalog prices used for comparison.
+        judgment_status: Provisional or human-calibrated status of the selected judge.
+        world_model_settings: Environment model and retrieval settings.
+        simulation_completion_input: Optional immutable provider reservation contract.
+        agent_id: Nonempty identity of the rollout agent.
+        seed: Scenario randomization seed.
+        run_id: Optional execution namespace; distinct values collect independent evidence.
+        maximum_steps: Positive candidate-turn ceiling.
+        continuation_of: Optional parent evaluation retained during budget continuation.
+        maximum_rollout_output_tokens: Positive cumulative generation ceiling, default one million.
+        maximum_concurrency: Positive maximum number of simultaneous rollouts.
+        repeats: Independent runs per scenario/model pair, default one and separate from retries.
+    """
 
     candidates: tuple[RoutedCandidateSnapshot, ...] = Field(min_length=1)
     observed_cells: tuple[ObservedProductionCell, ...] = ()

@@ -73,7 +73,7 @@ from exp.simulation.engines.text.leases import (
     TextCellLeaseState,
     TextCellLeaseStore,
 )
-from exp.simulation.engines.text.lineage_spend import lineage_spend, prefix_retry_credit
+from exp.simulation.engines.text.lineage_spend import prefix_retry_credit, resolution_spend
 from exp.simulation.engines.text.prompt import WORLD_MODEL_TEXT_PROMPT_VERSION
 from exp.simulation.engines.text.recording import (
     RecordingCandidateClient,
@@ -85,7 +85,6 @@ from exp.simulation.engines.text.resume import (
     ResumePins,
     load_optional_rollout,
     load_rollout,
-    persisted_cell_attempts,
     resolve_cell_attempt,
     validate_resume_rollout,
     verify_persisted_evaluation_plan,
@@ -256,6 +255,13 @@ class WorldModelSimulator:
 
         observe_cells = cell_progress_reporter(self._progress, cells, completed)
         observe_cells()
+        workers = dispatch.worker_count(
+            spec,
+            pending,
+            self._completion_contract,
+            self._tasks,
+            resolution_spend(self._store, self._plan.cells, bindings, self._pins(resolution_input)),
+        )
 
         def execute(cell: EvaluationCell) -> RolloutArtifact:
             """Claim and persist a cell under the shared reservation ledger."""
@@ -268,17 +274,12 @@ class WorldModelSimulator:
                 resolution,
                 resolution_input,
                 bindings,
+                parallel_admission=workers > 1,
             )
 
         dispatch.dispatch_cells(
             pending,
-            workers=dispatch.worker_count(
-                spec,
-                pending,
-                self._completion_contract,
-                self._tasks,
-                self._known_resolution_spend(bindings, resolution_input),
-            ),
+            workers=workers,
             execute=execute,
             completed=completed,
             observe=observe_cells,
@@ -545,6 +546,8 @@ class WorldModelSimulator:
         resolution: SimulationResolution,
         resolution_input: ArtifactInput,
         bindings: Mapping[ArtifactId, SimulationCellBinding],
+        *,
+        parallel_admission: bool,
     ) -> RolloutArtifact:
         """Claim, execute, and persist one cell within the reconciled budget remainder.
 
@@ -557,6 +560,7 @@ class WorldModelSimulator:
             resolution: Immutable resolution owning the cell binding.
             resolution_input: Exact resolution manifest pointer.
             bindings: Complete bindings for every selected cell.
+            parallel_admission: Whether this dispatch can reserve whole cells concurrently.
 
         Returns:
             Newly persisted or exactly replayed rollout evidence.
@@ -580,13 +584,19 @@ class WorldModelSimulator:
                 binding_sha256=binding_digest(binding),
                 maximum_cost_usd=spec.maximum_cost_usd,
                 rollout_completed=lambda item: load_optional_rollout(self._store, item) is not None,
-                observed_spend_usd=lambda: self._known_resolution_spend(bindings, resolution_input),
+                observed_spend_usd=lambda: resolution_spend(
+                    self._store, self._plan.cells, bindings, pins
+                ),
                 stop_on_overspend=spec.stop_on_overspend,
-                reservation_cost_usd=dispatch.cell_reservation(
-                    spec,
-                    cell,
-                    self._completion_contract,
-                    has_tools=bool(self._tasks[cell.task_id].tools),
+                reservation_cost_usd=(
+                    dispatch.cell_reservation(
+                        spec,
+                        cell,
+                        self._completion_contract,
+                        has_tools=bool(self._tasks[cell.task_id].tools),
+                    )
+                    if parallel_admission
+                    else None
                 ),
             )
         except TextCellLeaseError as exc:
@@ -644,24 +654,6 @@ class WorldModelSimulator:
             raise
         self._leases.release(claim.lease)
         return persisted
-
-    def _known_resolution_spend(
-        self,
-        bindings: Mapping[ArtifactId, SimulationCellBinding],
-        resolution_input: ArtifactInput,
-    ) -> float | None:
-        """Return conservative provider spend or unknown when one bound cell is unpriced.
-
-        Every persisted attempt of every bound cell counts, so a superseded unknown-spend
-        failure keeps charging its worst-case reservation while its re-execution is admitted
-        under whatever ceiling remains.
-        """
-        rollouts: list[RolloutArtifact] = []
-        pins = self._pins(resolution_input)
-        for cell_id, binding in bindings.items():
-            cell = next(item for item in self._plan.cells if item.cell_id == cell_id)
-            rollouts.extend(persisted_cell_attempts(self._store, cell, binding, pins))
-        return lineage_spend(self._store, rollouts)
 
     def _execute_cell(
         self,

@@ -1814,6 +1814,7 @@ def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_pers
                     resolution,
                     resolution_input,
                     bindings,
+                    parallel_admission=False,
                 )
             assert candidate_client.requests == []
             assert world_client.requests == []
@@ -1960,6 +1961,44 @@ def test_text_simulation_serializes_finite_cost_admission(
     assert len(artifact_set.artifact_ids) == 4
     assert candidate_client.maximum_active_calls == 1
     assert world_client.maximum_active_calls == 1
+
+
+def test_serial_fallback_reserves_remaining_budget_per_call(tmp_path: Path) -> None:
+    """Affordable short episodes run when the full parallel rollout ceiling cannot fit."""
+    cell = _cell("cell-a", "task-a")
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    contract_input = _persist_completion_contract(store)
+    candidate = _ScriptedClient([_response("done", snapshot=_snapshot("candidate-a"))])
+    world = _ScriptedClient(
+        [_response('{"message":"done","terminal":true}', snapshot=_snapshot("world-model-a"))]
+    )
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_input,
+        candidate,
+        world,
+        completion_contract_input=contract_input,
+    )
+    spec = _spec(
+        plan_input,
+        task_input,
+        (cell.cell_id,),
+        completion_contract_input=contract_input,
+        maximum_concurrency=2,
+        maximum_cost_usd=0.4,
+        stop_on_overspend=True,
+    )
+    result = simulator.run(spec)
+    rollout = simulator._load_rollout(result.artifact_ids[0])
+    assert rollout.stop_reason == StopReason.COMPLETED, rollout.failure
+    assert len(candidate.requests) == len(world.requests) == 1
+    assert simulator.run(spec).artifact_ids == result.artifact_ids
+    assert len(candidate.requests) == len(world.requests) == 1
 
 
 def test_text_simulation_continues_after_agent_completion_until_world_terminal(

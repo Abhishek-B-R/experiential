@@ -274,8 +274,11 @@ uv run pytest -q
    implementation when requirements differ materially and document the boundary.
 
 8. **Keep imports explicit and fail-fast.** Put imports at module scope unless moving them is
-   required to break a real circular dependency. Do not use lazy imports for optional convenience,
-   and do not catch `ImportError`/`ModuleNotFoundError` to silently fall back to alternate behavior.
+   required to break a real circular dependency. Declaration-only CLI command modules may defer
+   their execution-module import until command dispatch to satisfy the startup-isolation gate:
+   help and configuration must not load optimization machinery. Execution modules keep imports
+   at module scope. Do not defer imports for optional convenience, and do not catch
+   `ImportError`/`ModuleNotFoundError` to silently fall back to alternate behavior.
 
 9. **Design every public surface from the perspective of a dev using it.** Before implementing a
    feature, write the call site first — the Python snippet or CLI invocation an outside developer
