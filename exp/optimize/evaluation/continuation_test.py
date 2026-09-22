@@ -7,7 +7,7 @@ import pytest
 
 from exp.common.models import AssistantAction, ModelRequest, ModelResponse
 from exp.common.project import write_project_config
-from exp.common.rollouts import RolloutArtifact
+from exp.common.rollouts import RolloutArtifact, StopReason, unknown_dispatch_reserved_cost_usd
 from exp.optimize.evaluation.contracts import EvaluationBudget
 from exp.optimize.evaluation.prepare import ModelEvaluationOptions, prepare_model_evaluation
 from exp.optimize.evaluation.prepare_test import _prepare
@@ -19,21 +19,29 @@ from exp.optimize.router.automatic.service_test import (
     _RuntimeCatalog,
 )
 from exp.runtime.models import RuntimeModelCatalog
+from exp.simulation.engines.text.rollout_support import rollout_spend
 
 
 @pytest.mark.parametrize("limit", ["steps", "tokens"])
+@pytest.mark.parametrize("retry", [False, True])
 def test_native_continuation_keeps_prefix_costs_and_excludes_incomplete_judgments(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     limit: str,
+    retry: bool,
 ) -> None:
     """A budget-limited matrix resumes with one new turn per cell and no prefix dispatches."""
     project, catalog, state, initial = _prepare(tmp_path)
     terminal = False
+    failed = False
     original = _CompletionClient.complete
 
     def complete(client: _CompletionClient, request: ModelRequest) -> ModelResponse:
         """Keep worlds nonterminal until the next explicitly authorized execution."""
+        nonlocal failed
+        if retry and terminal and not failed and client._alias.startswith("candidate-"):
+            failed = True
+            raise TimeoutError("fixture unknown provider outcome")
         response = original(client, request)
         if client._alias == "world":
             return response.model_copy(
@@ -117,7 +125,16 @@ def test_native_continuation_keeps_prefix_costs_and_excludes_incomplete_judgment
         if identity not in parent_bytes
         and project.artifacts.read(identity).manifest.artifact_type == "rollout"
     ]
+    failed_children = [item for item in children if item.stop_reason == StopReason.FAILURE]
+    children = [item for item in children if item.stop_reason == StopReason.COMPLETED]
     assert len(children) == 6
+    assert len(failed_children) == int(retry)
+    expected = sum(rollout_spend(item) or 0 for item in children)
+    if failed_children:
+        reservation = unknown_dispatch_reserved_cost_usd(failed_children[0].failure)
+        assert reservation is not None
+        expected += reservation
+    assert resumed.simulation_cost_usd == pytest.approx(expected)
     assert all(item.continuation_of is not None for item in children)
     for item in children:
         assert item.continuation_of is not None

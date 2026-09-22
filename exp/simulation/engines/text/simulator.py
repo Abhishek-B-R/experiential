@@ -72,6 +72,7 @@ from exp.simulation.engines.text.leases import (
     TextCellLeaseState,
     TextCellLeaseStore,
 )
+from exp.simulation.engines.text.lineage_spend import lineage_spend, prefix_retry_credit
 from exp.simulation.engines.text.prompt import WORLD_MODEL_TEXT_PROMPT_VERSION
 from exp.simulation.engines.text.recording import (
     RecordingCandidateClient,
@@ -95,7 +96,6 @@ from exp.simulation.engines.text.rollout_support import (
     elapsed_seconds,
     failure_span,
     internal_failure,
-    known_total_spend,
     normalize_text_tool_failure,
     orchestration_economics,
 )
@@ -638,7 +638,7 @@ class WorldModelSimulator:
         for cell_id, binding in bindings.items():
             cell = next(item for item in self._plan.cells if item.cell_id == cell_id)
             rollouts.extend(persisted_cell_attempts(self._store, cell, binding, pins))
-        return known_total_spend(rollouts)
+        return lineage_spend(self._store, rollouts)
 
     def _execute_cell(
         self,
@@ -675,6 +675,7 @@ class WorldModelSimulator:
         )
         if parent is not None and parent.stop_reason == StopReason.COMPLETED:
             return rebind_completed(self._store, parent, spec, cell, binding, resolution_input)
+        maximum_cell_cost_usd += prefix_retry_credit(parent, attempt)
         task = self._tasks[cell.task_id]
         candidate = self._candidate_models[cell.candidate_alias]
         started_at = timestamp(self._clock)
@@ -760,7 +761,7 @@ class WorldModelSimulator:
                 recorder=recorder,
             )
         except Exception as exc:  # noqa: BLE001 - construction faults remain cell evidence
-            return self._failure_rollout(
+            failed = self._failure_rollout(
                 spec,
                 cell,
                 candidate,
@@ -774,6 +775,7 @@ class WorldModelSimulator:
                 recorder=recorder,
                 attempt=attempt,
             )
+            return retain_lineage(self._store, failed, parent)
         failure = outcome.failure
         if outcome.episodes and failure == outcome.episodes[-1].failure:
             failure = normalize_text_tool_failure(outcome.episodes[-1])
