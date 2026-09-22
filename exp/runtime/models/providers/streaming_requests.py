@@ -705,15 +705,36 @@ def route_generation_parameter_requests(
         # is semantic, so it lives in the coercion layer, where it runs only
         # after every rung declined verbatim and never steals narrowing
         # preference from an Anthropic rung that could honor the config.
+        budgeted_chat = (
+            request.surface == GatewayApiSurface.CHAT_COMPLETIONS
+            and "budget_tokens" in request.provider_thinking_config
+        )
         raise ProviderParameterError(
             message=(
-                "The parameter 'thinking' is not supported by this model route. "
+                "This model route cannot preserve thinking.budget_tokens. Choose a "
+                "budget-capable Anthropic route, or explicitly remove the budget and "
+                "select reasoning_effort."
+                if budgeted_chat
+                else "The parameter 'thinking' is not supported by this model route. "
                 "Remove the field or choose a native Anthropic-only route."
             ),
-            param="thinking",
+            param="thinking.budget_tokens" if budgeted_chat else "thinking",
             code="unsupported_parameter",
         )
     if request.provider_thinking_config is not None and not non_anthropic_route:
+        if (
+            request.surface == GatewayApiSurface.CHAT_COMPLETIONS
+            and "budget_tokens" in request.provider_thinking_config
+            and not all(profile.supports_reasoning for profile in profiles)
+        ):
+            raise ProviderParameterError(
+                message=(
+                    "This model route does not declare thinking support. Choose a "
+                    "budget-capable Anthropic route or remove thinking.budget_tokens."
+                ),
+                param="thinking.budget_tokens",
+                code="unsupported_parameter",
+            )
         shape_anthropic_thinking_config(profiles, request, provider_updates, ignored)
     if anthropic_server_tools_present(request) and not all(
         profile.dialect == "anthropic_messages" for profile in profiles

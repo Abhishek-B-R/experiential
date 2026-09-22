@@ -510,12 +510,12 @@ class _ThinkingConfig(_WireModel):
 
     Translated to the canonical reasoning control: ``enabled`` and ``adaptive``
     turn thinking on at the model's default effort; ``disabled`` maps to
-    ``reasoning_effort=none``. ``budget_tokens`` has no canonical equivalent
-    and is rejected when present.
+    ``reasoning_effort=none``. An enabled ``budget_tokens`` is preserved
+    for route admission and forwarded only where its numeric value is supported.
     """
 
     type: Literal["enabled", "disabled", "adaptive"]
-    budget_tokens: int | None = Field(default=None, ge=0)
+    budget_tokens: int | None = Field(default=None, ge=1024, strict=True)
 
 
 class _ChatTemplateKwargs(_WireModel):

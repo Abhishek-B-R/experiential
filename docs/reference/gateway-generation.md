@@ -60,10 +60,16 @@ controls conflict with this budget. Other provider routes are refused before dis
 unknown compatible servers are not assumed to enforce a field they might ignore.
 See [Qwen Cloud thinking budgets](https://docs.qwencloud.com/api-reference/chat/openai-chat).
 
-Numeric reasoning budgets on Chat (`reasoning.max_tokens` or `thinking.budget_tokens`) are
-refused rather than approximated by an effort tier. Use Messages with a budget-capable model,
-or deliberately remove the numeric budget and select an effort. This is a documented
-compatibility limitation, not a claim of full OpenRouter reasoning-parameter parity.
+Chat also accepts `thinking: {type: "enabled", budget_tokens: N}` for budget-capable
+Anthropic routes. The budget must be an integer of at least 1024 and below the output
+limit. It travels unchanged through admission, replay identity, and provider dispatch;
+it is never replaced by an effort tier. Adaptive-only Anthropic models and non-Anthropic
+routes reject it by `thinking.budget_tokens` before dispatch. Mixed routes narrow to
+rungs that can preserve it. Conflicting effort, top-level budget, or thinking-off controls
+are rejected. See [Anthropic extended thinking](https://platform.claude.com/docs/en/build-with-claude/extended-thinking).
+
+OpenRouter's `reasoning.max_tokens` remains unsupported on Chat. Remove that numeric
+budget and select an effort, or use Messages with a budget-capable model.
 
 ## Truncated tools
 
