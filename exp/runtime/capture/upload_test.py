@@ -5,13 +5,15 @@ import os
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
 import httpx
 import pytest
 
-from exp.runtime.capture.normalization import CapturedExchange, normalize_exchange
+from exp.common.core.artifacts import JsonValue
+from exp.runtime.capture.normalization import CapturedExchange, CaptureProtocol, normalize_exchange
 from exp.runtime.capture.upload import CaptureUploader
 
 _UPLOAD_ORIGIN = "https://storage.example"
@@ -46,6 +48,184 @@ def _wait(predicate: Callable[[], bool]) -> None:
         time.sleep(0.01)
 
 
+def _usage_exchange(input_tokens: int = 3, output_tokens: int = 7) -> CapturedExchange:
+    """Build one synthetic response with a provider-reported token pair."""
+    return replace(
+        _exchange(),
+        response=json.dumps(
+            {"output": [], "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}}
+        ).encode(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("protocol", "content_type", "response"),
+    [
+        (
+            "responses",
+            "application/json",
+            b'{"output":[],"usage":{"input_tokens":3,"output_tokens":7}}',
+        ),
+        (
+            "chat",
+            "application/json",
+            b'{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":7}}',
+        ),
+        (
+            "messages",
+            "application/json",
+            b'{"content":[],"usage":{"input_tokens":3,"output_tokens":7}}',
+        ),
+        (
+            "responses",
+            "text/event-stream",
+            b'data: {"type":"response.completed","response":{"output":[],'
+            b'"usage":{"input_tokens":3,"output_tokens":7}}}\n\n',
+        ),
+        (
+            "chat",
+            "text/event-stream",
+            b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":7}}\n\n'
+            b"data: [DONE]\n\n",
+        ),
+        (
+            "messages",
+            "text/event-stream",
+            b'data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}\n\n'
+            b'data: {"type":"message_delta","usage":{"output_tokens":7}}\n\n',
+        ),
+    ],
+)
+def test_provider_usage_reaches_live_and_final_capture_counts(
+    tmp_path: Path, protocol: CaptureProtocol, content_type: str, response: bytes
+) -> None:
+    """Count actual provider usage from each supported JSON and streaming wire protocol."""
+    run = str(uuid4())
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        tmp_path / run,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+        transport=httpx.MockTransport(lambda request: httpx.Response(503)),
+    )
+    uploader.start()
+    try:
+        assert uploader.submit(
+            replace(
+                _exchange(),
+                protocol=protocol,
+                response_content_type=content_type,
+                response=response,
+            )
+        )
+        _wait(lambda: uploader.stats.usage_exchanges == 1)
+        assert uploader.stats.input_tokens == 3
+        assert uploader.stats.output_tokens == 7
+    finally:
+        final = uploader.close()
+    assert (final.input_tokens, final.output_tokens, final.usage_exchanges) == (3, 7, 1)
+    assert uploader.stats == uploader.close() == final
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        None,
+        {},
+        {"input_tokens": 3},
+        {"input_tokens": -1, "output_tokens": 7},
+        {"input_tokens": 3, "output_tokens": -1},
+        {"input_tokens": True, "output_tokens": 7},
+        {"input_tokens": 3, "output_tokens": False},
+        {"input_tokens": "3", "output_tokens": 7},
+        {"input_tokens": 3, "output_tokens": 7.0},
+    ],
+)
+def test_missing_or_invalid_provider_usage_remains_unknown(
+    tmp_path: Path, usage: JsonValue
+) -> None:
+    """Persist supported requests without inventing token counts for missing or invalid usage."""
+    run = str(uuid4())
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        tmp_path / run,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+        transport=httpx.MockTransport(lambda request: httpx.Response(503)),
+    )
+    uploader.start()
+    assert uploader.submit(
+        replace(_exchange(), response=json.dumps({"output": [], "usage": usage}).encode())
+    )
+    final = uploader.close()
+    assert final.pending_batches == 1
+    assert final.dropped_exchanges == 0
+    assert (final.input_tokens, final.output_tokens, final.usage_exchanges) == (0, 0, 0)
+
+
+def test_usage_totals_accumulate_known_exchanges_including_zero(tmp_path: Path) -> None:
+    """Add known counts across this run while distinguishing reported zero from unknown usage."""
+    run = str(uuid4())
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        tmp_path / run,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+        transport=httpx.MockTransport(lambda request: httpx.Response(503)),
+    )
+    uploader.start()
+    for exchange in (_usage_exchange(), _usage_exchange(5, 11), _usage_exchange(0, 0), _exchange()):
+        assert uploader.submit(exchange)
+    final = uploader.close()
+    assert final.captured_exchanges == final.pending_batches == 4
+    assert (final.input_tokens, final.output_tokens, final.usage_exchanges) == (8, 18, 3)
+
+
+def test_current_run_usage_is_counted_once_across_upload_retries(tmp_path: Path) -> None:
+    """Retry the same durable batch without adding its provider usage a second time."""
+    run, ingest = str(uuid4()), str(uuid4())
+    directory = tmp_path / run
+    directory.mkdir()
+    statuses = iter(("running", "done"))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return two distinct receipts for one synthetic upload batch."""
+        return httpx.Response(200, json={"ingest_id": ingest, "status": next(statuses)})
+
+    uploader = CaptureUploader(
+        "https://api.example",
+        "org",
+        run,
+        "KEY",
+        directory,
+        upload_origin=_UPLOAD_ORIGIN,
+        upload_path_prefix=_UPLOAD_PREFIX,
+    )
+    assert uploader.submit(_usage_exchange())
+    uploader._stop.set()
+    uploader._work()
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        for _ in range(2):
+            uploader._retry_at.clear()
+            uploader._deliver_one(client)
+            assert uploader.stats.input_tokens == 3
+            assert uploader.stats.output_tokens == 7
+            assert uploader.stats.usage_exchanges == 1
+    final = uploader.close()
+    assert final.uploaded_batches == 1
+    assert final.pending_batches == 0
+    assert (final.input_tokens, final.output_tokens, final.usage_exchanges) == (3, 7, 1)
+
+
 def test_recovery_keeps_original_run_batch_and_never_sends_api_key_to_storage(
     tmp_path: Path,
 ) -> None:
@@ -53,7 +233,9 @@ def test_recovery_keeps_original_run_batch_and_never_sends_api_key_to_storage(
     prior_run, run, batch, ingest = (str(uuid4()) for _ in range(4))
     prior = tmp_path / prior_run
     prior.mkdir()
-    (prior / f"{batch}.json").write_bytes(normalize_exchange(_exchange(), max_body_bytes=4096))
+    (prior / f"{batch}.json").write_bytes(
+        normalize_exchange(_usage_exchange(), max_body_bytes=4096)
+    )
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -99,6 +281,8 @@ def test_recovery_keeps_original_run_batch_and_never_sends_api_key_to_storage(
         uploader.close()
     assert len(requests) == 4
     assert not (prior / f"{batch}.json").exists()
+    assert uploader.stats.usage_exchanges == 0
+    assert uploader.stats.input_tokens == uploader.stats.output_tokens == 0
 
 
 def test_slow_cloud_does_not_block_submission_or_local_shutdown_flush(tmp_path: Path) -> None:
@@ -399,15 +583,16 @@ def test_shutdown_counts_unfinished_copies_and_freezes_final_pending(
     )
     uploader.start()
     try:
-        assert uploader.submit(_exchange())
+        assert uploader.submit(_usage_exchange())
         assert entered.wait(1)
-        assert uploader.submit(_exchange())
+        assert uploader.submit(_usage_exchange())
         before = time.monotonic()
         final = uploader.close(timeout=0.02)
         assert time.monotonic() - before < 0.5
         assert final.captured_exchanges == 2
         assert final.dropped_exchanges == 2
         assert final.pending_batches == uploader.pending_current_run == 1
+        assert (final.input_tokens, final.output_tokens, final.usage_exchanges) == (0, 0, 0)
     finally:
         release.set()
         assert uploader._thread is not None
@@ -455,11 +640,13 @@ def test_shutdown_distinguishes_unfinished_write_from_durable_temporary(
     )
     uploader.start()
     try:
-        assert uploader.submit(_exchange())
+        assert uploader.submit(_usage_exchange())
         assert entered.wait(1)
         final = uploader.close(timeout=0.02)
         assert final.dropped_exchanges == int(stage == "fsync")
         assert final.pending_batches == uploader.pending_current_run == int(stage == "rename")
+        expected_usage = (3, 7, 1) if stage == "rename" else (0, 0, 0)
+        assert (final.input_tokens, final.output_tokens, final.usage_exchanges) == expected_usage
     finally:
         release.set()
         assert uploader._thread is not None
@@ -477,7 +664,7 @@ def test_start_recovers_complete_temps_and_removes_bounded_partial_files(tmp_pat
     previous = tmp_path / prior
     previous.mkdir()
     complete = previous / f"{uuid4()}.tmp"
-    complete.write_bytes(normalize_exchange(_exchange(), max_body_bytes=4096))
+    complete.write_bytes(normalize_exchange(_usage_exchange(), max_body_bytes=4096))
     for content in (b'{"resourceSpans":', b'{"resourceSpans":[]}', b"x" * 5000):
         (previous / f"{uuid4()}.tmp").write_bytes(content)
     uploader = CaptureUploader(
@@ -496,6 +683,7 @@ def test_start_recovers_complete_temps_and_removes_bounded_partial_files(tmp_pat
     assert final.pending_batches == 1
     assert final.dropped_exchanges == 3
     assert uploader.pending_current_run == 0
+    assert (final.input_tokens, final.output_tokens, final.usage_exchanges) == (0, 0, 0)
 
 
 def test_temporary_recovery_respects_combined_batch_count(tmp_path: Path) -> None:

@@ -14,6 +14,8 @@ from exp.runtime.capture.proxy import CaptureProxy
 from exp.runtime.capture.upload import CaptureUploader, UploadStats
 
 _SHUTDOWN_TIMEOUT = 5.0
+_STARTUP_TIMEOUT = 180.0
+_WAITING_NOTICE_DELAY = 3.0
 
 
 async def run_session(
@@ -26,6 +28,7 @@ async def run_session(
     on_started: Callable[[], None],
     on_progress: Callable[[UploadStats], None],
     on_warning: Callable[[str], None],
+    on_waiting: Callable[[], None] | None = None,
 ) -> UploadStats:
     """Serve provider traffic until interrupted, always releasing interception.
 
@@ -38,6 +41,7 @@ async def run_session(
         on_started: Terminal callback once network interception is ready.
         on_progress: Terminal callback receiving content-free upload counters.
         on_warning: Terminal callback for recoverable upload failures.
+        on_waiting: Optional callback when network startup remains pending.
 
     Returns:
         Final upload counters after bounded flushing.
@@ -57,7 +61,7 @@ async def run_session(
     uploader_started = False
     try:
         proxy_task = asyncio.create_task(proxy.serve(ca_directory=ca_directory, ready=ready.set))
-        if not await _wait_for_proxy(proxy_task, ready, stop):
+        if not await _wait_for_proxy(proxy_task, ready, stop, on_waiting=on_waiting):
             return uploader.stats
         uploader.start()
         uploader_started = True
@@ -117,30 +121,47 @@ async def run_session(
 
 
 async def _wait_for_proxy(
-    task: asyncio.Task[None], ready: asyncio.Event, stop: asyncio.Event
+    task: asyncio.Task[None],
+    ready: asyncio.Event,
+    stop: asyncio.Event,
+    on_waiting: Callable[[], None] | None = None,
 ) -> bool:
-    """Allow first-use macOS approval while keeping Ctrl+C immediately cancellable."""
+    """Report pending startup once without extending approval or cancellation bounds."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _STARTUP_TIMEOUT
     readiness = asyncio.create_task(ready.wait())
     interrupted = asyncio.create_task(stop.wait())
+    notice = asyncio.create_task(asyncio.sleep(_WAITING_NOTICE_DELAY))
+    waiting = {task, readiness, interrupted, notice}
     try:
-        done, _ = await asyncio.wait(
-            {task, readiness, interrupted}, timeout=180.0, return_when=asyncio.FIRST_COMPLETED
-        )
-        if task in done:
-            await task
-            raise RuntimeError("Capture proxy stopped before it was ready.")
-        if interrupted in done:
-            return False
-        if readiness not in done:
-            raise RuntimeError(
-                "Capture is waiting for macOS network extension approval. Approve Mitmproxy "
-                "Redirector in System Settings, then run exp capture again."
+        while True:
+            done, _ = await asyncio.wait(
+                waiting,
+                timeout=max(0.0, deadline - loop.time()),
+                return_when=asyncio.FIRST_COMPLETED,
             )
-        return True
+            if task.done():
+                await task
+                raise RuntimeError("Capture proxy stopped before it was ready.")
+            if stop.is_set():
+                return False
+            if ready.is_set():
+                return True
+            if not done:
+                raise RuntimeError(
+                    "Capture could not start the macOS network extension. Enable Mitmproxy "
+                    "Redirector in System Settings > General > Login Items & Extensions > "
+                    "Network Extensions, then run exp capture again."
+                )
+            if notice in done:
+                waiting.remove(notice)
+                if on_waiting is not None:
+                    on_waiting()
     finally:
         readiness.cancel()
         interrupted.cancel()
-        await asyncio.gather(readiness, interrupted, return_exceptions=True)
+        notice.cancel()
+        await asyncio.gather(readiness, interrupted, notice, return_exceptions=True)
 
 
 async def _finish_proxy(task: asyncio.Task[None]) -> None:

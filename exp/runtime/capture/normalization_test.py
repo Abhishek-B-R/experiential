@@ -8,7 +8,7 @@ import brotli
 import pytest
 import zstandard
 
-from exp.common.core.artifacts import JsonObject, SourceIdentity
+from exp.common.core.artifacts import JsonObject, JsonValue, SourceIdentity
 from exp.runtime.capture.normalization import CapturedExchange, capture_protocol, normalize_exchange
 from exp.simulation.ingest.otlp import normalize_otlp_payload
 
@@ -100,6 +100,111 @@ def test_anthropic_stream_merges_tool_arguments_and_usage() -> None:
     assert response["content"][0]["input"] == {"x": 1}
     assert attributes["gen_ai.usage.input_tokens"] == 9
     assert attributes["gen_ai.usage.output_tokens"] == 4
+
+
+def _anthropic_usage_attributes(usage: JsonObject, *, streamed: bool) -> JsonObject:
+    """Normalize the same synthetic Anthropic usage through JSON or separate SSE events."""
+    if streamed:
+        initial = {key: value for key, value in usage.items() if key != "output_tokens"}
+        events = [
+            {"type": "message_start", "message": {"usage": initial}},
+            {"type": "message_delta", "usage": {"output_tokens": usage["output_tokens"]}},
+        ]
+        response = b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events)
+    else:
+        response = json.dumps({"content": [], "usage": usage}).encode()
+    return _attributes(
+        _exchange(
+            protocol="messages",
+            response=response,
+            response_content_type="text/event-stream" if streamed else "application/json",
+        )
+    )
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize(
+    ("cache_usage", "expected_input"),
+    [
+        ({}, 3),
+        ({"cache_creation_input_tokens": 100}, 103),
+        ({"cache_read_input_tokens": 1_000}, 1_003),
+        ({"cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}, 3),
+        (
+            {
+                "cache_creation_input_tokens": 100,
+                "cache_read_input_tokens": 1_000,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 40,
+                    "ephemeral_1h_input_tokens": 60,
+                },
+            },
+            1_103,
+        ),
+    ],
+)
+def test_anthropic_input_total_includes_cache_once_and_preserves_raw_usage(
+    streamed: bool, cache_usage: JsonObject, expected_input: int
+) -> None:
+    """Count each Anthropic input category once without changing the copied provider breakdown."""
+    usage: JsonObject = {"input_tokens": 3, "output_tokens": 7, **cache_usage}
+    attributes = _anthropic_usage_attributes(usage, streamed=streamed)
+    assert attributes["gen_ai.usage.input_tokens"] == expected_input
+    assert attributes["gen_ai.usage.output_tokens"] == 7
+    assert json.loads(str(attributes["exp.capture.response"]))["usage"] == usage
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("cache_key", ["cache_creation_input_tokens", "cache_read_input_tokens"])
+@pytest.mark.parametrize("invalid", [True, -1, None, "100", 100.0])
+def test_anthropic_invalid_cache_count_keeps_total_usage_unknown(
+    streamed: bool, cache_key: str, invalid: JsonValue
+) -> None:
+    """An invalid reported cache category cannot produce a misleading complete token total."""
+    usage: JsonObject = {"input_tokens": 3, "output_tokens": 7, cache_key: invalid}
+    attributes = _anthropic_usage_attributes(usage, streamed=streamed)
+    assert "gen_ai.usage.input_tokens" not in attributes
+    assert "gen_ai.usage.output_tokens" not in attributes
+    assert json.loads(str(attributes["exp.capture.response"]))["usage"] == usage
+
+
+@pytest.mark.parametrize("protocol", ["responses", "chat"])
+@pytest.mark.parametrize("streamed", [False, True])
+def test_openai_cached_input_is_already_in_the_provider_total(
+    protocol: str, streamed: bool
+) -> None:
+    """Preserve OpenAI's inclusive total without adding its nested cached-token breakdown."""
+    if protocol == "responses":
+        usage = {
+            "input_tokens": 1_003,
+            "output_tokens": 7,
+            "input_tokens_details": {"cached_tokens": 1_000},
+        }
+        response = {"output": [], "usage": usage}
+        events = [{"type": "response.completed", "response": response}]
+    else:
+        usage = {
+            "prompt_tokens": 1_003,
+            "completion_tokens": 7,
+            "prompt_tokens_details": {"cached_tokens": 1_000},
+        }
+        response = {"choices": [], "usage": usage}
+        events = [response]
+    body = (
+        b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events)
+        if streamed
+        else json.dumps(response).encode()
+    )
+    attributes = _attributes(
+        _exchange(
+            protocol=protocol,
+            response=body,
+            response_content_type="text/event-stream" if streamed else "application/json",
+        )
+    )
+    assert attributes["gen_ai.usage.input_tokens"] == 1_003
+    assert attributes["gen_ai.usage.output_tokens"] == 7
+    assert json.loads(str(attributes["exp.capture.response"]))["usage"] == usage
 
 
 @pytest.mark.parametrize("encoding", ["br", "zstd"])

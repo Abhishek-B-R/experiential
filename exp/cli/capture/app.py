@@ -19,6 +19,12 @@ DOMAIN_OPTION = typer.Option(
     "--domain",
     help="Advanced: replace the default provider hosts with exact hostnames; repeat for several.",
 )
+VERBOSE_OPTION = typer.Option(
+    False,
+    "--verbose",
+    "-v",
+    help="Show setup details, provider hosts, and the public CA certificate path.",
+)
 capture_app = typer.Typer(
     help="Capture supported OpenAI and Anthropic traffic from all apps to Experiential.",
     invoke_without_command=True,
@@ -32,6 +38,7 @@ def capture(
     ctx: typer.Context,
     domain: list[str] | None = DOMAIN_OPTION,
     root: Path = ROOT_OPTION,
+    verbose: bool = VERBOSE_OPTION,
 ) -> None:
     """Reuse login and capture across applications until Ctrl+C."""
     if ctx.invoked_subcommand is not None:
@@ -40,7 +47,7 @@ def capture(
     _require_macos()
     domains = _domains(domain) if domain else DEFAULT_CAPTURE_DOMAINS
     try:
-        _capture(console, domains=domains, root=root)
+        _capture(console, domains=domains, root=root, verbose=verbose)
     except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
         console.print(f"Capture could not continue: {exc}", markup=False)
         raise typer.Exit(1) from None
@@ -67,13 +74,16 @@ def _domains(values: list[str]) -> tuple[str, ...]:
     return domains
 
 
-def _capture(console: Console, *, domains: tuple[str, ...], root: Path) -> None:
+def _capture(
+    console: Console, *, domains: tuple[str, ...], root: Path, verbose: bool = False
+) -> None:
     """Replace this process with the capture runner while preserving terminal signals.
 
     Args:
         console: Public CLI console, retained for the command invocation contract.
         domains: Validated exact provider hostnames.
         root: Project root used by the ordinary login flow.
+        verbose: Whether the runner should show detailed setup information.
 
     Raises:
         ValueError: This interpreter cannot run the capture engine.
@@ -88,4 +98,6 @@ def _capture(console: Console, *, domains: tuple[str, ...], root: Path) -> None:
     arguments = [sys.executable, "-m", "exp.cli.capture.runner", "--root", str(root)]
     for domain in domains:
         arguments.extend(("--domain", domain))
+    if verbose:
+        arguments.append("--verbose")
     os.execv(sys.executable, arguments)

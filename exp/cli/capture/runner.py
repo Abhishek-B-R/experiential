@@ -14,10 +14,10 @@ from pathlib import Path
 from uuid import uuid4
 
 from rich.console import Console
-from rich.live import Live
-from rich.text import Text
 
+from exp.cli.capture.approval import open_pending_approval_settings
 from exp.cli.capture.auth import CaptureCredentials, capture_credentials
+from exp.cli.capture.display import CaptureDisplay
 from exp.cli.capture.session import run_session
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.auth.paths import provider_data_dir
@@ -29,7 +29,7 @@ from exp.runtime.capture.certificates import (
 )
 from exp.runtime.capture.control import CaptureCloudError, CaptureRun, CaptureRunClient
 from exp.runtime.capture.local_backend import capture_instance, require_local_backend
-from exp.runtime.capture.upload import CaptureUploader, UploadStats
+from exp.runtime.capture.upload import CaptureUploader
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
@@ -37,22 +37,30 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Experiential foreground capture runner")
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--domain", action="append", required=True)
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(arguments)
     console = Console(theme=EXP_THEME)
     try:
-        _capture(console, domains=tuple(args.domain), root=args.root)
+        _capture(console, domains=tuple(args.domain), root=args.root, verbose=args.verbose)
     except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
         console.print(f"Capture could not continue: {exc}", markup=False)
         return 1
     return 0
 
 
-def _capture(console: Console, *, domains: tuple[str, ...], root: Path) -> None:
+def _capture(
+    console: Console, *, domains: tuple[str, ...], root: Path, verbose: bool = False
+) -> None:
     """Prepare normal authentication and certificates, then own one foreground run."""
-    require_local_backend()
+    with console.status("Checking Capture…"):
+        require_local_backend()
     with capture_instance():
         credentials = capture_credentials(console=console, environment=os.environ, root=root)
-        asyncio.run(_capture_authenticated(console, domains=domains, credentials=credentials))
+        asyncio.run(
+            _capture_authenticated(
+                console, domains=domains, credentials=credentials, verbose=verbose
+            )
+        )
 
 
 async def _capture_authenticated(
@@ -60,13 +68,16 @@ async def _capture_authenticated(
     *,
     domains: tuple[str, ...],
     credentials: CaptureCredentials,
+    verbose: bool = False,
 ) -> None:
     """Keep all cancellable control-plane requests in the foreground event loop."""
     control = CaptureRunClient(base_url=credentials.api_url, api_key=credentials.api_key)
     run: CaptureRun | None = None
     uploader: CaptureUploader | None = None
-    live = Live(console=console, auto_refresh=False)
+    display = CaptureDisplay(console, verbose=verbose)
+    approval_task: asyncio.Task[bool] | None = None
     try:
+        display.phase("Connecting to Experiential…")
         organization = await control.whoami()
         run = await control.start(
             organization.org_id,
@@ -74,11 +85,16 @@ async def _capture_authenticated(
             label=socket.gethostname(),
             version=version("experiential"),
         )
-        console.print(f"Organization: {organization.org_name}", markup=False)
-        console.print(f"Provider domains: {', '.join(domains)}", markup=False)
-        console.print("Captures model prompts, responses, and tool content from these domains.")
-        console.print("Approve Mitmproxy Redirector if macOS requests network extension access.")
-        console.print("Other traffic passes through without capture. DNS settings stay unchanged.")
+        if verbose:
+            console.print(f"Organization: {organization.org_name}", markup=False)
+            console.print(f"Provider domains: {', '.join(domains)}", markup=False)
+            console.print("Captures model prompts, responses, and tool content from these domains.")
+            console.print(
+                "Approve Mitmproxy Redirector if macOS requests network extension access."
+            )
+            console.print(
+                "Other traffic passes through without capture. DNS settings stay unchanged."
+            )
         data_dir = provider_data_dir() / "capture"
         ca_directory = capture_certificate_directory(data_dir, domains)
         origin_namespace = hashlib.sha256(credentials.api_url.encode()).hexdigest()[:16]
@@ -95,40 +111,39 @@ async def _capture_authenticated(
             / str(organization.org_id)
             / str(run.id),
         )
+        display.phase("Checking certificate…")
         certificate = prepare_certificate(ca_directory, domains)
         if not certificate_is_trusted(certificate, domains=domains):
-            console.print(
-                "First-time setup: trust Capture's certificate for your macOS user. "
-                "The certificate is restricted to the selected provider hosts."
-            )
+            display.close()
+            console.print("Waiting for certificate approval…")
+            if verbose:
+                console.print(
+                    "First-time setup: trust Capture's certificate for your macOS user. "
+                    "The certificate is restricted to the selected provider hosts."
+                )
             trust_certificate(certificate, domains=domains)
-        console.print(
-            "Capture stops if a client rejects its certificate. "
-            "Clients with a custom trust store may need the public CA certificate below."
-        )
-        console.print(f"Public CA: {certificate}", markup=False)
+        if verbose:
+            console.print(
+                "Capture stops if a client rejects its certificate. "
+                "Clients with a custom trust store may need the public CA certificate below."
+            )
+            console.print(f"Public CA: {certificate}", markup=False)
+        display.phase("Starting network extension… Ctrl+C to cancel")
 
         def started() -> None:
             """Show active capture only after network interception is ready."""
-            console.print(
-                "[green]Capturing.[/green] Use your AI apps normally. Press Ctrl+C to stop."
+            if approval_task is not None:
+                approval_task.cancel()
+            display.started(
+                organization=organization.org_name,
+                telemetry_url=f"{credentials.web_url}/api-keys?section=capture",
             )
-            console.print(
-                f"Dashboard: {credentials.web_url}/api-keys?section=capture", markup=False
-            )
-            live.start()
 
-        def progress(stats: UploadStats) -> None:
-            """Render counters without displaying prompts or provider credentials."""
-            live.update(
-                Text(
-                    f"{stats.captured_exchanges} requests captured"
-                    f" · {stats.uploaded_batches} batches uploaded"
-                    f" · {stats.pending_batches} pending · {stats.dropped_exchanges} dropped"
-                    f" · {stats.upload_errors} upload errors"
-                ),
-                refresh=True,
-            )
+        def waiting() -> None:
+            """Keep the approval hint visible and navigate without blocking startup."""
+            nonlocal approval_task
+            display.waiting()
+            approval_task = asyncio.create_task(open_pending_approval_settings())
 
         def warning(message: str) -> None:
             """Show a content-free recovery message alongside live counters."""
@@ -141,18 +156,16 @@ async def _capture_authenticated(
             control=control,
             run=run,
             on_started=started,
-            on_progress=progress,
+            on_progress=display.progress,
             on_warning=warning,
+            on_waiting=waiting,
         )
-        progress(stats)
-        live.stop()
-        console.print("[green]Capture stopped. Interception disabled.[/green]")
-        if stats.pending_batches:
-            console.print(
-                f"{stats.pending_batches} batches pending; the next exp capture retries them."
-            )
+        display.stopped(stats)
     finally:
-        live.stop()
+        if approval_task is not None:
+            approval_task.cancel()
+            await asyncio.gather(approval_task, return_exceptions=True)
+        display.close()
         if run is not None:
             stats = uploader.stats if uploader is not None else None
             try:

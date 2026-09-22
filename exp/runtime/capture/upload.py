@@ -32,6 +32,9 @@ class UploadStats:
     dropped_exchanges: int
     captured_exchanges: int
     uploaded_batches: int
+    input_tokens: int = 0
+    output_tokens: int = 0
+    usage_exchanges: int = 0
 
 
 class CaptureUploader:
@@ -92,6 +95,9 @@ class CaptureUploader:
         self._dropped = 0
         self._errors = 0
         self._uploaded = 0
+        self._input_tokens = 0
+        self._output_tokens = 0
+        self._usage_exchanges = 0
         self._pending_exchanges = 0
         self._durable_temps: set[Path] = set()
         self._pending_paths: set[Path] = set()
@@ -160,6 +166,9 @@ class CaptureUploader:
                 dropped_exchanges=self._dropped,
                 captured_exchanges=self._captured,
                 uploaded_batches=self._uploaded,
+                input_tokens=self._input_tokens,
+                output_tokens=self._output_tokens,
+                usage_exchanges=self._usage_exchanges,
             )
 
     def close(self, timeout: float = 5.0) -> UploadStats:
@@ -198,6 +207,9 @@ class CaptureUploader:
                 dropped_exchanges=self._dropped,
                 captured_exchanges=self._captured,
                 uploaded_batches=self._uploaded,
+                input_tokens=self._input_tokens,
+                output_tokens=self._output_tokens,
+                usage_exchanges=self._usage_exchanges,
             )
             return self._final_stats
 
@@ -238,6 +250,7 @@ class CaptureUploader:
             return
         if len(payload) > _MAX_BATCH_BYTES:
             raise ValueError("normalized capture exceeds the cloud batch limit")
+        usage = _reported_usage(payload)
         files = self._files()
         occupied = 0
         for path in files:
@@ -265,6 +278,10 @@ class CaptureUploader:
                 self._pending_paths.add(destination)
                 self._pending_exchanges -= 1
                 self._queued_bytes -= exchange.byte_count
+                if usage is not None:
+                    self._input_tokens += usage[0]
+                    self._output_tokens += usage[1]
+                    self._usage_exchanges += 1
             try:
                 temporary.replace(destination)
             except OSError:
@@ -493,6 +510,46 @@ class CaptureUploader:
         ):
             raise ValueError("capture upload destination differs from the approved ingest path")
         return parsed
+
+
+def _reported_usage(payload: bytes) -> tuple[int, int] | None:
+    """Read a known input/output token pair from the freshly normalized request span.
+
+    This reads the in-memory OTLP envelope once during persistence. Delivery and
+    recovery never recount usage, so totals belong only to this foreground run.
+    Missing or malformed usage is unknown; zero reported tokens remain valid.
+    """
+    span: JsonValue = json.loads(payload)
+    for key in ("resourceSpans", "scopeSpans", "spans"):
+        if not isinstance(span, dict):
+            return None
+        children = span.get(key)
+        if not isinstance(children, list) or len(children) != 1:
+            return None
+        span = children[0]
+    if not isinstance(span, dict) or not isinstance(attributes := span.get("attributes"), list):
+        return None
+    keys = ("gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens")
+    counts: dict[str, int] = {}
+    for attribute in attributes:
+        if not isinstance(attribute, dict):
+            continue
+        key = attribute.get("key")
+        if not isinstance(key, str) or key not in keys:
+            continue
+        value = attribute.get("value")
+        if key in counts or not isinstance(value, dict) or set(value) != {"intValue"}:
+            return None
+        raw = value["intValue"]
+        if not isinstance(raw, str) or re.fullmatch(r"[0-9]+", raw) is None:
+            return None
+        try:
+            counts[key] = int(raw)
+        except ValueError:
+            return None
+    if any(key not in counts for key in keys):
+        return None
+    return counts[keys[0]], counts[keys[1]]
 
 
 def _upload_scope(

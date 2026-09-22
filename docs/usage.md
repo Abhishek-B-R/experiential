@@ -6,7 +6,7 @@ The root surface is deliberately small:
 |---|---|---|
 | `exp` | Open the branded home screen. `Run Gateway` is the first option and runs setup when needed. | Interactive gateway menu, or the default gateway in a non-interactive terminal. |
 | `exp login [--root ROOT]` | Sign in to Experiential Cloud through the Platform browser approval flow, save the returned organization key, and synchronize the authenticated account's model identities. | User-local credential plus secret-free hosted provider/model records in `.exp/models.toml`. |
-| `exp capture [--domain HOST ...]` | Capture supported OpenAI and Anthropic traffic across macOS apps until Ctrl+C, reusing `exp login`. | Cloud traces and bounded private retry batches. |
+| `exp capture [--verbose] [--domain HOST ...]` | Capture supported OpenAI and Anthropic traffic across macOS apps until Ctrl+C, reusing `exp login`. | Cloud traces and bounded private retry batches. |
 | `exp run [PROJECT] [--root ROOT] [--check]` | Start the local gateway directly, optionally with one project-backed alias. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
 | `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Launch the guided end-to-end build when traces are omitted, or use one explicit local source for automation. | Simulation, serving RAG, fit RAG, syllabus, evaluation evidence, and a runnable automatic router. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
@@ -32,6 +32,13 @@ one foreground Capture process, rather than one application conversation. No sep
 credential or background capture daemon is required.
 Only one Capture process can run per macOS user, including across different preview profiles.
 
+The terminal shows setup progress, live capture counts, and provider-reported input/output tokens.
+Totals include cached input; missing usage is marked partial or unavailable. Use
+`exp capture --verbose` (or `-v`) for provider hosts, setup explanations, and the public CA certificate
+path. Approval requests and errors remain visible without verbose output. When macOS reports the
+extension awaiting approval, Capture opens Login Items & Extensions and continues once you enable
+Mitmproxy Redirector under Network Extensions.
+
 Capture requires Python 3.13 or newer. Other SDK and CLI commands continue to support Python 3.12.
 In a checkout, use `uv run --python 3.13 exp capture`. The first run installs the bundled, signed
 Mitmproxy Redirector app at `/Applications/Mitmproxy Redirector.app`. Approve its Network Extension
@@ -55,10 +62,11 @@ macOS and Chromium verifiers enforce the certificate constraints; hostname-speci
 settings are not used because Chromium does not support them.
 
 Each provider-host set gets a separate CA under `capture/ca-constrained/<scope-hash>` in the same
-user-data directory that owns the saved login. Capture prints its public `mitmproxy-ca-cert.pem`
-path. A client with its own trust store may need that public CA configured explicitly; certificate
-pinning is not bypassed. Never share the adjacent `mitmproxy-ca.pem`, which contains the private
-signing key. Existing unconstrained certificates are not reused or granted broader trust.
+user-data directory that owns the saved login. `exp capture --verbose` prints its public
+`mitmproxy-ca-cert.pem` path. A client with its own trust store may need that public CA configured
+explicitly; certificate pinning is not bypassed. Never share the adjacent `mitmproxy-ca.pem`, which
+contains the private signing key. Existing unconstrained certificates are not reused or granted
+broader trust.
 
 If a client explicitly rejects the Capture certificate, Capture stops interception and prints
 an error. A burst of repeated selected-host handshake disconnects also stops Capture with a
