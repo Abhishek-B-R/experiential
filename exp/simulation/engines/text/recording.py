@@ -54,12 +54,13 @@ from exp.simulation.engines.text.prompt import (
     SimulatedToolResult,
     TextWorldModelProtocolError,
     TextWorldModelTransition,
-    candidate_rag_action,
+    candidate_rag_actions,
     parse_world_model_transition,
     text_prompt_sha256,
 )
 from exp.simulation.engines.text.redaction import redact_json
 from exp.simulation.retrieval import RAGQuery
+from exp.simulation.retrieval.transitions import render_rag_key
 
 if TYPE_CHECKING:
     from exp.simulation.world_model import GroundedWorldModel
@@ -444,16 +445,39 @@ class RecordingCandidateClient:
                 "candidate tool calls require declared tool names and unique call IDs",
                 phase="candidate_tools",
             )
-        rag_query = RAGQuery(
-            task=self._task.instruction,
-            initial_context=self._task.initial_context,
-            action=candidate_rag_action(candidate_response.output),
-            excluded_lineage_ids=(self._task.lineage_group_id,),
-            top_k=self._grounded_world_model.artifact.top_k,
+        queries = tuple(
+            RAGQuery(
+                task=self._task.instruction,
+                initial_context=self._task.initial_context,
+                action=action,
+                excluded_lineage_ids=(self._task.lineage_group_id,),
+                top_k=self._grounded_world_model.artifact.top_k,
+            )
+            for action in candidate_rag_actions(candidate_response.output)
         )
-        query_economics = self._grounded_world_model.retriever.estimate_query_economics(
-            rag_query,
-            self._query_embedding,
+        query_bytes = sum(
+            len(
+                render_rag_key(
+                    task=query.task, initial_context=query.initial_context, action=query.action
+                ).encode("utf-8")
+            )
+            for query in queries
+        )
+        if query_bytes > self._query_embedding.maximum_input_tokens:
+            raise _text_failure(
+                StopReason.MAXIMUM_COST,
+                FailureCode.BUDGET,
+                "tool grounding batch exceeds its reserved input-token ceiling",
+                phase="query_embedding_budget",
+            )
+        query_economics = combine_economics(
+            tuple(
+                self._grounded_world_model.retriever.estimate_query_economics(
+                    query, self._query_embedding
+                )
+                for query in queries
+            ),
+            require_complete_usage=False,
         )
         self._check_spend_ceiling(role="query embedding")
         self._retrieval_economics.append(query_economics)

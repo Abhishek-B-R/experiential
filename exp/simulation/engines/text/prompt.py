@@ -204,15 +204,14 @@ def validate_transition_action(
         raise TextWorldModelProtocolError("tool results must be nonterminal without a user message")
 
 
-def candidate_rag_action(action: AssistantAction) -> RAGAction:
-    """Retain all visible action arguments in the grounding query for one candidate turn."""
-    if len(action.tool_calls) == 1:
-        call = action.tool_calls[0]
-        return RAGAction(kind="tool_call", tool_name=call.name, tool_arguments=call.arguments)
-    return RAGAction(
-        kind="message",
-        content=action.model_dump_json(exclude_none=True) if action.tool_calls else action.content,
-    )
+def candidate_rag_actions(action: AssistantAction) -> tuple[RAGAction, ...]:
+    """Use the real corpus's tool-call shape for every parallel invocation."""
+    if action.tool_calls:
+        return tuple(
+            RAGAction(kind="tool_call", tool_name=call.name, tool_arguments=call.arguments)
+            for call in action.tool_calls
+        )
+    return (RAGAction(kind="message", content=action.content),)
 
 
 def text_prompt_sha256() -> str:

@@ -24,7 +24,7 @@ from exp.common.tasks import TaskCase
 from exp.simulation.engines.text.prompt import (
     TextWorldModelTransition,
     build_world_model_request,
-    candidate_rag_action,
+    candidate_rag_actions,
     parse_world_model_transition,
     validate_transition_action,
 )
@@ -107,14 +107,25 @@ class GroundedWorldModel:
         Returns:
             Exact request and retrieved evidence before provider dispatch.
         """
-        query = RAGQuery(
-            task=task.instruction,
-            initial_context=task.initial_context,
-            action=candidate_rag_action(candidate_response),
-            excluded_lineage_ids=excluded_lineage_ids,
-            top_k=self.artifact.top_k,
+        queries = tuple(
+            RAGQuery(
+                task=task.instruction,
+                initial_context=task.initial_context,
+                action=action,
+                excluded_lineage_ids=excluded_lineage_ids,
+                top_k=self.artifact.top_k,
+            )
+            for action in candidate_rag_actions(candidate_response)
         )
-        matches = self.retriever.retrieve(query)
+        batches = tuple(self.retriever.retrieve(query) for query in queries)
+        # Round-robin over each call's nearest examples, retaining the pinned total context bound.
+        selected: dict[str, RAGMatch] = {}
+        for rank in range(self.artifact.top_k):
+            for batch in batches:
+                if rank < len(batch) and len(selected) < self.artifact.top_k:
+                    match = batch[rank]
+                    selected.setdefault(match.transition.transition_id, match)
+        matches = tuple(selected.values())
         request = build_world_model_request(
             task,
             visible_messages=visible_messages,
