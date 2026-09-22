@@ -25,6 +25,7 @@ http = "1"
 httpdate = "1"
 http-body-util = "0.1"
 base64 = "0.22"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 bytes = "1"
 futures-util = "0.3"
 regex = "1"

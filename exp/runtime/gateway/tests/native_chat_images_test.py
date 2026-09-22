@@ -17,8 +17,7 @@ from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.tests.launch_test import _provider_frame, _ServedGateway, _unused_port
 
 _PNG_BASE64 = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
-    "z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
 )
 
 
@@ -177,6 +176,9 @@ def test_generated_image_is_delivered_by_served_chat(
         provider="azure",
         api_version="2024-10-21",
         capabilities=ModelCapabilities(maximum_output_tokens=128_000, emits_images=True),
+        gateway_capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True, supports_image_input=True, supports_image_url_input=True
+        ),
     )
     gateway = _ServedGateway(tmp_path, _unused_port())
     try:
@@ -213,6 +215,23 @@ def test_generated_image_is_delivered_by_served_chat(
         else:
             assert response.json()["choices"][0]["message"]["images"] == [image]
             assert response.json()["usage"]["completion_tokens"] == 100
+        follow_up = httpx.post(
+            f"http://127.0.0.1:{gateway.port}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {raw_key}"},
+            json={
+                "model": "coding",
+                "messages": [
+                    {"role": "assistant", "content": [image]},
+                    {"role": "user", "content": "Make it blue"},
+                ],
+            },
+            timeout=20,
+        )
+        assert follow_up.status_code == 200, follow_up.text
+        assert len(received) == 2
+        replayed = received[1]["messages"]
+        assert isinstance(replayed, list)
+        assert replayed[0] == {"role": "assistant", "content": [image]}
     finally:
         gateway.stop()
         provider.shutdown()

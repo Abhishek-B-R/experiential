@@ -27,6 +27,16 @@ def image_aware_stream_payload(
     Raises:
         ProviderCapabilityError: The selected surface or wire cannot carry generated images.
     """
+    if profile.dialect not in {"gemini_generate_content", "openai_compatible"} and any(
+        message.role == "assistant" and message.images for message in request.messages
+    ):
+        raise ProviderCapabilityError(
+            capability="assistant_image_history",
+            detail=(
+                "This provider wire cannot preserve assistant images. "
+                "Choose a Gemini or Chat-compatible route."
+            ),
+        )
     emits_images = capabilities is not None and capabilities.emits_images
     if emits_images and (
         request.surface != GatewayApiSurface.CHAT_COMPLETIONS

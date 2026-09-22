@@ -17,23 +17,21 @@ fn invalid_image() -> Failure {
 
 /// Validate an inline raster image and preserve its encoded bytes exactly.
 pub fn inline_image(media_type: &str, data: &str) -> Result<String, Failure> {
-    if !matches!(
-        media_type,
-        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
-    ) {
-        return Err(invalid_image());
-    }
-    let bytes = STANDARD.decode(data).map_err(|_| invalid_image())?;
-    let valid = match media_type {
-        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-        "image/jpeg" => bytes.starts_with(b"\xff\xd8\xff"),
-        "image/webp" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"),
-        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
-        _ => false,
+    let format = match media_type {
+        "image/png" => image::ImageFormat::Png,
+        "image/jpeg" => image::ImageFormat::Jpeg,
+        "image/webp" => image::ImageFormat::WebP,
+        "image/gif" => image::ImageFormat::Gif,
+        _ => return Err(invalid_image()),
     };
-    if !valid {
-        return Err(invalid_image());
-    }
+    let bytes = STANDARD.decode(data).map_err(|_| invalid_image())?;
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(&bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    reader.decode().map_err(|_| invalid_image())?;
     Ok(format!("data:{media_type};base64,{data}"))
 }
 
@@ -62,7 +60,7 @@ mod tests {
     use crate::events::Event;
     use crate::sse::SseEvent;
 
-    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==";
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
 
     #[test]
     fn inline_raster_is_preserved_and_remote_or_active_content_is_refused() {
@@ -76,6 +74,7 @@ mod tests {
             let failure = chat_image(&image).unwrap_err();
             assert!(!failure.retryable_same_deployment);
         }
+        assert!(inline_image("image/png", "iVBORw0KGgo=").is_err());
         assert!(inline_image("image/png", "garbage").is_err());
         assert!(inline_image("image/png", "aGVsbG8=").is_err());
     }

@@ -236,9 +236,9 @@ impl Normalizer {
             }
         }
         if let Some(images) = delta.get("images").filter(|value| !value.is_null()) {
-            let images = images
-                .as_array()
-                .ok_or_else(|| malformed("Chat images must be an array"))?;
+            let images = images.as_array().ok_or_else(|| {
+                malformed("Chat images must be an array").with_retry(false, false)
+            })?;
             for image in images {
                 let url = crate::image_output::chat_image(image)?;
                 self.reserve_image_bytes(url.len())?;

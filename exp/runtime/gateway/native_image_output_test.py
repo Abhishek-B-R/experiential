@@ -3,6 +3,7 @@
 import pytest
 
 from exp.common.models import ModelCapabilities
+from exp.common.models.content import ImageContentPart
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.gateway.native_image_output import image_aware_stream_payload
 from exp.runtime.models.providers.base import GatewayWireProfile, ProviderCapabilityError
@@ -56,3 +57,23 @@ def test_text_lane_does_not_request_images() -> None:
         messages=(GatewayMessage(role="user", content="Hi"),),
     )
     assert "modalities" not in image_aware_stream_payload(profile, request, None, "openrouter")
+
+
+@pytest.mark.parametrize(
+    "dialect", ["anthropic_messages", "openai_responses", "bedrock_converse_stream"]
+)
+def test_assistant_images_reject_non_preserving_fallback_wires(dialect: str) -> None:
+    """Image-input support alone does not prove assistant-history preservation."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="assistant",
+                content="",
+                content_parts=(ImageContentPart(media_type="image/png", data="iVBORw0KGgo="),),
+            ),
+        ),
+    )
+    profile = GatewayWireProfile(dialect=dialect, url="https://example.test")
+    with pytest.raises(ProviderCapabilityError, match="assistant_image_history"):
+        image_aware_stream_payload(profile, request, None, "provider")

@@ -700,7 +700,12 @@ class NativeControlPlane(
             "maximum_total_attempts": MAXIMUM_TOTAL_ATTEMPTS,
             "maximum_same_deployment_attempts": MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
             "refusal_failover": authorization.refusal_failover,
-            "output_guardrail": native_output_mode(self._guardrails, policy, public_request).value,
+            "output_guardrail": native_output_mode(
+                self._guardrails,
+                policy,
+                public_request,
+                image_output=any(wire.get("image_output") is True for wire in wire_route),
+            ).value,
             "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
         }
         if route.snapshot.throttle_redial is not None:
