@@ -147,9 +147,7 @@ def _restore_linked_reasoning(
         if not isinstance(context, dict):
             return lineage, parent_id
         request = GatewayRequest.model_validate(restore_capture_context(context).get("request"))
-        outputs = [
-            output for output in _output_messages(parent) if not _empty_reasoning_item(output)
-        ]
+        outputs = _linked_output_turns(parent)
         for position, output in enumerate(outputs, start=len(request.messages)):
             if position >= len(messages):
                 raise ValueError("response lineage exceeds expanded history")
@@ -160,6 +158,45 @@ def _restore_linked_reasoning(
                     target["reasoning_content"] = reasoning
         parent_id = parent.parent_response_id
     return lineage, None
+
+
+def _linked_output_turns(experience: Experience) -> list[JsonObject]:
+    """Match public output items to the gateway's retained assistant segments.
+
+    A retained segment combines one text item with adjacent function calls.
+    A second text item or a native item starts another turn. Only this comparison
+    projection is grouped; the exact public response and raw arguments stay intact.
+    """
+    turns: list[JsonObject] = []
+    current: JsonObject | None = None
+    has_message = False
+    for output in _output_messages(experience):
+        if _empty_reasoning_item(output):
+            continue
+        if output.get("role") != "assistant" or output.get("provider_native_item") is not None:
+            turns.append(output)
+            current = None
+            has_message = False
+            continue
+        is_message = isinstance(output.get("content"), str) or isinstance(
+            output.get("provider_item_id"), str
+        )
+        if current is None or (is_message and has_message):
+            current = {"role": "assistant", "content": None, "tool_calls": []}
+            turns.append(current)
+            has_message = False
+        if is_message:
+            current["content"] = output.get("content") or None
+            has_message = True
+        calls = output.get("tool_calls")
+        if isinstance(calls, list):
+            retained_calls = current["tool_calls"]
+            assert isinstance(retained_calls, list)
+            retained_calls.extend(calls)
+        reasoning = output.get("reasoning_content")
+        if isinstance(reasoning, str):
+            current["reasoning_content"] = reasoning
+    return turns
 
 
 def _empty_reasoning_item(message: JsonObject) -> bool:

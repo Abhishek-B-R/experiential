@@ -320,6 +320,95 @@ def test_explicit_response_lineage_restores_reasoning_without_prefix_joining(
     assert incomplete.traces[0].initial_context["missing_parent_response_id"] == "parent"
 
 
+@pytest.mark.parametrize("text_first", [False, True])
+@pytest.mark.parametrize("changed", [False, True])
+@pytest.mark.parametrize("leading_text", [False, True])
+def test_linked_reasoning_survives_coalesced_text_and_tools(
+    tmp_path: Path, text_first: bool, changed: bool, leading_text: bool
+) -> None:
+    """Retained assistant segments keep parent reasoning unless visible content changed."""
+    arguments = '{ "id" : "A" }'
+    call = {
+        "type": "function_call",
+        "id": "fc1",
+        "call_id": "call-1",
+        "name": "lookup",
+        "arguments": arguments,
+    }
+    text = {
+        "type": "message",
+        "id": "msg1",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "\n\n", "annotations": []}],
+    }
+    output = [text, call] if text_first else [call, text]
+    if leading_text:
+        # Two message items delimit separate retained segments. Put the call
+        # after the second text so the first message remains a distinct turn.
+        output = [
+            dict(text, id="prefix", content=[{"type": "output_text", "text": "First"}]),
+            text,
+            call,
+        ]
+    parent_request = decode_responses({"model": "coding", "input": "Find record A"}).request
+    parent = _experience().model_copy(
+        update={
+            "protocol": "responses",
+            "response_id": "parent",
+            "request": {
+                "exp_context": capture_request_context(parent_request),
+                "exp_capture_output": {"provider_reasoning": "observed parent reasoning"},
+            },
+            "response": {
+                "id": "parent",
+                "status": "completed",
+                "output": output,
+            },
+        }
+    )
+    continued_request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "Find record A"},
+                *([{"role": "assistant", "content": "First"}] if leading_text else []),
+                {
+                    "role": "assistant",
+                    "content": "changed by guardrail" if changed else "\n\n",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": arguments},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": "Record A"},
+            ],
+        }
+    ).request
+    child = parent.model_copy(
+        update={
+            "experience_id": "child",
+            "response_id": "child",
+            "parent_response_id": "parent",
+            "request": {"exp_context": capture_request_context(continued_request)},
+            "response": {
+                "id": "child",
+                "status": "completed",
+                "output": [dict(text, id="child-msg")],
+            },
+        }
+    )
+    path = tmp_path / "traffic.db"
+    _database(path, (parent, child))
+    result = load_gateway_capture(path, identity_id="developer")
+    assert not result.issues
+    trace = next(t for t in result.traces if t.initial_context["response_id"] == "child")
+    outputs = [span.attributes.get("gen_ai.output.messages") for span in trace.spans]
+    assert ("observed parent reasoning" in str(outputs)) is not changed
+
+
 def test_messages_output_keeps_exact_provider_argument_text(tmp_path: Path) -> None:
     """Messages JSON objects do not erase the source provider's raw argument text."""
     request = decode_messages(
