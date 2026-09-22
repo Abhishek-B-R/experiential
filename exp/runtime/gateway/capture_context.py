@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import re
 
+from pydantic import JsonValue
+
 from exp.common.core.artifacts import JsonObject
 from exp.common.core.durable_json import normalize_durable_object
 from exp.runtime.gateway.contracts import GatewayRequest
@@ -28,7 +30,7 @@ def capture_request_context(
     document: JsonObject = {
         "schema_version": 1,
         "request": request.model_dump(mode="json", exclude_none=True, exclude={"idempotency_key"}),
-        "provider_context": provider_replay_authority(request),
+        "provider_context": _captured_provider_context(request),
     }
     encoded = json.dumps(document, ensure_ascii=True, separators=(",", ":"))
     if len(encoded) > maximum_bytes:
@@ -46,6 +48,36 @@ def capture_request_context(
         if len(json.dumps(cleaned, ensure_ascii=True, separators=(",", ":"))) <= maximum_bytes
         else None
     )
+
+
+def _captured_provider_context(request: GatewayRequest) -> JsonObject | None:
+    """Add caller-visible evidence to the stored copy, never to replay authority."""
+    provider = provider_replay_authority(request)
+    captured: dict[int, list[JsonValue]] = {
+        index: [block.model_dump(mode="json") for block in message.capture_only_reasoning]
+        for index, message in enumerate(request.messages)
+        if message.capture_only_reasoning
+    }
+    if not captured:
+        return provider
+    if provider is None:
+        provider = {"provider_replay": []}
+    replay = provider["provider_replay"]
+    assert isinstance(replay, list)
+    for entry in replay:
+        assert isinstance(entry, dict)
+        index = entry["message_index"]
+        assert isinstance(index, int)
+        visible = captured.pop(index, [])
+        if not visible:
+            continue
+        blocks = entry.setdefault("provider_reasoning", [])
+        assert isinstance(blocks, list)
+        blocks.extend(visible)
+    replay.extend(
+        {"message_index": index, "provider_reasoning": blocks} for index, blocks in captured.items()
+    )
+    return provider
 
 
 def restore_capture_context(context: JsonObject) -> JsonObject:

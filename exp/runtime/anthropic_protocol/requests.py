@@ -731,10 +731,15 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
         if content is None and not tool_calls and not reasoning and not attachments:
             ordered_blocks.clear()
             return
+        capture_only_reasoning = ()
         if any(block.kind == "sealed_reasoning_content" for block in reasoning):
             # A gateway tool turn returned its reasoning twice: the unsigned
             # display block that streamed live and the sealed carrier that
-            # holds the same text authenticated. Only the carrier replays.
+            # holds the same text authenticated. Only the carrier replays;
+            # retain the already-visible copy separately for trace capture.
+            capture_only_reasoning = tuple(
+                block for block in reasoning if block.kind == "exposed_reasoning_content"
+            )
             reasoning[:] = [
                 block for block in reasoning if block.kind != "exposed_reasoning_content"
             ]
@@ -757,6 +762,7 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                 content_parts=retained,
                 tool_calls=tuple(tool_calls),
                 provider_reasoning=tuple(reasoning),
+                capture_only_reasoning=capture_only_reasoning,
                 # The marked run is carried alongside the retained parts: its
                 # blocks are the same text in the same order, so a multimodal
                 # turn keeps its cache markers when it re-emits.

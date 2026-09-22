@@ -243,6 +243,74 @@ def test_messages_tool_error_and_thinking_are_preserved(tmp_path: Path) -> None:
     assert trace.outcome is None
 
 
+@pytest.mark.parametrize("new_user_turn", [False, True])
+def test_messages_visible_reasoning_with_sealed_replay_survives_standalone_ingestion(
+    tmp_path: Path, new_user_turn: bool
+) -> None:
+    """A single retained exchange includes visible reasoning from its full submitted history."""
+    visible = "Observed reasoning α\nexact\x00text\t"
+    carrier = "x-experiential-hunyuan-reasoning-v1:ZGVwbG95bWVudC0x:c2VhbGVkLWVudmVsb3Bl"
+    request = decode_messages(
+        {
+            "model": "coding",
+            "max_tokens": 128,
+            "messages": [
+                {"role": "user", "content": "Find record A"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": visible, "signature": ""},
+                        {
+                            "type": "tool_use",
+                            "id": "call-1",
+                            "name": "lookup",
+                            "input": {"id": "A"},
+                        },
+                        {"type": "redacted_thinking", "data": carrier},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "call-1", "content": "Record A"}
+                    ],
+                },
+                *([{"role": "user", "content": "Now summarize"}] if new_user_turn else []),
+            ],
+        }
+    ).request
+    experience = _experience().model_copy(
+        update={
+            "protocol": "messages",
+            "request": {"exp_context": capture_request_context(request)},
+            "response": {
+                "id": "msg-final",
+                "type": "message",
+                "role": "assistant",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "Found record A"}],
+            },
+        }
+    )
+    path = tmp_path / "traffic.db"
+    _database(path, (experience,))
+    result = load_gateway_capture(path, identity_id="developer")
+    assert not result.issues
+    assert len(result.traces) == 1
+    outputs = [span.attributes.get("gen_ai.output.messages") for span in result.traces[0].spans]
+    assert any(
+        isinstance(messages, list)
+        and any(
+            isinstance(message, dict) and message.get("reasoning_content") == visible
+            for message in messages
+        )
+        for messages in outputs
+    )
+    assert any(
+        span.attributes.get("gen_ai.tool.message") == "Record A" for span in result.traces[0].spans
+    )
+
+
 def test_explicit_response_lineage_restores_reasoning_without_prefix_joining(
     tmp_path: Path,
 ) -> None:
