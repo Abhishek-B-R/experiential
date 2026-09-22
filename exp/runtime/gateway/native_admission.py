@@ -36,8 +36,13 @@ from exp.runtime.gateway.native_execution import (
 from exp.runtime.gateway.native_fallback_rules import require_unrestricted_rung
 from exp.runtime.gateway.native_reasoning import rung_provider_request
 from exp.runtime.gateway.native_responses import ContinuationContext
+from exp.runtime.gateway.native_stage_admission import (
+    require_native_model_stage_contract,
+    stage_affinity_ordered_rungs,
+)
 from exp.runtime.gateway.prompt_cache_affinity import provider_prompt_cache_key
 from exp.runtime.gateway.prompt_size import context_window_compatible_indexes
+from exp.runtime.gateway.recovery_binding import bind_recovery_profiles
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.sticky_affinity import AffinityPlacement, sticky_first_order
 from exp.runtime.models.providers import (
@@ -52,6 +57,7 @@ from exp.runtime.models.providers.capability_policy import (
     coerce_structured_text_schema,
     reserve_thinking_headroom,
 )
+from exp.runtime.models.providers.dialect_dispatch import CACHE_CONTROL_NOT_FORWARDED_SUFFIX
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
@@ -132,6 +138,7 @@ def admitted_route_requests(
         GatewayRoutingError: No rung is protocol-compatible and none named a
             rejection.
     """
+    require_native_model_stage_contract(route)
     # flex/priority are the tiers we price as an OPT-IN pass-through, so they
     # fail CLOSED before any reservation when no rung can BILL the requested one:
     # a BYOK rung forwards any tier (customer pays the provider directly, no
@@ -337,7 +344,15 @@ def admitted_route_requests(
             }
         )
     provider_request = _with_cache_affinity(provider_request, authorization)
+    resolved_wires = bind_recovery_profiles(
+        route.deployments,
+        resolved_wires,
+        authorization.organization_id,
+        accounting.recovery_host,
+        request_region=provider_request.inference_geo,
+    )
     route, resolved_wires = _prefer_cache_capable_rungs(route, resolved_wires, provider_request)
+    scheduled_count = len(route.deployments)
     route, resolved_wires, placement = _affinity_ordered_rungs(
         route,
         resolved_wires,
@@ -346,6 +361,30 @@ def admitted_route_requests(
         authorization=authorization,
         continuation=continuation,
     )
+    if len(route.deployments) != scheduled_count and request_carries_cache_markers(
+        provider_request
+    ):
+        # Only disclosures are projected after recovery narrows the route. Keep
+        # already-shaped provider input and its tool identities exactly frozen.
+        selected_public, _ = route_generation_parameter_requests(
+            tuple(profile for profile, _client in resolved_wires), admitted_request
+        )
+        public_request = public_request.model_copy(
+            update={
+                "ignored_parameters": tuple(
+                    dict.fromkeys(
+                        (
+                            *public_request.ignored_parameters,
+                            *(
+                                item
+                                for item in selected_public.ignored_parameters
+                                if item.endswith(CACHE_CONTROL_NOT_FORWARDED_SUFFIX)
+                            ),
+                        )
+                    )
+                )
+            }
+        )
     # Every surviving rung failover-only would leave nothing to dial first:
     # fail closed here, named, instead of exhausting a ladder that dialed nothing.
     require_unrestricted_rung(route)
@@ -399,11 +438,14 @@ def _prefer_cache_capable_rungs(
     ``cache_control`` ``ignored_parameters`` entries. ``maximize_availability``
     pools keep their certified order untouched.
     """
+    if _keeps_issuing_rung_first(route):
+        return route, resolved_wires
+    if route.snapshot.model_stages:
+        # The stage scheduler ranks markers once, after stage-local affinity.
+        return route, resolved_wires
     if route.snapshot.failover_mode != "maximize_cache":
         return route, resolved_wires
     if len(resolved_wires) < 2 or not request_carries_cache_markers(provider_request):
-        return route, resolved_wires
-    if _keeps_issuing_rung_first(route):
         return route, resolved_wires
     marker_capable = tuple(
         index
@@ -462,6 +504,15 @@ def _affinity_ordered_rungs(
     wires still dispatches the marker-honoring group first, ordered within
     each group. The other two failover modes are untouched.
     """
+    if route.snapshot.model_stages or accounting.recovery_host is not None:
+        return stage_affinity_ordered_rungs(
+            route,
+            resolved_wires,
+            provider_request,
+            accounting=accounting,
+            authorization=authorization,
+            continuation=continuation,
+        )
     if route.snapshot.failover_mode != "maximize_cache_affinity":
         return route, resolved_wires, AffinityPlacement()
     material = affinity_seed_material(

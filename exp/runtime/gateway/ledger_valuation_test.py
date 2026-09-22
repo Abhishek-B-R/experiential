@@ -3,13 +3,33 @@
 import pytest
 
 from exp.common.models.catalog import MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
-from exp.runtime.gateway.contracts import GatewayUsage
+from exp.runtime.gateway.contracts import (
+    GatewayEvent,
+    GatewayEventKind,
+    GatewayFailure,
+    GatewayFailureClass,
+    GatewayUsage,
+)
+from exp.runtime.gateway.ledger_errors import GatewayLedgerError
 from exp.runtime.gateway.ledger_valuation import (
     MAXIMUM_NANO_USD,
     NanoUsdOverflowError,
     estimated_cost_nano_usd,
     optional_int,
+    terminal_values,
 )
+
+
+def test_terminal_value_normalization_keeps_unknown_usage_and_sanitized_failure() -> None:
+    """The pure owner preserves terminal accounting without inventing observed usage."""
+    event = GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=0)
+    assert terminal_values(event, None) == ("completed", None, None, None)
+    cancelled = GatewayFailure(
+        failure_class=GatewayFailureClass.CANCELLED, safe_message="cancelled"
+    )
+    assert terminal_values(None, cancelled) == ("cancelled", "cancelled", None, None)
+    with pytest.raises(GatewayLedgerError, match="needs a terminal"):
+        terminal_values(None, None)
 
 
 def test_subset_tokens_price_at_their_own_rates() -> None:

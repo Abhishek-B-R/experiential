@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
-from datetime import datetime
-from typing import cast
+from datetime import UTC, datetime
+from typing import Literal, cast
 
 import pytest
 
@@ -19,6 +20,8 @@ from exp.common.models.catalog import (
 )
 from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
+from exp.common.models.gateway_chains import ModelExecutionStage
+from exp.runtime.gateway import native_recovery
 from exp.runtime.gateway.budgets import (
     BudgetReservationRejected,
     BudgetScopeKind,
@@ -34,15 +37,33 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayMessage,
     GatewayRequest,
+    GatewayUsage,
 )
+from exp.runtime.gateway.ledger import AttemptRejectedError
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
 )
 from exp.runtime.gateway.native_components import SyncWriteLedger
-from exp.runtime.gateway.native_execution import InflightRequest, deployment_health_key
+from exp.runtime.gateway.native_execution import (
+    InflightRequest,
+    deployment_health_key,
+    rung_load_key,
+)
+from exp.runtime.gateway.native_recovery import record_session_outcome, session_cache_key
+from exp.runtime.gateway.native_recovery_test import RecoveryHostFake, recovery_entry
 from exp.runtime.gateway.native_settlement import failure_from_boundary_payload, ledger_failure
+from exp.runtime.gateway.recovery import (
+    FrozenRecoveryBinding,
+    RecoveryLease,
+    RecoveryObservation,
+    RecoverySnapshot,
+    SessionCacheKey,
+    SessionRecoveryRegistry,
+)
+from exp.runtime.gateway.recovery_test import Clock, eligible
 from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.rung_admission import RungShed
 from exp.runtime.openai_protocol.errors import (
     THROTTLED_RETRY_AFTER_SECONDS,
     public_failure_error,
@@ -125,6 +146,31 @@ def _route(
     )
 
 
+def test_typed_preflight_rejection_survives_public_and_ledger_terminal() -> None:
+    """Expected unavailable root preflight never becomes an internal-error settlement."""
+    ledger = _RecordingLedger()
+    ledger.typed_rejection = GatewayFailure(
+        failure_class=GatewayFailureClass.UNAVAILABLE,
+        safe_message="root funding preflight is unavailable",
+    )
+    accounting = NativeAttemptAccounting(ledger)
+    route = _route((_deployment("first", connection_sha256="b" * 64),))
+    entry = InflightRequest(
+        authorization=route.snapshot.authorization,
+        route=route,
+        request=_request(),
+        deadline_monotonic=time.monotonic() + 10,
+    )
+    accounting.register(entry)
+    with pytest.raises(NativeBridgeError) as raised:
+        accounting.start_attempt(
+            json.dumps({"request_id": entry.authorization.request_id, "attempt_ordinal": 0})
+        )
+    assert json.loads(raised.value.public_error_json)["status_code"] == 503
+    assert ledger.finished_requests == [ledger.typed_rejection]
+    assert not ledger.started
+
+
 class _RecordingLedger:
     """Blocking write-ledger fake recording every waterfall write."""
 
@@ -134,12 +180,14 @@ class _RecordingLedger:
         self.finished: list[JsonObject] = []
         self.terminal_events: list[GatewayEvent | None] = []
         self.upstream_providers: list[str | None] = []
+        self.first_token_times: list[datetime | None] = []
         self.web_search_requests: list[int | None] = []
         self.tool_search_requests: list[int | None] = []
         self.rate_limit_settlements: list[JsonObject] = []
         self.finished_requests: list[GatewayFailure] = []
         self.budget_rejections: dict[str, BudgetScopeKind] = {}
         self.fail_finishes = 0
+        self.typed_rejection: GatewayFailure | None = None
         self._counter = 0
 
     def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
@@ -163,6 +211,8 @@ class _RecordingLedger:
     ) -> str:
         """Reserve one recorded attempt row, honoring scripted rejections."""
         del snapshot, fallback_reason
+        if self.typed_rejection is not None:
+            raise AttemptRejectedError("root preflight required", failure=self.typed_rejection)
         scope = self.budget_rejections.get(deployment.deployment_id)
         if scope is not None:
             raise BudgetReservationRejected(scope_kind=scope, reason="scripted")
@@ -209,7 +259,7 @@ class _RecordingLedger:
         here (the protocol says ``0``) so a recorded ``None`` proves the
         registry withheld the keyword.
         """
-        del first_token_at
+        self.first_token_times.append(first_token_at)
         self.upstream_providers.append(upstream_provider)
         self.web_search_requests.append(web_search_requests)
         self.tool_search_requests.append(tool_search_requests)
@@ -677,6 +727,102 @@ def test_sweep_cancels_the_active_attempt_after_the_deadline() -> None:
     assert registry.counters()[1] == 1
 
 
+@pytest.mark.parametrize("writes", [None, 0, 25])
+@pytest.mark.parametrize("fault", ["raise", "provider", "exact_model_id", "organization_id"])
+@pytest.mark.parametrize("delivery", ["direct", "retry", "sweep"])
+@pytest.mark.parametrize("finalize", [False, True])
+def test_recovery_observer_failure_cannot_block_durable_settlement_cleanup(
+    writes: int | None,
+    fault: Literal["raise", "provider", "exact_model_id", "organization_id"],
+    delivery: Literal["direct", "retry", "sweep"],
+    finalize: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Both settlement paths release load and finalize despite unusable host scope."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger, recovery_host=RecoveryHostFake(fault))
+    deployments = _bounded_pair(1)
+    entry = _admit(registry, deployments, request_id="recovery-fault")
+    entry.request = _request().model_copy(
+        update={"provider_prompt_cache_key": "xpl-test-session", "prompt_cache_key": "session"}
+    )
+    deployment = entry.route.deployment
+    invalid_scope = (
+        RecoveryHostFake()
+        .scope_for(deployment, entry.authorization.organization_id)
+        .model_copy(update={"provider" if fault == "raise" else fault: "synthetic-private-detail"})
+    )
+    entry.recovery_bindings[deployment.deployment_id] = FrozenRecoveryBinding(
+        deployment.deployment_id,
+        deployment.connection_sha256,
+        "https://test.invalid",
+        deployment.provider_model,
+        invalid_scope,
+    )
+    frozen_bindings = dict(entry.recovery_bindings)
+    started = _start(registry, ordinal=0, request_id=entry.authorization.request_id)
+    settlement = json.dumps(
+        {
+            "request_id": entry.authorization.request_id,
+            "attempt_id": started["attempt_id"],
+            "outcome": "completed",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 5,
+                "cached_input_tokens": 50,
+                "cache_creation_input_tokens": writes,
+            },
+            "first_token_at": "2026-09-18T01:02:03+00:00",
+            "upstream_provider": "Azure",
+            "finalize": finalize,
+        }
+    )
+    if delivery != "direct":
+        ledger.fail_finishes = 1
+        with pytest.raises(NativeBridgeError):
+            registry.settle(settlement)
+        assert entry.pending_settlement == json.loads(settlement)
+        if delivery == "sweep":
+            registry.sweep_expired()
+            assert entry.pending_settlement is None
+            assert registry.counters()[0] == 1
+        else:
+            assert registry.settle(settlement) == "{}"
+    else:
+        assert registry.settle(settlement) == "{}"
+    assert len(ledger.finished) == 1 and ledger.finished[0]["finalize"] is finalize
+    observed = datetime.fromisoformat("2026-09-18T01:02:03+00:00")
+    calls = 1 if delivery == "direct" else 2
+    assert ledger.first_token_times == [observed] * calls
+    assert ledger.upstream_providers == ["Azure"] * calls
+    assert len(ledger.terminal_events) == calls
+    for event in ledger.terminal_events:
+        assert event is not None and event.usage is not None
+        assert event.usage.cache_creation_input_tokens == writes
+        assert event.usage.input_tokens == 100
+        assert event.usage.cached_input_tokens == 50
+    assert registry.loads.inflight(("deployment-a", "b" * 64)) == 0
+    assert registry.accounting_healthy
+    assert entry.recovery_bindings == frozen_bindings
+    assert not entry.recovery_recorded_attempts
+    assert not registry.recovery._sessions  # noqa: SLF001 - scope faults must write no evidence.
+    assert "synthetic-private-detail" not in caplog.text
+    assert caplog.records and all(record.exc_info is None for record in caplog.records)
+    if finalize:
+        assert registry.entry(entry.authorization.request_id) is None
+    else:
+        assert registry.entry(entry.authorization.request_id) is entry
+        assert entry.active_attempt_id is None
+        registry.abandon(json.dumps({"request_id": entry.authorization.request_id}))
+    # Another expired request still settles on the next sweep after the host fault.
+    other = _admit(registry, deployments, request_id="after-recovery-fault")
+    _start(registry, ordinal=0, request_id=other.authorization.request_id)
+    other.deadline_monotonic = time.monotonic() - 60
+    registry.sweep_expired()
+    assert registry.entry(other.authorization.request_id) is None
+    assert registry.counters()[1] == 1
+
+
 def test_rejected_parameter_crosses_the_boundary_only_as_a_string() -> None:
     """The provider-named parameter path survives the failure payload decode."""
     registry, _ledger, _entry = _registry()
@@ -844,6 +990,285 @@ class TestLaneSaturation:
         )
         _admit(registry, only, request_id="request-3")
         assert _start(registry, ordinal=0, request_id="request-3")["route_depth"] == 0
+
+    @pytest.mark.parametrize("authored", [False, True])
+    @pytest.mark.parametrize("staged", [False, True])
+    def test_reasoning_pin_never_bypasses_a_refusing_lane_bound(
+        self, authored: bool, staged: bool
+    ) -> None:
+        """Pinned reasoning cannot force a default or explicitly refusing lane past its bound."""
+
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+        policy = (
+            GatewayRungDispatchPolicy(concurrency_bound=1, saturation="refuse")
+            if authored
+            else None
+        )
+        only = (_deployment("deployment-a", connection_sha256="b" * 64, dispatch=policy),)
+        _admit(registry, only, request_id="occupied")
+        assert _start(registry, ordinal=0, request_id="occupied")["route_depth"] == 0
+        pinned = _admit(
+            registry, only, request_id="pinned", reasoning_pinned_deployment_id="deployment-a"
+        )
+        if staged:
+            snapshot = pinned.route.snapshot.model_copy(
+                update={
+                    "model_stages": (
+                        ModelExecutionStage(
+                            stage_index=0,
+                            exact_model_id="exact-one",
+                            pool_id="pool-one",
+                            deployment_ids=("deployment-a",),
+                        ),
+                    )
+                }
+            )
+            pinned.route = pinned.route.model_copy(update={"snapshot": snapshot})
+        refused = _start(registry, ordinal=0, request_id="pinned")
+        assert refused["exhausted"] is True
+        assert cast("JsonObject", refused["failure"])["failure_class"] == "throttled"
+        assert registry.rung_admission_counters() == (1, 0, 1)
+        assert len(ledger.started) == 1
+
+    @pytest.mark.parametrize("authored", [False, True])
+    @pytest.mark.parametrize("conditional_child", [False, True])
+    def test_root_child_capacity_refusal_preserves_existing_reservations(
+        self, authored: bool, conditional_child: bool
+    ) -> None:
+        """A full staged ladder cannot overflow or promote a failure-only child after a shed."""
+
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+        policy = (
+            GatewayRungDispatchPolicy(concurrency_bound=1, saturation="refuse")
+            if authored
+            else None
+        )
+        root = _deployment("deployment-a", connection_sha256="b" * 64, dispatch=policy)
+        child_policy = GatewayRungDispatchPolicy(
+            concurrency_bound=1 if authored else None,
+            saturation="refuse" if authored else "overflow",
+        )
+        child = _deployment(
+            "deployment-b", connection_sha256="c" * 64, dispatch=child_policy
+        ).model_copy(update={"exact_model_id": "child-model"})
+        if conditional_child:
+            child = child.model_copy(
+                update={
+                    "gateway": child.gateway.model_copy(
+                        update={
+                            "capabilities": child.gateway.capabilities.model_copy(
+                                update={
+                                    "failover_only_on": frozenset({"throttled"}),
+                                }
+                            ),
+                        }
+                    )
+                }
+            )
+        for index, deployment in enumerate((root, child)):
+            _admit(registry, (deployment,), request_id=f"occupied-{index}")
+            # Occupy only ordinary candidates; a conditional child is never a fresh first dial.
+            if not (conditional_child and index == 1):
+                assert (
+                    _start(registry, ordinal=0, request_id=f"occupied-{index}")["route_depth"] == 0
+                )
+        before = len(ledger.started)
+        entry = _admit(registry, (root, child), request_id="full-chain")
+        snapshot = entry.route.snapshot.model_copy(
+            update={
+                "model_stages": (
+                    ModelExecutionStage(
+                        stage_index=0,
+                        exact_model_id=root.exact_model_id,
+                        pool_id="pool-one",
+                        deployment_ids=(root.deployment_id,),
+                    ),
+                    ModelExecutionStage(
+                        stage_index=1,
+                        exact_model_id=child.exact_model_id,
+                        pool_id="child-pool",
+                        deployment_ids=(child.deployment_id,),
+                    ),
+                )
+            }
+        )
+        entry.route = entry.route.model_copy(update={"snapshot": snapshot})
+        entry.verified_warm_deployment_id = child.deployment_id
+        entry.verified_warm_until_monotonic = time.monotonic() + 30
+        entry.recovery_scoped = True
+        refused = _start(registry, ordinal=0, request_id="full-chain")
+        assert refused["exhausted"] is True
+        assert len(ledger.started) == before
+        assert registry.entry("full-chain") is None
+        assert registry.loads.inflight(rung_load_key(root)) == 1
+        assert registry.loads.inflight(rung_load_key(child)) == int(not conditional_child)
+        assert registry.rung_admission_counters()[1:] == (0, 1)
+
+    @pytest.mark.parametrize("competing_fill", [False, True])
+    def test_ordinary_rate_overflow_uses_latest_hard_shed(
+        self, monkeypatch: pytest.MonkeyPatch, competing_fill: bool
+    ) -> None:
+        """A competing capacity fill replaces the old rate shed and terminates without spinning."""
+
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+        deployment = _deployment(
+            "deployment-a",
+            connection_sha256="b" * 64,
+            dispatch=GatewayRungDispatchPolicy(requests_per_minute=1),
+        )
+        key = rung_load_key(deployment)
+        _admit(registry, (deployment,), request_id="spent-rate")
+        first = _start(registry, ordinal=0, request_id="spent-rate")
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="completed",
+            finalize=True,
+            request_id="spent-rate",
+        )
+        assert registry.loads.inflight(key) == 0
+        entry = _admit(registry, (deployment,), request_id="ordinary-overflow")
+        reserve = registry._reserve_rung_slot
+        calls: list[tuple[bool, bool, str]] = []
+        competitor: list[str] = []
+
+        def interleaved_reserve(
+            request_entry: InflightRequest,
+            selected: ExactModelDeployment,
+            *,
+            reserved_tokens: int,
+            force: bool,
+            rate_retry: bool = False,
+        ) -> str | RungShed | None:
+            """Fill capacity after the initial rate decision and fail on a repeated hard refusal."""
+            assert len(calls) < 2, "stale shed retried a hard-refused overflow target"
+            result = reserve(
+                request_entry,
+                selected,
+                reserved_tokens=reserved_tokens,
+                force=force,
+                rate_retry=rate_retry,
+            )
+            calls.append(
+                (force, rate_retry, result.reason if isinstance(result, RungShed) else "admitted")
+            )
+            if len(calls) == 1 and competing_fill:
+                assert isinstance(result, RungShed) and result.reason == "rate_limit"
+                ticket = registry.loads.reserve(
+                    key,
+                    organization_id="competitor",
+                    weight=1,
+                    bound=1,
+                    fair_share=False,
+                )
+                assert isinstance(ticket, str)
+                competitor.append(ticket)
+            return result
+
+        monkeypatch.setattr(registry, "_reserve_rung_slot", interleaved_reserve)
+        result = _start(registry, ordinal=0, request_id=entry.authorization.request_id)
+        assert calls == [
+            (False, False, "rate_limit"),
+            (True, False, "queue_bound" if competing_fill else "admitted"),
+        ]
+        if competing_fill:
+            assert result["exhausted"] is True
+            assert cast("JsonObject", result["failure"])["failure_class"] == "throttled"
+            assert len(ledger.started) == 1 and len(ledger.finished_requests) == 1
+            assert registry.entry(entry.authorization.request_id) is None
+            assert registry.rung_admission_counters() == (2, 0, 1)
+            assert registry.loads.inflight(key) == 1
+            registry.loads.release_ticket(competitor[0])
+            assert registry.loads.inflight(key) == 0
+            calls.clear()
+            monkeypatch.setattr(registry, "_reserve_rung_slot", reserve)
+            _admit(registry, (deployment,), request_id="after-release")
+            accepted = _start(registry, ordinal=0, request_id="after-release")
+            assert accepted["route_depth"] == 0 and len(ledger.started) == 2
+            assert registry.rung_admission_counters() == (3, 1, 1)
+            _settle(
+                registry,
+                attempt_id=str(accepted["attempt_id"]),
+                outcome="completed",
+                finalize=True,
+                request_id="after-release",
+            )
+        else:
+            assert result["route_depth"] == 0 and len(ledger.started) == 2
+            assert registry.rung_admission_counters() == (1, 1, 0)
+            _settle(
+                registry,
+                attempt_id=str(result["attempt_id"]),
+                outcome="completed",
+                finalize=True,
+                request_id=entry.authorization.request_id,
+            )
+        assert registry.loads.inflight(key) == 0
+
+    @pytest.mark.parametrize("interruption", ["deadline", "cancel"])
+    def test_lane_reselection_observes_request_interruption(
+        self, monkeypatch: pytest.MonkeyPatch, interruption: str
+    ) -> None:
+        """A request ending after its initial shed cannot dispatch through a later selection."""
+
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        deployment = _deployment(
+            "deployment-a",
+            connection_sha256="b" * 64,
+            dispatch=GatewayRungDispatchPolicy(requests_per_minute=1),
+        )
+        _admit(registry, (deployment,), request_id="spent-rate")
+        first = _start(registry, ordinal=0, request_id="spent-rate")
+        _settle(
+            registry,
+            attempt_id=str(first["attempt_id"]),
+            outcome="completed",
+            finalize=True,
+            request_id="spent-rate",
+        )
+        entry = _admit(registry, (deployment,), request_id="interrupted")
+        reserve = registry._reserve_rung_slot
+        calls = 0
+
+        def interrupt_after_shed(
+            request_entry: InflightRequest,
+            selected: ExactModelDeployment,
+            *,
+            reserved_tokens: int,
+            force: bool,
+            rate_retry: bool = False,
+        ) -> str | RungShed | None:
+            """Advance the deadline or durably abandon before the next selection."""
+            nonlocal calls
+            calls += 1
+            assert calls == 1, "interrupted request retried its reservation"
+            result = reserve(
+                request_entry,
+                selected,
+                reserved_tokens=reserved_tokens,
+                force=force,
+                rate_retry=rate_retry,
+            )
+            assert isinstance(result, RungShed)
+            if interruption == "deadline":
+                entry.deadline_monotonic = time.monotonic() - 1
+            else:
+                registry.abandon(json.dumps({"request_id": entry.authorization.request_id}))
+            return result
+
+        monkeypatch.setattr(registry, "_reserve_rung_slot", interrupt_after_shed)
+        result = _start(registry, ordinal=0, request_id=entry.authorization.request_id)
+        assert result["exhausted"] is True
+        assert cast("JsonObject", result["failure"])["failure_class"] == (
+            "timeout" if interruption == "deadline" else "cancelled"
+        )
+        assert calls == 1 and len(ledger.started) == 1
+        assert len(ledger.finished_requests) == 1
+        assert registry.entry(entry.authorization.request_id) is None
 
     def test_authored_bound_keeps_the_default_on_its_unauthored_sibling(self) -> None:
         """The authored bound wins on its rung; the sibling gets the worker default."""
@@ -1985,6 +2410,66 @@ def _settle_with_usage(
     )
 
 
+@pytest.mark.parametrize("mode", ["maximize_availability", "maximize_cache_affinity"])
+def test_recovery_placement_reason_does_not_replace_throttle_redial_reason(
+    mode: FailoverMode,
+) -> None:
+    """Initial recovery placement and a later physical backoff remain distinguishable."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    deployments = (_deployment("deployment-a", connection_sha256="b" * 64),)
+    entry = _admit(
+        registry,
+        deployments,
+        request_id="request-1",
+        failover_mode=mode,
+        throttle_redial=GatewayThrottleRedialPolicy(
+            max_attempts=1, base_delay_ms=100, max_delay_ms=100
+        ),
+    )
+    entry.recovery_reason = "retained_warm_fallback"
+    first = _start(registry, ordinal=0, request_id="request-1")
+    assert ledger.started[0]["dispatch_reason"] == "retained_warm_fallback"
+    _settle(
+        registry,
+        attempt_id=str(first["attempt_id"]),
+        outcome="failed",
+        finalize=False,
+        failure=_THROTTLE,
+        request_id="request-1",
+    )
+    redial = _start(
+        registry,
+        ordinal=1,
+        current_depth=0,
+        failure=_THROTTLE,
+        throttle_backoff=True,
+        request_id="request-1",
+    )
+    assert redial["route_depth"] == 0
+    assert ledger.started[1]["dispatch_reason"] == "throttle_backoff"
+    assert ledger.started[1]["preferred_deployment_id"] is None
+    registry.abandon(json.dumps({"request_id": "request-1"}))
+
+
+def test_recovery_placement_reason_does_not_replace_forced_overflow() -> None:
+    """A retained route forced past its capacity reports the real admission override."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    deployments = (_bounded_pair(1)[0],)
+    _admit(registry, deployments, request_id="holder")
+    _start(registry, ordinal=0, request_id="holder")
+    entry = _admit(
+        registry, deployments, request_id="overflow", failover_mode="maximize_cache_affinity"
+    )
+    entry.recovery_reason = "retained_warm_fallback"
+    assert _start(registry, ordinal=0, request_id="overflow")["route_depth"] == 0
+    assert ledger.started[-1]["dispatch_reason"] == "saturated_overflow"
+    assert registry.rung_admission_counters() == (1, 1, 0)
+    for request_id in ("holder", "overflow"):
+        registry.abandon(json.dumps({"request_id": request_id}))
+
+
 class TestThrottleCacheThreshold:
     """The per-request cache-stakes throttle decision and its disclosures."""
 
@@ -2260,7 +2745,10 @@ class TestThrottleRedial:
         assert [row["attempt_ordinal"] for row in ledger.started] == [0, 1, 2, 3]
         assert registry.throttle_cache_counters() == (0, 1, 2, 0)
 
-    def test_backoff_redial_is_force_admitted_past_the_warm_rungs_own_rate_shed(self) -> None:
+    @pytest.mark.parametrize("saturation", ["overflow", "refuse"])
+    def test_backoff_redial_is_force_admitted_past_the_warm_rungs_own_rate_shed(
+        self, saturation: Literal["overflow", "refuse"]
+    ) -> None:
         """A paid-for redial stays on the throttled rung when its rate window would shed it.
 
         The warm rung authors ``requests_per_minute: 1`` per worker and this
@@ -2277,6 +2765,22 @@ class TestThrottleRedial:
         ledger = _RecordingLedger()
         registry = NativeAttemptAccounting(ledger)
         deployments = _rated_pair(requests_per_minute=1)
+        deployments = tuple(
+            deployment.model_copy(
+                update={
+                    "gateway": deployment.gateway.model_copy(
+                        update={
+                            "dispatch": GatewayRungDispatchPolicy(
+                                concurrency_bound=10,
+                                requests_per_minute=1,
+                                saturation=saturation,
+                            )
+                        }
+                    )
+                }
+            )
+            for deployment in deployments
+        )
         _admit(
             registry,
             deployments,
@@ -2545,12 +3049,52 @@ class _LegacySignatureLedger(_RecordingLedger):
         ratelimit_remaining_tokens: int | None = None,
     ) -> None:
         """Record the settle exactly as the previous engine handed it over."""
-        del first_token_at, retry_after_seconds, ratelimit_limit_requests
+        del retry_after_seconds, ratelimit_limit_requests
         del ratelimit_remaining_requests, ratelimit_limit_tokens, ratelimit_remaining_tokens
+        self.first_token_times.append(first_token_at)
         self.terminal_events.append(terminal_event)
         self.finished.append(
             {"attempt_id": attempt_id, "finalize": finalize_request, "failed": failure is not None}
         )
+
+
+@pytest.mark.parametrize("writes", [None, 0, 25])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_cache_write_usage_keeps_legacy_and_current_host_signatures(
+    writes: int | None, legacy: bool
+) -> None:
+    """Cache writes ride typed usage, never a new keyword an older host must accept."""
+    ledger = _LegacySignatureLedger() if legacy else _RecordingLedger()
+    registry = NativeAttemptAccounting(cast("SyncWriteLedger", ledger))
+    _admit(registry, _bounded_pair(1), request_id="cache-write-host")
+    started = _start(registry, ordinal=0, request_id="cache-write-host")
+    observed = datetime(2026, 9, 18, 1, 2, 3, tzinfo=UTC)
+    registry.settle(
+        json.dumps(
+            {
+                "request_id": "cache-write-host",
+                "attempt_id": started["attempt_id"],
+                "outcome": "completed",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 5,
+                    "cached_input_tokens": 50,
+                    "cache_creation_input_tokens": writes,
+                },
+                "first_token_at": observed.isoformat(),
+                "upstream_provider": "Azure",
+                "finalize": True,
+                "opened": True,
+            }
+        )
+    )
+    (event,) = ledger.terminal_events
+    assert event is not None and event.usage is not None
+    assert event.usage.cache_creation_input_tokens == writes
+    assert ledger.first_token_times == [observed]
+    assert ledger.upstream_providers == ([] if legacy else ["Azure"])
+    assert len(ledger.finished) == 1
+    assert registry.entry("cache-write-host") is None
 
 
 def _settle_naming_upstream(
@@ -2815,3 +3359,316 @@ class TestToolSearchRound:
         assert ledger.started[1]["route_depth"] == 0
         # Not a throttle redial: the throttle budget is untouched.
         assert registry.throttle_cache_counters() == (0, 0, 0, 0)
+
+
+@pytest.mark.parametrize("failed_cleanup", [False, True])
+def test_abandon_during_committed_reservation_retains_and_closes_late_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    failed_cleanup: bool,
+) -> None:
+    """A cancelled callback cannot orphan a reservation committed before its result returns."""
+    monkeypatch.setattr(NativeAttemptAccounting, "_sweep_loop", lambda self: None)
+    ledger = _RecordingLedger()
+    accounting = NativeAttemptAccounting(ledger)
+    entry = _admit(
+        accounting,
+        (_deployment("lead", connection_sha256="b" * 64),),
+        request_id="late-reservation",
+        failover_mode="maximize_availability",
+    )
+    original = ledger.start_attempt
+    committed, release = threading.Event(), threading.Event()
+    results: list[JsonObject] = []
+    errors: list[BaseException] = []
+
+    def start() -> None:
+        """Enter actual accounting and wait after its durable reservation commits."""
+        try:
+            results.append(_start(accounting, ordinal=0, request_id="late-reservation"))
+        except BaseException as error:  # noqa: BLE001 - propagate the worker's failure.
+            errors.append(error)
+
+    def pause_after_commit(
+        *,
+        snapshot: ExecutionSnapshot,
+        deployment: ExactModelDeployment,
+        attempt_ordinal: int,
+        route_depth: int,
+        maximum_cost_nano_usd: int | None = None,
+        reserved_input_tokens: int | None = None,
+        reserved_output_tokens: int | None = None,
+        route_reason: str | None = None,
+        fallback_reason: str | None = None,
+        dispatch_reason: str | None = None,
+        preferred_deployment: ExactModelDeployment | None = None,
+    ) -> str:
+        """Delay the existing typed ledger method without changing reservation semantics."""
+        result = original(
+            snapshot=snapshot,
+            deployment=deployment,
+            attempt_ordinal=attempt_ordinal,
+            route_depth=route_depth,
+            maximum_cost_nano_usd=maximum_cost_nano_usd,
+            reserved_input_tokens=reserved_input_tokens,
+            reserved_output_tokens=reserved_output_tokens,
+            route_reason=route_reason,
+            fallback_reason=fallback_reason,
+            dispatch_reason=dispatch_reason,
+            preferred_deployment=preferred_deployment,
+        )
+        committed.set()
+        assert release.wait(5)
+        return result
+
+    monkeypatch.setattr(ledger, "start_attempt", pause_after_commit)
+    worker = threading.Thread(target=start)
+    worker.start()
+    try:
+        assert committed.wait(5)
+        accounting.abandon(json.dumps({"request_id": "late-reservation"}))
+        assert accounting.entry("late-reservation") is entry
+        assert not ledger.finished_requests and not ledger.finished
+        if failed_cleanup:
+            ledger.fail_finishes = 1
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    if failed_cleanup:
+        assert len(errors) == 1 and isinstance(errors[0], NativeBridgeError)
+        assert not results and accounting.entry("late-reservation") is entry
+        assert entry.active_attempt_id is not None and not ledger.finished
+        accounting.sweep_expired()
+    else:
+        assert not errors and results and results[0].get("exhausted") is True
+    assert len(ledger.started) == len(ledger.finished) == 1
+    assert ledger.finished[0]["failure_class"] == "cancelled"
+    assert ledger.terminal_events[-1] is not None
+    assert ledger.terminal_events[-1].usage is None
+    assert accounting.entry("late-reservation") is None
+    accounting.sweep_expired()
+    assert len(ledger.finished) == 1
+
+
+@pytest.mark.parametrize("swept", [False, True])
+@pytest.mark.parametrize("failure_class", ["provider_authentication", "provider_quota"])
+def test_customer_account_failure_replaces_transport_recovery_only(
+    monkeypatch: pytest.MonkeyPatch,
+    swept: bool,
+    failure_class: str,
+) -> None:
+    """Ledger and house health stay caller-owned while recovery remembers failed credentials."""
+    monkeypatch.setattr(NativeAttemptAccounting, "_sweep_loop", lambda self: None)
+    ledger, host, clock = _RecordingLedger(), RecoveryHostFake(), Clock()
+    accounting = NativeAttemptAccounting(ledger, recovery_host=host)
+    accounting.recovery = SessionRecoveryRegistry(clock=clock)
+    entry = recovery_entry()
+    usage = GatewayUsage(input_tokens=100, output_tokens=5, cached_input_tokens=80)
+    record_session_outcome(accounting.recovery, host, entry, "attempt", usage, None)
+    record_session_outcome(
+        accounting.recovery,
+        host,
+        entry,
+        "departure",
+        None,
+        GatewayFailure(failure_class=GatewayFailureClass.TRANSPORT, safe_message="transport"),
+    )
+    record_session_outcome(accounting.recovery, host, entry, "fallback", usage, None)
+    entry.attempt_depths["account-failure"] = 0
+    entry.active_attempt_id = "account-failure"
+    accounting.register(entry)
+    payload = json.dumps(
+        {
+            "request_id": entry.authorization.request_id,
+            "attempt_id": "account-failure",
+            "outcome": "failed",
+            "failure": {
+                "failure_class": failure_class,
+                "safe_message": "account failed",
+                "customer_owned": True,
+            },
+        }
+    )
+    if swept:
+        ledger.fail_finishes = 1
+        with pytest.raises(NativeBridgeError):
+            accounting.settle(payload)
+        clock.now += 1
+        accounting.sweep_expired()
+    else:
+        accounting.settle(payload)
+    assert ledger.finished[-1]["failure_class"] == "invalid_request"
+    assert not accounting.health.suppressed(
+        deployment_health_key(entry.authorization, entry.route.deployment)
+    )
+    clock.now += 10
+    key = session_cache_key(entry)
+    assert key is not None
+    candidates = tuple(
+        (d.deployment_id, entry.recovery_bindings[d.deployment_id].scope)
+        for d in entry.route.deployments
+    )
+    scope = candidates[0][1]
+    snapshot = RecoverySnapshot(
+        loaded_at=clock.now,
+        observations=(
+            RecoveryObservation(
+                scope=scope.operational(), cause="transport", observed_at=clock.now, healthy=True
+            ),
+        ),
+        leases=(
+            RecoveryLease(
+                lease_id="after-account", scope=scope.operational(), expires_at=clock.now + 20
+            ),
+        ),
+    )
+    decision = accounting.recovery.choose(key, candidates, eligible=eligible, snapshot=snapshot)
+    assert decision.deployment_id == entry.route.deployments[1].deployment_id
+    assert decision.reason == "retained_warm_fallback"
+
+
+def _retained_settlement(
+    monkeypatch: pytest.MonkeyPatch, *, failing: bool = False
+) -> tuple[NativeAttemptAccounting, _RecordingLedger, Clock, InflightRequest, JsonObject]:
+    """Retain a real accounting write at its original arrival time for deterministic retry."""
+    monkeypatch.setattr(NativeAttemptAccounting, "_sweep_loop", lambda self: None)
+    ledger, host, clock = _RecordingLedger(), RecoveryHostFake(), Clock(now=990)
+    accounting = NativeAttemptAccounting(ledger, recovery_host=host)
+    accounting._sweeper.join(timeout=5)
+    accounting.recovery = SessionRecoveryRegistry(clock=clock)
+    entry = recovery_entry()
+    usage = GatewayUsage(input_tokens=100, output_tokens=5, cached_input_tokens=50)
+    if failing:
+        for attempt_id in ("attempt", "fallback"):
+            record_session_outcome(accounting.recovery, host, entry, attempt_id, usage, None)
+    attempt_id = "departure" if failing else "attempt"
+    entry.active_attempt_id = attempt_id
+    accounting.register(entry)
+    payload: JsonObject = {
+        "request_id": entry.authorization.request_id,
+        "attempt_id": attempt_id,
+        "outcome": "failed" if failing else "completed",
+        "finalize": True,
+    }
+    if failing:
+        payload["failure"] = {"failure_class": "transport", "safe_message": "synthetic failure"}
+    else:
+        payload["usage"] = usage.model_dump(mode="json")
+    ledger.fail_finishes = 1
+    clock.now = 1000
+    with pytest.raises(NativeBridgeError):
+        accounting.settle(json.dumps(payload))
+    assert entry.pending_settlement == payload
+    return accounting, ledger, clock, entry, payload
+
+
+@pytest.mark.parametrize("failing", [False, True])
+def test_concurrent_settle_and_sweep_observe_recovery_once(
+    monkeypatch: pytest.MonkeyPatch, failing: bool
+) -> None:
+    """Serialized ledger retries cannot renew cache residency or duplicate a recovery failure."""
+    accounting, ledger, clock, entry, payload = _retained_settlement(monkeypatch, failing=failing)
+    original_key = native_recovery.session_cache_key
+    paused, release, sweep_finished_write = threading.Event(), threading.Event(), threading.Event()
+    finish = accounting._finish_attempt
+    ledger_lock = threading.Lock()
+    successful_writes: set[str] = set()
+    calls: list[str] = []
+
+    def observed_finish(
+        *,
+        attempt_id: str,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool = True,
+        **metadata: object,
+    ) -> None:
+        """Serialize idempotent ledger delivery and signal after the swept write returns."""
+        with ledger_lock:
+            calls.append(threading.current_thread().name)
+            if attempt_id not in successful_writes:
+                finish(
+                    attempt_id=attempt_id,
+                    terminal_event=terminal_event,
+                    failure=failure,
+                    finalize_request=finalize_request,
+                    **metadata,
+                )
+                successful_writes.add(attempt_id)
+        if threading.current_thread().name == "swept-retry":
+            sweep_finished_write.set()
+
+    monkeypatch.setattr(accounting, "_finish_attempt", observed_finish)
+    derived: list[str] = []
+    errors: list[BaseException] = []
+
+    def gated_key(current: InflightRequest) -> SessionCacheKey | None:
+        """Pause one observer without blocking a ledger write on another thread."""
+        derived.append(threading.current_thread().name)
+        if threading.current_thread().name == "direct-retry":
+            paused.set()
+            assert release.wait(5)
+        return original_key(current)
+
+    def retry() -> None:
+        """Retry the original terminal payload through the direct accounting path."""
+        try:
+            accounting.settle(json.dumps(payload))
+        except BaseException as error:  # noqa: BLE001 - propagate thread failures to the test.
+            errors.append(error)
+
+    def sweep() -> None:
+        """Race the retained terminal write through the actual sweep path."""
+        try:
+            accounting.sweep_expired()
+        except BaseException as error:  # noqa: BLE001 - propagate thread failures to the test.
+            errors.append(error)
+
+    monkeypatch.setattr(native_recovery, "session_cache_key", gated_key)
+    direct = threading.Thread(target=retry, name="direct-retry")
+    swept = threading.Thread(target=sweep, name="swept-retry")
+    direct.start()
+    try:
+        assert paused.wait(5)
+        swept.start()
+        assert sweep_finished_write.wait(5)
+        clock.now = 1010
+    finally:
+        release.set()
+        direct.join(5)
+        if swept.ident is not None:
+            swept.join(5)
+    assert not direct.is_alive() and not swept.is_alive() and not errors
+    assert len(derived) == 1
+    assert accounting.entry(entry.authorization.request_id) is None
+    assert calls == ["direct-retry", "swept-retry"]
+    assert successful_writes == {str(payload["attempt_id"])}
+    assert len(ledger.finished) == 1
+    assert len(ledger.terminal_events) == 2  # Initial failed delivery and one durable terminal.
+    key = original_key(entry)
+    assert key is not None
+    history = accounting.recovery._sessions[key]
+    primary = entry.route.deployment.deployment_id
+    if failing:
+        departure = history.departures[primary]
+        assert (departure.failed_at, departure.retry_at) == (1000, 1005)
+    else:
+        assert history.evidence[primary].expires_at == history.retained_until == 1100
+
+
+def test_delayed_first_sweep_does_not_renew_expired_cache_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A write received at 1000 cannot create fresh TTL100 warmth when retried at 1150."""
+    accounting, ledger, clock, entry, _payload = _retained_settlement(monkeypatch)
+    clock.now = 1150
+    accounting.sweep_expired()
+    key = session_cache_key(entry)
+    assert key is not None
+    deployment = entry.route.deployment
+    scope = entry.recovery_bindings[deployment.deployment_id].scope
+    decision = accounting.recovery.choose(
+        key, ((deployment.deployment_id, scope),), eligible=eligible, snapshot=None
+    )
+    assert len(ledger.finished) == 1
+    assert decision.deployment_id is None and decision.warm_remaining_seconds == 0

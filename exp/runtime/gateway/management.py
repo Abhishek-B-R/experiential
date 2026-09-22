@@ -8,6 +8,7 @@ from pathlib import Path
 
 from pydantic import Field
 
+from exp.common.config.settings import load_settings
 from exp.common.core.artifacts import ContractModel
 from exp.common.models import (
     GATEWAY_EXCLUDED_PROVIDERS,
@@ -17,6 +18,10 @@ from exp.common.models import (
 )
 from exp.runtime.gateway.auth import IssuedVirtualKey
 from exp.runtime.gateway.contracts import DirectTarget, ProjectTarget
+from exp.runtime.gateway.model_chain_authority import (
+    refuse_local_chain_snapshot,
+    serving_snapshot_limit,
+)
 from exp.runtime.gateway.sqlite import key_delivery
 from exp.runtime.gateway.sqlite.migrations import connect_database
 from exp.runtime.gateway.sqlite.provider_authority import (
@@ -109,13 +114,25 @@ class GatewayStatus(ContractModel):
 class GatewayManagement:
     """Own additive management operations around one SQLite gateway store."""
 
-    def __init__(self, root: Path, *, organization_id: str = "local") -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        organization_id: str = "local",
+        serving_snapshot_max_bytes: int | None = None,
+    ) -> None:
         """Bind one explicit local organization under a EXP root.
 
         Args:
             root: EXP root containing private gateway state.
             organization_id: Stable local organization identifier.
+            serving_snapshot_max_bytes: Explicit bound or the setting frozen from this root.
         """
+        self.serving_snapshot_max_bytes = serving_snapshot_limit(
+            load_settings(root).gateway.serving_snapshot_max_bytes
+            if serving_snapshot_max_bytes is None
+            else serving_snapshot_max_bytes
+        )
         self.root = root
         self.organization_id = organization_id
         self.state_dir = root / "gateway"
@@ -157,7 +174,15 @@ class GatewayManagement:
 
     def store(self) -> SQLiteGatewayStore:
         """Open the authoritative SQLite store and private pepper state."""
-        return SQLiteGatewayStore(self.database_path)
+        return SQLiteGatewayStore(
+            self.database_path, serving_snapshot_max_bytes=self.serving_snapshot_max_bytes
+        )
+
+    def check_serving_snapshot(self, snapshot_ref: str) -> None:
+        """Classify both local serving files using this manager's frozen resource policy."""
+        refuse_local_chain_snapshot(
+            self.state_dir, snapshot_ref, maximum_bytes=self.serving_snapshot_max_bytes
+        )
 
     def require_initialized(self) -> SQLiteGatewayStore:
         """Return the store or fail with an actionable initialization command."""
@@ -839,6 +864,7 @@ class GatewayManagement:
         refusal_failover: bool,
     ) -> tuple[bool, bool]:
         """Return activation and snapshot change status after read-only validation."""
+        self.check_serving_snapshot(snapshot_ref)
         self.require_initialized()
         connection = connect_database(self.database_path)
         try:
