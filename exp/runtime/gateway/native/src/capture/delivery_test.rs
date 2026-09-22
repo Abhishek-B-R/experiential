@@ -7,7 +7,13 @@ struct PausedSink {
 }
 
 impl Sink for PausedSink {
-    fn write(&mut self, record: &Record, _maximum_bytes: usize) -> Result<(), ()> {
+    type Prepared = Record;
+
+    fn prepare(record: &Record, _maximum_bytes: usize) -> Result<Self::Prepared, ()> {
+        Ok(record.clone())
+    }
+
+    fn write(&mut self, record: &Self::Prepared) -> Result<(), ()> {
         self.entered
             .send(record.request.request_id.clone())
             .map_err(|_| ())?;
@@ -15,6 +21,7 @@ impl Sink for PausedSink {
             .recv_timeout(Duration::from_secs(5))
             .map_err(|_| ())?;
         if self.fail {
+            self.fail = false;
             Err(())
         } else {
             Ok(())
@@ -131,13 +138,23 @@ fn allocated_capacity_not_just_json_length_is_charged() {
 }
 
 #[test]
-fn failed_destination_releases_budget_and_records_no_sensitive_error() {
+fn failed_destination_retains_budget_and_retries_the_same_record_after_close_timeout() {
     let (delivery, entered, resume) = paused(limits(), true);
     assert!(delivery.submit(record("private")));
     entered.recv_timeout(Duration::from_secs(1)).unwrap();
     resume.send(()).unwrap();
+    assert_eq!(
+        entered.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "private"
+    );
+    assert!(!delivery.close_until(Instant::now()));
+    assert_eq!(
+        delivery.counts(),
+        [1, record("private").heap_bytes() as u64, 0, 1, 0]
+    );
+    resume.send(()).unwrap();
     assert!(delivery.close_until(Instant::now() + Duration::from_secs(1)));
-    assert_eq!(delivery.counts(), [0, 0, 0, 1, 0]);
+    assert_eq!(delivery.counts(), [0, 0, 1, 1, 0]);
 }
 
 #[test]
@@ -173,7 +190,7 @@ fn shutdown_timeout_reports_incomplete_drain_without_purging_accepted_records() 
 }
 
 #[test]
-fn synchronous_completion_waits_for_durable_success_and_reports_writer_failure() {
+fn synchronous_completion_waits_for_acknowledgement_including_retries() {
     for fail in [false, true] {
         let (delivery, entered, resume) = paused(limits(), fail);
         let delivery = Arc::new(delivery);
@@ -187,7 +204,12 @@ fn synchronous_completion_waits_for_durable_success_and_reports_writer_failure()
         entered.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(result.recv_timeout(Duration::from_millis(30)).is_err());
         resume.send(()).unwrap();
-        assert_eq!(result.recv_timeout(Duration::from_secs(1)).unwrap(), !fail);
+        if fail {
+            assert_eq!(entered.recv_timeout(Duration::from_secs(1)).unwrap(), "ack");
+            assert!(result.recv_timeout(Duration::from_millis(30)).is_err());
+            resume.send(()).unwrap();
+        }
+        assert!(result.recv_timeout(Duration::from_secs(1)).unwrap());
         waiting.join().unwrap();
         assert!(delivery.close_until(Instant::now() + Duration::from_secs(1)));
         assert_eq!(delivery.counts()[4], 0);

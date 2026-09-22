@@ -12,8 +12,14 @@ use super::response::WireResponse;
 
 /// Local SQLite and hosted persistence implement the same off-path destination.
 pub(crate) trait Sink: Send + 'static {
-    /// Persist one versioned record. Errors are deliberately content-free.
-    fn write(&mut self, record: &Record, maximum_bytes: usize) -> Result<(), ()>;
+    type Prepared;
+
+    /// Prepare once, off serving; retrying storage must not re-encode the record.
+    fn prepare(record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()>;
+
+    /// Acknowledge an idempotent write or intentional policy exclusion. An error
+    /// retains the payload for retry; error details must never include content.
+    fn write(&mut self, prepared: &Self::Prepared) -> Result<(), ()>;
 
     /// Run retention maintenance without adding storage work to serving.
     fn maintain(&mut self) -> Result<(), ()> {
@@ -82,7 +88,7 @@ pub(crate) struct Delivery {
 }
 
 impl Delivery {
-    pub(crate) fn new(limits: Limits, mut sink: impl Sink) -> Result<Self, &'static str> {
+    pub(crate) fn new<S: Sink>(limits: Limits, mut sink: S) -> Result<Self, &'static str> {
         limits.validate()?;
         let (sender, receiver) = mpsc::sync_channel::<Pending>(limits.maximum_records);
         let counters = Arc::new(Counters::default());
@@ -108,7 +114,29 @@ impl Delivery {
                                     item.value.provider_tool_calls_json = None;
                                 }
                             }
-                            let persisted = sink.write(&item.value, maximum_record_bytes).is_ok();
+                            let persisted = match S::prepare(&item.value, maximum_record_bytes) {
+                                Ok(prepared) => {
+                                    let mut delay = Duration::from_millis(25);
+                                    while sink.write(&prepared).is_err() {
+                                        worker_counters.failed.fetch_add(1, Ordering::Relaxed);
+                                        // Hold the same queue slot and byte charge until
+                                        // acknowledged, including across close timeouts.
+                                        // Bound retry frequency, never expire accepted data.
+                                        std::thread::sleep(delay);
+                                        delay = (delay * 2).min(Duration::from_secs(1));
+                                        if maintained.elapsed() >= Duration::from_secs(1) {
+                                            if sink.maintain().is_err() {
+                                                worker_counters
+                                                    .failed
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            maintained = Instant::now();
+                                        }
+                                    }
+                                    true
+                                }
+                                Err(()) => false,
+                            };
                             let counter = if persisted {
                                 &worker_counters.persisted
                             } else {

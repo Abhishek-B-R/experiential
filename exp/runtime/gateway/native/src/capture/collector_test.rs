@@ -6,11 +6,15 @@ use std::sync::{mpsc, Arc};
 struct MemorySink(mpsc::Sender<Record>);
 
 impl Sink for MemorySink {
-    fn write(&mut self, record: &Record, maximum_bytes: usize) -> Result<(), ()> {
+    type Prepared = Record;
+
+    fn prepare(record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
         let encoded = record.encode(maximum_bytes).ok_or(())?;
-        self.0
-            .send(serde_json::from_str(&encoded).map_err(|_| ())?)
-            .map_err(|_| ())
+        serde_json::from_str(&encoded).map_err(|_| ())
+    }
+
+    fn write(&mut self, record: &Self::Prepared) -> Result<(), ()> {
+        self.0.send(record.clone()).map_err(|_| ())
     }
 }
 

@@ -79,8 +79,9 @@ The native queue carries structured request records and original response wire
 buffers, not expanded response JSON trees. Records own immutable request context.
 Only the destination worker parses response JSON, one record at a time.
 JSON sizing counts fields and escapes without encoding response buffers; the
-destination performs bounded final encoding. A
-hosted Python destination receives that encoded record. Native destinations consume
+destination prepares its bounded payload once, before writing. A
+hosted Python destination receives the same encoded string object on every retry;
+storage retries do not decode the response or serialize the record again. Native destinations consume
 the structure directly. Request admission still crosses the Python/Rust boundary
 as JSON; exceptional lossless sidecars and raw tool-call strings also use JSON.
 
@@ -99,16 +100,26 @@ limits throughput to what the destination can persist.
 When capture is required but admission cannot register it, the gateway returns a
 sanitized `capture_unavailable` 503 before provider dispatch. Policy-disabled capture
 still serves normally. An eligible response does not finish successfully until its
-destination write succeeds; a failed write terminates its HTTP body with an error.
+destination write succeeds. A destination error retains the current record and
+its queue slot, and retries with exponential backoff from 25 milliseconds to one
+second. There is no retry-count expiry: a persistent outage backpressures capture
+instead of discarding accepted data. A malformed or oversized payload that cannot
+be prepared still fails explicitly; raising a storage exception is never a way
+to skip a record. Destinations must be idempotent because a write may commit before
+its acknowledgement is lost. Returning normally also acknowledges an intentional
+exclusion by the destination's current consent or retention policy.
 Bytes already streamed cannot be withdrawn. Hosted eligibility can arrive after
 the response ends, so hosts must also monitor destination failure counters for
 these late writes. Destination exceptions never print potentially sensitive details.
 `counts()` returns pending records, retained delivery bytes, successful destination calls,
-destination failures, delivery drops and collector skips. A bounded `close()` drains
+failed preparation/write/maintenance attempts, delivery drops and collector skips.
+Failure counts do not count unique lost records: a recovered record has one success
+and can have multiple failed attempts. A bounded `close()` drains
 while releasing the GIL; a blocked destination cannot extend that caller's deadline.
 A drain timeout returns false and leaves accepted delivery records queued, including
 producers already waiting for space. It does not purge them. The host must keep the
-process alive to finish draining; this memory queue is not a crash-recovery journal.
+process and destination alive to finish draining; closing its database before a
+successful drain is unsafe. This memory queue is not a crash-recovery journal.
 Unsettled hosted records remain pending until permission arrives or their TTL expires;
 closing does not grant permission or purge them. Per-record size limits and explicit retention
 policies still apply; this overload guarantee does not mean unlimited retention.

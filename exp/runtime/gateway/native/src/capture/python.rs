@@ -13,14 +13,26 @@ use super::record::{Record, Request};
 struct PythonSink(Py<PyAny>);
 
 impl Sink for PythonSink {
-    fn write(&mut self, record: &Record, maximum_bytes: usize) -> Result<(), ()> {
+    type Prepared = Py<PyAny>;
+
+    fn prepare(record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
         let encoded = record.encode(maximum_bytes).ok_or(())?;
+        Python::try_attach(|py| {
+            encoded
+                .into_pyobject(py)
+                .map(|value| value.into_any().unbind())
+        })
+        .ok_or(())?
+        .map_err(|_| ())
+    }
+
+    fn write(&mut self, prepared: &Self::Prepared) -> Result<(), ()> {
         // This is the dedicated delivery worker, never a serving or bridge thread.
         // Exception text can contain SQL parameters or content, so only count failure.
         Python::try_attach(|py| {
             self.0
                 .bind(py)
-                .call1((encoded,))
+                .call1((prepared.bind(py),))
                 .map(|_| ())
                 .map_err(|_| ())
         })

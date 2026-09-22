@@ -76,21 +76,69 @@ def test_close_timeout_preserves_accepted_content_for_later_host_settlement() ->
     assert collector.counts() == (0, 0, 1, 0, 0, 0)
 
 
-def test_python_sink_failure_never_logs_exception_content(
+def test_python_sink_retries_without_losing_content_or_acknowledging_failure(
     capfd: pytest.CaptureFixture[str],
 ) -> None:
-    """Database exception strings may carry private parameters and must be discarded."""
+    """A failed destination retains its exact record until recovery, even during close."""
+    attempted = threading.Event()
+    recovering = threading.Event()
+    attempts: list[str] = []
+    persisted: list[str] = []
 
-    def fail(_record: str) -> None:
-        """Simulate a storage rejection containing sensitive context."""
-        raise RuntimeError("private SQL parameter that must not be logged")
+    def write(record: str) -> None:
+        """Simulate an outage whose exception contains private SQL parameters."""
+        attempts.append(record)
+        attempted.set()
+        if not recovering.is_set():
+            raise RuntimeError("private SQL parameter that must not be logged")
+        persisted.append(record)
 
-    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), fail)
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), write)
+    assert collector.begin(_request_json())
+    settlement = threading.Thread(target=collector.settle, args=("request", True, False))
+    settlement.start()
+    try:
+        assert attempted.wait(1)
+        assert not collector.close(0.05)
+        pending, retained, successes, failures, drops, skips = collector.counts()
+        assert pending == 1 and retained > 0
+        assert successes == drops == skips == 0
+        assert failures >= 1
+        assert settlement.is_alive()
+    finally:
+        recovering.set()
+        settlement.join(3)
+    assert not settlement.is_alive()
+    assert collector.close(1)
+    assert len(attempts) >= 2 and len(set(attempts)) == 1
+    assert all(record is attempts[0] for record in attempts)
+    assert persisted == attempts[:1]
+    assert collector.counts()[0:3] == (0, 0, 1)
+    assert collector.counts()[4:] == (0, 0)
+    assert "private SQL" not in "".join(capfd.readouterr())
+
+
+def test_python_sink_rechecks_policy_after_an_uncertain_commit() -> None:
+    """Retry is idempotent and may acknowledge revocation without retaining content."""
+    rows: dict[str, str] = {}
+    attempts = 0
+
+    def write(encoded: str) -> None:
+        """Lose the first acknowledgement, then simulate consent revocation on retry."""
+        nonlocal attempts
+        attempts += 1
+        record = CaptureRecord.model_validate_json(encoded)
+        if attempts == 1:
+            rows[record.request.request_id] = encoded
+            raise ConnectionError("lost acknowledgement")
+        rows.pop(record.request.request_id, None)
+
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), write)
     assert collector.begin(_request_json())
     collector.settle("request", True, False)
     assert collector.close(1)
-    assert collector.counts() == (0, 0, 0, 1, 0, 0)
-    assert "private SQL" not in "".join(capfd.readouterr())
+    assert attempts == 2 and not rows
+    assert collector.counts() == (0, 0, 1, 1, 0, 0)
 
 
 def test_python_and_rust_configuration_fail_closed() -> None:

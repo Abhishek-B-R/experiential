@@ -80,8 +80,14 @@ struct MaintainedSink<S> {
 }
 
 impl<S: Sink> Sink for MaintainedSink<S> {
-    fn write(&mut self, record: &Record, maximum_bytes: usize) -> Result<(), ()> {
-        self.sink.write(record, maximum_bytes)
+    type Prepared = S::Prepared;
+
+    fn prepare(record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
+        S::prepare(record, maximum_bytes)
+    }
+
+    fn write(&mut self, prepared: &Self::Prepared) -> Result<(), ()> {
+        self.sink.write(prepared)
     }
 
     fn maintain(&mut self) -> Result<(), ()> {
