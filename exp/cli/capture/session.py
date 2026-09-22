@@ -6,10 +6,12 @@ import asyncio
 import signal
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 
 from exp.runtime.capture.control import CaptureCloudError, CaptureRun, CaptureRunClient
+from exp.runtime.capture.health import CaptureHealth, CaptureHealthFailure
 from exp.runtime.capture.proxy import CaptureBypassReason, CaptureProxy
 from exp.runtime.capture.upload import CaptureUploader, UploadStats
 
@@ -55,18 +57,32 @@ async def run_session(
     ready = asyncio.Event()
     loop = asyncio.get_running_loop()
     proxy = CaptureProxy(sink=uploader.submit, domains=domains, on_bypass=on_bypass)
+    health = CaptureHealth(domains)
     original_signals = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
     for sig in original_signals:
         loop.add_signal_handler(sig, stop.set)
     proxy_task: asyncio.Task[None] | None = None
     heartbeat_task: asyncio.Task[None] | None = None
+    health_task: asyncio.Task[CaptureHealthFailure] | None = None
+    network_failure: CaptureHealthFailure | None = None
+    remaining_failures: tuple[CaptureHealthFailure, ...] = ()
     uploader_started = False
     try:
+        baseline = await _check_before_capture(health, stop)
+        if baseline is None:
+            return uploader.stats
+        if baseline:
+            raise RuntimeError(
+                f"Cannot resolve {baseline[0].host}. Check your connection and try again."
+                if baseline[0].kind == "dns"
+                else "Capture could not check network health. Try again."
+            )
         proxy_task = asyncio.create_task(proxy.serve(ca_directory=ca_directory, ready=ready.set))
         if not await _wait_for_proxy(proxy_task, ready, stop, on_waiting=on_waiting):
             return uploader.stats
         uploader.start()
         uploader_started = True
+        health_task = asyncio.create_task(health.watch())
         if not stop.is_set():
             on_started()
         next_heartbeat = time.monotonic() + 15.0
@@ -76,6 +92,9 @@ async def run_session(
                 raise RuntimeError(
                     "Capture proxy stopped unexpectedly. Local interception is stopping."
                 )
+            if health_task.done():
+                network_failure = await health_task
+                break
             stats = uploader.stats
             stats = replace(
                 stats, dropped_exchanges=stats.dropped_exchanges + proxy.dropped_exchanges
@@ -101,12 +120,31 @@ async def run_session(
             except TimeoutError:
                 continue
     finally:
+        if health_task is not None:
+            health_task.cancel()
+            await asyncio.gather(health_task, return_exceptions=True)
         proxy.shutdown()
         try:
             if proxy_task is not None:
                 if not ready.is_set() and not proxy_task.done():
                     proxy_task.cancel()
-                await _finish_proxy(proxy_task)
+                try:
+                    await _finish_proxy(proxy_task)
+                except (RuntimeError, OSError):
+                    # A diagnostic must not replace an unconfirmed shutdown or backend error.
+                    if ready.is_set():
+                        with suppress(Exception):
+                            failures = await health.check()
+                            if failures:
+                                on_warning(
+                                    f"DNS for {failures[0].host} is also unavailable; "
+                                    "check your connection before retrying Capture."
+                                    if failures[0].kind == "dns"
+                                    else "Capture could not verify network health."
+                                )
+                    raise
+                if ready.is_set():
+                    remaining_failures = await health.check()
         finally:
             try:
                 if heartbeat_task is not None:
@@ -118,8 +156,38 @@ async def run_session(
                 for sig, handler in original_signals.items():
                     loop.remove_signal_handler(sig)
                     signal.signal(sig, handler)
+    if remaining_failures:
+        failure = remaining_failures[0]
+        raise RuntimeError(
+            f"Capture stopped, but DNS for {failure.host} is still unavailable. "
+            "Check your connection before retrying."
+            if failure.kind == "dns"
+            else "Capture stopped. Network health could not be verified; check your connection."
+        )
+    if network_failure is not None:
+        raise RuntimeError(
+            f"Capture stopped after repeated DNS failures for {network_failure.host}. "
+            "DNS is responding again."
+            if network_failure.kind == "dns"
+            else "Capture stopped because its network health check became unavailable."
+        )
     stats = uploader.stats
     return replace(stats, dropped_exchanges=stats.dropped_exchanges + proxy.dropped_exchanges)
+
+
+async def _check_before_capture(
+    health: CaptureHealth, stop: asyncio.Event
+) -> tuple[CaptureHealthFailure, ...] | None:
+    """Cancel and reap the initial DNS check promptly if startup is interrupted."""
+    checked = asyncio.create_task(health.check())
+    interrupted = asyncio.create_task(stop.wait())
+    try:
+        await asyncio.wait((checked, interrupted), return_when=asyncio.FIRST_COMPLETED)
+        return None if stop.is_set() else checked.result()
+    finally:
+        checked.cancel()
+        interrupted.cancel()
+        await asyncio.gather(checked, interrupted, return_exceptions=True)
 
 
 async def _wait_for_proxy(

@@ -22,8 +22,10 @@ on the exact release checkout.
   handshake failures switch the affected process and host to encrypted pass-through for the run;
   missing process identity or exhausted capacity uses an explicit host-wide exclusion. Other capture
   continues, and the terminal names excluded targets and retains a partial-capture indicator.
-  Backend failure still stops Capture. Synthetic provider and backend lifecycle tests are separate
-  from real client testing.
+  Backend failure still stops Capture. A quiet DNS guard checks selected providers before startup,
+  stops after repeated lookup failures, and checks recovery after shutdown. The native selector
+  excludes the macOS DNS responder process. Synthetic provider, DNS, and backend lifecycle tests
+  are separate from real client testing; the guard does not prove application TLS compatibility.
 - The local gateway supports explicit provider references, identities, virtual keys, grants,
   singleton and certified ordered exact-model pools, frozen-project aliases, bounded precommit
   provider fallback, Chat Completions, Responses (over HTTP and as the Responses-over-WebSocket

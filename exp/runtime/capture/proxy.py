@@ -588,10 +588,10 @@ async def _wait_for_capture_stop(proxyserver: Proxyserver, stop: asyncio.Event) 
 
 
 def _capture_options(domains: tuple[str, ...], ca_directory: Path) -> options.Options:
-    """Select exact provider names before TLS inspection, ignoring all other hosts."""
+    """Select provider TLS names and leave the macOS resolver process outside interception."""
     return options.Options(
         confdir=str(ca_directory),
-        mode=["local"],
+        mode=["local:!mDNSResponder"],
         allow_hosts=[rf"^{re.escape(domain)}\.?:[0-9]+$" for domain in domains],
         show_ignored_hosts=False,
         ssl_insecure=False,

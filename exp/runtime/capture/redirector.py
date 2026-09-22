@@ -76,10 +76,15 @@ async def _stop_local_redirector(server: LocalRedirectorInstance, proxyserver: P
     if native is None:
         cls._instance = None
         return
+    # The macOS selector parser requires at least one action. Include then exclude
+    # the same PID to disable every flow, including PID 0, without an empty list.
+    # LocalRedirectorInstance.stop() sends an empty selector, so this owned boundary
+    # releases its singleton directly before draining and closing the native handle.
+    cls._instance = None
     try:
-        await server.stop()
+        native.set_intercept("0,!0")
     finally:
-        # An awaited stop must never confer authority over a replacement owner.
+        # Cleanup must never confer authority over a replacement owner.
         if cls._server is native and (cls._instance is None or cls._instance is server):
             try:
                 await _quiesce_connections(server, proxyserver)

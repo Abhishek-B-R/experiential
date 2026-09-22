@@ -36,7 +36,9 @@ class FakeNative:
     def set_intercept(self, spec: str) -> None:
         """Record the exact specification sent by the real mitmproxy instance."""
         self.events.append(f"intercept:{spec}")
-        if spec == "" and self.fail_clear:
+        if not spec:
+            raise IndexError("the macOS redirector requires a nonempty action list")
+        if spec == "0,!0" and self.fail_clear:
             raise OSError("control channel disconnected")
 
     def close(self) -> None:
@@ -109,7 +111,7 @@ def test_cancelled_startup_releases_incomplete_owner(monkeypatch: pytest.MonkeyP
 
 
 def test_active_stop_disables_and_closes_native(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A successful foreground exit disables interception and confirms native closure."""
+    """Shutdown avoids the native empty-action crash and confirms backend closure."""
     native = FakeNative()
     _fake_start(monkeypatch, native)
 
@@ -124,7 +126,14 @@ def test_active_stop_disables_and_closes_native(monkeypatch: pytest.MonkeyPatch)
         await stop_capture_servers(proxyserver)
 
     asyncio.run(scenario())
-    assert native.events == [f"intercept:!{os.getpid()}", "intercept:", "close", "closed"]
+    assert native.events == [f"intercept:!{os.getpid()}", "intercept:0,!0", "close", "closed"]
+
+
+def test_disabled_selector_is_valid_for_the_installed_native_parser() -> None:
+    """The native parser preserves the explicit include-then-exclude PID pair."""
+    assert (
+        mitmproxy_rs.local.LocalRedirector.describe_spec("0,!0") == "Include PID 0. Exclude PID 0."
+    )
 
 
 def test_failed_disable_still_closes_native_and_reports_failure(
@@ -145,7 +154,7 @@ def test_failed_disable_still_closes_native_and_reports_failure(
         assert LocalRedirectorInstance._server is None
 
     asyncio.run(scenario())
-    assert native.events[-3:] == ["intercept:", "close", "closed"]
+    assert native.events[-3:] == ["intercept:0,!0", "close", "closed"]
 
 
 def test_different_owner_is_not_stopped(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -342,7 +351,7 @@ def test_shutdown_quiesces_late_writes_before_closing_native(
         writer.write.assert_not_called()
 
     asyncio.run(scenario())
-    assert native.events.index("intercept:") < native.events.index("writer-close")
+    assert native.events.index("intercept:0,!0") < native.events.index("writer-close")
     assert native.events.index("writer-close") < native.events.index("connection-drained")
     assert native.events.index("connection-drained") < native.events.index("close")
     assert "mitmproxy has crashed" not in caplog.text

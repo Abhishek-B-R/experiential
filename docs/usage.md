@@ -83,6 +83,13 @@ Native write failures close only the affected connection; their resulting discon
 count as client certificate failures.
 If the native capture backend itself exits, Capture stops and reports that failure.
 
+Capture quietly checks provider DNS before starting and every few seconds while running.
+Two consecutive failures for the same provider stop interception automatically. A final check
+reports whether DNS recovered; Capture does not restart itself or request additional permissions.
+The macOS DNS responder process is excluded from interception. DNS attributed to other apps can
+still traverse the redirector, so this guard detects resolver failures rather than guaranteeing
+uninterrupted application connections. It does not change DNS settings or reset system services.
+
 Run the CLI as your normal user, without `sudo`. Mitmproxy Redirector's Network Extension provides
 system-wide interception while the foreground backend is running. Ctrl+C ends that interception;
 Capture does not edit `/etc/hosts`, DNS settings, or system proxy settings. There is no reset
