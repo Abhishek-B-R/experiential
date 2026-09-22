@@ -5,8 +5,8 @@ not permission to select a smaller output budget or a more expensive reasoning m
 
 ## Output limits
 
-Chat Completions accepts `max_completion_tokens` and `max_tokens` through its existing
-protocol decoder. Messages requires `max_tokens`. An explicit limit remains a ceiling:
+Chat Completions accepts `max_completion_tokens`, `max_tokens`, or `max_output_tokens`
+(one non-null spelling per request) through its protocol decoder. Messages requires `max_tokens`. An explicit limit remains a ceiling:
 a route that requires a larger minimum is excluded or refused before dispatch, not served
 with a silently increased limit.
 
@@ -50,6 +50,15 @@ budget that must fit the effective per-provider output ceiling. An explicit budg
 rewritten to fit. An impossible combination is refused before provider dispatch. Numeric
 Messages budgets are forwarded only to budget-capable wires, never converted into advisory
 effort or adaptive thinking.
+
+Chat also accepts the Qwen Cloud `thinking_budget` extension as a positive integer.
+It forwards the exact budget with `enable_thinking: true` on native Qwen3.8-Max Cloud Chat
+routes that declare reasoning support. The total output ceiling uses
+`max_completion_tokens` there so reasoning counts toward the reserved output limit. It does not infer a numeric budget from an
+effort tier or replace a numeric budget with a tier. Explicit thinking-off or effort
+controls conflict with this budget. Other provider routes are refused before dispatch;
+unknown compatible servers are not assumed to enforce a field they might ignore.
+See [Qwen Cloud thinking budgets](https://docs.qwencloud.com/api-reference/chat/openai-chat).
 
 Numeric reasoning budgets on Chat (`reasoning.max_tokens` or `thinking.budget_tokens`) are
 refused rather than approximated by an effort tier. Use Messages with a budget-capable model,

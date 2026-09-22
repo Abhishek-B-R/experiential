@@ -2504,3 +2504,35 @@ def test_large_tool_description_reaches_provider_unchanged(
     forwarded = cast(JsonObject, tools[0]["function"])
     assert forwarded["description"] == description
     assert marker not in (engine.root / "driver-stderr.log").read_text()
+
+
+@pytest.mark.parametrize("stream", (False, True))
+def test_chat_responses_spelling_of_output_limit_serves(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """The Chat endpoint accepts max_output_tokens and retains length-stop semantics."""
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "silent-stop-token"}],
+            "max_output_tokens": 40,
+            "stream": stream,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        chunks = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert any(
+            choice.get("finish_reason") == "length"
+            for chunk in chunks
+            for choice in chunk.get("choices", [])
+        )
+    else:
+        assert response.json()["choices"][0]["finish_reason"] == "length"

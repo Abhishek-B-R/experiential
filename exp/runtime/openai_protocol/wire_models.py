@@ -506,13 +506,9 @@ class _ThinkingConfig(_WireModel):
     """Anthropic-style ``thinking`` config on a Chat request.
 
     Translated to the canonical reasoning control: ``enabled`` and ``adaptive``
-    turn thinking on at the model's default effort (``adaptive`` is the only
-    on-mode Anthropic's 4.6+ generation accepts, and the value Anthropic SDKs
-    and Claude-configured clients send on every model), ``disabled`` maps to
+    turn thinking on at the model's default effort; ``disabled`` maps to
     ``reasoning_effort=none``. ``budget_tokens`` has no canonical equivalent
-    and is disclosed as not carried. 3,935 Chat requests over 7 days (19
-    organizations, Claude and MiniMax routes alike) were refused at decode for
-    sending ``adaptive`` before it was admitted here (2026-09-15).
+    and is rejected when present.
     """
 
     type: Literal["enabled", "disabled", "adaptive"]
@@ -538,6 +534,7 @@ class _ChatRequest(_WireModel):
     parallel_tool_calls: bool | None = None
     max_tokens: int | None = Field(default=None, gt=0)
     max_completion_tokens: int | None = Field(default=None, gt=0)
+    max_output_tokens: int | None = Field(default=None, gt=0, strict=True)
     stop: str | tuple[str, ...] | None = None
     n: int | None = None
     """Completion-count selector, accepted only at its no-op default of 1.
@@ -589,11 +586,11 @@ class _ChatRequest(_WireModel):
     reasoning: _ChatReasoning | None = None
     thinking: _ThinkingConfig | None = None
     chat_template_kwargs: _ChatTemplateKwargs | None = None
+    thinking_budget: int | None = Field(default=None, gt=0, strict=True)
     enable_thinking: bool | None = None
     """DashScope's top-level enable-thinking switch (``extra_body``), translated
     like the vLLM ``chat_template_kwargs`` spelling: Qwen-family clients send it
-    on every request (4,658 rejections across 110 organizations in the 7 days
-    to 2026-09-15)."""
+    on every request."""
     response_format: _ChatResponseFormat | None = None
     stream: bool = False
     stream_options: _ChatStreamOptions | None = None
@@ -617,8 +614,16 @@ class _ChatRequest(_WireModel):
     @model_validator(mode="after")
     def _require_coherent_options(self) -> _ChatRequest:
         """Reject conflicting token ceilings and non-stream usage options."""
-        if self.max_tokens is not None and self.max_completion_tokens is not None:
-            raise ValueError("max_tokens and max_completion_tokens are mutually exclusive")
+        if (
+            sum(
+                v is not None
+                for v in (self.max_tokens, self.max_completion_tokens, self.max_output_tokens)
+            )
+            > 1
+        ):
+            raise ValueError(
+                "max_tokens, max_completion_tokens and max_output_tokens are mutually exclusive"
+            )
         if self.stream_options is not None and not self.stream:
             raise ValueError("stream_options requires stream=true")
         return self
