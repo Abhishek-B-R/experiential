@@ -120,6 +120,7 @@ pub(crate) async fn chat(
         "idempotency_key": idempotency_key,
         "client_request_id": client_request_id,
         "client_ip": client_ip(&headers),
+        "capture_session_id": crate::capture::session_id(&headers),
     }));
     let admission_text = match state.bridge.call("admit", admit_argument).await {
         Ok(text) => text,
