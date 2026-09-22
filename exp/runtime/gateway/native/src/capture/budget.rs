@@ -87,6 +87,18 @@ pub(super) fn encode(value: &impl Serialize, maximum: usize) -> Option<String> {
             if bytes.len() > self.maximum.saturating_sub(self.bytes.len()) {
                 return Err(io::Error::other("capture record exceeds storage budget"));
             }
+            let required = self.bytes.len() + bytes.len();
+            if required > self.bytes.capacity() {
+                // Geometric growth must not retain spare capacity beyond the
+                // destination's UTF-8 preparation reservation.
+                let capacity = self
+                    .bytes
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(required)
+                    .min(self.maximum);
+                self.bytes.reserve_exact(capacity - self.bytes.len());
+            }
             self.bytes.extend_from_slice(bytes);
             Ok(bytes.len())
         }

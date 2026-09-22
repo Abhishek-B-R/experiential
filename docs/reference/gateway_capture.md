@@ -91,7 +91,11 @@ worker also reserves space for its prepared payload before any queue admission.
 The Python destination reserves five times the encoded-payload limit plus 256 bytes:
 one UTF-8 encoding, a worst-case four-byte Unicode string and object overhead.
 Queued content uses the remaining budget, so a full queue cannot prevent preparing
-its first record. Configurations without room for both are rejected. The reservation
+its first record. The remainder must be at least the encoded-record ceiling;
+configurations below that minimum are rejected in Python and Rust. Structured
+records must also fit their charged heap budget; encoded length is not a heap-size
+estimate. The UTF-8 encoder caps allocated capacity as well as payload length.
+The reservation
 is included in retained-byte counters while the worker prepares or retries a write.
 String/vector capacity and conservative object-node charges are included; shared trees are charged
 in every owning queue. The writer additionally owns one bounded response's decoded

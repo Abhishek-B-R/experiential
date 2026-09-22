@@ -162,6 +162,35 @@ def test_python_and_rust_configuration_fail_closed() -> None:
         native.CaptureCollector(json.dumps(invalid), lambda _: None)
 
 
+@pytest.mark.parametrize("maximum_bytes", [5 * 1024 + 257, 6 * 1024 + 255])
+def test_preparation_must_leave_a_full_record_budget(maximum_bytes: int) -> None:
+    """Do not accept a configuration whose preparation crowds out its queue."""
+    with pytest.raises(ValueError, match="preparation"):
+        CaptureDeliveryLimits(maximum_record_bytes=1024, maximum_bytes=maximum_bytes)
+    invalid = CaptureConfiguration().model_dump(mode="json")
+    invalid["delivery"] = {
+        "maximum_records": 1,
+        "maximum_record_bytes": 1024,
+        "maximum_bytes": maximum_bytes,
+    }
+    with pytest.raises(ValueError, match="preparation"):
+        native.CaptureCollector(json.dumps(invalid), lambda _: None)
+
+
+def test_exact_preparation_and_record_budget_boundary_is_valid() -> None:
+    """The exact queue-plus-preparation boundary admits and persists a record."""
+    delivery = CaptureDeliveryLimits(maximum_record_bytes=8192, maximum_bytes=6 * 8192 + 256)
+    records: list[str] = []
+    collector = native.CaptureCollector(
+        CaptureConfiguration(delivery=delivery).model_dump_json(), records.append
+    )
+    assert collector.begin(_request_json())
+    collector.settle("request", True, False)
+    assert collector.close(1)
+    assert len(records) == 1
+    assert collector.counts() == (0, 0, 1, 0, 0, 0)
+
+
 def test_prepared_python_unicode_payload_is_inside_delivery_memory_budget() -> None:
     """A wide Unicode string remains charged while a paused destination retains it."""
     entered, resume = threading.Event(), threading.Event()

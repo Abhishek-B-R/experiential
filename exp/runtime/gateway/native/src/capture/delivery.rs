@@ -108,8 +108,8 @@ impl Delivery {
         let maximum_queued_bytes = limits
             .maximum_bytes
             .checked_sub(preparation_bytes)
-            .filter(|available| *available > 0)
-            .ok_or("capture byte budget must fit destination preparation and queued content")?;
+            .filter(|available| *available >= limits.maximum_record_bytes)
+            .ok_or("capture byte budget must fit destination preparation and one record")?;
         let (sender, receiver) = mpsc::sync_channel::<Pending>(limits.maximum_records);
         let counters = Arc::new(Counters::default());
         let worker_counters = counters.clone();

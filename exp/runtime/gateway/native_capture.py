@@ -39,10 +39,8 @@ class CaptureDeliveryLimits(ContractModel):
     @model_validator(mode="after")
     def _validate_budget(self) -> CaptureDeliveryLimits:
         """Reserve one worker's preparation allocation outside queued content."""
-        if self.maximum_bytes <= 5 * self.maximum_record_bytes + 256:
-            raise ValueError(
-                "capture byte budget must fit destination preparation and queued content"
-            )
+        if self.maximum_bytes < 6 * self.maximum_record_bytes + 256:
+            raise ValueError("capture byte budget must fit destination preparation and one record")
         return self
 
 
