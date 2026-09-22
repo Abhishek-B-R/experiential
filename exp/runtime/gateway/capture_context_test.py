@@ -3,9 +3,77 @@
 import json
 from unittest.mock import patch
 
+import pytest
+
+from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.capture_context import capture_request_context, restore_capture_context
 from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.replay_identity import canonical_request_sha256, provider_replay_authority
 from exp.runtime.openai_protocol.requests import decode_chat
+
+
+@pytest.mark.parametrize("visible", ["Compare α and 雪.\n", "line one\x00line two\t"])
+def test_sealed_messages_history_retains_visible_reasoning_only_for_capture(visible: str) -> None:
+    """Visible history survives capture without joining authenticated provider replay."""
+    carrier = "x-experiential-hunyuan-reasoning-v1:ZGVwbG95bWVudC0x:c2VhbGVkLWVudmVsb3Bl"
+    request = decode_messages(
+        {
+            "model": "coding",
+            "max_tokens": 128,
+            "messages": [
+                {"role": "user", "content": "Inspect the environment."},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": visible, "signature": ""},
+                        {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {}},
+                        {"type": "redacted_thinking", "data": carrier},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "call-1", "content": "done"}
+                    ],
+                },
+            ],
+        }
+    ).request
+    before = request.model_dump_json()
+    authority = provider_replay_authority(request)
+    digest = canonical_request_sha256(request)
+    context = capture_request_context(request)
+    assert context is not None
+    restored = restore_capture_context(context)
+    provider = restored["provider_context"]
+    assert isinstance(provider, dict)
+    replay = provider["provider_replay"]
+    assert isinstance(replay, list)
+    assistant = next(
+        entry for entry in replay if isinstance(entry, dict) and entry["message_index"] == 1
+    )
+    assert isinstance(assistant, dict)
+    assert assistant["provider_reasoning"] == [
+        {"kind": "sealed_reasoning_content", "carrier": carrier, "deployment_hint": "deployment-1"},
+        {"kind": "exposed_reasoning_content", "content": visible},
+    ]
+    assert request.model_dump_json() == before
+    assert provider_replay_authority(request) == authority
+    assert canonical_request_sha256(request) == digest
+    without_visible_copy = request.model_copy(
+        update={
+            "messages": tuple(
+                message.model_copy(update={"capture_only_reasoning": ()})
+                for message in request.messages
+            )
+        }
+    )
+    assert canonical_request_sha256(without_visible_copy) == digest
+    assert provider_replay_authority(without_visible_copy) == authority
+    assert [block.kind for block in request.messages[1].provider_reasoning] == [
+        "sealed_reasoning_content"
+    ]
+    assert capture_request_context(request, maximum_bytes=1) is None
 
 
 def test_storable_context_is_encoded_once_without_a_normalization_copy() -> None:
