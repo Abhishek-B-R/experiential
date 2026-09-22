@@ -24,6 +24,7 @@ _SECRET_KEY = re.compile(
 _SECRET_TEXT = re.compile(
     r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+|\b(?:sk-(?:ant-|proj-)?|xpl_)[A-Za-z0-9_-]{12,}"
 )
+_INVALID_TOOL_ARGUMENTS = "[REDACTED_INVALID_TOOL_ARGUMENTS]"
 
 
 @dataclass(frozen=True)
@@ -410,7 +411,9 @@ def _sanitize(value: JsonValue, depth: int = 0) -> JsonValue:
         for key, item in value.items():
             if _SECRET_KEY.fullmatch(key):
                 result[key] = "[REDACTED]"
-            elif key == "arguments" and isinstance(item, str):
+            elif key == "delta" and value.get("type") == "response.function_call_arguments.delta":
+                result[key] = _INVALID_TOOL_ARGUMENTS
+            elif key in {"arguments", "capture_partial_input"} and isinstance(item, str):
                 result[key] = _sanitize_arguments(item, depth + 1)
             else:
                 result[key] = _sanitize(item, depth + 1)
@@ -423,7 +426,7 @@ def _sanitize(value: JsonValue, depth: int = 0) -> JsonValue:
 
 
 def _sanitize_arguments(value: str, depth: int) -> str:
-    """Apply the same credential rules to JSON tool arguments without changing benign text."""
+    """Preserve benign JSON formatting and redact arguments that cannot be safely parsed."""
     if depth > 48:
         return "[REDACTED_DEEP_VALUE]"
     try:
@@ -431,7 +434,7 @@ def _sanitize_arguments(value: str, depth: int) -> str:
     except RecursionError:
         return "[REDACTED_DEEP_VALUE]"
     except ValueError:
-        return _SECRET_TEXT.sub("[REDACTED]", value)
+        return _INVALID_TOOL_ARGUMENTS
     if isinstance(parsed, dict | list):
         sanitized = _sanitize(parsed, depth)
         if sanitized != parsed:

@@ -52,7 +52,8 @@ Advanced users can repeat `--domain HOST` to replace the defaults with an exact 
 `exp capture --domain api.openai.com`. The filter applies across applications. Only supported
 model request paths produce uploaded traces; authentication and unrelated web requests are
 forwarded without retaining their bodies.
-Captured traces include prompts, responses, and tool content. Credential headers are never
+Captured traces include prompts, responses, and tool content. Incomplete or malformed structured
+tool arguments are replaced with a redaction marker. Credential headers are never
 copied into uploaded traces. This is separate from anonymous aggregate product telemetry.
 
 The first run creates a private local certificate authority with critical X.509 name constraints

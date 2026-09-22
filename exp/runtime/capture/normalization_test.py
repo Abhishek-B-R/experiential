@@ -152,25 +152,103 @@ def test_json_tool_arguments_redact_known_credentials_in_every_uploaded_copy(
 
 @pytest.mark.parametrize(
     "arguments",
-    ["echo hello", '{"query": ', ' { "query" : ["keep formatting", 2] }\n', '"a scalar"'],
+    [' { "query" : ["keep formatting", 2] }\n', '"a scalar"'],
 )
-def test_benign_or_malformed_tool_arguments_keep_original_string(arguments: str) -> None:
-    """Argument redaction never reformats benign JSON or destroys unfinished tool text."""
+def test_benign_json_tool_arguments_keep_original_string(arguments: str) -> None:
+    """Argument redaction never reformats benign valid JSON."""
     request = {"model": "gpt-test", "input": [{"type": "function_call", "arguments": arguments}]}
     attributes = _attributes(_exchange(request=json.dumps(request).encode()))
     assert json.loads(str(attributes["exp.capture.request"]))["input"][0]["arguments"] == arguments
 
 
-def test_malformed_tool_arguments_still_redact_known_token_patterns() -> None:
-    """Incomplete JSON continues to receive the existing text token redaction."""
+@pytest.mark.parametrize(
+    "arguments", ['{"password":"ordinary-secret', "Bearer ordinary-secret", ""]
+)
+def test_malformed_tool_arguments_are_redacted(arguments: str) -> None:
+    """Unreadable arguments cannot skip field-aware credential redaction."""
     request = {
         "model": "gpt-test",
-        "input": [{"type": "function_call", "arguments": '{"value": "Bearer SYNTHETIC-CANARY'}],
+        "input": [{"type": "function_call", "arguments": arguments}],
     }
+    exchange = _exchange(request=json.dumps(request).encode())
+    payload = normalize_exchange(exchange, max_body_bytes=4096)
+    assert b"ordinary-secret" not in payload
+    attributes = _attributes(exchange)
+    captured = json.loads(str(attributes["exp.capture.request"]))
+    assert captured["input"][0]["arguments"] == "[REDACTED_INVALID_TOOL_ARGUMENTS]"
+
+
+@pytest.mark.parametrize("protocol", ["responses", "chat", "messages"])
+def test_interrupted_tool_streams_redact_partial_credentials_everywhere(protocol: str) -> None:
+    """Incomplete tool JSON and isolated argument fragments cannot survive in raw events."""
+    canary = "SYNTHETIC_PARTIAL_PASSWORD_CANARY"
+    fragments = ['{"password":"', canary]
+    events: list[JsonObject]
+    if protocol == "responses":
+        events = [
+            {"type": "response.output_text.delta", "delta": "retain ordinary output"},
+        ]
+        for fragment in fragments:
+            events.append({"type": "response.function_call_arguments.delta", "delta": fragment})
+    elif protocol == "chat":
+        events = [
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "content": "retain ordinary output" if index == 0 else "",
+                            "tool_calls": [{"index": 0, "function": {"arguments": fragment}}],
+                        },
+                    }
+                ]
+            }
+            for index, fragment in enumerate(fragments)
+        ]
+    else:
+        events = [
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": "retain ordinary output"},
+            },
+            {
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "tool_use", "id": "tool", "name": "lookup", "input": {}},
+            },
+        ]
+        for fragment in fragments:
+            events.append(
+                {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "input_json_delta", "partial_json": fragment},
+                }
+            )
+    body = b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events)
     payload = normalize_exchange(
-        _exchange(request=json.dumps(request).encode()), max_body_bytes=4096
+        _exchange(
+            protocol=protocol,
+            response=body,
+            response_content_type="text/event-stream",
+            failed=True,
+        ),
+        max_body_bytes=4096,
     )
-    assert b"SYNTHETIC-CANARY" not in payload
+    assert canary.encode() not in payload
+    assert b"[REDACTED_INVALID_TOOL_ARGUMENTS]" in payload
+    assert b"retain ordinary output" in payload
+
+
+def test_custom_tool_freeform_input_remains_captured() -> None:
+    """Custom tool input uses its own freeform field and is unaffected by JSON argument rules."""
+    request = {
+        "model": "gpt-test",
+        "input": [{"type": "custom_tool_call", "name": "shell", "input": "echo hello"}],
+    }
+    attributes = _attributes(_exchange(request=json.dumps(request).encode()))
+    assert json.loads(str(attributes["exp.capture.request"]))["input"][0]["input"] == "echo hello"
 
 
 @pytest.mark.parametrize("nesting", [60, 1500])
