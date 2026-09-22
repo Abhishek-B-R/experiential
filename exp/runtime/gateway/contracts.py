@@ -111,37 +111,35 @@ class GatewayApiSurface(StrEnum):
 class GatewayToolDefinition(ContractModel):
     """One caller-defined function tool with its exact JSON Schema declaration.
 
-    The description bound is deliberately generous: both providers accept
-    40k-character tool descriptions live (verified 2026-08-30), and real
-    Claude Code toolsets exceeded the earlier 8k bound. The request-body
-    size cap remains the effective total limit.
+    Descriptions are preserved without a per-field size limit. The gateway's
+    total request-body cap and provider context limits still apply.
+
+    Attributes:
+        name: Function name, between 1 and 256 characters.
+        description: Full caller description, or None when omitted.
+        parameters: Exact caller JSON Schema for function arguments.
+        strict: Whether the provider must enforce the argument schema.
+        cache_control: Optional Anthropic caching hint, excluded from serialization
+            and replay identity; dropped with disclosure on other wires.
+        eager_input_streaming: Optional Anthropic fine-grained tool-input streaming
+            selector, excluded from serialization but included in replay identity.
+        defer_loading: Optional Anthropic deferred-loading selector. The provider
+            owns validity rules for combinations of deferred tools.
+        allowed_callers: Optional Anthropic programmatic-tool caller allowlist.
+            The provider owns validity rules for caller combinations.
+        input_examples: Optional Anthropic example inputs. Excluded from ordinary
+            serialization, included in replay identity and reservation sizing.
     """
 
     name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=65_536)
+    description: str | None = None
     parameters: JsonObject
     strict: bool = False
     cache_control: JsonObject | None = Field(default=None, exclude=True)
-    """Validated caller prompt-caching hint attached to this tool definition,
-    forwarded onto the native Anthropic tool block and dropped with
-    disclosure on other wires. Like ``ToolCall.cache_control``, a cache hint
-    changes cost, not semantics: it joins neither serialization nor replay
-    identity."""
     eager_input_streaming: bool | None = Field(default=None, exclude=True)
-    """Verbatim Anthropic fine-grained tool-input streaming selector (Claude Code
-    sends it; accepted bare by the provider, verified 2026-08-30). Excluded from
-    serialization; a present value joins replay identity like every carrier below."""
     defer_loading: bool | None = Field(default=None, exclude=True)
-    """Verbatim Anthropic tool-search deferred-loading selector; the provider
-    owns the cross-tool validity rules (verified live 2026-08-30: ``false``
-    is a no-op and an all-deferred toolset is the provider's own 400)."""
     allowed_callers: tuple[str, ...] | None = Field(default=None, exclude=True)
-    """Verbatim Anthropic programmatic-tool-calling caller allowlist, accepted bare by
-    the provider (verified 2026-08-30), which stays the combination authority."""
     input_examples: tuple[JsonObject, ...] | None = Field(default=None, exclude=True)
-    """Verbatim Anthropic example tool inputs (accepted bare by the provider, verified
-    2026-08-30). Provider-visible prompt content: excluded from serialization, joins
-    replay identity, and reservation counts its bytes with the replay envelope."""
 
     def has_anthropic_tool_carriers(self) -> bool:
         """Whether any Anthropic-native tool carrier is present on this tool."""
