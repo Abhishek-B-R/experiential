@@ -17,6 +17,7 @@ os.environ.pop("CLICOLOR_FORCE", None)
 # read-only backend checks still run on the minimum supported SDK interpreter.
 collect_ignore = (
     [
+        "exp/cli/capture/display_test.py",
         "exp/cli/capture/runner_test.py",
         "exp/cli/capture/session_test.py",
         "exp/runtime/capture/certificates_test.py",
