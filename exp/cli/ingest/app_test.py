@@ -77,13 +77,24 @@ def test_ingest_stores_all_traces_without_setup_or_build(
         (["--source", "unknown"], "unsupported source"),
     ],
 )
+@pytest.mark.parametrize("color", [False, True])
 def test_bad_source_selection_has_no_side_effects(
-    tmp_path: Path, arguments: list[str], message: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: list[str],
+    message: str,
+    color: bool,
 ) -> None:
-    """Explicit source/identity validation precedes any storage or setup."""
+    """Source/identity errors stay readable in colored terminals and create no storage."""
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr(rich_utils, "FORCE_TERMINAL", color)
+    monkeypatch.setattr(rich_utils, "COLOR_SYSTEM", "standard" if color else None)
     root = tmp_path / "state"
     result = CliRunner().invoke(
-        app, ["ingest", "powerset", "--root", str(root), "--non-interactive", *arguments]
+        app,
+        ["ingest", "powerset", "--root", str(root), "--non-interactive", *arguments],
+        color=color,
     )
-    assert result.exit_code == 2 and message in result.output
+    assert ("\x1b[" in result.output) == color
+    assert result.exit_code == 2 and message in Text.from_ansi(result.output).plain
     assert not root.exists()
