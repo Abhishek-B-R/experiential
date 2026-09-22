@@ -406,15 +406,37 @@ def _sanitize(value: JsonValue, depth: int = 0) -> JsonValue:
     if depth > 48:
         return "[REDACTED_DEEP_VALUE]"
     if isinstance(value, dict):
-        return {
-            key: "[REDACTED]" if _SECRET_KEY.fullmatch(key) else _sanitize(item, depth + 1)
-            for key, item in value.items()
-        }
+        result: JsonObject = {}
+        for key, item in value.items():
+            if _SECRET_KEY.fullmatch(key):
+                result[key] = "[REDACTED]"
+            elif key == "arguments" and isinstance(item, str):
+                result[key] = _sanitize_arguments(item, depth + 1)
+            else:
+                result[key] = _sanitize(item, depth + 1)
+        return result
     if isinstance(value, list):
         return [_sanitize(item, depth + 1) for item in value]
     if isinstance(value, str):
         return _SECRET_TEXT.sub("[REDACTED]", value)
     return value
+
+
+def _sanitize_arguments(value: str, depth: int) -> str:
+    """Apply the same credential rules to JSON tool arguments without changing benign text."""
+    if depth > 48:
+        return "[REDACTED_DEEP_VALUE]"
+    try:
+        parsed: JsonValue = json.loads(value)
+    except RecursionError:
+        return "[REDACTED_DEEP_VALUE]"
+    except ValueError:
+        return _SECRET_TEXT.sub("[REDACTED]", value)
+    if isinstance(parsed, dict | list):
+        sanitized = _sanitize(parsed, depth)
+        if sanitized != parsed:
+            return json.dumps(sanitized, separators=(",", ":"), ensure_ascii=False)
+    return _SECRET_TEXT.sub("[REDACTED]", value)
 
 
 def _attribute(value: JsonValue) -> JsonObject:

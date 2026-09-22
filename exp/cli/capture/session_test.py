@@ -358,11 +358,13 @@ def test_initial_network_check_is_cancelled_with_startup(healthy_network: Mock) 
 
 
 @pytest.mark.parametrize("recovered", [True, False])
+@pytest.mark.parametrize("unrelated_failure", [False, True])
 def test_network_guard_stops_interception_before_checking_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     healthy_network: Mock,
     recovered: bool,
+    unrelated_failure: bool,
 ) -> None:
     """Persistent failure stops forwarding, then reports the actual post-stop DNS result."""
 
@@ -390,7 +392,10 @@ def test_network_guard_stops_interception_before_checking_recovery(
                 return ()
             assert "interception-disabled" in events
             events.append("recovery-checked")
-            return () if recovered else (failure,)
+            unrelated = (
+                (CaptureHealthFailure("api.anthropic.com", "dns"),) if unrelated_failure else ()
+            )
+            return unrelated + (() if recovered else (failure,))
 
         async def watch() -> CaptureHealthFailure:
             """Signal a sustained DNS regression after active capture was announced."""
@@ -402,18 +407,29 @@ def test_network_guard_stops_interception_before_checking_recovery(
         healthy_network.watch.side_effect = watch
         monkeypatch.setattr(session, "CaptureProxy", lambda **kwargs: proxy)
         message = "DNS is responding again" if recovered else "DNS.*still unavailable"
-        with pytest.raises(RuntimeError, match=message):
+        with pytest.raises(RuntimeError, match=message) as error:
             await _run_network_session(tmp_path, uploader, events)
-        assert events == ["active", "interception-disabled", "recovery-checked", "upload-close"]
+        assert "api.openai.com" in str(error.value)
+        expected = ["active", "interception-disabled", "recovery-checked", "upload-close"]
+        if unrelated_failure:
+            expected.append(
+                "DNS for api.anthropic.com is unavailable after Capture stopped; "
+                "check your connection before retrying."
+            )
+        assert events == expected
         assert proxy.serve.await_count == 1
 
     asyncio.run(run())
 
 
-def test_normal_stop_remains_quiet_and_cancels_network_monitor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, healthy_network: Mock
+@pytest.mark.parametrize("final_dns_failure", [False, True])
+def test_normal_stop_checks_dns_and_cancels_network_monitor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    healthy_network: Mock,
+    final_dns_failure: bool,
 ) -> None:
-    """A healthy Ctrl+C leaves the existing receipt path and no background monitor."""
+    """Ctrl+C stays quiet when healthy and describes a new final failure without history."""
 
     async def run() -> None:
         """Stop after native readiness while the monitor is inside a bounded DNS check."""
@@ -461,9 +477,17 @@ def test_normal_stop_remains_quiet_and_cancels_network_monitor(
 
         proxy.serve.side_effect = serve
         healthy_network.watch.side_effect = watch
+        healthy_network.check.side_effect = [
+            (),
+            (CaptureHealthFailure("api.openai.com", "dns"),) if final_dns_failure else (),
+        ]
         monkeypatch.setattr(session, "CaptureProxy", lambda **kwargs: proxy)
         monkeypatch.setattr(session, "_wait_for_proxy", wait)
-        assert await _run_network_session(tmp_path, uploader, events) == uploader.stats
+        if final_dns_failure:
+            with pytest.raises(RuntimeError, match="DNS for api.openai.com is unavailable"):
+                await _run_network_session(tmp_path, uploader, events)
+        else:
+            assert await _run_network_session(tmp_path, uploader, events) == uploader.stats
         assert cancelled.is_set()
         assert healthy_network.check.await_count == 2
         assert events == ["active"]

@@ -59,6 +59,133 @@ def test_known_usage_and_redacted_copies_normalize_through_existing_cloud_contra
     assert attributes["gen_ai.usage.output_tokens"] == 7
 
 
+@pytest.mark.parametrize("protocol", ["responses", "chat"])
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("array_arguments", [False, True])
+def test_json_tool_arguments_redact_known_credentials_in_every_uploaded_copy(
+    protocol: str, streamed: bool, array_arguments: bool
+) -> None:
+    """Request history and returned tool arguments redact known keys inside JSON strings."""
+    canary = "SYNTHETIC_CAPTURE_PASSWORD_CANARY"
+    arguments: JsonValue = {
+        "password": canary,
+        "nested": [{"api_key": canary}],
+        "query": "retain useful tool content",
+    }
+    if array_arguments:
+        arguments = [arguments]
+    encoded = json.dumps(arguments)
+    if protocol == "responses":
+        tool: JsonObject = {"type": "function_call", "name": "lookup", "arguments": encoded}
+        request: JsonObject = {"model": "gpt-test", "input": [tool]}
+        response: JsonObject = {"model": "gpt-test", "output": [tool]}
+        events = [{"type": "response.completed", "response": response}]
+    else:
+        tool = {"type": "function", "function": {"name": "lookup", "arguments": encoded}}
+        message: JsonObject = {"role": "assistant", "tool_calls": [tool]}
+        request = {"model": "gpt-test", "messages": [message]}
+        response = {"model": "gpt-test", "choices": [{"message": message}]}
+        midpoint = len(encoded) // 2
+        events = [
+            {
+                "model": "gpt-test",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {"name": "lookup", "arguments": encoded[:midpoint]},
+                                }
+                            ]
+                        },
+                    }
+                ],
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "function": {"arguments": encoded[midpoint:]}}
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            },
+        ]
+    body = (
+        b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events)
+        if streamed
+        else json.dumps(response).encode()
+    )
+    exchange = _exchange(
+        protocol=protocol,
+        request=json.dumps(request).encode(),
+        response=body,
+        response_content_type="text/event-stream" if streamed else "application/json",
+    )
+    payload = normalize_exchange(exchange, max_body_bytes=4096)
+    assert canary.encode() not in payload
+    attributes = _attributes(exchange)
+    for key in ("gen_ai.input.messages", "gen_ai.output.messages"):
+        messages = json.loads(str(attributes[key]))
+        captured_tool = messages[0] if protocol == "responses" else messages[0]["tool_calls"][0]
+        captured_arguments = (
+            captured_tool["arguments"]
+            if protocol == "responses"
+            else captured_tool["function"]["arguments"]
+        )
+        assert isinstance(captured_arguments, str)
+        decoded = json.loads(captured_arguments)
+        if array_arguments:
+            decoded = decoded[0]
+        assert decoded == {
+            "password": "[REDACTED]",
+            "nested": [{"api_key": "[REDACTED]"}],
+            "query": "retain useful tool content",
+        }
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    ["echo hello", '{"query": ', ' { "query" : ["keep formatting", 2] }\n', '"a scalar"'],
+)
+def test_benign_or_malformed_tool_arguments_keep_original_string(arguments: str) -> None:
+    """Argument redaction never reformats benign JSON or destroys unfinished tool text."""
+    request = {"model": "gpt-test", "input": [{"type": "function_call", "arguments": arguments}]}
+    attributes = _attributes(_exchange(request=json.dumps(request).encode()))
+    assert json.loads(str(attributes["exp.capture.request"]))["input"][0]["arguments"] == arguments
+
+
+def test_malformed_tool_arguments_still_redact_known_token_patterns() -> None:
+    """Incomplete JSON continues to receive the existing text token redaction."""
+    request = {
+        "model": "gpt-test",
+        "input": [{"type": "function_call", "arguments": '{"value": "Bearer SYNTHETIC-CANARY'}],
+    }
+    payload = normalize_exchange(
+        _exchange(request=json.dumps(request).encode()), max_body_bytes=4096
+    )
+    assert b"SYNTHETIC-CANARY" not in payload
+
+
+@pytest.mark.parametrize("nesting", [60, 1500])
+def test_deep_json_tool_arguments_are_bounded_and_redacted(nesting: int) -> None:
+    """Parsed deep values and parser recursion failures cannot retain known credentials."""
+    canary = "SYNTHETIC_DEEP_CREDENTIAL_CANARY"
+    arguments = "[" * nesting + json.dumps({"password": canary}) + "]" * nesting
+    request = {"model": "gpt-test", "input": [{"type": "function_call", "arguments": arguments}]}
+    payload = normalize_exchange(
+        _exchange(request=json.dumps(request).encode()), max_body_bytes=4096
+    )
+    assert canary.encode() not in payload
+    assert b"[REDACTED_DEEP_VALUE]" in payload
+
+
 def test_cancelled_sse_keeps_request_and_complete_events_without_inventing_usage() -> None:
     """Retain interrupted stream evidence without manufacturing token counts."""
     body = b'data: {"type":"response.output_text.delta","delta":"partial"}\n\ndata: {"type":'

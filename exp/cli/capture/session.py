@@ -156,10 +156,25 @@ async def run_session(
                 for sig, handler in original_signals.items():
                     loop.remove_signal_handler(sig)
                     signal.signal(sig, handler)
+    if network_failure is not None:
+        for failure in remaining_failures:
+            if failure.host != network_failure.host:
+                on_warning(
+                    f"DNS for {failure.host} is unavailable after Capture stopped; "
+                    "check your connection before retrying."
+                    if failure.kind == "dns"
+                    else f"Capture could not verify network health for {failure.host}."
+                )
+        remaining_failures = tuple(
+            failure for failure in remaining_failures if failure.host == network_failure.host
+        )
     if remaining_failures:
         failure = remaining_failures[0]
+        continued = (
+            "still " if network_failure is not None and network_failure.kind == "dns" else ""
+        )
         raise RuntimeError(
-            f"Capture stopped, but DNS for {failure.host} is still unavailable. "
+            f"Capture stopped, but DNS for {failure.host} is {continued}unavailable. "
             "Check your connection before retrying."
             if failure.kind == "dns"
             else "Capture stopped. Network health could not be verified; check your connection."
