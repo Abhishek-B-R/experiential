@@ -2195,6 +2195,74 @@ def test_two_finite_budget_runners_complete_each_cell_exactly_once(tmp_path: Pat
     assert all(rollout.stop_reason == StopReason.COMPLETED for rollout in rollouts)
 
 
+def test_tool_history_after_nonterminal_text_stays_ordered_once(tmp_path: Path) -> None:
+    """Restarted chat agents retain older turns before their local tool-call suffix."""
+    from exp.runtime.agents.chat import ChatAgentRuntime
+
+    task = _task(
+        "task-a", tools=(ToolSchema(name="lookup", description="Look up a fact", input_schema={}),)
+    )
+    cell = _cell("cell-a", task.task_id)
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_input = _persist_task_set(store, {task.task_id: task})
+    calls = tuple(ToolCall(call_id=f"call-{index}", name="lookup") for index in range(2))
+    candidate = _ScriptedClient(
+        [
+            _response("Initial answer.", snapshot=_snapshot("candidate-a")),
+            *(
+                _response("", snapshot=_snapshot("candidate-a")).model_copy(
+                    update={"output": AssistantAction(tool_calls=(call,))}
+                )
+                for call in calls
+            ),
+            _response("Verified answer.", snapshot=_snapshot("candidate-a")),
+        ]
+    )
+    world = _ScriptedClient(
+        [
+            _response(
+                '{"message":"Please verify it.","terminal":false}',
+                snapshot=_snapshot("world-model-a"),
+            ),
+            *(
+                _response(
+                    json.dumps({"tool_results": [{"call_id": call.call_id, "content": "fact"}]}),
+                    snapshot=_snapshot("world-model-a"),
+                )
+                for call in calls
+            ),
+            _response('{"message":"","terminal":true}', snapshot=_snapshot("world-model-a")),
+        ]
+    )
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_input,
+        candidate,
+        world,
+        agent_factory=lambda: ChatAgentRuntime(system_prompt="Verify the answer."),
+    )
+    result = simulator.run(_spec(plan_input, task_input, (cell.cell_id,), maximum_steps=4))
+    assert simulator._load_rollout(result.artifact_ids[0]).stop_reason == StopReason.COMPLETED
+    for index in (2, 3):
+        messages = candidate.requests[index].messages
+        assert [message.role for message in messages] == [
+            "system",
+            "user",
+            "assistant",
+            "user",
+            *(["assistant", "tool"] * (index - 1)),
+        ]
+        assert messages[2].assistant_action == AssistantAction(content="Initial answer.")
+        assert messages[3].content == "Please verify it."
+        assert [message.tool_call_id for message in messages if message.role == "tool"] == [
+            call.call_id for call in calls[: index - 1]
+        ]
+
+
 @pytest.mark.parametrize("query_padding", ["", "x" * 5_500])
 def test_simulated_tools_parallel_errors_state_and_replay(
     tmp_path: Path, query_padding: str

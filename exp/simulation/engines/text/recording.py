@@ -806,13 +806,14 @@ def _messages_with_visible_transcript(
     messages: tuple[ModelMessage, ...],
     visible_transcript: tuple[ModelMessage, ...],
 ) -> tuple[ModelMessage, ...]:
-    """Append retained visible turns unless a stateful agent already supplied that suffix."""
+    """Merge retained turns before the matching suffix owned by a restarted agent."""
     if not visible_transcript:
         return messages
-    if len(messages) >= len(visible_transcript) and messages[-len(visible_transcript) :] == (
-        visible_transcript
-    ):
-        return messages
+    for overlap in range(min(len(messages), len(visible_transcript)), 0, -1):
+        suffix = visible_transcript[-overlap:]
+        # Match a complete action boundary, never a coincidentally identical task/user prompt.
+        if suffix[0].role == "assistant" and messages[-overlap:] == suffix:
+            return (*messages[:-overlap], *visible_transcript)
     return (*messages, *visible_transcript)
 
 
