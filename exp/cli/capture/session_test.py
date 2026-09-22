@@ -406,10 +406,16 @@ def test_network_guard_stops_interception_before_checking_recovery(
         healthy_network.check.side_effect = check
         healthy_network.watch.side_effect = watch
         monkeypatch.setattr(session, "CaptureProxy", lambda **kwargs: proxy)
-        message = "DNS is responding again" if recovered else "DNS.*still unavailable"
-        with pytest.raises(RuntimeError, match=message) as error:
+        with pytest.raises(RuntimeError) as error:
             await _run_network_session(tmp_path, uploader, events)
-        assert "api.openai.com" in str(error.value)
+        expected_error = (
+            "Capture stopped after repeated DNS failures for api.openai.com. "
+            "DNS is responding again."
+            if recovered
+            else "Capture stopped, but DNS for api.openai.com is still unavailable. "
+            "Check your connection before retrying."
+        )
+        assert str(error.value) == expected_error
         expected = ["active", "interception-disabled", "recovery-checked", "upload-close"]
         if unrelated_failure:
             expected.append(
