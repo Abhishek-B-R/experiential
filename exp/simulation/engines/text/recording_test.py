@@ -28,7 +28,7 @@ from exp.common.models import (
     completion_cost_reservation,
 )
 from exp.common.rollouts import StopReason
-from exp.common.tasks import TaskCase
+from exp.common.tasks import TaskCase, ToolSchema
 from exp.runtime.models import ResolvedModel
 from exp.runtime.models.providers.openai import openai_responses_response
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
@@ -514,11 +514,11 @@ def test_recorder_rejects_tool_requests_before_any_provider_call() -> None:
     world_client = _ScriptedClient([])
     recorder = _recorder(candidate_client, world_client)
 
-    with pytest.raises(TextSimulationError, match="tool-free") as error:
+    with pytest.raises(TextSimulationError, match="declared tool schemas") as error:
         recorder.complete(
             ModelRequest(
                 messages=(ModelMessage(role="user", content="Use the system."),),
-                tool_choice="auto",
+                tools=(ToolSchema(name="unknown", description="Unknown", input_schema={}),),
             )
         )
 

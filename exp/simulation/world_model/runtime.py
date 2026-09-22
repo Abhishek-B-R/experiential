@@ -24,7 +24,9 @@ from exp.common.tasks import TaskCase
 from exp.simulation.engines.text.prompt import (
     TextWorldModelTransition,
     build_world_model_request,
+    candidate_rag_action,
     parse_world_model_transition,
+    validate_transition_action,
 )
 from exp.simulation.retrieval import (
     RAGAction,
@@ -50,6 +52,7 @@ class PreparedGroundedWorldModelCall:
 
     request: ModelRequest
     matches: tuple[RAGMatch, ...]
+    action: AssistantAction
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,7 @@ class DispatchedGroundedWorldModelCall:
     request: ModelRequest
     response: ModelResponse
     matches: tuple[RAGMatch, ...]
+    action: AssistantAction
 
 
 @dataclass(frozen=True)
@@ -88,6 +92,7 @@ class GroundedWorldModel:
         candidate_response: AssistantAction,
         excluded_lineage_ids: tuple[str, ...],
         maximum_output_tokens: int,
+        state: JsonObject | None = None,
     ) -> PreparedGroundedWorldModelCall:
         """Retrieve and frame one fit- or serving-bound grounded text transition.
 
@@ -97,16 +102,15 @@ class GroundedWorldModel:
             candidate_response: Latest visible candidate action.
             excluded_lineage_ids: Source lineages forbidden from retrieval.
             maximum_output_tokens: Explicit provider output ceiling.
+            state: Private environment state retained between simulated turns.
 
         Returns:
             Exact request and retrieved evidence before provider dispatch.
         """
-        if candidate_response.content is None:
-            raise ValueError("grounded text simulation requires a visible candidate message")
         query = RAGQuery(
             task=task.instruction,
             initial_context=task.initial_context,
-            action=RAGAction(kind="message", content=candidate_response.content),
+            action=candidate_rag_action(candidate_response),
             excluded_lineage_ids=excluded_lineage_ids,
             top_k=self.artifact.top_k,
         )
@@ -117,8 +121,11 @@ class GroundedWorldModel:
             candidate_response=candidate_response,
             grounded_examples=matches,
             maximum_output_tokens=maximum_output_tokens,
+            state=state,
         )
-        return PreparedGroundedWorldModelCall(request=request, matches=matches)
+        return PreparedGroundedWorldModelCall(
+            request=request, matches=matches, action=candidate_response
+        )
 
     def complete_turn(
         self,
@@ -137,6 +144,7 @@ class GroundedWorldModel:
             request=prepared.request,
             response=response,
             matches=prepared.matches,
+            action=prepared.action,
         )
 
     def parse_turn(
@@ -151,11 +159,13 @@ class GroundedWorldModel:
         Returns:
             Completed grounded call with its parsed visible transition.
         """
+        transition = parse_world_model_transition(dispatched.response.output)
+        validate_transition_action(transition, dispatched.action)
         return GroundedWorldModelCall(
             request=dispatched.request,
             response=dispatched.response,
             matches=dispatched.matches,
-            transition=parse_world_model_transition(dispatched.response.output),
+            transition=transition,
         )
 
     def step(

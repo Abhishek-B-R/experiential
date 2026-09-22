@@ -504,7 +504,7 @@ def _spec(
             WorldModelSettings(
                 world_model_alias="world-model-a",
                 grounded_world_model_input=grounded_input,
-                prompt_version="text-world-model-v1",
+                prompt_version="text-world-model-v2",
                 query_embedding=EmbeddingCostReservation(
                     model=_snapshot("world-model-a").model_copy(update={"model_id": "embedder-a"}),
                     input_usd_per_million_tokens=0.0,
