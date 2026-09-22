@@ -349,23 +349,22 @@ def build(
         if dry_run:
             _console.print("[green]dry run complete[/green] No provider calls or build selection.")
             return
-        if built is None:
-            if estimate is not None and estimate > maximum_build_cost_usd:
-                raise ValueError(
-                    over_ceiling_message(
-                        estimate=estimate,
-                        ceiling=maximum_build_cost_usd,
-                        project=project,
-                        trace_file=trace_file,
-                        import_id=import_id,
-                        source=source,
-                        root=root,
-                        world_model=world_model,
-                        judge=judge,
-                        embedder=embedder,
-                        top_k=top_k,
-                    )
+        if built is None and estimate is not None and estimate > maximum_build_cost_usd:
+            raise ValueError(
+                over_ceiling_message(
+                    estimate=estimate,
+                    ceiling=maximum_build_cost_usd,
+                    project=project,
+                    trace_file=trace_file,
+                    import_id=import_id,
+                    source=source,
+                    root=root,
+                    world_model=world_model,
+                    judge=judge,
+                    embedder=embedder,
+                    top_k=top_k,
                 )
+            )
         if not require_spend_consent(
             _console,
             root=root,
