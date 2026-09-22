@@ -40,8 +40,6 @@ from exp.runtime.gateway.native_admission import record_dead_admission_rungs
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
 from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_images_body
 from exp.runtime.gateway.native_execution import (
-    MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
-    MAXIMUM_TOTAL_ATTEMPTS,
     InflightRequest,
     NativeDialectUnavailableError,
     deployment_wire_entry,
@@ -98,7 +96,7 @@ class NativeImagesMixin:
         Returns:
             JSON wire configuration carrying the ordered ``route`` (one OpenAI-wire
             entry per deployment), ``image_count`` (the requested ``n``), and the
-            frozen retry-policy facts, or an ``{"escalate": reason}`` disposition.
+            selected provider payloads, or an ``{"escalate": reason}`` disposition.
 
         Raises:
             NativeBridgeError: Decoding, authorization, or routing failed, or no
@@ -251,8 +249,6 @@ def _admit_accepted(
         "route_reason": route.route_reason,
         "route": wire_route,
         "image_count": request.n,
-        "maximum_total_attempts": MAXIMUM_TOTAL_ATTEMPTS,
-        "maximum_same_deployment_attempts": MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
     }
     return json.dumps(response, separators=(",", ":"))
 

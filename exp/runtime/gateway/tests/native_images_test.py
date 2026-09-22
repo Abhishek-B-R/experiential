@@ -21,6 +21,7 @@ import time
 import zlib
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import httpx
 import openai
@@ -36,6 +37,8 @@ from exp.common.models import (
 from exp.common.models.catalog_prices import GatewayImagePrices
 from exp.runtime.gateway.catalog_authority import upsert_singleton_deployment
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
+from exp.runtime.gateway.native_bridge_test import _configured_pool_gateway
+from exp.runtime.gateway.tests.launch_test import _ServedGateway, _unused_port
 from exp.runtime.gateway.tests.native_messages_test import (
     _DRIVER_SOURCE,
     _HOST,
@@ -402,3 +405,50 @@ def test_sdk_does_not_retry_a_failed_generation(engine: _ServingEngine) -> None:
         client.images.generate(model="painter", prompt="server-error")
     with _ImagesUpstream.payloads_lock:
         assert len(_ImagesUpstream.payloads) == before + 1
+
+
+def test_conditional_fallback_cannot_repeat_a_failed_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A matching conditional fallback never authorizes a second image dispatch."""
+
+    class ConditionalUpstream(_ImagesUpstream):
+        """Isolated provider counters for the two-rung image route."""
+
+        openrouter = False
+        payloads: list[JsonObject] = []
+
+    upstream = ThreadingHTTPServer((_HOST, 0), ConditionalUpstream)
+    thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://{_HOST}:{upstream.server_port}/v1"
+    _manager, raw_key = _configured_pool_gateway(
+        tmp_path,
+        base_urls=(url, url),
+        model_capabilities=(
+            ModelCapabilities(supports_image_generation=True),
+            ModelCapabilities(supports_image_generation=True),
+        ),
+        gateway_capabilities=(
+            GatewayDeploymentCapabilities(),
+            GatewayDeploymentCapabilities(failover_only_on=("provider_internal",)),
+        ),
+    )
+    monkeypatch.setenv("TEST_PROVIDER_KEY", "synthetic-provider-key")
+    gateway = _ServedGateway(tmp_path, _unused_port())
+    try:
+        gateway.start()
+        reply = httpx.post(
+            f"http://{_HOST}:{gateway.port}/v1/images/generations",
+            headers={"authorization": f"Bearer {raw_key}"},
+            json={"model": "coding", "prompt": "server-error"},
+            timeout=10,
+        )
+        assert reply.status_code == 502
+        assert reply.headers["x-should-retry"] == "false"
+        assert len(ConditionalUpstream.payloads) == 1
+    finally:
+        gateway.stop()
+        upstream.shutdown()
+        upstream.server_close()
+        thread.join(timeout=2)

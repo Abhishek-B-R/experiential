@@ -5,7 +5,8 @@
 //! OpenAI-wire `/images/generations` payload per certified deployment and the
 //! ladder below reserves each attempt through `start_attempt`, POSTs the
 //! payload, buffers the JSON answer under the retained-output cap, validates
-//! it against the request (one image per requested `n`, a reported token
+//! it against the request (up to `n` images for OpenRouter, exactly `n` on
+//! other wires, a reported token
 //! usage), and settles the winning attempt with the provider's prompt and
 //! image token counts. A provider that answers without usage (the per-image
 //! priced dall-e models) is refused as an unbillable answer until the typed
@@ -35,7 +36,7 @@ use crate::respond::{
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
 use crate::upstream::open_stream;
-use crate::waterfall::{successor_possible, DeploymentWire, RoutePolicy, StartResponse};
+use crate::waterfall::{DeploymentWire, StartResponse};
 
 /// The wire configuration returned by one successful images admission.
 #[derive(Debug, Clone, Deserialize)]
@@ -46,21 +47,8 @@ struct ImagesAdmission {
     exact_model_id: String,
     route_reason: String,
     route: Vec<DeploymentWire>,
-    /// The requested `n`; the provider must answer with exactly this many images.
+    /// The requested `n`: OpenRouter may return fewer, other wires require exactly n.
     image_count: usize,
-    maximum_total_attempts: u32,
-    maximum_same_deployment_attempts: u32,
-}
-
-impl ImagesAdmission {
-    fn policy(&self) -> RoutePolicy {
-        RoutePolicy {
-            maximum_total_attempts: self.maximum_total_attempts.max(1),
-            maximum_same_deployment_attempts: self.maximum_same_deployment_attempts.max(1),
-            refusal_failover: false,
-            throttle_redial: None,
-        }
-    }
 }
 
 struct Served {
@@ -120,7 +108,7 @@ pub(crate) async fn images(
     };
     let _permit = permit;
 
-    match run_ladder(&state, &admission, &raw_key, &mut guard, deadline).await {
+    match run_once(&state, &admission, &raw_key, &mut guard, deadline).await {
         Err(error) => error_response(&error),
         Ok(served) => {
             if !guard
@@ -146,65 +134,31 @@ fn error_response(error: &PublicError) -> Response {
     response
 }
 
-/// Walk the certified ladder to one validated provider answer or the public
-/// error of the exhausting failure (same contract as the embeddings ladder).
-async fn run_ladder(
+/// Dispatch the admitted candidate once. No failure can dispatch another generation.
+async fn run_once(
     state: &AppState,
     admission: &ImagesAdmission,
     raw_key: &str,
     guard: &mut AttemptGuard,
     deadline: Instant,
 ) -> Result<Served, PublicError> {
-    let policy = admission.policy();
-    let mut total_attempts: u32 = 0;
-    let mut counts: Vec<u32> = vec![0; admission.route.len()];
-    let mut current_depth: Option<usize> = None;
-    let mut last_failure: Option<Failure> = None;
-    loop {
-        let argument = compact_json(&json!({
-            "request_id": admission.request_id,
-            "raw_key": raw_key,
-            "attempt_ordinal": total_attempts,
-            "current_depth": current_depth,
-            "failure": last_failure.as_ref().map(|failure| json!({
-                "failure_class": failure.failure_class.as_str(),
-                "safe_message": failure.safe_message,
-                "retryable_same_deployment": failure.retryable_same_deployment,
-                "failover_eligible": failure.failover_eligible,
-                "rejected_parameter": failure.rejected_parameter,
-                "provider_detail": failure.provider_detail,
-            })),
-        }));
-        let started_text = match state.bridge.call("start_attempt", argument).await {
-            Ok(text) => text,
-            Err(error) => {
-                guard.disarm_finalized("failed");
-                return Err(error);
-            }
-        };
-        let started: StartResponse = match serde_json::from_str(&started_text) {
-            Ok(started) => started,
-            Err(_) => {
-                guard
-                    .abandon(&Failure::new(
-                        FailureClass::Internal,
-                        "gateway attempt wire contract failed",
-                    ))
-                    .await;
-                return Err(PublicError::internal());
-            }
-        };
-        if started.exhausted {
+    let argument = compact_json(&json!({
+        "request_id": admission.request_id,
+        "raw_key": raw_key,
+        "attempt_ordinal": 0,
+        "current_depth": null,
+        "failure": null,
+    }));
+    let started_text = match state.bridge.call("start_attempt", argument).await {
+        Ok(text) => text,
+        Err(error) => {
             guard.disarm_finalized("failed");
-            let failure = started.failure.or(last_failure).unwrap_or_else(|| {
-                Failure::new(
-                    FailureClass::ProviderInternal,
-                    "all exact-model deployments are unavailable",
-                )
-            });
-            return Err(collection_public_error(&failure.boundary()));
+            return Err(error);
         }
-        let (Some(attempt_id), Some(depth)) = (started.attempt_id, started.route_depth) else {
+    };
+    let started: StartResponse = match serde_json::from_str(&started_text) {
+        Ok(started) => started,
+        Err(_) => {
             guard
                 .abandon(&Failure::new(
                     FailureClass::Internal,
@@ -212,57 +166,56 @@ async fn run_ladder(
                 ))
                 .await;
             return Err(PublicError::internal());
-        };
-        let Some(wire) = admission.route.get(depth) else {
-            guard.rebind(attempt_id);
-            let failure = Failure::new(
+        }
+    };
+    if started.exhausted {
+        guard.disarm_finalized("failed");
+        let failure = started.failure.unwrap_or_else(|| {
+            Failure::new(
+                FailureClass::ProviderInternal,
+                "all exact-model deployments are unavailable",
+            )
+        });
+        return Err(collection_public_error(&failure.boundary()));
+    }
+    let (Some(attempt_id), Some(depth)) = (started.attempt_id, started.route_depth) else {
+        guard
+            .abandon(&Failure::new(
                 FailureClass::Internal,
                 "gateway attempt wire contract failed",
-            );
-            guard
-                .settle("failed", None, &[], Some(&failure), true)
-                .await;
-            return Err(PublicError::internal());
-        };
-        if current_depth == Some(depth) {
-            METRICS.record_open_retry();
-        }
+            ))
+            .await;
+        return Err(PublicError::internal());
+    };
+    let Some(wire) = admission.route.get(depth) else {
         guard.rebind(attempt_id);
-        total_attempts += 1;
-        counts[depth] += 1;
-        match dispatch(&state.http, wire, deadline, admission).await {
-            Ok((body, usage)) => return Ok(Served { depth, body, usage }),
-            Err((failure, opened, usage)) => {
-                // No provider idempotency contract protects image generation.
-                // Even a header timeout or 5xx can follow completed billable work.
-                let failure = failure.with_retry(false, false);
-                if opened {
-                    guard.mark_opened();
-                }
-                let boundary = failure.clone().boundary();
-                let possible = successor_possible(
-                    policy,
-                    &admission.route,
-                    deadline,
-                    total_attempts,
-                    counts[depth],
-                    depth,
-                    &failure,
-                    false,
-                );
-                if !guard
-                    .settle("failed", usage.as_deref(), &[], Some(&boundary), !possible)
-                    .await
-                {
-                    return Err(PublicError::internal());
-                }
-                if possible {
-                    current_depth = Some(depth);
-                    last_failure = Some(failure);
-                    continue;
-                }
-                return Err(collection_public_error(&boundary));
+        let failure = Failure::new(
+            FailureClass::Internal,
+            "gateway attempt wire contract failed",
+        );
+        guard
+            .settle("failed", None, &[], Some(&failure), true)
+            .await;
+        return Err(PublicError::internal());
+    };
+    guard.rebind(attempt_id);
+    match dispatch(&state.http, wire, deadline, admission).await {
+        Ok((body, usage)) => Ok(Served { depth, body, usage }),
+        Err((failure, opened, usage)) => {
+            // No provider idempotency contract protects image generation.
+            // Even a header timeout or 5xx can follow completed billable work.
+            let failure = failure.with_retry(false, false);
+            if opened {
+                guard.mark_opened();
             }
+            let boundary = failure.clone().boundary();
+            if !guard
+                .settle("failed", usage.as_deref(), &[], Some(&boundary), true)
+                .await
+            {
+                return Err(PublicError::internal());
+            }
+            Err(collection_public_error(&boundary))
         }
     }
 }
@@ -354,7 +307,8 @@ fn malformed(reason: &str) -> Failure {
 }
 
 /// Validate one provider `/images/generations` body against the admitted
-/// request and rebuild it as the public answer: exactly `n` images, each a
+/// request and rebuild it as the public answer: up to `n` images on OpenRouter,
+/// exactly `n` on other wires, each a
 /// `b64_json` or `url` string (passed through untouched, with any
 /// `revised_prompt`), and a billable token usage. The public body keeps the
 /// provider's `created`, `usage`, and the echoed rendering facts.
@@ -525,8 +479,6 @@ mod tests {
             route_reason: "direct".to_string(),
             route: Vec::new(),
             image_count,
-            maximum_total_attempts: 8,
-            maximum_same_deployment_attempts: 2,
         }
     }
 
