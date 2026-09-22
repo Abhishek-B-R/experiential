@@ -54,6 +54,7 @@ fn record(id: &str) -> Record {
             "context":{"schema_version":1,"request":{}}},
         "response":null,"provider_reasoning":null,"provider_reasoning_source_json":null,
         "provider_tool_calls_json":null,"deployment_id":null,"captured_at":1.0,
+        "metrics":null,"gemini_thought_parts":[],"gemini_thought_parts_source_json":null,
     }))
     .unwrap()
 }

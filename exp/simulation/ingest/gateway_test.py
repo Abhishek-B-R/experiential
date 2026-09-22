@@ -87,6 +87,46 @@ def _database(path: Path, experiences: tuple[Experience, ...]) -> None:
             )
 
 
+def test_gateway_capture_exports_only_current_turn_metrics(tmp_path: Path) -> None:
+    """The public loader exposes measured timing, tokens and opaque Gemini evidence."""
+    experience = _experience()
+    metrics = {
+        "started_at": 1_800_000_000,
+        "first_token_at": 1_800_000_001,
+        "terminal_at": 1_800_000_002,
+        "duration_ms": 2000,
+        "usage_complete": True,
+        "usage": {
+            "input_tokens": 80,
+            "output_tokens": 9,
+            "cached_input_tokens": None,
+            "reasoning_tokens": 3,
+        },
+    }
+    parts = [{"thoughtSignature": "opaque==", "text": "answer"}]
+    request = dict(experience.request)
+    request["exp_capture_output"] = {"metrics": metrics, "gemini_thought_parts": parts}
+    experience = experience.model_copy(update={"request": request})
+    path = tmp_path / "traffic.db"
+    _database(path, (experience,))
+    result = load_gateway_capture(path, identity_id="developer")
+    assert not result.issues
+    trace = result.traces[0]
+    measured = [span for span in trace.spans if span.usage is not None]
+    assert len(measured) == 1
+    span = measured[0]
+    assert span.attributes["gen_ai.completion"] == "Found record A"
+    assert span.started_at.timestamp() == metrics["started_at"]
+    assert (span.ended_at - span.started_at).total_seconds() == 2
+    assert span.usage is not None and span.usage.input_tokens == 80
+    assert span.usage.cached_input_tokens is None
+    assert span.attributes["gen_ai.usage.reasoning_tokens"] == 3
+    assert trace.initial_context["capture_output"] == request["exp_capture_output"]
+    historical = [other for other in trace.spans if other.span_id != span.span_id]
+    assert all(other.usage is None for other in historical)
+    assert all(other.attributes["exp.source.time.synthetic"] for other in historical)
+
+
 def test_reopened_capture_preserves_tools_and_pairs_results_without_claiming_success(
     tmp_path: Path,
 ) -> None:

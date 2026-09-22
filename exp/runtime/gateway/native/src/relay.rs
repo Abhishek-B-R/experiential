@@ -1,5 +1,4 @@
-//! Decode provider responses into bounded, classified gateway events. The waterfall
-//! commits a relay to one deployment; HTTP surfaces drain it live or to completion.
+//! Bounded provider events, committed to one deployment and drained by HTTP surfaces.
 
 mod progress;
 
@@ -22,8 +21,7 @@ use crate::tool_search::{ToolSearchWithholder, WithheldSearchCall};
 use crate::tool_serialization::ToolCallSerializer;
 use crate::waterfall::CommittedAttempt;
 
-/// Map one collection failure to its public error, honoring the shared
-/// aggregate-output overflow contract.
+/// Map collection failures to public errors, honoring aggregate-output bounds.
 pub fn collection_public_error(failure: &Failure) -> PublicError {
     if failure.safe_message == OUTPUT_OVERFLOW_MESSAGE {
         return PublicError::provider_output_too_large();
@@ -35,6 +33,8 @@ pub fn collection_public_error(failure: &Failure) -> PublicError {
 /// again after streamed deltas, matching the Python bounded aggregator.
 pub fn event_retained_bytes(event: &Event) -> usize {
     match event {
+        Event::GeminiThoughtPart(part) => crate::dialects::records_retained_bytes(part)
+            .unwrap_or(MAXIMUM_RETAINED_OUTPUT_BYTES.saturating_add(1)),
         Event::TextDelta(text) | Event::RefusalDelta(text) | Event::Image(text) => text.len(),
         Event::ProviderTextDelta { delta, .. } | Event::ProviderRefusalDelta { delta, .. } => {
             delta.len()

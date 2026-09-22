@@ -1,5 +1,4 @@
-//! Public Responses encoding, the Rust mirror of `ResponsesSseEncoder` and
-//! the Responses branch of `completed_body`.
+//! Native public Responses encoding for streaming and completed bodies.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -333,6 +332,7 @@ impl ResponsesSseEncoder {
                     stable_public_id("rs", &format!("{}:thinking:{index}", self.response_id));
                 self.reasoning_summary_delta(*index, 0, &item_id, delta)
             }
+            Event::GeminiThoughtPart(_) => Ok(Vec::new()),
             Event::ThinkingSignature { .. } | Event::RedactedThinking { .. } => Ok(Vec::new()),
             Event::ReasoningContentDelta {
                 route_sha256,

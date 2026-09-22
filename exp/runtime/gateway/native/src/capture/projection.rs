@@ -199,7 +199,8 @@ mod tests {
                     "identity_id":"identity", "application_id":"app"},
                 "protocol":"responses", "model_id":"model",
                 "context":{"schema_version":1,"request":{}}
-            }, "response":response, "deployment_id":null,"captured_at":1.0
+            }, "response":response, "deployment_id":null,"captured_at":1.0,
+            "metrics":null,"gemini_thought_parts":[],"gemini_thought_parts_source_json":null
         }))
         .unwrap()
     }

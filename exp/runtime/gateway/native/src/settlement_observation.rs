@@ -1,7 +1,7 @@
 //! Bounded provider facts retained across cancellation of an owning future.
 
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::events::{Event, Usage};
 use crate::relay::track_event;
@@ -10,15 +10,47 @@ use crate::relay::track_event;
 #[derive(Clone, Default)]
 pub(crate) struct Observation(Arc<Mutex<Observed>>);
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct Observed {
+    pub started_at: SystemTime,
+    started: Instant,
+    pub terminal_at: Option<SystemTime>,
+    pub duration: Option<Duration>,
     pub usage: Option<Usage>,
     pub tool_names: Vec<String>,
     pub terminal: Option<Event>,
     pub first_token_at: Option<SystemTime>,
 }
 
+impl Default for Observed {
+    fn default() -> Self {
+        Self {
+            started_at: SystemTime::now(),
+            started: Instant::now(),
+            terminal_at: None,
+            duration: None,
+            usage: None,
+            tool_names: Vec::new(),
+            terminal: None,
+            first_token_at: None,
+        }
+    }
+}
+
 impl Observation {
+    /// A repaired dial resets its meter but retains the physical attempt's start.
+    pub(crate) fn next_dial(&self) -> Self {
+        let previous = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self(Arc::new(Mutex::new(Observed {
+            started_at: previous.started_at,
+            started: previous.started,
+            ..Observed::default()
+        })))
+    }
+
     /// Remember normalized facts before public delivery can suspend or fail.
     pub(crate) fn record(&self, event: &Event) {
         let mut observed = self
@@ -47,6 +79,8 @@ impl Observation {
         }
         if event.is_terminal() {
             observed.terminal = Some(event.clone());
+            observed.terminal_at = Some(SystemTime::now());
+            observed.duration = Some(observed.started.elapsed());
         }
     }
 
@@ -65,10 +99,15 @@ impl Observation {
     /// Stop-sequence filtering can refine a buffered provider terminal.
     pub(crate) fn record_effective_terminal(&self, event: &Event) {
         if event.is_terminal() {
-            self.0
+            let mut observed = self
+                .0
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .terminal = Some(event.clone());
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if observed.terminal_at.is_none() {
+                observed.terminal_at = Some(SystemTime::now());
+                observed.duration = Some(observed.started.elapsed());
+            }
+            observed.terminal = Some(event.clone());
         }
     }
 

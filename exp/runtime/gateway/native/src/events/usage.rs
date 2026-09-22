@@ -7,6 +7,10 @@ use serde_json::{Map, Value};
 use super::Usage;
 
 impl Usage {
+    pub fn has_token_counts(&self) -> bool {
+        self.input_tokens.is_some() && self.output_tokens.is_some()
+    }
+
     /// Coalesce cumulative reports from one attempt, never adding snapshots or
     /// replacing an observed count with an absent leg. A lower stale snapshot
     /// cannot reduce an already witnessed count; explicit zero stays known.

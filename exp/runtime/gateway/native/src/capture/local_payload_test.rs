@@ -15,6 +15,8 @@ fn record() -> Record {
             "id":"response","status":"completed","output":[]},"source_json":null},
         "provider_reasoning":"first\0second雪", "provider_reasoning_source_json":null,
         "provider_tool_calls_json":"[{\"raw_arguments\":\"{  }\"}]",
+        "metrics":null,"gemini_thought_parts":[{"thoughtSignature":"opaque=="}],
+        "gemini_thought_parts_source_json":null,
         "deployment_id":"deployment","captured_at":1.0
     }))
     .unwrap()
@@ -40,6 +42,9 @@ fn borrowed_payload_preserves_schema_content_sidecars_and_exact_limit() {
                     "response":record.response,"provider_reasoning":"first�second雪",
                     "provider_reasoning_source_json":"\"first\\u0000second雪\"",
                     "provider_tool_calls_json":record.provider_tool_calls_json,
+                    "metrics":record.metrics,
+                    "gemini_thought_parts":record.gemini_thought_parts,
+                    "gemini_thought_parts_source_json":null,
                 },"previous_response_id":"parent"
             },"response":response,
             "provenance":{"source_kind":"traffic","source_id":"request","model_id":"model",

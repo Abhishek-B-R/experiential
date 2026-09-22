@@ -14,9 +14,11 @@ from exp.runtime.claas.store import ExperienceStore
 from exp.runtime.gateway.capture_context import restore_capture_context
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.local_capture import GATEWAY_CAPTURE_APPLICATION
+from exp.runtime.gateway.native_capture import CaptureMetrics
 from exp.runtime.gateway.replay_identity import provider_replay_authority
 from exp.runtime.openai_protocol.requests import decode_responses
 from exp.simulation.ingest.chat_json import CHAT_JSON_SOURCE
+from exp.simulation.ingest.gateway_metrics import apply_gateway_metrics
 from exp.simulation.ingest.otlp import TraceNormalizationIssue, TraceNormalizationResult
 
 
@@ -45,7 +47,7 @@ def load_gateway_capture(
                     "collect fresh traffic with capture enabled.",
                 )
             )
-    return CHAT_JSON_SOURCE.normalize(
+    normalized = CHAT_JSON_SOURCE.normalize(
         documents,
         source=SourceIdentity(
             kind="production",
@@ -54,10 +56,14 @@ def load_gateway_capture(
         ),
         initial_issues=issues,
     )
+    return apply_gateway_metrics(normalized)
 
 
 def _conversation(experience: Experience, by_response_id: dict[str, Experience]) -> JsonObject:
     """Retain the full source exchange and expose observed messages and tool schemas."""
+    output = experience.request.get("exp_capture_output")
+    if isinstance(output, dict) and output.get("metrics") is not None:
+        CaptureMetrics.model_validate(output["metrics"])
     context = experience.request.get("exp_context")
     if not isinstance(context, dict) or context.get("schema_version") != 1:
         raise ValueError("effective capture context is required")
@@ -68,6 +74,7 @@ def _conversation(experience: Experience, by_response_id: dict[str, Experience])
     request = GatewayRequest.model_validate(raw_request)
     messages = _request_messages(request, context.get("provider_context"))
     lineage, missing_parent = _restore_linked_reasoning(messages, experience, by_response_id)
+    output_message_start = len(messages)
     messages.extend(_output_messages(experience))
     tool_names: dict[str, str] = {}
     for message in messages:
@@ -103,6 +110,7 @@ def _conversation(experience: Experience, by_response_id: dict[str, Experience])
             "gateway_request": context,
             "gateway_response": experience.response,
             "capture_output": experience.request.get("exp_capture_output"),
+            "output_message_start": output_message_start,
             "identity_id": experience.scope.user_id,
             "captured_at": experience.captured_at.isoformat(),
             "response_id": experience.response_id,

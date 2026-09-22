@@ -16,6 +16,10 @@ pub(crate) struct Observer {
 impl Observer {
     pub(crate) fn observe(&self, event: &Event) {
         match event {
+            Event::GeminiThoughtPart(part) => {
+                self.collector
+                    .gemini_thought_part(&self.request_id, part.clone());
+            }
             Event::ReasoningContentDelta { delta, .. } if self.reasoning_exposed => {
                 self.collector.reasoning(&self.request_id, delta);
             }
@@ -32,6 +36,7 @@ impl Observer {
 pub(crate) fn observe_winner(
     collector: Option<Arc<Collector>>,
     admission: &Admission,
+    guard: &crate::settlement::AttemptGuard,
     won: &mut Won,
 ) {
     let Some(collector) = collector else { return };
@@ -45,6 +50,9 @@ pub(crate) fn observe_winner(
         request_id: admission.request_id.clone(),
         reasoning_exposed: admission.reasoning_exposed_at(depth),
     };
+    observer
+        .collector
+        .observe_attempt(&admission.request_id, guard.capture_observation());
     match won {
         Won::Committed(attempt) => {
             for event in &attempt.prefix {

@@ -3,6 +3,7 @@ use super::record::{Protocol, Record, Response};
 use serde::Serialize;
 use serde_json::Value;
 use std::borrow::Cow;
+use std::sync::Arc;
 
 #[derive(Serialize)]
 struct Scope<'a> {
@@ -16,6 +17,9 @@ struct Output<'a> {
     provider_reasoning: Option<Cow<'a, str>>,
     provider_reasoning_source_json: Option<Cow<'a, str>>,
     provider_tool_calls_json: &'a Option<String>,
+    metrics: &'a Option<super::metrics::Metrics>,
+    gemini_thought_parts: Cow<'a, [Arc<Value>]>,
+    gemini_thought_parts_source_json: Option<Cow<'a, str>>,
 }
 
 #[derive(Serialize)]
@@ -61,6 +65,7 @@ pub(super) fn encode(
     let context = &record.request.context;
     let scope = &record.request.scope;
     let reasoning = record.durable_reasoning().ok()?;
+    let (gemini_thought_parts, gemini_thought_parts_source_json) = record.durable_gemini_parts();
     let parent = &context["request"]["previous_response_id"];
     let experience = Experience {
         schema_version: 1,
@@ -83,6 +88,9 @@ pub(super) fn encode(
                 provider_reasoning: reasoning.text,
                 provider_reasoning_source_json: reasoning.source_json,
                 provider_tool_calls_json: &record.provider_tool_calls_json,
+                metrics: &record.metrics,
+                gemini_thought_parts,
+                gemini_thought_parts_source_json,
             },
             previous_response_id: parent,
         },

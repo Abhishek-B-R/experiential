@@ -7,6 +7,7 @@ mod local;
 mod local_payload;
 mod local_store;
 mod messages;
+pub(crate) mod metrics;
 mod projection;
 pub(crate) mod python;
 pub(crate) mod reasoning;
