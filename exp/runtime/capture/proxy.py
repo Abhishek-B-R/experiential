@@ -11,8 +11,10 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 
+import mitmproxy_rs
 from cryptography import x509
 from mitmproxy import certs, connection, http, options, tcp, tls
 from mitmproxy.addons.errorcheck import ErrorCheck
@@ -27,6 +29,8 @@ from exp.runtime.capture.redirector import capture_server_closed, stop_capture_s
 from exp.runtime.capture.transports import guard_native_writer
 
 logger = logging.getLogger(__name__)
+_MAX_TLS_BYPASSES = 128
+CaptureBypassReason = Literal["certificate", "handshake"]
 
 
 class _CaptureTlsConfig(TlsConfig):
@@ -116,8 +120,13 @@ class CaptureProxy:
         max_body_bytes: int = 8 * 1024 * 1024,
         max_active_flows: int = 16,
         upstream_ca_file: Path | None = None,
+        on_bypass: Callable[[str, str, CaptureBypassReason], None] | None = None,
     ) -> None:
-        """Configure finite capture state and a nonblocking exchange sink."""
+        """Configure finite capture state and a nonblocking exchange sink.
+
+        The bypass callback receives a sanitized app label, exact selected host,
+        and fixed failure category. It never receives raw TLS errors or payloads.
+        """
         if not domains or max_body_bytes < 1 or max_active_flows < 1:
             raise ValueError("capture needs domains and positive memory limits")
         self._domains = frozenset(validate_domains(domains))
@@ -125,11 +134,13 @@ class CaptureProxy:
         self._max_body_bytes = max_body_bytes
         self._max_active_flows = max_active_flows
         self._upstream_ca_file = upstream_ca_file
+        self._on_bypass = on_bypass
+        self._app_bypasses: set[tuple[tuple[int, str], str]] = set()
+        self._host_bypasses: set[str] = set()
         self._captures: dict[str, _Capture] = {}
         self._master: DumpMaster | None = None
         self._stopping = False
-        self._tls_failure: str | None = None
-        self._tls_disconnects = {domain: deque[float](maxlen=3) for domain in self._domains}
+        self._tls_disconnects: dict[tuple[tuple[int, str] | None, str], deque[float]] = {}
         self._transport_failures: set[str] = set()
         self.dropped_exchanges = 0
 
@@ -141,7 +152,7 @@ class CaptureProxy:
         resolution or system DNS changes are performed by Capture.
 
         Raises:
-            RuntimeError: Startup, cleanup, or selected-client TLS compatibility fails.
+            RuntimeError: Startup, cleanup, or the native capture backend fails.
         """
         opts = _capture_options(tuple(self._domains), ca_directory)
         master = DumpMaster(opts, with_termlog=False, with_dumper=False)
@@ -191,8 +202,6 @@ class CaptureProxy:
                     self._master = None
                     self._finish_pending()
                     self._transport_failures.clear()
-        if self._tls_failure is not None:
-            raise RuntimeError(self._tls_failure)
 
     def _finish_pending(self) -> None:
         """Account for interrupted captures even when backend cleanup reports failure."""
@@ -254,51 +263,101 @@ class CaptureProxy:
         """Release failure attribution with the owning connection's lifetime."""
         self._transport_failures.discard(client.id)
 
+    def _client_identity(self, client: connection.Client) -> tuple[int, str] | None:
+        """Read native process identity from the owned reader without probing the OS."""
+        if self._master is None:
+            return None
+        proxyserver = self._master.addons.get("proxyserver")
+        assert isinstance(proxyserver, Proxyserver)
+        handler = proxyserver.connections.get(client.id)
+        transport = handler.transports.get(client) if handler is not None else None
+        if transport is None or not isinstance(transport.reader, mitmproxy_rs.Stream):
+            return None
+        pid = transport.reader.get_extra_info("pid")
+        name = transport.reader.get_extra_info("process_name")
+        if not isinstance(pid, int) or pid <= 0 or not isinstance(name, str) or not name:
+            return None
+        return pid, name
+
+    def tls_clienthello(self, data: tls.ClientHelloData) -> None:
+        """Preserve original encrypted traffic for a client that rejected inspection."""
+        host = (data.client_hello.sni or "").lower().rstrip(".")
+        if host not in self._domains:
+            return
+        identity = self._client_identity(data.context.client)
+        if host in self._host_bypasses or (
+            identity is not None and (identity, host) in self._app_bypasses
+        ):
+            data.ignore_connection = True
+
+    def _bypass_client(
+        self,
+        client: connection.Client,
+        host: str,
+        reason: CaptureBypassReason,
+        *,
+        host_wide: bool = False,
+    ) -> None:
+        """Remember rejected app/host pairs for this run, with bounded host fallback."""
+        if host in self._host_bypasses:
+            return
+        identity = self._client_identity(client)
+        if identity is not None and (identity, host) in self._app_bypasses:
+            return
+        if host_wide or identity is None or len(self._app_bypasses) >= _MAX_TLS_BYPASSES:
+            self._host_bypasses.add(host)
+            application = "All apps"
+        else:
+            self._app_bypasses.add((identity, host))
+            application = (
+                "".join(char for char in Path(identity[1]).name if char.isprintable())[:80] or "App"
+            )
+        if self._on_bypass is not None:
+            self._on_bypass(application, host, reason)
+
     def tls_failed_client(self, data: tls.TlsData) -> None:
-        """Stop on certificate rejection or repeated selected-host handshake disconnects.
+        """Isolate trust rejection and repeated handshake failures to their app and host.
 
         The failed handshake cannot be repaired or replayed as encrypted pass-through.
-        Request ordinary shutdown here and report failure only after backend cleanup;
-        exceptions raised inside an addon hook are logged and swallowed by mitmproxy.
-        Only a fixed message and an allowlisted hostname leave this hook, never the
-        upstream TLS error text or handshake contents.
+        Future connections from that app to that host retain original TLS instead.
+        A missing native identity or full app table uses a visible host-wide bypass.
+        No certificate verification is disabled, and bypasses last only for this run.
         """
-        if self._stopping or self._tls_failure is not None or data.conn is not data.context.client:
+        if self._stopping or data.conn is not data.context.client:
             return
         host = (data.conn.sni or "").lower().rstrip(".")
         if host not in self._domains:
+            return
+        identity = self._client_identity(data.context.client)
+        if host in self._host_bypasses or (
+            identity is not None and (identity, host) in self._app_bypasses
+        ):
             return
         error = (data.conn.error or "").lower()
         if any(
             alert in error for alert in ("unknown ca", "bad certificate", "certificate unknown")
         ):
-            diagnosis = f"Capture stopped because a client rejected its certificate for {host}."
-            guidance = (
-                "Retry or reload the affected app. Configure the client to trust Capture's CA "
-                "before running exp capture again."
-            )
+            self._bypass_client(data.context.client, host, "certificate")
+            return
         elif error.startswith("the client disconnected during the handshake."):
             if data.context.client.id in self._transport_failures:
                 # This disconnect follows a known native transport failure, not a
                 # client trust decision. Keep unrelated connections running.
                 return
-            # Other clients may still succeed on this host; only age clears this burst.
-            failures = self._tls_disconnects[host]
             now = time.monotonic()
-            while failures and failures[0] < now - 30:
-                failures.popleft()
+            for key, failures in tuple(self._tls_disconnects.items()):
+                while failures and failures[0] < now - 30:
+                    failures.popleft()
+                if not failures:
+                    del self._tls_disconnects[key]
+            key = (identity, host)
+            if key not in self._tls_disconnects and len(self._tls_disconnects) >= _MAX_TLS_BYPASSES:
+                key = (None, host)
+            failures = self._tls_disconnects.setdefault(key, deque(maxlen=3))
             failures.append(now)
             if len(failures) < 3:
                 return
-            diagnosis = (
-                "Capture stopped after repeated connections failed during TLS handshakes "
-                f"for {host}."
-            )
-            guidance = "Retry or reload the affected app, then run exp capture again."
-        else:
-            return
-        self._tls_failure = f"{diagnosis} {guidance}"
-        self.shutdown()
+            self._bypass_client(data.context.client, host, "handshake", host_wide=key[0] is None)
 
     def next_layer(self, nextlayer: layer.NextLayer) -> None:
         """Pass UDP, including QUIC and DNS, through without decrypting or recording it.

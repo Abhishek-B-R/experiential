@@ -17,6 +17,7 @@ from exp.cli.capture import runner
 from exp.cli.capture.auth import CaptureCredentials
 from exp.runtime.capture.certificates import capture_certificate_directory
 from exp.runtime.capture.control import CaptureRun, CaptureRunClient, Organization
+from exp.runtime.capture.proxy import CaptureBypassReason
 from exp.runtime.capture.upload import CaptureUploader, UploadStats
 
 
@@ -117,7 +118,7 @@ def test_session_ownership_covers_login_and_shutdown(
 
 @pytest.mark.parametrize("verbose", [False, True])
 @pytest.mark.parametrize("terminal", [False, True])
-def test_rejected_certificate_ends_cloud_run_without_reusing_legacy_ca(
+def test_session_failure_ends_cloud_run_without_reusing_legacy_ca(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verbose: bool, terminal: bool
 ) -> None:
     """Trust pauses terminal rendering, then startup resumes with the scoped CA."""
@@ -163,7 +164,7 @@ def test_rejected_certificate_ends_cloud_run_without_reusing_legacy_ca(
         trust_output_end = len(rendered)
 
     trust = Mock(side_effect=trust_prompt)
-    session = AsyncMock(side_effect=RuntimeError("Synthetic client certificate rejection"))
+    session = AsyncMock(side_effect=RuntimeError("Synthetic session failure"))
     monkeypatch.setattr(runner, "provider_data_dir", lambda: tmp_path)
     monkeypatch.setattr(runner, "CaptureRunClient", lambda **kwargs: control)
     monkeypatch.setattr(runner, "CaptureUploader", lambda **kwargs: uploader)
@@ -171,7 +172,7 @@ def test_rejected_certificate_ends_cloud_run_without_reusing_legacy_ca(
     monkeypatch.setattr(runner, "trust_certificate", trust)
     monkeypatch.setattr(runner, "run_session", session)
     monkeypatch.setattr(display_module, "Live", live)
-    with pytest.raises(RuntimeError, match="Synthetic client certificate rejection"):
+    with pytest.raises(RuntimeError, match="Synthetic session failure"):
         asyncio.run(
             runner._capture_authenticated(
                 console,
@@ -254,6 +255,7 @@ def test_runner_reports_pending_startup_then_real_activity(
         on_progress: Callable[[UploadStats], None],
         on_warning: Callable[[str], None],
         on_waiting: Callable[[], None],
+        on_bypass: Callable[[str, str, CaptureBypassReason], None],
     ) -> UploadStats:
         """Drive the actual console callbacks without activating native interception."""
         assert "Starting network extension" in output.getvalue()
@@ -276,6 +278,7 @@ def test_runner_reports_pending_startup_then_real_activity(
             )
         )
         on_warning("Synthetic upload warning")
+        on_bypass("Codex", "api.openai.com", "certificate")
         if fail_session:
             raise RuntimeError("Synthetic running proxy failure")
         return UploadStats(
@@ -311,6 +314,8 @@ def test_runner_reports_pending_startup_then_real_activity(
     assert "1 request captured" in rendered
     assert "last just now" in rendered
     assert "Synthetic upload warning" in rendered
+    assert "Not capturing Codex on api.openai.com: certificate rejected." in rendered
+    assert "partial capture: 1 target not captured" in rendered
     assert "Public CA" not in rendered
     assert "batches uploaded" not in rendered
     assert ("Capture stopped. 2 requests captured" in rendered) == (not fail_session)

@@ -173,7 +173,7 @@ def test_real_proxy_stops_cleanly_after_backend_lifetime_ends(
                 await asyncio.wait_for(task, 5)
             assert monitor_finished.is_set()
             assert proxy._master is None
-            assert proxy._tls_failure is None
+            assert not proxy._host_bypasses and not proxy._app_bypasses
             assert all(not server.is_running for server in manager.servers)
             with pytest.raises(OSError):
                 await asyncio.open_connection("127.0.0.1", port)
@@ -459,30 +459,44 @@ def test_stream_copy_limit_never_changes_forwarded_chunks() -> None:
     assert body.overflow and not body.data
 
 
-def test_real_client_ca_rejection_stops_proxy_and_reports_failure(
-    tmp_path: Path, regular_proxy: None
+@pytest.mark.parametrize("identified", [False, True])
+def test_real_client_ca_rejection_retries_with_original_tls_without_stopping_capture(
+    tmp_path: Path, regular_proxy: None, monkeypatch: pytest.MonkeyPatch, identified: bool
 ) -> None:
-    """A client trusting only its original server stops interception instead of retrying forever."""
+    """Rejected clients retry untouched while another identified app remains captured."""
 
     async def run() -> None:
-        """Reject the proxy certificate over real TLS using only ephemeral loopback listeners."""
+        """Exercise both TLS trust stores through ephemeral loopback listeners only."""
         hostname = "api.openai.com"
         certificate, key, upstream_ca = _certificate(tmp_path / "upstream", hostname)
         server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         server_context.load_cert_chain(certificate, key)
         received: list[bytes] = []
         captured: list[CapturedExchange] = []
+        warnings: list[tuple[str, str, capture_module.CaptureBypassReason]] = []
+        bypassed = asyncio.Event()
+        identity = (101, "/Applications/Synthetic.app/Contents/MacOS/client")
 
         async def upstream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            """Serve a harmless direct retry after Capture has stopped its listener."""
+            """Serve a fixed provider-shaped response without making external requests."""
             try:
                 received.append(await reader.readuntil(b"\r\n\r\n"))
-                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                body = b'{"id":"r1","model":"test","output":[]}'
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                    + body
+                )
                 await writer.drain()
             finally:
                 writer.close()
                 with suppress(ConnectionError):
                     await writer.wait_closed()
+
+        def warn(app: str, host: str, reason: capture_module.CaptureBypassReason) -> None:
+            """Observe degraded coverage only after the actual rejection hook has run."""
+            warnings.append((app, host, reason))
+            bypassed.set()
 
         server = await asyncio.start_server(upstream, "127.0.0.1", 0, ssl=server_context)
         port = server.sockets[0].getsockname()[1]
@@ -490,7 +504,10 @@ def test_real_client_ca_rejection_stops_proxy_and_reports_failure(
             sink=lambda exchange: captured.append(exchange) is None,
             domains=(hostname,),
             upstream_ca_file=upstream_ca,
+            on_bypass=warn,
         )
+        if identified:
+            monkeypatch.setattr(proxy, "_client_identity", lambda client: identity)
         ready = asyncio.Event()
         proxy_task = asyncio.create_task(
             proxy.serve(ca_directory=tmp_path / "proxy", ready=ready.set)
@@ -498,18 +515,17 @@ def test_real_client_ca_rejection_stops_proxy_and_reports_failure(
         try:
             await asyncio.wait_for(ready.wait(), 5)
             assert proxy._master is not None
-            proxyserver = proxy._master.addons.get("proxyserver")
-            assert isinstance(proxyserver, Proxyserver)
-            proxy_port = next(iter(proxyserver.servers)).listen_addrs[0][1]
+            manager = proxy._master.addons.get("proxyserver")
+            assert isinstance(manager, Proxyserver)
+            proxy_port = next(iter(manager.servers)).listen_addrs[0][1]
             client_context = ssl.create_default_context(cafile=str(upstream_ca))
 
             def reject_certificate() -> None:
-                """Use a socket TLS client that sends its fatal certificate-rejection alert."""
+                """Send a real fatal unknown-CA alert rather than a silent socket close."""
                 with socket.create_connection(("127.0.0.1", proxy_port), timeout=5) as sock:
                     sock.sendall(
-                        (
-                            f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
-                        ).encode()
+                        f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\n"
+                        f"Host: 127.0.0.1:{port}\r\n\r\n".encode()
                     )
                     header = b""
                     while not header.endswith(b"\r\n\r\n"):
@@ -522,33 +538,42 @@ def test_real_client_ca_rejection_stops_proxy_and_reports_failure(
 
             with pytest.raises(ssl.SSLCertVerificationError):
                 await asyncio.wait_for(asyncio.to_thread(reject_certificate), 7)
-            with pytest.raises(RuntimeError, match="client rejected its certificate") as failure:
-                await asyncio.wait_for(asyncio.shield(proxy_task), 5)
-            message = str(failure.value)
-            assert hostname in message
-            assert "Retry or reload" in message
-            assert "trust Capture's CA" in message
-            assert "SSL routines" not in message
-            assert "unknown ca" not in message
-            assert proxy._master is None
-            assert all(not instance.is_running for instance in proxyserver.servers)
-            assert not captured
-            assert not received
-            with pytest.raises(OSError):
-                await asyncio.open_connection("127.0.0.1", proxy_port)
-            direct_reader, direct_writer = await asyncio.open_connection(
-                "127.0.0.1", port, ssl=client_context, server_hostname=hostname
+            await asyncio.wait_for(bypassed.wait(), 5)
+            assert warnings == [("client" if identified else "All apps", hostname, "certificate")]
+            assert not proxy_task.done()
+            assert not captured and not received
+            original_certificate = x509.load_pem_x509_certificate(certificate.read_bytes())
+            request = (
+                b"POST /v1/responses HTTP/1.1\r\nHost: api.openai.com\r\n"
+                b"Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"
             )
-            direct_writer.write(b"GET /retry HTTP/1.1\r\nHost: api.openai.com\r\n\r\n")
-            await direct_writer.drain()
-            assert (await asyncio.wait_for(direct_reader.read(), 5)).endswith(b"\r\n\r\nok")
-            direct_writer.close()
-            await direct_writer.wait_closed()
-            assert len(received) == 1
+            reader, writer, peer = await _connect_tls(proxy, port, hostname, upstream_ca)
+            assert peer == original_certificate.public_bytes(serialization.Encoding.DER)
+            writer.write(request)
+            await writer.drain()
+            assert (await asyncio.wait_for(reader.read(), 5)).endswith(b'"output":[]}')
+            writer.close()
+            await writer.wait_closed()
+            assert len(received) == 1 and not captured
+            assert not proxy_task.done()
+
+            if identified:
+                identity = (202, "/Applications/Healthy.app/Contents/MacOS/healthy")
+                reader, writer, peer = await _connect_tls(
+                    proxy, port, hostname, tmp_path / "proxy/mitmproxy-ca-cert.pem"
+                )
+                assert peer != original_certificate.public_bytes(serialization.Encoding.DER)
+                writer.write(request)
+                await writer.drain()
+                assert (await asyncio.wait_for(reader.read(), 5)).endswith(b'"output":[]}')
+                writer.close()
+                await writer.wait_closed()
+                assert len(received) == 2
+                assert len(captured) == 1
+            assert len(warnings) == 1
         finally:
             proxy.shutdown()
-            with suppress(RuntimeError):
-                await asyncio.wait_for(proxy_task, 5)
+            await asyncio.wait_for(proxy_task, 5)
             server.close()
             await server.wait_closed()
 
@@ -556,11 +581,16 @@ def test_real_client_ca_rejection_stops_proxy_and_reports_failure(
 
 
 @pytest.mark.parametrize("alert", ["unknown ca", "bad certificate", "certificate unknown"])
-def test_client_certificate_alert_stops_once_without_exposing_error(
+def test_client_certificate_alert_bypasses_once_without_exposing_error(
     monkeypatch: pytest.MonkeyPatch, alert: str
 ) -> None:
-    """Only a fixed diagnosis and normalized allowlisted hostname become the fatal reason."""
-    proxy = CaptureProxy(sink=lambda exchange: True, domains=("api.openai.com",))
+    """A missing identity visibly bypasses only the selected host, without a global stop."""
+    warnings: list[tuple[str, str, capture_module.CaptureBypassReason]] = []
+    proxy = CaptureProxy(
+        sink=lambda exchange: True,
+        domains=("api.openai.com",),
+        on_bypass=lambda app, host, reason: warnings.append((app, host, reason)),
+    )
     shutdowns: list[bool] = []
     monkeypatch.setattr(proxy, "shutdown", lambda: shutdowns.append(True))
     client = connection.Client(
@@ -573,15 +603,9 @@ def test_client_certificate_alert_stops_once_without_exposing_error(
     data = tls.TlsData(client, ctx)
     proxy.tls_failed_client(data)
     proxy.tls_failed_client(data)
-    assert shutdowns == [True]
-    assert proxy._tls_failure is not None
-    assert proxy._tls_failure == (
-        "Capture stopped because a client rejected its certificate for api.openai.com. "
-        "Retry or reload the affected app. Configure the client to trust Capture's CA "
-        "before running exp capture again."
-    )
-    assert "private-handshake-detail" not in proxy._tls_failure
-    assert "OpenSSL" not in proxy._tls_failure
+    assert not shutdowns
+    assert proxy._host_bypasses == {"api.openai.com"}
+    assert warnings == [("All apps", "api.openai.com", "certificate")]
 
 
 @pytest.mark.parametrize("error", ["unknown ca", "The client disconnected during the handshake."])
@@ -600,8 +624,8 @@ def test_client_tls_callbacks_after_requested_shutdown_cannot_change_stop_reason
     proxy.shutdown()
     for _ in range(3):
         proxy.tls_failed_client(tls.TlsData(client, ctx))
-    assert proxy._tls_failure is None
-    assert not proxy._tls_disconnects["api.openai.com"]
+    assert not proxy._host_bypasses and not proxy._app_bypasses
+    assert not proxy._tls_disconnects.get((None, "api.openai.com"), ())
 
 
 @pytest.mark.parametrize("cancel_task", [False, True])
@@ -670,7 +694,7 @@ def test_real_incomplete_handshakes_closed_during_shutdown_are_not_ca_failures(
                 await writer.drain()
                 assert await asyncio.wait_for(reader.read(8192), 2)
             assert not failures
-            assert proxy._tls_failure is None
+            assert not proxy._host_bypasses and not proxy._app_bypasses
             if cancel_task:
                 proxy_task.cancel()
                 with pytest.raises(asyncio.CancelledError):
@@ -684,8 +708,8 @@ def test_real_incomplete_handshakes_closed_during_shutdown_are_not_ca_failures(
                 and error.startswith("The client disconnected during the handshake.")
                 for error in failures
             )
-            assert proxy._tls_failure is None
-            assert not proxy._tls_disconnects[host]
+            assert not proxy._host_bypasses and not proxy._app_bypasses
+            assert not proxy._tls_disconnects.get((None, host), ())
             assert proxy._master is None
         finally:
             for writer in writers:
@@ -716,7 +740,7 @@ def test_unrelated_tls_failure_does_not_stop_capture(
     affected = ctx.server if scenario == "upstream" else client
     proxy.tls_failed_client(tls.TlsData(affected, ctx))
     assert not shutdowns
-    assert proxy._tls_failure is None
+    assert not proxy._host_bypasses and not proxy._app_bypasses
 
 
 @pytest.mark.parametrize("error", ["unknown ca", "The client disconnected during the handshake."])
@@ -737,14 +761,13 @@ def test_native_failure_does_not_misclassify_generic_tls_disconnect(
     proxy._transport_failures.add(client.id)
     for _ in range(3):
         proxy.tls_failed_client(tls.TlsData(client, ctx))
-    assert not proxy._tls_disconnects["api.openai.com"]
+    assert not proxy._tls_disconnects.get((None, "api.openai.com"), ())
+    assert not shutdowns
     if error == "unknown ca":
-        assert shutdowns == [True]
-        assert proxy._tls_failure is not None
-        assert "client rejected its certificate" in proxy._tls_failure
+        assert proxy._host_bypasses == {"api.openai.com"}
     else:
         assert not shutdowns
-        assert proxy._tls_failure is None
+        assert not proxy._host_bypasses and not proxy._app_bypasses
     proxy.client_disconnected(client)
     assert not proxy._transport_failures
 
@@ -888,10 +911,10 @@ def test_one_native_failure_does_not_suppress_sibling_tls_disconnect_burst() -> 
         sni="api.openai.com",
         error="The client disconnected during the handshake.",
     )
-    manager.connections[failed.id] = Mock(spec=ProxyConnectionHandler, client=failed)
+    manager.connections[failed.id] = Mock(spec=ProxyConnectionHandler, client=failed, transports={})
     proxy._record_transport_failure(failed.id)
     proxy.tls_failed_client(tls.TlsData(failed, context.Context(failed, options.Options())))
-    assert not proxy._tls_disconnects["api.openai.com"]
+    assert not proxy._tls_disconnects.get((None, "api.openai.com"), ())
     for attempt in range(3):
         sibling = connection.Client(
             peername=("127.0.0.1", attempt + 2),
@@ -900,11 +923,9 @@ def test_one_native_failure_does_not_suppress_sibling_tls_disconnect_burst() -> 
             error="The client disconnected during the handshake.",
         )
         proxy.tls_failed_client(tls.TlsData(sibling, context.Context(sibling, options.Options())))
-        assert len(proxy._tls_disconnects["api.openai.com"]) == attempt + 1
-    master.shutdown.assert_called_once_with()
-    assert proxy._tls_failure is not None
-    assert "repeated connections failed" in proxy._tls_failure
-    assert "CA" not in proxy._tls_failure
+        assert len(proxy._tls_disconnects.get((None, "api.openai.com"), ())) == attempt + 1
+    master.shutdown.assert_not_called()
+    assert proxy._host_bypasses == {"api.openai.com"}
     proxy.client_disconnected(failed)
     assert not proxy._transport_failures
 
@@ -935,21 +956,18 @@ def test_handshake_disconnects_are_bounded_by_host_and_time(
     now += 1
     proxy.tls_failed_client(data)
     assert not shutdowns
-    assert len(proxy._tls_disconnects["api.openai.com"]) == 2
-    assert not proxy._tls_disconnects["api.anthropic.com"]
+    assert len(proxy._tls_disconnects.get((None, "api.openai.com"), ())) == 2
+    assert not proxy._tls_disconnects.get((None, "api.anthropic.com"), ())
     now += 1
     proxy.tls_failed_client(data)
-    assert shutdowns == [True]
-    assert proxy._tls_failure is not None
-    assert "repeated connections failed during TLS handshakes" in proxy._tls_failure
-    assert "CA" not in proxy._tls_failure
-    assert "private-detail" not in proxy._tls_failure
-    assert len(proxy._tls_disconnects["api.openai.com"]) == 3
-    assert proxy._tls_disconnects["api.openai.com"].maxlen == 3
+    assert not shutdowns
+    assert proxy._host_bypasses == {"api.openai.com"}
+    assert len(proxy._tls_disconnects.get((None, "api.openai.com"), ())) == 3
+    assert proxy._tls_disconnects[(None, "api.openai.com")].maxlen == 3
 
 
-def test_real_silent_ca_rejection_burst_stops_proxy(tmp_path: Path, regular_proxy: None) -> None:
-    """Three real asyncio trust failures stop Capture even when no TLS alert is sent."""
+def test_real_silent_ca_rejection_burst_bypasses_host(tmp_path: Path, regular_proxy: None) -> None:
+    """Three real silent trust failures isolate the host without stopping Capture."""
 
     async def run() -> None:
         """Retry untrusted handshakes through an explicitly addressed loopback proxy only."""
@@ -985,7 +1003,7 @@ def test_real_silent_ca_rejection_burst_stops_proxy(tmp_path: Path, regular_prox
                 if attempt < 2:
                     # Let the failed-client hook finish, rather than checking before delivery.
                     deadline = asyncio.get_running_loop().time() + 2
-                    while len(proxy._tls_disconnects[hostname]) < attempt + 1:
+                    while len(proxy._tls_disconnects.get((None, hostname), ())) < attempt + 1:
                         assert asyncio.get_running_loop().time() < deadline
                         await asyncio.sleep(0.01)
                     assert not proxy_task.done()
@@ -997,21 +1015,165 @@ def test_real_silent_ca_rejection_burst_stops_proxy(tmp_path: Path, regular_prox
                         trusted_writer.close()
                         with suppress(ConnectionError):
                             await trusted_writer.wait_closed()
-                        assert len(proxy._tls_disconnects[hostname]) == 1
-            with pytest.raises(RuntimeError, match="repeated connections failed") as failure:
-                await asyncio.wait_for(asyncio.shield(proxy_task), 5)
-            assert "CA" not in str(failure.value)
-            assert "Retry or reload" in str(failure.value)
-            assert proxy._master is None
-            assert all(not instance.is_running for instance in proxyserver.servers)
-            with pytest.raises(OSError):
-                await asyncio.open_connection("127.0.0.1", proxy_port)
+                        assert len(proxy._tls_disconnects.get((None, hostname), ())) == 1
+            deadline = asyncio.get_running_loop().time() + 2
+            while hostname not in proxy._host_bypasses:
+                assert asyncio.get_running_loop().time() < deadline
+                await asyncio.sleep(0.01)
+            assert not proxy_task.done()
+            assert proxy._master is not None
+            assert all(instance.is_running for instance in proxyserver.servers)
         finally:
             proxy.shutdown()
             with suppress(RuntimeError):
                 await asyncio.wait_for(proxy_task, 5)
 
     asyncio.run(run())
+
+
+def test_native_process_identity_survives_writer_guard() -> None:
+    """Process scoping reads the native reader even after Capture wraps its writer."""
+
+    async def run() -> None:
+        """Install the writer adapter on its owning event loop."""
+        proxy = CaptureProxy(sink=lambda exchange: True, domains=("api.openai.com",))
+        manager = Proxyserver()
+        master = Mock(spec=DumpMaster, addons=Mock())
+        master.addons.get.return_value = manager
+        proxy._master = master
+        client = connection.Client(peername=("127.0.0.1", 1), sockname=("127.0.0.1", 443))
+        native = Mock(spec=mitmproxy_rs.Stream)
+        native.get_extra_info.side_effect = {"pid": 123, "process_name": "/Applications/client"}.get
+        transport = ConnectionIO(reader=native, writer=native)
+        manager.connections[client.id] = Mock(
+            spec=ProxyConnectionHandler, client=client, transports={client: transport}
+        )
+        proxy.client_connected(client)
+        assert transport.writer is not native and transport.reader is native
+        assert proxy._client_identity(client) == (123, "/Applications/client")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("pid,name", [(None, "/app"), (0, "/app"), (1, None), (1, "")])
+def test_incomplete_native_process_identity_uses_explicit_host_fallback(
+    pid: int | None, name: str | None
+) -> None:
+    """Unavailable metadata never creates an ambiguous app-level bypass key."""
+    proxy = CaptureProxy(sink=lambda exchange: True, domains=("api.openai.com",))
+    manager = Proxyserver()
+    master = Mock(spec=DumpMaster, addons=Mock())
+    master.addons.get.return_value = manager
+    proxy._master = master
+    client = connection.Client(
+        peername=("127.0.0.1", 1),
+        sockname=("127.0.0.1", 443),
+        sni="api.openai.com",
+        error="unknown ca",
+    )
+    native = Mock(spec=mitmproxy_rs.Stream)
+    native.get_extra_info.side_effect = {"pid": pid, "process_name": name}.get
+    manager.connections[client.id] = Mock(
+        spec=ProxyConnectionHandler,
+        client=client,
+        transports={client: ConnectionIO(reader=native, writer=native)},
+    )
+    proxy.tls_failed_client(tls.TlsData(client, context.Context(client, options.Options())))
+    assert proxy._host_bypasses == {"api.openai.com"}
+    assert not proxy._app_bypasses
+    master.shutdown.assert_not_called()
+
+
+def test_bypass_is_scoped_to_process_and_host_and_sanitizes_display_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing app cannot suppress healthy apps or another selected provider."""
+    warnings: list[tuple[str, str, capture_module.CaptureBypassReason]] = []
+    proxy = CaptureProxy(
+        sink=lambda exchange: True,
+        domains=("api.openai.com", "api.anthropic.com"),
+        on_bypass=lambda app, host, reason: warnings.append((app, host, reason)),
+    )
+    identity = (123, "/Applications/cli\n\x1b")
+    monkeypatch.setattr(proxy, "_client_identity", lambda client: identity)
+    client = connection.Client(
+        peername=("127.0.0.1", 1),
+        sockname=("127.0.0.1", 443),
+        sni="api.openai.com",
+        error="unknown ca",
+    )
+    ctx = context.Context(client, options.Options())
+    proxy.tls_failed_client(tls.TlsData(client, ctx))
+    proxy.tls_failed_client(tls.TlsData(client, ctx))
+    assert warnings == [("cli", "api.openai.com", "certificate")]
+    for pid, name, host, expected in [
+        (123, "/Applications/cli\n\x1b", "API.OPENAI.COM.", True),
+        (456, "/Applications/cli\n\x1b", "api.openai.com", False),
+        (123, "/Applications/other", "api.openai.com", False),
+        (123, "/Applications/cli\n\x1b", "api.anthropic.com", False),
+        (123, "/Applications/cli\n\x1b", "unselected.example", False),
+    ]:
+        identity = (pid, name)
+        hello = tls.ClientHelloData(ctx, Mock(spec=tls.ClientHello, sni=host))
+        proxy.tls_clienthello(hello)
+        assert hello.ignore_connection is expected
+    assert not proxy._host_bypasses
+
+
+def test_bypass_capacity_falls_back_to_selected_host_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A full process table remains bounded and visibly isolates the overflow host."""
+    monkeypatch.setattr(capture_module, "_MAX_TLS_BYPASSES", 2)
+    identity = (1, "/Applications/client")
+    warnings: list[tuple[str, str, capture_module.CaptureBypassReason]] = []
+    proxy = CaptureProxy(
+        sink=lambda exchange: True,
+        domains=("api.openai.com", "api.anthropic.com"),
+        on_bypass=lambda app, host, reason: warnings.append((app, host, reason)),
+    )
+    monkeypatch.setattr(proxy, "_client_identity", lambda client: identity)
+    client = connection.Client(
+        peername=("127.0.0.1", 1),
+        sockname=("127.0.0.1", 443),
+        sni="api.openai.com",
+        error="unknown ca",
+    )
+    ctx = context.Context(client, options.Options())
+    for pid in range(1, 5):
+        identity = (pid, "/Applications/client")
+        proxy.tls_failed_client(tls.TlsData(client, ctx))
+    assert len(proxy._app_bypasses) == 2
+    assert proxy._host_bypasses == {"api.openai.com"}
+    assert len(warnings) == 3 and warnings[-1] == ("All apps", "api.openai.com", "certificate")
+
+
+def test_generic_handshake_failures_are_counted_per_app_and_reported_neutrally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two apps' isolated cancellations do not combine into a false shared trust failure."""
+    warnings: list[tuple[str, str, capture_module.CaptureBypassReason]] = []
+    proxy = CaptureProxy(
+        sink=lambda exchange: True,
+        domains=("api.openai.com",),
+        on_bypass=lambda app, host, reason: warnings.append((app, host, reason)),
+    )
+    identity = (1, "/app")
+    monkeypatch.setattr(proxy, "_client_identity", lambda client: identity)
+    client = connection.Client(
+        peername=("127.0.0.1", 1),
+        sockname=("127.0.0.1", 443),
+        sni="api.openai.com",
+        error="The client disconnected during the handshake.",
+    )
+    data = tls.TlsData(client, context.Context(client, options.Options()))
+    for pid in (1, 2, 1, 2):
+        identity = (pid, "/app")
+        proxy.tls_failed_client(data)
+    assert not warnings
+    identity = (1, "/app")
+    proxy.tls_failed_client(data)
+    assert warnings == [("app", "api.openai.com", "handshake")]
+    assert proxy._app_bypasses == {((1, "/app"), "api.openai.com")}
+    assert not proxy._host_bypasses
 
 
 def test_websocket_request_completion_retains_no_flow_message_history() -> None:

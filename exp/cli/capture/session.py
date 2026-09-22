@@ -10,7 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from exp.runtime.capture.control import CaptureCloudError, CaptureRun, CaptureRunClient
-from exp.runtime.capture.proxy import CaptureProxy
+from exp.runtime.capture.proxy import CaptureBypassReason, CaptureProxy
 from exp.runtime.capture.upload import CaptureUploader, UploadStats
 
 _SHUTDOWN_TIMEOUT = 5.0
@@ -29,6 +29,7 @@ async def run_session(
     on_progress: Callable[[UploadStats], None],
     on_warning: Callable[[str], None],
     on_waiting: Callable[[], None] | None = None,
+    on_bypass: Callable[[str, str, CaptureBypassReason], None] | None = None,
 ) -> UploadStats:
     """Serve provider traffic until interrupted, always releasing interception.
 
@@ -42,6 +43,7 @@ async def run_session(
         on_progress: Terminal callback receiving content-free upload counters.
         on_warning: Terminal callback for recoverable upload failures.
         on_waiting: Optional callback when network startup remains pending.
+        on_bypass: Optional callback naming an app and host excluded after trust rejection.
 
     Returns:
         Final upload counters after bounded flushing.
@@ -52,7 +54,7 @@ async def run_session(
     stop = asyncio.Event()
     ready = asyncio.Event()
     loop = asyncio.get_running_loop()
-    proxy = CaptureProxy(sink=uploader.submit, domains=domains)
+    proxy = CaptureProxy(sink=uploader.submit, domains=domains, on_bypass=on_bypass)
     original_signals = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
     for sig in original_signals:
         loop.add_signal_handler(sig, stop.set)

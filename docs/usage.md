@@ -69,12 +69,18 @@ explicitly; certificate pinning is not bypassed. Never share the adjacent `mitmp
 contains the private signing key. Existing unconstrained certificates are not reused or granted
 broader trust.
 
-If a client explicitly rejects the Capture certificate, Capture stops interception and prints
-an error with certificate-trust guidance. A burst of repeated selected-host handshake disconnects
-also stops Capture, but those disconnects alone do not identify a certificate problem. Retry or
-reload the app after Capture stops. Isolated handshake disconnects do not end a run, and connections
-closed during shutdown do not trigger a new TLS failure. Native write failures close only the
-affected connection; their resulting disconnects do not count as client certificate failures.
+If a client explicitly rejects the Capture certificate, its subsequent connections to that host
+pass through with the original certificate and are not captured for the rest of the run. Retry or
+reload the affected app after the first failed connection. Capture names the app and host, keeps
+partial coverage visible in the terminal, and continues capturing other apps and hosts. If native
+process identity is unavailable or the bounded app list is full, all apps pass through for that
+host, with the wider exclusion shown explicitly. No client verification or certificate pinning is
+disabled. Three unexplained handshake disconnects for the same app and host within 30 seconds also
+switch that target to pass-through, with neutral guidance rather than a certificate diagnosis.
+Restart the app and Capture to retry tracing, allowing restarted apps to reload certificate trust.
+Isolated disconnects and connections closed during shutdown do not trigger bypasses.
+Native write failures close only the affected connection; their resulting disconnects do not
+count as client certificate failures.
 If the native capture backend itself exits, Capture stops and reports that failure.
 
 Run the CLI as your normal user, without `sudo`. Mitmproxy Redirector's Network Extension provides

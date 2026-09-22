@@ -124,7 +124,7 @@ async def _capture_authenticated(
             trust_certificate(certificate, domains=domains)
         if verbose:
             console.print(
-                "Capture stops if a client rejects its certificate. "
+                "Clients rejecting Capture's certificate pass through without capture. "
                 "Clients with a custom trust store may need the public CA certificate below."
             )
             console.print(f"Public CA: {certificate}", markup=False)
@@ -159,6 +159,7 @@ async def _capture_authenticated(
             on_progress=display.progress,
             on_warning=warning,
             on_waiting=waiting,
+            on_bypass=display.bypassed,
         )
         display.stopped(stats)
     finally:

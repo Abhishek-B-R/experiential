@@ -10,6 +10,7 @@ from rich.text import Text
 
 from exp.cli.capture import display as display_module
 from exp.cli.capture.display import CaptureDisplay
+from exp.runtime.capture.proxy import CaptureBypassReason
 from exp.runtime.capture.upload import UploadStats
 
 
@@ -311,3 +312,58 @@ def test_token_units_round_without_precision_loss_or_scientific_notation(
 ) -> None:
     """Readable token totals trim zeros and promote rounded thousands and millions."""
     assert display_module._format_tokens(count) == expected
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+@pytest.mark.parametrize("reason", ["certificate", "handshake"])
+def test_bypassed_targets_remain_visible_as_partial_capture(
+    monkeypatch: pytest.MonkeyPatch, terminal: bool, reason: CaptureBypassReason
+) -> None:
+    """Trust recovery names the uncaptured target once and persists beside changing usage."""
+    monkeypatch.setenv("TERM", "xterm-256color")
+    output = io.StringIO()
+    display = CaptureDisplay(
+        Console(file=output, width=200, force_terminal=terminal, color_system=None), verbose=False
+    )
+    stats = UploadStats(
+        0, 0, 0, 8, 8, input_tokens=1_752_000, output_tokens=3_100, usage_exchanges=8
+    )
+    try:
+        display.progress(stats)
+        display.bypassed("Codex [Helper]", "chatgpt.com", reason)
+        before = output.getvalue()
+        display.bypassed("Codex [Helper]", "chatgpt.com", reason)
+        assert output.getvalue() == before
+        diagnosis = (
+            "certificate rejected"
+            if reason == "certificate"
+            else "repeated TLS connection failures"
+        )
+        warning = f"Not capturing Codex [Helper] on chatgpt.com: {diagnosis}."
+        assert warning in Text.from_ansi(before).plain
+        if reason == "handshake":
+            assert "certificate" not in Text.from_ansi(before).plain
+
+        display.progress(replace(stats, captured_exchanges=9, usage_exchanges=9))
+        progress = Text.from_ansi(output.getvalue()[len(before) :]).plain
+        assert "9 requests captured" in progress
+        assert "partial capture: 1 target not captured" in progress
+        assert "1.75M in / 3.1K out tokens" in progress
+
+        before = output.getvalue()
+        display.stopped(stats)
+        receipt = Text.from_ansi(output.getvalue()[len(before) :]).plain
+        assert "partial capture: 1 target not captured" in receipt
+    finally:
+        display.close()
+
+
+def test_host_wide_bypass_is_explicit_before_any_requests() -> None:
+    """Unidentified client recovery cannot leave zero-request capture looking complete."""
+    output = io.StringIO()
+    display = CaptureDisplay(Console(file=output, width=200), verbose=False)
+    display.bypassed("All apps", "chatgpt.com", "certificate")
+    display.progress(UploadStats(0, 0, 0, 0, 0))
+    text = output.getvalue()
+    assert "Not capturing All apps on chatgpt.com" in text
+    assert "0 requests captured · partial capture: 1 target not captured" in text

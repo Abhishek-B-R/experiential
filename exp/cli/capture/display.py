@@ -9,6 +9,7 @@ from rich.live import Live
 from rich.spinner import Spinner
 from rich.text import Text
 
+from exp.runtime.capture.proxy import CaptureBypassReason
 from exp.runtime.capture.upload import UploadStats
 
 
@@ -37,6 +38,7 @@ class CaptureDisplay:
         self._live_started = False
         self._last_stats: UploadStats | None = None
         self._last_capture_at: float | None = None
+        self._bypasses: set[tuple[str, str]] = set()
 
     def phase(self, message: str) -> None:
         """Show work immediately without claiming interception has started."""
@@ -80,10 +82,36 @@ class CaptureDisplay:
             self._console.print(line)
         self._last_stats = stats
 
+    def bypassed(self, application: str, host: str, reason: CaptureBypassReason) -> None:
+        """Expose reduced coverage once and retain it beside the live request counters."""
+        target = (application, host)
+        if target in self._bypasses:
+            return
+        self._bypasses.add(target)
+        diagnosis = (
+            "certificate rejected"
+            if reason == "certificate"
+            else "repeated TLS connection failures"
+        )
+        self._console.print(
+            f"Not capturing {application} on {host}: {diagnosis}. "
+            "Retry the request; restart the app and Capture to retry tracing.",
+            markup=False,
+            style="yellow",
+        )
+        if self._last_stats is not None:
+            line = self._stats_text(self._last_stats, now=time.monotonic())
+            if self._live_started:
+                self._live.update(line, refresh=True)
+            else:
+                self._console.print(line)
+
     def _stats_text(self, stats: UploadStats, *, now: float) -> Text:
         """Keep request activity prominent and show delivery problems even in quiet mode."""
         count = stats.captured_exchanges
         parts = [f"{count} {'request' if count == 1 else 'requests'} captured"]
+        if self._bypasses:
+            parts.append(self._coverage_summary())
         if tokens := self._token_summary(stats):
             parts.append(tokens)
         if self._last_capture_at is not None:
@@ -100,7 +128,13 @@ class CaptureDisplay:
         ):
             if count or self._verbose:
                 parts.append(f"{count} {label}")
-        return Text(" · ".join(parts), style="green" if stats.captured_exchanges else "")
+        style = "yellow" if self._bypasses else "green" if stats.captured_exchanges else ""
+        return Text(" · ".join(parts), style=style)
+
+    def _coverage_summary(self) -> str:
+        """Keep exclusions visible without repeating per-app warnings on every update."""
+        count = len(self._bypasses)
+        return f"partial capture: {count} {'target' if count == 1 else 'targets'} not captured"
 
     @staticmethod
     def _token_summary(stats: UploadStats) -> str:
@@ -124,6 +158,8 @@ class CaptureDisplay:
         receipt = f"{count} {'request' if count == 1 else 'requests'} captured"
         if tokens := self._token_summary(stats):
             receipt += f" · {tokens}"
+        if self._bypasses:
+            receipt += f" · {self._coverage_summary()}"
         self._console.print(
             Text.assemble(
                 ("Capture stopped.", "green"),
