@@ -30,6 +30,7 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "messages",
                 "max_tokens",
                 "max_completion_tokens",
+                "max_output_tokens",
                 "temperature",
                 "top_p",
                 "stream",
@@ -67,6 +68,7 @@ CHAT_MANIFEST = CompatibilityManifest(
         # DashScope's top-level spelling of the same switch (Qwen-family clients
         # send it via extra_body); translated exactly like chat_template_kwargs.
         _field("enable_thinking", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
+        _field("thinking_budget", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
         _field("logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
         # Sampling penalties: admitted and adapted per rung — honored where the

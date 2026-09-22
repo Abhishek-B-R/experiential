@@ -27,6 +27,7 @@ from exp.runtime.models.providers.openai_payloads import (
     openai_compatible_stream_payload,
     openai_responses_stream_payload,
 )
+from exp.runtime.models.providers.thinking_budget import require_thinking_budget_support
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
@@ -127,6 +128,7 @@ def dialect_stream_payload(
         ProviderCapabilityError: The request uses a capability this dialect
             cannot preserve.
     """
+    require_thinking_budget_support(profile, provider_request)
     if profile.inference_geo is not None and profile.dialect != "anthropic_messages":
         raise ProviderCapabilityError(capability="inference_geo")
     if fireworks_continuation_required(profile, provider_request):
@@ -208,10 +210,14 @@ def dialect_stream_payload(
     if profile.dialect == "openai_compatible":
         if profile.fireworks_reasoning_route_sha256 is not None:
             require_responses_continuation_channel(provider_request)
-        return openai_compatible_stream_payload(
+        payload = openai_compatible_stream_payload(
             profile.model_id,
             provider_request,
-            token_limit_key=profile.token_limit_key,
+            token_limit_key=(
+                "max_completion_tokens"
+                if provider_request.thinking_budget is not None
+                else profile.token_limit_key
+            ),
             supports_temperature=profile.supports_temperature,
             supports_top_p=(
                 profile.supports_temperature
@@ -235,4 +241,8 @@ def dialect_stream_payload(
             forwards_prompt_cache_key=profile.forwards_prompt_cache_key,
             forwards_cache_control=profile.forwards_cache_control,
         )
+        if provider_request.thinking_budget is not None:
+            payload["thinking_budget"] = provider_request.thinking_budget
+            payload["enable_thinking"] = True
+        return payload
     raise ProviderCapabilityError(capability=f"wire_dialect:{profile.dialect}")

@@ -4914,3 +4914,31 @@ def test_responses_accepts_returned_probability_content_in_stateless_history() -
         }
     ).request
     assert request.messages[0].content == "A"
+
+
+@pytest.mark.parametrize("limit", (1, 128, 8192))
+def test_chat_accepts_max_output_tokens_without_losing_the_ceiling(limit: int) -> None:
+    """Clients using the Responses spelling retain an exact Chat output ceiling."""
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_output_tokens": limit,
+        }
+    ).request
+    assert request.maximum_output_tokens == limit
+    assert request.maximum_output_tokens_parameter == "max_output_tokens"
+
+
+@pytest.mark.parametrize("other", ("max_tokens", "max_completion_tokens"))
+def test_chat_output_limit_spellings_cannot_override_each_other(other: str) -> None:
+    """Reject ambiguous ceilings rather than increasing a caller's bound."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_output_tokens": 128,
+                other: 256,
+            }
+        )

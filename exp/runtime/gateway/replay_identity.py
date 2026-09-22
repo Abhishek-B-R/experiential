@@ -106,6 +106,7 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
     if (
         not replay
         and not retained_tools
+        and request.thinking_budget is None
         and request.provider_thinking_config is None
         and request.reasoning_context is None
         and request.context_management is None
@@ -133,6 +134,8 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
     }
     # The newer Messages carriers join the envelope only when present, so
     # every request decoded before they existed keeps its exact digest.
+    if request.thinking_budget is not None:
+        envelope["thinking_budget"] = request.thinking_budget
     if request.diagnostics is not None:
         envelope["diagnostics"] = request.diagnostics
     if request.speed is not None:
