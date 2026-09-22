@@ -109,6 +109,23 @@ impl Normalizer {
                             continue;
                         }
                     }
+                    if let Some(image) = part.get("inlineData") {
+                        let media_type =
+                            image
+                                .get("mimeType")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| {
+                                    malformed("Gemini image requires a media type")
+                                        .with_retry(false, false)
+                                })?;
+                        let data = image.get("data").and_then(Value::as_str).ok_or_else(|| {
+                            malformed("Gemini image requires base64 data").with_retry(false, false)
+                        })?;
+                        let url = crate::image_output::inline_image(media_type, data)?;
+                        self.reserve_image_bytes(url.len())?;
+                        events.push(Event::Image(url));
+                        continue;
+                    }
                     match part.get("text") {
                         Some(Value::String(text)) => {
                             if !text.is_empty() {

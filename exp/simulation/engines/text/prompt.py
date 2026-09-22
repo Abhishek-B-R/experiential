@@ -111,8 +111,6 @@ def build_world_model_request(
     Returns:
         A text-only provider request with the pinned prompt and no candidate hidden state.
 
-    Raises:
-        TextWorldModelProtocolError: The candidate response lacks visible text or includes tools.
     """
     evidence: JsonObject = {
         "task": {
@@ -157,7 +155,7 @@ def build_world_model_request(
 
 
 def parse_world_model_transition(output: AssistantAction) -> TextWorldModelTransition:
-    """Parse a strict visible transition and reject tools, prose, or hidden-output stand-ins.
+    """Parse a strict transition and reject native tool calls, prose, or hidden-output stand-ins.
 
     The prompt forbids Markdown fences, and one fence around an otherwise valid transition is
     unwrapped before parsing because supported providers still add it. Prose and extra keys stay

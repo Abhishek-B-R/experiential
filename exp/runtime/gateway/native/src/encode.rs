@@ -288,6 +288,10 @@ impl ChatSseEncoder {
                 None,
                 update.logprobs.as_ref(),
             )]),
+            Event::Image(url) => Ok(vec![self.chunk(
+                json!({"images": [crate::image_output::chat_image_value(url)]}),
+                None,
+            )]),
             Event::TextDelta(text) => Ok(vec![self.chunk(json!({"content": text}), None)]),
             Event::RefusalDelta(text) => Ok(vec![self.chunk(json!({"refusal": text}), None)]),
             Event::ProviderTextDelta { delta, .. } => {
@@ -702,6 +706,16 @@ pub fn completed_chat_body_with_carrier(
         "content": if text.is_empty() { Value::Null } else { Value::String(text) },
         "refusal": if refusal.is_empty() { Value::Null } else { Value::String(refusal) },
     });
+    let images: Vec<Value> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Image(url) => Some(crate::image_output::chat_image_value(url)),
+            _ => None,
+        })
+        .collect();
+    if !images.is_empty() {
+        message["images"] = Value::Array(images);
+    }
     // OpenAI documents `tool_calls` as an optional array and omits it from a
     // message that made no calls; it never serializes `null` there. Strict
     // OpenAI-schema consumers (the OpenRouter SDK's response parser, for one)

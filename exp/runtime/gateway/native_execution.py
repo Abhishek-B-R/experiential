@@ -892,13 +892,8 @@ def deployment_wire_entry(
         "native_tool_translation": {
             mangled: list(origin) for mangled, origin in (native_tool_translation or {}).items()
         },
-        # An image-emitting lane (the platform projects `emits_images` from the
-        # model's output modalities): the data plane answers an empty
-        # completion there at once instead of redialing a second whole image.
-        # Deliberately NOT `supports_image_generation`: that claim admits
-        # /v1/images, and every OpenAI-compatible profile carries an
-        # images_url, so reusing it opened OpenRouter chat lanes to image
-        # generations (2026-09-15).
+        # Mixed chat image output needs a larger bounded SSE frame and must
+        # never regenerate an image after an empty completion.
         "image_output": (
             deployment.capabilities is not None and deployment.capabilities.emits_images
         ),
