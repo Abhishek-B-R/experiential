@@ -17,8 +17,11 @@ include the effective effort, including the provider default when the caller
 omits it. An empty declaration means unknown and rejects that reasoning rung.
 Admission preserves route order, rejects when no eligible rung remains, and
 rechecks the final per-rung request before freezing dispatch. It never changes
-reasoning effort to make a probability request fit. This change does not enable
-probabilities across provider catalogs automatically.
+reasoning effort to make a probability request fit. A numeric `thinking_budget`
+is not qualified by an effort declaration and cannot be combined with enabled
+probabilities. Remove the budget and select a probability-capable effort, or
+disable probabilities. This does not enable probabilities across provider
+catalogs automatically.
 
 Output guardrails and gateway-emulated stop sequences are unsupported with
 probabilities because replacement or truncation can invalidate token alignment.

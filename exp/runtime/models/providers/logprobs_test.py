@@ -16,8 +16,12 @@ from exp.runtime.models.providers.logprobs import (
     require_chat_logprobs,
     require_unmodified_probability_output,
 )
-from exp.runtime.models.providers.streaming_requests import dialect_stream_payload
+from exp.runtime.models.providers.streaming_requests import (
+    dialect_stream_payload,
+    route_generation_parameter_requests,
+)
 from exp.runtime.models.providers.streaming_requests_test import _chat_request
+from exp.runtime.openai_protocol.requests import decode_chat
 
 
 def _profile() -> GatewayWireProfile:
@@ -127,6 +131,63 @@ def test_responses_probabilities_never_coerce_reasoning_intent(
         update={"surface": GatewayApiSurface.RESPONSES, "reasoning_effort": "high", **intent}
     )
     assert coerce_generation_parameters((profile,), request) is None
+
+
+@pytest.mark.parametrize("probabilities", [False, True])
+def test_numeric_thinking_budget_cannot_borrow_nonreasoning_probability_qualification(
+    probabilities: bool,
+) -> None:
+    """A numeric budget enables thinking, so a qualified none default cannot authorize it."""
+    profile = replace(
+        _profile(),
+        url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions",
+        model_id="qwen3.8-max",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        reasoning_effort="none",
+        supported_reasoning_efforts=("none", "low"),
+        logprobs_reasoning_efforts=("none",),
+    )
+    request = decode_chat(
+        {
+            "model": "qwen3.8-max",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking_budget": 128,
+            "max_output_tokens": 256,
+            "logprobs": probabilities,
+        }
+    ).request
+    assert request.reasoning_effort is None
+    if probabilities:
+        with pytest.raises(ProviderParameterError) as error:
+            route_generation_parameter_requests((profile,), request)
+        assert error.value.param == "thinking_budget"
+        assert error.value.code == "unsupported_parameter"
+        with pytest.raises(ProviderParameterError):
+            require_chat_logprobs((profile,), request)
+    else:
+        public, provider = route_generation_parameter_requests((profile,), request)
+        payload = dialect_stream_payload(profile, provider)
+        assert public.thinking_budget == payload["thinking_budget"] == 128
+        assert payload["enable_thinking"] is True
+        assert "logprobs" not in payload
+        assert "reasoning_effort" not in payload
+
+
+@pytest.mark.parametrize("intent", [{"include_output_text_logprobs": True}, {"top_logprobs": 0}])
+def test_native_responses_probabilities_cannot_carry_numeric_chat_budget(
+    intent: dict[str, bool | int],
+) -> None:
+    """The existing native-wire budget guard refuses this unsupported Responses combination."""
+    profile = replace(_profile(), dialect="openai_responses", supports_responses_logprobs=True)
+    request = _chat_request().model_copy(
+        update={"surface": GatewayApiSurface.RESPONSES, "thinking_budget": 128, **intent}
+    )
+    with pytest.raises(ProviderParameterError) as error:
+        route_generation_parameter_requests((profile,), request)
+    assert error.value.param == "thinking_budget"
+    with pytest.raises(ProviderParameterError):
+        dialect_stream_payload(profile, request)
 
 
 def test_responses_probability_intent_uses_existing_optional_replay_authority() -> None:

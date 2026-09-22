@@ -29,6 +29,16 @@ def require_chat_logprobs(profiles: Sequence[GatewayWireProfile], request: Gatew
             param="top_logprobs",
             code="invalid_parameter",
         )
+    if request.thinking_budget is not None:
+        raise ProviderParameterError(
+            message=(
+                "Token probabilities are not qualified with a numeric thinking_budget. "
+                "Remove thinking_budget and select a probability-capable reasoning_effort, "
+                "or disable logprobs."
+            ),
+            param="thinking_budget",
+            code="unsupported_parameter",
+        )
     for profile in profiles:
         compatible = profile.dialect == "openai_compatible" and profile.supports_logprobs is True
         if profile.supports_reasoning:
