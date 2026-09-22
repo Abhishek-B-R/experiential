@@ -10,7 +10,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from exp.cli.build.cost import over_ceiling_message
+from exp.cli.build.cost import grounded_build_command, over_ceiling_message
 from exp.cli.providers.provider_picker import resolve_setup_providers
 from exp.cli.providers.setup import (
     ProviderSetupOptions,
@@ -102,6 +102,7 @@ class GroundedBuildCompletion:
 
 
 def build(
+    ctx: typer.Context,
     project: str = _PROJECT_ARGUMENT,
     legacy_trace_file: Path | None = _LEGACY_TRACE_ARGUMENT,
     trace_file: Path | None = _TRACE_FILE_OPTION,
@@ -157,6 +158,7 @@ def build(
     provider-free preflight before reading credentials or constructing provider clients.
 
     Args:
+        ctx: Invoking CLI context, preserving the command name in authorization and recovery.
         project: Safe local project identifier below ``<root>/projects``.
         legacy_trace_file: Active positional trace-path compatibility for packaged examples.
         trace_file: Explicit local canonical trace export, or ``None`` for the interactive wizard.
@@ -176,6 +178,7 @@ def build(
     Raises:
         typer.BadParameter: Input, setup, role, cost, project, or artifact validation fails.
     """
+    command_name = ctx.info_name or "build"
     if legacy_trace_file is not None:
         if trace_file is not None:
             raise typer.BadParameter("provide traces once, using -t/--traces or the trace path")
@@ -324,6 +327,7 @@ def build(
             if estimate is not None and estimate > maximum_build_cost_usd:
                 raise ValueError(
                     over_ceiling_message(
+                        command_name=command_name,
                         estimate=estimate,
                         ceiling=maximum_build_cost_usd,
                         project=project,
@@ -341,7 +345,18 @@ def build(
             root=root,
             yes=yes,
             estimated_cost_usd=estimate,
-            command=f"exp build {project} {trace_file}",
+            command=grounded_build_command(
+                command_name=command_name,
+                project=project,
+                trace_file=trace_file,
+                source=source,
+                root=root,
+                world_model=world_model,
+                judge=judge,
+                embedder=embedder,
+                top_k=top_k,
+                maximum_build_cost_usd=str(maximum_build_cost_usd),
+            ),
             non_interactive=no_interactive,
         ):
             return

@@ -443,7 +443,7 @@ def test_first_build_configures_providers_and_models_through_the_picker(
     result = _RUNNER.invoke(
         app,
         ["build", "support", "--traces", str(source), "--root", str(root)],
-        input="1\n\n1\n\n1\n\n2\n\ny\n",
+        input="/openai\n1\n\n1\n\n1\n\n2\n\ny\n",
     )
 
     assert result.exit_code == 0, result.output

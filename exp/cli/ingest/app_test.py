@@ -9,7 +9,8 @@ from typer import rich_utils
 from typer.testing import CliRunner
 
 from exp.cli.app import app
-from exp.cli.build.app_test import _catalog, _RuntimeCatalog
+from exp.cli.build.app_test import _catalog, _otlp_export, _RuntimeCatalog
+from exp.common.config.settings import set_maximum_command_cost_usd
 from exp.common.project import ProjectStore
 from exp.common.traces import load_trace_dataset
 
@@ -108,3 +109,77 @@ def test_ingest_preserves_tool_trace_evidence_without_router_execution(
         replay = CliRunner().invoke(app, arguments)
         assert replay.exit_code == 0, replay.output
         assert store.load_project().build == config.build
+
+
+@pytest.mark.parametrize("command_name", ["build", "ingest"])
+def test_over_budget_recovery_keeps_invoked_command_and_trace_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command_name: str
+) -> None:
+    """A rejected ingestion retries the selected source through the command the user invoked."""
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root)
+    source = _otlp_export(tmp_path, count=2)
+    monkeypatch.setattr("exp.cli.build.app.RuntimeModelCatalog", _RuntimeCatalog)
+    monkeypatch.setattr("exp.cli.build.app._embedding_cost_ceiling", lambda *_args: 0.75)
+    result = CliRunner().invoke(
+        app,
+        [
+            command_name,
+            "support",
+            "--traces",
+            str(source),
+            "--source",
+            "otlp",
+            "--root",
+            str(root),
+            "--max-build-cost-usd",
+            "0.01",
+            "--non-interactive",
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    output = " ".join(Text.from_ansi(result.output).plain.replace("│", " ").split())
+    assert "conservative embedding estimate $0.750000 exceeds" in output
+    assert f"exp {command_name} support --traces" in output
+    assert "--source otlp" in output
+    assert "--max-build-cost-usd 0.750000" in output
+    assert ProjectStore(root, "support").load_project().build is None
+
+
+@pytest.mark.parametrize("command_name", ["build", "ingest"])
+def test_spend_confirmation_names_the_invoked_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command_name: str
+) -> None:
+    """Both CLI entrypoints authorize their own command while sharing grounded-build execution."""
+    monkeypatch.chdir(tmp_path)
+    root = Path("custom-state")
+    root.mkdir()
+    _catalog(root)
+    source = _otlp_export(Path("."), count=2)
+    set_maximum_command_cost_usd(1.0, root)
+    monkeypatch.setattr("exp.cli.build.app.RuntimeModelCatalog", _RuntimeCatalog)
+    monkeypatch.setattr("exp.cli.build.app.capture_build_completed", lambda **_kwargs: None)
+    monkeypatch.setattr("exp.cli.build.app._embedding_cost_ceiling", lambda *_args: 0.75)
+    monkeypatch.setattr("exp.cli.shared.consent.can_prompt", lambda _console: True)
+    monkeypatch.setattr("exp.cli.ingest.app.can_prompt", lambda _console: True)
+    result = CliRunner().invoke(
+        app,
+        [
+            command_name,
+            "support",
+            "--traces",
+            str(source),
+            "--source",
+            "otlp",
+            "--root",
+            str(root),
+        ],
+        input="y\n",
+    )
+    assert result.exit_code == 0, result.output
+    output = " ".join(Text.from_ansi(result.output).plain.replace("│", " ").split())
+    assert f"Authorize exp {command_name} support --traces traces.jsonl" in output
+    assert "--source otlp --root custom-state" in output
+    assert "--max-build-cost-usd 5.0" in output
+    assert ProjectStore(root, "support").load_project().build is not None

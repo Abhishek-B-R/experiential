@@ -21,6 +21,7 @@ def over_ceiling_message(
     judge: str | None,
     embedder: str | None,
     top_k: int,
+    command_name: str,
 ) -> str:
     """Describe an over-ceiling refusal and the exact command that raises the limit.
 
@@ -35,13 +36,61 @@ def over_ceiling_message(
         judge: Optional judge alias override.
         embedder: Optional embedder alias override.
         top_k: Requested retrieval result limit.
+        command_name: Invoked CLI command, used unchanged in the recovery instruction.
 
     Returns:
         Fail-closed message naming both amounts and a sufficient rebuild command.
     """
-    command = ["exp", "build", project, "--traces", str(trace_file)]
-    if source.strip().casefold() != "otlp":
-        command.extend(["--source", source])
+    command = grounded_build_command(
+        command_name=command_name,
+        project=project,
+        trace_file=trace_file,
+        source=source,
+        root=root,
+        world_model=world_model,
+        judge=judge,
+        embedder=embedder,
+        top_k=top_k,
+        maximum_build_cost_usd=sufficient_ceiling_usd(estimate),
+    )
+    return (
+        f"conservative embedding estimate ${estimate:.6f} exceeds "
+        f"--max-build-cost-usd ${ceiling:.6f}. "
+        f"Re-run with a higher ceiling: {command}"
+    )
+
+
+def grounded_build_command(
+    *,
+    command_name: str,
+    project: str,
+    trace_file: Path,
+    source: str,
+    root: Path,
+    world_model: str | None,
+    judge: str | None,
+    embedder: str | None,
+    top_k: int,
+    maximum_build_cost_usd: str,
+) -> str:
+    """Render a reusable invocation for spend consent and cost-ceiling recovery.
+
+    Args:
+        command_name: Invoked CLI command name.
+        project: Local project identifier.
+        trace_file: Explicit trace export path.
+        source: Selected source, retained even when it matches one command's default.
+        root: Local artifact root.
+        world_model: Optional world-model alias override.
+        judge: Optional judge alias override.
+        embedder: Optional embedder alias override.
+        top_k: Requested retrieval result limit.
+        maximum_build_cost_usd: Requested or recommended ceiling encoded without precision loss.
+
+    Returns:
+        Shell-quoted command preserving the selected ingestion workflow and cost ceiling.
+    """
+    command = ["exp", command_name, project, "--traces", str(trace_file), "--source", source]
     if root != Path(ARTIFACT_DIR):
         command.extend(["--root", str(root)])
     if world_model is not None:
@@ -52,12 +101,8 @@ def over_ceiling_message(
         command.extend(["--embedder", embedder])
     if top_k != 5:
         command.extend(["--top-k", str(top_k)])
-    command.extend(["--max-build-cost-usd", sufficient_ceiling_usd(estimate)])
-    return (
-        f"conservative embedding estimate ${estimate:.6f} exceeds "
-        f"--max-build-cost-usd ${ceiling:.6f}. "
-        f"Re-run with a higher ceiling: {shlex.join(command)}"
-    )
+    command.extend(["--max-build-cost-usd", maximum_build_cost_usd])
+    return shlex.join(command)
 
 
 def sufficient_ceiling_usd(estimate: float) -> str:

@@ -17,6 +17,7 @@ _TRACE_OPTION = typer.Option(None, "--traces", help="JSON, JSONL, or OTel export
 
 
 def ingest(
+    ctx: typer.Context,
     project: str = typer.Argument(..., metavar="PROJECT"),
     traces: Path | None = _TRACE_OPTION,
     source: str = typer.Option("chat-json", "--source", help="Declared trace format."),
@@ -32,6 +33,7 @@ def ingest(
     """Normalize, mine, and ground traces for later evaluations.
 
     Args:
+        ctx: Invoking CLI context passed through the shared grounded-build handler.
         project: Local project name.
         traces: Explicit export path, or an interactive file prompt.
         source: Canonical source loader name.
@@ -53,6 +55,7 @@ def ingest(
             "Trace format", choices=list(CANONICAL_TRACE_SOURCES), default=source, console=_console
         )
     build(
+        ctx=ctx,
         project=project,
         legacy_trace_file=None,
         trace_file=traces,
