@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+from exp.common.project import ProjectConfig, ProjectStore
 from exp.common.traces.sqlite import SQLiteTraceStore
 from exp.common.traces.sqlite_schema import trace_database_path
 from exp.simulation.ingest.otlp import TraceNormalizationResult
@@ -26,3 +27,29 @@ def load_stored_build_import(
         raise ValueError("the selected import is not associated with this project")
     stored = imports.read_import(import_id)
     return stored.source_format, read_ingested_traces(root, import_id)
+
+
+def project_for_build(root: Path, proposed: ProjectConfig) -> ProjectStore:
+    """Initialize one project or verify mutable build pointers are the only difference.
+
+    Args:
+        root: Local EXP root.
+        proposed: Complete project configuration for this build invocation.
+
+    Returns:
+        Initialized or verified project store.
+
+    Raises:
+        ValueError: Existing project configuration differs outside completed-build pointers.
+    """
+    store = ProjectStore(root, proposed.project_id)
+    if not store.exists():
+        store.initialize(proposed)
+        return store
+    existing = store.load_project()
+    if (
+        existing.model_copy(update={"build": None, "trace_import_id": proposed.trace_import_id})
+        != proposed
+    ):
+        raise ValueError("project configuration already exists with different build configuration")
+    return store

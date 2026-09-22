@@ -72,6 +72,7 @@ def _project_store(
     tmp_path: Path,
     *,
     with_catalog: bool = False,
+    with_blob: bool = False,
     project_id: str = "portable-project",
 ) -> ProjectStore:
     """Create a selected provider-free graph plus one unrelated sibling artifact."""
@@ -89,7 +90,12 @@ def _project_store(
                 sha256="a" * 64,
             ),
         ),
-        files={"nested/trace.json": {"trace_id": "trace-1"}},
+        files={
+            "nested/trace.json": {
+                "trace_id": "trace-1",
+                "payload": "x" * (1_100_000 if with_blob else 0),
+            }
+        },
     )
     trace_input = artifact_input(trace)
     task = store.artifacts.write_json(

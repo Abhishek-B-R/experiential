@@ -556,11 +556,14 @@ class ProjectStore(HostedProjectStoreMixin):
         if task.code_revision != trace.code_revision:
             raise ValueError("provider-free trace and task manifest revisions differ")
 
-    def bind_completed_build(self, build: ProjectBuildArtifacts) -> ProjectConfig:
+    def bind_completed_build(
+        self, build: ProjectBuildArtifacts, *, trace_import_id: ArtifactId | None = None
+    ) -> ProjectConfig:
         """Atomically select a fully verified immutable build for future project workflows.
 
         Args:
             build: Exact trace, task, RAG, and world-model artifact manifest references.
+            trace_import_id: Optional exact stored corpus backing the selected graph.
 
         Returns:
             Updated project configuration naming the completed build.
@@ -602,7 +605,9 @@ class ProjectStore(HostedProjectStoreMixin):
                             f"{field_name} artifact does not bind the completed build graph"
                         )
                 existing = load_project_config(self.paths)
-                updated = existing.model_copy(update={"build": build})
+                updated = existing.model_copy(
+                    update={"build": build, "trace_import_id": trace_import_id}
+                )
                 write_project_config(self.paths, updated)
             except (ArtifactCorruptionError, ValueError) as exc:
                 raise ProjectStoreError(f"cannot bind completed build: {exc}") from exc

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -98,3 +99,27 @@ def close_idle_connections() -> int:
         connection.close()
     idle.clear()
     return closed
+
+
+def enable_wal_mode(connection: sqlite3.Connection, *, timeout_s: float) -> None:
+    """Enable WAL with a finite retry when another process initializes the same database.
+
+    SQLite journal-mode changes can return SQLITE_BUSY immediately without invoking
+    the busy handler. Recheck the committed mode after releasing that attempt so
+    concurrent first writers can converge on WAL within their shared wait allowance.
+
+    Args:
+        connection: Open database whose complete schema has already been validated.
+        timeout_s: Maximum total wait for enabling durable WAL mode.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        try:
+            if connection.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+                connection.execute("PRAGMA journal_mode=WAL").fetchone()
+            return
+        except sqlite3.OperationalError as error:
+            remaining = deadline - time.monotonic()
+            if error.sqlite_errorcode & 0xFF != sqlite3.SQLITE_BUSY or remaining <= 0:
+                raise
+            time.sleep(min(0.01, remaining))

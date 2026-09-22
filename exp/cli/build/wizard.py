@@ -16,6 +16,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 
+from exp.cli.build.source import project_for_build
 from exp.cli.build.wizard_screens import (
     WizardBuildPlan,
 )
@@ -554,7 +555,6 @@ def _prepare_new_build(
         _embedding_cost_ceiling,
         _load_canonical_traces,
         _missing_build_configuration,
-        _project_store,
         _reuse_completed_grounded_artifacts,
         _selected_roles,
         _validated_role_snapshots,
@@ -593,7 +593,7 @@ def _prepare_new_build(
     world_snapshot, embedder_snapshot, embedder_capabilities = _validated_role_snapshots(
         runtime, selected
     )
-    store = _project_store(
+    store = project_for_build(
         root,
         ProjectConfig(
             project_id=project,

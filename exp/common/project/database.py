@@ -7,12 +7,14 @@ import sqlite3
 import stat
 import threading
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
 from exp.common.project.sqlite_schema import initialize_project_schema
+from exp.common.sqlite.connection import enable_wal_mode
 from exp.common.sqlite.schema import validate_content_tables
+from exp.common.sqlite.writers import writer_turn
 
 
 def content_database_path(root: Path) -> Path:
@@ -97,34 +99,38 @@ def project_connection(
         else:
             active.connection.execute("RELEASE project_nested")
         return
-    if write:
-        _create_database(path)
-    elif path.is_symlink():
-        raise ValueError("Content database must not be a symlink.")
-    mode = "rw" if write else "ro"
-    connection = sqlite3.connect(
-        f"{path.as_uri()}?mode={mode}", uri=True, timeout=max(0.0, timeout_s), isolation_level=None
-    )
-    try:
-        connection.execute("PRAGMA foreign_keys=ON")
-        validate_content_tables(connection)
+    admission = writer_turn(path, timeout_s=timeout_s) if write else nullcontext(timeout_s)
+    with admission as remaining_s:
         if write:
-            if connection.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
-                connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA synchronous=FULL")
-        connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-        tables = validate_content_tables(connection)
-        if write and "project_store_schema" not in tables:
-            initialize_project_schema(connection)
-        _transactions.active[path] = _Transaction(connection, write)
+            _create_database(path)
+        elif path.is_symlink():
+            raise ValueError("Content database must not be a symlink.")
+        mode = "rw" if write else "ro"
+        connection = sqlite3.connect(
+            f"{path.as_uri()}?mode={mode}",
+            uri=True,
+            timeout=max(0.0, remaining_s),
+            isolation_level=None,
+        )
         try:
-            yield connection
+            connection.execute("PRAGMA foreign_keys=ON")
+            validate_content_tables(connection)
             if write:
-                connection.execute("COMMIT")
+                enable_wal_mode(connection, timeout_s=remaining_s)
+                connection.execute("PRAGMA synchronous=FULL")
+            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            tables = validate_content_tables(connection)
+            if write and "project_store_schema" not in tables:
+                initialize_project_schema(connection)
+            _transactions.active[path] = _Transaction(connection, write)
+            try:
+                yield connection
+                if write:
+                    connection.execute("COMMIT")
+            finally:
+                _transactions.active.pop(path, None)
         finally:
-            _transactions.active.pop(path, None)
-    finally:
-        connection.close()
+            connection.close()
 
 
 def has_project_schema(root: Path) -> bool:

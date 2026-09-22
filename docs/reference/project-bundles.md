@@ -42,7 +42,9 @@ absolute paths, extra artifacts, and incomplete content.
 Verified state is materialized in a private staging database. Referenced large files are published
 before one SQLite transaction installs the project's configuration and artifact records in
 `gateway/traffic.db`. Other projects, capture rows, and trace imports are unchanged. A failed commit
-rolls back the project records and staged publication; no partial project is selected.
+rolls back the selected project records. A durable SQLite intent binds any published files to the
+exact bundle digest, so a retry verifies those bytes and completes the same restore. No partial
+project is selected, and a different bundle cannot adopt the interrupted publication.
 
 ## Stage events and runtime state
 
