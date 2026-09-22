@@ -126,6 +126,14 @@
       $ = (id) => document.getElementById(id);
     const models = d.report.models,
       fmt = (x, n = 3) => (x == null ? "unavailable" : Number(x).toFixed(n));
+    function cost(x) {
+      if (x == null) return "unavailable";
+      const value = Number(x),
+        rounded = value.toFixed(value !== 0 && Math.abs(value) < 0.001 ? 6 : 4);
+      return value !== 0 && Number(rounded) === 0
+        ? value.toExponential(2)
+        : rounded;
+    }
     $("summary").textContent =
       `${d.project} · ${d.tasks.length} distinct scenarios · ${models.length} models · ${d.report.compared_cells} shared valid scenario/repeat pairs · ${d.report.excluded_cells} excluded pairs`;
     $("method").textContent =
@@ -151,7 +159,7 @@
       [
         m.candidate.alias,
         m.quality == null ? "unavailable" : fmt(m.quality * 100, 1),
-        fmt(m.operating_cost_usd, 4),
+        cost(m.operating_cost_usd),
         fmt(m.latency_seconds, 1),
         m.scored_cells,
         m.failed_cells,
@@ -166,7 +174,9 @@
     const points = models.filter(
         (m) => m.quality != null && m.operating_cost_usd != null,
       ),
-      max = Math.max(...points.map((m) => m.operating_cost_usd), 0.001) * 1.25;
+      max =
+        (Math.max(...points.map((m) => m.operating_cost_usd), 0) || 0.001) *
+        1.25;
     function svg(tag, attrs, text) {
       const e = document.createElementNS("http://www.w3.org/2000/svg", tag);
       Object.entries(attrs).forEach(([k, v]) => e.setAttribute(k, v));
@@ -187,7 +197,7 @@
       svg(
         "text",
         { x: x(v * max), y: 386, fill: "#666", "font-size": 13 },
-        "$" + (v * max).toFixed(3),
+        "$" + cost(v * max),
       );
     }
     svg(

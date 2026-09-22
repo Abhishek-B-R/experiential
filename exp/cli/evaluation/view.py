@@ -108,5 +108,11 @@ def inspect_report(console: Console, project: ProjectStore, run: EvaluationRun) 
 
 
 def _number(value: float | None, prefix: str, suffix: str = "") -> str:
-    """Format a measurement without turning missing data into zero."""
-    return "unavailable" if value is None else f"{prefix}{value:.4f}{suffix}"
+    """Format a measurement without turning missing or small positive values into zero."""
+    if value is None:
+        return "unavailable"
+    precision = 6 if 0 < abs(value) < 0.001 else 4
+    rendered = f"{value:.{precision}f}"
+    if value != 0 and float(rendered) == 0:
+        rendered = f"{value:.3g}"
+    return f"{prefix}{rendered}{suffix}"
