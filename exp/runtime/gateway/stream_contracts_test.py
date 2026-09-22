@@ -1,8 +1,9 @@
 """Tests for stream outcome contracts."""
 
 import pytest
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.stream_contracts import (
     GatewayEvent,
     GatewayEventKind,
@@ -148,3 +149,85 @@ def test_tool_search_requests_ride_on_usage_but_never_make_usage_alone() -> None
         GatewayUsage(tool_search_requests=2)
     with pytest.raises(ValidationError):
         GatewayUsage(input_tokens=1, output_tokens=1, tool_search_requests=-1)
+
+
+def test_native_responses_probability_event_round_trips_from_rust_shape() -> None:
+    """Native probability observations preserve part identity and raw records."""
+    event = GatewayEvent.model_validate(
+        {
+            "kind": "provider_responses_logprobs",
+            "sequence_number": 4,
+            "output_index": 0,
+            "item_id": "msg_1",
+            "content_index": 1,
+            "phase": "terminal",
+            "records": [{"token": "OK", "logprob": -0.125, "bytes": [79, 75]}],
+        }
+    )
+    assert event.responses_item_id == "msg_1"
+    assert event.responses_content_index == 1
+    assert event.responses_logprobs_phase == "terminal"
+
+
+@pytest.mark.parametrize("phase", ["delta", "text_done"])
+@pytest.mark.parametrize("alternatives", [None, [{"token": None, "logprob": None}]])
+def test_responses_probability_delta_optional_fields_survive(
+    phase: str, alternatives: JsonValue
+) -> None:
+    """Delta alternatives preserve nullable fields defined by the provider SDK."""
+    records = [{"token": "A", "logprob": -0.1, "top_logprobs": alternatives}]
+    event = GatewayEvent.model_validate(
+        {
+            "kind": "provider_responses_logprobs",
+            "sequence_number": 0,
+            "output_index": 0,
+            "item_id": "a",
+            "content_index": 0,
+            "phase": phase,
+            "records": records,
+        }
+    )
+    assert event.model_dump(mode="json", by_alias=True)["records"] == records
+
+
+@pytest.mark.parametrize("phase", ["content_part_done", "item_done", "terminal"])
+def test_responses_probability_completed_part_accepts_null(phase: str) -> None:
+    """Null is a valid optional final-part observation, distinct from an empty list."""
+    event = GatewayEvent.model_validate(
+        {
+            "kind": "provider_responses_logprobs",
+            "sequence_number": 0,
+            "output_index": 0,
+            "item_id": "a",
+            "content_index": 0,
+            "phase": phase,
+            "records": None,
+        }
+    )
+    assert event.model_dump(mode="json", by_alias=True)["records"] is None
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"phase": "invented"},
+        {"records": [{"token": 1, "logprob": -0.1}]},
+        {"records": None},
+        {"records": [1]},
+    ],
+)
+def test_responses_probability_boundary_rejects_invalid_shape(change: JsonObject) -> None:
+    """Internal event ingress rejects unknown phases and malformed delta records."""
+    with pytest.raises(ValidationError):
+        GatewayEvent.model_validate(
+            {
+                "kind": "provider_responses_logprobs",
+                "sequence_number": 0,
+                "output_index": 0,
+                "item_id": "a",
+                "content_index": 0,
+                "phase": "delta",
+                "records": [],
+                **change,
+            }
+        )

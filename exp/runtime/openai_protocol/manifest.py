@@ -84,11 +84,7 @@ CHAT_MANIFEST = CompatibilityManifest(
         # any rung, so false is already satisfied and store:true is rejected:
         # silently dropping a retention request would be dishonest.
         _field("store", CompatibilityDisposition.SUPPORTED),
-        # top_logprobs stays UNSUPPORTED: the gateway response contract does not
-        # project logprob arrays yet, so it cannot be honored on any rung —
-        # rejecting is the honest outcome (never a silent drop of a probability
-        # request). Admit it only once response normalization emits logprobs.
-        _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),
+        _field("top_logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         # End-user attribution (OpenAI spec). Accepted and recorded gateway-side,
         # never forwarded to the model: `safety_identifier` is the current
@@ -188,7 +184,7 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         ),
         _field("reasoning", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
-        _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),
+        _field("top_logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
         # Accepted only at their no-op values (the wire models enforce them):
         # Copilot hardcodes truncation:"disabled" and
         # prompt_cache_options:{"mode":"implicit"} on every Responses request,
@@ -250,7 +246,9 @@ RESPONSES_REASONING_CONTEXTS_ACCEPTED = frozenset({"auto", "current_turn", "all_
 RESPONSES_REASONING_SUMMARIES_ACCEPTED = frozenset({"auto", "concise", "detailed"})
 """``reasoning.summary`` and ``generate_summary`` values the decoder accepts."""
 
-RESPONSES_INCLUDE_PATHS_ACCEPTED = frozenset({"reasoning.encrypted_content"})
+RESPONSES_INCLUDE_PATHS_ACCEPTED = frozenset(
+    {"reasoning.encrypted_content", "message.output_text.logprobs"}
+)
 """``include`` selectors the gateway honors."""
 
 RESPONSES_INCLUDE_PATHS_REJECTED = frozenset(
@@ -259,7 +257,6 @@ RESPONSES_INCLUDE_PATHS_REJECTED = frozenset(
         "computer_call_output.output.image_url",
         "file_search_call.results",
         "message.input_image.image_url",
-        "message.output_text.logprobs",
         "web_search_call.action.sources",
         "web_search_call.results",
     }

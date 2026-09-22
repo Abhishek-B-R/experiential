@@ -64,6 +64,21 @@ pub fn event_retained_bytes(event: &Event) -> usize {
         }
         Event::HostedToolItemProgress { payload, .. } => payload.len(),
         Event::ProviderTextAnnotation { annotation, .. } => annotation.len(),
+        Event::ProviderOutputItemStarted { item_id, .. } => {
+            64usize.saturating_add(item_id.as_deref().map_or(0, str::len))
+        }
+        Event::ChoiceLogprobsDelta(delta) => delta.retained_bytes(),
+        Event::ProviderResponsesLogprobs {
+            item_id,
+            phase,
+            records,
+            ..
+        } => crate::dialects::records_retained_bytes(records)
+            .map(|size| {
+                size.saturating_add(item_id.len())
+                    .saturating_add(phase.len())
+            })
+            .unwrap_or(MAXIMUM_RETAINED_OUTPUT_BYTES.saturating_add(1)),
         _ => 64,
     }
 }
@@ -486,6 +501,19 @@ impl UpstreamRelay {
 
     /// Enforce the caller's stop sequences on this relay's visible text.
     /// Installed before the first event is yielded; an empty set is a no-op.
+    pub fn set_probability_output(&mut self, chat: bool, payload: &serde_json::Value) {
+        self.normalizer.enable_chat_logprobs(
+            chat && payload.get("logprobs").and_then(serde_json::Value::as_bool) == Some(true),
+        );
+        self.normalizer.enable_responses_logprobs(
+            payload.get("top_logprobs").is_some_and(|v| !v.is_null())
+                || payload
+                    .get("include")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|items| items.iter().any(|v| v == "message.output_text.logprobs")),
+        );
+    }
+
     pub fn set_stop_sequences<I, S>(&mut self, sequences: I)
     where
         I: IntoIterator<Item = S>,

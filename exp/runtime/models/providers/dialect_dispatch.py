@@ -151,7 +151,7 @@ def dialect_stream_payload(
                 else profile.supports_top_p
             ),
             supports_top_k=profile.supports_top_k,
-            supports_logprobs=profile.supports_logprobs,
+            supports_logprobs=profile.supports_responses_logprobs,
             supports_reasoning=profile.supports_reasoning,
             reasoning_effort=required_reasoning_effort,
             sampling_requires_reasoning_none=profile.sampling_requires_reasoning_none,

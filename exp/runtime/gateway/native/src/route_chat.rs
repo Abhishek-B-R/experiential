@@ -145,17 +145,18 @@ pub(crate) async fn chat(
         }
         return error_response(&escalation_error());
     }
-    let mut admission: Admission = match serde_json::from_value(admission_value.clone()) {
-        Ok(admission) => admission,
-        Err(_) => {
-            // The request is durably accepted; abandon it before failing so
-            // wire-contract drift cannot leak an open request row.
-            if let Some(mut owner) = lease.take() {
-                owner.abandon().await;
+    let mut admission: Admission =
+        match serde_json::from_value::<Admission>(admission_value.clone()) {
+            Ok(admission) if admission.preserves_chat_probabilities() => admission,
+            _ => {
+                // The request is durably accepted; abandon it before failing so
+                // wire-contract drift cannot leak an open request row.
+                if let Some(mut owner) = lease.take() {
+                    owner.abandon().await;
+                }
+                return wire_drift_response(&state, &admission_value, started).await;
             }
-            return wire_drift_response(&state, &admission_value, started).await;
-        }
-    };
+        };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
     guard.record_web_search_requests(admission.web_search_requests());
     // The replay key was authorized independently of admission. If an alias
@@ -213,6 +214,7 @@ pub(crate) async fn chat(
         // Bytes over four approximates input tokens; a timeout heuristic
         // only, never a billing quantity.
         approximate_input_tokens: (body_text.len() as f64) / 4.0,
+        chat_logprobs: true,
         output_less_retention: None,
         output_token_cap: admission.maximum_output_tokens,
         tool_search: admission.tool_search.as_ref(),

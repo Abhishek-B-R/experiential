@@ -9,7 +9,15 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 from pydantic.types import JsonValue
 
 from exp.common.core.artifacts import JsonObject
@@ -43,19 +51,14 @@ _EchoedItemStatus = Literal["in_progress", "completed", "incomplete"]
 class _TextPart(_WireModel):
     """One supported text-only content part.
 
-    Echoed ``output_text`` parts carry ``annotations`` and ``logprobs``
-    arrays: this gateway emits them and callers resend prior output verbatim
-    on continuations. Hosted web-search answers carry populated annotation
-    objects (URL citations), which are validated shallowly and dropped on
-    replay: the provider derives nothing from echoed display metadata, and
-    the cited text itself rides ``text``. A populated ``logprobs`` echo stays
-    rejected because this gateway never emits one.
+    Echoed output_text annotations and probabilities are accepted as typed
+    objects, then stripped from provider history; the text remains unchanged.
     """
 
     type: Literal["text", "input_text", "output_text"]
     text: str
     annotations: tuple[JsonObject, ...] | None = None
-    logprobs: tuple[()] | None = None
+    logprobs: tuple[JsonObject, ...] | None = None
 
     @field_validator("annotations")
     @classmethod
@@ -590,8 +593,8 @@ class _ChatRequest(_WireModel):
     top_k: int | None = Field(default=None, ge=0)
     frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
     presence_penalty: float | None = Field(default=None, ge=-2, le=2)
-    logprobs: bool | None = None
-    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    logprobs: StrictBool | None = None
+    top_logprobs: StrictInt | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None
     reasoning: _ChatReasoning | None = None
     thinking: _ThinkingConfig | None = None
@@ -628,6 +631,8 @@ class _ChatRequest(_WireModel):
             raise ValueError("max_tokens and max_completion_tokens are mutually exclusive")
         if self.stream_options is not None and not self.stream:
             raise ValueError("stream_options requires stream=true")
+        if self.top_logprobs is not None and self.logprobs is not True:
+            raise ValueError("top_logprobs requires logprobs=true")
         return self
 
 
@@ -960,7 +965,7 @@ class _ResponsesRequest(_WireModel):
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
     top_k: int | None = Field(default=None, ge=0)
-    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    top_logprobs: StrictInt | None = Field(default=None, ge=0, le=20)
     reasoning: _ResponseReasoning | None = None
     text: _ResponseText | None = None
     truncation: str | None = Field(default=None, max_length=64)

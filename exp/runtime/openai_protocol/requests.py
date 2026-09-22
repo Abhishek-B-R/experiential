@@ -387,7 +387,9 @@ def decode_responses(
         official_probe,
         extension_fields={"top_k", "reasoning", "client_metadata", "provider"},
     )
-    include_encrypted_reasoning = _include_encrypted_reasoning(request.include)
+    include_encrypted_reasoning, include_output_text_logprobs = _responses_include_options(
+        request.include
+    )
     idempotency_key, client_request_id = _validated_operation_headers(
         idempotency_key, client_request_id
     )
@@ -452,8 +454,9 @@ def decode_responses(
             temperature=request.temperature,
             top_p=request.top_p,
             top_k=request.top_k,
-            logprobs=(True if request.top_logprobs is not None else None),
+            logprobs=None,
             top_logprobs=request.top_logprobs,
+            include_output_text_logprobs=include_output_text_logprobs,
             reasoning_effort=(request.reasoning.effort if request.reasoning is not None else None),
             reasoning_context=(
                 request.reasoning.context if request.reasoning is not None else None
@@ -770,28 +773,32 @@ def _responses_tool_choice(
     raise invalid_field("tool_choice")
 
 
-def _include_encrypted_reasoning(include: tuple[str, ...] | None) -> bool:
+def _responses_include_options(include: tuple[str, ...] | None) -> tuple[bool, bool]:
     """Validate the closed ``include`` selector list.
 
     Args:
         include: Raw caller include paths.
 
     Returns:
-        Whether the caller asked for ``reasoning.encrypted_content``.
+        A pair of encrypted-reasoning and output-text-logprobs selectors.
 
     Raises:
         OpenAIProtocolError: An include path is not supported by this gateway.
     """
     if include is None:
-        return False
+        return False, False
     for path in include:
-        if path != "reasoning.encrypted_content":
+        if path not in {"reasoning.encrypted_content", "message.output_text.logprobs"}:
             raise invalid_field(
                 "include",
                 f"The include path {path!r} is not supported by this gateway. "
-                "Only 'reasoning.encrypted_content' is available.",
+                "Only 'reasoning.encrypted_content' and "
+                "'message.output_text.logprobs' are available.",
             )
-    return bool(include)
+    return (
+        "reasoning.encrypted_content" in include,
+        "message.output_text.logprobs" in include,
+    )
 
 
 def _response_input_messages(
