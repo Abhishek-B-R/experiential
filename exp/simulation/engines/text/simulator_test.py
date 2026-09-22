@@ -2238,6 +2238,7 @@ def test_simulated_tools_parallel_errors_state_and_replay(tmp_path: Path) -> Non
             _response('{"message":"","terminal":true}', snapshot=_snapshot("world-model-a")),
         ]
     )
+    retriever = _FitRetriever(_fit_rag_input())
     simulator = _simulator(
         store,
         plan,
@@ -2245,6 +2246,7 @@ def test_simulated_tools_parallel_errors_state_and_replay(tmp_path: Path) -> Non
         task_input,
         candidate_client,
         world_client,
+        fit_retriever=retriever,
         agent_factory=lambda: ChatAgentRuntime(system_prompt="Use the declared research tool."),
     )
     spec = _spec(plan_input, task_input, (cell.cell_id,), maximum_steps=4)
@@ -2270,6 +2272,8 @@ def test_simulated_tools_parallel_errors_state_and_replay(tmp_path: Path) -> Non
     assert json.loads(world_client.requests[2].messages[1].content or "")["environment_state"][
         "saved"
     ]
+    assert [query.action.tool_name for query in retriever.queries[:2]] == ["research", "research"]
+    assert all(query.action.kind == "tool_call" for query in retriever.queries[:3])
     assert all(request.tools == () for request in world_client.requests)
     assert rollout.candidate_economics.cost_usd is not None
     assert rollout.world_model_economics is not None
