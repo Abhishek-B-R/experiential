@@ -61,7 +61,7 @@ def test_manifests_classify_explicit_exclusions() -> None:
     # Chat verbosity is admitted (forwarded on native Responses rungs, dropped
     # with disclosure elsewhere); opencode sends it on every request.
     assert chat["verbosity"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
-    assert chat["top_logprobs"] == CompatibilityDisposition.UNSUPPORTED
+    assert chat["top_logprobs"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["top_k"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["top_p"] == CompatibilityDisposition.SUPPORTED
     # Every enable-thinking spelling is admitted and translated, never dropped.
@@ -75,7 +75,7 @@ def test_manifests_classify_explicit_exclusions() -> None:
     assert responses["store"] == CompatibilityDisposition.SUPPORTED
     assert responses["top_p"] == CompatibilityDisposition.SUPPORTED
     assert responses["top_k"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
-    assert responses["top_logprobs"] == CompatibilityDisposition.UNSUPPORTED
+    assert responses["top_logprobs"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["prompt_cache_options"] == CompatibilityDisposition.UNSUPPORTED
     assert chat["prompt_cache_retention"] == CompatibilityDisposition.UNSUPPORTED
     assert responses["max_tool_calls"] == CompatibilityDisposition.UNSUPPORTED

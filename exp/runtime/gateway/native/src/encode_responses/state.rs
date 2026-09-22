@@ -55,6 +55,8 @@ impl ReasoningState {
 
 /// Provider-owned output item reserved before its content-bearing event.
 pub(crate) struct ProviderOutputStart {
+    /// True until an actual provider item-start upgrades probability-only scaffolding.
+    pub(crate) inferred: bool,
     pub(crate) item_id: Option<String>,
     pub(crate) kind: ProviderOutputItemKind,
     pub(crate) output_index: usize,
@@ -81,6 +83,11 @@ pub(crate) struct MessageState {
     pub(crate) annotations: Vec<Value>,
     pub(crate) text_started: bool,
     pub(crate) refusal_started: bool,
+    /// Rich provider probability records keyed by content part, then phase.
+    /// Keeping both dimensions prevents a later part or phase from replacing
+    /// an earlier observation.
+    pub(crate) logprobs: BTreeMap<u32, BTreeMap<String, Value>>,
+    pub(crate) probability_bytes: usize,
     pub(crate) done: bool,
 }
 
@@ -90,13 +97,26 @@ impl MessageState {
         include_content: bool,
         fallback_status: ProviderOutputItemStatus,
     ) -> Value {
+        self.item_at_phase(include_content, fallback_status, "terminal")
+    }
+
+    pub(crate) fn item_at_phase(
+        &self,
+        include_content: bool,
+        fallback_status: ProviderOutputItemStatus,
+        phase: &str,
+    ) -> Value {
         let mut content = Vec::new();
         if include_content && self.text_started {
-            content.push(json!({
+            let mut part = json!({
                 "type": "output_text",
                 "text": self.text,
                 "annotations": self.annotations,
-            }));
+            });
+            if let Some(value) = self.logprobs.get(&0).and_then(|phases| phases.get(phase)) {
+                part["logprobs"] = value.clone();
+            }
+            content.push(part);
         }
         if include_content && self.refusal_started {
             content.push(json!({"type": "refusal", "refusal": self.refusal}));

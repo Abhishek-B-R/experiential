@@ -42,18 +42,20 @@ class Plane:
         # for the contract-violation test.
         self.rules = [None, None]
         self.first_depth = None
+        self.refusal_failover = False
 
     def configure(self, argument):
         data = json.loads(argument)
         with self.lock:
             self.rules = data.get("rules", self.rules)
             self.first_depth = data.get("first_depth")
+            self.refusal_failover = data.get("refusal_failover", self.refusal_failover)
         return "{}"
 
     def admits(self, depth, failure):
         rules = self.rules[depth]
         if rules is None:
-            return failure.get("failover_eligible")
+            return failure.get("failover_eligible") or (self.refusal_failover and failure["failure_class"] == "refusal")
         token = failure["failure_class"]
         if token == "refusal":
             token = "refusal:" + (failure.get("refusal_reason") or "unspecified")
@@ -429,6 +431,7 @@ impl Harness {
             time_to_first_byte_slope_seconds_per_million_input_tokens: 0.0,
             time_to_first_token: Duration::from_secs(120),
             approximate_input_tokens: 10.0,
+            chat_logprobs: false,
             output_less_retention: None,
             output_token_cap: None,
             tool_search: None,
@@ -852,3 +855,6 @@ fn a_first_dial_reserved_on_a_failover_only_rung_fails_closed() {
         assert_eq!(settles[0]["failure"]["failure_class"], "internal");
     });
 }
+
+mod logprobs_tests;
+mod responses_logprobs_tests;

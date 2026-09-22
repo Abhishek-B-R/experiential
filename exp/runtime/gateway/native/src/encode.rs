@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::errors::{Failure, PublicError};
-use crate::events::{Event, Usage};
+use crate::events::{ChoiceLogprobs, Event, Usage};
 use crate::tool_search::annotate_tool_search_usage_details;
 use crate::web_search::{annotate_usage_details, ChatWebSearch, WebSearchAdmission};
 
@@ -280,6 +280,14 @@ impl ChatSseEncoder {
             web_search.observe(event);
         }
         match event {
+            Event::ProviderResponsesLogprobs { .. } => Err(invalid_provider_stream(
+                "Responses probability events require the Responses encoder",
+            )),
+            Event::ChoiceLogprobsDelta(update) => Ok(vec![self.chunk_with_logprobs(
+                json!({}),
+                None,
+                update.logprobs.as_ref(),
+            )]),
             Event::TextDelta(text) => Ok(vec![self.chunk(json!({"content": text}), None)]),
             Event::RefusalDelta(text) => Ok(vec![self.chunk(json!({"refusal": text}), None)]),
             Event::ProviderTextDelta { delta, .. } => {
@@ -457,6 +465,15 @@ impl ChatSseEncoder {
     }
 
     fn chunk(&self, delta: Value, finish_reason: Option<&str>) -> String {
+        self.chunk_with_logprobs(delta, finish_reason, None)
+    }
+
+    fn chunk_with_logprobs(
+        &self,
+        delta: Value,
+        finish_reason: Option<&str>,
+        logprobs: Option<&ChoiceLogprobs>,
+    ) -> String {
         let mut payload = json!({
             "id": self.completion_id,
             "object": "chat.completion.chunk",
@@ -467,7 +484,7 @@ impl ChatSseEncoder {
                     "index": 0,
                     "delta": delta,
                     "finish_reason": finish_reason,
-                    "logprobs": Value::Null,
+                    "logprobs": logprobs.map_or(Value::Null, |value| serde_json::to_value(value).unwrap_or(Value::Null)),
                 }
             ],
         });
@@ -670,6 +687,7 @@ pub fn completed_chat_body_with_carrier(
             _ => None,
         })
         .collect();
+    let logprobs = crate::logprobs::aggregate(events);
     let reasoning = reasoning_carrier_candidate(events)?;
     let incomplete = matches!(terminal, Event::Incomplete);
     let finish_reason = if incomplete {
@@ -748,7 +766,7 @@ pub fn completed_chat_body_with_carrier(
                 "index": 0,
                 "message": message,
                 "finish_reason": finish_reason,
-                "logprobs": Value::Null,
+                "logprobs": logprobs.as_ref().map_or(Value::Null, |value| serde_json::to_value(value).unwrap_or(Value::Null)),
             }
         ],
         "usage": completed_chat_usage(usage.as_ref()),

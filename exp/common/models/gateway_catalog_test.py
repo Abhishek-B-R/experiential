@@ -913,3 +913,21 @@ def test_normalized_multi_deployment_pool_requires_operator_certification() -> N
             exact_model_id="exact-one",
             deployment_ids=("route-a", "route-b"),
         )
+
+
+def test_probability_defaults_preserve_published_snapshot_identity() -> None:
+    """Absent and explicit dark probability metadata hydrate the same pinned catalog."""
+    caps = GatewayDeploymentCapabilities.model_validate({})
+    explicit = GatewayDeploymentCapabilities(
+        supports_responses_logprobs=False, logprobs_reasoning_efforts=()
+    )
+    assert caps == explicit
+    assert explicit.model_dump(mode="json", exclude_defaults=True) == {}
+    normalized = normalize_gateway_catalog(_identity_fixture_catalog())
+    document = normalized.model_dump(mode="json", by_alias=True, exclude_defaults=True)
+    assert "supports_responses_logprobs" not in str(document)
+    assert "logprobs_reasoning_efforts" not in str(document)
+    assert (
+        NormalizedGatewayCatalog.model_validate(document).identity_sha256()
+        == normalized.identity_sha256()
+    )

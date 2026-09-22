@@ -73,6 +73,7 @@ pub(crate) fn is_semantic(event: &Event) -> bool {
         event,
         Event::TextDelta(_)
             | Event::RefusalDelta(_)
+            | Event::ChoiceLogprobsDelta(_)
             | Event::ProviderTextDelta { .. }
             | Event::ProviderRefusalDelta { .. }
             | Event::ProviderOutputItemStarted { .. }
@@ -96,5 +97,6 @@ pub(crate) fn is_semantic(event: &Event) -> bool {
             | Event::HostedToolItemProgress { .. }
             | Event::HostedToolItemCompleted { .. }
             | Event::ProviderTextAnnotation { .. }
-    )
+    ) || matches!(event, Event::ProviderResponsesLogprobs { records, .. }
+        if records.as_array().is_some_and(|items| !items.is_empty()))
 }

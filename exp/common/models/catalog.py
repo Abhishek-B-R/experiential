@@ -401,6 +401,8 @@ class GatewayDeploymentCapabilities(ContractModel):
         supports_developer_messages: Whether developer-role messages are supported.
         supports_streaming: Whether streaming responses are supported.
         supports_streaming_tool_arguments: Whether tool arguments can be streamed incrementally.
+        supports_responses_logprobs: Verified native Responses probability support, opt-in.
+        logprobs_reasoning_efforts: Verified Chat probability efforts; empty means unknown.
         supports_strict_tools: Whether strict function-tool schemas are supported.
         supports_parallel_tool_calls: Whether parallel tool calls are supported.
         supports_custom_tools: Whether this deployment's relevant native wire can preserve
@@ -549,6 +551,7 @@ class GatewayDeploymentCapabilities(ContractModel):
     supports_developer_messages: bool = False
     supports_streaming: bool = False
     supports_streaming_tool_arguments: bool = False
+    supports_responses_logprobs: bool = False
     supports_strict_tools: bool = False
     supports_parallel_tool_calls: bool = False
     supports_custom_tools: bool = False
@@ -567,6 +570,7 @@ class GatewayDeploymentCapabilities(ContractModel):
     supports_media_handle_input: bool = False
     maximum_stop_sequences: int | None = Field(default=None, ge=1)
     minimum_output_tokens: int | None = Field(default=None, ge=1)
+    logprobs_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
     supported_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
     reasoning_default_effort: ReasoningEffort | None = None
     reasoning_effort_required: bool = False
