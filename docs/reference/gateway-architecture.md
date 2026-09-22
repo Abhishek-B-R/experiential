@@ -320,8 +320,8 @@ channel. On Messages, a numeric `max_tokens` reasoning budget becomes an exact b
 replace another explicit numeric budget. Unsupported hard constraints are refused before
 dispatch. `exclude` retains its disclosed omission policy. The Chat surface accepts effort
 and enable controls beside `thinking`, `chat_template_kwargs`, and DashScope's top-level
-`enable_thinking`; numeric reasoning budgets receive a named compatibility refusal instead
-of a nearest-tier approximation. See [generation controls](gateway-generation.md). Chat also
+`enable_thinking`; numeric budgets travel unchanged on qualified Anthropic, Gemini 2.5 and Qwen Cloud
+routes. Unsupported budgets are refused; see [generation controls](gateway-generation.md). Chat also
 replays OpenRouter's `reasoning` / `reasoning_details` (the `reasoning.text` blocks) as the
 same caller-owned plaintext history a `reasoning_content` echo is; mid-conversation `system` turns keep their position on wires that express
 them (instruction-hoisting rungs narrow out), and `thinking.display` rides the verbatim thinking
@@ -722,19 +722,14 @@ reasoning model such as GPT-6 Astra) is dropped and disclosed (`temperature->dro
 so the model still answers with its own default; the 400 remains only for a value outside a
 supporting route's declared range, which is a genuine caller error.
 
-**An Anthropic-shaped `thinking` object on the Chat wire is a reasoning control, `adaptive`
-included.** Clients configured for Claude send `thinking: {type: "adaptive"}` (the 4.6+
-generation's only on-mode) to `/v1/chat/completions` on every model; the decoder reads `adaptive`
-and `enabled` alike as "think at the route's default depth" (`thinking->translated(reasoning_effort)`:
-the LANE default, the first rung in route order pinning a catalog `reasoning_default_effort` every
-rung can serve, as on the Messages surface; a route pinning none takes its one required default or
-the lowest portable tier), `disabled` as
-`reasoning_effort: none`, and a `budget_tokens` beside either as not carried. An Anthropic rung
-then receives the adaptive object plus `output_config.effort`; every other reasoning rung receives
-its own effort field; a route with no reasoning effort at all still refuses by name. A `type`
-outside the three members is refused naming the members, never the arriving JSON type (3,935
-Chat requests over 7 days died at decode as "expected one of 'enabled' or 'disabled', but got a
-string instead", 2026-09-15).
+**An Anthropic-shaped `thinking` object on Chat retains its requested depth.** Bare
+`enabled` and `adaptive` select the route's default effort with
+`thinking->translated(reasoning_effort)` disclosure; `disabled` selects `reasoning_effort: none`.
+An enabled `budget_tokens` instead travels unchanged on qualified numeric-budget rungs,
+without an effort approximation. The budget must be an integer of at least 1024 and below
+the output ceiling. Adaptive/off modes and competing effort or budget controls are rejected.
+Top-level Chat `thinking_budget` also exposes Gemini zero/dynamic controls. Unsupported routes return an actionable
+`thinking.budget_tokens` error before dispatch. See [generation controls](gateway-generation.md).
 
 **`parallel_tool_calls` is honoured on every route.** A rung whose wire carries the control forwards it.
 On a rung without it (Gemini, Bedrock, an OpenAI-compatible server that ignores the field), `true` is

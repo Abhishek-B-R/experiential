@@ -27,7 +27,13 @@ from exp.runtime.models.providers.openai_payloads import (
     openai_compatible_stream_payload,
     openai_responses_stream_payload,
 )
-from exp.runtime.models.providers.thinking_budget import require_thinking_budget_support
+from exp.runtime.models.providers.thinking_budget import (
+    budgeted_provider_request,
+    qwen_budget_payload,
+    qwen_uses_total_budget_cap,
+    require_thinking_budget_support,
+    thinking_budget_value,
+)
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
@@ -129,6 +135,8 @@ def dialect_stream_payload(
             cannot preserve.
     """
     require_thinking_budget_support(profile, provider_request)
+    budget = thinking_budget_value(provider_request)
+    provider_request = budgeted_provider_request(profile, provider_request)
     if profile.inference_geo is not None and profile.dialect != "anthropic_messages":
         raise ProviderCapabilityError(capability="inference_geo")
     if fireworks_continuation_required(profile, provider_request):
@@ -140,7 +148,7 @@ def dialect_stream_payload(
         # otherwise retries with the disclosed drop in capability_policy.
         raise ProviderCapabilityError(capability="service_tier")
     required_reasoning_effort = (
-        profile.reasoning_effort if profile.reasoning_effort_required else None
+        profile.reasoning_effort if profile.reasoning_effort_required and budget is None else None
     )
     if profile.dialect == "openai_responses":
         return openai_responses_stream_payload(
@@ -180,7 +188,7 @@ def dialect_stream_payload(
             payload["inference_geo"] = profile.inference_geo
         return payload
     if profile.dialect == "gemini_generate_content":
-        return gemini_generate_content_stream_payload(
+        payload = gemini_generate_content_stream_payload(
             profile.model_id,
             provider_request,
             supports_temperature=profile.supports_temperature,
@@ -194,6 +202,11 @@ def dialect_stream_payload(
             supports_reasoning=profile.supports_reasoning,
             reasoning_effort=required_reasoning_effort,
         )
+        if budget is not None:
+            generation = payload["generationConfig"]
+            assert isinstance(generation, dict)
+            generation["thinkingConfig"] = {"thinkingBudget": budget}
+        return payload
     if profile.dialect == "bedrock_converse_stream":
         return bedrock_converse_stream_payload(
             profile.model_id,
@@ -215,7 +228,7 @@ def dialect_stream_payload(
             provider_request,
             token_limit_key=(
                 "max_completion_tokens"
-                if provider_request.thinking_budget is not None
+                if budget is not None and qwen_uses_total_budget_cap(profile)
                 else profile.token_limit_key
             ),
             supports_temperature=profile.supports_temperature,
@@ -241,8 +254,6 @@ def dialect_stream_payload(
             forwards_prompt_cache_key=profile.forwards_prompt_cache_key,
             forwards_cache_control=profile.forwards_cache_control,
         )
-        if provider_request.thinking_budget is not None:
-            payload["thinking_budget"] = provider_request.thinking_budget
-            payload["enable_thinking"] = True
+        qwen_budget_payload(profile, provider_request, payload)
         return payload
     raise ProviderCapabilityError(capability=f"wire_dialect:{profile.dialect}")

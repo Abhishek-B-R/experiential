@@ -2178,20 +2178,14 @@ def test_chat_decoder_accepts_image_parts_inside_a_tool_message() -> None:
     assert decoded.request.images == tool_message.images
 
 
-def test_chat_decoder_still_rejects_image_parts_on_an_assistant_message() -> None:
-    """No wire carries an image inside an assistant turn; the 400 names the tool exception."""
+def test_chat_decoder_preserves_generated_assistant_image_parts() -> None:
+    """A generated image can be replayed in a following chat turn."""
     part: JsonObject = {
         "type": "image_url",
         "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
     }
-
-    with pytest.raises(OpenAIProtocolError) as captured:
-        decode_chat(_copilot_tool_screenshot_body("assistant", part))
-
-    assert captured.value.detail.code == "invalid_parameter"
-    assert captured.value.detail.param == "messages.2"
-    assert "valid only for user messages" in captured.value.detail.message
-    assert "tool message may carry image parts" in captured.value.detail.message
+    decoded = decode_chat(_copilot_tool_screenshot_body("assistant", part))
+    assert decoded.request.messages[2].images[0].data == _PNG_BASE64
 
 
 @pytest.mark.parametrize(
@@ -2388,25 +2382,25 @@ def test_malformed_chat_image_url_is_rejected_with_its_field() -> None:
     assert error.value.detail.param == "messages.0.content.0.image_url"
 
 
-def test_assistant_image_parts_are_rejected() -> None:
-    """Only a caller message may carry an image."""
-    with pytest.raises(OpenAIProtocolError):
-        decode_chat(
-            {
-                "model": "coding",
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
-                            }
-                        ],
-                    }
-                ],
-            }
-        )
+def test_assistant_image_only_history_is_preserved() -> None:
+    """Image-only assistant content remains available to the next turn."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    assert decoded.request.messages[0].images[0].data == _PNG_BASE64
 
 
 _PDF_BASE64 = "JVBERi0xLjQKJSBtaW5pbWFsIHBkZgo="

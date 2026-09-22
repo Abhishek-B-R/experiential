@@ -302,6 +302,7 @@ def decode_chat(
                 else None
             ),
             thinking_budget=request.thinking_budget,
+            provider_thinking_config=thinking.thinking_config,
             stop=stop,
             temperature=request.temperature,
             top_p=request.top_p,
