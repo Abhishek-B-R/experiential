@@ -1007,7 +1007,7 @@ def test_an_explicit_thinking_budget_is_not_replaced_with_advisory_effort() -> N
             accounting=cast(NativeAttemptAccounting, accounting),
             authorization=route.snapshot.authorization,
         )
-    assert rejected.value.param == "thinking"
+    assert rejected.value.param == "thinking.budget_tokens"
     assert request.provider_thinking_config == {"type": "enabled", "budget_tokens": 8192}
     assert accounting.recorded == 0
 

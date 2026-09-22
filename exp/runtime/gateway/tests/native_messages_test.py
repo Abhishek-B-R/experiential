@@ -303,6 +303,31 @@ class _SseUpstream(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length))
         with self.payloads_lock:
             self.payloads.append(payload)
+        if self.path == "/v1/gemini":
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(
+                _sse_frame(
+                    {
+                        "candidates": [
+                            {
+                                "content": {"role": "model", "parts": [{"text": "hello world"}]},
+                                "finishReason": "STOP",
+                                "index": 0,
+                            }
+                        ],
+                        "usageMetadata": {
+                            "promptTokenCount": 9,
+                            "candidatesTokenCount": 4,
+                            "thoughtsTokenCount": 2,
+                            "totalTokenCount": 15,
+                        },
+                    }
+                )
+            )
+            self.wfile.flush()
+            return
         if self.path == "/v1/messages":
             self.send_response(200)
             self.send_header("content-type", "text/event-stream")
@@ -994,7 +1019,10 @@ def _engine(
     Yields:
         The live serving facts as a :class:`_ServingEngine`.
     """
-    qwen_budget = getattr(request, "param", None) == "qwen-budget"
+    variant = str(getattr(request, "param", ""))
+    qwen_budget = variant.startswith("qwen-budget")
+    qwen_model = variant.partition(":")[2] or "qwen3.8-max"
+    gemini_budget = variant == "gemini-budget"
     anthropic_budget = getattr(request, "param", None) == "anthropic-budget"
     root = tmp_path_factory.mktemp("native-messages-root")
     with _SseUpstream.payloads_lock:
@@ -1010,19 +1038,25 @@ def _engine(
             if qwen_budget
             else mock_url
         ),
-        provider="anthropic" if anthropic_budget else "openai-compatible",
+        provider="anthropic"
+        if anthropic_budget
+        else "gemini"
+        if gemini_budget
+        else "openai-compatible",
         provider_model=(
             "claude-sonnet-4-6"
             if anthropic_budget
-            else "qwen3.8-max"
+            else "gemini-2.5-flash"
+            if gemini_budget
+            else qwen_model
             if qwen_budget
             else "provider-model-exact"
         ),
         capabilities=ModelCapabilities(
             chat_max_tokens_field="max_completion_tokens",
-            maximum_output_tokens=8192 if anthropic_budget else 128,
+            maximum_output_tokens=8192 if anthropic_budget or qwen_budget or gemini_budget else 128,
             maximum_temperature=1.0,
-            supports_reasoning=qwen_budget or anthropic_budget,
+            supports_reasoning=qwen_budget or anthropic_budget or gemini_budget,
         ),
     )
     driver = root / "native_messages_driver.py"
@@ -1037,6 +1071,14 @@ def _engine(
                     "expected_destination": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
                 }
                 if qwen_budget
+                else {}
+            ),
+            **(
+                {
+                    "mock_destination": f"{mock_url}/gemini",
+                    "expected_destination": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+                }
+                if gemini_budget
                 else {}
             ),
             **(
@@ -3182,5 +3224,179 @@ def test_chat_nested_budget_above_rung_default_never_dispatches(engine: _Serving
     )
     assert response.status_code == 400, response.text
     assert response.json()["error"]["param"] == "thinking.budget_tokens"
+    with _SseUpstream.payloads_lock:
+        assert _SseUpstream.payloads == []
+
+
+@pytest.mark.parametrize(
+    "engine",
+    (
+        "anthropic-budget",
+        "gemini-budget",
+        "qwen-budget",
+        "qwen-budget:qwen3.8-27b",
+        "qwen-budget:glm-5.2",
+        "qwen-budget:kimi-k2.5",
+    ),
+    indirect=True,
+)
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("control", ("thinking_budget", "thinking"))
+def test_numeric_budget_cross_provider_http_dispatch(
+    engine: _ServingEngine,
+    stream: bool,
+    control: str,
+) -> None:
+    """The same client budget is frozen into each provider's exact native control."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    body: JsonObject = {
+        "model": "coding",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 8192,
+        "stream": stream,
+    }
+    body[control] = (
+        2048 if control == "thinking_budget" else {"type": "enabled", "budget_tokens": 2048}
+    )
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json=body,
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "data: [DONE]" in response.text
+        chunks = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert (
+            "".join(
+                choice.get("delta", {}).get("content", "")
+                for chunk in chunks
+                for choice in chunk.get("choices", [])
+            )
+            == "hello world"
+        )
+    else:
+        assert response.json()["choices"][0]["message"]["content"] == "hello world"
+    with _SseUpstream.payloads_lock:
+        captured = list(_SseUpstream.payloads)
+    assert len(captured) == 1
+    payload = captured[0]
+    if "generationConfig" in payload:
+        assert payload["generationConfig"] == {
+            "thinkingConfig": {"thinkingBudget": 2048},
+            "maxOutputTokens": 8192,
+        }
+    elif "thinking" in payload:
+        assert payload["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+        assert payload["max_tokens"] == 8192
+    else:
+        assert payload["thinking_budget"] == 2048
+        if payload["model"] == "qwen3.8-max":
+            assert payload["max_completion_tokens"] == 8192
+            assert "max_tokens" not in payload
+        else:
+            assert payload["max_tokens"] == 6144
+            assert "max_completion_tokens" not in payload
+    assert "reasoning_effort" not in payload
+    assert "reasoning" not in payload
+
+
+@pytest.mark.parametrize("engine", ("gemini-budget",), indirect=True)
+@pytest.mark.parametrize("budget", (0, -1, 24576))
+def test_gemini_sentinels_survive_native_http(engine: _ServingEngine, budget: int) -> None:
+    """Zero and dynamic thinking remain explicit controls rather than omissions."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking_budget": budget,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    with _SseUpstream.payloads_lock:
+        payload = _SseUpstream.payloads[-1]
+    assert payload["generationConfig"] == {
+        "thinkingConfig": {"thinkingBudget": budget},
+        "maxOutputTokens": 8192,
+    }
+
+
+@pytest.mark.parametrize("engine", ("gemini-budget", "qwen-budget:kimi-k2.5"), indirect=True)
+@pytest.mark.parametrize("stream", (False, True))
+def test_messages_budget_crosses_native_non_anthropic_routes(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """Messages clients preserve nested budgets when the selected native wire supports them."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key, "anthropic-version": "2023-06-01"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8192,
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            "stream": stream,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        events = [
+            json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")
+        ]
+        assert "".join(event.get("delta", {}).get("text", "") for event in events) == "hello world"
+        assert events[-1]["type"] == "message_stop"
+    else:
+        assert response.json()["content"][0]["text"] == "hello world"
+    with _SseUpstream.payloads_lock:
+        payload = _SseUpstream.payloads[-1]
+    if "generationConfig" in payload:
+        assert payload["generationConfig"] == {
+            "thinkingConfig": {"thinkingBudget": 2048},
+            "maxOutputTokens": 8192,
+        }
+    else:
+        assert payload["thinking_budget"] == 2048
+        assert payload["max_tokens"] == 6144
+    assert "thinking" not in payload
+
+
+@pytest.mark.parametrize(
+    "engine,budget",
+    (("gemini-budget", 24577), ("qwen-budget:kimi-k3", 2048), ("qwen-budget:glm-5.3", 2048)),
+    indirect=("engine",),
+)
+def test_incapable_numeric_budget_never_reaches_upstream(
+    engine: _ServingEngine, budget: int
+) -> None:
+    """An invalid range or a model that ignores budgets fails before network dispatch."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking_budget": budget,
+            "max_tokens": 8192,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["param"] == "thinking_budget"
     with _SseUpstream.payloads_lock:
         assert _SseUpstream.payloads == []

@@ -92,7 +92,13 @@ from exp.runtime.models.providers.server_tools import (
     anthropic_server_tools_present,
     disclose_dropped_server_tools,
 )
-from exp.runtime.models.providers.thinking_budget import require_thinking_budget_support
+from exp.runtime.models.providers.thinking_budget import (
+    qwen_uses_total_budget_cap,
+    require_thinking_budget_support,
+    thinking_budget_parameter,
+    thinking_budget_value,
+    thinking_budget_wire_field,
+)
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
@@ -168,6 +174,19 @@ def route_generation_parameter_requests(
             require_responses_continuation_channel(request)
 
     ignored = list(request.ignored_parameters)
+    budget = thinking_budget_value(request)
+    if budget is not None:
+        source = thinking_budget_parameter(request)
+        for profile in profiles:
+            target = thinking_budget_wire_field(profile)
+            if target != source:
+                disclosure = f"{source}->translated({target})"
+                if disclosure not in ignored:
+                    ignored.append(disclosure)
+            if profile.dialect == "openai_compatible" and not qwen_uses_total_budget_cap(profile):
+                disclosure = "max_tokens->translated(total_output_minus_thinking_budget)"
+                if disclosure not in ignored:
+                    ignored.append(disclosure)
     provider_updates: dict[str, object] = {}
 
     def ignore(field: str, public_path: str | None = None) -> None:
@@ -350,7 +369,7 @@ def route_generation_parameter_requests(
                 ),
                 param=effort_path,
             )
-    else:
+    elif budget is None:
         # An omitted caller value remains omitted on the shared request. Each
         # dialect payload injects only its own provider-required default, so a
         # fallback never forces that default onto a wire where it is optional.
@@ -697,7 +716,7 @@ def route_generation_parameter_requests(
         # serves and discloses the drop: foreign wires omit them at encoding.
         if THINKING_HISTORY_DROP_DISCLOSURE not in ignored:
             ignored.append(THINKING_HISTORY_DROP_DISCLOSURE)
-    if request.provider_thinking_config is not None and non_anthropic_route:
+    if request.provider_thinking_config is not None and non_anthropic_route and budget is None:
         # A thinking CONFIG (unlike replayed thinking blocks) has a serviceable
         # cross-wire reading. The named rejection here is what lets the admit
         # loop offer the disclosed thinking->reasoning_effort translation (or
@@ -705,36 +724,15 @@ def route_generation_parameter_requests(
         # is semantic, so it lives in the coercion layer, where it runs only
         # after every rung declined verbatim and never steals narrowing
         # preference from an Anthropic rung that could honor the config.
-        budgeted_chat = (
-            request.surface == GatewayApiSurface.CHAT_COMPLETIONS
-            and "budget_tokens" in request.provider_thinking_config
-        )
         raise ProviderParameterError(
             message=(
-                "This model route cannot preserve thinking.budget_tokens. Choose a "
-                "budget-capable Anthropic route, or explicitly remove the budget and "
-                "select reasoning_effort."
-                if budgeted_chat
-                else "The parameter 'thinking' is not supported by this model route. "
+                "The parameter 'thinking' is not supported by this model route. "
                 "Remove the field or choose a native Anthropic-only route."
             ),
-            param="thinking.budget_tokens" if budgeted_chat else "thinking",
+            param="thinking",
             code="unsupported_parameter",
         )
     if request.provider_thinking_config is not None and not non_anthropic_route:
-        if (
-            request.surface == GatewayApiSurface.CHAT_COMPLETIONS
-            and "budget_tokens" in request.provider_thinking_config
-            and not all(profile.supports_reasoning for profile in profiles)
-        ):
-            raise ProviderParameterError(
-                message=(
-                    "This model route does not declare thinking support. Choose a "
-                    "budget-capable Anthropic route or remove thinking.budget_tokens."
-                ),
-                param="thinking.budget_tokens",
-                code="unsupported_parameter",
-            )
         shape_anthropic_thinking_config(profiles, request, provider_updates, ignored)
     if anthropic_server_tools_present(request) and not all(
         profile.dialect == "anthropic_messages" for profile in profiles

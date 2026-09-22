@@ -7,8 +7,8 @@ Anthropic-style ``thinking:{type}`` (``enabled`` or ``adaptive``), the vLLM-nati
 ``chat_template_kwargs:{enable_thinking}``, and DashScope's top-level
 ``enable_thinking``. Bare enable controls translate to canonical
 ``reasoning_effort``; the route resolves level-less enables through
-``GatewayRequest.thinking_default_enable``. Explicit nested Anthropic budgets
-remain exact thinking configurations for model-aware admission, while
+``GatewayRequest.thinking_default_enable``. Explicit nested thinking budgets
+retain their numeric value for model-aware admission, while
 OpenRouter numeric budgets receive a named compatibility refusal.
 """
 
@@ -109,12 +109,18 @@ def translate_enable_thinking(request: _ChatRequest) -> _EnableThinkingResult:
             reasoning.enabled if reasoning else None,
             request.thinking.type != "disabled" if request.thinking else None,
         )
+        if request.thinking_budget == 0 and any(switch is not None for switch in switches):
+            raise invalid_field(
+                "thinking_budget",
+                "A zero budget has provider-specific semantics. "
+                "Remove the enable-thinking controls and use the budget alone.",
+            )
         if False in switches:
             raise invalid_field(
                 "thinking_budget",
                 "thinking_budget requires thinking enabled. Remove the off control.",
             )
-        # The budget itself enables thinking; resolving a default effort would
+        # The budget itself controls thinking; resolving a default effort would
         # introduce a second depth control the provider refuses.
         disclosures = (_EXCLUDE_DROPPED,) if reasoning is not None and reasoning.exclude else ()
         return _EnableThinkingResult(None, False, disclosures)
@@ -198,7 +204,7 @@ def translate_enable_thinking(request: _ChatRequest) -> _EnableThinkingResult:
 
 
 def _budgeted_thinking(request: _ChatRequest) -> _EnableThinkingResult:
-    """Validate a nested budget and preserve it for the Anthropic route adapter."""
+    """Validate a nested budget and preserve its value for native route adaptation."""
     thinking = request.thinking
     assert thinking is not None and thinking.budget_tokens is not None
     budget = thinking.budget_tokens

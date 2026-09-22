@@ -320,8 +320,8 @@ channel. On Messages, a numeric `max_tokens` reasoning budget becomes an exact b
 replace another explicit numeric budget. Unsupported hard constraints are refused before
 dispatch. `exclude` retains its disclosed omission policy. The Chat surface accepts effort
 and enable controls beside `thinking`, `chat_template_kwargs`, and DashScope's top-level
-`enable_thinking`; nested `thinking.budget_tokens` travels unchanged on budget-capable
-Anthropic routes. Unsupported budgets are refused; see [generation controls](gateway-generation.md). Chat also
+`enable_thinking`; numeric budgets travel unchanged on qualified Anthropic, Gemini 2.5 and Qwen Cloud
+routes. Unsupported budgets are refused; see [generation controls](gateway-generation.md). Chat also
 replays OpenRouter's `reasoning` / `reasoning_details` (the `reasoning.text` blocks) as the
 same caller-owned plaintext history a `reasoning_content` echo is; mid-conversation `system` turns keep their position on wires that express
 them (instruction-hoisting rungs narrow out), and `thinking.display` rides the verbatim thinking
@@ -725,10 +725,10 @@ supporting route's declared range, which is a genuine caller error.
 **An Anthropic-shaped `thinking` object on Chat retains its requested depth.** Bare
 `enabled` and `adaptive` select the route's default effort with
 `thinking->translated(reasoning_effort)` disclosure; `disabled` selects `reasoning_effort: none`.
-An enabled `budget_tokens` instead travels unchanged on budget-capable Anthropic rungs,
+An enabled `budget_tokens` instead travels unchanged on qualified numeric-budget rungs,
 without an effort approximation. The budget must be an integer of at least 1024 and below
 the output ceiling. Adaptive/off modes and competing effort or budget controls are rejected.
-Mixed routes narrow to budget-capable rungs; unsupported routes return an actionable
+Top-level Chat `thinking_budget` also exposes Gemini zero/dynamic controls. Unsupported routes return an actionable
 `thinking.budget_tokens` error before dispatch. See [generation controls](gateway-generation.md).
 
 **`parallel_tool_calls` is honoured on every route.** A rung whose wire carries the control forwards it.

@@ -511,7 +511,7 @@ class _ThinkingConfig(_WireModel):
     Translated to the canonical reasoning control: ``enabled`` and ``adaptive``
     turn thinking on at the model's default effort; ``disabled`` maps to
     ``reasoning_effort=none``. An enabled ``budget_tokens`` is preserved
-    for route admission and forwarded only where its numeric value is supported.
+    for route admission and translated only where its numeric value is supported.
     """
 
     type: Literal["enabled", "disabled", "adaptive"]
@@ -589,7 +589,7 @@ class _ChatRequest(_WireModel):
     reasoning: _ChatReasoning | None = None
     thinking: _ThinkingConfig | None = None
     chat_template_kwargs: _ChatTemplateKwargs | None = None
-    thinking_budget: int | None = Field(default=None, gt=0, strict=True)
+    thinking_budget: int | None = Field(default=None, ge=-1, strict=True)
     enable_thinking: bool | None = None
     """DashScope's top-level enable-thinking switch (``extra_body``), translated
     like the vLLM ``chat_template_kwargs`` spelling: Qwen-family clients send it

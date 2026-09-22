@@ -518,8 +518,8 @@ class GatewayRequest(ContractModel):
     own recovery finds the field it sent. ``None`` means the surface default
     (see :attr:`caller_effort_parameter`)."""
     # Level-less enable-thinking; the route seam resolves the concrete effort.
-    thinking_budget: int | None = Field(default=None, gt=0, strict=True, exclude=True)
-    """Explicit Chat reasoning-token cap, forwarded only to budget-capable wires."""
+    thinking_budget: int | None = Field(default=None, ge=-1, strict=True, exclude=True)
+    """Numeric Chat thinking control; provider validation owns zero and -1 semantics."""
     thinking_default_enable: bool = False
     reasoning_summary: Literal["auto", "concise", "detailed"] | None = None
     reasoning_summary_parameters: tuple[
@@ -529,9 +529,9 @@ class GatewayRequest(ContractModel):
     provider_thinking_config: JsonObject | None = Field(default=None, exclude=True)
     """Verbatim caller ``thinking`` configuration from Messages or budgeted Chat.
 
-    Validated at decode and route admission, then forwarded unchanged to
-    Anthropic, overriding the catalog's adaptive default. Excluded from
-    serialization; present configs join :func:`canonical_request_sha256`.
+    Validated at decode and route admission. Numeric values survive translation
+    to qualified native wires; other config fields require verbatim support.
+    Excluded from serialization; joins :func:`canonical_request_sha256`.
     """
     context_management: JsonObject | None = Field(default=None, exclude=True)
     """Verbatim caller ``context_management`` from the Messages surface.
