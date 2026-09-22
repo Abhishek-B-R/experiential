@@ -67,6 +67,20 @@ with exp.load_router("my-project") as client:
     )
 ```
 
+## Capture Traffic
+
+Collect supported traces from apps such as Codex and Claude Code while they keep using OpenAI
+or Anthropic directly. Capture runs on macOS with Python 3.13 or newer:
+
+```bash
+exp capture
+```
+
+Sign in if prompted, approve the macOS extension and certificate prompts, and leave the terminal
+open while you work. Capture uploads prompts, responses, and tool content to Experiential.
+Press Ctrl+C to stop.
+See [Capture usage](./docs/usage.md#direct-provider-capture-on-macos) for supported traffic and setup details.
+
 ## Optimize from Traffic
 
 First, collect OpenTelemetry traces from your current agent. If you just want to try it out, grab
