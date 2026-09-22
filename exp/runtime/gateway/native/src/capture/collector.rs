@@ -42,7 +42,17 @@ impl Configuration {
     }
 }
 
+/// Stay live through the pending-to-delivery handoff, including capacity waits.
+struct Admission(Arc<AtomicUsize>);
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct Entry {
+    _admission: Admission,
     record: Record,
     wire: Option<WireResponse>,
     request_bytes: usize,
@@ -98,6 +108,7 @@ pub(crate) struct Collector {
     delivery: Delivery,
     pending: Arc<Mutex<Pending>>,
     skipped: Arc<AtomicU64>,
+    admissions: Arc<AtomicUsize>,
     body_bytes: AtomicUsize,
     body_capacity: Arc<Semaphore>,
 }
@@ -118,6 +129,7 @@ impl Collector {
             config,
             pending,
             skipped,
+            admissions: Arc::new(AtomicUsize::new(0)),
             body_bytes: AtomicUsize::new(0),
         })
     }
@@ -155,9 +167,11 @@ impl Collector {
             return self.skip();
         }
         pending.bytes += bytes;
+        self.admissions.fetch_add(1, Ordering::AcqRel);
         pending.entries.insert(
             record.request.request_id.clone(),
             Entry {
+                _admission: Admission(self.admissions.clone()),
                 record,
                 wire: None,
                 request_bytes,
@@ -451,13 +465,20 @@ impl Collector {
         self.body_bytes.fetch_sub(bytes, Ordering::AcqRel);
     }
 
+    /// Stop admissions but preserve accepted work until settlement and persistence finish.
     pub(crate) fn close_until(&self, deadline: Instant) -> bool {
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.closed = true;
-            self.skipped
-                .fetch_add(pending.entries.len() as u64, Ordering::Relaxed);
-            pending.entries.clear();
-            pending.bytes = 0;
+        let Ok(mut pending) = self.pending.lock() else {
+            return false;
+        };
+        pending.closed = true;
+        drop(pending);
+        // An entry owns its admission through emit(), even after removal from
+        // the pending map. Closing delivery earlier could reject that handoff.
+        while self.admissions.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if self.admissions.load(Ordering::Acquire) > 0 {
+            return false;
         }
         self.delivery.close_until(deadline)
     }
