@@ -96,6 +96,11 @@ class GatewayWireProfile:
     The native (Rust) data plane builds provider payloads and parses provider
     streams itself; this profile carries the connection-specific wire facts
     that only the resolved Python client knows.
+
+    Attributes:
+        supports_logprobs: Verified Chat probability support on this exact model.
+        supports_responses_logprobs: Native Responses probability support, opt-in.
+        logprobs_reasoning_efforts: Qualified efforts; empty means unknown support.
     """
 
     dialect: str
@@ -192,10 +197,10 @@ class GatewayWireProfile:
     """Largest top-k value accepted by the provider wire, when known."""
 
     supports_logprobs: bool = False
-    """Provider metadata for logprob support.
 
-    Dispatch stays disabled until normalized output projection exists.
-    """
+    supports_responses_logprobs: bool = False
+
+    logprobs_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
 
     supports_frequency_penalty: bool = False
     """Whether this exact route accepts the ``frequency_penalty`` sampling control.

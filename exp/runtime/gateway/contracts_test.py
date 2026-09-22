@@ -1277,3 +1277,16 @@ def test_a_tool_result_caller_is_valid_only_on_tool_messages() -> None:
             content="ok",
             provider_tool_caller={"type": "direct"},
         )
+
+
+@pytest.mark.parametrize(
+    "surface", [GatewayApiSurface.CHAT_COMPLETIONS, GatewayApiSurface.MESSAGES]
+)
+def test_responses_probability_selector_rejects_other_surfaces(surface: GatewayApiSurface) -> None:
+    """A canonical request cannot carry the Responses selector on a different API."""
+    with pytest.raises(ValueError, match="include_output_text_logprobs"):
+        GatewayRequest(
+            surface=surface,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            include_output_text_logprobs=True,
+        )
