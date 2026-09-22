@@ -99,6 +99,7 @@ fn assemble_chat(chunks: &[Value]) -> Option<Value> {
     let mut result = json!({"id": first.get("id")?, "object": "chat.completion",
         "model": first.get("model")?, "created": first.get("created").unwrap_or(&Value::Null)});
     let mut choices: BTreeMap<u64, Value> = BTreeMap::new();
+    let mut tools: BTreeMap<u64, BTreeMap<u64, Value>> = BTreeMap::new();
     for chunk in chunks {
         if let Some(usage) = chunk.get("usage").filter(|value| !value.is_null()) {
             result["usage"] = usage.clone();
@@ -112,7 +113,7 @@ fn assemble_chat(chunks: &[Value]) -> Option<Value> {
             if let Some(delta) = choice.get("delta").and_then(Value::as_object) {
                 for (key, value) in delta {
                     if key == "tool_calls" {
-                        merge_tools(message, value)?;
+                        merge_tools(tools.entry(index).or_default(), value)?;
                     } else if key == "role" {
                         message.insert(key.clone(), value.clone());
                     } else {
@@ -124,6 +125,10 @@ fn assemble_chat(chunks: &[Value]) -> Option<Value> {
                 target["finish_reason"] = reason.clone();
             }
         }
+    }
+    for (index, calls) in tools {
+        choices.get_mut(&index)?["message"]["tool_calls"] =
+            Value::Array(calls.into_values().collect());
     }
     if choices.is_empty()
         || choices
@@ -152,21 +157,15 @@ fn append(object: &mut Map<String, Value>, key: &str, addition: &Value) -> Optio
     Some(())
 }
 
-fn merge_tools(message: &mut Map<String, Value>, addition: &Value) -> Option<()> {
-    let tools = message
-        .entry("tool_calls")
-        .or_insert_with(|| json!([]))
-        .as_array_mut()?;
+fn merge_tools(tools: &mut BTreeMap<u64, Value>, addition: &Value) -> Option<()> {
     for delta in addition.as_array()? {
-        let index = delta.get("index")?.as_u64()? as usize;
-        // Provider indexes cannot allocate an unbounded sparse vector.
-        if index > tools.len() {
-            return None;
-        }
-        if index == tools.len() {
-            tools.push(json!({"type": "function", "function": {}}));
-        }
-        let target = tools[index].as_object_mut()?;
+        let index = delta.get("index")?.as_u64()?;
+        // Output indexes may include omitted reasoning/text items. Allocate only
+        // observed calls, never a vector sized by an untrusted provider index.
+        let target = tools
+            .entry(index)
+            .or_insert_with(|| json!({"type": "function", "function": {}}))
+            .as_object_mut()?;
         for (key, value) in delta.as_object()? {
             match key.as_str() {
                 "index" => {}
@@ -243,6 +242,52 @@ mod tests {
         assert_eq!(
             result["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
             "{}"
+        );
+    }
+
+    #[test]
+    fn tool_indexes_are_sparse_labels_not_allocation_sizes() {
+        for index in [1_u64, 8, u64::MAX] {
+            let first = json!({"id":"completion","model":"model","choices":[{"index":0,
+                "delta":{"tool_calls":[{"index":index,"id":"call","type":"function",
+                    "function":{"name":"lookup","arguments":"{ \"id\" :"}}]},"finish_reason":null}]});
+            let last = json!({"id":"completion","model":"model","choices":[{"index":0,
+                "delta":{"tool_calls":[{"index":index,"function":{"arguments":" \"雪\" }"}}]},
+                "finish_reason":"tool_calls"}]});
+            let result = assemble_chat(&[first, last]).unwrap();
+            assert_eq!(
+                result["choices"][0]["message"]["tool_calls"],
+                json!([
+                    {"id":"call","type":"function","function":{"name":"lookup","arguments":"{ \"id\" : \"雪\" }"}}
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn interleaved_sparse_tools_are_grouped_by_choice_then_tool_index() {
+        let chunks = vec![
+            json!({"id":"completion","model":"model","choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":9,"id":"second","function":{"name":"b","arguments":"["}},
+                {"index":3,"id":"first","function":{"name":"a","arguments":"{"}}
+            ]}}]}),
+            json!({"choices":[{"index":1,"delta":{"tool_calls":[
+                {"index":3,"id":"other-choice","function":{"name":"c","arguments":"{}"}}
+            ]},"finish_reason":"tool_calls"}]}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":3,"function":{"arguments":"}"}},
+                {"index":9,"function":{"arguments":"]"}}
+            ]},"finish_reason":"tool_calls"}]}),
+        ];
+        let result = assemble_chat(&chunks).unwrap();
+        let tools = &result["choices"][0]["message"]["tool_calls"];
+        assert_eq!(tools[0]["id"], "first");
+        assert_eq!(tools[0]["function"]["arguments"], "{}");
+        assert_eq!(tools[1]["id"], "second");
+        assert_eq!(tools[1]["function"]["arguments"], "[]");
+        assert_eq!(
+            result["choices"][1]["message"]["tool_calls"][0]["id"],
+            "other-choice"
         );
     }
 }
