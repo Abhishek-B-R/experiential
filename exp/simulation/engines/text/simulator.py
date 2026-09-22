@@ -112,7 +112,7 @@ class WorldModelSimulator:
     """Execute a text-only customer agent against a remote world-model provider.
 
     The simulator deliberately owns only one concrete mode. It invokes independently resolved
-    candidate and world-model clients, gives the agent an execute-only no-tools environment,
+    candidate and world-model clients, gives the agent a simulated tool environment,
     persists one immutable rollout per selected cell, never exposes a mutable world-model session,
     sends no tools to the world model, and records candidate economics apart from simulator cost.
 
@@ -652,7 +652,7 @@ class WorldModelSimulator:
         maximum_cell_cost_usd: float,
         attempt: int = 0,
     ) -> RolloutArtifact:
-        """Execute one grounded no-tools episode or retain its structured failure.
+        """Execute one grounded simulated episode or retain its structured failure.
 
         Args:
             spec: Validated finite-cost simulation specification.
@@ -680,25 +680,6 @@ class WorldModelSimulator:
         candidate = self._candidate_models[cell.candidate_alias]
         started_at = timestamp(self._clock)
         started_monotonic = self._monotonic()
-        if task.tools:
-            return self._failure_rollout(
-                spec,
-                cell,
-                candidate,
-                world_model,
-                binding,
-                resolution_input,
-                started_at,
-                StopReason.FAILURE,
-                StructuredFailure(
-                    code=FailureCode.UNSUPPORTED,
-                    message="text world-model simulation cannot run a task that declares tools",
-                    attribution=FailureAttribution.TOOL,
-                    details={"phase": "task_tools", "tool_count": len(task.tools)},
-                ),
-                duration_seconds=elapsed_seconds(started_monotonic, self._monotonic()),
-                attempt=attempt,
-            )
         settings = spec.world_model
         if settings is None:  # pragma: no cover - validated before this execution path
             raise SimulationConfigurationError("world-model simulation settings are missing")

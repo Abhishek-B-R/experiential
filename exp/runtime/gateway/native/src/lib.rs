@@ -18,6 +18,10 @@ mod events;
 mod eventstream;
 mod first_token_bound;
 mod guardrails;
+mod image_output;
+mod logprobs;
+#[cfg(test)]
+mod logprobs_tests;
 mod memory;
 mod metrics;
 mod param_attribution;
@@ -453,8 +457,27 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
             None => Err("provider output item requires item_type".to_string()),
         };
         let event = match kind {
+            "image" => events::Event::Image(
+                object
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("image requires url")?
+                    .to_string(),
+            ),
             "text_delta" => events::Event::TextDelta(text),
             "refusal_delta" => events::Event::RefusalDelta(text),
+            "choice_logprobs_delta" => {
+                let choice_index = object
+                    .get("choice_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|index| *index == 0)
+                    .ok_or("choice logprobs requires choice_index 0")?;
+                events::Event::ChoiceLogprobsDelta(
+                    crate::logprobs::parse(object.get("logprobs"), choice_index as u32)
+                        .map_err(|failure| failure.safe_message)?
+                        .ok_or("choice logprobs requires logprobs")?,
+                )
+            }
             "provider_text_delta" => events::Event::ProviderTextDelta {
                 output_index,
                 item_id: item_id.ok_or("provider text delta requires item_id")?,

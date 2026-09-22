@@ -54,10 +54,24 @@ impl ResponsesSseEncoder {
         status: Option<ProviderOutputItemStatus>,
         phase: Option<ProviderAssistantMessagePhase>,
     ) -> Result<Vec<String>, PublicError> {
-        if self
-            .provider_output_starts
-            .contains_key(&provider_output_index)
-        {
+        if let Some(existing) = self.provider_output_starts.get_mut(&provider_output_index) {
+            if existing.inferred && existing.kind == kind && existing.item_id.as_deref() == item_id
+            {
+                let message = self
+                    .messages
+                    .get_mut(&MessageKey::Provider(provider_output_index))
+                    .ok_or_else(|| {
+                        invalid_provider_stream("Responses inferred message is missing")
+                    })?;
+                if !message.done {
+                    existing.inferred = false;
+                    existing.status = status.or(existing.status);
+                    existing.phase = phase.or(existing.phase);
+                    message.status = status.or(message.status);
+                    message.phase = phase.or(message.phase);
+                    return Ok(Vec::new());
+                }
+            }
             return Err(invalid_provider_stream(
                 "Responses provider output-item index was started twice.",
             ));
@@ -80,6 +94,7 @@ impl ResponsesSseEncoder {
         self.provider_output_starts.insert(
             provider_output_index,
             ProviderOutputStart {
+                inferred: false,
                 item_id: item_id.map(str::to_string),
                 kind,
                 output_index,
@@ -128,6 +143,8 @@ impl ResponsesSseEncoder {
                     text: String::new(),
                     refusal: String::new(),
                     annotations: Vec::new(),
+                    logprobs: BTreeMap::new(),
+                    probability_bytes: 0,
                     text_started: false,
                     refusal_started: false,
                     done: false,

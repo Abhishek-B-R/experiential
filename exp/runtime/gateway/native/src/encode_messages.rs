@@ -348,6 +348,15 @@ impl MessagesSseEncoder {
         }
         self.reasoning.observe(event)?;
         match event {
+            Event::ProviderResponsesLogprobs { .. } => Err(invalid_provider_stream(
+                "Responses probability events cannot be projected on this surface.",
+            )),
+            Event::ChoiceLogprobsDelta(_) => Err(invalid_provider_stream(
+                "Chat token probabilities cannot be projected on this surface.",
+            )),
+            Event::Image(_) => Err(invalid_provider_stream(
+                "Generated image output requires Chat Completions or the Images API.",
+            )),
             Event::TextDelta(text) => self.text_delta(text),
             Event::ProviderTextDelta { delta, .. } => self.text_delta(delta),
             Event::RefusalDelta(_) => {

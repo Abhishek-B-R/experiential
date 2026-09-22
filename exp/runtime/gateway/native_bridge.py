@@ -6,8 +6,7 @@ authorization, payload construction, continuation state, and durable ledger
 transactions. Every boundary call takes and returns one JSON string.
 Admission returns the full ordered certified route (one wire configuration
 per deployment) plus the frozen retry-policy facts, accepting the request
-without starting any attempt. The data plane then reserves each physical
-dispatch through ``start_attempt`` immediately before network work and lands
+without starting attempts. The data plane reserves each ``start_attempt`` and lands
 each attempt's durable terminal through ``settle`` (finalizing the request
 only on the terminal attempt); candidate selection stays here: the frozen
 waterfall policy, health circuits, and budget skipping.
@@ -138,6 +137,7 @@ from exp.runtime.models.providers.errors import (
     ProviderParameterError,
     normalized_provider_failure,
 )
+from exp.runtime.models.providers.logprobs import require_unmodified_probability_output
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 from exp.runtime.openai_protocol.errors import (
     OpenAIProtocolError,
@@ -534,6 +534,7 @@ class NativeControlPlane(
                     continuation=continuation_context,
                 )
             )
+            require_unmodified_probability_output(request, bool(policy and policy.output_checks))
             wire_route: list[JsonObject] = []
             parallel_disclosures: set[str] = set()
             output_bounds: list[int] = []
@@ -699,7 +700,12 @@ class NativeControlPlane(
             "maximum_total_attempts": MAXIMUM_TOTAL_ATTEMPTS,
             "maximum_same_deployment_attempts": MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
             "refusal_failover": authorization.refusal_failover,
-            "output_guardrail": native_output_mode(self._guardrails, policy, public_request).value,
+            "output_guardrail": native_output_mode(
+                self._guardrails,
+                policy,
+                public_request,
+                image_output=any(wire.get("image_output") is True for wire in wire_route),
+            ).value,
             "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
         }
         if route.snapshot.throttle_redial is not None:

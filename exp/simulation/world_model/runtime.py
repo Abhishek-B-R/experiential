@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -20,14 +19,15 @@ from exp.common.models import (
     ModelResponse,
 )
 from exp.common.project import ArtifactStore, artifact_input
-from exp.common.tasks import TaskCase
+from exp.common.tasks import TaskCase, ToolSchema
 from exp.simulation.engines.text.prompt import (
     TextWorldModelTransition,
     build_world_model_request,
+    candidate_rag_actions,
     parse_world_model_transition,
+    validate_transition_action,
 )
 from exp.simulation.retrieval import (
-    RAGAction,
     RAGMatch,
     RAGQuery,
     TraceRAGRetriever,
@@ -36,7 +36,6 @@ from exp.simulation.retrieval import (
 from exp.simulation.retrieval.embedding import RAGEmbedderBinding
 from exp.simulation.world_model.artifact import (
     GROUNDED_WORLD_MODEL_PROMPT_VERSION,
-    GROUNDED_WORLD_MODEL_SYSTEM_PROMPT,
     WORLD_MODEL_ARTIFACT_PATH,
     GroundedWorldModelArtifact,
     grounded_world_model_content,
@@ -46,19 +45,34 @@ from exp.simulation.world_model.artifact import (
 
 @dataclass(frozen=True)
 class PreparedGroundedWorldModelCall:
-    """One retrieved and framed grounded request before provider dispatch."""
+    """One retrieved and framed grounded request before provider dispatch.
+
+    Attributes:
+        request: Fully framed world-model request ready for dispatch.
+        matches: Ordered grounding examples selected for the action.
+        action: Exact candidate action whose call IDs constrain generated results.
+    """
 
     request: ModelRequest
     matches: tuple[RAGMatch, ...]
+    action: AssistantAction
 
 
 @dataclass(frozen=True)
 class DispatchedGroundedWorldModelCall:
-    """One artifact-bound response paired with its exact request and retrieval evidence."""
+    """One artifact-bound response paired with its exact request and retrieval evidence.
+
+    Attributes:
+        request: Exact dispatched world-model request.
+        response: Provider response awaiting protocol validation.
+        matches: Grounding evidence included in the request.
+        action: Exact candidate action used when validating generated result identities.
+    """
 
     request: ModelRequest
     response: ModelResponse
     matches: tuple[RAGMatch, ...]
+    action: AssistantAction
 
 
 @dataclass(frozen=True)
@@ -88,6 +102,7 @@ class GroundedWorldModel:
         candidate_response: AssistantAction,
         excluded_lineage_ids: tuple[str, ...],
         maximum_output_tokens: int,
+        state: JsonObject | None = None,
     ) -> PreparedGroundedWorldModelCall:
         """Retrieve and frame one fit- or serving-bound grounded text transition.
 
@@ -97,28 +112,41 @@ class GroundedWorldModel:
             candidate_response: Latest visible candidate action.
             excluded_lineage_ids: Source lineages forbidden from retrieval.
             maximum_output_tokens: Explicit provider output ceiling.
+            state: Private environment state retained between simulated turns.
 
         Returns:
             Exact request and retrieved evidence before provider dispatch.
         """
-        if candidate_response.content is None:
-            raise ValueError("grounded text simulation requires a visible candidate message")
-        query = RAGQuery(
-            task=task.instruction,
-            initial_context=task.initial_context,
-            action=RAGAction(kind="message", content=candidate_response.content),
-            excluded_lineage_ids=excluded_lineage_ids,
-            top_k=self.artifact.top_k,
+        queries = tuple(
+            RAGQuery(
+                task=task.instruction,
+                initial_context=task.initial_context,
+                action=action,
+                excluded_lineage_ids=excluded_lineage_ids,
+                top_k=self.artifact.top_k,
+            )
+            for action in candidate_rag_actions(candidate_response)
         )
-        matches = self.retriever.retrieve(query)
+        batches = tuple(self.retriever.retrieve(query) for query in queries)
+        # Round-robin over each call's nearest examples, retaining the pinned total context bound.
+        selected: dict[str, RAGMatch] = {}
+        for rank in range(self.artifact.top_k):
+            for batch in batches:
+                if rank < len(batch) and len(selected) < self.artifact.top_k:
+                    match = batch[rank]
+                    selected.setdefault(match.transition.transition_id, match)
+        matches = tuple(selected.values())
         request = build_world_model_request(
             task,
             visible_messages=visible_messages,
             candidate_response=candidate_response,
             grounded_examples=matches,
             maximum_output_tokens=maximum_output_tokens,
+            state=state,
         )
-        return PreparedGroundedWorldModelCall(request=request, matches=matches)
+        return PreparedGroundedWorldModelCall(
+            request=request, matches=matches, action=candidate_response
+        )
 
     def complete_turn(
         self,
@@ -137,6 +165,7 @@ class GroundedWorldModel:
             request=prepared.request,
             response=response,
             matches=prepared.matches,
+            action=prepared.action,
         )
 
     def parse_turn(
@@ -151,18 +180,21 @@ class GroundedWorldModel:
         Returns:
             Completed grounded call with its parsed visible transition.
         """
+        transition = parse_world_model_transition(dispatched.response.output)
+        validate_transition_action(transition, dispatched.action)
         return GroundedWorldModelCall(
             request=dispatched.request,
             response=dispatched.response,
             matches=dispatched.matches,
-            transition=parse_world_model_transition(dispatched.response.output),
+            transition=transition,
         )
 
     def step(
         self,
         *,
         task: str,
-        action: RAGAction,
+        action: AssistantAction,
+        tools: tuple[ToolSchema, ...] = (),
         initial_context: JsonObject | None = None,
         excluded_lineage_ids: tuple[str, ...] = (),
         maximum_output_tokens: int = 1_024,
@@ -171,59 +203,49 @@ class GroundedWorldModel:
 
         Args:
             task: Current request-visible task.
-            action: Latest assistant message or tool call.
+            action: Latest assistant text or tool calls retaining their original call IDs.
+            tools: Declared schemas for every tool the assistant may invoke.
             initial_context: Safe request-visible starting context.
             excluded_lineage_ids: Source lineages forbidden for this query.
             maximum_output_tokens: Explicit provider output ceiling.
 
         Returns:
             Parsed next visible message and terminal state from the text world-model protocol.
+
+        Raises:
+            TypeError: The action is not a canonical assistant action.
+            ValueError: Tool names, call IDs, response identity, or generated results are invalid.
         """
+        if not isinstance(action, AssistantAction):
+            raise TypeError("world-model actions must use AssistantAction with original tool IDs")
+        names = {tool.name for tool in tools}
+        if any(call.name not in names for call in action.tool_calls):
+            raise ValueError("declare every assistant tool in the tools argument")
+        if len({call.call_id for call in action.tool_calls}) != len(action.tool_calls):
+            raise ValueError("assistant tool calls must have unique call IDs")
         context = {} if initial_context is None else initial_context
-        query = RAGQuery(
-            task=task,
+        task_id = stable_id("world-model-step-task", {"task": task, "initial_context": context})
+        task_case = TaskCase(
+            task_id=task_id,
+            lineage_group_id=task_id,
+            partition="held_out",
+            instruction=task,
             initial_context=context,
-            action=action,
-            excluded_lineage_ids=excluded_lineage_ids,
-            top_k=self.artifact.top_k,
+            tools=tools,
+            workload_weight=1.0,
+            source_trace_ids=(task_id,),
         )
-        matches = self.retriever.retrieve(query)
-        evidence = [
-            {
-                "task": match.transition.task,
-                "action": match.transition.action.model_dump(mode="json", exclude_none=True),
-                "observation": match.transition.observation.model_dump(mode="json"),
-            }
-            for match in matches
-        ]
-        request = ModelRequest(
-            messages=(
-                ModelMessage(
-                    role="system",
-                    content=GROUNDED_WORLD_MODEL_SYSTEM_PROMPT,
-                ),
-                ModelMessage(
-                    role="user",
-                    content=json.dumps(
-                        {
-                            "task": task,
-                            "initial_context": context,
-                            "action": action.model_dump(mode="json", exclude_none=True),
-                            "grounded_examples": evidence,
-                        },
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    ),
-                ),
-            ),
-            tool_choice="none",
+        prepared = self.prepare_turn(
+            task=task_case,
+            visible_messages=(),
+            candidate_response=action,
+            excluded_lineage_ids=excluded_lineage_ids,
             maximum_output_tokens=maximum_output_tokens,
         )
-        response = self.client.complete(request)
-        if response.model != self.artifact.model:
+        dispatched = self.complete_turn(prepared)
+        if dispatched.response.model != self.artifact.model:
             raise ValueError("world-model response identity differs from its build artifact")
-        return parse_world_model_transition(response.output)
+        return self.parse_turn(dispatched).transition
 
 
 def load_grounded_world_model(

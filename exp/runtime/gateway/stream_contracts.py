@@ -7,11 +7,66 @@ that module re-exports every name here, so import paths are unchanged.
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Annotated, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, TypeAdapter, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ToolCall
+
+ByteValue = Annotated[int, Field(strict=True, ge=0, le=255)]
+"""One byte from a provider token representation."""
+
+LogProbability = Annotated[float, Field(strict=True, allow_inf_nan=False)]
+"""One finite natural-log probability."""
+
+
+class LogprobCandidate(ContractModel):
+    """One alternate token and its provider probability.
+
+    Attributes:
+        token: Provider token text, never normalized.
+        logprob: Finite natural-log probability.
+        bytes: Provider bytes, or None when omitted or null.
+    """
+
+    token: str
+    logprob: LogProbability
+    bytes: tuple[ByteValue, ...] | None = None
+
+
+class TokenLogprob(LogprobCandidate):
+    """The selected token probability and bounded alternate candidates.
+
+    Attributes:
+        top_logprobs: Ordered alternatives, including an explicitly empty tuple.
+    """
+
+    top_logprobs: tuple[LogprobCandidate, ...] = Field(max_length=20)
+
+
+class ChoiceLogprobs(ContractModel):
+    """Probability records for one Chat choice.
+
+    Attributes:
+        content: Content records; None differs from an observed empty sequence.
+        refusal: Refusal records; None differs from an observed empty sequence.
+    """
+
+    content: tuple[TokenLogprob, ...] | None = None
+    refusal: tuple[TokenLogprob, ...] | None = None
+
+
+class ChoiceLogprobsDelta(ContractModel):
+    """One ordered probability observation scoped to a Chat choice.
+
+    Attributes:
+        choice_index: The provider choice index.
+        logprobs: Observed channels, or None for a null observation.
+    """
+
+    choice_index: int = Field(strict=True, ge=0, le=2**32 - 1)
+    logprobs: ChoiceLogprobs | None
 
 
 class GatewayUsage(ContractModel):
@@ -87,6 +142,8 @@ class GatewayEventKind(StrEnum):
 
     TEXT_DELTA = "text_delta"
     REFUSAL_DELTA = "refusal_delta"
+    CHOICE_LOGPROBS_DELTA = "choice_logprobs_delta"
+    PROVIDER_RESPONSES_LOGPROBS = "provider_responses_logprobs"
     REASONING_SUMMARY_DELTA = "reasoning_summary_delta"
     THINKING_DELTA = "thinking_delta"
     THINKING_SIGNATURE = "thinking_signature"
@@ -124,6 +181,7 @@ class GatewayEvent(ContractModel):
     tool_call: ToolCall | None = None
     usage: GatewayUsage | None = None
     failure: GatewayFailure | None = None
+    choice_logprobs_delta: ChoiceLogprobsDelta | None = None
     usage_incomplete_due_to_disconnect: bool = Field(default=False, exclude=True, strict=True)
     """Trusted evidence of caller loss after dispatch but before an observed provider terminal.
 
@@ -139,6 +197,16 @@ class GatewayEvent(ContractModel):
     False leaves unmetered decision work financially unresolved. This is not
     provider token usage and never joins serialized events or replay identity.
     """
+
+    responses_output_index: int | None = Field(default=None, ge=0, alias="output_index")
+    responses_item_id: str | None = Field(
+        default=None, min_length=1, max_length=256, alias="item_id"
+    )
+    responses_content_index: int | None = Field(default=None, ge=0, alias="content_index")
+    responses_logprobs_phase: (
+        Literal["delta", "text_done", "content_part_done", "item_done", "terminal"] | None
+    ) = Field(default=None, alias="phase")
+    responses_logprobs_records: tuple[JsonObject, ...] | None = Field(default=None, alias="records")
 
     @model_validator(mode="after")
     def _require_event_payload(self) -> GatewayEvent:
@@ -159,6 +227,28 @@ class GatewayEvent(ContractModel):
         if self.kind in {GatewayEventKind.TEXT_DELTA, GatewayEventKind.REFUSAL_DELTA}:
             if self.text_delta is None:
                 raise ValueError("text and refusal deltas require text_delta")
+        elif self.kind == GatewayEventKind.CHOICE_LOGPROBS_DELTA:
+            if self.choice_logprobs_delta is None:
+                raise ValueError("choice logprobs deltas require their payload")
+        elif self.kind == GatewayEventKind.PROVIDER_RESPONSES_LOGPROBS:
+            if (
+                self.responses_output_index is None
+                or self.responses_item_id is None
+                or self.responses_content_index is None
+                or self.responses_logprobs_phase is None
+                or "responses_logprobs_records" not in self.model_fields_set
+            ):
+                raise ValueError(
+                    "Responses probability events require identity, phase, and records"
+                )
+            if self.responses_logprobs_records is None and self.responses_logprobs_phase in {
+                "delta",
+                "text_done",
+            }:
+                raise ValueError("Responses delta and text-done probabilities require arrays")
+            _validate_responses_probability_records(
+                self.responses_logprobs_records, self.responses_logprobs_phase
+            )
         elif self.kind == GatewayEventKind.REASONING_SUMMARY_DELTA:
             if (
                 self.text_delta is None
@@ -283,3 +373,34 @@ class GatewayFailure(ContractModel):
     Set from the provider's own code and sentence and carried on the public
     error and the settlement argument, so the caller reads the category and
     the control plane counts refusals by reason without parsing detail."""
+
+
+def _validate_responses_probability_records(
+    records: tuple[JsonObject, ...] | None, phase: str
+) -> None:
+    """Validate phase-shaped provider observations without filling optional fields."""
+    if records is None:
+        return
+    optional_alternatives = phase in {"delta", "text_done"}
+    for record in records:
+        LogprobCandidate.model_validate(
+            {key: record[key] for key in ("token", "logprob", "bytes") if key in record}
+        )
+        if "top_logprobs" not in record:
+            continue
+        alternatives = record["top_logprobs"]
+        if alternatives is None and optional_alternatives:
+            continue
+        candidates = TypeAdapter(tuple[JsonObject, ...]).validate_python(alternatives)
+        if len(candidates) > 20:
+            raise ValueError("Responses probabilities allow at most 20 alternatives")
+        for candidate in candidates:
+            if optional_alternatives:
+                if candidate.get("token") is not None and not isinstance(candidate["token"], str):
+                    raise ValueError("Responses alternative token must be text or null")
+                if candidate.get("logprob") is not None:
+                    TypeAdapter(LogProbability).validate_python(candidate["logprob"])
+                if "bytes" in candidate:
+                    TypeAdapter(tuple[ByteValue, ...]).validate_python(candidate["bytes"])
+            else:
+                LogprobCandidate.model_validate(candidate)

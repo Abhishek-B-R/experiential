@@ -208,8 +208,8 @@ def test_model_messages_reject_tool_and_assistant_fields_on_the_wrong_roles() ->
         ModelMessage(role="tool", content="missing linkage")
 
 
-def test_model_messages_carry_image_parts_on_user_and_tool_roles_only() -> None:
-    """A tool result holds a screenshot beside its text; no other non-user role does."""
+def test_model_messages_carry_images_on_user_tool_and_assistant_roles() -> None:
+    """Tool screenshots and generated assistant images preserve their content parts."""
     image = ImageContentPart(media_type="image/png", data="aGk=")
     tool = ModelMessage(
         role="tool",
@@ -218,11 +218,15 @@ def test_model_messages_carry_image_parts_on_user_and_tool_roles_only() -> None:
         content_parts=(TextContentPart(text="shot"), image),
     )
     assert tool.images == (image,)
-    with pytest.raises(ValidationError, match="valid only for user and tool messages"):
+    assistant = ModelMessage(
+        role="assistant",
+        content="shot",
+        content_parts=(TextContentPart(text="shot"), image),
+    )
+    assert assistant.images == (image,)
+    with pytest.raises(ValidationError, match="valid only for user, tool, and assistant messages"):
         ModelMessage(
-            role="assistant",
-            content="shot",
-            content_parts=(TextContentPart(text="shot"), image),
+            role="system", content="shot", content_parts=(TextContentPart(text="shot"), image)
         )
     with pytest.raises(ValidationError, match="tool messages carry only text and image parts"):
         ModelMessage(
