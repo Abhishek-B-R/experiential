@@ -61,6 +61,8 @@ def test_prepare_freezes_replayable_catalog_selection_without_provider_access(
 ) -> None:
     """Static preparation freezes only model, judge, pricing and scenario evidence."""
     project, catalog, _, prepared = _prepare(tmp_path)
+    assert ModelEvaluationOptions().maximum_output_tokens is None
+    assert prepared.setup.world_model_settings.maximum_output_tokens == 32_000
     assert prepared.cost.worker_count == 2
     assert prepared.cost.scenario_count == 3
     assert prepared.cost.maximum_cost_usd > 0

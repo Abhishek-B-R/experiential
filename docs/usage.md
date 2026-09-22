@@ -130,7 +130,8 @@ There is no budget reset job and no budgets dashboard.
 
 Rollouts default to 100 candidate steps and 1,000,000 cumulative candidate output tokens.
 Both are configurable without a fixed engine step ceiling. `maximum_output_tokens` is a
-separate per-request setting (default 16,000), clamped to each model's declared output capacity
+separate optional per-request setting; omitting it uses each model's declared output capacity.
+Explicit limits are clamped to that capacity
 and, for candidates, the remaining rollout token budget. Provider output usage includes
 reasoning; it is not counted twice. Missing usage blocks further candidate dispatch.
 

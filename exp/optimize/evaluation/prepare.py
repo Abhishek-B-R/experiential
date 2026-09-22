@@ -57,7 +57,7 @@ class ModelEvaluationOptions(ContractModel):
     maximum_steps: int = Field(default=100, ge=1)
     maximum_rollout_output_tokens: int = Field(default=1_000_000, gt=0)
     maximum_concurrency: int = Field(default=1, ge=1, le=32)
-    maximum_output_tokens: int = Field(default=16_000, gt=0)
+    maximum_output_tokens: int | None = Field(default=None, gt=0)
     maximum_judge_input_tokens: int = Field(default=32_768, gt=0)
     maximum_judge_output_tokens: int = Field(default=8_192, gt=0)
     maximum_retrieval_query_tokens: int = Field(default=32_768, gt=0)
@@ -194,12 +194,21 @@ def prepare_model_evaluation(
         RoutedCandidateSnapshot(alias=alias, model=static.snapshot(alias)[0])
         for alias in sorted(worker_aliases)
     )
+    capacities = tuple(
+        static.snapshot(alias)[1].maximum_output_tokens
+        for alias in (*worker_aliases, world.model_alias)
+    )
+    if any(value is None for value in capacities):
+        raise ValueError("evaluation requires declared worker and world-model output capacities")
+    maximum_output_tokens = options.maximum_output_tokens or max(
+        value for value in capacities if value is not None
+    )
     traces = load_trace_dataset(project.artifacts, completed.trace_dataset.artifact_id).traces
     estimated_input = simulation_input_token_estimate(
         traces,
         retrieved_transition_count=world.top_k,
         maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
-        maximum_output_tokens=options.maximum_output_tokens,
+        maximum_output_tokens=maximum_output_tokens,
     )
     if estimated_input is None:
         raise ValueError("evaluation requires captured source traces for a cost estimate")
@@ -213,7 +222,7 @@ def prepare_model_evaluation(
         world=world.model,
         maximum_attempts=attempts,
         estimated_input_tokens=estimated_input,
-        maximum_output_tokens=options.maximum_output_tokens,
+        maximum_output_tokens=maximum_output_tokens,
     )
     retrieval = retrieval_embedding_reservation(
         problems,
@@ -315,7 +324,7 @@ def prepare_model_evaluation(
             grounded_world_model_input=completed.world_model,
             prompt_version=WORLD_MODEL_TEXT_PROMPT_VERSION,
             query_embedding=retrieval,
-            maximum_output_tokens=options.maximum_output_tokens,
+            maximum_output_tokens=maximum_output_tokens,
         ),
         simulation_completion_input=completion_input,
         agent_id=config.project_id,
