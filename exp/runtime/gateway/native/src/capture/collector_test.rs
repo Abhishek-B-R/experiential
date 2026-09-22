@@ -111,6 +111,14 @@ fn denied_response_never_persists_gemini_parts_in_either_settlement_order() {
     for before in [true, false] {
         let (collector, receiver) = collector(config());
         assert!(collector.begin(request("denied")));
+        let observation = crate::settlement::Observation::default();
+        observation.record(&crate::events::Event::Usage(crate::events::Usage {
+            input_tokens: Some(10),
+            output_tokens: Some(3),
+            ..crate::events::Usage::default()
+        }));
+        observation.record(&crate::events::Event::Completed);
+        collector.observe_attempt("denied", observation);
         collector.gemini_thought_part("denied", Arc::new(json!({"thoughtSignature":"private"})));
         if before {
             collector.settle("denied", true, false);
@@ -123,6 +131,7 @@ fn denied_response_never_persists_gemini_parts_in_either_settlement_order() {
         assert_eq!(records.len(), 1);
         assert!(records[0].response.is_none());
         assert!(records[0].gemini_thought_parts.is_empty());
+        assert!(records[0].metrics.is_none());
     }
 }
 
