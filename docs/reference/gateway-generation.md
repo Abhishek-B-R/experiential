@@ -117,17 +117,29 @@ facts.
 
 ## Connection loss
 
-Unkeyed Chat and Messages streams observe receiver closure while awaiting the same provider
-read. Closing the response drops the upstream transport before waiting for settlement.
+Unkeyed Chat, Messages, and Responses streams observe receiver closure while awaiting the same
+provider read. Closing the response drops the upstream transport before waiting for settlement.
 Periodic SSE comments keep a publicly silent stream active without restarting provider reads,
 changing first-token measurements, or extending provider/request deadlines.
+
+Responses WebSockets also observe close during request startup and buffered response collection.
+Follow-up requests remain sequential in a bounded FIFO, at most eight pending frames and 64 MiB
+combined. Overflow closes the connection and cancels active generation rather than dispatching
+queued requests. Pings are answered while provider output is quiet; socket writes remain within
+the request deadline. The transport's existing individual frame/message limits are unchanged.
+
+A synchronous control-plane admission callback cannot be interrupted mid-transaction. If a
+Responses WebSocket client leaves during that callback, no provider generation starts afterward;
+an accepted request whose result arrives after cancellation is cleaned up by the existing
+periodic deadline-plus-grace sweep.
 
 Closing a transport is not proof that every provider stops its own compute immediately.
 Observed usage remains billable according to the host's policy. Cancellation must never erase
 usage already parsed or override a provider terminal already observed. The settlement guard
 retains these facts across cancellation of the owning task and delivers one decided outcome.
 
-Keyed Chat owners retain their bounded replay contract after their subscriber leaves. A retry
+Keyed Chat and HTTP Responses owners retain their bounded replay contract after their
+subscriber leaves, while their captured response remains replayable. A retry
 joins or retrieves the same operation rather than dispatching a second generation. Heartbeat
 comments are not retained as replay content. Requests without an operation key are distinct
 submissions even when their prompts match; the gateway does not deduplicate unrelated callers
@@ -154,8 +166,9 @@ generations cannot acquire a known total by adding a known count to an unknown o
 ## Verification boundaries
 
 Regression coverage exercises the actual native normalizers, encoders, and served loopback
-HTTP sockets. It checks partial tools, quiet disconnects, upstream close before settlement,
-terminal precedence, parsed usage preservation, keyed replay, and heartbeat deadline behavior.
+HTTP and WebSocket connections. It checks partial tools, quiet and pre-output disconnects,
+upstream close before settlement, terminal precedence, parsed usage preservation, keyed replay,
+heartbeat deadline behavior, and bounded sequential WebSocket requests.
 These tests do not establish a real provider's cancellation guarantee. A hosted rollout also
 requires exact-version provider and ledger verification in its authorized environment.
 

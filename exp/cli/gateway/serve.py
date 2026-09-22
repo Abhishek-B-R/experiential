@@ -320,7 +320,12 @@ def _run_gateway(
                         _emit_unavailable_aliases(components.unavailable_aliases)
 
                 if check:
-                    announce_ready()
+                    try:
+                        announce_ready()
+                    finally:
+                        components.write_ledger.close()
+                        if components.write_ledger.stopped:
+                            components.manager.close()
                     return
 
                 # Readiness is announced by the native server itself, from
@@ -337,6 +342,10 @@ def _run_gateway(
                     )
                 except NativeGatewayServerError as exc:
                     raise typer.BadParameter(str(exc)) from exc
+                finally:
+                    components.write_ledger.close()
+                    if components.write_ledger.stopped:
+                        components.manager.close()
     except typer.BadParameter:
         if setup is not None:
             _emit_setup_recovery(setup=setup)

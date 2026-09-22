@@ -30,8 +30,8 @@ use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey};
 use crate::respond::{
     bearer_key, cached_response, capture_frame, client_ip, complete_visible_refusal,
     emit_responses_failure, error_response, escalation_error, finish_stream_terminal,
-    json_response, latin1_header, outward_event, read_body, send_bounded, settle_stream_end,
-    sse_body_response,
+    json_response, latin1_header, outward_event, read_body, settle_stream_end, sse_body_response,
+    stream_delivery::Delivery,
 };
 use crate::responses_retention::{remember_argument, remember_continuation, ResponsesRetention};
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
@@ -727,11 +727,8 @@ async fn stream_responses(
     let alias = admission.alias.clone();
     let envelope = admission.envelope.clone().unwrap_or_default();
     let phase_timeout = admission.phase_timeout(committed.depth);
-    let cached_headers = {
-        let mut sorted = header_pairs.clone();
-        sorted.sort();
-        sorted
-    };
+    let mut cached_headers = header_pairs.clone();
+    cached_headers.sort();
     let task_hold = guard.hold_task();
     tokio::spawn(async move {
         let _task = task_hold;
@@ -739,6 +736,7 @@ async fn stream_responses(
         let mut guard = guard;
         let mut committed = committed;
         let mut lease = lease;
+        let mut delivery = Delivery::new(sender.clone(), lease.is_some());
         // Keyed streams capture every public frame so the owner can publish
         // the exact byte stream; terminal frames flow through the shared
         // publication tail, matching the chat surface.
@@ -761,6 +759,7 @@ async fn stream_responses(
 
         macro_rules! fail_stream {
             ($failure:expr) => {{
+                committed.relay.close_transport();
                 let failure = $failure.boundary();
                 emit_responses_failure(&sender, deadline, &mut encoder, &failure).await;
                 guard
@@ -785,8 +784,10 @@ async fn stream_responses(
             let data = Bytes::from(frame);
             if lease.is_some() {
                 replayable = capture_frame(&mut capture, &data, replayable);
+                delivery.retain_replay(replayable);
             }
-            if !send_bounded(&sender, deadline, data).await {
+            if !delivery.send(deadline, data).await {
+                committed.relay.close_transport();
                 guard.settle_cancelled(usage.as_ref(), &tool_names).await;
                 return;
             }
@@ -794,23 +795,36 @@ async fn stream_responses(
 
         let mut prefix: std::collections::VecDeque<Event> = committed.prefix.drain(..).collect();
         'stream: loop {
+            if crate::relay::remaining(deadline).is_zero() {
+                committed.relay.close_transport();
+                guard.settle_cancelled(usage.as_ref(), &tool_names).await;
+                return;
+            }
             let event = if let Some(event) = prefix.pop_front() {
                 event
             } else {
-                match committed
-                    .relay
-                    .next_event(deadline, phase_timeout, guard.started)
+                match delivery
+                    .next(
+                        committed
+                            .relay
+                            .next_event(deadline, phase_timeout, guard.started),
+                    )
                     .await
                 {
-                    Ok(Some(event)) => event,
-                    Ok(None) => {
+                    None => {
+                        committed.relay.close_transport();
+                        guard.settle_cancelled(usage.as_ref(), &tool_names).await;
+                        return;
+                    }
+                    Some(Ok(Some(event))) => event,
+                    Some(Ok(None)) => {
                         usage = committed.relay.usage_before_failure(usage.take());
                         fail_stream!(Failure::new(
                             FailureClass::MalformedResponse,
                             "provider stream ended without a terminal event",
                         ))
                     }
-                    Err(failure) => {
+                    Some(Err(failure)) => {
                         usage = committed.relay.usage_before_failure(usage.take());
                         fail_stream!(failure)
                     }
@@ -852,6 +866,7 @@ async fn stream_responses(
             // disconnect during the final flush still settles by the
             // provider's outcome instead of as a cancellation.
             if event.is_terminal() {
+                committed.relay.close_transport();
                 terminal = Some(event.clone());
                 if matches!(event, Event::Completed) {
                     let candidate = match reasoning_carrier_candidate(&retention.carrier_events) {
@@ -906,8 +921,10 @@ async fn stream_responses(
                     let data = Bytes::from(data);
                     if lease.is_some() {
                         replayable = capture_frame(&mut capture, &data, replayable);
+                        delivery.retain_replay(replayable);
                     }
-                    if !send_bounded(&sender, deadline, data).await {
+                    if !delivery.send(deadline, data).await {
+                        committed.relay.close_transport();
                         settle_stream_end(
                             &mut guard,
                             terminal.as_ref(),
@@ -925,31 +942,17 @@ async fn stream_responses(
         // Retention runs before the terminal frames flush; a bounded
         // retention failure truncates the stream before its terminal, the
         // same observable behavior as the python service.
-        let retainable = !matches!(terminal, Some(Event::Failed(_)));
-        if retainable {
-            if let Err(_error) = remember_continuation(
+        let retained = matches!(terminal, Some(Event::Failed(_)))
+            || remember_continuation(
                 &state,
                 &admission.request_id,
                 &retention,
                 reasoning_content_carrier.as_deref(),
             )
             .await
-            {
-                settle_stream_end(
-                    &mut guard,
-                    terminal.as_ref(),
-                    usage.as_ref(),
-                    &tool_names,
-                    false,
-                )
-                .await;
-                return;
-            }
-        }
-        // The durable settlement lands before any keyed publication so a
-        // replayable success can never outlive a lost accounting write; a
-        // failed terminal abandons ownership so duplicates fail closed.
-        settle_stream_end(
+            .is_ok();
+        // Settle every terminal once, including a failed continuation write.
+        let settled = settle_stream_end(
             &mut guard,
             terminal.as_ref(),
             usage.as_ref(),
@@ -957,6 +960,9 @@ async fn stream_responses(
             false,
         )
         .await;
+        if !retained || !settled {
+            return;
+        }
         if matches!(terminal, Some(Event::Failed(_))) {
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;

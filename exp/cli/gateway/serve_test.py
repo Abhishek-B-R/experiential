@@ -156,6 +156,8 @@ def test_project_option_launches_the_native_gateway_on_loopback(
         reconciled_expired_requests=0,
         reconciled_unknown_attempts=0,
         unavailable_aliases=(),
+        write_ledger=SimpleNamespace(close=mock.Mock(), stopped=True),
+        manager=SimpleNamespace(close=mock.Mock()),
     )
 
     def load_components(
@@ -250,6 +252,8 @@ def test_project_option_launches_the_native_gateway_on_loopback(
     result = CliRunner().invoke(app, arguments)
 
     assert result.exit_code == 0, result.output
+    components.write_ledger.close.assert_called_once()
+    components.manager.close.assert_called_once()
     assert prepared == [("project-a", Path("/tmp/local-exp"), "policy-a")]
     assert loaded == [(Path("/tmp/local-exp"), frozenset({"project-a"}))]
     assert served == [(control_planes[0], "127.0.0.1", 8123)]
@@ -300,6 +304,8 @@ def test_unbindable_port_fails_before_any_ready_receipt(
         reconciled_expired_requests=0,
         reconciled_unknown_attempts=0,
         unavailable_aliases=(),
+        write_ledger=SimpleNamespace(close=mock.Mock(), stopped=True),
+        manager=SimpleNamespace(close=mock.Mock()),
     )
     monkeypatch.setattr("exp.cli.gateway.compatibility.prepare_project_gateway", prepare)
     monkeypatch.setattr(
