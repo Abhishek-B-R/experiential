@@ -12,10 +12,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from mitmproxy import http, options, tcp
+from cryptography import x509
+from mitmproxy import certs, http, options, tcp, tls
 from mitmproxy.addons.errorcheck import ErrorCheck
 from mitmproxy.addons.proxyserver import Proxyserver
-from mitmproxy.proxy import layer, layers
+from mitmproxy.addons.tlsconfig import TlsConfig
+from mitmproxy.proxy import context, layer, layers
 from mitmproxy.tools.dump import DumpMaster
 
 from exp.runtime.capture.normalization import CapturedExchange, CaptureProtocol, capture_protocol
@@ -23,6 +25,33 @@ from exp.runtime.capture.policy import validate_domains
 from exp.runtime.capture.redirector import stop_capture_servers
 
 logger = logging.getLogger(__name__)
+
+
+class _CaptureTlsConfig(TlsConfig):
+    """Issue DNS-only leaves without changing the connection's original destination.
+
+    Mitmproxy also includes server.address in its default leaf SANs. Local mode
+    supplies the original IP there, which Capture's constrained CA prohibits.
+    Override only certificate selection and retain upstream TLS verification,
+    cipher negotiation, and connection handling from the standard TLS addon.
+    """
+
+    name = "tlsconfig"
+
+    def __init__(self, domains: frozenset[str]) -> None:
+        """Bind certificate issuance to Capture's already validated exact DNS names."""
+        self._domains = domains
+
+    def get_cert(self, conn_context: context.Context) -> certs.CertStoreEntry:
+        """Return a leaf for one selected SNI without borrowing any upstream SANs.
+
+        Raises:
+            RuntimeError: TLS inspection reached an unselected or missing DNS SNI.
+        """
+        host = (conn_context.client.sni or "").lower().rstrip(".")
+        if host not in self._domains:
+            raise RuntimeError("Capture TLS inspection requires a selected DNS server name.")
+        return self.certstore.get_cert(host, [x509.DNSName(host)])
 
 
 @dataclass
@@ -96,6 +125,8 @@ class CaptureProxy:
         self._upstream_ca_file = upstream_ca_file
         self._captures: dict[str, _Capture] = {}
         self._master: DumpMaster | None = None
+        self._tls_failure: str | None = None
+        self._tls_disconnects = {domain: deque[float](maxlen=3) for domain in self._domains}
         self.dropped_exchanges = 0
 
     async def serve(self, *, ca_directory: Path, ready: Callable[[], None]) -> None:
@@ -104,6 +135,9 @@ class CaptureProxy:
         The redirector preserves each connection's original destination and excludes
         this process, including provider forwarding and cloud uploads. No hostname
         resolution or system DNS changes are performed by Capture.
+
+        Raises:
+            RuntimeError: Startup, cleanup, or selected-client TLS compatibility fails.
         """
         opts = _capture_options(tuple(self._domains), ca_directory)
         master = DumpMaster(opts, with_termlog=False, with_dumper=False)
@@ -113,6 +147,8 @@ class CaptureProxy:
         if isinstance(errorcheck, ErrorCheck):
             errorcheck.finish()
             master.addons.remove(errorcheck)
+        master.addons.remove(master.addons.get("tlsconfig"))
+        master.addons.add(_CaptureTlsConfig(self._domains))
         nextlayer = master.addons.get("nextlayer")
         master.addons.remove(nextlayer)
         master.addons.add(self, nextlayer)
@@ -133,11 +169,11 @@ class CaptureProxy:
                     "Capture could not start the network extension. Approve Mitmproxy "
                     "Redirector in macOS System Settings, then run exp capture again."
                 )
-            if master.should_exit.is_set():
-                return
-            await master.running()
-            ready()
-            await master.should_exit.wait()
+            if not master.should_exit.is_set():
+                await master.running()
+                if not master.should_exit.is_set():
+                    ready()
+                    await master.should_exit.wait()
         finally:
             try:
                 # Stop redirection before releasing the proxy and upload lifetime.
@@ -149,6 +185,8 @@ class CaptureProxy:
                 finally:
                     self._master = None
                     self._finish_pending()
+        if self._tls_failure is not None:
+            raise RuntimeError(self._tls_failure)
 
     def _finish_pending(self) -> None:
         """Account for interrupted captures even when backend cleanup reports failure."""
@@ -178,6 +216,48 @@ class CaptureProxy:
         """Request bounded server shutdown without blocking the caller's event loop."""
         if self._master is not None:
             self._master.shutdown()
+
+    def tls_failed_client(self, data: tls.TlsData) -> None:
+        """Stop on certificate rejection or repeated selected-host handshake disconnects.
+
+        The failed handshake cannot be repaired or replayed as encrypted pass-through.
+        Request ordinary shutdown here and report failure only after backend cleanup;
+        exceptions raised inside an addon hook are logged and swallowed by mitmproxy.
+        Only a fixed message and an allowlisted hostname leave this hook, never the
+        upstream TLS error text or handshake contents.
+        """
+        if self._tls_failure is not None or data.conn is not data.context.client:
+            return
+        host = (data.conn.sni or "").lower().rstrip(".")
+        if host not in self._domains:
+            return
+        error = (data.conn.error or "").lower()
+        if any(
+            alert in error for alert in ("unknown ca", "bad certificate", "certificate unknown")
+        ):
+            diagnosis = f"Capture stopped because a client rejected its certificate for {host}."
+            guidance = "Configure the client to trust Capture's CA"
+        elif error.startswith("the client disconnected during the handshake."):
+            # Other clients may still succeed on this host; only age clears this burst.
+            failures = self._tls_disconnects[host]
+            now = time.monotonic()
+            while failures and failures[0] < now - 30:
+                failures.popleft()
+            failures.append(now)
+            if len(failures) < 3:
+                return
+            diagnosis = (
+                f"Capture stopped after repeated TLS handshakes failed for {host}. "
+                "The client may not trust Capture's CA."
+            )
+            guidance = "Check whether the client trusts Capture's CA"
+        else:
+            return
+        self._tls_failure = (
+            f"{diagnosis} Retry or reload the affected app. "
+            f"{guidance} before running exp capture again."
+        )
+        self.shutdown()
 
     def next_layer(self, nextlayer: layer.NextLayer) -> None:
         """Pass UDP, including QUIC and DNS, through without decrypting or recording it.

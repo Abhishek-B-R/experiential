@@ -2,24 +2,28 @@
 
 import asyncio
 import json
+import socket
 import ssl
 from contextlib import suppress
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import httpx
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
-from mitmproxy import certs, connection, http, options, tcp, websocket
+from mitmproxy import certs, connection, http, options, tcp, tls, websocket
 from mitmproxy.addons.proxyserver import Proxyserver
 from mitmproxy.proxy import commands, context, events, layer, layers
+from mitmproxy.proxy.mode_specs import ProxyMode
 from wsproto.frame_protocol import Opcode
 
 from exp.common.core.artifacts import SourceIdentity
 from exp.runtime.capture import proxy as capture_module
+from exp.runtime.capture.certificates import prepare_certificate
 from exp.runtime.capture.normalization import CapturedExchange
-from exp.runtime.capture.proxy import CaptureProxy, _Body
+from exp.runtime.capture.proxy import CaptureProxy, _Body, _CaptureTlsConfig
 from exp.runtime.capture.upload import CaptureUploader
 from exp.simulation.ingest.otlp import normalize_otlp_payload
 
@@ -205,6 +209,7 @@ def test_real_tls_sse_passes_unchanged_and_rejects_wrong_upstream_hostname(
             upstream_ca_file=upstream_ca,
         )
         ready = asyncio.Event()
+        prepare_certificate(tmp_path / "proxy", (host,))
         proxy_task = asyncio.create_task(
             proxy.serve(ca_directory=tmp_path / "proxy", ready=ready.set)
         )
@@ -216,6 +221,12 @@ def test_real_tls_sse_passes_unchanged_and_rejects_wrong_upstream_hostname(
             assert peer_certificate != x509.load_pem_x509_certificate(
                 certificate.read_bytes()
             ).public_bytes(serialization.Encoding.DER)
+            peer_names = (
+                x509.load_der_x509_certificate(peer_certificate)
+                .extensions.get_extension_for_class(x509.SubjectAlternativeName)
+                .value
+            )
+            assert list(peer_names) == [x509.DNSName(host)]
             request = b'{"model":"test","input":"hello","stream":true}'
             writer.write(
                 b"POST /v1/responses?beta=true HTTP/1.1\r\nHost: api.openai.com\r\n"
@@ -261,6 +272,41 @@ def test_real_tls_sse_passes_unchanged_and_rejects_wrong_upstream_hostname(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("destination", ["192.0.2.15", "2001:db8::15"])
+def test_local_mode_certificate_uses_only_selected_sni(tmp_path: Path, destination: str) -> None:
+    """Constrained certificates exclude original destination IPs without rewriting routing."""
+    host = "api.openai.com"
+    directory = tmp_path / "proxy"
+    prepare_certificate(directory, (host,))
+    config = _CaptureTlsConfig(frozenset({host}))
+    config.certstore = certs.CertStore.from_store(directory, "mitmproxy", 2048)
+    client = connection.Client(
+        peername=("127.0.0.1", 12345),
+        sockname=(destination, 443),
+        sni="API.OpenAI.com.",
+        proxy_mode=ProxyMode.parse("local"),
+    )
+    ctx = context.Context(client, options.Options(mode=["local"]))
+    ctx.server = connection.Server(address=(destination, 443), sni=host)
+    entry = config.get_cert(ctx)
+    assert entry.cert.cn == host
+    assert list(entry.cert.altnames) == [x509.DNSName(host)]
+    assert ctx.server.address == (destination, 443)
+    assert ctx.server.sni == host
+    assert client.sni == "API.OpenAI.com."
+
+
+@pytest.mark.parametrize("sni", [None, "unselected.example", "sub.api.openai.com", "127.0.0.1"])
+def test_certificate_issuance_refuses_unselected_sni(sni: str | None) -> None:
+    """A selected destination cannot cause issuance for missing, nested, or unrelated SNI."""
+    config = _CaptureTlsConfig(frozenset({"api.openai.com"}))
+    client = connection.Client(peername=("127.0.0.1", 12345), sockname=("192.0.2.15", 443), sni=sni)
+    ctx = context.Context(client, options.Options(mode=["local"]))
+    ctx.server = connection.Server(address=("api.openai.com", 443))
+    with pytest.raises(RuntimeError, match="requires a selected DNS server name"):
+        config.get_cert(ctx)
+
+
 def test_stream_copy_limit_never_changes_forwarded_chunks() -> None:
     """Discard oversized copies while forwarding every original byte."""
     body = _Body(3)
@@ -268,6 +314,253 @@ def test_stream_copy_limit_never_changes_forwarded_chunks() -> None:
     assert body.tee(b"cd") == b"cd"
     assert body.tee(b"ef") == b"ef"
     assert body.overflow and not body.data
+
+
+def test_real_client_ca_rejection_stops_proxy_and_reports_failure(
+    tmp_path: Path, regular_proxy: None
+) -> None:
+    """A client trusting only its original server stops interception instead of retrying forever."""
+
+    async def run() -> None:
+        """Reject the proxy certificate over real TLS using only ephemeral loopback listeners."""
+        hostname = "api.openai.com"
+        certificate, key, upstream_ca = _certificate(tmp_path / "upstream", hostname)
+        server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_context.load_cert_chain(certificate, key)
+        received: list[bytes] = []
+        captured: list[CapturedExchange] = []
+
+        async def upstream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            """Serve a harmless direct retry after Capture has stopped its listener."""
+            try:
+                received.append(await reader.readuntil(b"\r\n\r\n"))
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                await writer.drain()
+            finally:
+                writer.close()
+                with suppress(ConnectionError):
+                    await writer.wait_closed()
+
+        server = await asyncio.start_server(upstream, "127.0.0.1", 0, ssl=server_context)
+        port = server.sockets[0].getsockname()[1]
+        proxy = CaptureProxy(
+            sink=lambda exchange: captured.append(exchange) is None,
+            domains=(hostname,),
+            upstream_ca_file=upstream_ca,
+        )
+        ready = asyncio.Event()
+        proxy_task = asyncio.create_task(
+            proxy.serve(ca_directory=tmp_path / "proxy", ready=ready.set)
+        )
+        try:
+            await asyncio.wait_for(ready.wait(), 5)
+            assert proxy._master is not None
+            proxyserver = proxy._master.addons.get("proxyserver")
+            assert isinstance(proxyserver, Proxyserver)
+            proxy_port = next(iter(proxyserver.servers)).listen_addrs[0][1]
+            client_context = ssl.create_default_context(cafile=str(upstream_ca))
+
+            def reject_certificate() -> None:
+                """Use a socket TLS client that sends its fatal certificate-rejection alert."""
+                with socket.create_connection(("127.0.0.1", proxy_port), timeout=5) as sock:
+                    sock.sendall(
+                        (
+                            f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+                        ).encode()
+                    )
+                    header = b""
+                    while not header.endswith(b"\r\n\r\n"):
+                        chunk = sock.recv(4096)
+                        assert chunk and len(header) < 8192
+                        header += chunk
+                    assert header.startswith(b"HTTP/1.1 200")
+                    with client_context.wrap_socket(sock, server_hostname=hostname):
+                        pytest.fail("the client must reject Capture's untrusted certificate")
+
+            with pytest.raises(ssl.SSLCertVerificationError):
+                await asyncio.wait_for(asyncio.to_thread(reject_certificate), 7)
+            with pytest.raises(RuntimeError, match="client rejected its certificate") as failure:
+                await asyncio.wait_for(asyncio.shield(proxy_task), 5)
+            message = str(failure.value)
+            assert hostname in message
+            assert "Retry or reload" in message
+            assert "trust Capture's CA" in message
+            assert "SSL routines" not in message
+            assert "unknown ca" not in message
+            assert proxy._master is None
+            assert all(not instance.is_running for instance in proxyserver.servers)
+            assert not captured
+            assert not received
+            with pytest.raises(OSError):
+                await asyncio.open_connection("127.0.0.1", proxy_port)
+            direct_reader, direct_writer = await asyncio.open_connection(
+                "127.0.0.1", port, ssl=client_context, server_hostname=hostname
+            )
+            direct_writer.write(b"GET /retry HTTP/1.1\r\nHost: api.openai.com\r\n\r\n")
+            await direct_writer.drain()
+            assert (await asyncio.wait_for(direct_reader.read(), 5)).endswith(b"\r\n\r\nok")
+            direct_writer.close()
+            await direct_writer.wait_closed()
+            assert len(received) == 1
+        finally:
+            proxy.shutdown()
+            with suppress(RuntimeError):
+                await asyncio.wait_for(proxy_task, 5)
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("alert", ["unknown ca", "bad certificate", "certificate unknown"])
+def test_client_certificate_alert_stops_once_without_exposing_error(
+    monkeypatch: pytest.MonkeyPatch, alert: str
+) -> None:
+    """Only a fixed diagnosis and normalized allowlisted hostname become the fatal reason."""
+    proxy = CaptureProxy(sink=lambda exchange: True, domains=("api.openai.com",))
+    shutdowns: list[bool] = []
+    monkeypatch.setattr(proxy, "shutdown", lambda: shutdowns.append(True))
+    client = connection.Client(
+        peername=("127.0.0.1", 1),
+        sockname=("127.0.0.1", 2),
+        sni="API.OPENAI.COM.",
+        error=f"OpenSSL {alert.upper()} private-handshake-detail",
+    )
+    ctx = context.Context(client, options.Options())
+    data = tls.TlsData(client, ctx)
+    proxy.tls_failed_client(data)
+    proxy.tls_failed_client(data)
+    assert shutdowns == [True]
+    assert proxy._tls_failure is not None
+    assert "api.openai.com" in proxy._tls_failure
+    assert "private-handshake-detail" not in proxy._tls_failure
+    assert "OpenSSL" not in proxy._tls_failure
+
+
+@pytest.mark.parametrize("scenario", ["unselected", "upstream", "unrelated_error"])
+def test_unrelated_tls_failure_does_not_stop_capture(
+    monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    """Opaque hosts, provider failures, and unrelated protocol errors retain their behavior."""
+    proxy = CaptureProxy(sink=lambda exchange: True, domains=("api.openai.com",))
+    shutdowns: list[bool] = []
+    monkeypatch.setattr(proxy, "shutdown", lambda: shutdowns.append(True))
+    client = connection.Client(
+        peername=("127.0.0.1", 1),
+        sockname=("127.0.0.1", 2),
+        sni="unrelated.example" if scenario == "unselected" else "api.openai.com",
+        error="unsupported protocol" if scenario == "unrelated_error" else "unknown ca",
+    )
+    ctx = context.Context(client, options.Options())
+    ctx.server = connection.Server(address=("api.openai.com", 443), error="unknown ca")
+    affected = ctx.server if scenario == "upstream" else client
+    proxy.tls_failed_client(tls.TlsData(affected, ctx))
+    assert not shutdowns
+    assert proxy._tls_failure is None
+
+
+def test_handshake_disconnects_are_bounded_by_host_and_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One-off cancellations and expired failures cannot trigger the burst safeguard."""
+    proxy = CaptureProxy(
+        sink=lambda exchange: True, domains=("api.openai.com", "api.anthropic.com")
+    )
+    shutdowns: list[bool] = []
+    monkeypatch.setattr(proxy, "shutdown", lambda: shutdowns.append(True))
+    now = 100.0
+    monkeypatch.setattr(capture_module, "time", SimpleNamespace(monotonic=lambda: now))
+    client = connection.Client(
+        peername=("127.0.0.1", 1),
+        sockname=("127.0.0.1", 2),
+        sni="api.openai.com",
+        error="The client disconnected during the handshake. private-detail",
+    )
+    ctx = context.Context(client, options.Options())
+    data = tls.TlsData(client, ctx)
+    proxy.tls_failed_client(data)
+    assert not shutdowns
+    now += 31
+    proxy.tls_failed_client(data)
+    now += 1
+    proxy.tls_failed_client(data)
+    assert not shutdowns
+    assert len(proxy._tls_disconnects["api.openai.com"]) == 2
+    assert not proxy._tls_disconnects["api.anthropic.com"]
+    now += 1
+    proxy.tls_failed_client(data)
+    assert shutdowns == [True]
+    assert proxy._tls_failure is not None
+    assert "may not trust" in proxy._tls_failure
+    assert "private-detail" not in proxy._tls_failure
+    assert len(proxy._tls_disconnects["api.openai.com"]) == 3
+    assert proxy._tls_disconnects["api.openai.com"].maxlen == 3
+
+
+def test_real_silent_ca_rejection_burst_stops_proxy(tmp_path: Path, regular_proxy: None) -> None:
+    """Three real asyncio trust failures stop Capture even when no TLS alert is sent."""
+
+    async def run() -> None:
+        """Retry untrusted handshakes through an explicitly addressed loopback proxy only."""
+        hostname = "api.openai.com"
+        _, _, unrelated_ca = _certificate(tmp_path / "unrelated", "unrelated.example")
+        proxy = CaptureProxy(sink=lambda exchange: True, domains=(hostname,))
+        ready = asyncio.Event()
+        proxy_task = asyncio.create_task(
+            proxy.serve(ca_directory=tmp_path / "proxy", ready=ready.set)
+        )
+        try:
+            await asyncio.wait_for(ready.wait(), 5)
+            assert proxy._master is not None
+            proxyserver = proxy._master.addons.get("proxyserver")
+            assert isinstance(proxyserver, Proxyserver)
+            proxy_port = next(iter(proxyserver.servers)).listen_addrs[0][1]
+            for attempt in range(3):
+                reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+                try:
+                    # Lazy TLS inspection fails before connecting to this closed local port.
+                    writer.write(b"CONNECT 127.0.0.1:1 HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n")
+                    await writer.drain()
+                    assert (await reader.readuntil(b"\r\n\r\n")).startswith(b"HTTP/1.1 200")
+                    client_context = ssl.create_default_context(cafile=str(unrelated_ca))
+                    with pytest.raises(ssl.SSLCertVerificationError):
+                        await asyncio.wait_for(
+                            writer.start_tls(client_context, server_hostname=hostname), 5
+                        )
+                finally:
+                    writer.close()
+                    with suppress(OSError):
+                        await writer.wait_closed()
+                if attempt < 2:
+                    # Let the failed-client hook finish, rather than checking before delivery.
+                    deadline = asyncio.get_running_loop().time() + 2
+                    while len(proxy._tls_disconnects[hostname]) < attempt + 1:
+                        assert asyncio.get_running_loop().time() < deadline
+                        await asyncio.sleep(0.01)
+                    assert not proxy_task.done()
+                    if attempt == 0:
+                        # A working SDK client must not conceal another client's retry burst.
+                        _, trusted_writer, _ = await _connect_tls(
+                            proxy, 1, hostname, tmp_path / "proxy/mitmproxy-ca-cert.pem"
+                        )
+                        trusted_writer.close()
+                        with suppress(ConnectionError):
+                            await trusted_writer.wait_closed()
+                        assert len(proxy._tls_disconnects[hostname]) == 1
+            with pytest.raises(RuntimeError, match="repeated TLS handshakes failed") as failure:
+                await asyncio.wait_for(asyncio.shield(proxy_task), 5)
+            assert "may not trust Capture's CA" in str(failure.value)
+            assert "Retry or reload" in str(failure.value)
+            assert proxy._master is None
+            assert all(not instance.is_running for instance in proxyserver.servers)
+            with pytest.raises(OSError):
+                await asyncio.open_connection("127.0.0.1", proxy_port)
+        finally:
+            proxy.shutdown()
+            with suppress(RuntimeError):
+                await asyncio.wait_for(proxy_task, 5)
+
+    asyncio.run(run())
 
 
 def test_websocket_request_completion_retains_no_flow_message_history() -> None:

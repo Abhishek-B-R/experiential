@@ -1,7 +1,10 @@
-"""Private per-installation interception certificates and macOS trust setup."""
+"""Private scope-constrained interception certificates and macOS user trust setup."""
 
 from __future__ import annotations
 
+import datetime
+import hashlib
+import ipaddress
 import os
 import shlex
 import stat
@@ -10,66 +13,223 @@ import tempfile
 from pathlib import Path
 
 from cryptography import x509
-from mitmproxy.certs import CertStore
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from mitmproxy.certs import DEFAULT_DHPARAM, CertStore
+
+from exp.runtime.capture.policy import validate_domains
+
+_CA_FILES = frozenset({"mitmproxy-ca.pem", "mitmproxy-ca-cert.pem", "mitmproxy-dhparam.pem"})
 
 
-def prepare_certificate(directory: Path) -> Path:
-    """Create or reuse a user-owned capture CA without sharing private keys.
+def capture_certificate_directory(base: Path, domains: tuple[str, ...]) -> Path:
+    """Select a separate immutable CA identity for each exact hostname scope.
 
     Args:
-        directory: Dedicated capture certificate directory.
+        base: Capture's data directory, separate from any previous CA directory.
+        domains: Nonoverlapping exact DNS hostnames selected for capture.
 
     Returns:
-        Public certificate path suitable for the macOS trust store.
+        A deterministic scope directory without reading or changing existing CAs.
 
     Raises:
-        ValueError: The directory or existing key material is not privately owned.
+        ValueError: Hostnames are invalid or contain a parent and its subdomain.
     """
+    scope = _certificate_domains(domains)
+    digest = hashlib.sha256("\n".join(scope).encode("ascii")).hexdigest()
+    return base / "ca-constrained" / digest
+
+
+def prepare_certificate(directory: Path, domains: tuple[str, ...]) -> Path:
+    """Create or verify a private CA whose certificate permits only the selected hosts.
+
+    Args:
+        directory: Dedicated scope directory from capture_certificate_directory.
+        domains: Exact hostnames encoded in the critical name constraints.
+
+    Returns:
+        Public certificate path suitable for the macOS user trust store.
+
+    Raises:
+        ValueError: Existing files are unsafe, incomplete, or have a different scope.
+    """
+    scope = _certificate_domains(domains)
+    _check_directory(directory, create=True)
+    certificate = directory / "mitmproxy-ca-cert.pem"
+    if not any(directory.iterdir()):
+        directory.chmod(0o700)
+        _create_certificate(directory, scope)
+    _validate_certificate(certificate, scope)
+    directory.chmod(0o700)
+    for path in directory.iterdir():
+        path.chmod(0o600)
+    return certificate
+
+
+def _certificate_domains(domains: tuple[str, ...]) -> tuple[str, ...]:
+    """Reject nested selections that cannot share these exact DNS name constraints."""
+    scope = validate_domains(domains)
+    for domain in scope:
+        for parent in scope:
+            if domain.endswith("." + parent):
+                raise ValueError(
+                    f"Capture cannot combine {parent!r} and its subdomain {domain!r} in one "
+                    "certificate. Select nonoverlapping hostnames with --domain."
+                )
+    return scope
+
+
+def _name_constraints(domains: tuple[str, ...]) -> x509.NameConstraints:
+    """Permit exact DNS names, exclude their subdomains, and prohibit every IP address."""
+    return x509.NameConstraints(
+        permitted_subtrees=[x509.DNSName(domain) for domain in domains],
+        excluded_subtrees=[
+            *(x509.DNSName("." + domain) for domain in domains),
+            x509.IPAddress(ipaddress.ip_network("0.0.0.0/0")),
+            x509.IPAddress(ipaddress.ip_network("::/0")),
+        ],
+    )
+
+
+def _check_directory(directory: Path, *, create: bool = False) -> None:
+    """Reject linked or foreign certificate paths before reading or creating key material."""
     for ancestor in (directory, *directory.parents):
         if ancestor.is_symlink():
             raise ValueError(
                 "Capture certificate directory must be a user-owned directory without links."
             )
-    directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if create:
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
     info = directory.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
         raise ValueError("Capture certificate directory must be a user-owned directory.")
-    directory.chmod(0o700)
     for path in directory.iterdir():
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
             raise ValueError("Capture certificate directory contains unsafe files.")
-        path.chmod(0o600)
-    old_mask = os.umask(0o077)
+
+
+def _create_certificate(directory: Path, domains: tuple[str, ...]) -> None:
+    """Generate a fresh signing key and constrained CA without replacing existing files."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name(
+        [
+            x509.NameAttribute(x509.NameOID.COMMON_NAME, "Experiential Capture"),
+            x509.NameAttribute(x509.NameOID.ORGANIZATION_NAME, "Experiential Labs"),
+        ]
+    )
+    now = datetime.datetime.now(datetime.UTC)
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
+        )
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .add_extension(_name_constraints(domains), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    public = ca.public_bytes(serialization.Encoding.PEM)
+    bundle = (
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+        + public
+    )
+    for filename, data in (
+        ("mitmproxy-ca.pem", bundle),
+        ("mitmproxy-ca-cert.pem", public),
+        ("mitmproxy-dhparam.pem", DEFAULT_DHPARAM),
+    ):
+        descriptor = os.open(directory / filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(data)
+
+
+def _validate_certificate(certificate: Path, domains: tuple[str, ...]) -> None:
+    """Fail closed before reuse or trust if the CA identity or exact constraints differ."""
+    _check_directory(certificate.parent)
+    if (
+        certificate.name != "mitmproxy-ca-cert.pem"
+        or {path.name for path in certificate.parent.iterdir()} != _CA_FILES
+    ):
+        raise ValueError("Capture CA files are incomplete or unexpected; use a fresh CA directory.")
+    bundle = (certificate.parent / "mitmproxy-ca.pem").read_bytes()
+    certificates = x509.load_pem_x509_certificates(bundle)
+    public = certificate.read_bytes()
+    if len(certificates) != 1 or certificates[0].public_bytes(serialization.Encoding.PEM) != public:
+        raise ValueError("Capture CA identity does not match its private bundle; use a fresh CA.")
+    ca = certificates[0]
+    key = serialization.load_pem_private_key(bundle, password=None)
+    if not isinstance(key, rsa.RSAPrivateKey) or key.public_key() != ca.public_key():
+        raise ValueError("Capture CA signing key does not match its certificate; use a fresh CA.")
     try:
-        if not (directory / "mitmproxy-ca.pem").exists():
-            CertStore.create_store(
-                directory,
-                "mitmproxy",
-                2048,
-                organization="Experiential Labs",
-                cn="Experiential Capture",
-            )
-        CertStore.from_store(str(directory), "mitmproxy", 2048)
-    finally:
-        os.umask(old_mask)
-    return directory / "mitmproxy-ca-cert.pem"
+        constraints = ca.extensions.get_extension_for_class(x509.NameConstraints)
+        basic = ca.extensions.get_extension_for_class(x509.BasicConstraints)
+        usage = ca.extensions.get_extension_for_class(x509.KeyUsage)
+        extended = ca.extensions.get_extension_for_class(x509.ExtendedKeyUsage)
+    except x509.ExtensionNotFound as error:
+        raise ValueError(
+            "Capture requires a constrained CA; use a fresh scoped CA directory."
+        ) from error
+    if (
+        not constraints.critical
+        or constraints.value != _name_constraints(domains)
+        or not basic.critical
+        or basic.value != x509.BasicConstraints(ca=True, path_length=0)
+        or not usage.critical
+        or not usage.value.key_cert_sign
+        or extended.value != x509.ExtendedKeyUsage([x509.ExtendedKeyUsageOID.SERVER_AUTH])
+    ):
+        raise ValueError(
+            "Capture CA constraints do not match the selected hostnames; use a fresh CA."
+        )
+    ca.verify_directly_issued_by(ca)
+    now = datetime.datetime.now(datetime.UTC)
+    if not ca.not_valid_before_utc <= now < ca.not_valid_after_utc:
+        raise ValueError(
+            "Capture CA has expired or is not valid yet; use a fresh scoped CA directory."
+        )
 
 
 def certificate_is_trusted(certificate: Path, domains: tuple[str, ...]) -> bool:
-    """Verify a locally signed TLS leaf for each intended host using macOS trust.
+    """Verify constrained CA leaves for every host against installed macOS user trust.
 
-    Explicit roots are deliberately omitted so verification cannot bypass the
-    user's installed trust policy. Only public leaf certificates touch disk.
+    Explicit roots are deliberately omitted so this cannot bypass installed trust.
+    Only temporary public leaf certificates touch disk.
     """
     if not domains:
         return False
+    scope = _certificate_domains(domains)
+    _validate_certificate(certificate, scope)
     store = CertStore.from_files(
         certificate.parent / "mitmproxy-ca.pem", certificate.parent / "mitmproxy-dhparam.pem"
     )
     with tempfile.TemporaryDirectory(prefix="verify-", dir=certificate.parent) as temporary:
         leaf = Path(temporary) / "leaf.pem"
-        for domain in domains:
+        for domain in scope:
             descriptor = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(descriptor, "wb") as output:
                 output.write(store.get_cert(domain, [x509.DNSName(domain)]).cert.to_pem())
@@ -99,20 +259,21 @@ def certificate_is_trusted(certificate: Path, domains: tuple[str, ...]) -> bool:
 
 
 def trust_certificate(certificate: Path, domains: tuple[str, ...]) -> None:
-    """Request persistent user trust for this CA under hostname-specific TLS policies.
+    """Request user SSL trust only after verifying the CA's critical hostname restrictions.
+
+    Chromium ignores macOS hostname-specific trust policies. The certificate itself
+    therefore enforces the exact DNS scope; this command deliberately omits `-s`.
 
     Args:
-        certificate: Public certificate generated by prepare_certificate.
+        certificate: Public constrained certificate generated by prepare_certificate.
         domains: Exact hostnames captured by the local proxy.
 
     Raises:
-        ValueError: Trust installation is declined or cannot be verified.
+        ValueError: CA constraints are unsafe or trust installation cannot be verified.
     """
-    if not domains:
-        raise ValueError("Capture certificate trust requires at least one provider hostname.")
+    scope = _certificate_domains(domains)
+    _validate_certificate(certificate, scope)
     keychain = _user_keychain()
-    # One call replaces this certificate's user-domain policy with all hostnames.
-    # Repeated calls per host would replace, rather than append, its constraints.
     result = subprocess.run(
         [
             "/usr/bin/security",
@@ -121,7 +282,6 @@ def trust_certificate(certificate: Path, domains: tuple[str, ...]) -> None:
             "trustRoot",
             "-p",
             "ssl",
-            *(argument for domain in domains for argument in ("-s", domain)),
             "-k",
             str(keychain),
             str(certificate),
@@ -130,7 +290,7 @@ def trust_certificate(certificate: Path, domains: tuple[str, ...]) -> None:
         timeout=180,
         env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
     )
-    if result.returncode or not certificate_is_trusted(certificate, domains):
+    if result.returncode or not certificate_is_trusted(certificate, scope):
         raise ValueError("Capture certificate trust was not installed. Run exp capture to retry.")
 
 

@@ -47,15 +47,24 @@ forwarded without retaining their bodies.
 Captured traces include prompts, responses, and tool content. Credential headers are never
 copied into uploaded traces. This is separate from anonymous aggregate product telemetry.
 
-The first run creates a private local certificate authority and requests trust for the current
-macOS user, scoped to the selected provider hostnames in native macOS trust settings. Clients
-that import CA certificates into their own TLS stacks may not preserve those hostname restrictions;
-the local signing key remains sensitive even when capture is stopped. A client
-with its own trust store may need that public CA certificate configured explicitly; certificate
-pinning is not bypassed. The certificate is under the `capture/ca` directory of the same user-data
-directory that owns the saved login. On macOS this defaults to
-`~/Library/Application Support/exp/capture/ca/mitmproxy-ca-cert.pem`. Never share the adjacent
-`mitmproxy-ca.pem`, which contains the private signing key.
+The first run creates a private local certificate authority with critical X.509 name constraints
+for exactly the selected provider hostnames and requests SSL trust for the current macOS user.
+The certificate excludes subdomains and IP addresses. Selecting both a parent hostname and one
+of its subdomains is rejected because those exact-host constraints would conflict. The native
+macOS and Chromium verifiers enforce the certificate constraints; hostname-specific macOS trust
+settings are not used because Chromium does not support them.
+
+Each provider-host set gets a separate CA under `capture/ca-constrained/<scope-hash>` in the same
+user-data directory that owns the saved login. Capture prints its public `mitmproxy-ca-cert.pem`
+path. A client with its own trust store may need that public CA configured explicitly; certificate
+pinning is not bypassed. Never share the adjacent `mitmproxy-ca.pem`, which contains the private
+signing key. Existing unconstrained certificates are not reused or granted broader trust.
+
+If a client explicitly rejects the Capture certificate, Capture stops interception and prints
+an error. A burst of repeated selected-host handshake disconnects also stops Capture with a
+diagnostic because some clients close the socket without sending a certificate alert. The failed
+connection cannot be repaired in place; retry or reload the app after Capture stops, then configure
+its trust before restarting Capture. Isolated handshake disconnects do not end a run.
 
 Run the CLI as your normal user, without `sudo`. Mitmproxy Redirector's Network Extension provides
 system-wide interception while the foreground backend is running. Ctrl+C ends that interception;

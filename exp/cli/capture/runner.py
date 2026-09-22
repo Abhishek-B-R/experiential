@@ -22,6 +22,7 @@ from exp.cli.capture.session import run_session
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.auth.paths import provider_data_dir
 from exp.runtime.capture.certificates import (
+    capture_certificate_directory,
     certificate_is_trusted,
     prepare_certificate,
     trust_certificate,
@@ -79,7 +80,7 @@ async def _capture_authenticated(
         console.print("Approve Mitmproxy Redirector if macOS requests network extension access.")
         console.print("Other traffic passes through without capture. DNS settings stay unchanged.")
         data_dir = provider_data_dir() / "capture"
-        ca_directory = data_dir / "ca"
+        ca_directory = capture_certificate_directory(data_dir, domains)
         origin_namespace = hashlib.sha256(credentials.api_url.encode()).hexdigest()[:16]
         uploader = CaptureUploader(
             base_url=credentials.api_url,
@@ -94,13 +95,18 @@ async def _capture_authenticated(
             / str(organization.org_id)
             / str(run.id),
         )
-        certificate = prepare_certificate(ca_directory)
+        certificate = prepare_certificate(ca_directory, domains)
         if not certificate_is_trusted(certificate, domains=domains):
-            console.print("First-time setup: trust Capture's certificate for your macOS user.")
+            console.print(
+                "First-time setup: trust Capture's certificate for your macOS user. "
+                "The certificate is restricted to the selected provider hosts."
+            )
             trust_certificate(certificate, domains=domains)
         console.print(
-            "If a client reports a certificate error, stop capture and configure its CA trust."
+            "Capture stops if a client rejects its certificate. "
+            "Clients with a custom trust store may need the public CA certificate below."
         )
+        console.print(f"Public CA: {certificate}", markup=False)
 
         def started() -> None:
             """Show active capture only after network interception is ready."""

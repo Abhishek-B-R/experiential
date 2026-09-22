@@ -17,7 +17,9 @@ on the exact release checkout.
   It defaults to supported provider hosts across all apps, with an optional exact-host override.
   The signed Mitmproxy Redirector app and its approved Network Extension own interception for the
   foreground backend's lifetime. Capture does not edit hosts, DNS, or system proxy settings and
-  has no reset subcommand. Certificate trust persists between runs. Synthetic provider and
+  has no reset subcommand. Each selected host set gets a CA with critical certificate-level
+  name constraints and persistent current-user SSL trust. Client certificate rejection or a
+  burst of handshake disconnects stops interception with a diagnostic. Synthetic provider and
   backend lifecycle tests are separate from real client testing.
 - The local gateway supports explicit provider references, identities, virtual keys, grants,
   singleton and certified ordered exact-model pools, frozen-project aliases, bounded precommit
