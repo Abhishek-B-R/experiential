@@ -1,11 +1,5 @@
-//! Provider wire dialects: SSE normalizers mirroring the event mappers in
-//! `exp.runtime.models.providers.streaming`. Upstream payloads are built by
-//! the python control plane with the shared `streaming_requests` builders and
-//! arrive fully formed in the admission response.
-//!
-//! This module owns the dialect registry, the dialect-selected frame decoder,
-//! and the shared `Normalizer` state machine; each provider's frame mapping
-//! lives in its own submodule as `Normalizer` methods.
+//! Wire registry, frame decoding, and normalization of Python-built upstream payloads.
+//! Provider frame mappings live in submodules as `Normalizer` methods.
 
 mod anthropic;
 mod bedrock;

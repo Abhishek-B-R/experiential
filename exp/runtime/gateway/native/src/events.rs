@@ -375,18 +375,12 @@ impl Event {
         }
     }
 
-    /// Whether this event carries the first visible model output, used to
-    /// stamp time-to-first-token. A content, refusal, reasoning, or tool-argument
-    /// delta counts only when it carries at least one character: an empty delta
-    /// (a role-establishing or empty refusal frame) is not a visible token and
-    /// must not stamp TTFT early. A tool-call start is itself the first token of
-    /// a tool-only turn, so it counts even before any arguments stream. Purely
-    /// structural frames are excluded so TTFT is not stamped early: the Responses
-    /// `ProviderOutputItemStarted` reserves a slot at the item-start boundary
-    /// *before* the first delta arrives, and the opaque reasoning-carrier frames
-    /// (`ThinkingSignature`, `RedactedThinking`, `EncryptedReasoning`) never lead
-    /// a turn on their own. Usage, item-close, and lifecycle/terminal frames are
-    /// not output tokens either.
+    /// Whether this event starts visible output for time-to-first-token accounting.
+    /// Empty text, refusal, reasoning, and tool-argument deltas do not count.
+    /// A tool-call or hosted-tool start counts even before arguments arrive.
+    /// Structural `ProviderOutputItemStarted` frames only reserve slots and do not
+    /// count. Neither do opaque reasoning carriers (`ThinkingSignature`,
+    /// `RedactedThinking`, `EncryptedReasoning`), usage, closes, or terminal frames.
     pub fn is_output_token(&self) -> bool {
         match self {
             Event::TextDelta(text) | Event::RefusalDelta(text) | Event::Image(text) => !text.is_empty(),

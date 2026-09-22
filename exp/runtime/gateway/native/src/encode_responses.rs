@@ -20,9 +20,8 @@ mod envelope;
 mod output;
 mod provider;
 
-// `completed_responses_body_with_carrier` stays on the public seam for the
-// unit tests and any host that never runs a search; the routes now call the
-// web-search-aware variant.
+// Expose the carrier variant for tests and hosts without search; HTTP routes use
+// the web-search-aware variant.
 #[allow(unused_imports)]
 pub use aggregate::{
     completed_responses_body, completed_responses_body_with_carrier,
