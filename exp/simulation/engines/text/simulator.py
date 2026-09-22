@@ -36,6 +36,7 @@ from exp.runtime.agents import AgentRuntime
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.models import ResolvedModel
 from exp.simulation.engines.clock import timestamp, utc_now
+from exp.simulation.engines.text import dispatch
 from exp.simulation.engines.text.artifact_set import persist_artifact_set
 from exp.simulation.engines.text.bindings import (
     SimulationResolution,
@@ -51,7 +52,6 @@ from exp.simulation.engines.text.continuation import (
     rebind_completed,
     retain_lineage,
 )
-from exp.simulation.engines.text.dispatch import cell_reservation, dispatch_cells
 from exp.simulation.engines.text.episode_loop import execute_text_episode_loop
 from exp.simulation.engines.text.errors import (
     SimulationConfigurationError,
@@ -270,9 +270,15 @@ class WorldModelSimulator:
                 bindings,
             )
 
-        dispatch_cells(
+        dispatch.dispatch_cells(
             pending,
-            workers=spec.maximum_concurrency,
+            workers=dispatch.worker_count(
+                spec,
+                pending,
+                self._completion_contract,
+                self._tasks,
+                self._known_resolution_spend(bindings, resolution_input),
+            ),
             execute=execute,
             completed=completed,
             observe=observe_cells,
@@ -576,7 +582,7 @@ class WorldModelSimulator:
                 rollout_completed=lambda item: load_optional_rollout(self._store, item) is not None,
                 observed_spend_usd=lambda: self._known_resolution_spend(bindings, resolution_input),
                 stop_on_overspend=spec.stop_on_overspend,
-                reservation_cost_usd=cell_reservation(
+                reservation_cost_usd=dispatch.cell_reservation(
                     spec,
                     cell,
                     self._completion_contract,

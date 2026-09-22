@@ -1902,7 +1902,10 @@ def test_resume_recovers_a_later_stale_cell_before_admitting_earlier_pending_cel
     assert len(world_client.requests) == 1
 
 
-def test_text_simulation_serializes_finite_cost_admission(tmp_path: Path) -> None:
+@pytest.mark.parametrize("stop_on_overspend", [False, True])
+def test_text_simulation_serializes_finite_cost_admission(
+    tmp_path: Path, stop_on_overspend: bool
+) -> None:
     """Serialize cells so later admission uses reconciled provider spend.
 
     Args:
@@ -1919,7 +1922,7 @@ def test_text_simulation_serializes_finite_cost_admission(tmp_path: Path) -> Non
     task_set_input = _persist_task_set(store, tasks)
     candidate_client = _ScriptedClient(
         [_response(f"candidate {index}", snapshot=_snapshot("candidate-a")) for index in range(4)],
-        delay_seconds=0.03,
+        delay_seconds=0.06,
     )
     world_client = _ScriptedClient(
         [
@@ -1938,11 +1941,18 @@ def test_text_simulation_serializes_finite_cost_admission(tmp_path: Path) -> Non
         candidate_client,
         world_client,
     )
+    simulator._leases = TextCellLeaseStore(
+        store.project_directory,
+        clock=lambda: _TIME,
+        wait_timeout_seconds=0.01,
+        poll_interval_seconds=0.001,
+    )
     spec = _spec(
         plan_input,
         task_set_input,
         tuple(cell.cell_id for cell in cells),
         maximum_concurrency=2,
+        stop_on_overspend=stop_on_overspend,
     )
 
     artifact_set = simulator.run(spec)

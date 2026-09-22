@@ -90,6 +90,7 @@
   <h1>Model evaluation</h1>
   <p id="summary" class="muted"></p>
   <p id="method" class="muted"></p>
+  <p id="spend" class="muted"></p>
   <svg
     id="plot"
     viewBox="0 0 1100 430"
@@ -138,6 +139,10 @@
       `${d.project} · ${d.tasks.length} distinct scenarios · ${models.length} models · ${d.report.compared_cells} shared valid scenario/repeat pairs · ${d.report.excluded_cells} excluded pairs`;
     $("method").textContent =
       `Simulated environment: ${d.world_model} · Judge: ${d.judge_model} (${d.judgment_status})`;
+    const dollars = (value) =>
+      value == null ? "unavailable" : "$" + cost(value);
+    $("spend").textContent =
+      `Accounted experiment spend: simulation ${dollars(d.simulation_cost_usd)} · judge ${dollars(d.judge_cost_usd)}. Includes invalid attempts and retry reserves; separate from assistant cost per task.`;
     const headers = [
       "Model",
       "Quality / 100",
