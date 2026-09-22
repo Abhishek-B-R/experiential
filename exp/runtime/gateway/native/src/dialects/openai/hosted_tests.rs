@@ -575,6 +575,60 @@ fn malformed_terminal_probabilities_preserve_reported_billing_usage() {
 }
 
 #[test]
+fn terminal_probability_indices_reject_overflow_and_malformed_values_without_losing_usage() {
+    for output_index in [
+        serde_json::json!(u64::from(u32::MAX) + 1),
+        serde_json::json!(-1),
+        serde_json::json!("0"),
+        serde_json::json!(1.5),
+        serde_json::json!(false),
+        serde_json::Value::Null,
+    ] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        normalizer.enable_responses_logprobs(true);
+        let frame = hosted_frame(serde_json::json!({
+            "type": "response.completed", "response": {
+                "status": "completed", "usage": {"input_tokens": 17, "output_tokens": 4},
+                "output": [{"type": "message", "id": "msg-bad", "output_index": output_index,
+                    "content": [{"type": "output_text", "text": "A", "logprobs": []}]}]
+            }
+        }));
+        let failure = normalizer
+            .feed(&frame)
+            .expect_err("present invalid index must not fall back or wrap");
+        assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+        let usage = normalizer
+            .observed_usage()
+            .expect("meter survives index refusal");
+        assert_eq!(usage.input_tokens, Some(17));
+        assert_eq!(usage.output_tokens, Some(4));
+    }
+}
+
+#[test]
+fn terminal_probability_indices_preserve_valid_values_and_fall_back_only_when_absent() {
+    for explicit in [None, Some(u32::MAX)] {
+        let mut item = serde_json::json!({"type":"message", "id":"msg-ok", "content":[
+            {"type":"output_text", "text":"A", "logprobs":[]}
+        ]});
+        if let Some(index) = explicit {
+            item["output_index"] = serde_json::json!(index);
+        }
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        normalizer.enable_responses_logprobs(true);
+        let frame = hosted_frame(serde_json::json!({"type":"response.completed", "response":{
+            "status":"completed", "output":[{"type":"function_call"}, item]
+        }}));
+        let events = normalizer
+            .feed(&frame)
+            .expect("valid index remains distinct");
+        assert!(events.iter().any(|event| matches!(event,
+            Event::ProviderResponsesLogprobs { output_index, .. } if *output_index == explicit.unwrap_or(1)
+        )));
+    }
+}
+
+#[test]
 fn nullable_probabilities_are_accepted_only_on_optional_completed_parts() {
     for event_type in [
         "response.output_text.delta",

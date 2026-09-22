@@ -130,6 +130,11 @@ pub(crate) fn payload_records(payload: &Map<String, Value>) -> Option<Value> {
         .cloned()
 }
 
+/// Convert array positions without allowing distinct provider items to alias.
+fn bounded_position(position: usize, label: &str) -> Result<u32, Failure> {
+    u32::try_from(position).map_err(|_| malformed(&format!("{label} exceeds the supported range")))
+}
+
 /// Extract item completion probability observations, retaining each content
 /// part identity and the provider's exact record values.
 pub(crate) fn item_done_events(
@@ -151,7 +156,7 @@ pub(crate) fn item_done_events(
         events.push(Event::ProviderResponsesLogprobs {
             output_index,
             item_id: item_id.to_string(),
-            content_index: content_index as u32,
+            content_index: bounded_position(content_index, "OpenAI content_index")?,
             phase: "item_done".to_string(),
             records: records.clone(),
         });
@@ -175,10 +180,11 @@ pub(crate) fn terminal_events(response: &Map<String, Value>) -> Result<Vec<Event
         let Some(item_id) = item_object.get("id").and_then(Value::as_str) else {
             continue;
         };
-        let output_index = item_object
-            .get("output_index")
-            .and_then(Value::as_u64)
-            .unwrap_or(output_position as u64);
+        let output_index = if item_object.contains_key("output_index") {
+            openai_index(item_object, "output_index", "OpenAI output_index")?
+        } else {
+            bounded_position(output_position, "OpenAI output_index")?
+        };
         let Some(content) = item_object.get("content").and_then(Value::as_array) else {
             continue;
         };
@@ -188,9 +194,9 @@ pub(crate) fn terminal_events(response: &Map<String, Value>) -> Result<Vec<Event
             };
             validate(records)?;
             events.push(Event::ProviderResponsesLogprobs {
-                output_index: output_index as u32,
+                output_index,
                 item_id: item_id.to_string(),
-                content_index: content_index as u32,
+                content_index: bounded_position(content_index, "OpenAI content_index")?,
                 phase: "terminal".to_string(),
                 records: records.clone(),
             });
