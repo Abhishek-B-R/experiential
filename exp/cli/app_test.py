@@ -26,7 +26,6 @@ def test_root_cli_and_subgroups_are_exact() -> None:
         "build",
         "config",
         "eval",
-        "ingest",
         "login",
         "optimize",
         "run",

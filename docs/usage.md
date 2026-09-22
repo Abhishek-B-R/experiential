@@ -7,7 +7,6 @@ The root surface is deliberately small:
 | `exp` | Open the branded home screen. `Run Gateway` is the first option and runs setup when needed. | Interactive gateway menu, or the default gateway in a non-interactive terminal. |
 | `exp login [--root ROOT]` | Sign in to Experiential Cloud through the Platform browser approval flow, save the returned organization key, and synchronize the authenticated account's model identities. | User-local credential plus secret-free hosted provider/model records in `.exp/models.toml`. |
 | `exp run [PROJECT] [--root ROOT] [--check]` | Start the local gateway directly, optionally with one project-backed alias. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
-| `exp ingest PROJECT --traces PATH --source chat-json` | Normalize and ground a trace export for evaluation. | Frozen scenarios and project world-model/judge roles. |
 | `exp eval [PROJECT] --models ALIAS,ALIAS` | Compare models on the project scenarios, or open the terminal project picker. | Saved resumable run, JSON evidence, and offline Pareto report. |
 | `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Launch the guided end-to-end build when traces are omitted, or use one explicit local source for automation. | Simulation, serving RAG, fit RAG, syllabus, evaluation evidence, and a runnable automatic router. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
@@ -245,15 +244,9 @@ projects created with a different prompt before running them.
 
 ### Evaluate a project
 
-`exp ingest powerset --traces rollouts.jsonl --source chat-json` normalizes traces, preserves
-initial instructions and declared tool schemas, mines scenarios, and builds the grounded world
-model. It never runs router optimization. OTel sources (`otlp`, `otel-genai`) and completed native
-chat captures (`experiential`) use the same pipeline. Stream captures must first be exported as
-reconstructed `chat-json`; incomplete captures appear as explicit exclusions.
-
 `exp eval powerset --models gpt-5.6-luna,deepseek-v4.1-flash` prepares and reviews the model matrix,
 then simulates, judges, and writes a report. Model names are configured catalog aliases; project
-world-model and judge choices come from ingestion. Existing authored/calibrated project judges
+world-model and judge choices come from the configured project. Existing authored/calibrated project judges
 are selected automatically. Otherwise the task-success judge is explicitly provisional.
 
 `exp eval powerset` opens the terminal project screen: select models, configure repeats and

@@ -106,7 +106,7 @@ def evaluation_tasks(project: ProjectStore) -> tuple[TaskCase, ...]:
     build = project.load_project().build
     if build is None:
         raise ValueError(
-            f"project has no grounded scenarios; run exp ingest {project.paths.project_id} "
+            f"project has no grounded scenarios; run exp build {project.paths.project_id} "
             "--traces PATH --source chat-json"
         )
     return load_task_set(project.artifacts, build.task_set.artifact_id).tasks

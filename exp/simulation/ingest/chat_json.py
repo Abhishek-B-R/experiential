@@ -11,7 +11,7 @@ Message mapping follows the roles the conversation already declares:
 - an ``assistant`` message with ``tool_calls`` becomes one model call per requested tool,
 - an ordinary ``assistant`` message becomes a model call carrying its completion text,
 - a ``tool`` message becomes the tool result paired with the earlier call,
-- ``system`` and ``developer`` messages are retained as initial instructions.
+- ``system`` and ``developer`` messages carry no agent step and are not converted.
 
 Chat JSON carries no source timing. When a message declares no timestamp, EXP assigns ordinal
 timestamps that preserve message order only, and every resulting span records
@@ -107,36 +107,11 @@ def _conversation_observations(
     raw_messages = conversation.get("messages", conversation.get("conversation"))
     if not isinstance(raw_messages, list):
         raise VendorTraceFormatError("chat JSON conversations need a messages array")
-    messages = [dict(message) for message in raw_messages if isinstance(message, dict)]
+    messages = [message for message in raw_messages if isinstance(message, dict)]
     if len(messages) != len(raw_messages):
         raise VendorTraceFormatError("chat JSON messages must be objects")
     source_trace_id = _source_trace_id(conversation)
     extensions = _extensions(conversation)
-    if "tools" in conversation:
-        extensions["exp.request.tools"] = conversation["tools"]
-    initial_messages: list[JsonValue] = []
-    for message in messages:
-        if message_role(message) in ("assistant", "tool"):
-            break
-        if message_role(message) in ("system", "developer"):
-            initial_messages.append(
-                {"role": message_role(message), "content": message_text(message.get("content"))}
-            )
-    if initial_messages:
-        context = extensions.get("exp.request.context", {})
-        if not isinstance(context, dict):
-            raise VendorTraceFormatError("initial context must be an object")
-        extensions["exp.request.context"] = {**context, "instruction_messages": initial_messages}
-    names_by_id: dict[str, str] = {}
-    for message in messages:
-        if message_role(message) == "assistant":
-            for call in declared_tool_calls(message):
-                if call.call_id is not None:
-                    names_by_id[call.call_id] = call.name
-        elif message_role(message) == "tool" and not message.get("name"):
-            call_id = first_text(message, ("tool_call_id", "call_id", "id"))
-            if call_id in names_by_id:
-                message["name"] = names_by_id[call_id]
     model = _model_identity(conversation)
     request_text = _first_user_message(messages)
     if request_text is None:

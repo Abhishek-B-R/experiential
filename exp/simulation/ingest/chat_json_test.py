@@ -44,9 +44,7 @@ def test_load_chat_json_file_keeps_synthetic_timing_and_source_metadata(tmp_path
     result = CHAT_JSON_SOURCE.load(path)
 
     trace = result.traces[0]
-    assert trace.initial_context == {
-        "instruction_messages": [{"role": "system", "content": "You are helpful."}]
-    }
+    assert trace.initial_context == {}
     call, completion = trace.spans[0], trace.spans[2]
     assert completion.attributes["gen_ai.completion"] == "It is 18C in Paris."
     assert call.attributes[SYNTHETIC_TIME_ATTRIBUTE] is True

@@ -87,7 +87,7 @@ def run_evaluation(
             )
             if not options:
                 raise ValueError(
-                    "no local projects; run exp ingest NAME --traces PATH --source chat-json"
+                    "no local projects; run exp build NAME --traces PATH --source chat-json"
                 )
             picked = choose_one(_console, title="Evaluation project", options=options)
             if not picked.values:
