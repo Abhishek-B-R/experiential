@@ -196,12 +196,15 @@ fn import_namespace_survives_native_retention_and_reopen() {
             .as_nanos()
     ));
     let existing = Connection::open(&path).unwrap();
-    existing.execute_batch(
-        "CREATE TABLE trace_store_schema(version INTEGER); INSERT INTO trace_store_schema VALUES(1);
-         CREATE TABLE trace_records(payload TEXT); INSERT INTO trace_records VALUES('saved import');
-         CREATE TABLE trace_imports(id TEXT); CREATE TABLE trace_import_records(id TEXT);
-         CREATE TABLE trace_project_imports(id TEXT);"
-    ).unwrap();
+    for (_, sql) in TRACE_TABLE_SQL {
+        existing.execute_batch(sql).unwrap();
+    }
+    existing
+        .execute_batch(
+            "INSERT INTO trace_store_schema VALUES(1);
+         INSERT INTO trace_records VALUES(printf('%064d',0),'source-trace','saved import');",
+        )
+        .unwrap();
     drop(existing);
     let mut writer = open_database(&path).unwrap();
     persist(&mut writer, pending("expired", policy())).unwrap();
@@ -283,4 +286,29 @@ fn native_writer_waits_for_a_short_import_transaction() {
     );
     drop(importer);
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn complete_import_names_cannot_hide_changed_columns_or_constraints() {
+    for mutation in [
+        "ALTER TABLE trace_records ADD COLUMN injected TEXT",
+        "DROP TABLE trace_project_imports; CREATE TABLE trace_project_imports (sequence INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, import_id TEXT NOT NULL)",
+        "DROP TABLE trace_records; CREATE TABLE trace_records (record_sha256 TEXT PRIMARY KEY, trace_id TEXT NOT NULL, payload TEXT NOT NULL) STRICT",
+    ] {
+        let path = std::env::temp_dir().join(format!(
+            "capture-import-definition-{}-{}.db", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let existing = Connection::open(&path).unwrap();
+        for (_, sql) in TRACE_TABLE_SQL {
+            existing.execute_batch(sql).unwrap();
+        }
+        existing.execute_batch("INSERT INTO trace_store_schema VALUES(1)").unwrap();
+        existing.execute_batch(mutation).unwrap();
+        drop(existing);
+        let before = std::fs::read(&path).unwrap();
+        assert!(open_database(&path).unwrap_err().contains("incompatible trace table"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(path).unwrap();
+    }
 }

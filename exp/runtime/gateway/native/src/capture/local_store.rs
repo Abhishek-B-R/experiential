@@ -5,6 +5,46 @@ use std::fs::OpenOptions;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+// Complete import definitions are also verified by Python before shared writes.
+const TRACE_TABLE_SQL: &[(&str, &str)] = &[
+    (
+        "trace_store_schema",
+        "CREATE TABLE trace_store_schema (version INTEGER PRIMARY KEY CHECK(version=1)) STRICT",
+    ),
+    (
+        "trace_records",
+        "CREATE TABLE trace_records (
+        record_sha256 TEXT PRIMARY KEY CHECK(length(record_sha256)=64),
+        trace_id TEXT NOT NULL, payload TEXT NOT NULL
+    ) STRICT",
+    ),
+    (
+        "trace_imports",
+        "CREATE TABLE trace_imports (
+        import_id TEXT PRIMARY KEY, source_format TEXT NOT NULL,
+        source TEXT NOT NULL, metadata TEXT NOT NULL, created_at TEXT NOT NULL
+    ) STRICT",
+    ),
+    (
+        "trace_import_records",
+        "CREATE TABLE trace_import_records (
+        import_id TEXT NOT NULL REFERENCES trace_imports(import_id),
+        ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+        record_sha256 TEXT NOT NULL REFERENCES trace_records(record_sha256),
+        source TEXT NOT NULL,
+        PRIMARY KEY(import_id,ordinal)
+    ) STRICT",
+    ),
+    (
+        "trace_project_imports",
+        "CREATE TABLE trace_project_imports (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL, import_id TEXT NOT NULL REFERENCES trace_imports(import_id),
+        UNIQUE(project_id,import_id)
+    ) STRICT",
+    ),
+];
+
 pub(super) struct Pending {
     pub policy: Policy,
     pub payload: String,
@@ -115,6 +155,26 @@ pub(super) fn open_database(path: &Path) -> Result<Connection, String> {
     if trace_tables != 0 {
         if trace_tables != 5 {
             return Err("incomplete trace import schema; preserve this traffic database".into());
+        }
+        for (table, expected) in TRACE_TABLE_SQL {
+            let saved: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .map_err(safe_error)?;
+            let normalize = |sql: &str| {
+                sql.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase()
+            };
+            if normalize(&saved) != normalize(expected) {
+                return Err(
+                    "incompatible trace table definition; preserve this traffic database".into(),
+                );
+            }
         }
         let supported: bool = connection
             .query_row(

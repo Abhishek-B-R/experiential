@@ -44,3 +44,26 @@ def test_trace_schema_can_join_capture_and_rejects_unknown_version(tmp_path: Pat
         connection.execute("UPDATE trace_store_schema SET version=2")
         with pytest.raises(TraceStoreError, match="Unsupported"):
             validate_schema(connection)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "ALTER TABLE trace_records ADD COLUMN injected TEXT",
+        "DROP TABLE trace_project_imports; CREATE TABLE trace_project_imports "
+        "(sequence INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "project_id TEXT NOT NULL, import_id TEXT NOT NULL)",
+        "DROP TABLE trace_records; CREATE TABLE trace_records "
+        "(record_sha256 TEXT PRIMARY KEY, trace_id TEXT NOT NULL, payload TEXT NOT NULL) STRICT",
+    ],
+)
+def test_complete_names_do_not_accept_incompatible_definitions(tmp_path: Path, change: str) -> None:
+    """Matching names/version cannot hide missing constraints or a changed table shape."""
+    path = tmp_path / "traffic.db"
+    with sqlite3.connect(path) as connection:
+        initialize_schema(connection)
+        connection.executescript(change)
+    before = path.read_bytes()
+    with pytest.raises(TraceStoreError, match="Incompatible trace table"):
+        _save(SQLiteTraceStore(path), (_trace(),))
+    assert path.read_bytes() == before
