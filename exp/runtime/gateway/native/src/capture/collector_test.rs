@@ -180,7 +180,7 @@ fn idle_maintenance_expires_pending_content_without_another_request() {
 fn response_before_settlement_is_held_and_byok_never_writes_any_content() {
     let (collector, receiver) = collector(config());
     assert!(collector.begin(request("request")));
-    assert!(collector.attach("request"));
+    assert!(collector.attach("request").is_some());
     collector.finish("request", Some(response()), Some("deployment".into()));
     assert!(receiver.try_recv().is_err());
     collector.settle("request", false, false);
@@ -188,20 +188,20 @@ fn response_before_settlement_is_held_and_byok_never_writes_any_content() {
 }
 
 #[test]
-fn settlement_before_response_captures_prompt_then_one_response_update() {
+fn settlement_before_response_emits_one_complete_record_without_a_stale_prompt_update() {
     let (collector, receiver) = collector(config());
     assert!(collector.begin(request("request")));
     collector.settle("request", true, true);
-    assert!(collector.attach("request"));
-    assert!(!collector.attach("request"));
+    assert!(receiver.try_recv().is_err());
+    assert!(collector.attach("request").is_some());
+    assert!(collector.attach("request").is_none());
     collector.finish("request", Some(response()), Some("deployment".into()));
     collector.finish("request", Some(response()), None);
     let records = drain(&collector, receiver);
-    assert_eq!(records.len(), 2);
-    assert!(records[0].response.is_none());
-    assert!(records[1].response.is_some());
-    assert_eq!(records[1].request.scope.identity_id, "identity");
-    assert_eq!(records[1].deployment_id.as_deref(), Some("deployment"));
+    assert_eq!(records.len(), 1);
+    assert!(records[0].response.is_some());
+    assert_eq!(records[0].request.scope.identity_id, "identity");
+    assert_eq!(records[0].deployment_id.as_deref(), Some("deployment"));
 }
 
 #[test]

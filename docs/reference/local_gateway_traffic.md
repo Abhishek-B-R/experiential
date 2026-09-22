@@ -39,10 +39,16 @@ The human-readable banner discloses capture before requests are served.
 Turning capture off does not delete existing local data; remove the dedicated
 traffic database only when no process is using it and you want that data deleted.
 
-Native capture uses a bounded asynchronous writer, seven-day expiry, at most
+Native capture uses a bounded writer with backpressure, seven-day expiry, at most
 10,000 records and 256 MiB of serialized payloads per identity, with a 1 MiB
 per-record ceiling. SQLite indexes/journals add disk overhead. Oversize,
 interrupted and non-successful responses are not reproducible completed records.
+When storage is slower than incoming traffic, response completion waits for the
+SQLite transaction rather than discarding queued captures. Admission that cannot
+register required capture returns 503 before making a provider call. A write
+failure terminates the HTTP body with an error; already-streamed bytes cannot be
+withdrawn. Graceful shutdown reports an incomplete drain without purging accepted
+delivery records, and the process must stay alive until that drain completes.
 The collector's content-free counters report delivery and collection failures.
 `maintenance_failures()` reports retention/WAL cleanup failures separately: a busy
 reader cannot turn an already-committed capture into a reported write failure.

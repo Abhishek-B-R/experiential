@@ -234,14 +234,22 @@ def decode_chat(
     _validate_official(
         _CHAT_OFFICIAL,
         _without_chat_message_extensions(payload),
-        extension_fields={"top_k", "reasoning_effort", "enable_thinking", "provider", "plugins"},
+        extension_fields={
+            "top_k",
+            "reasoning_effort",
+            "enable_thinking",
+            "thinking_budget",
+            "max_output_tokens",
+            "provider",
+            "plugins",
+        },
     )
     request = _validate_wire(_ChatRequest, payload)
     alias, online_suffix = split_online_suffix(request.model)
     idempotency_key, client_request_id = _validated_operation_headers(
         idempotency_key, client_request_id
     )
-    maximum = request.max_completion_tokens or request.max_tokens
+    maximum = request.max_completion_tokens or request.max_tokens or request.max_output_tokens
     stop = (
         ()
         if request.stop is None
@@ -289,8 +297,11 @@ def decode_chat(
                 if request.max_completion_tokens is not None
                 else "max_tokens"
                 if request.max_tokens is not None
+                else "max_output_tokens"
+                if request.max_output_tokens is not None
                 else None
             ),
+            thinking_budget=request.thinking_budget,
             stop=stop,
             temperature=request.temperature,
             top_p=request.top_p,

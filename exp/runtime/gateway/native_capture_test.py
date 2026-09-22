@@ -141,12 +141,13 @@ def test_accepted_routing_failure_keeps_effective_prompt_without_inventing_model
     assert "retained task" in records[0]
 
 
-@pytest.mark.parametrize("policy", ["local", "hosted", "off", "broken"])
-def test_real_http_surfaces_use_one_collector_without_affecting_serving(
+@pytest.mark.parametrize("policy", ["local", "hosted", "off", "broken", "full"])
+def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy: str
 ) -> None:
     """Collect Chat, Responses and Messages JSON/SSE through native HTTP, not a fixture tap."""
     monkeypatch.setenv("LOOPBACK_PROVIDER_KEY", "provider-secret")
+    _LoopbackProvider.calls = 0
     provider = ThreadingHTTPServer(("127.0.0.1", 0), _LoopbackProvider)
     provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
     provider_thread.start()
@@ -157,6 +158,8 @@ def test_real_http_surfaces_use_one_collector_without_affecting_serving(
     records: list[str] = []
     configuration = CaptureConfiguration(settlement_required=policy == "hosted")
     collector = native.CaptureCollector(configuration.model_dump_json(), records.append)
+    if policy == "full":
+        assert collector.close(1)
 
     def application_for(authorization: AuthorizationSnapshot) -> str | None:
         """Exercise host policy separately from content assembly and persistence."""
@@ -202,6 +205,13 @@ def test_real_http_surfaces_use_one_collector_without_affecting_serving(
                     json=payload,
                     timeout=10,
                 )
+                if policy in {"broken", "full"}:
+                    assert response.status_code == 503
+                    assert (
+                        "overloaded_error" if surface == "messages" else "capture_unavailable"
+                    ) in response.text
+                    assert "private policy" not in response.text
+                    continue
                 assert response.status_code == 200, response.text
                 assert "hello " in response.text and "world" in response.text
                 if policy == "hosted":
@@ -216,7 +226,8 @@ def test_real_http_surfaces_use_one_collector_without_affecting_serving(
     assert not failures
     assert not worker.is_alive()
     assert collector.close(1)
-    if policy in {"off", "broken"}:
+    assert _LoopbackProvider.calls == (0 if policy in {"broken", "full"} else 6)
+    if policy in {"off", "broken", "full"}:
         assert records == []
         return
     parsed = [CaptureRecord.model_validate_json(value) for value in records]

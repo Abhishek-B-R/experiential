@@ -54,6 +54,143 @@ fn collector(maximum_response_bytes: usize) -> (Arc<Collector>, mpsc::Receiver<R
     (collector, receiver)
 }
 
+struct HeldSink {
+    entered: Option<tokio::sync::oneshot::Sender<()>>,
+    resume: mpsc::Receiver<()>,
+    records: mpsc::Sender<Record>,
+    fail: bool,
+}
+
+impl Sink for HeldSink {
+    fn write(&mut self, record: &Record, _maximum_bytes: usize) -> Result<(), ()> {
+        if let Some(entered) = self.entered.take() {
+            let _ = entered.send(());
+            self.resume
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| ())?;
+        }
+        if self.fail {
+            Err(())
+        } else {
+            self.records.send(record.clone()).map_err(|_| ())
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn stalled_writer_backpressures_complete_responses_without_blocking_the_runtime() {
+    for fail in [false, true] {
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let (resume, paused) = mpsc::channel();
+        let (records, observed) = mpsc::channel();
+        let collector = Arc::new(
+            Collector::new(
+                Configuration {
+                    delivery: Limits {
+                        maximum_records: 1,
+                        maximum_bytes: 16384,
+                        maximum_record_bytes: 8192,
+                    },
+                    maximum_pending_records: 8,
+                    maximum_pending_bytes: 16384,
+                    maximum_request_bytes: 2048,
+                    maximum_response_bytes: 8192,
+                    ttl_seconds: 30,
+                    settlement_required: false,
+                },
+                HeldSink {
+                    entered: Some(started),
+                    resume: paused,
+                    records,
+                    fail,
+                },
+            )
+            .unwrap(),
+        );
+        // Two whole responses fit; a third waits before consuming any bytes.
+        let first = collector.body_permit().await.unwrap();
+        let second = collector.body_permit().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), collector.body_permit())
+                .await
+                .is_err()
+        );
+        drop(first);
+        let third = tokio::time::timeout(Duration::from_secs(1), collector.body_permit())
+            .await
+            .unwrap()
+            .unwrap();
+        drop((second, third));
+        let mut tasks = Vec::new();
+        for index in 0..8 {
+            let id = index.to_string();
+            assert!(collector.begin(Request {
+                request_id: id.clone(),
+                scope: Scope {
+                    organization_id: "org".into(),
+                    identity_id: "identity".into(),
+                    application_id: "alias".into()
+                },
+                protocol: Protocol::ChatCompletions,
+                model_id: Some("model".into()),
+                context: Arc::new(json!({"schema_version":1,"request":{}})),
+            }));
+            let owner = collector.clone();
+            tasks.push(tokio::spawn(async move {
+                let expected =
+                    serde_json::to_vec(&json!({"id":id,"text":"x".repeat(2048)})).unwrap();
+                let actual = capture_response(
+                    Some(owner),
+                    &id,
+                    Response::new(Body::from(expected.clone())),
+                )
+                .into_body()
+                .collect()
+                .await;
+                if fail {
+                    assert!(actual.is_err());
+                } else {
+                    assert_eq!(actual.unwrap().to_bytes().as_ref(), expected.as_slice());
+                }
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(1), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        // With one async worker this timer proves delivery does not monopolize it.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::time::sleep(Duration::from_millis(30)),
+        )
+        .await
+        .unwrap();
+        assert!(tasks.iter().all(|task| !task.is_finished()));
+        assert_eq!(&collector.counts()[3..], &[0, 0, 0]);
+        resume.send(()).unwrap();
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert!(collector.close_until(Instant::now() + Duration::from_secs(1)));
+        let rows: Vec<_> = observed.try_iter().collect();
+        assert_eq!(rows.len(), if fail { 0 } else { 8 });
+        assert!(rows
+            .iter()
+            .all(|record| matches!(record.response, Some(CapturedResponse::Json { .. }))));
+        assert_eq!(
+            collector.counts(),
+            if fail {
+                [0, 0, 0, 8, 0, 0]
+            } else {
+                [0, 0, 8, 0, 0, 0]
+            }
+        );
+    }
+}
+
 fn record(collector: &Collector, receiver: mpsc::Receiver<Record>) -> Record {
     assert!(collector.close_until(Instant::now() + Duration::from_secs(1)));
     let records: Vec<Record> = receiver.try_iter().collect();
@@ -208,6 +345,30 @@ async fn dropped_stream_keeps_only_whole_observed_frames_and_marks_disconnect() 
     assert_eq!(frames, vec![json!({"delta":"hello"})]);
     assert!(client_disconnected);
     assert!(!truncated);
+}
+
+#[tokio::test]
+async fn explicit_host_denial_does_not_turn_a_valid_response_into_a_storage_failure() {
+    for keep_prompt in [false, true] {
+        let (collector, receiver) = collector(4096);
+        let bytes = Bytes::from_static(b"data: {\"text\":\"ok\"}\n\n");
+        let source = futures_util::stream::iter([Ok::<_, Infallible>(bytes.clone())]);
+        let response = Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(source))
+            .unwrap();
+        let mut body = capture_response(Some(collector.clone()), "request", response)
+            .into_body()
+            .into_data_stream();
+        assert_eq!(body.next().await.unwrap().unwrap(), bytes);
+        collector.settle("request", keep_prompt, false);
+        assert!(body.next().await.is_none());
+        assert!(collector.close_until(Instant::now() + Duration::from_secs(1)));
+        let records: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(records.len(), usize::from(keep_prompt));
+        assert!(records.iter().all(|record| record.response.is_none()));
+        assert_eq!(&collector.counts()[3..], &[0, 0, 0]);
+    }
 }
 
 #[tokio::test]

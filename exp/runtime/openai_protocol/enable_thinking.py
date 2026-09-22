@@ -96,6 +96,30 @@ def translate_enable_thinking(request: _ChatRequest) -> _EnableThinkingResult:
                 "budget-capable model, or explicitly remove the budget and choose reasoning_effort."
             ),
         )
+    if request.thinking_budget is not None:
+        if request.reasoning_effort is not None or (
+            reasoning is not None and reasoning.effort is not None
+        ):
+            raise invalid_field(
+                "thinking_budget",
+                "thinking_budget and reasoning effort are mutually exclusive. "
+                "Choose one depth control.",
+            )
+        switches = (
+            request.enable_thinking,
+            request.chat_template_kwargs.enable_thinking if request.chat_template_kwargs else None,
+            reasoning.enabled if reasoning else None,
+            request.thinking.type != "disabled" if request.thinking else None,
+        )
+        if False in switches:
+            raise invalid_field(
+                "thinking_budget",
+                "thinking_budget requires thinking enabled. Remove the off control.",
+            )
+        # The budget itself enables thinking; resolving a default effort would
+        # introduce a second depth control the provider refuses.
+        disclosures = (_EXCLUDE_DROPPED,) if reasoning is not None and reasoning.exclude else ()
+        return _EnableThinkingResult(None, False, disclosures)
     reasoning_intent = _reasoning_object_intent(request)
     reasoning_present = reasoning_intent is not None
 

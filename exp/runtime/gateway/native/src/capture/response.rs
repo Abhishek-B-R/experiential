@@ -1,11 +1,13 @@
-//! Native response tap. Bytes are forwarded unchanged; storage never runs here.
+//! Native response tap. Forward bytes unchanged and acknowledge destination completion.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::body::{Body, HttpBody};
 use axum::response::Response;
 use futures_util::StreamExt;
 use serde_json::Value;
+use tokio::sync::OwnedSemaphorePermit;
 
 use super::collector::Collector;
 use super::record::Response as CapturedResponse;
@@ -20,6 +22,93 @@ struct Tap {
     charged: usize,
     truncated: bool,
     finished: bool,
+    permit: Option<OwnedSemaphorePermit>,
+    discarded: Arc<AtomicBool>,
+}
+
+struct BodyCharge {
+    collector: Arc<Collector>,
+    bytes: usize,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for BodyCharge {
+    fn drop(&mut self) {
+        self.collector.release_body(self.bytes);
+    }
+}
+
+/// Retain original wire bytes until the single destination worker needs JSON.
+/// The response permit covers queued, blocked and actively decoded bodies alike.
+pub(super) struct WireResponse {
+    bytes: Vec<u8>,
+    sse: bool,
+    status: u16,
+    truncated: bool,
+    disconnected: bool,
+    maximum_bytes: usize,
+    _charge: BodyCharge,
+}
+
+impl WireResponse {
+    pub(super) fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.bytes.capacity()
+    }
+
+    pub(super) fn decode(self) -> Option<CapturedResponse> {
+        if self.sse {
+            let mut frames = data_frames(&self.bytes);
+            let mut truncated = self.truncated;
+            loop {
+                let mut frame_value = Value::Array(frames);
+                let source_json = lossless_projection(&mut frame_value);
+                let Value::Array(moved_frames) = frame_value else {
+                    unreachable!()
+                };
+                let response = CapturedResponse::Sse {
+                    status: self.status,
+                    frames: moved_frames,
+                    truncated,
+                    client_disconnected: self.disconnected,
+                    source_json,
+                };
+                if response.json_bytes() <= self.maximum_bytes {
+                    break Some(response);
+                }
+                let CapturedResponse::Sse {
+                    frames: mut reduced,
+                    source_json,
+                    ..
+                } = response
+                else {
+                    unreachable!()
+                };
+                if let Some(source) = source_json {
+                    reduced = serde_json::from_str(&source).unwrap_or(reduced);
+                }
+                if reduced.is_empty() {
+                    break None;
+                }
+                reduced.truncate(reduced.len() / 2);
+                frames = reduced;
+                truncated = true;
+            }
+        } else if !self.truncated && !self.disconnected {
+            serde_json::from_slice::<Value>(&self.bytes)
+                .ok()
+                .map(|mut body| {
+                    let source_json = lossless_projection(&mut body);
+                    CapturedResponse::Json {
+                        status: self.status,
+                        body,
+                        source_json,
+                    }
+                })
+                .filter(|response| response.json_bytes() <= self.maximum_bytes)
+        } else {
+            None
+        }
+    }
 }
 
 impl Tap {
@@ -52,7 +141,6 @@ impl Tap {
                 self.truncated = true;
                 return;
             }
-            // The allocator may grant more than requested; never leave that capacity uncharged.
             let excess = self.bytes.capacity().saturating_sub(self.charged);
             if !self.collector.reserve_body(excess) {
                 self.bytes = Vec::new();
@@ -66,64 +154,27 @@ impl Tap {
         self.bytes.extend_from_slice(chunk);
     }
 
-    fn finish(&mut self, disconnected: bool) {
+    fn finish(&mut self, disconnected: bool) -> bool {
         if self.finished {
-            return;
+            return true;
         }
         self.finished = true;
-        let response = if self.sse {
-            let mut frames = data_frames(&self.bytes);
-            let mut truncated = self.truncated;
-            loop {
-                let mut frame_value = Value::Array(frames);
-                let source_json = lossless_projection(&mut frame_value);
-                let Value::Array(moved_frames) = frame_value else {
-                    unreachable!()
-                };
-                let response = CapturedResponse::Sse {
-                    status: self.status,
-                    frames: moved_frames,
-                    truncated,
-                    client_disconnected: disconnected,
-                    source_json,
-                };
-                if response.json_bytes() <= self.collector.config.maximum_response_bytes {
-                    break Some(response);
-                }
-                let CapturedResponse::Sse {
-                    frames: mut reduced,
-                    source_json,
-                    ..
-                } = response
-                else {
-                    unreachable!()
-                };
-                if let Some(source) = source_json {
-                    reduced = serde_json::from_str(&source).unwrap_or(reduced);
-                }
-                if reduced.is_empty() {
-                    break None;
-                }
-                reduced.truncate(reduced.len() / 2);
-                frames = reduced;
-                truncated = true;
-            }
-        } else if !self.truncated && !disconnected {
-            serde_json::from_slice::<Value>(&self.bytes)
-                .ok()
-                .map(|mut body| {
-                    let source_json = lossless_projection(&mut body);
-                    CapturedResponse::Json {
-                        status: self.status,
-                        body,
-                        source_json,
-                    }
-                })
-        } else {
-            None
+        let wire = WireResponse {
+            bytes: std::mem::take(&mut self.bytes),
+            sse: self.sse,
+            status: self.status,
+            truncated: self.truncated,
+            disconnected,
+            maximum_bytes: self.collector.config.maximum_response_bytes,
+            _charge: BodyCharge {
+                collector: self.collector.clone(),
+                bytes: std::mem::take(&mut self.charged),
+                _permit: self.permit.take(),
+            },
         };
         self.collector
-            .finish(&self.request_id, response, self.deployment_id.take());
+            .finish_wire(&self.request_id, wire, self.deployment_id.take())
+            || self.discarded.load(Ordering::Acquire)
     }
 }
 
@@ -143,9 +194,9 @@ pub(crate) fn capture_response(
     let Some(collector) = collector else {
         return response;
     };
-    if !collector.attach(request_id) {
+    let Some(discarded) = collector.attach(request_id) else {
         return response;
-    }
+    };
     if !response.status().is_success() {
         collector.finish(request_id, None, None);
         return response;
@@ -183,27 +234,44 @@ pub(crate) fn capture_response(
         charged: 0,
         truncated: false,
         finished: false,
+        permit: None,
+        discarded,
     };
     let stream = futures_util::stream::unfold(
         (body.into_data_stream(), tap, 0u64),
         move |(mut body, mut tap, mut sent)| async move {
+            if tap.permit.is_none() && !tap.finished {
+                tap.permit = tap.collector.body_permit().await;
+            }
             match body.next().await {
-                Some(item) => {
+                Some(mut item) => {
                     match &item {
                         Ok(chunk) => {
                             tap.push(chunk);
                             sent = sent.saturating_add(chunk.len() as u64);
-                            if expected == Some(sent) {
-                                tap.finish(false);
+                            if expected == Some(sent) && !tap.finish(false) {
+                                item = Err(axum::Error::new(std::io::Error::other(
+                                    "capture persistence failed",
+                                )));
                             }
                         }
-                        Err(_) => tap.finish(true),
+                        Err(_) => {
+                            tap.finish(true);
+                        }
                     }
                     Some((item, (body, tap, sent)))
                 }
                 None => {
-                    tap.finish(false);
-                    None
+                    if tap.finish(false) {
+                        None
+                    } else {
+                        Some((
+                            Err(axum::Error::new(std::io::Error::other(
+                                "capture persistence failed",
+                            ))),
+                            (body, tap, sent),
+                        ))
+                    }
                 }
             }
         },

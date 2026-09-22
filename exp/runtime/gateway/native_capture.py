@@ -51,9 +51,11 @@ class CaptureConfiguration(ContractModel):
 
     @model_validator(mode="after")
     def _validate_pending_budget(self) -> CaptureConfiguration:
-        """Require room for one maximum-size input."""
-        if self.maximum_pending_bytes < self.maximum_request_bytes:
-            raise ValueError("capture pending budget must fit one request")
+        """Require room for one complete input and one reserved response buffer."""
+        if self.maximum_pending_bytes < max(
+            self.maximum_request_bytes, self.maximum_response_bytes
+        ):
+            raise ValueError("capture pending budget must fit one request or response")
         return self
 
 
@@ -133,7 +135,7 @@ class CaptureController:
 
     def begin(
         self, authorization: AuthorizationSnapshot, request: GatewayRequest, model_id: str | None
-    ) -> None:
+    ) -> bool:
         """Prepare only an allowed identity's post-guardrail, expanded request."""
         application_id = self._application_for(authorization)
         if application_id is None or request.surface.value not in {
@@ -141,10 +143,10 @@ class CaptureController:
             "responses",
             "messages",
         }:
-            return
+            return True
         context = capture_request_context(request, maximum_bytes=self._maximum_request_bytes)
         if context is None:
-            return
+            return False
         record = CaptureRequest.model_validate(
             {
                 "request_id": authorization.request_id,
@@ -158,7 +160,7 @@ class CaptureController:
                 "context": context,
             }
         )
-        self.native.begin(record.model_dump_json())
+        return self.native.begin(record.model_dump_json())
 
 
 def begin_capture(
@@ -166,14 +168,15 @@ def begin_capture(
     authorization: AuthorizationSnapshot,
     request: GatewayRequest,
     model_id: str | None = None,
-) -> None:
-    """Contain optional capture failures without logging customer content or exceptions."""
+) -> bool:
+    """Reject unavailable required capture without exposing customer content or exceptions."""
     if controller is None:
-        return
+        return True
     try:
-        controller.begin(authorization, request, model_id)
-    except Exception:  # noqa: BLE001 - capture must never fail an otherwise valid admission.
-        _LOGGER.warning("capture.admission_dropped request_id=%s", authorization.request_id)
+        return controller.begin(authorization, request, model_id)
+    except Exception:  # noqa: BLE001 - sanitize policy and collector failures at admission.
+        _LOGGER.warning("capture.admission_failed request_id=%s", authorization.request_id)
+        return False
 
 
 def select_capture_model(
