@@ -2173,7 +2173,10 @@ def test_two_finite_budget_runners_complete_each_cell_exactly_once(tmp_path: Pat
     assert all(rollout.stop_reason == StopReason.COMPLETED for rollout in rollouts)
 
 
-def test_simulated_tools_parallel_errors_state_and_replay(tmp_path: Path) -> None:
+@pytest.mark.parametrize("query_padding", ["", "x" * 5_500])
+def test_simulated_tools_parallel_errors_state_and_replay(
+    tmp_path: Path, query_padding: str
+) -> None:
     """Run a tool-using chat agent entirely against generated observations, then replay it."""
     from exp.runtime.agents.chat import ChatAgentRuntime
 
@@ -2185,8 +2188,8 @@ def test_simulated_tools_parallel_errors_state_and_replay(tmp_path: Path) -> Non
     plan_input = _persist_plan(store, plan)
     task_input = _persist_task_set(store, {task.task_id: task})
     calls = (
-        ToolCall(call_id="search-a", name="research", arguments={"query": "Acme"}),
-        ToolCall(call_id="search-b", name="research", arguments={"query": ""}),
+        ToolCall(call_id="search-a", name="research", arguments={"query": "Acme" + query_padding}),
+        ToolCall(call_id="search-b", name="research", arguments={"query": query_padding}),
     )
     record_call = ToolCall(call_id="record-a", name="research", arguments={"record": "Acme"})
     candidate_client = _ScriptedClient(
