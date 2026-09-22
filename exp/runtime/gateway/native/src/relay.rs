@@ -98,18 +98,10 @@ pub fn stream_timeout_failure(deadline: Instant) -> Failure {
     }
 }
 
-/// Classify a provider that accepted the connection but did not stream its
-/// first TOKEN (the first semantic event) within the fail-fast first-token
-/// bound. Headers, keepalive comments and role-only frames do not count. A
-/// stalled lead deployment must not hold the request for its full per-chunk
-/// timeout, so this is a transient, capacity-shaped failure that is
-/// failover-eligible.
-///
-/// It is deliberately *not* same-deployment retryable: a lane that accepted
-/// the connection but never answered is the clearest dead-lane signal, and
-/// redialing it would only stall again for another window. Skipping the redial
-/// and advancing straight to the next certified deployment is what keeps a
-/// fresh pod's cost on a dead lane near one fail-fast window instead of several.
+/// Classify a provider missing its first semantic token within the fail-fast bound.
+/// Headers, keepalives and role-only frames do not count. Advance to the next
+/// certified deployment without redialing the stalled lane, limiting its cost
+/// to one first-token window rather than the full per-chunk timeout.
 pub fn first_byte_timeout_failure() -> Failure {
     Failure::new(
         FailureClass::Timeout,
@@ -505,8 +497,7 @@ impl UpstreamRelay {
         self.carried_usage = carried;
     }
 
-    /// Enforce the caller's stop sequences on this relay's visible text.
-    /// Installed before the first event is yielded; an empty set is a no-op.
+    /// Enable the probability output requested in the frozen provider payload.
     pub fn set_probability_output(&mut self, chat: bool, payload: &serde_json::Value) {
         self.normalizer.enable_chat_logprobs(
             chat && payload.get("logprobs").and_then(serde_json::Value::as_bool) == Some(true),
@@ -520,6 +511,7 @@ impl UpstreamRelay {
         );
     }
 
+    /// Enforce stop sequences before yielding events; an empty set is a no-op.
     pub fn set_stop_sequences<I, S>(&mut self, sequences: I)
     where
         I: IntoIterator<Item = S>,
