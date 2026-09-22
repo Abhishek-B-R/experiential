@@ -4,19 +4,25 @@ import asyncio
 import json
 import socket
 import ssl
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 from uuid import uuid4
 
 import httpx
+import mitmproxy_rs
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from mitmproxy import certs, connection, http, options, tcp, tls, websocket
 from mitmproxy.addons.proxyserver import Proxyserver
-from mitmproxy.proxy import commands, context, events, layer, layers
+from mitmproxy.proxy import commands, context, events, layer, layers, server_hooks
+from mitmproxy.proxy.mode_servers import ProxyConnectionHandler
 from mitmproxy.proxy.mode_specs import ProxyMode
+from mitmproxy.proxy.server import ConnectionIO
+from mitmproxy.tools.dump import DumpMaster
 from wsproto.frame_protocol import Opcode
 
 from exp.common.core.artifacts import SourceIdentity
@@ -441,6 +447,119 @@ def test_client_certificate_alert_stops_once_without_exposing_error(
     assert "OpenSSL" not in proxy._tls_failure
 
 
+@pytest.mark.parametrize("error", ["unknown ca", "The client disconnected during the handshake."])
+def test_client_tls_callbacks_after_requested_shutdown_cannot_change_stop_reason(
+    error: str,
+) -> None:
+    """Late callbacks during teardown cannot turn an ordinary stop into a certificate failure."""
+    proxy = CaptureProxy(sink=lambda exchange: True, domains=("api.openai.com",))
+    client = connection.Client(
+        peername=("127.0.0.1", 1),
+        sockname=("127.0.0.1", 2),
+        sni="api.openai.com",
+        error=error,
+    )
+    ctx = context.Context(client, options.Options())
+    proxy.shutdown()
+    for _ in range(3):
+        proxy.tls_failed_client(tls.TlsData(client, ctx))
+    assert proxy._tls_failure is None
+    assert not proxy._tls_disconnects["api.openai.com"]
+
+
+@pytest.mark.parametrize("cancel_task", [False, True])
+def test_real_incomplete_handshakes_closed_during_shutdown_are_not_ca_failures(
+    tmp_path: Path,
+    regular_proxy: None,
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_task: bool,
+) -> None:
+    """Closing three real TLS transports during requested or cancelled shutdown stays orderly."""
+
+    async def run() -> None:
+        """Pause three loopback handshakes, then close their transports at the cleanup boundary."""
+        host = "api.openai.com"
+        proxy = CaptureProxy(sink=lambda exchange: True, domains=(host,))
+        writers: list[asyncio.StreamWriter] = []
+        failures: list[str | None] = []
+        original_stop = capture_module.stop_capture_servers
+        original_failed = proxy.tls_failed_client
+
+        def failed(data: tls.TlsData) -> None:
+            """Record actual TLS callbacks so the regression cannot pass without disconnects."""
+            failures.append(data.conn.error)
+            original_failed(data)
+
+        async def stop_and_disconnect(proxyserver: Proxyserver) -> None:
+            """Model native shutdown closing its streams after the regular listener stops."""
+            await original_stop(proxyserver)
+            for writer in writers:
+                writer.close()
+            await asyncio.gather(
+                *(writer.wait_closed() for writer in writers), return_exceptions=True
+            )
+            deadline = asyncio.get_running_loop().time() + 2
+            while len(failures) < 3:
+                assert asyncio.get_running_loop().time() < deadline
+                await asyncio.sleep(0.01)
+
+        monkeypatch.setattr(proxy, "tls_failed_client", failed)
+        monkeypatch.setattr(capture_module, "stop_capture_servers", stop_and_disconnect)
+        ready = asyncio.Event()
+        proxy_task = asyncio.create_task(
+            proxy.serve(ca_directory=tmp_path / "proxy", ready=ready.set)
+        )
+        try:
+            await asyncio.wait_for(ready.wait(), 5)
+            assert proxy._master is not None
+            proxyserver = proxy._master.addons.get("proxyserver")
+            assert isinstance(proxyserver, Proxyserver)
+            port = next(iter(proxyserver.servers)).listen_addrs[0][1]
+            for _ in range(3):
+                reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                writers.append(writer)
+                writer.write(b"CONNECT 127.0.0.1:1 HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n")
+                await writer.drain()
+                header = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 2)
+                assert header.startswith(b"HTTP/1.1 200")
+                incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+                client_context = ssl.create_default_context(
+                    cafile=str(tmp_path / "proxy/mitmproxy-ca-cert.pem")
+                )
+                client = client_context.wrap_bio(incoming, outgoing, server_hostname=host)
+                with pytest.raises(ssl.SSLWantReadError):
+                    client.do_handshake()
+                writer.write(outgoing.read())
+                await writer.drain()
+                assert await asyncio.wait_for(reader.read(8192), 2)
+            assert not failures
+            assert proxy._tls_failure is None
+            if cancel_task:
+                proxy_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(proxy_task, 5)
+            else:
+                proxy.shutdown()
+                await asyncio.wait_for(proxy_task, 5)
+            assert len(failures) == 3
+            assert all(
+                error is not None
+                and error.startswith("The client disconnected during the handshake.")
+                for error in failures
+            )
+            assert proxy._tls_failure is None
+            assert not proxy._tls_disconnects[host]
+            assert proxy._master is None
+        finally:
+            for writer in writers:
+                writer.close()
+            if not proxy_task.done():
+                proxy.shutdown()
+                await asyncio.gather(proxy_task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("scenario", ["unselected", "upstream", "unrelated_error"])
 def test_unrelated_tls_failure_does_not_stop_capture(
     monkeypatch: pytest.MonkeyPatch, scenario: str
@@ -461,6 +580,196 @@ def test_unrelated_tls_failure_does_not_stop_capture(
     proxy.tls_failed_client(tls.TlsData(affected, ctx))
     assert not shutdowns
     assert proxy._tls_failure is None
+
+
+@pytest.mark.parametrize("error", ["unknown ca", "The client disconnected during the handshake."])
+def test_native_failure_does_not_misclassify_generic_tls_disconnect(
+    monkeypatch: pytest.MonkeyPatch, error: str
+) -> None:
+    """Known transport losses bypass only the generic guard, never a certificate alert."""
+    proxy = CaptureProxy(sink=lambda exchange: True, domains=("api.openai.com",))
+    shutdowns: list[bool] = []
+    monkeypatch.setattr(proxy, "shutdown", lambda: shutdowns.append(True))
+    client = connection.Client(
+        peername=("127.0.0.1", 1),
+        sockname=("127.0.0.1", 2),
+        sni="api.openai.com",
+        error=error,
+    )
+    ctx = context.Context(client, options.Options())
+    proxy._transport_failures.add(client.id)
+    for _ in range(3):
+        proxy.tls_failed_client(tls.TlsData(client, ctx))
+    assert not proxy._tls_disconnects["api.openai.com"]
+    if error == "unknown ca":
+        assert shutdowns == [True]
+        assert proxy._tls_failure is not None
+        assert "client rejected its certificate" in proxy._tls_failure
+    else:
+        assert not shutdowns
+        assert proxy._tls_failure is None
+    proxy.client_disconnected(client)
+    assert not proxy._transport_failures
+
+
+def test_native_guard_hooks_use_only_the_capture_owned_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Client and upstream hooks route their exact targets and failure callback to this master."""
+    proxy = CaptureProxy(sink=lambda exchange: True, domains=("api.openai.com",))
+    owned = Proxyserver()
+    master = Mock(spec=DumpMaster, addons=Mock())
+    master.addons.get.return_value = owned
+    client = connection.Client(peername=("127.0.0.1", 1), sockname=("127.0.0.1", 2))
+    upstream = connection.Server(address=("api.openai.com", 443))
+    data = server_hooks.ServerConnectionHookData(upstream, client)
+    calls: list[tuple[Proxyserver, connection.Client, connection.Connection]] = []
+    callbacks: list[Callable[[str], None]] = []
+
+    def guard(
+        manager: Proxyserver,
+        owner: connection.Client,
+        target: connection.Connection,
+        on_failure: Callable[[str], None],
+    ) -> None:
+        """Observe only the existing transport integration boundary without native I/O."""
+        calls.append((manager, owner, target))
+        callbacks.append(on_failure)
+
+    monkeypatch.setattr(capture_module, "guard_native_writer", guard)
+    proxy.client_connected(client)
+    proxy.server_connected(data)
+    assert not calls
+
+    proxy._master = master
+    owned.connections[client.id] = Mock(spec=ProxyConnectionHandler, client=client)
+    proxy.client_connected(client)
+    proxy.server_connected(data)
+    assert calls == [(owned, client, client), (owned, client, upstream)]
+    for callback in callbacks:
+        callback(client.id)
+    assert proxy._transport_failures == {client.id}
+    proxy.client_disconnected(client)
+    assert not proxy._transport_failures
+
+
+@pytest.mark.parametrize("upstream", [False, True])
+def test_native_guard_hook_attributes_real_adapter_failures_to_the_owning_client(
+    upstream: bool,
+) -> None:
+    """Hook-installed adapters report their failed connection without stopping its siblings."""
+
+    async def run() -> None:
+        """Exercise the actual writer adapter with one inert native stream and owned registry."""
+        proxy = CaptureProxy(sink=lambda exchange: True, domains=("api.openai.com",))
+        manager = Proxyserver()
+        master = Mock(spec=DumpMaster, addons=Mock())
+        master.addons.get.return_value = manager
+        proxy._master = master
+        client = connection.Client(
+            peername=("127.0.0.1", 1), sockname=("127.0.0.1", 443), sni="api.openai.com"
+        )
+        server = connection.Server(address=("api.openai.com", 443))
+        native = Mock(spec=mitmproxy_rs.Stream)
+        native.write.side_effect = OSError("Server has been shut down.")
+        transport = ConnectionIO(writer=native)
+        target = server if upstream else client
+        manager.connections[client.id] = Mock(
+            spec=ProxyConnectionHandler, client=client, transports={target: transport}
+        )
+        if upstream:
+            proxy.server_connected(server_hooks.ServerConnectionHookData(server, client))
+        else:
+            proxy.client_connected(client)
+        assert transport.writer is not None
+        assert transport.writer is not native
+        transport.writer.write(b"synthetic bytes")
+        await asyncio.sleep(0)
+        assert proxy._transport_failures == {client.id}
+        assert transport.writer.is_closing()
+        native.close.assert_called_once_with()
+        master.shutdown.assert_not_called()
+        proxy.client_disconnected(client)
+        assert not proxy._transport_failures
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("state", ["missing", "ended", "stopping", "no_master"])
+def test_transport_failure_attribution_ignores_inactive_clients(state: str) -> None:
+    """Late guard callbacks retain nothing after the client's or Capture's lifetime ends."""
+    proxy = CaptureProxy(sink=lambda exchange: True, domains=("api.openai.com",))
+    manager = Proxyserver()
+    master = Mock(spec=DumpMaster, addons=Mock())
+    master.addons.get.return_value = manager
+    proxy._master = master
+    client = connection.Client(peername=("127.0.0.1", 1), sockname=("127.0.0.1", 2))
+    if state != "missing":
+        manager.connections[client.id] = Mock(spec=ProxyConnectionHandler, client=client)
+    if state == "ended":
+        client.timestamp_end = 123.0
+    elif state == "stopping":
+        proxy.shutdown()
+    elif state == "no_master":
+        proxy._master = None
+    proxy._record_transport_failure(client.id)
+    assert not proxy._transport_failures
+
+
+def test_transport_failure_history_is_bounded_by_active_client_lifetimes() -> None:
+    """Repeated failures deduplicate and completed connections leave no retained identifiers."""
+    proxy = CaptureProxy(sink=lambda exchange: True, domains=("api.openai.com",))
+    manager = Proxyserver()
+    master = Mock(spec=DumpMaster, addons=Mock())
+    master.addons.get.return_value = manager
+    proxy._master = master
+    for port in range(1, 5):
+        client = connection.Client(peername=("127.0.0.1", port), sockname=("127.0.0.1", 443))
+        manager.connections[client.id] = Mock(spec=ProxyConnectionHandler, client=client)
+        proxy._record_transport_failure(client.id)
+        proxy._record_transport_failure(client.id)
+        assert proxy._transport_failures == {client.id}
+        client.timestamp_end = 123.0
+        proxy.client_disconnected(client)
+        proxy._record_transport_failure(client.id)
+        assert not proxy._transport_failures
+        del manager.connections[client.id]
+        proxy._record_transport_failure(client.id)
+        assert not proxy._transport_failures
+
+
+def test_one_native_failure_does_not_suppress_sibling_tls_disconnect_burst() -> None:
+    """Only the failed client's generic disconnect is excluded from the selected-host guard."""
+    proxy = CaptureProxy(sink=lambda exchange: True, domains=("api.openai.com",))
+    manager = Proxyserver()
+    master = Mock(spec=DumpMaster, addons=Mock())
+    master.addons.get.return_value = manager
+    proxy._master = master
+    failed = connection.Client(
+        peername=("127.0.0.1", 1),
+        sockname=("127.0.0.1", 443),
+        sni="api.openai.com",
+        error="The client disconnected during the handshake.",
+    )
+    manager.connections[failed.id] = Mock(spec=ProxyConnectionHandler, client=failed)
+    proxy._record_transport_failure(failed.id)
+    proxy.tls_failed_client(tls.TlsData(failed, context.Context(failed, options.Options())))
+    assert not proxy._tls_disconnects["api.openai.com"]
+    for attempt in range(3):
+        sibling = connection.Client(
+            peername=("127.0.0.1", attempt + 2),
+            sockname=("127.0.0.1", 443),
+            sni="api.openai.com",
+            error="The client disconnected during the handshake.",
+        )
+        proxy.tls_failed_client(tls.TlsData(sibling, context.Context(sibling, options.Options())))
+        assert len(proxy._tls_disconnects["api.openai.com"]) == attempt + 1
+    master.shutdown.assert_called_once_with()
+    assert proxy._tls_failure is not None
+    assert "repeated connections failed" in proxy._tls_failure
+    assert "CA" not in proxy._tls_failure
+    proxy.client_disconnected(failed)
+    assert not proxy._transport_failures
 
 
 def test_handshake_disconnects_are_bounded_by_host_and_time(
@@ -495,7 +804,8 @@ def test_handshake_disconnects_are_bounded_by_host_and_time(
     proxy.tls_failed_client(data)
     assert shutdowns == [True]
     assert proxy._tls_failure is not None
-    assert "may not trust" in proxy._tls_failure
+    assert "repeated connections failed during TLS handshakes" in proxy._tls_failure
+    assert "CA" not in proxy._tls_failure
     assert "private-detail" not in proxy._tls_failure
     assert len(proxy._tls_disconnects["api.openai.com"]) == 3
     assert proxy._tls_disconnects["api.openai.com"].maxlen == 3
@@ -551,9 +861,9 @@ def test_real_silent_ca_rejection_burst_stops_proxy(tmp_path: Path, regular_prox
                         with suppress(ConnectionError):
                             await trusted_writer.wait_closed()
                         assert len(proxy._tls_disconnects[hostname]) == 1
-            with pytest.raises(RuntimeError, match="repeated TLS handshakes failed") as failure:
+            with pytest.raises(RuntimeError, match="repeated connections failed") as failure:
                 await asyncio.wait_for(asyncio.shield(proxy_task), 5)
-            assert "may not trust Capture's CA" in str(failure.value)
+            assert "CA" not in str(failure.value)
             assert "Retry or reload" in str(failure.value)
             assert proxy._master is None
             assert all(not instance.is_running for instance in proxyserver.servers)

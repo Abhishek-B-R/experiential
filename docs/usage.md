@@ -69,10 +69,11 @@ contains the private signing key. Existing unconstrained certificates are not re
 broader trust.
 
 If a client explicitly rejects the Capture certificate, Capture stops interception and prints
-an error. A burst of repeated selected-host handshake disconnects also stops Capture with a
-diagnostic because some clients close the socket without sending a certificate alert. The failed
-connection cannot be repaired in place; retry or reload the app after Capture stops, then configure
-its trust before restarting Capture. Isolated handshake disconnects do not end a run.
+an error with certificate-trust guidance. A burst of repeated selected-host handshake disconnects
+also stops Capture, but those disconnects alone do not identify a certificate problem. Retry or
+reload the app after Capture stops. Isolated handshake disconnects do not end a run, and connections
+closed during shutdown do not trigger a new TLS failure. Native write failures close only the
+affected connection; their resulting disconnects do not count as client certificate failures.
 
 Run the CLI as your normal user, without `sudo`. Mitmproxy Redirector's Network Extension provides
 system-wide interception while the foreground backend is running. Ctrl+C ends that interception;

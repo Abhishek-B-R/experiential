@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from mitmproxy.addons.proxyserver import Proxyserver
 from mitmproxy.proxy.mode_servers import LocalRedirectorInstance
+
+_CONNECTION_SHUTDOWN_TIMEOUT = 2.0
 
 
 async def stop_capture_servers(proxyserver: Proxyserver) -> None:
@@ -19,7 +23,7 @@ async def stop_capture_servers(proxyserver: Proxyserver) -> None:
     for server in tuple(proxyserver.servers):
         try:
             if isinstance(server, LocalRedirectorInstance):
-                await _stop_local_redirector(server)
+                await _stop_local_redirector(server, proxyserver)
             elif server.is_running:
                 await server.stop()
         except Exception as exc:  # noqa: BLE001 - Attempt all owned cleanup before reporting failure.
@@ -31,7 +35,7 @@ async def stop_capture_servers(proxyserver: Proxyserver) -> None:
         ) from errors[0]
 
 
-async def _stop_local_redirector(server: LocalRedirectorInstance) -> None:
+async def _stop_local_redirector(server: LocalRedirectorInstance, proxyserver: Proxyserver) -> None:
     """Release only this instance's native redirector, including partial initialization.
 
     Mitmproxy 12's local mode stores its native handle and owner in class-level
@@ -52,9 +56,56 @@ async def _stop_local_redirector(server: LocalRedirectorInstance) -> None:
     finally:
         # An awaited stop must never confer authority over a replacement owner.
         if cls._server is native and (cls._instance is None or cls._instance is server):
-            native.close()
-            cls._instance = None
-            cls._server = None
-            # Clear ownership before awaiting closure so a new capture can own a
-            # distinct handle without this cleanup clearing it afterward.
-            await native.wait_closed()
+            try:
+                await _quiesce_connections(server, proxyserver)
+            finally:
+                if cls._server is native and (cls._instance is None or cls._instance is server):
+                    native.close()
+                    cls._instance = None
+                    cls._server = None
+                    # Clear ownership before awaiting closure so a new capture can own a
+                    # distinct handle without this cleanup clearing it afterward.
+                    await native.wait_closed()
+
+
+async def _quiesce_connections(server: LocalRedirectorInstance, proxyserver: Proxyserver) -> None:
+    """Close owned writers and drain transport tasks while their native channels still exist.
+
+    Native streams can report an open writer after their command channel closes.
+    Marking each writer closed before releasing the backend prevents pending TLS
+    and UDP events from attempting writes through a terminated native channel.
+    """
+    errors: list[Exception] = []
+    tasks: set[asyncio.Task[None]] = set()
+    for handler in tuple(proxyserver.connections.values()):
+        if handler.client.proxy_mode != server.mode:
+            continue
+        for transport in tuple(handler.transports.values()):
+            if transport.writer is not None:
+                try:
+                    transport.writer.close()
+                except OSError:
+                    # A native stream marks itself closed before reporting a lost channel.
+                    pass
+                except Exception as exc:  # noqa: BLE001 - Close every owned writer first.
+                    errors.append(exc)
+            if transport.handler is not None and not transport.handler.done():
+                tasks.add(transport.handler)
+        tasks.update(task for task in handler.wakeup_timer if not task.done())
+    for task in tasks:
+        task.cancel("Capture is stopping")
+    if tasks:
+        done, pending = await asyncio.wait(tasks, timeout=_CONNECTION_SHUTDOWN_TIMEOUT)
+        for task in done:
+            try:
+                task.result()
+            except (asyncio.CancelledError, OSError):
+                pass
+            except Exception as exc:  # noqa: BLE001 - Native closure must still be attempted.
+                errors.append(exc)
+        if pending:
+            raise RuntimeError("Capture could not finish closing active network connections.")
+    if errors:
+        raise RuntimeError("Capture could not close every active network connection.") from errors[
+            0
+        ]

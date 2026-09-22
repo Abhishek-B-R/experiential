@@ -13,16 +13,17 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from cryptography import x509
-from mitmproxy import certs, http, options, tcp, tls
+from mitmproxy import certs, connection, http, options, tcp, tls
 from mitmproxy.addons.errorcheck import ErrorCheck
 from mitmproxy.addons.proxyserver import Proxyserver
 from mitmproxy.addons.tlsconfig import TlsConfig
-from mitmproxy.proxy import context, layer, layers
+from mitmproxy.proxy import context, layer, layers, server_hooks
 from mitmproxy.tools.dump import DumpMaster
 
 from exp.runtime.capture.normalization import CapturedExchange, CaptureProtocol, capture_protocol
 from exp.runtime.capture.policy import validate_domains
 from exp.runtime.capture.redirector import stop_capture_servers
+from exp.runtime.capture.transports import guard_native_writer
 
 logger = logging.getLogger(__name__)
 
@@ -125,8 +126,10 @@ class CaptureProxy:
         self._upstream_ca_file = upstream_ca_file
         self._captures: dict[str, _Capture] = {}
         self._master: DumpMaster | None = None
+        self._stopping = False
         self._tls_failure: str | None = None
         self._tls_disconnects = {domain: deque[float](maxlen=3) for domain in self._domains}
+        self._transport_failures: set[str] = set()
         self.dropped_exchanges = 0
 
     async def serve(self, *, ca_directory: Path, ready: Callable[[], None]) -> None:
@@ -175,6 +178,7 @@ class CaptureProxy:
                     ready()
                     await master.should_exit.wait()
         finally:
+            self._stopping = True
             try:
                 # Stop redirection before releasing the proxy and upload lifetime.
                 # master.done() alone does not stop mitmproxy's local redirector.
@@ -185,6 +189,7 @@ class CaptureProxy:
                 finally:
                     self._master = None
                     self._finish_pending()
+                    self._transport_failures.clear()
         if self._tls_failure is not None:
             raise RuntimeError(self._tls_failure)
 
@@ -214,8 +219,39 @@ class CaptureProxy:
 
     def shutdown(self) -> None:
         """Request bounded server shutdown without blocking the caller's event loop."""
+        self._stopping = True
         if self._master is not None:
             self._master.shutdown()
+
+    def client_connected(self, client: connection.Client) -> None:
+        """Contain native client write failures within their own connection."""
+        self._guard_transport(client, client)
+
+    def server_connected(self, data: server_hooks.ServerConnectionHookData) -> None:
+        """Apply the same connection lifetime to native upstream UDP writers."""
+        self._guard_transport(data.client, data.server)
+
+    def _guard_transport(self, client: connection.Client, target: connection.Connection) -> None:
+        """Install the native writer guard only in this Capture master's transports."""
+        if self._master is None:
+            return
+        proxyserver = self._master.addons.get("proxyserver")
+        assert isinstance(proxyserver, Proxyserver)
+        guard_native_writer(proxyserver, client, target, self._record_transport_failure)
+
+    def _record_transport_failure(self, client_id: str) -> None:
+        """Attribute failures only while their client remains active."""
+        if self._master is None or self._stopping:
+            return
+        proxyserver = self._master.addons.get("proxyserver")
+        assert isinstance(proxyserver, Proxyserver)
+        handler = proxyserver.connections.get(client_id)
+        if handler is not None and handler.client.timestamp_end is None:
+            self._transport_failures.add(client_id)
+
+    def client_disconnected(self, client: connection.Client) -> None:
+        """Release failure attribution with the owning connection's lifetime."""
+        self._transport_failures.discard(client.id)
 
     def tls_failed_client(self, data: tls.TlsData) -> None:
         """Stop on certificate rejection or repeated selected-host handshake disconnects.
@@ -226,7 +262,7 @@ class CaptureProxy:
         Only a fixed message and an allowlisted hostname leave this hook, never the
         upstream TLS error text or handshake contents.
         """
-        if self._tls_failure is not None or data.conn is not data.context.client:
+        if self._stopping or self._tls_failure is not None or data.conn is not data.context.client:
             return
         host = (data.conn.sni or "").lower().rstrip(".")
         if host not in self._domains:
@@ -236,8 +272,15 @@ class CaptureProxy:
             alert in error for alert in ("unknown ca", "bad certificate", "certificate unknown")
         ):
             diagnosis = f"Capture stopped because a client rejected its certificate for {host}."
-            guidance = "Configure the client to trust Capture's CA"
+            guidance = (
+                "Retry or reload the affected app. Configure the client to trust Capture's CA "
+                "before running exp capture again."
+            )
         elif error.startswith("the client disconnected during the handshake."):
+            if data.context.client.id in self._transport_failures:
+                # This disconnect follows a known native transport failure, not a
+                # client trust decision. Keep unrelated connections running.
+                return
             # Other clients may still succeed on this host; only age clears this burst.
             failures = self._tls_disconnects[host]
             now = time.monotonic()
@@ -247,16 +290,13 @@ class CaptureProxy:
             if len(failures) < 3:
                 return
             diagnosis = (
-                f"Capture stopped after repeated TLS handshakes failed for {host}. "
-                "The client may not trust Capture's CA."
+                "Capture stopped after repeated connections failed during TLS handshakes "
+                f"for {host}."
             )
-            guidance = "Check whether the client trusts Capture's CA"
+            guidance = "Retry or reload the affected app, then run exp capture again."
         else:
             return
-        self._tls_failure = (
-            f"{diagnosis} Retry or reload the affected app. "
-            f"{guidance} before running exp capture again."
-        )
+        self._tls_failure = f"{diagnosis} {guidance}"
         self.shutdown()
 
     def next_layer(self, nextlayer: layer.NextLayer) -> None:

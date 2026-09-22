@@ -3,14 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import socket
 from collections.abc import Awaitable, Callable
+from typing import Literal
+from unittest.mock import Mock
 
 import mitmproxy_rs
 import pytest
+from mitmproxy import options
 from mitmproxy.addons.proxyserver import Proxyserver
-from mitmproxy.proxy.mode_servers import LocalRedirectorInstance, RegularInstance
+from mitmproxy.proxy import commands, context, events, layer
+from mitmproxy.proxy.mode_servers import (
+    LocalRedirectorInstance,
+    ProxyConnectionHandler,
+    RegularInstance,
+)
 
+from exp.runtime.capture import redirector
 from exp.runtime.capture.redirector import stop_capture_servers
 
 
@@ -241,3 +252,253 @@ def test_one_failure_does_not_skip_other_owned_servers(monkeypatch: pytest.Monke
         assert stopped == [regular]
 
     asyncio.run(scenario())
+
+
+class _FinalWrite(layer.Layer):
+    """Model a TLS alert or UDP reply queued while its connection is being closed."""
+
+    def _handle_event(self, event: events.Event) -> layer.CommandGenerator[None]:
+        """Exercise mitmproxy's real SendData dispatch with synthetic content only."""
+        yield commands.SendData(self.context.client, b"synthetic shutdown reply")
+
+
+def _connection(
+    manager: Proxyserver,
+    server: LocalRedirectorInstance,
+    native: FakeNative,
+    protocol: Literal["tcp", "udp"] = "tcp",
+) -> tuple[ProxyConnectionHandler, Mock]:
+    """Register a real mitmproxy handler backed by an inert native-like stream."""
+    writer = Mock(spec=mitmproxy_rs.Stream)
+    writer.get_extra_info.side_effect = lambda name, default=None: {
+        "transport_protocol": protocol,
+        "peername": ("127.0.0.1", 43123),
+        "sockname": ("127.0.0.1", 443),
+    }.get(name, default)
+    closed = False
+
+    def close() -> None:
+        """Mark the native-like writer closed before its backend can disappear."""
+        nonlocal closed
+        closed = True
+        native.events.append("writer-close")
+
+    def write(data: bytes) -> None:
+        """Expose exactly the native error if a late reply reaches a closed backend."""
+        if "close" in native.events:
+            raise OSError("Server has been shut down.")
+        native.events.append("writer-write")
+
+    writer.close.side_effect = close
+    writer.write.side_effect = write
+    writer.is_closing.side_effect = lambda: closed
+    handler = ProxyConnectionHandler(Mock(), writer, writer, options.Options(), server.mode)
+    handler.layer = _FinalWrite(context.Context(handler.client, options.Options()))
+    manager.connections[handler.client.id] = handler
+    return handler, writer
+
+
+@pytest.mark.parametrize("protocol", ["tcp", "udp"])
+@pytest.mark.parametrize("fail_clear", [False, True])
+def test_shutdown_quiesces_late_writes_before_closing_native(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    protocol: Literal["tcp", "udp"],
+    fail_clear: bool,
+) -> None:
+    """Real SendData dispatch cannot hit a closed native channel during TCP or UDP teardown."""
+    native = FakeNative(fail_clear=fail_clear)
+    _fake_start(monkeypatch, native)
+    caplog.set_level(logging.ERROR)
+
+    async def scenario() -> None:
+        """Queue final replies while a simulated active native connection is cancelled."""
+        manager = Proxyserver()
+        server = _local(manager)
+        await server.start()
+        handler, writer = _connection(manager, server, native, protocol)
+        entered = asyncio.Event()
+
+        async def connection() -> None:
+            """Dispatch several shutdown replies through the actual mitmproxy event handler."""
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                for _ in range(3):
+                    await handler.server_event(events.ConnectionClosed(handler.client))
+                native.events.append("connection-drained")
+
+        task = asyncio.create_task(connection())
+        handler.transports[handler.client].handler = task
+        await entered.wait()
+        if fail_clear:
+            with pytest.raises(RuntimeError, match="could not confirm network interception"):
+                await stop_capture_servers(manager)
+        else:
+            await stop_capture_servers(manager)
+        assert task.done()
+        assert writer.is_closing()
+        writer.write.assert_not_called()
+
+    asyncio.run(scenario())
+    assert native.events.index("intercept:") < native.events.index("writer-close")
+    assert native.events.index("writer-close") < native.events.index("connection-drained")
+    assert native.events.index("connection-drained") < native.events.index("close")
+    assert "mitmproxy has crashed" not in caplog.text
+    assert "Server has been shut down" not in caplog.text
+
+
+def test_slow_connection_drain_is_bounded_and_still_closes_native(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An uncooperative task cannot postpone native cleanup beyond its finite drain budget."""
+    monkeypatch.setattr(redirector, "_CONNECTION_SHUTDOWN_TIMEOUT", 0.02)
+    native = FakeNative()
+    _fake_start(monkeypatch, native)
+
+    async def scenario() -> None:
+        """Ignore one cancellation without retaining the network redirector handle."""
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        manager = Proxyserver()
+        server = _local(manager)
+        await server.start()
+        handler, writer = _connection(manager, server, native)
+
+        async def stubborn() -> None:
+            """Delay one connection's cleanup until the bounded native stop has completed."""
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        task = asyncio.create_task(stubborn())
+        handler.transports[handler.client].handler = task
+        await entered.wait()
+        try:
+            with pytest.raises(RuntimeError, match="could not confirm network interception"):
+                await asyncio.wait_for(stop_capture_servers(manager), timeout=0.5)
+            assert native.events[-2:] == ["close", "closed"]
+            assert writer.is_closing()
+            assert LocalRedirectorInstance._server is None
+        finally:
+            release.set()
+            await task
+
+    asyncio.run(scenario())
+
+
+def test_owner_replaced_during_connection_drain_is_preserved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An awaited connection drain cannot close a native handle reused by a new owner."""
+    native = FakeNative()
+    _fake_start(monkeypatch, native)
+
+    async def scenario() -> None:
+        """Start a replacement after interception is cleared but before old tasks finish."""
+        entered = asyncio.Event()
+        replacement_ready = asyncio.Event()
+        previous_manager = Proxyserver()
+        previous = _local(previous_manager)
+        await previous.start()
+        handler, writer = _connection(previous_manager, previous, native)
+        current_manager = Proxyserver()
+        current = _local(current_manager)
+
+        async def connection() -> None:
+            """Use cancellation cleanup to simulate a separately owned replacement instance."""
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await current.start()
+                replacement_ready.set()
+
+        task = asyncio.create_task(connection())
+        handler.transports[handler.client].handler = task
+        await entered.wait()
+        await stop_capture_servers(previous_manager)
+        assert replacement_ready.is_set()
+        assert writer.is_closing()
+        assert LocalRedirectorInstance._instance is current
+        assert "close" not in native.events
+        await stop_capture_servers(current_manager)
+        assert native.events[-2:] == ["close", "closed"]
+
+    asyncio.run(scenario())
+
+
+def test_real_native_udp_stream_closes_before_backend_release(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Real native stream state prevents late sends while an isolated loopback backend closes."""
+    caplog.set_level(logging.ERROR)
+
+    async def scenario() -> None:
+        """Use native UDP transport without installing or activating any macOS extension."""
+        received: asyncio.Future[mitmproxy_rs.Stream] = asyncio.get_running_loop().create_future()
+        release_callback = asyncio.Event()
+
+        async def receive(stream: mitmproxy_rs.Stream) -> None:
+            """Retain one synthetic UDP stream until its owner performs shutdown."""
+            received.set_result(stream)
+            await release_callback.wait()
+
+        backend = await mitmproxy_rs.udp.start_udp_server("127.0.0.1", 0, receive)
+
+        class NativeUdp(FakeNative):
+            """Reuse real native close acknowledgement with an inert interception selector."""
+
+            def close(self) -> None:
+                """Release the real UDP server only after its writer became closed."""
+                assert received.result().is_closing()
+                super().close()
+                backend.close()
+
+            async def wait_closed(self) -> None:
+                """Wait for native transport closure without any operating-system redirector."""
+                await asyncio.wait_for(backend.wait_closed(), timeout=1.0)
+                await super().wait_closed()
+
+        native = NativeUdp()
+        _fake_start(monkeypatch, native)
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sender.sendto(b"synthetic UDP request", backend.getsockname())
+            stream = await asyncio.wait_for(received, timeout=1.0)
+            manager = Proxyserver()
+            server = _local(manager)
+            await server.start()
+            handler = ProxyConnectionHandler(Mock(), stream, stream, options.Options(), server.mode)
+            handler.layer = _FinalWrite(context.Context(handler.client, options.Options()))
+            manager.connections[handler.client.id] = handler
+            entered = asyncio.Event()
+
+            async def connection() -> None:
+                """Dispatch a final datagram after cancellation through the real native writer."""
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    await handler.server_event(events.ConnectionClosed(handler.client))
+                    native.events.append("connection-drained")
+
+            task = asyncio.create_task(connection())
+            handler.transports[handler.client].handler = task
+            await entered.wait()
+            await asyncio.wait_for(stop_capture_servers(manager), timeout=2.0)
+            assert task.done()
+            assert stream.is_closing()
+            assert native.events.index("connection-drained") < native.events.index("close")
+        finally:
+            release_callback.set()
+            sender.close()
+            backend.close()
+            await asyncio.wait_for(backend.wait_closed(), timeout=1.0)
+
+    asyncio.run(scenario())
+    assert "mitmproxy has crashed" not in caplog.text
+    assert "Server has been shut down" not in caplog.text

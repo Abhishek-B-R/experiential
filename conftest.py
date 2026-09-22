@@ -24,6 +24,7 @@ collect_ignore = (
         "exp/runtime/capture/normalization_test.py",
         "exp/runtime/capture/proxy_test.py",
         "exp/runtime/capture/redirector_test.py",
+        "exp/runtime/capture/transports_test.py",
         "exp/runtime/capture/upload_test.py",
     ]
     if sys.version_info < (3, 13)
