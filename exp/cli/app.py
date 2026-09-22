@@ -35,7 +35,7 @@ add_deferred_typer(
     help="Optimize supported frozen project artifacts.",
     known_names=("router", "model"),
 )
-app.command("ingest", help="Create reusable grounded scenarios from local traces.")(ingest)
+app.command("ingest", help="Store file or gateway traces in local SQLite.")(ingest)
 app.command("build", help="Build a reusable grounded world model from local trace evidence.")(build)
 app.command("run", help="Run the local gateway, optionally with one project-backed alias.")(run)
 app.command(

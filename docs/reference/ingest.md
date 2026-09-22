@@ -1,7 +1,7 @@
 # Local trace input
 
-`exp build PROJECT --traces PATH --source SOURCE` reads one explicit local corpus through one canonical
-loader. Each source is declared, never guessed:
+`exp ingest PROJECT --traces PATH --source SOURCE` normalizes a local corpus and commits it to
+`<root>/gateway/traffic.db` (default root: `.exp`). Each source is declared, never guessed:
 
 | `--source` | Local input |
 |---|---|
@@ -14,6 +14,8 @@ loader. Each source is declared, never guessed:
 | `mastra` | Mastra spans, or a `spans` envelope. |
 | `phoenix` | Phoenix and OpenInference spans, native nested, flat dotted, or OTLP JSON. |
 | `chat-json` | OpenAI-style chat conversations, one object, an array, or bare message arrays. |
+| `experiential` | Completed native JSON Chat Completions capture exports. |
+| `gateway` | Retained native captures in a local SQLite database, with required `--identity ID`. |
 
 Every file source accepts JSON or JSONL. A malformed JSONL line is never skipped silently: it is
 retained as an explicit normalization issue. Every normalized trace keeps the immutable source
@@ -38,25 +40,52 @@ The source table is explicit, so an undeclared name fails closed rather than bei
 
 ## Stored evidence
 
-Raw exports remain at the customer path. Experiential stores a normalized immutable snapshot and explicit
-normalization issues under the selected project. Public build accepts 100 through 1000 valid
-normalized traces after validation and source deduplication. The limit applies to normalized traces,
-not to the smaller representative task count that semantic deduplication and mining produce.
+Ingest writes canonical traces and source provenance into the same SQLite content database as
+local gateway capture. Source files stay at the caller's path. The database owns normalized trace
+records, immutable imports, ordered import membership and project associations. It does not yet
+own the other project-folder artifacts. Import does not require an existing project configuration.
 
-No generic vendor-adapter registry and no format detection are part of the command. Build does not
-pull a remote source, propose a rubric, run a judge, or call the selected world model. Representative
-task selection uses the deterministic local hashing embedder unless a Python caller supplies another
-explicit descriptor embedder.
+Canonical content is hashed independently of per-import source provenance, so overlapping exports
+can share identical normalized records. An import ID binds the source format, source digest,
+ordered trace records, normalization exclusions and model identity evidence. Repeat ingestion is
+idempotent. Changed evidence creates another immutable import, including changes to a trace that
+reuses its original ID. Imported evidence survives native capture expiry and count/byte pruning.
+Deleting the shared database also deletes those imports; preserve it when clearing raw captures.
 
-After local trace and split construction, build shows the selected world model and embedder, the
-conservative embedding-cost ceiling, and the configured maximum. An estimate over that maximum
-fails before credentials or provider construction. An estimate within the maximum runs without a
-confirmation prompt, builds the serving and fit-only RAG indexes, and binds the grounded world model.
-`--dry-run` shows the same preflight with no provider call and no completed-build selection. Exact
-replay verifies and reuses completed indexes with no provider call. Anonymous aggregate PostHog
-product telemetry may send after successful persistence unless the user runs
-`exp config telemetry disable`. Telemetry does not include prompts, traces, paths, model names, or
-customer content.
+Each import and project association commits in one transaction. A failed write publishes no partial
+import. Normalization and serialization run before acquiring the writer lock; reads use their own
+SQLite snapshot. Gateway collection and ingestion serialize writes with a bounded lock wait.
+Unsupported database schemas fail before any settings or table changes.
+
+`--dry-run` validates without creating a database or project directory. Ingest has no trace-count
+minimum or total-count ceiling, and it performs no model setup, embedding, simulation or judging.
+`--source gateway --identity ID` defaults to this root's traffic database and reads all retained
+records for that identity, across bounded read pages in one snapshot. `--traces PATH` can select
+another explicit capture database. Identity is never inferred from the project name.
+
+Python callers can restore complete normalized evidence after the original export disappears:
+
+```python
+from pathlib import Path
+from exp.common.traces.sqlite import SQLiteTraceStore
+from exp.common.traces.sqlite_schema import trace_database_path
+from exp.simulation.ingest.persistence import ingest_traces, read_ingested_traces
+
+root = Path(".exp")
+result, receipt = ingest_traces(
+    "powerset", root=root, path=Path("rollouts.jsonl"), source_format="chat-json"
+)
+assert receipt is not None
+store = SQLiteTraceStore(trace_database_path(root))
+import_ids = store.list_imports("powerset")
+restored = read_ingested_traces(root, receipt.import_id)
+assert restored == result
+```
+
+`exp build` remains a separate workflow: it mines representative tasks, selects project model
+roles, estimates embedding cost, builds serving and fit-only RAG indexes, and binds the grounded
+world model under the configured spend ceiling. Its current CLI reads an explicit source corpus.
+Ingest alone does not run or select a build, and does not produce an evaluation or HTML report.
 
 ## Authorized PostHog HogQL pull
 

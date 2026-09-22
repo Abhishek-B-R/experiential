@@ -149,6 +149,7 @@ def normalize_posthog_payload(
         return TraceNormalizationResult(
             traces=(),
             issues=(*issues, TraceNormalizationIssue("posthog-payload", str(exc))),
+            source=source,
         )
     by_trace: dict[str, list[_PostHogEvent]] = defaultdict(list)
     for event in events:

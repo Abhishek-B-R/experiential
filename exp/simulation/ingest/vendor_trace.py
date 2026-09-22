@@ -189,6 +189,7 @@ def build_vendor_traces(
         traces=normalized,
         issues=tuple(issues),
         identity_evidence=normalized_model_identity_evidence(normalized),
+        source=source,
     )
 
 

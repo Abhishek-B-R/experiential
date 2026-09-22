@@ -215,15 +215,19 @@ def _message_observations(
                     message.get("name", message.get("tool_name")),
                     "chat JSON tool message name",
                 ),
-                tool_message=message_text(message.get("content")),
+                tool_message=_exact_message_text(message),
                 tool_call_id=first_text(message, ("tool_call_id", "call_id", "id")),
+                declared_attributes={
+                    "gen_ai.output.messages": [message],
+                    "gen_ai.tool.is_error": message.get("tool_is_error", False),
+                },
                 extensions=extensions,
                 synthetic_time=synthetic,
             ),
         )
     if role != "assistant":
         return ()
-    completion = message_text(message.get("content"))
+    completion = _exact_message_text(message)
     return (
         VendorObservation(
             source_trace_id=source_trace_id,
@@ -237,10 +241,17 @@ def _message_observations(
             completion_text=completion or None,
             tool_calls=declared_tool_calls(message),
             model=model,
+            declared_attributes={"gen_ai.output.messages": [message]},
             extensions=extensions,
             synthetic_time=synthetic,
         ),
     )
+
+
+def _exact_message_text(message: JsonObject) -> str:
+    """Keep source strings exact; structured content also stays in output messages."""
+    content = message.get("content")
+    return content if isinstance(content, str) else message_text(content)
 
 
 def _first_user_message(messages: Sequence[JsonObject]) -> str | None:

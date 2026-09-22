@@ -77,11 +77,13 @@ class TraceNormalizationResult:
         issues: Corrupt or incomplete source records that were excluded without repair.
         identity_evidence: Exact model-span provenance from a telemetry-aware normalizer. ``None``
             marks direct or programmatic records whose digest origin is unspecified.
+        source: Original corpus identity, retained even if every record is excluded.
     """
 
     traces: tuple[Trace, ...]
     issues: tuple[TraceNormalizationIssue, ...]
     identity_evidence: tuple[TraceModelIdentityEvidence, ...] | None = None
+    source: SourceIdentity | None = None
 
     @property
     def invalid_trace_count(self) -> int:
@@ -238,6 +240,7 @@ def normalize_otlp_payloads(
         traces=normalized_traces,
         issues=tuple(issues),
         identity_evidence=normalized_model_identity_evidence(normalized_traces),
+        source=source,
     )
 
 

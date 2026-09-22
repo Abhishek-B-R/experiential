@@ -1,4 +1,4 @@
-"""Ingest local traces into a grounded project without running router optimization."""
+"""Import file or gateway traces into the shared local SQLite content store."""
 
 from pathlib import Path
 
@@ -6,69 +6,84 @@ import typer
 from rich.console import Console
 from rich.prompt import Prompt
 
-from exp.cli.build.app import build
 from exp.cli.shared.consent import can_prompt
 from exp.cli.shared.options import ROOT_OPTION
 from exp.cli.shared.theme import EXP_THEME
+from exp.common.core.artifacts import validate_artifact_id
+from exp.common.traces.sqlite_schema import trace_database_path
+from exp.simulation.ingest.persistence import ingest_traces
 from exp.simulation.ingest.sources import CANONICAL_TRACE_SOURCES
 
 _console = Console(theme=EXP_THEME)
-_TRACE_OPTION = typer.Option(None, "--traces", help="JSON, JSONL, or OTel export.")
+_TRACE_OPTION = typer.Option(
+    None, "--traces", help="JSON, JSONL, OTel export, or gateway database."
+)
 
 
 def ingest(
-    ctx: typer.Context,
     project: str = typer.Argument(..., metavar="PROJECT"),
     traces: Path | None = _TRACE_OPTION,
-    source: str = typer.Option("chat-json", "--source", help="Declared trace format."),
+    source: str = typer.Option("chat-json", "--source", help="Declared trace format, or gateway."),
     root: Path = ROOT_OPTION,
-    world_model: str | None = typer.Option(None, "--world-model"),
-    judge: str | None = typer.Option(None, "--judge"),
-    embedder: str | None = typer.Option(None, "--embedder"),
-    maximum_build_cost_usd: float = typer.Option(5.0, "--max-build-cost-usd", min=0.000001),
-    yes: bool = typer.Option(False, "--yes", "-y"),
-    dry_run: bool = typer.Option(False, "--dry-run"),
+    identity: str | None = typer.Option(
+        None, "--identity", help="Gateway capture identity to import."
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Validate without writing SQLite."),
     non_interactive: bool = typer.Option(False, "--non-interactive"),
 ) -> None:
-    """Normalize, mine, and ground traces for later evaluations.
+    """Store canonical traces and provenance without model setup or paid work.
 
     Args:
-        ctx: Invoking CLI context passed through the shared grounded-build handler.
-        project: Local project name.
-        traces: Explicit export path, or an interactive file prompt.
-        source: Canonical source loader name.
-        root: Local artifact root.
-        world_model: Project environment model alias.
-        judge: Project judge alias.
-        embedder: Retrieval embedding model alias.
-        maximum_build_cost_usd: Embedding spend ceiling.
-        yes: Confirm an allowed estimate.
-        dry_run: Stop after provider-free review.
-        non_interactive: Never prompt for missing setup.
+        project: Local project namespace receiving the import.
+        traces: Explicit source path; gateway sources default to local traffic.db.
+        source: Canonical loader name.
+        root: Local workspace containing the shared traffic database.
+        identity: Required gateway identity; never inferred from project names.
+        dry_run: Validate without changing the database or project directory.
+        non_interactive: Never prompt for a missing file or source.
     """
-    interactive = not non_interactive and can_prompt(_console)
-    if traces is None:
-        if not interactive:
-            raise typer.BadParameter("provide --traces PATH, or run exp ingest in a terminal")
-        traces = Path(Prompt.ask("Trace file", console=_console)).expanduser()
-        source = Prompt.ask(
-            "Trace format", choices=list(CANONICAL_TRACE_SOURCES), default=source, console=_console
+    source = source.strip().casefold()
+    try:
+        validate_artifact_id(project)
+        if source not in CANONICAL_TRACE_SOURCES:
+            raise ValueError(
+                f"unsupported source; choose one of: {', '.join(CANONICAL_TRACE_SOURCES)}"
+            )
+        if source == "gateway":
+            if identity is None:
+                raise ValueError("--source gateway requires --identity ID")
+            traces = traces or trace_database_path(root)
+        elif identity is not None:
+            raise ValueError("--identity requires --source gateway")
+        if traces is None:
+            if non_interactive or not can_prompt(_console):
+                raise ValueError("provide --traces PATH, or run exp ingest in a terminal")
+            traces = Path(Prompt.ask("Trace file", console=_console)).expanduser()
+            source = Prompt.ask(
+                "Trace format",
+                choices=[name for name in CANONICAL_TRACE_SOURCES if name != "gateway"],
+                default=source,
+                console=_console,
+            )
+        result, receipt = ingest_traces(
+            project,
+            root=root,
+            source_format=source,
+            path=traces.expanduser(),
+            identity_id=identity,
+            dry_run=dry_run,
         )
-    build(
-        ctx=ctx,
-        project=project,
-        legacy_trace_file=None,
-        trace_file=traces,
-        source=source,
-        root=root,
-        world_model=world_model,
-        judge=judge,
-        embedder=embedder,
-        top_k=5,
-        maximum_build_cost_usd=maximum_build_cost_usd,
-        yes=yes,
-        maximum_router_cost_usd=None,
-        dry_run=dry_run,
-        no_interactive=not interactive,
-        provider=None,
-    )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    _console.print(f"{len(result.traces)} accepted traces · {len(result.issues)} excluded records")
+    for issue in result.issues:
+        _console.print(f"  {issue.source_record}: {issue.message}", markup=False)
+    if receipt is None:
+        _console.print("Dry run complete. No database or project files written.")
+    else:
+        disposition = "Already imported" if receipt.already_linked else "Imported"
+        _console.print(
+            f"{disposition} for {project}: {receipt.import_id} · {receipt.new_records} new records",
+            markup=False,
+        )
+        _console.print(f"Database: {trace_database_path(root)}", markup=False)

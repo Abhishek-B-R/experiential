@@ -4,6 +4,7 @@ from exp.simulation.ingest.braintrust import BRAINTRUST_SOURCE
 from exp.simulation.ingest.chat_json import CHAT_JSON_SOURCE
 from exp.simulation.ingest.dataset import PersistedTraceDataset, persist_trace_dataset
 from exp.simulation.ingest.experiential import EXPERIENTIAL_SOURCE
+from exp.simulation.ingest.gateway import load_gateway_capture
 from exp.simulation.ingest.langfuse import LANGFUSE_SOURCE
 from exp.simulation.ingest.langsmith import LANGSMITH_SOURCE
 from exp.simulation.ingest.mastra import MASTRA_SOURCE
@@ -36,6 +37,7 @@ from exp.simulation.ingest.vendor_records import VendorTraceFormatError
 from exp.simulation.ingest.vendor_source import VendorSource
 
 __all__ = [
+    "load_gateway_capture",
     "BRAINTRUST_SOURCE",
     "CANONICAL_TRACE_SOURCES",
     "CHAT_JSON_SOURCE",

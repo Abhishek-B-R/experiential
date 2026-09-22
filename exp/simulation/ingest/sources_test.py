@@ -148,6 +148,7 @@ def test_declared_sources_are_the_supported_set() -> None:
         "braintrust",
         "chat-json",
         "experiential",
+        "gateway",
         "langfuse",
         "langsmith",
         "mastra",

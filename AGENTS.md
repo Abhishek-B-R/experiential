@@ -54,13 +54,17 @@ uv run pytest -q
 - `exp/simulation/` owns trace ingestion, representative-task mining, typed simulation specs,
   current engines, orchestration, artifact construction, and comparisons. New modules for those
   responsibilities go inside `exp/simulation/`, never at the flat `exp/` root.
-- `exp ingest PROJECT --traces TRACE_FILE --source SOURCE --root ROOT` and
-  `exp build PROJECT --traces TRACE_FILE --source SOURCE --root ROOT` create immutable task
-  evidence from local traces. The usual starting range is 100 through 1000 normalized traces,
-  which is guidance rather than an enforced limit. Both commands write manifest-bound fit and
-  held-out tasks plus `proposals_pending` review state, build both RAG indexes under a strict
-  embedding-cost ceiling, and bind the grounded world model without a
-  completion or judge call. Route each corpus through an explicit canonical source loader.
+- `exp ingest PROJECT --traces TRACE_FILE --source SOURCE --root ROOT` normalizes local traces
+  into the shared `<root>/gateway/traffic.db` SQLite database. `--source gateway --identity ID`
+  selects retained captures for one explicit gateway identity. Imports preserve canonical traces,
+  exact source provenance, tool definitions/results, normalization exclusions and model identity
+  evidence. Immutable import IDs and project membership are transactional and idempotent. Ingest
+  does not create project folders, mine tasks, configure providers, embed, simulate or judge.
+- `exp build PROJECT --traces TRACE_FILE --source SOURCE --root ROOT` creates immutable task
+  evidence from an explicit corpus. It writes manifest-bound fit and held-out tasks plus
+  `proposals_pending` review state, builds both RAG indexes under a strict embedding-cost ceiling,
+  and binds the grounded world model without a completion or judge call. Route each corpus
+  through an explicit canonical source loader.
 - New trace sources belong in `exp/simulation/ingest/`, normalize into the `Trace` and `TraceSpan`
   contracts in `exp/common/traces/`, support file ingestion, and register from
   `exp/simulation/ingest/__init__.py`.

@@ -10,7 +10,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from exp.cli.build.cost import grounded_build_command, over_ceiling_message
+from exp.cli.build.cost import over_ceiling_message
 from exp.cli.providers.provider_picker import resolve_setup_providers
 from exp.cli.providers.setup import (
     ProviderSetupOptions,
@@ -43,6 +43,7 @@ from exp.common.project import (
     artifact_input,
 )
 from exp.common.release_revision import installed_release_revision
+from exp.runtime.gateway.local_capture import local_capture_path
 from exp.runtime.models import (
     CapabilityRequirement,
     ModelCapabilityError,
@@ -102,7 +103,6 @@ class GroundedBuildCompletion:
 
 
 def build(
-    ctx: typer.Context,
     project: str = _PROJECT_ARGUMENT,
     legacy_trace_file: Path | None = _LEGACY_TRACE_ARGUMENT,
     trace_file: Path | None = _TRACE_FILE_OPTION,
@@ -112,6 +112,9 @@ def build(
         help=f"Trace source format: {', '.join(CANONICAL_TRACE_SOURCES)}.",
     ),
     root: Path = ROOT_OPTION,
+    identity: str | None = typer.Option(
+        None, "--identity", help="Identity whose local gateway traffic supplies the build."
+    ),
     world_model: str | None = typer.Option(None, "--world-model", help="World-model alias."),
     judge: str | None = typer.Option(None, "--judge", help="Judge alias."),
     embedder: str | None = typer.Option(None, "--embedder", help="Embedding-capable alias."),
@@ -158,12 +161,12 @@ def build(
     provider-free preflight before reading credentials or constructing provider clients.
 
     Args:
-        ctx: Invoking CLI context, preserving the command name in authorization and recovery.
         project: Safe local project identifier below ``<root>/projects``.
         legacy_trace_file: Active positional trace-path compatibility for packaged examples.
         trace_file: Explicit local canonical trace export, or ``None`` for the interactive wizard.
         source: Declared local-export format.
         root: Local ``.exp`` artifact root.
+        identity: Required local identity when using ``--source gateway``.
         world_model: Optional configured alias override for this project.
         judge: Optional configured alias override for this project.
         embedder: Optional configured alias override for this project.
@@ -178,11 +181,16 @@ def build(
     Raises:
         typer.BadParameter: Input, setup, role, cost, project, or artifact validation fails.
     """
-    command_name = ctx.info_name or "build"
     if legacy_trace_file is not None:
         if trace_file is not None:
             raise typer.BadParameter("provide traces once, using -t/--traces or the trace path")
         trace_file = legacy_trace_file
+    if source.strip().casefold() == "gateway":
+        if identity is None:
+            raise typer.BadParameter("--source gateway requires --identity ID")
+        trace_file = trace_file or local_capture_path(root)
+    elif identity is not None:
+        raise typer.BadParameter("--identity requires --source gateway")
     if trace_file is None:
         if dry_run or no_interactive or not can_prompt(_console):
             raise typer.BadParameter(
@@ -253,7 +261,11 @@ def build(
         path = _resolve_trace_file(trace_file)
         with progress_display(_console) as progress:
             report(progress, "normalization")
-            normalized = _load_canonical_traces(path, source)
+            normalized = (
+                load_trace_source(source, path, identity_id=identity)
+                if identity is not None
+                else _load_canonical_traces(path, source)
+            )
             if not normalized.traces:
                 raise ValueError(
                     "no valid canonical traces were produced; inspect the input and provide at "
@@ -327,7 +339,6 @@ def build(
             if estimate is not None and estimate > maximum_build_cost_usd:
                 raise ValueError(
                     over_ceiling_message(
-                        command_name=command_name,
                         estimate=estimate,
                         ceiling=maximum_build_cost_usd,
                         project=project,
@@ -345,18 +356,7 @@ def build(
             root=root,
             yes=yes,
             estimated_cost_usd=estimate,
-            command=grounded_build_command(
-                command_name=command_name,
-                project=project,
-                trace_file=trace_file,
-                source=source,
-                root=root,
-                world_model=world_model,
-                judge=judge,
-                embedder=embedder,
-                top_k=top_k,
-                maximum_build_cost_usd=str(maximum_build_cost_usd),
-            ),
+            command=f"exp build {project} {trace_file}",
             non_interactive=no_interactive,
         ):
             return
