@@ -3,11 +3,36 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
 
 from mitmproxy.addons.proxyserver import Proxyserver
 from mitmproxy.proxy.mode_servers import LocalRedirectorInstance
 
 _CONNECTION_SHUTDOWN_TIMEOUT = 2.0
+
+
+def capture_server_closed(proxyserver: Proxyserver) -> Awaitable[None] | None:
+    """Observe closure of the currently owned local backend without stopping it.
+
+    The native method clones its shutdown watch receiver for every waiter. This
+    observer can run alongside cleanup's wait_closed call, and cancelling it
+    does not close the backend or consume another waiter's notification.
+
+    Args:
+        proxyserver: The connection manager owned by this Capture process.
+
+    Returns:
+        The owned native backend's closure notification, or None when no local
+        backend is fully initialized and owned by this manager.
+    """
+    for server in proxyserver.servers:
+        if not isinstance(server, LocalRedirectorInstance):
+            continue
+        cls = type(server)
+        native = cls._server
+        if cls._instance is server and native is not None:
+            return native.wait_closed()
+    return None
 
 
 async def stop_capture_servers(proxyserver: Proxyserver) -> None:
@@ -40,7 +65,7 @@ async def _stop_local_redirector(server: LocalRedirectorInstance, proxyserver: P
 
     Mitmproxy 12's local mode stores its native handle and owner in class-level
     fields. Startup cancellation can leave an owner without a native handle, and
-    ordinary stop deliberately retains the native daemon. This is the single
+    ordinary stop deliberately retains the native daemon. This module owns the
     boundary that accesses those internals so foreground Capture can fully close
     its redirector without changing an unrelated owner's state.
     """

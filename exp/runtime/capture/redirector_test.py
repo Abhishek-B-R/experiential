@@ -22,7 +22,7 @@ from mitmproxy.proxy.mode_servers import (
 )
 
 from exp.runtime.capture import redirector
-from exp.runtime.capture.redirector import stop_capture_servers
+from exp.runtime.capture.redirector import capture_server_closed, stop_capture_servers
 
 
 class FakeNative:
@@ -502,3 +502,90 @@ def test_real_native_udp_stream_closes_before_backend_release(
     asyncio.run(scenario())
     assert "mitmproxy has crashed" not in caplog.text
     assert "Server has been shut down" not in caplog.text
+
+
+def test_backend_notification_requires_initialized_local_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing, partial, regular, and foreign-owned backends never report a false shutdown."""
+    native = FakeNative()
+    _fake_start(monkeypatch, native)
+
+    async def scenario() -> None:
+        """Inspect only ownership metadata without constructing spurious lifetime waiters."""
+        empty = Proxyserver()
+        assert capture_server_closed(empty) is None
+        regular_manager = Proxyserver()
+        regular = RegularInstance.make("regular", regular_manager)
+        regular_manager.servers._instances[regular.mode] = regular
+        assert capture_server_closed(regular_manager) is None
+        previous_manager = Proxyserver()
+        previous = _local(previous_manager)
+        LocalRedirectorInstance._instance = previous
+        assert capture_server_closed(previous_manager) is None
+        LocalRedirectorInstance._instance = None
+        current_manager = Proxyserver()
+        await _local(current_manager).start()
+        assert capture_server_closed(previous_manager) is None
+        assert native.events == [f"intercept:!{os.getpid()}"]
+        await stop_capture_servers(current_manager)
+
+    asyncio.run(scenario())
+
+
+def test_real_native_backend_waiters_are_independent_and_cancellable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled real native watcher neither closes the backend nor steals cleanup's signal."""
+
+    async def scenario() -> None:
+        """Observe a loopback UDP backend through the local-owner seam without OS interception."""
+
+        async def unused(stream: mitmproxy_rs.Stream) -> None:
+            """Close unexpected loopback traffic; this fixture never sends a request."""
+            stream.close()
+
+        backend = await mitmproxy_rs.udp.start_udp_server("127.0.0.1", 0, unused)
+
+        class NativeUdp(FakeNative):
+            """Use the real native lifetime with an inert interception configuration."""
+
+            def close(self) -> None:
+                """Request native shutdown while concurrent observers remain attached."""
+                super().close()
+                backend.close()
+
+            async def wait_closed(self) -> None:
+                """Give every call its own real native shutdown receiver."""
+                await backend.wait_closed()
+                await super().wait_closed()
+
+        native = NativeUdp()
+        _fake_start(monkeypatch, native)
+        manager = Proxyserver()
+        await _local(manager).start()
+        first = capture_server_closed(manager)
+        second = capture_server_closed(manager)
+        assert first is not None and second is not None
+        cancelled = asyncio.ensure_future(first)
+        observer = asyncio.ensure_future(second)
+        try:
+            await asyncio.sleep(0.01)
+            assert not cancelled.done() and not observer.done()
+            cancelled.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancelled
+            assert not observer.done()
+            assert "close" not in native.events
+            await asyncio.wait_for(stop_capture_servers(manager), timeout=1.0)
+            await asyncio.wait_for(observer, timeout=1.0)
+            assert native.events.count("closed") == 2
+            assert capture_server_closed(manager) is None
+        finally:
+            cancelled.cancel()
+            observer.cancel()
+            await asyncio.gather(cancelled, observer, return_exceptions=True)
+            backend.close()
+            await asyncio.wait_for(backend.wait_closed(), timeout=1.0)
+
+    asyncio.run(scenario())

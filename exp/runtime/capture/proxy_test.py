@@ -48,6 +48,143 @@ def regular_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(capture_module, "_capture_options", regular_options)
 
 
+def test_capture_stop_monitor_without_native_owner_waits_for_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ordinary test listener remains active until its requested shutdown."""
+    monkeypatch.setattr(capture_module, "capture_server_closed", lambda manager: None)
+
+    async def run() -> None:
+        """Wait through one event-loop turn before requesting the non-native listener stop."""
+        baseline = asyncio.all_tasks()
+        stop = asyncio.Event()
+        task = asyncio.create_task(capture_module._wait_for_capture_stop(Proxyserver(), stop))
+        await asyncio.sleep(0)
+        assert not task.done()
+        stop.set()
+        await asyncio.wait_for(task, 1)
+        assert asyncio.all_tasks() == baseline
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("ending", ["stop", "cancel", "both"])
+def test_capture_stop_monitor_reaps_native_and_stop_waiters(
+    monkeypatch: pytest.MonkeyPatch, ending: str
+) -> None:
+    """Stop, cancellation, and simultaneous closure finish without leaking either waiter."""
+
+    async def run() -> None:
+        """Use a native-style Future so cancellation and simultaneous completion are observable."""
+        baseline = asyncio.all_tasks()
+        closed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        monkeypatch.setattr(capture_module, "capture_server_closed", lambda manager: closed)
+        stop = asyncio.Event()
+        task = asyncio.create_task(capture_module._wait_for_capture_stop(Proxyserver(), stop))
+        await asyncio.sleep(0)
+        assert not task.done()
+        if ending == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            if ending == "both":
+                closed.set_result(None)
+            stop.set()
+            await asyncio.wait_for(task, 1)
+        assert closed.done()
+        assert closed.cancelled() is (ending != "both")
+        assert asyncio.all_tasks() == baseline
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("backend_error", [False, True])
+def test_capture_stop_monitor_reports_unexpected_native_end_without_raw_error(
+    monkeypatch: pytest.MonkeyPatch, backend_error: bool
+) -> None:
+    """Native completion or failure produces one fixed message and cleans the remaining waiter."""
+
+    async def run() -> None:
+        """End an observed backend independently of Capture's stop request."""
+        baseline = asyncio.all_tasks()
+        closed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        monkeypatch.setattr(capture_module, "capture_server_closed", lambda manager: closed)
+        stop = asyncio.Event()
+        task = asyncio.create_task(capture_module._wait_for_capture_stop(Proxyserver(), stop))
+        await asyncio.sleep(0)
+        if backend_error:
+            closed.set_exception(OSError("synthetic private backend detail"))
+        else:
+            closed.set_result(None)
+        with pytest.raises(RuntimeError) as failure:
+            await asyncio.wait_for(task, 1)
+        assert str(failure.value) == (
+            "Capture network backend stopped unexpectedly. Run exp capture again."
+        )
+        assert not stop.is_set()
+        assert asyncio.all_tasks() == baseline
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("backend_dies", [False, True])
+def test_real_proxy_stops_cleanly_after_backend_lifetime_ends(
+    tmp_path: Path,
+    regular_proxy: None,
+    monkeypatch: pytest.MonkeyPatch,
+    backend_dies: bool,
+) -> None:
+    """Drive actual proxy startup and cleanup with an independently controlled backend monitor."""
+
+    async def run() -> None:
+        """Close an isolated loopback listener after backend death or a normal Capture stop."""
+        closed = asyncio.Event()
+        monitor_finished = asyncio.Event()
+
+        async def backend_closed() -> None:
+            """Expose a fake native lifetime and prove its monitor is reaped during cleanup."""
+            try:
+                await closed.wait()
+            finally:
+                monitor_finished.set()
+
+        monkeypatch.setattr(
+            capture_module, "capture_server_closed", lambda manager: backend_closed()
+        )
+        proxy = CaptureProxy(sink=lambda exchange: True, domains=("api.openai.com",))
+        ready = asyncio.Event()
+        task = asyncio.create_task(proxy.serve(ca_directory=tmp_path / "proxy", ready=ready.set))
+        try:
+            await asyncio.wait_for(ready.wait(), 5)
+            assert proxy._master is not None
+            manager = proxy._master.addons.get("proxyserver")
+            assert isinstance(manager, Proxyserver)
+            port = next(iter(manager.servers)).listen_addrs[0][1]
+            if backend_dies:
+                closed.set()
+                with pytest.raises(RuntimeError) as failure:
+                    await asyncio.wait_for(task, 5)
+                assert str(failure.value) == (
+                    "Capture network backend stopped unexpectedly. Run exp capture again."
+                )
+            else:
+                proxy.shutdown()
+                await asyncio.wait_for(task, 5)
+            assert monitor_finished.is_set()
+            assert proxy._master is None
+            assert proxy._tls_failure is None
+            assert all(not server.is_running for server in manager.servers)
+            with pytest.raises(OSError):
+                await asyncio.open_connection("127.0.0.1", port)
+        finally:
+            if not task.done():
+                proxy.shutdown()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
 async def _connect_tls(
     proxy: CaptureProxy,
     upstream_port: int,

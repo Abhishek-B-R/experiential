@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -22,7 +23,7 @@ from mitmproxy.tools.dump import DumpMaster
 
 from exp.runtime.capture.normalization import CapturedExchange, CaptureProtocol, capture_protocol
 from exp.runtime.capture.policy import validate_domains
-from exp.runtime.capture.redirector import stop_capture_servers
+from exp.runtime.capture.redirector import capture_server_closed, stop_capture_servers
 from exp.runtime.capture.transports import guard_native_writer
 
 logger = logging.getLogger(__name__)
@@ -176,7 +177,7 @@ class CaptureProxy:
                 await master.running()
                 if not master.should_exit.is_set():
                     ready()
-                    await master.should_exit.wait()
+                    await _wait_for_capture_stop(proxyserver, master.should_exit)
         finally:
             self._stopping = True
             try:
@@ -497,6 +498,34 @@ class CaptureProxy:
         except Exception:  # noqa: BLE001
             self.dropped_exchanges += 1
             logger.warning("Capture queue rejected an exchange; inference is unaffected")
+
+
+async def _wait_for_capture_stop(proxyserver: Proxyserver, stop: asyncio.Event) -> None:
+    """Observe native backend termination independently from per-connection errors.
+
+    Cancellation drops only this waiter's notification receiver. The server owner
+    retains responsibility for stopping interception and awaiting native closure.
+
+    Raises:
+        RuntimeError: The owned native backend exits before Capture requests a stop.
+    """
+    closed = capture_server_closed(proxyserver)
+    if closed is None:
+        await stop.wait()
+        return
+    backend_task = asyncio.ensure_future(closed)
+    stop_task = asyncio.create_task(stop.wait())
+    try:
+        done, _ = await asyncio.wait((backend_task, stop_task), return_when=asyncio.FIRST_COMPLETED)
+        if backend_task in done and not stop.is_set():
+            cause = None if backend_task.cancelled() else backend_task.exception()
+            raise RuntimeError(
+                "Capture network backend stopped unexpectedly. Run exp capture again."
+            ) from cause
+    finally:
+        backend_task.cancel()
+        stop_task.cancel()
+        await asyncio.gather(backend_task, stop_task, return_exceptions=True)
 
 
 def _capture_options(domains: tuple[str, ...], ca_directory: Path) -> options.Options:

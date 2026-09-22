@@ -74,6 +74,7 @@ also stops Capture, but those disconnects alone do not identify a certificate pr
 reload the app after Capture stops. Isolated handshake disconnects do not end a run, and connections
 closed during shutdown do not trigger a new TLS failure. Native write failures close only the
 affected connection; their resulting disconnects do not count as client certificate failures.
+If the native capture backend itself exits, Capture stops and reports that failure.
 
 Run the CLI as your normal user, without `sudo`. Mitmproxy Redirector's Network Extension provides
 system-wide interception while the foreground backend is running. Ctrl+C ends that interception;
