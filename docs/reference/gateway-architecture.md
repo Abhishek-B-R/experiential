@@ -43,19 +43,6 @@ It serves:
 this same gateway application. It does not create a router HTTP server. Gateway startup and readiness
 perform no provider request. Only an authorized model request may cross the provider boundary.
 
-Image-emitting Chat models on Gemini and OpenAI-compatible wires return inline raster images
-in `choices[].delta.images[].image_url.url` while streaming and
-`choices[].message.images[].image_url.url` when buffered. Each URL is a complete base64 PNG,
-JPEG, WebP, or GIF. Text and token usage remain in their ordinary fields. Replay generated
-images as assistant `content` parts with `type: "image_url"`; Gemini reconstructs caller-owned
-history with its documented signature-validation bypass, as it does for replayed function calls.
-This does not preserve provider-private reasoning signatures.
-Image lanes request text and images explicitly on Gemini and OpenRouter, allow bounded SSE
-frames up to 64 MiB, and share the 64 MiB aggregate output bound. Output guardrails that inspect
-text cannot inspect image pixels, so protected image output fails closed. Known image-emitting
-models on unsupported completion surfaces are refused before dispatch; use Chat Completions
-or a separately supported Images API route. The Images API capability remains independent.
-
 Chat Completions and Responses tool-call IDs are opaque strings of 1 to 65,536 characters.
 Replay each complete ID, including any signature suffix, in both the assistant call and tool result.
 OpenAI-compatible Chat routes preserve IDs verbatim; other API dialects may restrict their wire shape.
