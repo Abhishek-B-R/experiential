@@ -29,7 +29,11 @@ from exp.runtime.gateway.embeddings_contracts import (
     ServingRequest,
     embeddings_input_ceiling_nano_usd,
 )
-from exp.runtime.gateway.images_contracts import ImagesRequest, images_ceiling_nano_usd
+from exp.runtime.gateway.images_contracts import (
+    MAXIMUM_IMAGE_OUTPUT_TOKENS,
+    ImagesRequest,
+    images_ceiling_nano_usd,
+)
 from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.ledger_valuation import (
     MAXIMUM_NANO_USD,
@@ -573,11 +577,17 @@ def maximum_attempt_cost_nano_usd(
                 input_rate=deployment.gateway.prices.input_nano_usd_per_million_tokens,
             )
         case ImagesRequest():
+            image_card = deployment.gateway.prices.images
             return images_ceiling_nano_usd(
                 request,
                 input_tokens=input_tokens,
                 input_rate=deployment.gateway.prices.input_nano_usd_per_million_tokens,
                 output_rate=deployment.gateway.prices.output_nano_usd_per_million_tokens,
+                output_tokens_per_image=(
+                    image_card.maximum_output_tokens_per_image
+                    if image_card is not None
+                    else MAXIMUM_IMAGE_OUTPUT_TOKENS
+                ),
             )
         case GatewayRequest() | DecisionRequest():
             return _token_attempt_cost_nano_usd(request, deployment, input_tokens)

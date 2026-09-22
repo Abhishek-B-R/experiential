@@ -62,6 +62,7 @@ def images_ceiling_nano_usd(
     input_tokens: int,
     input_rate: int | None,
     output_rate: int | None,
+    output_tokens_per_image: int = MAXIMUM_IMAGE_OUTPUT_TOKENS,
 ) -> int | None:
     """Return the conservative reservation ceiling for one token-priced image call.
 
@@ -75,7 +76,7 @@ def images_ceiling_nano_usd(
     if input_rate is None or output_rate is None:
         return None
     input_ceiling = input_tokens * input_rate
-    output_ceiling = request.n * MAXIMUM_IMAGE_OUTPUT_TOKENS * output_rate
+    output_ceiling = request.n * output_tokens_per_image * output_rate
     return require_representable_nano_usd(
         (input_ceiling + output_ceiling + 999_999) // 1_000_000,
         what="images reservation ceiling",

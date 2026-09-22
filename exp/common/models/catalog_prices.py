@@ -60,7 +60,9 @@ class GatewayServiceTierPrices(ContractModel):
 
 
 class GatewayImagePrices(ContractModel):
-    """Separate token rates for the Images API, never applied to text chat."""
+    """Separate token rates and conservative image ceiling, never applied to chat."""
+
+    maximum_output_tokens_per_image: int = Field(gt=0, le=1_000_000)
 
     input_nano_usd_per_million_tokens: int = Field(
         ge=0, le=MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS

@@ -167,6 +167,7 @@ def _engine(
             input_nano_usd_per_million_tokens=5_000_000,
             output_nano_usd_per_million_tokens=40_000_000,
             images=GatewayImagePrices(
+                maximum_output_tokens_per_image=128_000,
                 input_nano_usd_per_million_tokens=8_000_000_000,
                 output_nano_usd_per_million_tokens=30_000_000_000,
             )

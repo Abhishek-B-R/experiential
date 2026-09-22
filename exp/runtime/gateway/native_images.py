@@ -190,6 +190,7 @@ def _admit_accepted(
                     "gateway": deployment.gateway.model_copy(
                         update={
                             "prices": GatewayTokenPrices(
+                                images=card,
                                 input_nano_usd_per_million_tokens=card.input_nano_usd_per_million_tokens,
                                 output_nano_usd_per_million_tokens=card.output_nano_usd_per_million_tokens,
                             )
