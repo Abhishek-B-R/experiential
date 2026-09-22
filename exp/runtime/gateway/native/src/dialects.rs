@@ -642,12 +642,9 @@ impl Normalizer {
         ))
     }
 
-    /// Recover a Gemini stream that emitted content and then terminated
-    /// *abnormally* — a broken transport read, a malformed frame, or a decoder
-    /// error — rather than closing cleanly. `on_stream_end` covers the clean
-    /// end (last content frame, then EOF, no terminal frame); this covers the
-    /// abnormal end, where the underlying failure would otherwise discard a
-    /// real partial answer.
+    /// Recover Gemini content after a transport, frame, or decoder failure.
+    /// `on_stream_end` covers a clean EOF without a terminal frame; this covers
+    /// abnormal ends where the failure would otherwise discard a partial answer.
     ///
     /// Scoped to Gemini: Gemini uniquely ends legitimate turns without a
     /// terminal frame, so a break after content is far more likely a
@@ -661,12 +658,14 @@ impl Normalizer {
     /// malformed reject. Any non-Gemini dialect, or a stream already terminated,
     /// keeps the original failure unchanged.
     ///
-    /// A retained-output overflow is never recovered: it is a deliberate gateway
-    /// limit (`provider_output_too_large`), not a provider abnormality, so
-    /// converting it to `Incomplete` would deliver and bill an over-limit partial
-    /// instead of surfacing the overflow — regardless of dialect or content.
+    /// Deliberate output limits and nonretryable validation failures remain errors:
+    /// recovery must not regenerate a rejected image or disguise it as partial output.
     pub fn recover_abnormal_end(&mut self, failure: Failure) -> Result<Vec<Event>, Failure> {
-        if failure.safe_message == OUTPUT_OVERFLOW_MESSAGE {
+        if failure.safe_message == OUTPUT_OVERFLOW_MESSAGE
+            || (failure.failure_class == FailureClass::MalformedResponse
+                && !failure.retryable_same_deployment
+                && !failure.failover_eligible)
+        {
             return Err(failure);
         }
         if self.terminal || self.dialect != Dialect::GeminiGenerateContent {

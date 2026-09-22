@@ -379,8 +379,8 @@ class _Message(_WireModel):
         media = {type(part) for part in self.image_capable_parts} - {_TextPart}
         if media and self.role not in ("user", "tool", "assistant"):
             raise ValueError(
-                "image, video, and audio parts are valid only for user messages "
-                "(a tool message may carry image parts beside its text)"
+                "media parts are valid only for user messages "
+                "(tool and assistant messages may carry image parts beside their text)"
             )
         if self.role in ("tool", "assistant") and media - {_ChatImagePart, _ResponsesImagePart}:
             raise ValueError(f"{self.role} messages carry only text and image parts")
