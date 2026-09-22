@@ -10,7 +10,7 @@ from exp.common.models import AssistantAction
 from exp.common.rollouts import StopReason
 from exp.common.tasks import TaskCase
 from exp.runtime.agents import AgentEpisode, AgentRuntime, execute_agent_episode
-from exp.simulation.engines.text.environment import TextOnlyEnvironmentRuntime
+from exp.simulation.engines.text.environment import SimulatedEnvironmentRuntime
 from exp.simulation.engines.text.recording import RecordingCandidateClient
 
 
@@ -45,7 +45,7 @@ def execute_text_episode_loop(
 
     Args:
         agent_factory: Creates one isolated customer runtime for the simulation cell.
-        task: Canonical text-only representative task.
+        task: Canonical task and declared simulated tool schemas.
         recorder: Candidate client that records each candidate and world-model transition.
 
     Returns:
@@ -57,7 +57,7 @@ def execute_text_episode_loop(
         prior_turn_count = recorder.candidate_turn_count
         episode = execute_agent_episode(
             agent,
-            TextOnlyEnvironmentRuntime(),
+            SimulatedEnvironmentRuntime(recorder.observe_tool),
             task,
             recorder,
         )

@@ -37,9 +37,9 @@ product telemetry, which may send unless disabled. Gateway startup makes no prov
 build calls only the configured embedder; automatic router optimization separately executes the
 bounded candidate, world-model, and judge schedule shown in its cost preflight.
 An authenticated gateway request is the explicit online model-call boundary. Project selectors
-remain frozen for the process lifetime and return only an exact model pool. `--ghost` remains a
-compatibility flag for project-journal behavior; gateway authentication, replay, attempts, and
-usage accounting stay enabled.
+remain frozen for the process lifetime and return only an exact model pool. `--ghost` disables
+local traffic content capture; gateway authentication, replay, attempts, and usage accounting
+stay enabled.
 
 The default and project gateway forms use one gateway lifecycle. It binds only `127.0.0.1`, starts with no
 provider call, and requires an explicit provider environment reference, exact model alias, identity,
@@ -157,7 +157,21 @@ quality measurement can call the separate `build_fidelity_evaluation_plan` and
 `build_fidelity_report` APIs; those results never enter router fitting or activation. Fidelity
 reports contain measurements only, never an approval or denial. See the
 [router contracts](reference/router_optimization_config.md).
-# Local gateway traffic
+
+### Simulated tool observations
+
+Text world models generate environment observations for declared tools. Candidate tool calls are
+passed to the world model together with schemas, the visible transcript, retrieved trace examples,
+and private environment state. Parallel calls receive one ordered tool message per call ID; no
+external tool implementation runs. Malformed observation batches are invalid rollouts.
+
+The public session API accepts `world.new_session(task="Research", tools=(tool_schema,))` followed
+by `world.step(session.id, assistant_message)`. Each result exposes `messages`, an ordered tuple
+of OpenAI user or tool messages, and `terminal`. Tool observations are nonterminal so the agent can
+consume them before producing its final answer. World-model artifacts pin the v2 prompt; rebuild
+projects created with a different prompt before running them.
+
+### Local gateway traffic
 
 See [local traffic capture](reference/local_gateway_traffic.md) for default-on,
 identity-scoped collection and `exp build --source gateway --identity ID`.

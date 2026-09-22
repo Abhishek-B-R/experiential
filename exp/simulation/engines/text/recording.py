@@ -1,4 +1,4 @@
-"""Visible-turn recording, context preflight, and text-only model-call boundaries."""
+"""Visible-turn recording, context preflight, and simulated model-call boundaries."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
+from threading import Lock
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 from pydantic import JsonValue
@@ -14,6 +15,7 @@ from pydantic import JsonValue
 from exp.common.core.artifacts import (
     FailureAttribution,
     FailureCode,
+    JsonObject,
     StructuredFailure,
 )
 from exp.common.models import (
@@ -28,6 +30,7 @@ from exp.common.models import (
     ModelSnapshot,
     NumericMeasurement,
     OperationEconomics,
+    ToolCall,
     combine_economics,
     completion_request_cost_usd,
     reconcile_completion_economics,
@@ -40,16 +43,21 @@ from exp.common.rollouts import (
     StopReason,
 )
 from exp.common.tasks import TaskCase
+from exp.runtime.environments import Observation
 from exp.runtime.models import ResolvedModel
 from exp.runtime.models.providers.transport import classify_retry
 from exp.simulation.engines.clock import timestamp
+from exp.simulation.engines.text.environment import SimulatedToolUseError
 from exp.simulation.engines.text.prompt import (
+    SimulatedToolResult,
     TextWorldModelProtocolError,
     TextWorldModelTransition,
+    candidate_rag_actions,
     text_prompt_sha256,
 )
 from exp.simulation.engines.text.redaction import redact_json
-from exp.simulation.retrieval import RAGAction, RAGQuery
+from exp.simulation.retrieval import RAGQuery
+from exp.simulation.retrieval.transitions import render_rag_key
 
 if TYPE_CHECKING:
     from exp.simulation.world_model import GroundedWorldModel
@@ -133,10 +141,10 @@ class RecordingCandidateClient:
         clock: Callable[[], datetime],
         token_counter: TokenCounter,
     ) -> None:
-        """Bind one task, two independent model clients, and strict text-mode boundaries.
+        """Bind one task, two independent model clients, and strict simulation boundaries.
 
         Args:
-            task: Canonical no-tools task currently being simulated.
+            task: Canonical task currently being simulated.
             candidate: Candidate model injected into the customer agent.
             world_model: Model that simulates the next visible text turn.
             grounded_world_model: Artifact-bound executor over the exact fit-only index.
@@ -177,10 +185,35 @@ class RecordingCandidateClient:
         self._retrieval_economics: list[OperationEconomics] = []
         self._visible_transcript: tuple[ModelMessage, ...] = ()
         self._terminal = False
+        self._environment_state: JsonObject = {}
+        self._pending_tools: dict[str, tuple[ToolCall, SimulatedToolResult]] = {}
+        self._tool_lock = Lock()
         self._failure: TextSimulationError | None = None
         self._provider_dispatch_unknown_spend = False
         self._unknown_dispatch_reserved_cost_usd: float | None = None
         self._overspend_warned = False
+
+    def observe_tool(self, action: ToolCall) -> Observation:
+        """Consume exactly one generated result for the pending candidate invocation.
+
+        Args:
+            action: Exact call emitted by the candidate, including its arguments and ID.
+
+        Returns:
+            Simulated content and error status, without external tool execution.
+
+        Raises:
+            SimulatedToolUseError: The call is unknown, modified, or already consumed.
+        """
+        with self._tool_lock:
+            pending = self._pending_tools.get(action.call_id)
+            if pending is None or pending[0] != action:
+                raise SimulatedToolUseError(
+                    "tool call does not match an unconsumed simulated result"
+                )
+            del self._pending_tools[action.call_id]
+        result = pending[1]
+        return Observation(content=result.content, is_error=result.is_error)
 
     @property
     def terminal_error(self) -> TextSimulationError | None:
@@ -259,7 +292,7 @@ class RecordingCandidateClient:
             Candidate response after the corresponding world-model turn has been recorded.
 
         Raises:
-            TextSimulationError: The request uses tools, overflows context, reaches a terminal
+            TextSimulationError: The request overflows context, reaches a terminal
                 limit, or either model returns an unsupported or truncated response.
         """
         try:
@@ -318,7 +351,20 @@ class RecordingCandidateClient:
                 f"text simulation reached its maximum of {self._maximum_steps} candidate turns",
                 phase="candidate_turn_limit",
             )
-        _require_text_only_candidate_request(request)
+        if self._pending_tools:
+            raise _text_failure(
+                StopReason.FAILURE,
+                FailureCode.VALIDATION,
+                "consume every simulated tool result before requesting another candidate turn",
+                phase="pending_tool_results",
+            )
+        if request.tools != self._task.tools:
+            raise _text_failure(
+                StopReason.FAILURE,
+                FailureCode.VALIDATION,
+                "candidate request must preserve the task's declared tool schemas",
+                phase="candidate_tools",
+            )
         candidate_request = _bounded_candidate_request(
             request,
             visible_transcript=self._visible_transcript,
@@ -379,20 +425,50 @@ class RecordingCandidateClient:
         _require_response_identity(candidate_response, self._candidate, role="candidate")
         self._clear_unknown_dispatch()
         _require_complete_response(candidate_response, role="candidate")
-        _require_text_only_action(candidate_response.output, role="candidate")
-        candidate_content = candidate_response.output.content
-        if candidate_content is None:  # pragma: no cover - text-only validation guarantees text
-            raise TypeError("text-only candidate response omitted visible content")
-        rag_query = RAGQuery(
-            task=self._task.instruction,
-            initial_context=self._task.initial_context,
-            action=RAGAction(kind="message", content=candidate_content),
-            excluded_lineage_ids=(self._task.lineage_group_id,),
-            top_k=self._grounded_world_model.artifact.top_k,
+        calls = candidate_response.output.tool_calls
+        names = {tool.name for tool in self._task.tools}
+        if any(call.name not in names for call in calls) or len({c.call_id for c in calls}) != len(
+            calls
+        ):
+            raise _text_failure(
+                StopReason.FAILURE,
+                FailureCode.VALIDATION,
+                "candidate tool calls require declared tool names and unique call IDs",
+                phase="candidate_tools",
+            )
+        queries = tuple(
+            RAGQuery(
+                task=self._task.instruction,
+                initial_context=self._task.initial_context,
+                action=action,
+                excluded_lineage_ids=(self._task.lineage_group_id,),
+                top_k=self._grounded_world_model.artifact.top_k,
+            )
+            for action in candidate_rag_actions(candidate_response.output)
         )
-        query_economics = self._grounded_world_model.retriever.estimate_query_economics(
-            rag_query,
-            self._query_embedding,
+        query_bytes = max(
+            len(
+                render_rag_key(
+                    task=query.task, initial_context=query.initial_context, action=query.action
+                ).encode("utf-8")
+            )
+            for query in queries
+        )
+        if query_bytes > self._query_embedding.maximum_input_tokens:
+            raise _text_failure(
+                StopReason.MAXIMUM_COST,
+                FailureCode.BUDGET,
+                "grounding query exceeds its reserved input-token ceiling",
+                phase="query_embedding_budget",
+            )
+        query_economics = combine_economics(
+            tuple(
+                self._grounded_world_model.retriever.estimate_query_economics(
+                    query, self._query_embedding
+                )
+                for query in queries
+            ),
+            require_complete_usage=False,
         )
         self._check_spend_ceiling(role="query embedding")
         self._retrieval_economics.append(query_economics)
@@ -402,6 +478,7 @@ class RecordingCandidateClient:
                 visible_messages=candidate_request.messages,
                 candidate_response=candidate_response.output,
                 excluded_lineage_ids=(self._task.lineage_group_id,),
+                state=self._environment_state,
                 maximum_output_tokens=self._maximum_output_tokens,
             ),
             # The retained retrieval estimate above already covers this dispatch's worst case
@@ -485,8 +562,13 @@ class RecordingCandidateClient:
         self._visible_transcript = (
             *self._visible_transcript,
             ModelMessage(role="assistant", assistant_action=candidate_response.output),
-            transition.visible_message,
+            *transition.visible_messages,
         )
+        self._environment_state = transition.state
+        self._pending_tools = {
+            call.call_id: (call, result)
+            for call, result in zip(calls, transition.tool_results, strict=True)
+        }
         self._terminal = transition.terminal
         return candidate_response
 
@@ -683,7 +765,7 @@ def _bounded_candidate_request(
         update={
             "messages": _messages_with_visible_transcript(request.messages, visible_transcript),
             "maximum_output_tokens": requested_budget or maximum_output_tokens,
-            "tool_choice": "none",
+            "tool_choice": request.tool_choice,
         }
     )
 
@@ -692,36 +774,15 @@ def _messages_with_visible_transcript(
     messages: tuple[ModelMessage, ...],
     visible_transcript: tuple[ModelMessage, ...],
 ) -> tuple[ModelMessage, ...]:
-    """Append retained visible turns unless a stateful agent already supplied that suffix."""
+    """Merge retained turns before the matching suffix owned by a restarted agent."""
     if not visible_transcript:
         return messages
-    if len(messages) >= len(visible_transcript) and messages[-len(visible_transcript) :] == (
-        visible_transcript
-    ):
-        return messages
+    for overlap in range(min(len(messages), len(visible_transcript)), 0, -1):
+        suffix = visible_transcript[-overlap:]
+        # Match a complete action boundary, never a coincidentally identical task/user prompt.
+        if suffix[0].role == "assistant" and messages[-overlap:] == suffix:
+            return (*messages[:-overlap], *visible_transcript)
     return (*messages, *visible_transcript)
-
-
-def _require_text_only_candidate_request(request: ModelRequest) -> None:
-    """Reject candidate tool configuration before it can reach a provider."""
-    if request.tools or (request.tool_choice is not None and request.tool_choice != "none"):
-        raise _text_failure(
-            StopReason.FAILURE,
-            FailureCode.UNSUPPORTED,
-            "text simulation accepts only tool-free candidate requests; use sandbox mode for tools",
-            phase="candidate_tools",
-        )
-
-
-def _require_text_only_action(action: AssistantAction, *, role: str) -> None:
-    """Reject tool-call outputs that cannot be simulated in the v1 text engine."""
-    if action.tool_calls or action.content is None:
-        raise _text_failure(
-            StopReason.FAILURE,
-            FailureCode.UNSUPPORTED,
-            f"{role} emitted tool calls or no visible text; use sandbox mode for tools",
-            phase=f"{role.replace(' ', '_')}_tools",
-        )
 
 
 def _require_response_identity(
