@@ -6,9 +6,10 @@ import logging
 import math
 import os
 import stat
+import threading
 import time
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -20,7 +21,7 @@ from pydantic import AwareDatetime, Field, ValidationError, field_validator, mod
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256, canonical_json_bytes
 from exp.common.core.files import fsync_directory_best_effort
-from exp.common.core.locks import FileLockTimeout, file_write_lock
+from exp.common.core.locks import DEFAULT_LOCK_TIMEOUT_S, FileLockTimeout, file_write_lock
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +159,7 @@ class TextCellLeaseStore:
         self._stale_after = timedelta(seconds=stale_after_seconds)
         self._poll_interval_seconds = poll_interval_seconds
         self._wait_timeout_seconds = wait_timeout_seconds
+        self._admission_lock = threading.Lock()
 
     def acquire(
         self,
@@ -237,6 +239,9 @@ class TextCellLeaseStore:
     def release(self, lease: TextCellLease) -> None:
         """Remove this owner's claim after its immutable rollout is safely persisted.
 
+        Lock or filesystem cleanup failures are logged and leave the claim intact. A later
+        admission reaps it using the authoritative rollout, without repeating provider work.
+
         Args:
             lease: Exact active claim obtained from ``acquire`` or its durable intent successor.
 
@@ -246,7 +251,7 @@ class TextCellLeaseStore:
         self._ensure_directory()
         path = self._path(lease.lease_id)
         try:
-            with file_write_lock(self._admission_path(), what="text simulation cell admission"):
+            with self._admission_transaction():
                 existing = self._read_optional(path)
                 if existing is None:
                     return
@@ -256,7 +261,7 @@ class TextCellLeaseStore:
                         f"text-cell lease {lease.lease_id!r} changed before its owner released it"
                     )
                 self._reap(path, existing)
-        except OSError as exc:
+        except (OSError, FileLockTimeout) as exc:
             logger.warning(
                 "could not release text-cell lease %s after immutable rollout persistence: %s",
                 lease.lease_id,
@@ -303,7 +308,7 @@ class TextCellLeaseStore:
         self._ensure_directory()
         path = self._path(lease.lease_id)
         intended = lease.model_copy(update={"dispatch_intent_recorded": True})
-        with file_write_lock(self._admission_path(), what="text simulation cell admission"):
+        with self._admission_transaction():
             existing = self._read_optional(path)
             if existing is None:
                 raise TextCellLeaseError(
@@ -335,11 +340,7 @@ class TextCellLeaseStore:
     ) -> TextCellLeaseClaim | None:
         """Make one lock-protected admission attempt, returning ``None`` for a live follower."""
         self._ensure_directory()
-        with file_write_lock(
-            self._admission_path(),
-            what="text simulation cell admission",
-            timeout_s=lock_timeout_seconds,
-        ):
+        with self._admission_transaction(timeout_s=lock_timeout_seconds):
             path = self._path(lease_id)
             existing = self._read_optional(path)
             now = _aware_now(self._clock)
@@ -396,6 +397,38 @@ class TextCellLeaseStore:
             )
             self._write_exclusive(path, lease)
             return TextCellLeaseClaim(TextCellLeaseState.OWNED, lease, spend)
+
+    @contextmanager
+    def _admission_transaction(
+        self, *, timeout_s: float = DEFAULT_LOCK_TIMEOUT_S
+    ) -> Iterator[None]:
+        """Queue local metadata writers before the bounded cross-process lock.
+
+        Local workers wake directly when their predecessor exits instead of repeatedly
+        polling the file lock while newer workers acquire it. Both waits share one deadline.
+        No provider call runs under either lock.
+
+        Args:
+            timeout_s: Combined local and cross-process lock wait allowance.
+
+        Yields:
+            None while both metadata locks are held.
+
+        Raises:
+            FileLockTimeout: Another metadata writer holds either lock past the deadline.
+        """
+        deadline = time.monotonic() + timeout_s
+        if not self._admission_lock.acquire(timeout=timeout_s):
+            raise FileLockTimeout("local text simulation metadata is busy; retry the operation")
+        try:
+            with file_write_lock(
+                self._admission_path(),
+                what="text simulation cell admission",
+                timeout_s=max(0.0, deadline - time.monotonic()),
+            ):
+                yield
+        finally:
+            self._admission_lock.release()
 
     def _reserve_budget(
         self,
