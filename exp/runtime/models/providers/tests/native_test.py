@@ -456,6 +456,7 @@ def test_gemini_uses_native_function_calls_usage_identity_and_embeddings() -> No
                     "usageMetadata": {
                         "promptTokenCount": 12,
                         "candidatesTokenCount": 6,
+                        "thoughtsTokenCount": 14,
                         "cachedContentTokenCount": 4,
                     },
                 },
@@ -490,7 +491,7 @@ def test_gemini_uses_native_function_calls_usage_identity_and_embeddings() -> No
     )
     assert response.economics.usage == Usage(
         input_tokens=12,
-        output_tokens=6,
+        output_tokens=20,
         cached_input_tokens=4,
     )
     assert tuple(item.values for item in embeddings) == ((0.6, 0.8), (0.0, 1.0))

@@ -81,6 +81,8 @@ class Usage(ContractModel):
 
     Cache-read and cache-write counts are subsets of ``input_tokens`` when present. They never
     replace the total input count and must not be added a second time by callers.
+    ``output_tokens`` is total generated usage, including provider-reported reasoning tokens;
+    reasoning is a subset and must not be added again.
     """
 
     input_tokens: int = Field(ge=0)

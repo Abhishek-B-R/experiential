@@ -33,6 +33,7 @@ from exp.common.rollouts import (
     StopReason,
 )
 from exp.runtime.agents import AgentRuntime
+from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.models import ResolvedModel
 from exp.simulation.engines.clock import timestamp, utc_now
 from exp.simulation.engines.text.artifact_set import persist_artifact_set
@@ -45,6 +46,11 @@ from exp.simulation.engines.text.bindings import (
     rollout_id_for_binding,
 )
 from exp.simulation.engines.text.cell_progress import cell_progress_reporter
+from exp.simulation.engines.text.continuation import (
+    load_continuations,
+    rebind_completed,
+    retain_lineage,
+)
 from exp.simulation.engines.text.episode_loop import execute_text_episode_loop
 from exp.simulation.engines.text.errors import (
     SimulationConfigurationError,
@@ -221,11 +227,6 @@ class WorldModelSimulator:
     def run(self, spec: SimulationSpec) -> SimulationArtifactSet:
         """Run or resume exactly the sparse simulated cells selected by ``spec``.
 
-        A finite spend ceiling serializes new episode admission so later cells can be marked as
-        structured budget failures after observed provider spend reaches the ceiling. Provider
-        pricing is observed after a call in the v1 model contract, so the first episode that
-        crosses a ceiling is retained honestly rather than fabricated as a zero-cost estimate.
-
         Args:
             spec: Frozen world-model recipe selecting exact evaluation-plan cells.
 
@@ -246,6 +247,9 @@ class WorldModelSimulator:
             world_model,
             grounded_world_model,
         )
+        continuations = load_continuations(self._store, spec, tuple(cells), bindings)
+        if continuations and type(self._agent_factory()) is not ChatAgentRuntime:
+            raise SimulationResumeError("continuation requires the built-in chat runtime")
         completed = self._load_completed_rollouts(cells, bindings, resolution_input)
         pending = tuple(cell for cell in cells if cell.cell_id not in completed)
         pending = self._stale_recovery_first(pending, resolution, resolution_input, bindings)
@@ -666,6 +670,11 @@ class WorldModelSimulator:
         Raises:
             SimulationConfigurationError: Required world-model or retrieval settings are absent.
         """
+        parent = load_continuations(self._store, spec, (cell,), {cell.cell_id: binding}).get(
+            cell.cell_id
+        )
+        if parent is not None and parent.stop_reason == StopReason.COMPLETED:
+            return rebind_completed(self._store, parent, spec, cell, binding, resolution_input)
         task = self._tasks[cell.task_id]
         candidate = self._candidate_models[cell.candidate_alias]
         started_at = timestamp(self._clock)
@@ -736,11 +745,14 @@ class WorldModelSimulator:
             maximum_cost_usd=maximum_cell_cost_usd,
             stop_on_overspend=spec.stop_on_overspend,
             maximum_steps=spec.maximum_steps,
+            maximum_rollout_output_tokens=spec.maximum_rollout_output_tokens,
             maximum_output_tokens=settings.maximum_output_tokens,
             redacted_field_names=self._redacted_field_names,
             clock=self._clock,
             token_counter=self._token_counter,
         )
+        if parent is not None and parent.text_checkpoint is not None:
+            recorder.restore(parent.text_checkpoint, parent.spans)
         try:
             outcome = execute_text_episode_loop(
                 agent_factory=self._agent_factory,
@@ -765,7 +777,7 @@ class WorldModelSimulator:
         failure = outcome.failure
         if outcome.episodes and failure == outcome.episodes[-1].failure:
             failure = normalize_text_tool_failure(outcome.episodes[-1])
-        return self._rollout_builder.make(
+        rollout = self._rollout_builder.make(
             spec=spec,
             cell=cell,
             candidate=candidate,
@@ -789,6 +801,9 @@ class WorldModelSimulator:
             ),
             attempt=attempt,
         )
+
+        rollout = rollout.model_copy(update={"text_checkpoint": recorder.checkpoint()})
+        return retain_lineage(self._store, rollout, parent)
 
     def _failure_rollout(
         self,

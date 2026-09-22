@@ -31,6 +31,7 @@ class ModelEvaluationMetrics(ContractModel):
     planned_cells: int = Field(ge=1)
     scored_cells: int = Field(ge=0)
     failed_cells: int = Field(ge=0)
+    incomplete_cells: int = Field(default=0, ge=0)
     not_run_cells: int = Field(ge=0)
     compared_cells: int = Field(ge=0)
     quality: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
@@ -206,6 +207,7 @@ def _metrics(
         planned_cells=len(rows),
         scored_cells=sum(row.score is not None for row in rows.values()),
         failed_cells=sum(row.status == "failed" for row in rows.values()),
+        incomplete_cells=sum(row.status == "incomplete" for row in rows.values()),
         not_run_cells=sum(row.status == "not_run" for row in rows.values()),
         compared_cells=len(common),
         quality=quality,

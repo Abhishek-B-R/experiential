@@ -38,10 +38,8 @@ def execute_text_episode_loop(
     normal customer runtime seam while making the simulator, rather than a one-turn adapter,
     authoritative for scenario termination.
 
-    Exhausting the pinned candidate turn ceiling is a judgeable episode outcome, not an
-    infrastructure failure: the recorded transcript is complete evidence that the candidate did
-    not finish the task within the pinned budget, so the cell stops with ``MAXIMUM_STEPS`` and
-    no structured failure.
+    Exhausting an execution budget is incomplete evidence. The evaluation layer excludes it
+    from judging and model quality; the simulator retains a checkpoint when safe to continue.
 
     Args:
         agent_factory: Creates one isolated customer runtime for the simulation cell.

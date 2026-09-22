@@ -230,6 +230,8 @@ def _recorder(
     active_input_price: float | None = 1.0,
     maximum_cost_usd: float = 10.0,
     stop_on_overspend: bool = False,
+    maximum_steps: int = 2,
+    maximum_rollout_output_tokens: int = 1_000_000,
 ) -> RecordingCandidateClient:
     """Build a recorder with explicit fake candidate, world model, and retriever.
 
@@ -298,7 +300,8 @@ def _recorder(
         completion_maximum_attempts=1,
         maximum_cost_usd=maximum_cost_usd,
         stop_on_overspend=stop_on_overspend,
-        maximum_steps=2,
+        maximum_steps=maximum_steps,
+        maximum_rollout_output_tokens=maximum_rollout_output_tokens,
         maximum_output_tokens=16_000,
         redacted_field_names=frozenset(),
         clock=lambda: _TIME,
@@ -728,3 +731,49 @@ def test_stop_mode_recorder_blocks_the_next_dispatch_after_spend_reaches_the_cei
 
     assert error.value.stop_reason == StopReason.MAXIMUM_COST
     assert len(candidate_client.requests) == 1
+
+
+def test_rollout_token_budget_bounds_the_next_request_and_preserves_usage() -> None:
+    """Only remaining total generated tokens are admitted on later candidate requests."""
+    candidate = _ScriptedClient(
+        [
+            _response("first", model=_snapshot("candidate-a")),
+            _response("second", model=_snapshot("candidate-a")),
+        ]
+    )
+    world = _ScriptedClient(
+        [
+            _response('{"message":"continue","terminal":false}', model=_snapshot("world-model-a")),
+            _response('{"message":"continue","terminal":false}', model=_snapshot("world-model-a")),
+        ]
+    )
+    recorder = _recorder(candidate, world, maximum_steps=100, maximum_rollout_output_tokens=6)
+    request = ModelRequest(messages=(ModelMessage(role="user", content="start"),))
+    recorder.complete(request)
+    recorder.complete(request)
+    assert [item.maximum_output_tokens for item in candidate.requests] == [6, 3]
+    with pytest.raises(TextSimulationError) as caught:
+        recorder.complete(request)
+    assert caught.value.stop_reason == StopReason.MAXIMUM_OUTPUT_TOKENS
+    assert len(candidate.requests) == 2
+    assert recorder.checkpoint() is not None
+
+
+def test_missing_token_usage_blocks_further_dispatch() -> None:
+    """Missing usage never silently replenishes a rollout's output budget."""
+    response = _response("answer", model=_snapshot("candidate-a"))
+    response = response.model_copy(
+        update={"economics": response.economics.model_copy(update={"usage": None})}
+    )
+    candidate = _ScriptedClient([response])
+    world = _ScriptedClient(
+        [
+            _response('{"message":"continue","terminal":false}', model=_snapshot("world-model-a")),
+        ]
+    )
+    recorder = _recorder(candidate, world, maximum_steps=100)
+    request = ModelRequest(messages=(ModelMessage(role="user", content="start"),))
+    recorder.complete(request)
+    with pytest.raises(TextSimulationError, match="usage is missing"):
+        recorder.complete(request)
+    assert len(candidate.requests) == 1

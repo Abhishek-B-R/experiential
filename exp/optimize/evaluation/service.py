@@ -208,6 +208,7 @@ def _execution_contract(
     inputs = sorted_unique_inputs(
         setup.fit_rag_input,
         setup.world_model_settings.grounded_world_model_input,
+        *((setup.continuation_of,) if setup.continuation_of is not None else ()),
         *(
             ()
             if setup.simulation_completion_input is None

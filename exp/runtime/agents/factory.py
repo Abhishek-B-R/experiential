@@ -37,8 +37,8 @@ def agent_factory_sha256(
     Raises:
         ValueError: The built-in request ceiling or system prompt is invalid.
     """
-    if not 1 <= maximum_model_calls <= 64:
-        raise ValueError("maximum_model_calls must be between 1 and 64")
+    if maximum_model_calls < 1:
+        raise ValueError("maximum_model_calls must be positive")
     if configuration is not None and configuration.code_revision is None:
         raise ValueError(
             "custom agent configuration requires an immutable code_revision for exact replay"

@@ -54,7 +54,8 @@ from exp.simulation.world_model.runtime import load_grounded_world_model_artifac
 class ModelEvaluationOptions(ContractModel):
     """Bounded execution controls independent of router fitting and activation."""
 
-    maximum_steps: int = Field(default=8, ge=1, le=64)
+    maximum_steps: int = Field(default=100, ge=1)
+    maximum_rollout_output_tokens: int = Field(default=1_000_000, gt=0)
     maximum_concurrency: int = Field(default=1, ge=1, le=32)
     maximum_output_tokens: int = Field(default=16_000, gt=0)
     maximum_judge_input_tokens: int = Field(default=32_768, gt=0)
@@ -119,6 +120,7 @@ def prepare_model_evaluation(
     catalog: ModelCatalog,
     worker_aliases: tuple[str, ...],
     *,
+    continuation_of: str | None = None,
     judge_setup: ArtifactInput | None = None,
     calibration_id: str | None = None,
     embedder_alias: str,
@@ -132,6 +134,7 @@ def prepare_model_evaluation(
         project: Completed grounded project containing the selected judge evidence.
         catalog: Secret-free catalog with explicit model capabilities and prices.
         worker_aliases: Two or more distinct worker aliases, never an incumbent or router.
+        continuation_of: Prior simulation ID to continue under increased budgets.
         judge_setup: Authored judge setup manifest, or omit both judge arguments for task success.
         calibration_id: Verified calibration identity paired with an explicit judge setup.
         embedder_alias: Catalog alias matching the completed fit-RAG embedder.
@@ -317,7 +320,13 @@ def prepare_model_evaluation(
         simulation_completion_input=completion_input,
         agent_id=config.project_id,
         seed=options.seed,
+        continuation_of=(
+            artifact_input(project.artifacts.read(continuation_of).manifest)
+            if continuation_of is not None
+            else None
+        ),
         maximum_steps=options.maximum_steps,
+        maximum_rollout_output_tokens=options.maximum_rollout_output_tokens,
         maximum_concurrency=options.maximum_concurrency,
     )
     cost = estimate_model_evaluation(

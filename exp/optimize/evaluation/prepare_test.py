@@ -18,6 +18,7 @@ from exp.optimize.router.automatic.service_test import (
     _completed_project,
     _ProviderState,
 )
+from exp.runtime.agents import ChatAgentRuntime, agent_factory_sha256
 from exp.runtime.models.providers.transport import RetryPolicy
 
 
@@ -116,3 +117,13 @@ def test_prepare_defaults_to_binary_task_success_without_calibration_calls(tmp_p
     )
     assert prepared.setup.judgment_status == "provisional"
     assert before == (len(state.completion_calls), state.credential_resolutions)
+
+
+def test_rollout_defaults_and_large_explicit_limits() -> None:
+    """Long agent tasks are not rejected by an arbitrary small engine ceiling."""
+    options = ModelEvaluationOptions()
+    assert options.maximum_steps == 100
+    assert options.maximum_rollout_output_tokens == 1_000_000
+    assert ModelEvaluationOptions(maximum_steps=1000).maximum_steps == 1000
+    ChatAgentRuntime(maximum_model_calls=1000)
+    assert agent_factory_sha256(None, maximum_model_calls=1000)

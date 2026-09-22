@@ -416,6 +416,8 @@ def completion_reservation_from_catalog(
     if capabilities is None:
         return None
     context = capabilities.context_window_tokens
+    if capabilities.maximum_output_tokens is not None:
+        maximum_output_tokens = min(maximum_output_tokens, capabilities.maximum_output_tokens)
     if (
         context is None
         or capabilities.maximum_output_tokens is None

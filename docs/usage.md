@@ -128,6 +128,26 @@ There is no budget reset job and no budgets dashboard.
 
 ## Standalone model evaluation in Python
 
+Rollouts default to 100 candidate steps and 1,000,000 cumulative candidate output tokens.
+Both are configurable without a fixed engine step ceiling. `maximum_output_tokens` is a
+separate per-request setting (default 16,000), clamped to each model's declared output capacity
+and, for candidates, the remaining rollout token budget. Provider output usage includes
+reasoning; it is not counted twice. Missing usage blocks further candidate dispatch.
+
+Budget exhaustion and truncated output are `incomplete`, excluded from judging, quality and
+operating-cost comparisons. Actual incurred spend remains in execution accounting. A complete,
+secret-free text-world turn saves a checkpoint. To continue the built-in chat runtime, prepare
+another evaluation with `continuation_of=previous.simulation_spec.simulation_id` and larger
+`ModelEvaluationOptions(maximum_steps=200, maximum_rollout_output_tokens=2_000_000)`.
+Keep the same workers, judge setup/calibration, prompts, retrieval, per-call reservations and
+producer revision; then authorize its quote with `run_prepared_model_evaluation` as usual.
+This creates a new immutable execution and parent-linked rollouts. Completed candidate/world
+work is retained without redispatch; cumulative costs include the retained prefix. Exact replay
+of the child also reuses its judgments. Continuation does not restore arbitrary custom-agent
+process state, truncated generations, interrupted world turns, or redacted transcript content;
+those require a fresh evaluation. No prior artifact is edited.
+
+
 For a completed grounded project, `exp.prepare_model_evaluation` freezes a worker matrix and
 prices its simulation, retrieval and judge requests without calling providers. The default judge
 is binary task success with explicitly provisional provenance. Pass both `judge_setup` and

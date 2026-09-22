@@ -246,7 +246,7 @@ def _gemini_tool_call(value: JsonValue, index: int) -> ToolCall:
 
 
 def _gemini_usage(payload: JsonObject) -> Usage | None:
-    """Read Gemini's usage metadata with cached tokens treated as an input subset."""
+    """Normalize separate visible and thinking counts into total generated output usage."""
     raw = payload.get("usageMetadata")
     if raw is None:
         return None
@@ -255,7 +255,8 @@ def _gemini_usage(payload: JsonObject) -> Usage | None:
         input_tokens=require_integer(usage.get("promptTokenCount"), "Gemini promptTokenCount"),
         output_tokens=require_integer(
             usage.get("candidatesTokenCount"), "Gemini candidatesTokenCount"
-        ),
+        )
+        + require_integer(usage.get("thoughtsTokenCount", 0), "Gemini thoughtsTokenCount"),
         cached_input_tokens=require_integer(
             usage.get("cachedContentTokenCount"), "Gemini cachedContentTokenCount"
         ),

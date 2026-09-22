@@ -54,7 +54,11 @@ def build_router_simulation_spec(
         "settings": setup.world_model_settings.model_dump(mode="json"),
         "agent_id": setup.agent_id,
         "seed": setup.seed,
+        "continuation_of": setup.continuation_of.model_dump(mode="json")
+        if setup.continuation_of
+        else None,
         "maximum_steps": setup.maximum_steps,
+        "maximum_rollout_output_tokens": setup.maximum_rollout_output_tokens,
         "maximum_concurrency": setup.maximum_concurrency,
         "maximum_cost_usd": maximum_cost_usd,
         "stop_on_overspend": stop_on_overspend,
@@ -68,6 +72,8 @@ def build_router_simulation_spec(
         setup.fit_rag_input,
         setup.world_model_settings.grounded_world_model_input,
     ]
+    if setup.continuation_of is not None:
+        spec_inputs.append(setup.continuation_of)
     if setup.simulation_completion_input is not None:
         spec_inputs.append(setup.simulation_completion_input)
     return SimulationSpec(
@@ -82,7 +88,9 @@ def build_router_simulation_spec(
         mode=SimulationMode.WORLD_MODEL,
         world_model=setup.world_model_settings,
         seed=setup.seed,
+        continuation_of=setup.continuation_of,
         maximum_steps=setup.maximum_steps,
+        maximum_rollout_output_tokens=setup.maximum_rollout_output_tokens,
         maximum_concurrency=setup.maximum_concurrency,
         maximum_cost_usd=maximum_cost_usd,
         stop_on_overspend=stop_on_overspend,

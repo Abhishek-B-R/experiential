@@ -106,7 +106,7 @@ class ProjectSystemConfiguration(ContractModel):
 
     kind: Literal["builtin_chat"] = "builtin_chat"
     system_prompt: str = Field(min_length=1, max_length=20_000)
-    maximum_model_calls: int = Field(default=8, ge=1, le=64)
+    maximum_model_calls: int = Field(default=100, ge=1)
 
     @field_validator("system_prompt", mode="before")
     @classmethod

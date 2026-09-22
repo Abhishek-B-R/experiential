@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import datetime
 
 from exp.common.core.artifacts import (
-    ArtifactEnvelope,
     ArtifactInput,
     canonical_json_bytes,
     sorted_unique_inputs,
@@ -15,6 +14,7 @@ from exp.common.evaluations import EvaluationPlan
 from exp.common.models import ModelSnapshot, verify_completion_reservation
 from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.continuation import EvaluationRuntimeContract, validate_continuation
 from exp.optimize.evaluation.contracts import EvaluationBudget, EvaluationServices
 from exp.optimize.evaluation.judge import DurableEvaluationJudge
 from exp.optimize.evaluation.planning import estimate_model_evaluation
@@ -29,13 +29,6 @@ from exp.simulation.engines.text import WorldModelSimulator
 from exp.simulation.retrieval import RAGEmbedderBinding, load_fit_rag_retriever
 from exp.simulation.specs import load_simulation_completion_contract
 from exp.simulation.world_model import bind_fit_grounded_world_model
-
-
-class EvaluationRuntimeContract(ArtifactEnvelope):
-    """Immutable runtime, judge and quote binding included in the evaluation identity."""
-
-    contract_id: str
-    prepared: PreparedModelEvaluation
 
 
 def run_prepared_model_evaluation(
@@ -67,6 +60,7 @@ def run_prepared_model_evaluation(
     Raises:
         ValueError: Consent, quote admission, identities, configuration or artifacts drift.
     """
+    validate_continuation(project, prepared)
     setup = prepared.setup
     selected = read_evaluation_judge(project, prepared.judge_setup)
     if (

@@ -30,6 +30,8 @@ class EvaluationSetup(ContractModel):
     agent_id: str = Field(min_length=1, max_length=256)
     seed: int
     maximum_steps: int = Field(gt=0)
+    continuation_of: ArtifactInput | None = None
+    maximum_rollout_output_tokens: int = Field(default=1_000_000, gt=0)
     maximum_concurrency: int = Field(gt=0)
 
 

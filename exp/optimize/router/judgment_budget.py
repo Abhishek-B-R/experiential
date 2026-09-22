@@ -852,7 +852,14 @@ def _rollout_failed(rollout: RolloutArtifact) -> bool:
     Returns:
         True when the rollout carries a structured failure or a failed stop reason.
     """
-    return rollout.failure is not None or rollout.stop_reason == StopReason.FAILURE
+    return rollout.failure is not None or rollout.stop_reason in {
+        StopReason.FAILURE,
+        StopReason.MAXIMUM_STEPS,
+        StopReason.MAXIMUM_OUTPUT_TOKENS,
+        StopReason.MAXIMUM_COST,
+        StopReason.MAXIMUM_TIME,
+        StopReason.LENGTH,
+    }
 
 
 def _persist_judgment(project: ProjectStore, judgment: Judgment) -> None:
