@@ -243,6 +243,7 @@ def _validated_release_core_names(metadata: str) -> frozenset[str]:
         "dev": {
             "anthropic",
             "maturin",
+            "packaging",
             "pytest",
             "pytest-xdist",
             "ruff",
@@ -2839,7 +2840,7 @@ def _installed_release_driver() -> None:
             session.id,
             {"role": "assistant", "content": "What account email is associated?"},
         )
-        assert observation.message == {
+        assert observation.messages[0] == {
             "role": "user",
             "content": "P17 generated world observation",
         }

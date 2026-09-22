@@ -665,6 +665,9 @@ async fn run_attempt(
         if wire.image_output {
             relay.allow_image_output();
         }
+        relay.set_gemini_capture(ctx.capture.and_then(|collector| {
+            collector.begin_capture_dial(ctx.request_id, dialect == Dialect::GeminiGenerateContent)
+        }));
         relay.set_observation(observation);
         relay.set_carried_usage(carried_usage.take());
         relay.set_stop_sequences(wire.stop_sequences.iter().cloned());

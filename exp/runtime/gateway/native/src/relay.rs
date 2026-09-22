@@ -1,5 +1,4 @@
-//! Decode provider responses into bounded, classified gateway events. The waterfall
-//! commits a relay to one deployment; HTTP surfaces drain it live or to completion.
+//! Bounded provider events, committed to one deployment and drained by HTTP surfaces.
 
 mod progress;
 
@@ -22,8 +21,7 @@ use crate::tool_search::{ToolSearchWithholder, WithheldSearchCall};
 use crate::tool_serialization::ToolCallSerializer;
 use crate::waterfall::CommittedAttempt;
 
-/// Map one collection failure to its public error, honoring the shared
-/// aggregate-output overflow contract.
+/// Map collection failures to public errors, honoring aggregate-output bounds.
 pub fn collection_public_error(failure: &Failure) -> PublicError {
     if failure.safe_message == OUTPUT_OVERFLOW_MESSAGE {
         return PublicError::provider_output_too_large();
@@ -94,18 +92,10 @@ pub fn stream_timeout_failure(deadline: Instant) -> Failure {
     }
 }
 
-/// Classify a provider that accepted the connection but did not stream its
-/// first TOKEN (the first semantic event) within the fail-fast first-token
-/// bound. Headers, keepalive comments and role-only frames do not count. A
-/// stalled lead deployment must not hold the request for its full per-chunk
-/// timeout, so this is a transient, capacity-shaped failure that is
-/// failover-eligible.
-///
-/// It is deliberately *not* same-deployment retryable: a lane that accepted
-/// the connection but never answered is the clearest dead-lane signal, and
-/// redialing it would only stall again for another window. Skipping the redial
-/// and advancing straight to the next certified deployment is what keeps a
-/// fresh pod's cost on a dead lane near one fail-fast window instead of several.
+/// Classify a provider missing its first semantic token within the fail-fast bound.
+/// Headers, keepalives and role-only frames do not count. Advance to the next
+/// certified deployment without redialing the stalled lane, limiting its cost
+/// to one first-token window rather than the full per-chunk timeout.
 pub fn first_byte_timeout_failure() -> Failure {
     Failure::new(
         FailureClass::Timeout,
@@ -221,6 +211,7 @@ pub struct UpstreamRelay {
     /// the reservation settles both dials' tokens as one.
     carried_usage: Option<Usage>,
     observation: Option<crate::settlement::Observation>,
+    capture_reasoning: Option<crate::capture::reasoning::Observer>,
 }
 
 impl UpstreamRelay {
@@ -293,11 +284,23 @@ impl UpstreamRelay {
             tool_search: ToolSearchWithholder::default(),
             carried_usage: None,
             observation: None,
+            capture_reasoning: None,
         }
     }
 
     pub(crate) fn set_observation(&mut self, observation: crate::settlement::Observation) {
         self.observation = Some(observation);
+    }
+
+    pub(crate) fn set_gemini_capture(
+        &mut self,
+        observer: Option<crate::capture::reasoning::GeminiObserver>,
+    ) {
+        self.normalizer.capture_gemini(observer);
+    }
+
+    pub(crate) fn set_capture_reasoning(&mut self, observer: crate::capture::reasoning::Observer) {
+        self.capture_reasoning = Some(observer);
     }
 
     /// Close the network body before any settlement callback is awaited.
@@ -338,6 +341,12 @@ impl UpstreamRelay {
     }
 
     fn queue_events(&mut self, events: Vec<Event>) {
+        if self.normalizer.take_gemini_progress() {
+            self.last_progress_at = Some(Instant::now());
+            if self.committed {
+                self.stall_bound_armed = false;
+            }
+        }
         if let Some(observation) = &self.observation {
             // Several dialects retain a parsed meter until terminal encoding.
             // Accounting observes it now, even when this frame yields no event.
@@ -519,8 +528,7 @@ impl UpstreamRelay {
         self.carried_usage = carried;
     }
 
-    /// Enforce the caller's stop sequences on this relay's visible text.
-    /// Installed before the first event is yielded; an empty set is a no-op.
+    /// Enable the probability output requested in the frozen provider payload.
     pub fn set_probability_output(&mut self, chat: bool, payload: &serde_json::Value) {
         self.normalizer.enable_chat_logprobs(
             chat && payload.get("logprobs").and_then(serde_json::Value::as_bool) == Some(true),
@@ -534,6 +542,7 @@ impl UpstreamRelay {
         );
     }
 
+    /// Enforce stop sequences before yielding events; an empty set is a no-op.
     pub fn set_stop_sequences<I, S>(&mut self, sequences: I)
     where
         I: IntoIterator<Item = S>,
@@ -637,6 +646,9 @@ impl UpstreamRelay {
                     observation.record_effective_terminal(&event);
                 }
                 self.yielded_at = Some(Instant::now());
+                if let Some(observer) = &self.capture_reasoning {
+                    observer.observe(&event);
+                }
                 return Ok(Some(event));
             }
             if self.guard_next_pending()? {
@@ -772,8 +784,7 @@ impl Drop for UpstreamRelay {
     }
 }
 
-/// Drain one committed attempt to completion for non-streaming responses,
-/// bounding total retained output like the python service's aggregation.
+/// Drain one non-streaming attempt, bounding output like the Python aggregation.
 pub async fn collect_committed(
     committed: &mut CommittedAttempt,
     deadline: Instant,

@@ -7,8 +7,19 @@ use crate::errors::{Failure, FailureClass};
 use crate::events::{gemini_usage, require_string, Event, ToolAccumulator};
 
 impl Normalizer {
-    /// Normalize one Gemini `streamGenerateContent` SSE frame: reasoning parts
-    /// are skipped, whole function calls expand to start/arguments/completed,
+    pub(crate) fn capture_gemini(
+        &mut self,
+        observer: Option<crate::capture::reasoning::GeminiObserver>,
+    ) {
+        self.gemini_capture = observer;
+    }
+
+    pub(crate) fn take_gemini_progress(&mut self) -> bool {
+        std::mem::take(&mut self.gemini_progress)
+    }
+
+    /// Normalize one Gemini `streamGenerateContent` SSE frame: thought parts
+    /// stay capture-only, whole function calls expand to start/arguments/completed,
     /// and the terminal candidate flushes the latest usage before its finish
     /// reason maps to the shared completion, incomplete, refusal, or
     /// provider-internal outcome. A prompt-level block (`promptFeedback.
@@ -98,8 +109,24 @@ impl Normalizer {
                     let part = raw_part
                         .as_object()
                         .ok_or_else(|| malformed("Gemini candidate part must be an object"))?;
-                    // Reasoning parts (thought text and thought signatures)
-                    // are not gateway-visible output.
+                    // Google exposes thought summaries, not full CoT. Preserve the
+                    // whole signed part so a signature remains paired with its
+                    // text or functionCall, without treating it as readable output.
+                    if part.get("thought") == Some(&Value::Bool(true))
+                        || part.contains_key("thoughtSignature")
+                    {
+                        self.gemini_progress |= part
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.is_empty())
+                            || part
+                                .get("thoughtSignature")
+                                .and_then(Value::as_str)
+                                .is_some_and(|signature| !signature.is_empty());
+                        if let Some(observer) = &self.gemini_capture {
+                            observer.observe(raw_part);
+                        }
+                    }
                     if part.get("thought") == Some(&Value::Bool(true)) {
                         continue;
                     }
@@ -261,6 +288,30 @@ mod gemini_tests {
 
     fn sse(payload: &Value) -> Vec<u8> {
         format!("data: {payload}\n\n").into_bytes()
+    }
+
+    #[test]
+    fn thought_summaries_and_signatures_keep_their_exact_part_association() {
+        let parts = vec![
+            json!({"thought":true,"text":"Summary, not full CoT. 雪"}),
+            json!({"functionCall":{"name":"lookup","args":{"id":"a"}},"thoughtSignature":"tool-signature=="}),
+            json!({"text":"answer","thoughtSignature":"text-signature=="}),
+            json!({"thoughtSignature":"standalone=="}),
+        ];
+        let chunk = sse(&json!({"candidates":[{"content":{"parts":parts},"finishReason":"STOP"}]}));
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &[chunk.as_slice()]);
+        assert!(failure.is_none());
+        assert!(!events
+            .iter()
+            .any(|event| event["kind"] == "gemini_thought_part"));
+        assert!(!events
+            .iter()
+            .any(|event| event["kind"] == "reasoning_content_delta"));
+        let visible: Vec<_> = events
+            .iter()
+            .filter(|event| event["kind"] == "text_delta")
+            .collect();
+        assert_eq!(visible, vec![&json!({"kind":"text_delta","text":"answer"})]);
     }
 
     #[test]

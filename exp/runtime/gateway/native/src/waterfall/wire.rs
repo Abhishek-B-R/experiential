@@ -141,6 +141,7 @@ pub struct RoutePolicy {
 /// Everything one waterfall run needs besides its request guard.
 pub struct WaterfallContext<'a> {
     pub bridge: &'a Arc<Bridge>,
+    pub capture: Option<&'a Arc<crate::capture::collector::Collector>>,
     pub http: &'a reqwest::Client,
     pub request_id: &'a str,
     /// The presented virtual key, forwarded so hosted budget-error policy

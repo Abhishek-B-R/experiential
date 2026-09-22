@@ -39,7 +39,7 @@ use crate::server::AppState;
 use crate::settlement::AttemptGuard;
 use crate::tool_search::{
     adopt_outcome, completed_responses_body_for, configure_responses_encoder,
-    disclose_after_collection,
+    disclose_after_collection, encode_responses_sse,
 };
 use crate::waterfall::{acquire_attempt, CommittedAttempt, SettledAttempt, WaterfallContext, Won};
 
@@ -130,6 +130,7 @@ pub(crate) async fn responses(
         "idempotency_key": idempotency_key,
         "client_request_id": client_request_id,
         "client_ip": client_ip(&headers),
+        "capture_session_id": crate::capture::session_id(&headers),
     }));
     let admission_text = match state.bridge.call("admit", admit_argument).await {
         Ok(text) => text,
@@ -202,6 +203,7 @@ pub(crate) async fn responses(
     };
 
     let context = WaterfallContext {
+        capture: state.capture.as_ref(),
         bridge: &state.bridge,
         http: &state.http,
         request_id: &admission.request_id,
@@ -230,13 +232,16 @@ pub(crate) async fn responses(
     };
     let mut won = acquire_attempt(&context, &mut guard).await;
     adopt_outcome(&mut admission, &mut won);
+    crate::capture::reasoning::observe_winner(state.capture.clone(), &admission, &guard, &mut won);
 
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or(0);
 
-    match won {
+    let capture = state.capture.clone();
+    let capture_request_id = admission.request_id.clone();
+    let response = match won {
         Won::Failed(error) => {
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;
@@ -292,7 +297,8 @@ pub(crate) async fn responses(
                 .await
             }
         }
-    }
+    };
+    crate::capture::response::capture_response(capture, &capture_request_id, response)
 }
 
 /// Answer one Responses attempt that the waterfall already settled: a
@@ -603,35 +609,6 @@ async fn completed_responses(
         false,
     )
     .await
-}
-
-fn encode_responses_sse(
-    admission: &Admission,
-    created_at: i64,
-    events: &[Event],
-    reasoning_content_carrier: Option<&str>,
-) -> Result<Vec<u8>, PublicError> {
-    let envelope = admission.envelope.clone().unwrap_or_default();
-    let mut encoder = ResponsesSseEncoder::new(
-        &admission.request_id,
-        &admission.alias,
-        created_at,
-        envelope,
-    );
-    configure_responses_encoder(&mut encoder, admission);
-    if let Some(carrier) = reasoning_content_carrier {
-        encoder.set_reasoning_content_carrier(carrier.to_string())?;
-    }
-    let mut body = Vec::new();
-    for frame in encoder.start()? {
-        body.extend_from_slice(frame.as_bytes());
-    }
-    for event in events {
-        for frame in encoder.feed(event)? {
-            body.extend_from_slice(frame.as_bytes());
-        }
-    }
-    Ok(body)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -53,12 +53,6 @@ pub struct Usage {
     pub reasoning_tokens: Option<u64>,
 }
 
-impl Usage {
-    pub fn has_token_counts(&self) -> bool {
-        self.input_tokens.is_some() && self.output_tokens.is_some()
-    }
-}
-
 /// One completed tool call with provider-order raw argument text.
 #[derive(Debug, Clone)]
 pub struct CompletedToolCall {
@@ -702,11 +696,7 @@ pub fn simplified_event(event: &Event) -> Value {
 
 mod item_metadata;
 use item_metadata::add_provider_item_metadata;
-
-/// Count hosted invocations only, not results, approvals, listings or opaque items.
-pub fn hosted_item_type_is_invocation(item_type: &str) -> bool {
-    item_type.ends_with("_call")
-}
+pub use item_metadata::hosted_item_type_is_invocation;
 
 /// Validate one raw tool-argument accumulation as a single JSON object.
 ///

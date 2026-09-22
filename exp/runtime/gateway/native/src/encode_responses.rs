@@ -1,5 +1,4 @@
-//! Public Responses encoding, the Rust mirror of `ResponsesSseEncoder` and
-//! the Responses branch of `completed_body`.
+//! Native public Responses encoding for streaming and completed bodies.
 
 use std::collections::{BTreeMap, HashMap};
 

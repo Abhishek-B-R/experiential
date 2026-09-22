@@ -141,7 +141,13 @@ class StructuredTextFormat(ContractModel):
 
 
 class GatewayMessage(ContractModel):
-    """One canonical gateway message preserving developer and tool-call identity."""
+    """One canonical gateway message preserving developer and tool-call identity.
+
+    Attributes:
+        capture_only_reasoning: Caller-visible copies accompanying sealed replay.
+            Empty by default; excluded from serialization, provider dispatch and
+            replay authority. Only content capture consumes this evidence.
+    """
 
     role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | None = None
@@ -149,17 +155,11 @@ class GatewayMessage(ContractModel):
         default=None, min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS
     )
     tool_calls: tuple[ToolCall, ...] = ()
+    capture_only_reasoning: tuple[ExposedReasoningContentBlock, ...] = Field(
+        default=(), exclude=True
+    )
     tool_is_error: bool = Field(default=False, exclude=True)
-    """Whether this tool result reports a failed tool invocation.
-
-    Only the Anthropic Messages surface can express it (``tool_result.is_error``),
-    and only the Anthropic upstream dialect can emit it back, so route
-    admission requires every waterfall rung to use that dialect. OpenAI-family
-    wires cannot represent the flag and are rejected instead of dropping it. Like
-    ``ToolCall.raw_arguments``, the field is deliberately excluded from model
-    serialization so request digests, replay identity, and immutable
-    artifacts are unaffected by it.
-    """
+    """Whether this tool result reports a failed invocation; retained outside serialization."""
     provider_specific_fields: JsonObject | None = Field(default=None, exclude=True)
     """LiteLLM's echoed per-message ``provider_specific_fields``: accepted so verbatim
     replays keep working, dropped on every wire with a disclosure, excluded from
@@ -339,7 +339,7 @@ class GatewayMessage(ContractModel):
             raise ValueError("gateway messages need content, tool calls, or reasoning blocks")
         if self.role != "assistant" and self.tool_calls:
             raise ValueError("tool_calls are valid only for assistant messages")
-        if self.role != "assistant" and self.provider_reasoning:
+        if self.role != "assistant" and (self.provider_reasoning or self.capture_only_reasoning):
             raise ValueError("provider reasoning blocks are valid only for assistant messages")
         if self.role != "assistant" and (
             self.provider_item_id is not None
