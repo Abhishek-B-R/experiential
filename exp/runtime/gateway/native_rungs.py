@@ -109,7 +109,7 @@ def build_rung_dispatch(
         ),
     )
     output_disclosure = (
-        f"max_tokens->default({output_bound};anthropic_messages;declared_bound)"
+        f"max_tokens->default({output_bound};{profile.dialect};declared_bound)"
         if provider_request.maximum_output_tokens is None
         and rung_request.maximum_output_tokens is not None
         else None

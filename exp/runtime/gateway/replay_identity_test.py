@@ -136,3 +136,20 @@ def test_web_search_joins_request_identity_without_its_results() -> None:
     assert len({canonical_request_sha256(bare), plugin, narrow}) == 3
     # The search object is excluded from plain serialization, so bodies digest alike.
     assert sha256_json(request(GatewayWebSearch(declared_as="plugin"))) == sha256_json(bare)
+
+
+def test_chat_nested_thinking_budget_changes_replay_identity() -> None:
+    """Changing a retained budget cannot replay an answer computed under another bound."""
+    from exp.runtime.openai_protocol.requests import decode_chat
+
+    requests = [
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "enabled", "budget_tokens": budget},
+            }
+        ).request
+        for budget in (1024, 2048)
+    ]
+    assert canonical_request_sha256(requests[0]) != canonical_request_sha256(requests[1])

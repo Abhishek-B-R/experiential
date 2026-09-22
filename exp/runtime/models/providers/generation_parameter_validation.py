@@ -16,6 +16,7 @@ from exp.runtime.models.providers.reasoning_compat import (
     REASONING_EFFORTS,
     supported_reasoning_efforts,
 )
+from exp.runtime.models.providers.thinking_budget import thinking_budget_value
 
 
 def output_limit_parameter(request: GatewayRequest) -> str:
@@ -95,7 +96,9 @@ def bounded_output_request(
             param=parameter,
             code="invalid_parameter",
         )
-    if request.maximum_output_tokens is None and profile.dialect == "anthropic_messages":
+    if request.maximum_output_tokens is None and (
+        profile.dialect == "anthropic_messages" or thinking_budget_value(request) is not None
+    ):
         if bound < (profile.minimum_output_tokens or 1):
             raise ProviderParameterError(
                 message=(

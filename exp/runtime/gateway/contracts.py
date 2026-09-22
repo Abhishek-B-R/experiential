@@ -518,8 +518,8 @@ class GatewayRequest(ContractModel):
     own recovery finds the field it sent. ``None`` means the surface default
     (see :attr:`caller_effort_parameter`)."""
     # Level-less enable-thinking; the route seam resolves the concrete effort.
-    thinking_budget: int | None = Field(default=None, gt=0, strict=True, exclude=True)
-    """Explicit Chat reasoning-token cap, forwarded only to budget-capable wires."""
+    thinking_budget: int | None = Field(default=None, ge=-1, strict=True, exclude=True)
+    """Numeric Chat thinking control; provider validation owns zero and -1 semantics."""
     thinking_default_enable: bool = False
     reasoning_summary: Literal["auto", "concise", "detailed"] | None = None
     reasoning_summary_parameters: tuple[
@@ -527,14 +527,11 @@ class GatewayRequest(ContractModel):
     ] = Field(default=(), exclude=True)
     """Exact caller selector paths normalized into ``reasoning_summary``."""
     provider_thinking_config: JsonObject | None = Field(default=None, exclude=True)
-    """Verbatim caller ``thinking`` configuration from the Messages surface.
+    """Verbatim caller ``thinking`` configuration from Messages or budgeted Chat.
 
-    The object is opaque to the gateway: it is validated against the closed
-    wire profile at decode time and then forwarded byte-for-byte to the
-    Anthropic upstream, overriding the catalog's adaptive default. Excluded
-    from serialization like the other Anthropic-only carriers so
-    config-free digests are unperturbed; a present config joins replay
-    identity through :func:`canonical_request_sha256`.
+    Validated at decode and route admission. Numeric values survive translation
+    to qualified native wires; other config fields require verbatim support.
+    Excluded from serialization; joins :func:`canonical_request_sha256`.
     """
     context_management: JsonObject | None = Field(default=None, exclude=True)
     """Verbatim caller ``context_management`` from the Messages surface.
@@ -859,8 +856,11 @@ class GatewayRequest(ContractModel):
             raise ValueError("include_encrypted_reasoning is valid only for Responses requests")
         if self.reasoning_context is not None and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("reasoning_context is valid only for Responses requests")
-        if self.provider_thinking_config is not None and self.surface != GatewayApiSurface.MESSAGES:
-            raise ValueError("provider_thinking_config is valid only for Messages requests")
+        if self.provider_thinking_config is not None and self.surface not in {
+            GatewayApiSurface.MESSAGES,
+            GatewayApiSurface.CHAT_COMPLETIONS,
+        }:
+            raise ValueError("provider_thinking_config is valid only for Messages or Chat requests")
         if self.provider_output_config is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_output_config is valid only for Messages requests")
         if self.text_verbosity is not None and self.surface not in {
