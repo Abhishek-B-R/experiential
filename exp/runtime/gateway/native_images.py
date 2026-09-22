@@ -4,13 +4,14 @@ The images surface reuses the chat surface's authority, ledger, route
 resolution, deployment-health, and reservation seams unchanged (the same
 shape as :mod:`exp.runtime.gateway.native_embeddings`) and differs only in
 what it admits: a prompt-in, images-out request that dispatches one buffered
-OpenAI-wire ``/images/generations`` POST per attempt and bills the provider's
+OpenAI-wire image-generation POST per attempt and bills the provider's
 reported prompt and image tokens.
 
 Deliberately absent on day one: image edits and variations (multipart image
 input), streaming partial images, per-image priced models (dall-e answers
 without token usage and is refused as unbilled until the typed billed-units
-ledger lands), keyed replay, and non-OpenAI wires.
+ledger lands), keyed replay, and non-OpenAI image wires. OpenRouter uses its dedicated
+``/images`` adapter with a separately authored image token rate card.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from dataclasses import replace
 from typing import Protocol
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.catalog_prices import GatewayTokenPrices
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -50,6 +52,7 @@ from exp.runtime.gateway.native_settlement import gateway_updating_failure
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers import require_gateway_provider
 from exp.runtime.models.providers.openai_compatible import openai_images_request
+from exp.runtime.models.providers.openrouter_images import openrouter_images_request
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 
@@ -165,7 +168,9 @@ def _admit_accepted(
     ):
         capabilities = route.deployments[index].capabilities
         supports = None if capabilities is None else capabilities.supports_image_generation
-        if _images_rung(profile.images_url, supports):
+        deployment = route.deployments[index]
+        priced = deployment.provider != "openrouter" or deployment.gateway.prices.images is not None
+        if _images_rung(profile.images_url, supports) and priced:
             serving.append(index)
     if not serving:
         _finish_unsupported(plane, authorization)
@@ -176,6 +181,26 @@ def _admit_accepted(
         if index in serving
     ]
     route = select_route_deployments(route, tuple(serving))
+    deployments = []
+    for deployment in route.deployments:
+        card = deployment.gateway.prices.images
+        if card is not None:
+            deployment = deployment.model_copy(
+                update={
+                    "gateway": deployment.gateway.model_copy(
+                        update={
+                            "prices": GatewayTokenPrices(
+                                input_nano_usd_per_million_tokens=card.input_nano_usd_per_million_tokens,
+                                output_nano_usd_per_million_tokens=card.output_nano_usd_per_million_tokens,
+                            )
+                        }
+                    )
+                }
+            )
+        deployments.append(deployment)
+    route = route.model_copy(
+        update={"deployment": deployments[0], "fallback_deployments": tuple(deployments[1:])}
+    )
     wire_route: list[JsonObject] = []
     try:
         for deployment, (profile, _client) in zip(route.deployments, served_wires, strict=True):
@@ -188,7 +213,11 @@ def _admit_accepted(
                     route,
                     deployment,
                     replace(profile, url=images_url),
-                    openai_images_request(profile.model_id, request),
+                    (
+                        openrouter_images_request(profile.model_id, request)
+                        if deployment.provider == "openrouter"
+                        else openai_images_request(profile.model_id, request)
+                    ),
                 )
             )
     except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.

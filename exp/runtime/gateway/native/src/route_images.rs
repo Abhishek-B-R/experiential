@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Response;
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
@@ -28,7 +29,8 @@ use crate::events::Usage;
 use crate::metrics::{classify_escalation, METRICS};
 use crate::relay::{collection_public_error, remaining};
 use crate::respond::{
-    bearer_key, error_response, escalation_error, json_response, latin1_header, read_body,
+    bearer_key, error_response as gateway_error_response, escalation_error, json_response,
+    latin1_header, read_body,
 };
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
@@ -134,6 +136,16 @@ pub(crate) async fn images(
     }
 }
 
+/// Suppress automatic SDK retries: image requests have no keyed replay contract.
+fn error_response(error: &PublicError) -> Response {
+    let mut response = gateway_error_response(error);
+    response.headers_mut().insert(
+        "x-should-retry",
+        axum::http::HeaderValue::from_static("false"),
+    );
+    response
+}
+
 /// Walk the certified ladder to one validated provider answer or the public
 /// error of the exhausting failure (same contract as the embeddings ladder).
 async fn run_ladder(
@@ -220,7 +232,10 @@ async fn run_ladder(
         counts[depth] += 1;
         match dispatch(&state.http, wire, deadline, admission).await {
             Ok((body, usage)) => return Ok(Served { depth, body, usage }),
-            Err((failure, opened)) => {
+            Err((failure, opened, usage)) => {
+                // No provider idempotency contract protects image generation.
+                // Even a header timeout or 5xx can follow completed billable work.
+                let failure = failure.with_retry(false, false);
                 if opened {
                     guard.mark_opened();
                 }
@@ -236,7 +251,7 @@ async fn run_ladder(
                     false,
                 );
                 if !guard
-                    .settle("failed", None, &[], Some(&boundary), !possible)
+                    .settle("failed", usage.as_deref(), &[], Some(&boundary), !possible)
                     .await
                 {
                     return Err(PublicError::internal());
@@ -259,7 +274,7 @@ async fn dispatch(
     wire: &DeploymentWire,
     deadline: Instant,
     admission: &ImagesAdmission,
-) -> Result<(Value, Usage), (Failure, bool)> {
+) -> Result<(Value, Usage), (Failure, bool, Option<Box<Usage>>)> {
     let phase_timeout = Duration::from_secs_f64(wire.timeout_seconds.max(0.001));
     let bound = remaining(deadline).min(phase_timeout);
     let response = open_stream(
@@ -273,7 +288,7 @@ async fn dispatch(
         Dialect::OpenAiCompatible,
     )
     .await
-    .map_err(|failure| (failure, false))?;
+    .map_err(|failure| (failure, false, None))?;
     if response
         .content_length()
         .is_some_and(|length| length > MAXIMUM_RETAINED_OUTPUT_BYTES as u64)
@@ -281,16 +296,19 @@ async fn dispatch(
         return Err((
             Failure::new(FailureClass::MalformedResponse, OUTPUT_OVERFLOW_MESSAGE),
             true,
+            None,
         ));
     }
     let bytes = read_bounded_body(response, deadline, phase_timeout)
         .await
-        .map_err(|failure| (failure, true))?;
+        .map_err(|failure| (failure, true, None))?;
     let payload: Value = match serde_json::from_slice(&bytes) {
         Ok(payload) => payload,
-        Err(_) => return Err((malformed("images response is not JSON"), true)),
+        Err(_) => return Err((malformed("images response is not JSON"), true, None)),
     };
-    public_images(payload, admission).map_err(|failure| (failure, true))
+    let openrouter = wire.provider == "openrouter";
+    let observed = image_usage(&payload, openrouter).ok().map(Box::new);
+    public_images(payload, admission, openrouter).map_err(|failure| (failure, true, observed))
 }
 
 /// Read one provider body chunk by chunk under the retained-output cap (a
@@ -340,7 +358,11 @@ fn malformed(reason: &str) -> Failure {
 /// `b64_json` or `url` string (passed through untouched, with any
 /// `revised_prompt`), and a billable token usage. The public body keeps the
 /// provider's `created`, `usage`, and the echoed rendering facts.
-fn public_images(payload: Value, admission: &ImagesAdmission) -> Result<(Value, Usage), Failure> {
+fn public_images(
+    payload: Value,
+    admission: &ImagesAdmission,
+    openrouter: bool,
+) -> Result<(Value, Usage), Failure> {
     let object = payload
         .as_object()
         .ok_or_else(|| malformed("images response is not an object"))?;
@@ -348,7 +370,10 @@ fn public_images(payload: Value, admission: &ImagesAdmission) -> Result<(Value, 
         .get("data")
         .and_then(Value::as_array)
         .ok_or_else(|| malformed("images response omitted the data array"))?;
-    if data.len() != admission.image_count {
+    if data.is_empty()
+        || data.len() > admission.image_count
+        || (!openrouter && data.len() != admission.image_count)
+    {
         return Err(malformed(
             "images response count does not match the requested n",
         ));
@@ -360,9 +385,25 @@ fn public_images(payload: Value, admission: &ImagesAdmission) -> Result<(Value, 
             .ok_or_else(|| malformed("images response item is not an object"))?;
         let mut public_item = Map::new();
         let mut carried = false;
-        for key in ["b64_json", "url", "revised_prompt"] {
+        for key in ["b64_json", "url", "revised_prompt", "media_type"] {
             if let Some(value) = entry.get(key).filter(|value| value.is_string()) {
-                carried |= key != "revised_prompt";
+                let text = value.as_str().unwrap_or_default();
+                if key == "b64_json" {
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(text)
+                        .map_err(|_| malformed("images response contains invalid base64"))?;
+                    if decoded.is_empty() {
+                        return Err(malformed("images response contains an empty image"));
+                    }
+                    carried = true;
+                }
+                if key == "url" {
+                    if openrouter || !(text.starts_with("https://") || text.starts_with("http://"))
+                    {
+                        return Err(malformed("images response contains an unusable image URL"));
+                    }
+                    carried = true;
+                }
                 public_item.insert(key.to_string(), value.clone());
             }
         }
@@ -379,14 +420,9 @@ fn public_images(payload: Value, admission: &ImagesAdmission) -> Result<(Value, 
         .get("usage")
         .and_then(Value::as_object)
         .ok_or_else(|| malformed("images response omitted its token usage"))?;
-    let input_tokens = usage
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| malformed("images response omitted usage.input_tokens"))?;
-    let output_tokens = usage
-        .get("output_tokens")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| malformed("images response omitted usage.output_tokens"))?;
+    let observed = image_usage(&payload, openrouter)?;
+    let input_tokens = observed.input_tokens.unwrap_or_default();
+    let output_tokens = observed.output_tokens.unwrap_or_default();
     let mut public = Map::new();
     public.insert(
         "created".to_string(),
@@ -398,16 +434,47 @@ fn public_images(payload: Value, admission: &ImagesAdmission) -> Result<(Value, 
             public.insert(key.to_string(), value.clone());
         }
     }
-    public.insert("usage".to_string(), Value::Object(usage.clone()));
-    let usage = Usage {
+    let mut public_usage = usage.clone();
+    if openrouter {
+        public_usage.remove("prompt_tokens");
+        public_usage.remove("completion_tokens");
+        public_usage.insert("input_tokens".to_string(), json!(input_tokens));
+        public_usage.insert("output_tokens".to_string(), json!(output_tokens));
+    }
+    public.insert("usage".to_string(), Value::Object(public_usage));
+    Ok((Value::Object(public), observed))
+}
+
+/// Preserve observed counts even when an image body fails validation.
+fn image_usage(payload: &Value, openrouter: bool) -> Result<Usage, Failure> {
+    let usage = payload
+        .get("usage")
+        .and_then(Value::as_object)
+        .ok_or_else(|| malformed("images response omitted its token usage"))?;
+    let input_tokens = usage
+        .get(if openrouter {
+            "prompt_tokens"
+        } else {
+            "input_tokens"
+        })
+        .and_then(Value::as_u64)
+        .ok_or_else(|| malformed("images response omitted input token usage"))?;
+    let output_tokens = usage
+        .get(if openrouter {
+            "completion_tokens"
+        } else {
+            "output_tokens"
+        })
+        .and_then(Value::as_u64)
+        .ok_or_else(|| malformed("images response omitted output token usage"))?;
+    Ok(Usage {
         input_tokens: Some(input_tokens),
         output_tokens: Some(output_tokens),
         cached_input_tokens: None,
         cache_creation_input_tokens: None,
         cache_creation_1h_input_tokens: None,
         reasoning_tokens: None,
-    };
-    Ok((Value::Object(public), usage))
+    })
 }
 
 fn served_headers(
@@ -482,7 +549,8 @@ mod tests {
                 "input_tokens_details": {"text_tokens": 11, "image_tokens": 0},
             },
         });
-        let (body, usage) = public_images(payload.clone(), &admission(2)).expect("valid answer");
+        let (body, usage) =
+            public_images(payload.clone(), &admission(2), false).expect("valid answer");
         assert_eq!(body["data"], payload["data"]);
         assert_eq!(body["usage"], payload["usage"]);
         assert_eq!(body["created"], json!(1_700_000_000));
@@ -501,9 +569,36 @@ mod tests {
             "usage": {"input_tokens": 1, "output_tokens": 1},
         });
         for payload in [unbilled, short, imageless] {
-            let failure = public_images(payload, &admission(2)).expect_err("malformed");
+            let failure = public_images(payload, &admission(2), false).expect_err("malformed");
             assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
             assert!(failure.failover_eligible);
+        }
+    }
+    #[test]
+    fn openrouter_usage_and_partial_count_are_mapped_without_losing_media() {
+        let payload = json!({
+            "created": 17,
+            "data": [{"b64_json": "aW1hZ2U=", "media_type": "image/png"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 272, "total_tokens": 275, "cost": 0.008184}
+        });
+        let (body, usage) = public_images(payload, &admission(2), true).unwrap();
+        assert_eq!(body["data"][0]["media_type"], "image/png");
+        assert_eq!(body["usage"]["input_tokens"], 3);
+        assert_eq!(body["usage"]["output_tokens"], 272);
+        assert_eq!(body["usage"]["cost"], 0.008184);
+        assert_eq!(usage.input_tokens, Some(3));
+        assert_eq!(usage.output_tokens, Some(272));
+    }
+
+    #[test]
+    fn invalid_base64_and_sandbox_references_are_not_images() {
+        for item in [
+            json!({"b64_json":""}),
+            json!({"b64_json":"!!!"}),
+            json!({"url":"sandbox:/mnt/data/0.png"}),
+        ] {
+            let payload = json!({"data":[item], "usage":{"prompt_tokens":1,"completion_tokens":1}});
+            assert!(public_images(payload, &admission(1), true).is_err());
         }
     }
 }
