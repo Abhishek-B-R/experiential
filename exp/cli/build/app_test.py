@@ -38,6 +38,7 @@ from exp.common.models import (
     write_model_catalog,
 )
 from exp.common.project import ArtifactCorruptionError, ProjectStore, ProjectStoreError
+from exp.common.project.testing import RawArtifact
 from exp.common.traces import load_trace_dataset
 from exp.runtime.models import CatalogRoleName, ResolvedModel
 from exp.simulation.ingest.dataset import read_trace_model_identity_evidence
@@ -670,7 +671,10 @@ def test_build_package_upgrade_graphs_remain_independently_verified(
     second_build = store.load_project().build
     assert second_build is not None
     selected = first_build if selected_graph == "old" else second_build
-    trace_directory = store.artifacts.read(selected.trace_dataset.artifact_id).directory
+    trace_directory = RawArtifact(
+        store.artifacts._paths,
+        store.artifacts.read(selected.trace_dataset.artifact_id).manifest.artifact_id,
+    )
     trace_path = trace_directory / "traces.jsonl"
     trace_path.write_text("corrupt\n", encoding="utf-8")
 
@@ -1605,3 +1609,28 @@ def test_build_rejects_an_undeclared_trace_source(tmp_path: Path) -> None:
     assert result.exit_code == 2
     assert "unsupported trace source 'helicone'" in unstyle(result.output)
     assert "posthog" in unstyle(result.output)
+
+
+def test_build_pins_stored_import_after_original_source_is_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The downstream build consumes the exact ingestion receipt without rereading a path."""
+    from exp.simulation.ingest.persistence import ingest_traces
+
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root)
+    _, receipt = ingest_traces("support", root=root, source_format="otlp", path=source)
+    assert receipt is not None
+    source.unlink()
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support", "--import-id", receipt.import_id, "--root", str(root), "--dry-run"],
+    )
+    assert result.exit_code == 0, result.output
+    store = ProjectStore(root, "support")
+    assert store.load_project().trace_import_id == receipt.import_id
+    assert store.artifacts.list_ids()
+    assert not (store.paths.project_directory / "project.toml").exists()

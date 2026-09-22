@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import sqlite3
 import stat
 import tempfile
 import unicodedata
@@ -59,6 +60,7 @@ from exp.common.project.project import (
     ProjectHostedSetup,
     require_durable_source_id,
 )
+from exp.common.project.restore import publish_restored_project
 from exp.common.project.store import ProjectStore
 
 _BUNDLE_MANIFEST_PATH = "bundle.json"
@@ -325,11 +327,10 @@ def restore_project_bundle(
         _verify_restored_project(staged, loaded)
         if verify_project is not None:
             verify_project(staged)
-        os.rename(staged.paths.project_directory, destination)
-        fsync_directory_best_effort(paths.projects_directory)
+        publish_restored_project(staged.paths, paths)
     except ProjectBundleError:
         raise
-    except (OSError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
         raise ProjectBundleError(f"cannot atomically restore Project bundle: {exc}") from exc
     finally:
         shutil.rmtree(staging_root, ignore_errors=True)

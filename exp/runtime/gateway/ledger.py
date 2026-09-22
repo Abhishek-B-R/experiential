@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.sqlite.connection import persistent_connection
 from exp.runtime.gateway.auth import utc_text
 from exp.runtime.gateway.budgets import (
     MAXIMUM_NANO_USD,
@@ -38,7 +39,7 @@ from exp.runtime.gateway.ledger_usage import (
     identity_usage_rows,
 )
 from exp.runtime.gateway.ledger_valuation import frozen_usage_cost, optional_int
-from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
+from exp.runtime.gateway.sqlite.migrations import initialize_database
 from exp.runtime.gateway.sqlite.store import SystemGatewayClock
 
 

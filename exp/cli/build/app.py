@@ -43,6 +43,8 @@ from exp.common.project import (
     artifact_input,
 )
 from exp.common.release_revision import installed_release_revision
+from exp.common.traces.sqlite import SQLiteTraceStore
+from exp.common.traces.sqlite_schema import trace_database_path
 from exp.runtime.gateway.local_capture import local_capture_path
 from exp.runtime.models import (
     CapabilityRequirement,
@@ -56,6 +58,7 @@ from exp.runtime.models.providers.transport import ProviderTransportError, Retry
 from exp.simulation.build import ProjectBuild, TaskSetBuild, build_project, select_completed_build
 from exp.simulation.engines.text.errors import SimulationContentionError
 from exp.simulation.ingest.otlp import TraceNormalizationResult
+from exp.simulation.ingest.persistence import read_ingested_traces
 from exp.simulation.ingest.sources import CANONICAL_TRACE_SOURCES, load_trace_source
 from exp.simulation.retrieval import (
     RAGEmbedderBinding,
@@ -106,6 +109,9 @@ def build(
     project: str = _PROJECT_ARGUMENT,
     legacy_trace_file: Path | None = _LEGACY_TRACE_ARGUMENT,
     trace_file: Path | None = _TRACE_FILE_OPTION,
+    import_id: str | None = typer.Option(
+        None, "--import-id", help="Exact stored trace import to build without rereading its source."
+    ),
     source: str = typer.Option(
         "otlp",
         "--source",
@@ -164,6 +170,7 @@ def build(
         project: Safe local project identifier below ``<root>/projects``.
         legacy_trace_file: Active positional trace-path compatibility for packaged examples.
         trace_file: Explicit local canonical trace export, or ``None`` for the interactive wizard.
+        import_id: Immutable stored import selected explicitly for this build.
         source: Declared local-export format.
         root: Local ``.exp`` artifact root.
         identity: Required local identity when using ``--source gateway``.
@@ -185,16 +192,20 @@ def build(
         if trace_file is not None:
             raise typer.BadParameter("provide traces once, using -t/--traces or the trace path")
         trace_file = legacy_trace_file
-    if source.strip().casefold() == "gateway":
+    if import_id is not None and (
+        trace_file is not None or identity is not None or source != "otlp"
+    ):
+        raise typer.BadParameter("--import-id cannot be combined with traces, source, or identity")
+    if import_id is None and source.strip().casefold() == "gateway":
         if identity is None:
             raise typer.BadParameter("--source gateway requires --identity ID")
         trace_file = trace_file or local_capture_path(root)
     elif identity is not None:
         raise typer.BadParameter("--identity requires --source gateway")
-    if trace_file is None:
+    if trace_file is None and import_id is None:
         if dry_run or no_interactive or not can_prompt(_console):
             raise typer.BadParameter(
-                "automation and dry runs require an explicit -t/--traces PATH; bare "
+                "automation and dry runs require -t/--traces PATH or --import-id ID; bare "
                 "`exp build PROJECT` is the interactive end-to-end build"
             )
         from exp.cli.build.wizard import run_build_wizard
@@ -258,14 +269,24 @@ def build(
             selected,
         )
         _console.print("[dim]loading[/dim] Normalize trace evidence")
-        path = _resolve_trace_file(trace_file)
+
         with progress_display(_console) as progress:
             report(progress, "normalization")
-            normalized = (
-                load_trace_source(source, path, identity_id=identity)
-                if identity is not None
-                else _load_canonical_traces(path, source)
-            )
+            if import_id is not None:
+                imports = SQLiteTraceStore(trace_database_path(root))
+                if import_id not in imports.list_imports(project):
+                    raise ValueError("the selected import is not associated with this project")
+                selected_import = imports.read_import(import_id)
+                source = selected_import.source_format
+                normalized = read_ingested_traces(root, import_id)
+            else:
+                assert trace_file is not None
+                path = _resolve_trace_file(trace_file)
+                normalized = (
+                    load_trace_source(source, path, identity_id=identity)
+                    if identity is not None
+                    else _load_canonical_traces(path, source)
+                )
             if not normalized.traces:
                 raise ValueError(
                     "no valid canonical traces were produced; inspect the input and provide at "
@@ -284,6 +305,7 @@ def build(
                 ProjectConfig(
                     project_id=project,
                     trace_source=source.strip().casefold(),
+                    trace_import_id=import_id,
                     models=selected,
                     retrieval=ProjectRetrievalConfiguration(top_k=top_k),
                     budgets=ProjectBudgetConfiguration(
@@ -343,6 +365,7 @@ def build(
                         ceiling=maximum_build_cost_usd,
                         project=project,
                         trace_file=trace_file,
+                        import_id=import_id,
                         source=source,
                         root=root,
                         world_model=world_model,
@@ -356,7 +379,11 @@ def build(
             root=root,
             yes=yes,
             estimated_cost_usd=estimate,
-            command=f"exp build {project} {trace_file}",
+            command=(
+                f"exp build {project} --import-id {import_id}"
+                if import_id is not None
+                else f"exp build {project} {trace_file}"
+            ),
             non_interactive=no_interactive,
         ):
             return
@@ -578,7 +605,7 @@ def _project_store(root: Path, proposed: ProjectConfig) -> ProjectStore:
         ValueError: Existing project configuration differs outside completed-build pointers.
     """
     store = ProjectStore(root, proposed.project_id)
-    if not store.paths.project_toml.exists():
+    if not store.exists():
         store.initialize(proposed)
         return store
     existing = store.load_project()

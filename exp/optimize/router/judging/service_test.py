@@ -53,6 +53,7 @@ from exp.common.project import (
     ProjectStoreError,
     artifact_input,
 )
+from exp.common.project.testing import RawArtifact
 from exp.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 from exp.optimize.router.judging.contracts import (
     JudgePromptTemplate,
@@ -1130,7 +1131,12 @@ def test_completed_audit_tamper_fails_before_replay_or_approval(tmp_path: Path) 
         created_at=_TIME,
         code_revision="test-revision",
     )
-    audit_path = store.artifacts.read(result.audit.audit_id).directory / "audit.json"
+    audit_path = (
+        RawArtifact(
+            store.artifacts._paths, store.artifacts.read(result.audit.audit_id).manifest.artifact_id
+        )
+        / "audit.json"
+    )
     audit_path.write_text("{}", encoding="utf-8")
 
     with pytest.raises(ManualJudgeError, match="audit is unavailable"):
