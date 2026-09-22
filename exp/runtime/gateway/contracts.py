@@ -125,7 +125,7 @@ class GatewayToolDefinition(ContractModel):
 
     Attributes:
         name: Function name, bounded to 256 characters.
-        description: Optional description; the request-body cap bounds the toolset.
+        description: Unbounded caller description; body and provider context limits apply.
         parameters: The caller JSON Schema, unchanged.
         strict: Whether the provider must enforce the schema.
         cache_control: Validated caching hint, excluded from replay identity.
@@ -138,7 +138,7 @@ class GatewayToolDefinition(ContractModel):
     """
 
     name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=65_536)
+    description: str | None = None
     parameters: JsonObject
     strict: bool = False
     cache_control: JsonObject | None = Field(default=None, exclude=True)

@@ -2912,3 +2912,54 @@ def test_nullable_completed_probability_phases_are_preserved(
         assert '"logprobs":null' in response.text
     else:
         assert response.json()["output"][0]["content"][0]["logprobs"] is None
+
+
+@pytest.mark.parametrize("surface", ["chat/completions", "responses", "messages"])
+@pytest.mark.parametrize("length", [119_825, 262_145])
+def test_large_tool_description_reaches_provider_unchanged(
+    engine: _ServingEngine, surface: str, length: int
+) -> None:
+    """The served endpoints forward full descriptions without writing them to diagnostics."""
+    marker = f"tool-description-canary-{surface}-{length}"
+    description = marker + "x" * (length - len(marker) - 1) + "界"
+    function: JsonObject = {
+        "name": "lookup",
+        "description": description,
+        "parameters": {"type": "object"},
+    }
+    body: JsonObject = {"model": "coding"}
+    if surface == "responses":
+        body.update(input=marker, tools=[{"type": "function", **function}])
+    else:
+        body["messages"] = [{"role": "user", "content": marker}]
+        if surface == "messages":
+            body.update(
+                max_tokens=64,
+                tools=[
+                    {
+                        "name": "lookup",
+                        "description": description,
+                        "input_schema": {"type": "object"},
+                    }
+                ],
+            )
+        else:
+            body["tools"] = [{"type": "function", "function": function}]
+    response = httpx.post(
+        f"{engine.base}/v1/{surface}",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json=body,
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    with _SseUpstream.payloads_lock:
+        matching = [
+            payload
+            for payload in _SseUpstream.payloads
+            if marker in json.dumps(payload["messages"])
+        ]
+    assert len(matching) == 1
+    tools = cast(list[JsonObject], matching[0]["tools"])
+    forwarded = cast(JsonObject, tools[0]["function"])
+    assert forwarded["description"] == description
+    assert marker not in (engine.root / "driver-stderr.log").read_text()

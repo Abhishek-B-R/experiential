@@ -103,15 +103,8 @@ _MAXIMUM_FILE_ID_CHARACTERS = 512
 """Longest OpenAI Files handle accepted on the wire."""
 
 
-_MAXIMUM_DESCRIPTION_CHARACTERS = 65_536
-"""Tool, function, and structured-format description bound, both surfaces.
-
-Matches the Messages surface and the canonical GatewayToolDefinition bound.
-The provider itself accepts far larger values (probed live 2026-09-05,
-api.openai.com: 8,292, 30,000, and 66,000-character descriptions all
-serve), and real agent toolsets exceeded the earlier 8,192 bound (prod
-report: an 8,292-character tool description 400d every agentic turn). The
-request-body size cap remains the effective total limit."""
+_MAXIMUM_FORMAT_DESCRIPTION_CHARACTERS = 65_536
+"""Structured-output format description bound on both OpenAI surfaces."""
 
 
 class _ResponsesImagePart(_WireModel):
@@ -426,7 +419,7 @@ class _FunctionDefinition(_WireModel):
     """One function schema offered through Chat Completions."""
 
     name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=_MAXIMUM_DESCRIPTION_CHARACTERS)
+    description: str | None = None
     parameters: JsonObject = Field(default_factory=dict)
     strict: bool = False
 
@@ -459,7 +452,7 @@ class _StructuredSchema(_WireModel):
     """Named strict JSON Schema in a Chat response format."""
 
     name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=_MAXIMUM_DESCRIPTION_CHARACTERS)
+    description: str | None = Field(default=None, max_length=_MAXIMUM_FORMAT_DESCRIPTION_CHARACTERS)
     schema_: JsonObject = Field(alias="schema")
     strict: bool = True
 
@@ -641,7 +634,7 @@ class _ResponseTool(_WireModel):
 
     type: Literal["function"] = "function"
     name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=_MAXIMUM_DESCRIPTION_CHARACTERS)
+    description: str | None = None
     parameters: JsonObject = Field(default_factory=dict)
     strict: bool | None = None
     defer_loading: bool | None = None
@@ -754,7 +747,7 @@ class _ResponseFormat(_WireModel):
 
     type: Literal["text", "json_schema"]
     name: str | None = Field(default=None, min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=_MAXIMUM_DESCRIPTION_CHARACTERS)
+    description: str | None = Field(default=None, max_length=_MAXIMUM_FORMAT_DESCRIPTION_CHARACTERS)
     schema_: JsonObject | None = Field(default=None, alias="schema")
     strict: bool = True
 
