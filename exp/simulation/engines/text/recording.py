@@ -47,6 +47,7 @@ from exp.common.rollouts.checkpoint import TextRolloutCheckpoint
 from exp.common.tasks import TaskCase
 from exp.runtime.environments import Observation
 from exp.runtime.models import ResolvedModel
+from exp.runtime.models.providers.errors import ProviderRefusalError
 from exp.runtime.models.providers.transport import classify_retry
 from exp.simulation.engines.clock import timestamp
 from exp.simulation.engines.text.environment import SimulatedToolUseError
@@ -288,7 +289,7 @@ class RecordingCandidateClient:
             failure = StructuredFailure(
                 code=FailureCode.PROVIDER,
                 message=f"text simulation provider call failed with {type(exc).__name__}",
-                retryable=classification.retryable,
+                retryable=classification.retryable or isinstance(exc, ProviderRefusalError),
                 exception_type=type(exc).__name__,
                 attribution=FailureAttribution.MODEL,
                 details=details,

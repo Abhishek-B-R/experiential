@@ -174,20 +174,21 @@ def prepare_run(
         setup = config.hosted_judge.setup
         calibration = config.hosted_judge.calibration
     created_at = datetime.now(UTC)
+    run_id = stable_id(
+        "eval", {"project": project.paths.project_id, "created_at": created_at.isoformat()}
+    )
     prepared = prepare_model_evaluation(
         project,
         catalog,
         defaults.models,
         embedder_alias=config.models.embedder,
         options=defaults.options,
+        run_id=run_id,
         judge_setup=setup,
         calibration_id=calibration.artifact_id if calibration else None,
         continuation_of=continuation_of,
         created_at=created_at,
         code_revision=code_revision,
-    )
-    run_id = stable_id(
-        "eval", {"prepared": prepared.model_dump(mode="json"), "created_at": created_at.isoformat()}
     )
     run = EvaluationRun(
         run_id=run_id, created_at=created_at, code_revision=code_revision, prepared=prepared
@@ -209,7 +210,7 @@ def load_run(project: ProjectStore, run_id: str) -> EvaluationRun:
     run = EvaluationRun.model_validate_json(
         (run_directory(project, run_id) / "run.json").read_bytes()
     )
-    if run.run_id != run_id:
+    if run.run_id != run_id or run.prepared.setup.run_id != run_id:
         raise ValueError("evaluation run identity differs from its directory")
     return run
 

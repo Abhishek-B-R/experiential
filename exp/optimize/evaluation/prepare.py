@@ -122,6 +122,7 @@ def prepare_model_evaluation(
     worker_aliases: tuple[str, ...],
     *,
     continuation_of: str | None = None,
+    run_id: str | None = None,
     judge_setup: ArtifactInput | None = None,
     calibration_id: str | None = None,
     embedder_alias: str,
@@ -136,6 +137,7 @@ def prepare_model_evaluation(
         catalog: Secret-free catalog with explicit model capabilities and prices.
         worker_aliases: Two or more distinct worker aliases, never an incumbent or router.
         continuation_of: Prior simulation ID to continue under increased budgets.
+        run_id: Optional distinct experiment identity; identical settings can run fresh evidence.
         judge_setup: Authored judge setup manifest, or omit both judge arguments for task success.
         calibration_id: Verified calibration identity paired with an explicit judge setup.
         embedder_alias: Catalog alias matching the completed fit-RAG embedder.
@@ -320,6 +322,7 @@ def prepare_model_evaluation(
         pricing_snapshot_id=pricing.pricing_snapshot_id,
     )
     setup = EvaluationSetup(
+        run_id=run_id,
         candidates=candidates,
         production_protocol=production,
         simulation_protocol=simulation,

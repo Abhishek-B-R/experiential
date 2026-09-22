@@ -77,6 +77,10 @@ def test_twenty_scenarios_repeats_persist_report_and_exact_resume(tmp_path: Path
     saved = load_run(project, run.run_id)
     assert saved.status == "completed"
     assert result.report.compared_cells == 40
+    assert all(
+        model.operating_cost_usd == pytest.approx(0.000016) for model in result.report.models
+    )
+    assert all(model.latency_seconds is not None for model in result.report.models)
     evidence = load_report_evidence(project, saved)
     assert len(evidence.tasks) == 20
     assert len(evidence.rollouts) == 80
@@ -89,6 +93,15 @@ def test_twenty_scenarios_repeats_persist_report_and_exact_resume(tmp_path: Path
     replay = execute_run(project, saved, runtime, provider_spend_consented=True)
     assert replay.report == result.report
     assert before == (len(state.completion_calls), len(state.embedding_calls))
+    fresh = prepare_run(project, catalog, defaults, code_revision=_REVISION)
+    assert fresh.run_id != saved.run_id
+    rerun = execute_run(project, fresh, runtime, provider_spend_consented=True)
+    assert rerun.simulation_spec.simulation_id != result.simulation_spec.simulation_id
+    assert len(state.completion_calls) > before[0]
+    fresh_evidence = load_report_evidence(project, load_run(project, fresh.run_id))
+    assert {item.rollout_id for item in evidence.rollouts}.isdisjoint(
+        item.rollout_id for item in fresh_evidence.rollouts
+    )
 
 
 def test_underfilled_project_never_dispatches_or_creates_a_run(tmp_path: Path) -> None:

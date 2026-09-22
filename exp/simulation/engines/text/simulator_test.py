@@ -54,6 +54,7 @@ from exp.common.tasks import TaskCase, TaskSet, ToolSchema
 from exp.runtime.agents import AgentEpisode, AgentRuntime
 from exp.runtime.environments import EnvironmentSession
 from exp.runtime.models import ResolvedModel
+from exp.runtime.models.providers.errors import ProviderRefusalError, ProviderRefusalSignal
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.simulation.engines.text.bindings import (
     binding_digest,
@@ -135,15 +136,17 @@ class _TimeoutClient:
 class _FlakyOnceClient:
     """Raise one exhausted transport failure, then delegate to scripted responses."""
 
-    def __init__(self, responses: list[ModelResponse]) -> None:
+    def __init__(self, responses: list[ModelResponse], *, failure: Exception | None = None) -> None:
         """Store the answers served after the single scripted transport failure.
 
         Args:
             responses: Responses returned in order once the transport recovers.
+            failure: Optional explicit refusal or transport exception on the first call.
         """
         self._responses = list(responses)
         self.requests: list[ModelRequest] = []
         self._failed = False
+        self._failure = failure or ProviderTransportError("connection reset by provider")
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Fail the first dispatch at the transport level and answer afterwards.
@@ -160,7 +163,7 @@ class _FlakyOnceClient:
         self.requests.append(request)
         if not self._failed:
             self._failed = True
-            raise ProviderTransportError("connection reset by provider")
+            raise self._failure
         return self._responses.pop(0)
 
 
@@ -1351,8 +1354,10 @@ def test_invalid_production_usage_charges_reservation_and_admits_later_paid_cell
     assert (len(candidate_client.requests), len(world_client.requests)) == calls
 
 
+@pytest.mark.parametrize("refused", [False, True])
 def test_resume_reexecutes_retryable_transport_failure_as_new_immutable_attempt(
     tmp_path: Path,
+    refused: bool,
 ) -> None:
     """A persisted transport failure is superseded on resume by a fresh-budget attempt.
 
@@ -1365,7 +1370,12 @@ def test_resume_reexecutes_retryable_transport_failure_as_new_immutable_attempt(
     plan_input = _persist_plan(store, plan)
     task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
     candidate_client = _FlakyOnceClient(
-        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=None)]
+        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=None)],
+        failure=(
+            ProviderRefusalError(provider="test", signal=ProviderRefusalSignal.PROVIDER_REFUSAL)
+            if refused
+            else None
+        ),
     )
     world_client = _ScriptedClient(
         [
@@ -1403,7 +1413,9 @@ def test_resume_reexecutes_retryable_transport_failure_as_new_immutable_attempt(
     assert first.stop_reason == StopReason.FAILURE
     assert first.failure is not None
     assert first.failure.retryable is True
-    assert first.failure.exception_type == "ProviderTransportError"
+    assert first.failure.exception_type == (
+        "ProviderRefusalError" if refused else "ProviderTransportError"
+    )
     assert first.failure.details["provider_dispatch_unknown_spend"] is True
     reserved = first.failure.details[UNKNOWN_DISPATCH_RESERVED_COST_KEY]
     assert isinstance(reserved, float) and reserved > 0

@@ -26,7 +26,7 @@ def render_report(console: Console, project: ProjectStore, run: EvaluationRun) -
         "Model",
         "Quality /100",
         "Assistant / task",
-        "Latency",
+        "Assistant latency",
         "Valid",
         "Invalid",
         "Incomplete",
@@ -47,7 +47,7 @@ def render_report(console: Console, project: ProjectStore, run: EvaluationRun) -
     console.print(f"Report and Pareto plot: {html_path}", markup=False)
     console.print(f"Portable data: {json_path}", markup=False)
     console.print(
-        f"Actual experiment spend: simulation {_number(run.simulation_cost_usd, '$')} · "
+        f"Accounted experiment spend: simulation {_number(run.simulation_cost_usd, '$')} · "
         f"judge {_number(run.judge_cost_usd, '$')}"
     )
 

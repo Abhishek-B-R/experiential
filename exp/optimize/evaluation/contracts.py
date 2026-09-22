@@ -29,6 +29,7 @@ class EvaluationSetup(ContractModel):
     simulation_completion_input: ArtifactInput | None = None
     agent_id: str = Field(min_length=1, max_length=256)
     seed: int
+    run_id: str | None = Field(default=None, min_length=1, max_length=256)
     maximum_steps: int = Field(gt=0)
     continuation_of: ArtifactInput | None = None
     maximum_rollout_output_tokens: int = Field(default=1_000_000, gt=0)

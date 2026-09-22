@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 
@@ -27,6 +28,9 @@ class ReportEvidence(ContractModel):
         project: Local project name.
         run_id: Exact execution receipt.
         report: Verified aggregate model comparison.
+        judgment_status: Provisional or human-calibrated project judge status.
+        world_model: Configured simulator alias.
+        judge_model: Exact judging model identity.
         tasks: Scenarios pinned by the evaluation dataset.
         rows: Model/scenario/repeat outcomes, including invalid evidence.
         rollouts: Immutable selected rollout records.
@@ -38,6 +42,9 @@ class ReportEvidence(ContractModel):
     project: str
     run_id: str
     report: ModelEvaluationReport
+    judgment_status: Literal["provisional", "human_calibrated"]
+    world_model: str
+    judge_model: str
     tasks: tuple[TaskCase, ...]
     rows: tuple[EvaluationRow, ...]
     rollouts: tuple[RolloutArtifact, ...]
@@ -65,6 +72,9 @@ def load_report_evidence(project: ProjectStore, run: EvaluationRun) -> ReportEvi
         project=project.paths.project_id,
         run_id=run.run_id,
         report=report,
+        judgment_status=run.prepared.setup.judgment_status,
+        world_model=run.prepared.setup.world_model_settings.world_model_alias,
+        judge_model=run.prepared.judge_request.model.model_id,
         tasks=load_task_set(project.artifacts, dataset.manifest.task_set_id).tasks,
         rows=dataset.rows,
         rollouts=rollouts,

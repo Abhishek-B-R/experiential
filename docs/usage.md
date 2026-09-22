@@ -259,7 +259,8 @@ are selected automatically. Otherwise the task-success judge is explicitly provi
 `exp eval powerset` opens the terminal project screen: select models, configure repeats and
 budgets, resume saved work, or inspect results. The default minimum is 20 distinct scenarios,
 with one repeat, eight parallel workers, 100 steps, and 1,000,000 generated tokens per rollout.
-Retries are separate from repeats. Settings are saved in the project's `evaluation.json`.
+Retries are separate from repeats. New evaluations collect fresh evidence; resume reuses the
+exact saved run. Settings are saved in the project's `evaluation.json`.
 
 Use `--dry-run` for provider-free preparation, `--resume RUN_ID` for exact saved execution, and
 `--report RUN_ID` for read-only results. Ctrl-C cancels queued work and drains active rollouts;
@@ -270,3 +271,7 @@ Each completed run writes `report.json`, `rollouts.jsonl`, and a standalone offl
 under `.exp/projects/PROJECT/runtime/evaluations/RUN_ID/`. The HTML contains a cost-quality Pareto
 plot and one tile per scenario with model and repeat selectors. Assistant cost and quality use the
 shared valid cohort; invalid/incomplete coverage and total experiment spend remain visible.
+
+Assistant cost per task reprices recorded successful-rollout tokens at the frozen catalog rates.
+It excludes simulation, judging, invalid attempts, and hypothetical retry reservations.
+Conservative experiment-spend accounting remains separate from the report's operating cost.
