@@ -11,6 +11,7 @@ import typer
 from rich.console import Console
 
 from exp.cli.build.cost import over_ceiling_message
+from exp.cli.build.source import load_stored_build_import
 from exp.cli.providers.provider_picker import resolve_setup_providers
 from exp.cli.providers.setup import (
     ProviderSetupOptions,
@@ -43,8 +44,6 @@ from exp.common.project import (
     artifact_input,
 )
 from exp.common.release_revision import installed_release_revision
-from exp.common.traces.sqlite import SQLiteTraceStore
-from exp.common.traces.sqlite_schema import trace_database_path
 from exp.runtime.gateway.local_capture import local_capture_path
 from exp.runtime.models import (
     CapabilityRequirement,
@@ -58,7 +57,6 @@ from exp.runtime.models.providers.transport import ProviderTransportError, Retry
 from exp.simulation.build import ProjectBuild, TaskSetBuild, build_project, select_completed_build
 from exp.simulation.engines.text.errors import SimulationContentionError
 from exp.simulation.ingest.otlp import TraceNormalizationResult
-from exp.simulation.ingest.persistence import read_ingested_traces
 from exp.simulation.ingest.sources import CANONICAL_TRACE_SOURCES, load_trace_source
 from exp.simulation.retrieval import (
     RAGEmbedderBinding,
@@ -269,16 +267,10 @@ def build(
             selected,
         )
         _console.print("[dim]loading[/dim] Normalize trace evidence")
-
         with progress_display(_console) as progress:
             report(progress, "normalization")
             if import_id is not None:
-                imports = SQLiteTraceStore(trace_database_path(root))
-                if import_id not in imports.list_imports(project):
-                    raise ValueError("the selected import is not associated with this project")
-                selected_import = imports.read_import(import_id)
-                source = selected_import.source_format
-                normalized = read_ingested_traces(root, import_id)
+                source, normalized = load_stored_build_import(root, project, import_id)
             else:
                 assert trace_file is not None
                 path = _resolve_trace_file(trace_file)
