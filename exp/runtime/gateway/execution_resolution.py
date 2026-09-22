@@ -55,6 +55,10 @@ def _resolved_wire_profile(
         return replace(
             profile,
             model_id=profile.model_id or runtime_model.snapshot.model_id,
+            supports_responses_logprobs=(
+                gateway_capabilities.supports_responses_logprobs
+                and profile.dialect == "openai_responses"
+            ),
             billing_customer_managed=(deployment.billing_source == BillingSource.CUSTOMER_MANAGED),
             service_tier_pricing_enabled=capabilities.service_tier_pricing_enabled,
             service_tier_cards=frozenset(
@@ -95,6 +99,7 @@ def _resolved_wire_profile(
                 else profile.maximum_top_k
             ),
             sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
+            logprobs_reasoning_efforts=gateway_capabilities.logprobs_reasoning_efforts,
             supported_reasoning_efforts=(
                 gateway_capabilities.supported_reasoning_efforts
                 or profile.supported_reasoning_efforts

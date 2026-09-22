@@ -56,7 +56,8 @@ class ModelEvaluationOptions(ContractModel):
 
     maximum_steps: int = Field(default=100, ge=1)
     maximum_rollout_output_tokens: int = Field(default=1_000_000, gt=0)
-    maximum_concurrency: int = Field(default=1, ge=1, le=32)
+    maximum_concurrency: int = Field(default=8, ge=1)
+    repeats: int = Field(default=1, ge=1)
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     maximum_judge_input_tokens: int = Field(default=32_768, gt=0)
     maximum_judge_output_tokens: int = Field(default=8_192, gt=0)
@@ -343,6 +344,7 @@ def prepare_model_evaluation(
         maximum_steps=options.maximum_steps,
         maximum_rollout_output_tokens=options.maximum_rollout_output_tokens,
         maximum_concurrency=options.maximum_concurrency,
+        repeats=options.repeats,
     )
     cost = estimate_model_evaluation(
         project,

@@ -9,7 +9,15 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 from pydantic.types import JsonValue
 
 from exp.common.core.artifacts import JsonObject
@@ -43,19 +51,14 @@ _EchoedItemStatus = Literal["in_progress", "completed", "incomplete"]
 class _TextPart(_WireModel):
     """One supported text-only content part.
 
-    Echoed ``output_text`` parts carry ``annotations`` and ``logprobs``
-    arrays: this gateway emits them and callers resend prior output verbatim
-    on continuations. Hosted web-search answers carry populated annotation
-    objects (URL citations), which are validated shallowly and dropped on
-    replay: the provider derives nothing from echoed display metadata, and
-    the cited text itself rides ``text``. A populated ``logprobs`` echo stays
-    rejected because this gateway never emits one.
+    Echoed output_text annotations and probabilities are accepted as typed
+    objects, then stripped from provider history; the text remains unchanged.
     """
 
     type: Literal["text", "input_text", "output_text"]
     text: str
     annotations: tuple[JsonObject, ...] | None = None
-    logprobs: tuple[()] | None = None
+    logprobs: tuple[JsonObject, ...] | None = None
 
     @field_validator("annotations")
     @classmethod
@@ -100,15 +103,8 @@ _MAXIMUM_FILE_ID_CHARACTERS = 512
 """Longest OpenAI Files handle accepted on the wire."""
 
 
-_MAXIMUM_DESCRIPTION_CHARACTERS = 65_536
-"""Tool, function, and structured-format description bound, both surfaces.
-
-Matches the Messages surface and the canonical GatewayToolDefinition bound.
-The provider itself accepts far larger values (probed live 2026-09-05,
-api.openai.com: 8,292, 30,000, and 66,000-character descriptions all
-serve), and real agent toolsets exceeded the earlier 8,192 bound (prod
-report: an 8,292-character tool description 400d every agentic turn). The
-request-body size cap remains the effective total limit."""
+_MAXIMUM_FORMAT_DESCRIPTION_CHARACTERS = 65_536
+"""Structured-output format description bound on both OpenAI surfaces."""
 
 
 class _ResponsesImagePart(_WireModel):
@@ -423,7 +419,7 @@ class _FunctionDefinition(_WireModel):
     """One function schema offered through Chat Completions."""
 
     name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=_MAXIMUM_DESCRIPTION_CHARACTERS)
+    description: str | None = None
     parameters: JsonObject = Field(default_factory=dict)
     strict: bool = False
 
@@ -456,7 +452,7 @@ class _StructuredSchema(_WireModel):
     """Named strict JSON Schema in a Chat response format."""
 
     name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=_MAXIMUM_DESCRIPTION_CHARACTERS)
+    description: str | None = Field(default=None, max_length=_MAXIMUM_FORMAT_DESCRIPTION_CHARACTERS)
     schema_: JsonObject = Field(alias="schema")
     strict: bool = True
 
@@ -513,17 +509,13 @@ class _ThinkingConfig(_WireModel):
     """Anthropic-style ``thinking`` config on a Chat request.
 
     Translated to the canonical reasoning control: ``enabled`` and ``adaptive``
-    turn thinking on at the model's default effort (``adaptive`` is the only
-    on-mode Anthropic's 4.6+ generation accepts, and the value Anthropic SDKs
-    and Claude-configured clients send on every model), ``disabled`` maps to
-    ``reasoning_effort=none``. ``budget_tokens`` has no canonical equivalent
-    and is disclosed as not carried. 3,935 Chat requests over 7 days (19
-    organizations, Claude and MiniMax routes alike) were refused at decode for
-    sending ``adaptive`` before it was admitted here (2026-09-15).
+    turn thinking on at the model's default effort; ``disabled`` maps to
+    ``reasoning_effort=none``. An enabled ``budget_tokens`` is preserved
+    for route admission and translated only where its numeric value is supported.
     """
 
     type: Literal["enabled", "disabled", "adaptive"]
-    budget_tokens: int | None = Field(default=None, ge=0)
+    budget_tokens: int | None = Field(default=None, ge=1024, strict=True)
 
 
 class _ChatTemplateKwargs(_WireModel):
@@ -545,6 +537,7 @@ class _ChatRequest(_WireModel):
     parallel_tool_calls: bool | None = None
     max_tokens: int | None = Field(default=None, gt=0)
     max_completion_tokens: int | None = Field(default=None, gt=0)
+    max_output_tokens: int | None = Field(default=None, gt=0, strict=True)
     stop: str | tuple[str, ...] | None = None
     n: int | None = None
     """Completion-count selector, accepted only at its no-op default of 1.
@@ -590,17 +583,17 @@ class _ChatRequest(_WireModel):
     top_k: int | None = Field(default=None, ge=0)
     frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
     presence_penalty: float | None = Field(default=None, ge=-2, le=2)
-    logprobs: bool | None = None
-    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    logprobs: StrictBool | None = None
+    top_logprobs: StrictInt | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None
     reasoning: _ChatReasoning | None = None
     thinking: _ThinkingConfig | None = None
     chat_template_kwargs: _ChatTemplateKwargs | None = None
+    thinking_budget: int | None = Field(default=None, ge=-1, strict=True)
     enable_thinking: bool | None = None
     """DashScope's top-level enable-thinking switch (``extra_body``), translated
     like the vLLM ``chat_template_kwargs`` spelling: Qwen-family clients send it
-    on every request (4,658 rejections across 110 organizations in the 7 days
-    to 2026-09-15)."""
+    on every request."""
     response_format: _ChatResponseFormat | None = None
     stream: bool = False
     stream_options: _ChatStreamOptions | None = None
@@ -624,10 +617,20 @@ class _ChatRequest(_WireModel):
     @model_validator(mode="after")
     def _require_coherent_options(self) -> _ChatRequest:
         """Reject conflicting token ceilings and non-stream usage options."""
-        if self.max_tokens is not None and self.max_completion_tokens is not None:
-            raise ValueError("max_tokens and max_completion_tokens are mutually exclusive")
+        if (
+            sum(
+                v is not None
+                for v in (self.max_tokens, self.max_completion_tokens, self.max_output_tokens)
+            )
+            > 1
+        ):
+            raise ValueError(
+                "max_tokens, max_completion_tokens and max_output_tokens are mutually exclusive"
+            )
         if self.stream_options is not None and not self.stream:
             raise ValueError("stream_options requires stream=true")
+        if self.top_logprobs is not None and self.logprobs is not True:
+            raise ValueError("top_logprobs requires logprobs=true")
         return self
 
 
@@ -636,7 +639,7 @@ class _ResponseTool(_WireModel):
 
     type: Literal["function"] = "function"
     name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=_MAXIMUM_DESCRIPTION_CHARACTERS)
+    description: str | None = None
     parameters: JsonObject = Field(default_factory=dict)
     strict: bool | None = None
     defer_loading: bool | None = None
@@ -749,7 +752,7 @@ class _ResponseFormat(_WireModel):
 
     type: Literal["text", "json_schema"]
     name: str | None = Field(default=None, min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=_MAXIMUM_DESCRIPTION_CHARACTERS)
+    description: str | None = Field(default=None, max_length=_MAXIMUM_FORMAT_DESCRIPTION_CHARACTERS)
     schema_: JsonObject | None = Field(default=None, alias="schema")
     strict: bool = True
 
@@ -960,7 +963,7 @@ class _ResponsesRequest(_WireModel):
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
     top_k: int | None = Field(default=None, ge=0)
-    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    top_logprobs: StrictInt | None = Field(default=None, ge=0, le=20)
     reasoning: _ResponseReasoning | None = None
     text: _ResponseText | None = None
     truncation: str | None = Field(default=None, max_length=64)

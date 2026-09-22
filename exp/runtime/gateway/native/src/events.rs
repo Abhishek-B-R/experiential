@@ -34,6 +34,8 @@ use serde_json::Value;
 
 use crate::errors::Failure;
 
+pub use crate::logprobs::{ChoiceLogprobs, ChoiceLogprobsDelta};
+
 /// Normalized token usage mirroring `GatewayUsage` semantics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
@@ -145,11 +147,24 @@ impl ProviderAssistantMessagePhase {
 pub enum Event {
     TextDelta(String),
     RefusalDelta(String),
+    /// Ordered probability metadata for one Chat choice. This is independent
+    /// of text because providers may send a metadata-only chunk.
+    ChoiceLogprobsDelta(ChoiceLogprobsDelta),
     /// One text delta for a specific provider-owned assistant message item.
     ProviderTextDelta {
         output_index: u32,
         item_id: String,
         delta: String,
+    },
+    /// One native Responses output-text probability observation. The raw
+    /// provider record is retained by phase; terminal reconciliation owns any
+    /// structural comparison and never synthesizes token bytes.
+    ProviderResponsesLogprobs {
+        output_index: u32,
+        item_id: String,
+        content_index: u32,
+        phase: String,
+        records: Value,
     },
     /// One refusal delta for a specific provider-owned assistant message item.
     ProviderRefusalDelta {
@@ -397,6 +412,9 @@ pub fn simplified_event(event: &Event) -> Value {
     match event {
         Event::TextDelta(text) => serde_json::json!({"kind": "text_delta", "text": text}),
         Event::RefusalDelta(text) => serde_json::json!({"kind": "refusal_delta", "text": text}),
+        Event::ChoiceLogprobsDelta(delta) => {
+            serde_json::json!({"kind": "choice_logprobs_delta", "choice_index": delta.choice_index, "logprobs": delta.logprobs})
+        }
         Event::ProviderTextDelta {
             output_index,
             item_id,
@@ -406,6 +424,20 @@ pub fn simplified_event(event: &Event) -> Value {
             "output_index": output_index,
             "item_id": item_id,
             "text": delta,
+        }),
+        Event::ProviderResponsesLogprobs {
+            output_index,
+            item_id,
+            content_index,
+            phase,
+            records,
+        } => serde_json::json!({
+            "kind": "provider_responses_logprobs",
+            "output_index": output_index,
+            "item_id": item_id,
+            "content_index": content_index,
+            "phase": phase,
+            "records": records,
         }),
         Event::ProviderRefusalDelta {
             output_index,
@@ -671,29 +703,10 @@ pub fn simplified_event(event: &Event) -> Value {
     }
 }
 
-fn add_provider_item_metadata(
-    payload: &mut Value,
-    item_id: &Option<String>,
-    status: Option<ProviderOutputItemStatus>,
-    phase: Option<ProviderAssistantMessagePhase>,
-) {
-    if let Some(item_id) = item_id {
-        payload["item_id"] = Value::String(item_id.clone());
-    }
-    if let Some(status) = status {
-        payload["status"] = Value::String(status.as_str().to_string());
-    }
-    if let Some(phase) = phase {
-        payload["phase"] = Value::String(phase.as_str().to_string());
-    }
-}
+mod item_metadata;
+use item_metadata::add_provider_item_metadata;
 
-/// Whether one hosted Responses item type names a tool INVOCATION.
-///
-/// Only invocations join the ledger's tool names: the hosted union also
-/// carries results (`*_call_output`), approvals, listings, and opaque
-/// conversation items (`additional_tools`, `compaction`), and recording one
-/// of those would report a tool call that never occurred.
+/// Count hosted invocations only, not results, approvals, listings or opaque items.
 pub fn hosted_item_type_is_invocation(item_type: &str) -> bool {
     item_type.ends_with("_call")
 }

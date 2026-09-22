@@ -380,6 +380,11 @@ impl AttemptGuard {
         self.upstream_provider = provider;
     }
 
+    /// Preserve independently validated decision usage before answer validation.
+    pub fn record_decision_usage(&mut self, usage: Usage) {
+        self.observation.record(&Event::Usage(usage));
+    }
+
     /// Record this request's terminal outcome and duration exactly once, at
     /// the moment the outcome is decided. Recording happens before delivery
     /// is awaited, so a task cancelled mid-write cannot re-report a decided

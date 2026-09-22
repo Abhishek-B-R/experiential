@@ -366,3 +366,55 @@ def test_every_anthropic_fallback_freezes_us_constraint_before_dispatch() -> Non
         payload = entry["upstream_payload"]
         assert isinstance(payload, dict)
         assert payload["inference_geo"] == "us"
+
+
+@pytest.mark.parametrize("model", ("qwen3.8-max", "qwen3.8-27b", "glm-5.2", "kimi-k2.5"))
+def test_numeric_budget_freezes_each_rungs_total_reservation(model: str) -> None:
+    """Split and combined ceilings never exceed the same per-rung reserved total."""
+    from exp.runtime.openai_protocol.requests import decode_chat
+
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking_budget": 1024,
+            "stream": True,
+        }
+    ).request
+    rungs = tuple(
+        _deployment(f"rung-{bound}", "openai-compatible").model_copy(
+            update={"capabilities": ModelCapabilities(maximum_output_tokens=bound)}
+        )
+        for bound in (8192, 4096)
+    )
+    route = _route(rungs)
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        model_id=model,
+        url="https://maas.qwencloudapi.com/compatible-mode/v1/chat/completions",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+    )
+    for rung, bound in zip(rungs, (8192, 4096), strict=True):
+        dispatch = build_rung_dispatch(
+            route,
+            rung,
+            profile,
+            _NoSigningClient(),
+            provider_request=request,
+            public_request=request,
+            authorization=_AUTHORIZATION,
+        )
+        payload = dispatch.wire_entry["upstream_payload"]
+        assert isinstance(payload, dict)
+        assert dispatch.reserved_output_tokens == bound
+        assert payload["thinking_budget"] == 1024
+        if model == "qwen3.8-max":
+            assert payload["max_completion_tokens"] == bound
+        else:
+            assert payload["max_tokens"] == bound - 1024
+        assert (
+            dispatch.output_disclosure
+            == f"max_tokens->default({bound};openai_compatible;declared_bound)"
+        )
+    assert request.maximum_output_tokens is None

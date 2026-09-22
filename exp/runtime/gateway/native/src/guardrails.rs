@@ -87,6 +87,8 @@ pub fn apply_text_replacement(events: &[Event], replacement: &str) -> Vec<Event>
     for event in events {
         match event {
             Event::RefusalDelta(_)
+            | Event::ChoiceLogprobsDelta(_)
+            | Event::ProviderResponsesLogprobs { .. }
             | Event::ProviderRefusalDelta { .. }
             | Event::ProviderOutputItemStarted { .. }
             | Event::ProviderOutputItemCompleted { .. }
@@ -246,7 +248,9 @@ fn classify(event: &Event) -> StreamAdmission {
             },
             delta.clone(),
         ),
-        Event::ReasoningSummaryDelta { .. }
+        Event::ChoiceLogprobsDelta(_)
+        | Event::ProviderResponsesLogprobs { .. }
+        | Event::ReasoningSummaryDelta { .. }
         | Event::ThinkingDelta { .. }
         | Event::ReasoningContentDelta { .. }
         | Event::ToolCallStarted { .. }

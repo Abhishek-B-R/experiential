@@ -1007,7 +1007,7 @@ def test_an_explicit_thinking_budget_is_not_replaced_with_advisory_effort() -> N
             accounting=cast(NativeAttemptAccounting, accounting),
             authorization=route.snapshot.authorization,
         )
-    assert rejected.value.param == "thinking"
+    assert rejected.value.param == "thinking.budget_tokens"
     assert request.provider_thinking_config == {"type": "enabled", "budget_tokens": 8192}
     assert accounting.recorded == 0
 
@@ -2093,3 +2093,156 @@ def test_media_cache_markers_order_and_disclose_routes(
         "messages.content.cache_control->not_forwarded" in value
         for value in public.ignored_parameters
     )
+
+
+def test_chat_thinking_budget_selects_only_the_native_qwen_rung() -> None:
+    """A mixed route retains the explicit cap and excludes rungs that would drop it."""
+    request = decode_chat(
+        {
+            "model": "qwen3.8-max",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking_budget": 4096,
+        }
+    ).request
+    gateway = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    deployments = (
+        _deployment("effort-only", gateway=gateway),
+        _deployment("qwen", gateway=gateway),
+    )
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    client = cast(NativeWireClient, object())
+    wires = (
+        (GatewayWireProfile(dialect="openai_compatible", url="https://relay.test/v1"), client),
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
+                model_id="qwen3.8-max",
+                supports_reasoning=True,
+                reasoning_wire_format="reasoning_effort",
+                supported_reasoning_efforts=("low", "medium", "xhigh"),
+            ),
+            client,
+        ),
+    )
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    accounting = _AdmissionCoercionCounter()
+    narrowed, retained, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert narrowed.deployment.deployment_id == "qwen"
+    assert len(retained) == 1
+    assert public.thinking_budget == provider.thinking_budget == 4096
+    assert provider.reasoning_effort is None
+    assert accounting.recorded == 0
+
+
+@pytest.mark.parametrize("stream", (False, True))
+def test_chat_nested_budget_narrows_to_budget_capable_anthropic_rung(stream: bool) -> None:
+    """A mixed ladder preserves the numeric bound on its eligible Anthropic rung."""
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "max_tokens": 8192,
+            "stream": stream,
+        }
+    ).request
+    gateway = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    deployments = tuple(
+        _deployment(name, gateway=gateway) for name in ("effort", "adaptive", "budget")
+    )
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    client = cast(NativeWireClient, object())
+    profiles = (
+        GatewayWireProfile(dialect="openai_compatible", url="https://relay.test/v1"),
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://api.anthropic.com/v1/messages",
+            model_id="claude-sonnet-5",
+            supports_reasoning=True,
+            reasoning_wire_format="anthropic_adaptive",
+        ),
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://api.anthropic.com/v1/messages",
+            model_id="claude-sonnet-4-6",
+            supports_reasoning=True,
+            reasoning_wire_format="anthropic_adaptive",
+        ),
+    )
+    accounting = _AdmissionCoercionCounter()
+    narrowed, retained, public, provider, _placement = admitted_route_requests(
+        route,
+        tuple((profile, client) for profile in profiles),
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert narrowed.deployment.deployment_id == "budget"
+    assert len(retained) == 1
+    assert (
+        public.provider_thinking_config
+        == provider.provider_thinking_config
+        == {
+            "type": "enabled",
+            "budget_tokens": 4096,
+        }
+    )
+    assert provider.reasoning_effort is None
+    assert accounting.recorded == 0
+
+
+@pytest.mark.parametrize(
+    "dialect,model,reasoning",
+    (
+        ("openai_compatible", "kimi-k2-thinking", True),
+        ("anthropic_messages", "claude-sonnet-5", True),
+        ("anthropic_messages", "claude-haiku-3-5", False),
+    ),
+)
+def test_chat_nested_budget_refuses_routes_that_cannot_preserve_it(
+    dialect: str, model: str, reasoning: bool
+) -> None:
+    """Numeric budgets never fall through to a lossy effort substitution."""
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "max_tokens": 8192,
+        }
+    ).request
+    route = _mixed_route(
+        "maximize_availability", (_deployment("only"),), GatewayApiSurface.CHAT_COMPLETIONS
+    )
+    profile = GatewayWireProfile(
+        dialect=dialect,
+        url="https://provider.test/v1",
+        model_id=model,
+        supports_reasoning=reasoning,
+        reasoning_wire_format="anthropic_adaptive"
+        if dialect == "anthropic_messages"
+        else "reasoning_effort",
+    )
+    accounting = _AdmissionCoercionCounter()
+    with pytest.raises(ProviderParameterError) as error:
+        admitted_route_requests(
+            route,
+            ((profile, cast(NativeWireClient, object())),),
+            request,
+            accounting=cast(NativeAttemptAccounting, accounting),
+            authorization=route.snapshot.authorization,
+        )
+    assert error.value.param == "thinking.budget_tokens"
+    assert accounting.recorded == 0

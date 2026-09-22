@@ -33,6 +33,7 @@ class EvaluationSetup(ContractModel):
     continuation_of: ArtifactInput | None = None
     maximum_rollout_output_tokens: int = Field(default=1_000_000, gt=0)
     maximum_concurrency: int = Field(gt=0)
+    repeats: int = Field(default=1, ge=1)
 
 
 class EvaluationBudget(ContractModel):

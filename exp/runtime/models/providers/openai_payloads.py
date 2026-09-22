@@ -8,7 +8,7 @@ OpenAI-compatible Chat builders live here; ``dialect_stream_payload`` in
 
 from __future__ import annotations
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.common.models import ChatMaxTokensField
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
@@ -40,6 +40,20 @@ _INPUT_MESSAGE_ROLES = frozenset({"user", "system", "developer"})
 _FOREIGN_ITEM_ID_PREFIX = "item_"
 
 
+def _without_probability_metadata(item: JsonObject) -> JsonObject:
+    """Drop only output-text probability fields from a replayed message."""
+    content_value = item.get("content")
+    if item.get("type") != "message" or not isinstance(content_value, list):
+        return item
+    content: list[JsonValue] = []
+    for part in content_value:
+        if isinstance(part, dict) and part.get("type") == "output_text":
+            content.append({key: value for key, value in part.items() if key != "logprobs"})
+        else:
+            content.append(part)
+    return {**item, "content": content}
+
+
 def _replayable_native_item(item: JsonObject) -> JsonObject | None:
     """Shape one replayed Responses item for the OpenAI wire; ``None`` drops it.
 
@@ -49,7 +63,7 @@ def _replayable_native_item(item: JsonObject) -> JsonObject | None:
     foreign id is dropped whole: without its encrypted content the provider
     has nothing to resume from, and the id alone is refused).
     """
-    shaped = item
+    shaped = _without_probability_metadata(item)
     item_id = shaped.get("id")
     if isinstance(item_id, str) and item_id.startswith(_FOREIGN_ITEM_ID_PREFIX):
         if shaped.get("type") == "reasoning" and "encrypted_content" not in shaped:
@@ -152,8 +166,23 @@ def openai_responses_stream_payload(
         "stream": True,
     }
     response_store = request.response_store
+    include_paths: list[str] = []
     if request.include_encrypted_reasoning or supports_reasoning and response_store is not False:
-        payload["include"] = ["reasoning.encrypted_content"]
+        include_paths.append("reasoning.encrypted_content")
+    if request.include_output_text_logprobs:
+        if not supports_logprobs:
+            raise ProviderResponseError(
+                "This Responses route cannot preserve output text log probabilities."
+            )
+        include_paths.append("message.output_text.logprobs")
+    if include_paths:
+        payload["include"] = include_paths
+    if request.top_logprobs is not None:
+        if not supports_logprobs:
+            raise ProviderResponseError(
+                "This Responses route cannot preserve output text log probabilities."
+            )
+        payload["top_logprobs"] = request.top_logprobs
     if instructions:
         payload["instructions"] = "\n\n".join(instructions)
     add_openai_tools(payload, request, responses=True)
@@ -206,9 +235,6 @@ def openai_responses_stream_payload(
     # Native OpenAI Responses has no top-k request field. Never trust a
     # mistaken route declaration to send this extension to the API.
     del supports_top_k
-    # Responses output normalization has no probability representation. Keep
-    # the shared capability argument, but ignore logprob controls before send.
-    del supports_logprobs
     reasoning: JsonObject = {}
     if supports_reasoning and effective_reasoning_effort is not None:
         reasoning["effort"] = openai_reasoning_effort(model_id, effective_reasoning_effort)
@@ -351,9 +377,12 @@ def openai_compatible_stream_payload(
         payload["frequency_penalty"] = request.frequency_penalty
     if request.presence_penalty is not None and supports_presence_penalty:
         payload["presence_penalty"] = request.presence_penalty
-    # Compatible streaming responses also normalize logprobs to null, so an
-    # accepted public control is intentionally ignored until projection exists.
-    del supports_logprobs
+    if request.logprobs is True:
+        if not supports_logprobs:
+            raise ProviderResponseError("logprobs was admitted without provider support")
+        payload["logprobs"] = True
+        if request.top_logprobs is not None:
+            payload["top_logprobs"] = request.top_logprobs
     if request.stop:
         payload["stop"] = list(request.stop)
     if request.service_tier is not None and forwards_service_tier:

@@ -220,7 +220,6 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
                             "type": "output_text",
                             "text": message.content,
                             "annotations": [],
-                            "logprobs": [],
                         }
                     ]
                     if message.content is not None

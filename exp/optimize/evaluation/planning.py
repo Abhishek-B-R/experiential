@@ -115,7 +115,7 @@ def estimate_model_evaluation(
         raise ValueError("evaluation estimates require an explicit query embedding reservation")
     count = len(tasks)
     workers = len(setup.candidates)
-    steps = count * setup.maximum_steps
+    steps = count * setup.repeats * setup.maximum_steps
     worker_cost = _sum_completion(tuple(requests.values()), steps)
     world_cost = _sum_completion((contract.world_model_request,), steps * workers)
     retrieval_reservation = maximum_query_reservation(retrieval).cost_usd
@@ -125,7 +125,7 @@ def estimate_model_evaluation(
         estimated_cost_usd=retrieval_cost,
         maximum_cost_usd=retrieval_cost * MAXIMUM_CELL_ATTEMPTS,
     )
-    judge_count = count * workers
+    judge_count = count * workers * setup.repeats
     judge_component = _sum_completion(
         (judge_request,), judge_count * judge_calls_per_rollout, cell_attempts=1
     )

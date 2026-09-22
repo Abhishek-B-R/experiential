@@ -103,7 +103,7 @@ def evaluate_models(
         calibration_id=calibration.calibration_id,
     )
     tasks = load_task_set(project.artifacts, completed.task_set.artifact_id).tasks
-    required_judgments = len(tasks) * len(setup.candidates)
+    required_judgments = len(tasks) * len(setup.candidates) * setup.repeats
     if required_judgments > budget.maximum_judgments:
         raise ValueError("evaluation judgment ceiling is below scenarios times worker models")
     execution_input = _execution_contract(project, setup, budget, created_at, code_revision)
@@ -113,6 +113,7 @@ def evaluate_models(
         candidate_snapshots=setup.candidates,
         pricing_snapshot_id=setup.pricing_snapshot_id,
         observed_cells=(),
+        repeats=tuple(range(setup.repeats)),
         additional_inputs=sorted_unique_inputs(
             calibration_input, execution_input, *services.plan_inputs
         ),

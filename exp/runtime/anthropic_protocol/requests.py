@@ -194,9 +194,8 @@ class _Message(AnthropicWireModel):
 class _Tool(AnthropicWireModel):
     """One caller-defined custom tool with its JSON Schema declaration.
 
-    The description bound is generous on purpose: the provider accepts 40k
-    character descriptions live (verified 2026-08-30) and a real Claude Code
-    toolset exceeded an 8k bound; the request-body cap is the effective limit.
+    Descriptions are preserved without a per-field size limit. The gateway's
+    total request-body cap and provider context limits still apply.
 
     ``eager_input_streaming``, ``defer_loading``, ``allowed_callers``, and
     ``input_examples`` are provider-native tool annotations the live API
@@ -207,7 +206,7 @@ class _Tool(AnthropicWireModel):
     """
 
     name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=65_536)
+    description: str | None = None
     input_schema: JsonObject
     cache_control: CacheControl | None = None
     type: Literal["custom"] | None = None

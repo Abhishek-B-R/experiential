@@ -66,6 +66,7 @@ from exp.runtime.models.providers.generation_parameter_validation import (
     require_route_numeric_parameter as _require_route_numeric_parameter,
 )
 from exp.runtime.models.providers.instruction_turns import disclose_system_fold
+from exp.runtime.models.providers.logprobs import require_chat_logprobs, require_responses_logprobs
 from exp.runtime.models.providers.messages_payloads import (
     anthropic_messages_stream_payload as anthropic_messages_stream_payload,
 )
@@ -90,6 +91,13 @@ from exp.runtime.models.providers.server_tools import (
     anthropic_server_tools_message,
     anthropic_server_tools_present,
     disclose_dropped_server_tools,
+)
+from exp.runtime.models.providers.thinking_budget import (
+    qwen_uses_total_budget_cap,
+    require_thinking_budget_support,
+    thinking_budget_parameter,
+    thinking_budget_value,
+    thinking_budget_wire_field,
 )
 
 if TYPE_CHECKING:
@@ -157,11 +165,28 @@ def route_generation_parameter_requests(
     """
     if not profiles:
         raise ValueError("generation parameter shaping requires at least one wire profile")
+    if request.surface == GatewayApiSurface.CHAT_COMPLETIONS:
+        require_chat_logprobs(profiles, request)
+    require_responses_logprobs(profiles, request)
     for profile in profiles:
+        require_thinking_budget_support(profile, request)
         if fireworks_continuation_required(profile, request):
             require_responses_continuation_channel(request)
 
     ignored = list(request.ignored_parameters)
+    budget = thinking_budget_value(request)
+    if budget is not None:
+        source = thinking_budget_parameter(request)
+        for profile in profiles:
+            target = thinking_budget_wire_field(profile)
+            if target != source:
+                disclosure = f"{source}->translated({target})"
+                if disclosure not in ignored:
+                    ignored.append(disclosure)
+            if profile.dialect == "openai_compatible" and not qwen_uses_total_budget_cap(profile):
+                disclosure = "max_tokens->translated(total_output_minus_thinking_budget)"
+                if disclosure not in ignored:
+                    ignored.append(disclosure)
     provider_updates: dict[str, object] = {}
 
     def ignore(field: str, public_path: str | None = None) -> None:
@@ -344,7 +369,7 @@ def route_generation_parameter_requests(
                 ),
                 param=effort_path,
             )
-    else:
+    elif budget is None:
         # An omitted caller value remains omitted on the shared request. Each
         # dialect payload injects only its own provider-required default, so a
         # fallback never forces that default onto a wire where it is optional.
@@ -691,7 +716,7 @@ def route_generation_parameter_requests(
         # serves and discloses the drop: foreign wires omit them at encoding.
         if THINKING_HISTORY_DROP_DISCLOSURE not in ignored:
             ignored.append(THINKING_HISTORY_DROP_DISCLOSURE)
-    if request.provider_thinking_config is not None and non_anthropic_route:
+    if request.provider_thinking_config is not None and non_anthropic_route and budget is None:
         # A thinking CONFIG (unlike replayed thinking blocks) has a serviceable
         # cross-wire reading. The named rejection here is what lets the admit
         # loop offer the disclosed thinking->reasoning_effort translation (or
@@ -890,33 +915,8 @@ def route_generation_parameter_requests(
             )
             provider_updates["serialize_tool_calls"] = True
 
-    # A true logprob request changes the requested result. Until the normalized
-    # response can return those arrays, reject it rather than pretending it ran.
-    if request.logprobs is True:
-        path = (
-            "top_logprobs"
-            if request.surface.value == "responses" and request.top_logprobs is not None
-            else "logprobs"
-        )
-        raise ProviderParameterError(
-            message=(
-                f"The parameter {path!r} is not supported by this gateway response contract. "
-                "Remove the field and resend the request."
-            ),
-            param=path,
-            code="unsupported_parameter",
-        )
     if request.logprobs is False:
         ignore("logprobs")
-    if request.top_logprobs is not None:
-        raise ProviderParameterError(
-            message=(
-                "The parameter 'top_logprobs' is not supported by this gateway response "
-                "contract. Remove the field and resend the request."
-            ),
-            param="top_logprobs",
-            code="unsupported_parameter",
-        )
 
     ignored_parameters = tuple(ignored)
     public_request = request.model_copy(update={"ignored_parameters": ignored_parameters})

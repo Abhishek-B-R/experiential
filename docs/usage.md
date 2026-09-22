@@ -227,3 +227,16 @@ quality measurement can call the separate `build_fidelity_evaluation_plan` and
 `build_fidelity_report` APIs; those results never enter router fitting or activation. Fidelity
 reports contain measurements only, never an approval or denial. See the
 [router contracts](reference/router_optimization_config.md).
+
+### Simulated tool observations
+
+Text world models generate environment observations for declared tools. Candidate tool calls are
+passed to the world model together with schemas, the visible transcript, retrieved trace examples,
+and private environment state. Parallel calls receive one ordered tool message per call ID; no
+external tool implementation runs. Malformed observation batches are invalid rollouts.
+
+The public session API accepts `world.new_session(task="Research", tools=(tool_schema,))` followed
+by `world.step(session.id, assistant_message)`. Each result exposes `messages`, an ordered tuple
+of OpenAI user or tool messages, and `terminal`. Tool observations are nonterminal so the agent can
+consume them before producing its final answer. World-model artifacts pin the v2 prompt; rebuild
+projects created with a different prompt before running them.

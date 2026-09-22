@@ -35,7 +35,7 @@ def _spec(**updates: object) -> SimulationSpec:
         "world_model": WorldModelSettings(
             world_model_alias="world-model-a",
             grounded_world_model_input=_WORLD_MODEL_INPUT,
-            prompt_version="text-world-model-v1",
+            prompt_version="text-world-model-v2",
         ),
         "seed": 7,
         "maximum_steps": 3,

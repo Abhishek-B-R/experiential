@@ -58,10 +58,12 @@ pub(crate) fn unreported_empty_completion(terminal: &Event, usage: Option<&Usage
 /// attempt is still in flight, settle, then answer with the tracked usage
 /// ahead of the terminal so the encoders keep the client-visible token
 /// accounting.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn settle_output_less(
     ctx: &WaterfallContext<'_>,
     guard: &mut AttemptGuard,
     terminal: Event,
+    mut events: Vec<Event>,
     usage: Option<Usage>,
     tool_names: Vec<String>,
     depth: usize,
@@ -87,7 +89,6 @@ pub(super) async fn settle_output_less(
         // attempt's retention failure; only the HTTP result reports it.
         return AttemptEnd::Retention(error);
     }
-    let mut events = Vec::with_capacity(2);
     if let Some(tracked) = usage {
         events.push(Event::Usage(tracked));
     }

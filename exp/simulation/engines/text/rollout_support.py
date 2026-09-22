@@ -20,7 +20,7 @@ from exp.common.rollouts import (
     unknown_spend_failure,
 )
 from exp.runtime.agents import AgentEpisode
-from exp.simulation.engines.text.environment import TextOnlyToolUseError
+from exp.simulation.engines.text.environment import SimulatedToolUseError
 from exp.simulation.engines.text.redaction import redact_span
 
 
@@ -81,20 +81,20 @@ def internal_failure(phase: str, exception: Exception) -> StructuredFailure:
 
 
 def normalize_text_tool_failure(episode: AgentEpisode) -> StructuredFailure | None:
-    """Translate a tool attempt into the text mode's explicit unsupported-cell evidence.
+    """Translate a forged or repeated tool invocation into explicit invalid evidence.
 
     Args:
-        episode: Customer-agent episode that may have ended at the text-only tool boundary.
+        episode: Customer-agent episode that may have ended at the simulated tool boundary.
 
     Returns:
         The original failure, a normalized unsupported failure, or ``None``.
     """
     failure = episode.failure
-    if failure is None or failure.exception_type != TextOnlyToolUseError.__name__:
+    if failure is None or failure.exception_type != SimulatedToolUseError.__name__:
         return failure
     return StructuredFailure(
         code=FailureCode.UNSUPPORTED,
-        message="text world-model simulation cannot execute a customer-agent tool call",
+        message="agent requested an observation outside the pending simulated tool calls",
         exception_type=failure.exception_type,
         attribution=FailureAttribution.TOOL,
         details={"phase": "agent_tool_call"},

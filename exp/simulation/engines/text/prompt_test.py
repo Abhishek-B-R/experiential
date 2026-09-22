@@ -50,7 +50,7 @@ def test_text_prompt_uses_visible_evidence_only_and_never_enables_tools() -> Non
     assert request.tool_choice == "none"
     assert request.maximum_output_tokens == 16_000
     assert "candidate_hidden_reasoning" not in evidence
-    assert evidence["candidate_response"] == "I can help."
+    assert evidence["candidate_response"] == {"content": "I can help.", "tool_calls": []}
     assert evidence["visible_conversation"][1]["content"] == "Please help me."
     assert len(text_prompt_sha256()) == 64
     assert WORLD_MODEL_TEXT_PROMPT_VERSION in (request.messages[0].content or "")

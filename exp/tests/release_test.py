@@ -2660,7 +2660,7 @@ def _installed_release_driver() -> None:
             session.id,
             {"role": "assistant", "content": "What account email is associated?"},
         )
-        assert observation.message == {
+        assert observation.messages[0] == {
             "role": "user",
             "content": "P17 generated world observation",
         }
