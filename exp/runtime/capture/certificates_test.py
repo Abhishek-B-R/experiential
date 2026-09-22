@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from mitmproxy.certs import CertStore
 
+from exp.runtime.capture import certificates
 from exp.runtime.capture.certificates import (
     capture_certificate_directory,
     certificate_is_trusted,
@@ -355,6 +356,112 @@ def test_partial_ca_store_is_never_repaired_with_a_new_key(tmp_path: Path) -> No
         prepare_certificate(directory, _DOMAINS)
     assert (directory / "mitmproxy-ca.pem").read_bytes() == key
     assert not certificate.exists()
+
+
+@pytest.mark.parametrize("filename", ["mitmproxy-ca-cert.pem", "mitmproxy-dhparam.pem"])
+@pytest.mark.parametrize("failure", [OSError, KeyboardInterrupt])
+def test_failed_ca_initialization_leaves_empty_scope_and_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    failure: type[BaseException],
+) -> None:
+    """Failure on the second or third write never publishes an incomplete signing store."""
+    directory = capture_certificate_directory(tmp_path, _DOMAINS)
+    original_open = os.open
+
+    def fail_write(
+        path: str | os.PathLike[str],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        """Interrupt one real certificate file creation after earlier writes have finished."""
+        if Path(path).name == filename and flags & os.O_CREAT:
+            raise failure("injected certificate write failure")
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(certificates.os, "open", fail_write)
+        with pytest.raises(failure, match="injected certificate write failure"):
+            prepare_certificate(directory, _DOMAINS)
+    assert directory.is_dir()
+    assert not list(directory.iterdir())
+    assert list(directory.parent.iterdir()) == [directory]
+    certificate = prepare_certificate(directory, _DOMAINS)
+    assert certificate.is_file()
+    assert prepare_certificate(directory, _DOMAINS) == certificate
+
+
+def test_abandoned_staging_directory_does_not_block_or_change_next_initialization(
+    tmp_path: Path,
+) -> None:
+    """An unpublished store left by a killed process neither blocks retry nor gets reused."""
+    directory = capture_certificate_directory(tmp_path, _DOMAINS)
+    directory.mkdir(parents=True, mode=0o700)
+    abandoned = directory.parent / f".{directory.name}-interrupted"
+    abandoned.mkdir(mode=0o700)
+    partial = abandoned / "mitmproxy-ca.pem"
+    partial.write_bytes(b"unpublished signing material")
+    certificate = prepare_certificate(directory, _DOMAINS)
+    assert certificate.is_file()
+    assert partial.read_bytes() == b"unpublished signing material"
+    assert set(directory.parent.iterdir()) == {directory, abandoned}
+
+
+def test_staged_ca_must_validate_before_atomic_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fully written but unsafe staging store cannot become the reusable scoped identity."""
+    directory = capture_certificate_directory(tmp_path, _DOMAINS)
+    original_create = certificates._create_certificate
+
+    def create_unsafe_store(staging: Path, domains: tuple[str, ...]) -> None:
+        """Strip constraints from genuinely generated test material before publication."""
+        original_create(staging, domains)
+        _rewrite_ca(staging / "mitmproxy-ca-cert.pem", "unconstrained")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(certificates, "_create_certificate", create_unsafe_store)
+        with pytest.raises(ValueError, match="constrained CA"):
+            prepare_certificate(directory, _DOMAINS)
+    assert not list(directory.iterdir())
+    assert list(directory.parent.iterdir()) == [directory]
+    assert prepare_certificate(directory, _DOMAINS).is_file()
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_atomic_publication_preserves_store_appearing_during_initialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, complete: bool
+) -> None:
+    """Atomic directory replacement refuses concurrent complete or partial existing material."""
+    directory = capture_certificate_directory(tmp_path, _DOMAINS)
+    concurrent = tmp_path / "concurrent"
+    prepare_certificate(concurrent, _DOMAINS)
+    if not complete:
+        (concurrent / "mitmproxy-ca-cert.pem").unlink()
+    expected = {path.name: path.read_bytes() for path in concurrent.iterdir()}
+    original_replace = os.replace
+
+    def publish_with_race(source: str | os.PathLike[str], target: str | os.PathLike[str]) -> None:
+        """Publish another store immediately before the real atomic replacement attempt."""
+        assert Path(target) == directory
+        original_replace(concurrent, directory)
+        original_replace(source, target)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(certificates.os, "replace", publish_with_race)
+        with pytest.raises(OSError):
+            prepare_certificate(directory, _DOMAINS)
+    assert {path.name: path.read_bytes() for path in directory.iterdir()} == expected
+    assert list(directory.parent.iterdir()) == [directory]
+    if complete:
+        assert prepare_certificate(directory, _DOMAINS).is_file()
+    else:
+        with pytest.raises(ValueError, match="incomplete"):
+            prepare_certificate(directory, _DOMAINS)
+    assert {path.name: path.read_bytes() for path in directory.iterdir()} == expected
 
 
 def _write_leaf(

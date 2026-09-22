@@ -58,7 +58,15 @@ def prepare_certificate(directory: Path, domains: tuple[str, ...]) -> Path:
     certificate = directory / "mitmproxy-ca-cert.pem"
     if not any(directory.iterdir()):
         directory.chmod(0o700)
-        _create_certificate(directory, scope)
+        with tempfile.TemporaryDirectory(
+            prefix=f".{directory.name}-", dir=directory.parent
+        ) as temporary:
+            staging = Path(temporary)
+            _create_certificate(staging, scope)
+            _validate_certificate(staging / certificate.name, scope)
+            # Replacing an empty directory is atomic. A concurrently published
+            # nonempty store makes this fail without replacing its signing key.
+            os.replace(staging, directory)
     _validate_certificate(certificate, scope)
     directory.chmod(0o700)
     for path in directory.iterdir():
