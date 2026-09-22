@@ -41,7 +41,13 @@ environment state, retained privately across turns. Do not include markdown fenc
 
 
 class SimulatedToolResult(ContractModel):
-    """One generated observation tied to an exact candidate tool invocation."""
+    """One generated observation tied to an exact candidate tool invocation.
+
+    Attributes:
+        call_id: Required nonempty identifier matching one supplied tool call.
+        content: Required visible tool response, including an empty response when appropriate.
+        is_error: Whether the simulated tool failed; defaults to false.
+    """
 
     call_id: str = Field(min_length=1)
     content: str
@@ -49,7 +55,14 @@ class SimulatedToolResult(ContractModel):
 
 
 class TextWorldModelTransition(ContractModel):
-    """One parsed visible text turn emitted by the versioned world-model prompt."""
+    """One parsed visible text turn emitted by the versioned world-model prompt.
+
+    Attributes:
+        message: Simulated user text, empty by default and required empty for tool actions.
+        terminal: Whether a text action ends the scenario, false by default and for tool actions.
+        tool_results: Ordered results matching all supplied call IDs; empty for text actions.
+        state: Complete private environment state carried into the next turn, initially empty.
+    """
 
     message: str = ""
     terminal: bool = False

@@ -94,7 +94,12 @@ class WorldModelSession:
 
 @dataclass(frozen=True)
 class WorldModelObservation:
-    """Ordered OpenAI-shaped user or tool observations predicted by a world model."""
+    """Ordered OpenAI-shaped user or tool observations predicted by a world model.
+
+    Attributes:
+        messages: Required ordered user message or tool results for the submitted action.
+        terminal: Required completion flag; tool-result observations remain nonterminal.
+    """
 
     messages: tuple[ChatCompletionUserMessageParam | ChatCompletionToolMessageParam, ...]
     terminal: bool
@@ -102,7 +107,18 @@ class WorldModelObservation:
 
 @dataclass
 class _SessionState:
-    """Mutable transcript and lifecycle bookkeeping for one public session."""
+    """Mutable transcript and lifecycle bookkeeping for one public session.
+
+    Attributes:
+        session: Public immutable session identity and initial context.
+        task_case: Internal task carrying the declared tools and grounding lineage.
+        messages: Ordered retained visible conversation.
+        transcript_bytes: Current retained transcript size for resource admission.
+        expires_at: Monotonic expiry deadline.
+        lock: Per-session synchronization lock, allocated on creation.
+        closed: Whether cleanup closed the session, initially false.
+        environment_state: Private simulated facts and mutations, initially empty.
+    """
 
     session: WorldModelSession
     task_case: TaskCase
