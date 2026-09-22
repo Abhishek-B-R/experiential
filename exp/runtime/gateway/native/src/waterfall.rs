@@ -729,7 +729,9 @@ async fn run_attempt(
                 relay.private_progress();
                 continue;
             }
-            if crate::logprobs::withhold_before_commit(&event, refusal_failover) {
+            if matches!(event, Event::GeminiThoughtPart(_))
+                || crate::logprobs::withhold_before_commit(&event, refusal_failover)
+            {
                 let event_bytes = crate::relay::event_retained_bytes(&event);
                 if withheld_bytes.saturating_add(event_bytes) > MAXIMUM_WITHHELD_REFUSAL_BYTES
                     || withheld.len() + 1 > MAXIMUM_WITHHELD_REFUSAL_EVENTS

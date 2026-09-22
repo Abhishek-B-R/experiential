@@ -99,7 +99,7 @@ mod tests {
         let mut bytes = kind.to_vec();
         bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
         bytes.extend_from_slice(data);
-        if data.len() % 2 != 0 {
+        if !data.len().is_multiple_of(2) {
             bytes.push(0);
         }
         bytes
