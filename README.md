@@ -69,18 +69,17 @@ with exp.load_router("my-project") as client:
 
 ## Capture Traffic
 
-Capture is designed to collect supported traces from Codex and Claude Code using your existing
-ChatGPT or Claude subscription, or provider API keys, while requests go directly to OpenAI or
-Anthropic. It requires macOS, Python 3.13 or newer, and approval for its extension and certificate:
+Capture is designed to collect supported traces from the Codex and Claude Code desktop apps using
+your existing ChatGPT or Claude subscription, while requests go directly to OpenAI or Anthropic.
+It requires macOS, Python 3.13 or newer, and approval for its extension and certificate:
 
 ```bash
 exp capture
 ```
 
-After logging in, collect traces to optimize quality, cost, and speed. Use Experiential's gateway
-as middleware to control costs and enforce guardrails. Leave the terminal open while you work
-and press Ctrl+C to stop.
-See [Capture usage](./docs/usage.md#direct-provider-capture-on-macos) for supported traffic and setup details.
+Use Experiential's gateway as middleware to control costs, enforce guardrails, and optimize quality,
+costs, and speed. Leave the terminal open while you work. Press Ctrl+C to stop capture.
+View your [capture telemetry](https://platform.experientiallabs.ai/api-keys?section=capture).
 
 ## Optimize from Traffic
 
