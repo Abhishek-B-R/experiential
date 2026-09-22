@@ -51,19 +51,49 @@ rewritten to fit. An impossible combination is refused before provider dispatch.
 Messages budgets are forwarded only to budget-capable wires, never converted into advisory
 effort or adaptive thinking.
 
-Chat also accepts the Qwen Cloud `thinking_budget` extension as a positive integer.
-It forwards the exact budget with `enable_thinking: true` on native Qwen3.8-Max Cloud Chat
-routes that declare reasoning support. The total output ceiling uses
-`max_completion_tokens` there so reasoning counts toward the reserved output limit. It does not infer a numeric budget from an
-effort tier or replace a numeric budget with a tier. Explicit thinking-off or effort
-controls conflict with this budget. Other provider routes are refused before dispatch;
-unknown compatible servers are not assumed to enforce a field they might ignore.
-See [Qwen Cloud thinking budgets](https://docs.qwencloud.com/api-reference/chat/openai-chat).
+The Chat field `thinking_budget` preserves the caller's numeric control on qualified
+Anthropic, Gemini 2.5, and native Qwen Cloud routes. Use it as an OpenAI SDK `extra_body`
+field (or a top-level field in HTTP JSON). It is not combined with `reasoning_effort`.
+The gateway translates the field name for the selected provider and discloses that
+translation; it does not replace the number with an effort tier.
 
-Numeric reasoning budgets on Chat (`reasoning.max_tokens` or `thinking.budget_tokens`) are
-refused rather than approximated by an effort tier. Use Messages with a budget-capable model,
-or deliberately remove the numeric budget and select an effort. This is a documented
-compatibility limitation, not a claim of full OpenRouter reasoning-parameter parity.
+| Native provider route | Models | Provider control and constraints |
+| --- | --- | --- |
+| Anthropic Messages | Thinking-capable Claude 3.7, Sonnet/Opus 4 through 4.6, Haiku 4.5, Mythos Preview | `thinking: {type: "enabled", budget_tokens: N}`; integer >=1024 and below total output limit |
+| Gemini generateContent (including native Vertex Gemini) | Gemini 2.5 Pro | `generationConfig.thinkingConfig.thinkingBudget`; 128..32768, or -1 dynamic; zero is refused |
+| Gemini generateContent | Gemini 2.5 Flash / Flash-Lite and qualified previews | Same field; Flash 0..24576; Lite 512..24576; both also accept 0 off and -1 dynamic |
+| Native Qwen Cloud Chat | Qualified Qwen3/3.5/3.6/3.7/3.8 and Qwen3-VL identities; GLM 4.7/5/5.1/5.2; Kimi K2 Thinking/2.5/2.6/2.7 Code | `thinking_budget` plus the model's enable switch; nonnegative integer |
+
+Only explicitly qualified model identities and dated snapshots are admitted, not arbitrary
+future families or all models sharing a brand. Qwen Cloud uses its native HTTPS endpoints;
+other compatible hosts do not inherit this contract. Kimi K3 and GLM 5.3 are excluded because
+they do not honor this parameter. Gemini 3 numeric-budget compatibility is not adopted;
+use its effort control. A zero Chat budget must be sent without additional on/off controls
+because zero's meaning is provider-specific. `-1` is qualified only on Gemini 2.5.
+
+Chat also accepts `thinking: {type: "enabled", budget_tokens: N}` with integer N >=1024;
+Messages clients use the same nested shape. The exact number travels to any qualified
+provider using the fields above. Nested budgets require room below the caller's output
+ceiling. Off/adaptive modes, competing budgets/efforts and unsupported additional thinking
+controls fail explicitly. Budget values participate in replay identity, including zero and -1.
+
+The gateway's output limit and reservation cover thinking plus the final answer. Qwen Cloud
+models documenting `max_completion_tokens` receive the combined cap there. On models where
+`max_tokens` limits only the answer when a thinking budget is supplied, the gateway sends
+`max_tokens = total output limit - thinking_budget` and discloses that translation. A budget
+leaving no answer room is refused. Omitted output limits are filled from the selected rung's
+finite declared bound before payload freezing. Each fallback retains its own bound.
+
+Provider budgets are targets or provider-defined limits, not a gateway guarantee of the exact
+observed reasoning length. The gateway preserves the requested control and separately binds
+the provider's output ceiling to its reservation.
+
+Sources: [Anthropic extended thinking](https://platform.claude.com/docs/en/build-with-claude/extended-thinking),
+[Qwen Cloud Chat](https://docs.qwencloud.com/api-reference/chat/openai-chat),
+[Gemini generateContent thinking](https://ai.google.dev/gemini-api/docs/generate-content/thinking).
+
+OpenRouter's `reasoning.max_tokens` remains unsupported on Chat. Remove that numeric
+budget and select an effort, or use the supported numeric controls above on a qualified route.
 
 ## Truncated tools
 

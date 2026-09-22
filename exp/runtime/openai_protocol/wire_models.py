@@ -375,15 +375,15 @@ class _Message(_WireModel):
                 "reasoning_content, reasoning, and reasoning_details are valid only "
                 "for assistant messages"
             )
-        # Tool results carry images (agents report screenshots there); other roles stay text-only.
+        # User input, tool screenshots, and generated assistant images retain their parts.
         media = {type(part) for part in self.image_capable_parts} - {_TextPart}
-        if media and self.role not in ("user", "tool"):
+        if media and self.role not in ("user", "tool", "assistant"):
             raise ValueError(
-                "image, video, and audio parts are valid only for user messages "
-                "(a tool message may carry image parts beside its text)"
+                "media parts are valid only for user messages "
+                "(tool and assistant messages may carry image parts beside their text)"
             )
-        if self.role == "tool" and media - {_ChatImagePart, _ResponsesImagePart}:
-            raise ValueError("tool messages carry only text and image parts")
+        if self.role in ("tool", "assistant") and media - {_ChatImagePart, _ResponsesImagePart}:
+            raise ValueError(f"{self.role} messages carry only text and image parts")
         call_ids = tuple(call.id for call in self.history_tool_calls)
         if len(call_ids) != len(set(call_ids)):
             raise ValueError("assistant tool call IDs must be unique")
@@ -510,12 +510,12 @@ class _ThinkingConfig(_WireModel):
 
     Translated to the canonical reasoning control: ``enabled`` and ``adaptive``
     turn thinking on at the model's default effort; ``disabled`` maps to
-    ``reasoning_effort=none``. ``budget_tokens`` has no canonical equivalent
-    and is rejected when present.
+    ``reasoning_effort=none``. An enabled ``budget_tokens`` is preserved
+    for route admission and translated only where its numeric value is supported.
     """
 
     type: Literal["enabled", "disabled", "adaptive"]
-    budget_tokens: int | None = Field(default=None, ge=0)
+    budget_tokens: int | None = Field(default=None, ge=1024, strict=True)
 
 
 class _ChatTemplateKwargs(_WireModel):
@@ -589,7 +589,7 @@ class _ChatRequest(_WireModel):
     reasoning: _ChatReasoning | None = None
     thinking: _ThinkingConfig | None = None
     chat_template_kwargs: _ChatTemplateKwargs | None = None
-    thinking_budget: int | None = Field(default=None, gt=0, strict=True)
+    thinking_budget: int | None = Field(default=None, ge=-1, strict=True)
     enable_thinking: bool | None = None
     """DashScope's top-level enable-thinking switch (``extra_body``), translated
     like the vLLM ``chat_template_kwargs`` spelling: Qwen-family clients send it

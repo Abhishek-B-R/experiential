@@ -19,6 +19,7 @@ mod events;
 mod eventstream;
 mod first_token_bound;
 mod guardrails;
+mod image_output;
 mod logprobs;
 #[cfg(test)]
 mod logprobs_tests;
@@ -466,6 +467,13 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
             None => Err("provider output item requires item_type".to_string()),
         };
         let event = match kind {
+            "image" => events::Event::Image(
+                object
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("image requires url")?
+                    .to_string(),
+            ),
             "text_delta" => events::Event::TextDelta(text),
             "refusal_delta" => events::Event::RefusalDelta(text),
             "choice_logprobs_delta" => {
