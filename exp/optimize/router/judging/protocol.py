@@ -35,7 +35,7 @@ from exp.optimize.router.judging.contracts import (
     JudgeProtocolProbeArtifact,
     ManualJudgeError,
 )
-from exp.simulation.engines.text.recording import Utf8UpperBoundTokenCounter
+from exp.simulation.engines.text.tokens import Utf8UpperBoundTokenCounter
 
 PairwiseCitationEvidence = tuple[tuple[ArtifactId, tuple[str, ...], tuple[str, ...]], ...]
 

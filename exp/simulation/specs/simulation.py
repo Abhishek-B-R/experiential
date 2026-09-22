@@ -90,6 +90,8 @@ class SimulationSpec(ArtifactEnvelope):
     mixed_reality: MixedRealitySettings | None = None
     seed: int
     maximum_steps: int = Field(ge=1)
+    continuation_of: ArtifactInput | None = None
+    maximum_rollout_output_tokens: int = Field(default=1_000_000, gt=0)
     maximum_concurrency: int = Field(default=1, ge=1)
     maximum_cost_usd: float | None = Field(default=None, gt=0)
     stop_on_overspend: bool = False

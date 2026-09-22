@@ -30,14 +30,14 @@ uv run pytest -q
   may not import optimize or cli; optimize may not import cli. Optimize owns application
   orchestration and may depend inward on common, runtime, and simulation. The AST gate rejects
   every current forbidden edge directly and proves that the package graph is acyclic.
-- The root CLI command set is exact: `build`, `config`, `optimize`, and `run`. An invocation without a
+- The root CLI command set is exact: `build`, `config`, `eval`, `login`, `optimize`, and `run`. An invocation without a
   subcommand opens the default gateway home screen. `exp/cli/app_test.py` and the release tests
   enforce the current command and distribution shape.
 
 ## CLI package ownership
 
 - `exp/cli/app.py` owns root command composition only. Command implementations live in the
-  `build/`, `config/`, `judge/`, `optimize/`, and `gateway/` packages. Gateway serving and the
+  `build/`, `config/`, `evaluation/`, `judge/`, `optimize/`, and `gateway/` packages. Gateway serving and the
   default home screen live under `gateway/`.
 - `exp/cli/providers/` owns provider discovery, model selection, and catalog setup shared by
   commands. Command-specific orchestration stays with its command package. In particular,
@@ -129,7 +129,7 @@ uv run pytest -q
   orchestration lives in `automatic/`, manual judge calibration in `judging/`, offline policy work
   in `fit/`, and evaluation preparation in `evaluation/`. The durable judgment ledger remains at
   `judgment_budget.py`.
-- The root CLI is locked to `build`, `optimize`, `config`, and `run`. The optimize group is locked
+- The root CLI is locked to `build`, `config`, `eval`, `login`, `optimize`, and `run`. The optimize group is locked
   to `router` and `model`; the config group is locked to `budget`, `gateway`, `judge`, `providers`,
   and `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag, is a
   deliberate change to the locked surface and needs the same scrutiny as a public API change.
@@ -273,8 +273,11 @@ uv run pytest -q
    implementation when requirements differ materially and document the boundary.
 
 8. **Keep imports explicit and fail-fast.** Put imports at module scope unless moving them is
-   required to break a real circular dependency. Do not use lazy imports for optional convenience,
-   and do not catch `ImportError`/`ModuleNotFoundError` to silently fall back to alternate behavior.
+   required to break a real circular dependency. Declaration-only CLI command modules may defer
+   their execution-module import until command dispatch to satisfy the startup-isolation gate:
+   help and configuration must not load optimization machinery. Execution modules keep imports
+   at module scope. Do not defer imports for optional convenience, and do not catch
+   `ImportError`/`ModuleNotFoundError` to silently fall back to alternate behavior.
 
 9. **Design every public surface from the perspective of a dev using it.** Before implementing a
    feature, write the call site first — the Python snippet or CLI invocation an outside developer

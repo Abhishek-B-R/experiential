@@ -1,0 +1,55 @@
+"""Command and terminal presentation regressions for evaluation workflows."""
+
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from exp.cli.app import app
+from exp.optimize.evaluation.prepare import ModelEvaluationOptions
+from exp.optimize.evaluation.runs import EvaluationDefaults, load_run, prepare_run
+from exp.optimize.evaluation.runs_test import _twenty_scenarios
+from exp.optimize.router.automatic.service_test import _REVISION
+
+
+def test_cli_review_and_resume_preserve_exact_preparation(tmp_path: Path) -> None:
+    """Dry-run review needs no provider credentials and prints a directly usable resume command."""
+    project, catalog, state = _twenty_scenarios(tmp_path)
+    run = prepare_run(
+        project,
+        catalog,
+        EvaluationDefaults(
+            models=("candidate-a", "candidate-b"), options=ModelEvaluationOptions(maximum_steps=1)
+        ),
+        code_revision=_REVISION,
+    )
+    before = len(state.completion_calls), len(state.embedding_calls)
+    result = CliRunner().invoke(
+        app,
+        [
+            "eval",
+            "support",
+            "--root",
+            str(project.paths.root),
+            "--resume",
+            run.run_id,
+            "--dry-run",
+            "--non-interactive",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "20 distinct scenarios" in result.output
+    assert (
+        "Assistant" in result.output and "World model" in result.output and "Judge" in result.output
+    )
+    assert run.run_id in result.output
+    assert load_run(project, run.run_id).status == "prepared"
+    assert before == (len(state.completion_calls), len(state.embedding_calls))
+
+
+@pytest.mark.parametrize("args", [[], ["support", "--resume", "run-a", "--models", "a,b"]])
+def test_noninteractive_missing_or_conflicting_inputs_fail_clearly(args: list[str]) -> None:
+    """Automation never hangs for missing choices or silently changes frozen settings."""
+    result = CliRunner().invoke(app, ["eval", *args, "--non-interactive"])
+    assert result.exit_code != 0
+    assert "PROJECT" in result.output or "frozen settings" in result.output

@@ -10,6 +10,7 @@ The root surface is deliberately small:
 | `exp` | Open the branded home screen. `Run Gateway` is the first option and runs setup when needed. | Interactive gateway menu, or the default gateway in a non-interactive terminal. |
 | `exp login [--root ROOT]` | Sign in to Experiential Cloud through the Platform browser approval flow, save the returned organization key, and synchronize the authenticated account's model identities. | User-local credential plus secret-free hosted provider/model records in `.exp/models.toml`. |
 | `exp run [PROJECT] [--root ROOT] [--check]` | Start the local gateway directly, optionally with one project-backed alias. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
+| `exp eval [PROJECT] --models ALIAS,ALIAS` | Compare models on the project scenarios, or open the terminal project picker. | Saved resumable run, JSON evidence, and offline Pareto report. |
 | `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Launch the guided end-to-end build when traces are omitted, or use one explicit local source for automation. | Simulation, serving RAG, fit RAG, syllabus, evaluation evidence, and a runnable automatic router. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
 | `exp optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
@@ -129,6 +130,81 @@ team --assigned-cost-nano-usd COST --root ROOT --non-interactive` settles each u
 attempt at an explicit assigned cost and restores service with exact per-attempt attribution.
 There is no budget reset job and no budgets dashboard.
 
+## Standalone model evaluation in Python
+
+Rollouts default to 100 candidate steps and 1,000,000 cumulative candidate output tokens.
+Both are configurable without a fixed engine step ceiling. `maximum_output_tokens` is a
+separate optional per-request setting; omitting it uses each model's declared output capacity.
+Explicit limits are clamped to that capacity
+and, for candidates, the remaining rollout token budget. Provider output usage includes
+reasoning; it is not counted twice. Missing usage blocks further candidate dispatch.
+
+Budget exhaustion and truncated output are `incomplete`, excluded from judging, quality and
+operating-cost comparisons. Actual incurred spend remains in execution accounting. A complete,
+secret-free text-world turn saves a checkpoint. To continue the built-in chat runtime, prepare
+another evaluation with `continuation_of=previous.simulation_spec.simulation_id` and larger
+`ModelEvaluationOptions(maximum_steps=200, maximum_rollout_output_tokens=2_000_000)`.
+Keep the same workers, judge setup/calibration, prompts, retrieval, per-call reservations and
+producer revision; then authorize its quote with `run_prepared_model_evaluation` as usual.
+This creates a new immutable execution and parent-linked rollouts. Completed candidate/world
+work is retained without redispatch; cumulative costs include the retained prefix. Exact replay
+of the child also reuses its judgments. Continuation does not restore arbitrary custom-agent
+process state, truncated generations, interrupted world turns, or redacted transcript content;
+those require a fresh evaluation. No prior artifact is edited.
+
+
+For a completed grounded project, `exp.prepare_model_evaluation` freezes a worker matrix and
+prices its simulation, retrieval and judge requests without calling providers. The default judge
+is binary task success with explicitly provisional provenance. Pass both `judge_setup` and
+`calibration_id` to use a saved authored or calibrated judge instead. No router is fitted or
+activated.
+
+```python
+from datetime import UTC, datetime
+
+from exp import (
+    EvaluationBudget,
+    ModelEvaluationOptions,
+    prepare_model_evaluation,
+    run_prepared_model_evaluation,
+)
+
+# project is a completed ProjectStore; catalog is its secret-free ModelCatalog.
+prepared = prepare_model_evaluation(
+    project,
+    catalog,
+    ("worker-a", "worker-b"),
+    embedder_alias="embedder",
+    options=ModelEvaluationOptions(maximum_steps=8),
+    created_at=datetime.now(UTC),
+    code_revision=engine_revision,
+)
+
+# Display prepared.cost. A host reserves sufficient credits atomically and obtains
+# consent before constructing its credential-backed runtime_catalog and executing.
+result = run_prepared_model_evaluation(
+    project,
+    prepared,
+    runtime_catalog,
+    budget=EvaluationBudget(
+        maximum_cost_usd=prepared.cost.maximum_cost_usd,
+        maximum_judgments=prepared.cost.judgment_count,
+    ),
+    provider_spend_consented=consent_after_credit_reservation,
+    created_at=run_started_at,
+    code_revision=engine_revision,
+)
+```
+
+`result.report` contains the common-cohort model metrics, explicit exclusions and cost-quality
+frontier. The chart's cost is worker operating cost, not the cost of generating the report.
+`result.cost_usd` reconciles simulation and judging charges. Exact replay dispatches no new model
+calls. The quote and result exclude earlier trace mining and grounding costs; a host must include
+those separately before offering a complete trace-to-report price. Credit conversion, promotions,
+identity authorization and job persistence remain hosting responsibilities.
+
+## Gateway clients
+
 Official OpenAI SDK clients use the issued virtual key and loopback base URL:
 
 ```python
@@ -168,3 +244,30 @@ by `world.step(session.id, assistant_message)`. Each result exposes `messages`, 
 of OpenAI user or tool messages, and `terminal`. Tool observations are nonterminal so the agent can
 consume them before producing its final answer. World-model artifacts pin the v2 prompt; rebuild
 projects created with a different prompt before running them.
+
+### Evaluate a project
+
+`exp eval powerset --models gpt-5.6-luna,deepseek-v4.1-flash` prepares and reviews the model matrix,
+then simulates, judges, and writes a report. Model names are configured catalog aliases; project
+world-model and judge choices come from the configured project. Existing authored/calibrated project judges
+are selected automatically. Otherwise the task-success judge is explicitly provisional.
+
+`exp eval powerset` opens the terminal project screen: select models, configure repeats and
+budgets, resume saved work, or inspect results. The default minimum is 20 distinct scenarios,
+with one repeat, eight parallel workers, 100 steps, and 1,000,000 generated tokens per rollout.
+Retries are separate from repeats. New evaluations collect fresh evidence; resume reuses the
+exact saved run. Settings are saved in the project's `evaluation.json`.
+
+Use `--dry-run` for provider-free preparation, `--resume RUN_ID` for exact saved execution, and
+`--report RUN_ID` for read-only results. Ctrl-C cancels queued work and drains active rollouts;
+completed cells remain immutable and resume does not repeat them. Unknown in-flight provider
+outcomes remain invalid evidence, with their cost reservation retained by the engine.
+
+Each completed run writes `report.json`, `rollouts.jsonl`, and a standalone offline `report.html`
+under `.exp/projects/PROJECT/runtime/evaluations/RUN_ID/`. The HTML contains a cost-quality Pareto
+plot and one tile per scenario with model and repeat selectors. Assistant cost and quality use the
+shared valid cohort; invalid/incomplete coverage and total experiment spend remain visible.
+
+Assistant cost per task reprices recorded successful-rollout tokens at the frozen catalog rates.
+It excludes simulation, judging, invalid attempts, and hypothetical retry reservations.
+Conservative experiment-spend accounting remains separate from the report's operating cost.

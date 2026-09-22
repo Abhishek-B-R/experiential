@@ -33,8 +33,10 @@ from exp.common.rollouts import (
     StopReason,
 )
 from exp.runtime.agents import AgentRuntime
+from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.models import ResolvedModel
 from exp.simulation.engines.clock import timestamp, utc_now
+from exp.simulation.engines.text import dispatch
 from exp.simulation.engines.text.artifact_set import persist_artifact_set
 from exp.simulation.engines.text.bindings import (
     SimulationResolution,
@@ -45,6 +47,11 @@ from exp.simulation.engines.text.bindings import (
     rollout_id_for_binding,
 )
 from exp.simulation.engines.text.cell_progress import cell_progress_reporter
+from exp.simulation.engines.text.continuation import (
+    load_continuations,
+    rebind_completed,
+    retain_lineage,
+)
 from exp.simulation.engines.text.episode_loop import execute_text_episode_loop
 from exp.simulation.engines.text.errors import (
     SimulationConfigurationError,
@@ -66,11 +73,10 @@ from exp.simulation.engines.text.leases import (
     TextCellLeaseState,
     TextCellLeaseStore,
 )
+from exp.simulation.engines.text.lineage_spend import prefix_retry_credit, resolution_spend
 from exp.simulation.engines.text.prompt import WORLD_MODEL_TEXT_PROMPT_VERSION
 from exp.simulation.engines.text.recording import (
     RecordingCandidateClient,
-    TokenCounter,
-    Utf8UpperBoundTokenCounter,
     text_prompt_digest,
 )
 from exp.simulation.engines.text.redaction import redact_rollout_secrets, redacted_field_set
@@ -79,7 +85,6 @@ from exp.simulation.engines.text.resume import (
     ResumePins,
     load_optional_rollout,
     load_rollout,
-    persisted_cell_attempts,
     resolve_cell_attempt,
     validate_resume_rollout,
     verify_persisted_evaluation_plan,
@@ -89,11 +94,11 @@ from exp.simulation.engines.text.rollout_support import (
     elapsed_seconds,
     failure_span,
     internal_failure,
-    known_total_spend,
     normalize_text_tool_failure,
     orchestration_economics,
 )
 from exp.simulation.engines.text.spec_persistence import persist_canonical_specification
+from exp.simulation.engines.text.tokens import TokenCounter, Utf8UpperBoundTokenCounter
 from exp.simulation.orchestration import require_implemented_mode
 from exp.simulation.retrieval import TraceRAGRetriever
 from exp.simulation.specs import SimulationSpec
@@ -221,11 +226,6 @@ class WorldModelSimulator:
     def run(self, spec: SimulationSpec) -> SimulationArtifactSet:
         """Run or resume exactly the sparse simulated cells selected by ``spec``.
 
-        A finite spend ceiling serializes new episode admission so later cells can be marked as
-        structured budget failures after observed provider spend reaches the ceiling. Provider
-        pricing is observed after a call in the v1 model contract, so the first episode that
-        crosses a ceiling is retained honestly rather than fabricated as a zero-cost estimate.
-
         Args:
             spec: Frozen world-model recipe selecting exact evaluation-plan cells.
 
@@ -246,14 +246,26 @@ class WorldModelSimulator:
             world_model,
             grounded_world_model,
         )
+        continuations = load_continuations(self._store, spec, tuple(cells), bindings)
+        if continuations and type(self._agent_factory()) is not ChatAgentRuntime:
+            raise SimulationResumeError("continuation requires the built-in chat runtime")
         completed = self._load_completed_rollouts(cells, bindings, resolution_input)
         pending = tuple(cell for cell in cells if cell.cell_id not in completed)
         pending = self._stale_recovery_first(pending, resolution, resolution_input, bindings)
 
         observe_cells = cell_progress_reporter(self._progress, cells, completed)
         observe_cells()
-        for cell in pending:
-            completed[cell.cell_id] = self._execute_and_persist_cell(
+        workers = dispatch.worker_count(
+            spec,
+            pending,
+            self._completion_contract,
+            self._tasks,
+            resolution_spend(self._store, self._plan.cells, bindings, self._pins(resolution_input)),
+        )
+
+        def execute(cell: EvaluationCell) -> RolloutArtifact:
+            """Claim and persist a cell under the shared reservation ledger."""
+            return self._execute_and_persist_cell(
                 spec,
                 cell,
                 world_model,
@@ -262,8 +274,16 @@ class WorldModelSimulator:
                 resolution,
                 resolution_input,
                 bindings,
+                parallel_admission=workers > 1,
             )
-            observe_cells()
+
+        dispatch.dispatch_cells(
+            pending,
+            workers=workers,
+            execute=execute,
+            completed=completed,
+            observe=observe_cells,
+        )
         ordered_rollouts = tuple(completed[cell.cell_id] for cell in cells)
         return persist_artifact_set(
             store=self._store,
@@ -526,6 +546,8 @@ class WorldModelSimulator:
         resolution: SimulationResolution,
         resolution_input: ArtifactInput,
         bindings: Mapping[ArtifactId, SimulationCellBinding],
+        *,
+        parallel_admission: bool,
     ) -> RolloutArtifact:
         """Claim, execute, and persist one cell within the reconciled budget remainder.
 
@@ -538,6 +560,7 @@ class WorldModelSimulator:
             resolution: Immutable resolution owning the cell binding.
             resolution_input: Exact resolution manifest pointer.
             bindings: Complete bindings for every selected cell.
+            parallel_admission: Whether this dispatch can reserve whole cells concurrently.
 
         Returns:
             Newly persisted or exactly replayed rollout evidence.
@@ -561,8 +584,20 @@ class WorldModelSimulator:
                 binding_sha256=binding_digest(binding),
                 maximum_cost_usd=spec.maximum_cost_usd,
                 rollout_completed=lambda item: load_optional_rollout(self._store, item) is not None,
-                observed_spend_usd=lambda: self._known_resolution_spend(bindings, resolution_input),
+                observed_spend_usd=lambda: resolution_spend(
+                    self._store, self._plan.cells, bindings, pins
+                ),
                 stop_on_overspend=spec.stop_on_overspend,
+                reservation_cost_usd=(
+                    dispatch.cell_reservation(
+                        spec,
+                        cell,
+                        self._completion_contract,
+                        has_tools=bool(self._tasks[cell.task_id].tools),
+                    )
+                    if parallel_admission
+                    else None
+                ),
             )
         except TextCellLeaseError as exc:
             raise SimulationResumeError(
@@ -599,7 +634,9 @@ class WorldModelSimulator:
             raise SimulationResumeError("owned text-cell admission omitted its durable lease")
         try:
             observed_spend = claim.observed_spend_usd or 0.0
-            maximum_cell_cost_usd = (spec.maximum_cost_usd or 0.0) - observed_spend
+            maximum_cell_cost_usd = claim.lease.reserved_cost_usd or (
+                (spec.maximum_cost_usd or 0.0) - observed_spend
+            )
             rollout = self._execute_cell(
                 spec,
                 cell,
@@ -617,24 +654,6 @@ class WorldModelSimulator:
             raise
         self._leases.release(claim.lease)
         return persisted
-
-    def _known_resolution_spend(
-        self,
-        bindings: Mapping[ArtifactId, SimulationCellBinding],
-        resolution_input: ArtifactInput,
-    ) -> float | None:
-        """Return conservative provider spend or unknown when one bound cell is unpriced.
-
-        Every persisted attempt of every bound cell counts, so a superseded unknown-spend
-        failure keeps charging its worst-case reservation while its re-execution is admitted
-        under whatever ceiling remains.
-        """
-        rollouts: list[RolloutArtifact] = []
-        pins = self._pins(resolution_input)
-        for cell_id, binding in bindings.items():
-            cell = next(item for item in self._plan.cells if item.cell_id == cell_id)
-            rollouts.extend(persisted_cell_attempts(self._store, cell, binding, pins))
-        return known_total_spend(rollouts)
 
     def _execute_cell(
         self,
@@ -666,6 +685,12 @@ class WorldModelSimulator:
         Raises:
             SimulationConfigurationError: Required world-model or retrieval settings are absent.
         """
+        parent = load_continuations(self._store, spec, (cell,), {cell.cell_id: binding}).get(
+            cell.cell_id
+        )
+        if parent is not None and parent.stop_reason == StopReason.COMPLETED:
+            return rebind_completed(self._store, parent, spec, cell, binding, resolution_input)
+        maximum_cell_cost_usd += prefix_retry_credit(parent, attempt)
         task = self._tasks[cell.task_id]
         candidate = self._candidate_models[cell.candidate_alias]
         started_at = timestamp(self._clock)
@@ -717,11 +742,14 @@ class WorldModelSimulator:
             maximum_cost_usd=maximum_cell_cost_usd,
             stop_on_overspend=spec.stop_on_overspend,
             maximum_steps=spec.maximum_steps,
+            maximum_rollout_output_tokens=spec.maximum_rollout_output_tokens,
             maximum_output_tokens=settings.maximum_output_tokens,
             redacted_field_names=self._redacted_field_names,
             clock=self._clock,
             token_counter=self._token_counter,
         )
+        if parent is not None and parent.text_checkpoint is not None:
+            recorder.restore(parent.text_checkpoint, parent.spans)
         try:
             outcome = execute_text_episode_loop(
                 agent_factory=self._agent_factory,
@@ -729,7 +757,7 @@ class WorldModelSimulator:
                 recorder=recorder,
             )
         except Exception as exc:  # noqa: BLE001 - construction faults remain cell evidence
-            return self._failure_rollout(
+            failed = self._failure_rollout(
                 spec,
                 cell,
                 candidate,
@@ -743,10 +771,11 @@ class WorldModelSimulator:
                 recorder=recorder,
                 attempt=attempt,
             )
+            return retain_lineage(self._store, failed, parent)
         failure = outcome.failure
         if outcome.episodes and failure == outcome.episodes[-1].failure:
             failure = normalize_text_tool_failure(outcome.episodes[-1])
-        return self._rollout_builder.make(
+        rollout = self._rollout_builder.make(
             spec=spec,
             cell=cell,
             candidate=candidate,
@@ -770,6 +799,9 @@ class WorldModelSimulator:
             ),
             attempt=attempt,
         )
+
+        rollout = rollout.model_copy(update={"text_checkpoint": recorder.checkpoint()})
+        return retain_lineage(self._store, rollout, parent)
 
     def _failure_rollout(
         self,

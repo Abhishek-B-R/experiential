@@ -335,6 +335,16 @@ def _materialize_row(
     )
     if evidence.source_run_id is not None and evidence.source_run_id != rollout.source_run_id:
         raise EvaluationEvidenceError("cell evidence source run differs from its rollout")
+    if rollout.stop_reason in {
+        StopReason.MAXIMUM_STEPS,
+        StopReason.MAXIMUM_OUTPUT_TOKENS,
+        StopReason.MAXIMUM_COST,
+        StopReason.MAXIMUM_TIME,
+        StopReason.LENGTH,
+    }:
+        if evidence.judgment_artifact_id is not None:
+            raise EvaluationEvidenceError("incomplete rollouts cannot carry a judgment")
+        return _row_from_rollout(cell, protocol, rollout, status="incomplete")
     if rollout.failure is not None or rollout.stop_reason == StopReason.FAILURE:
         if evidence.judgment_artifact_id is not None:
             raise EvaluationEvidenceError("failed rollouts cannot carry a judgment")
@@ -441,7 +451,7 @@ def _row_from_rollout(
     protocol: EvaluationProtocol,
     rollout: RolloutArtifact,
     *,
-    status: Literal["observed", "completed", "failed"],
+    status: Literal["observed", "completed", "failed", "incomplete"],
     judgment: Judgment | None = None,
     error: StructuredFailure | None = None,
 ) -> EvaluationRow:

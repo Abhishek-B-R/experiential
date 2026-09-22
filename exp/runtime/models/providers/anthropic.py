@@ -64,7 +64,7 @@ def anthropic_messages_request(
     system_parts: list[str] = []
     messages: list[JsonObject] = []
     for message in request.messages:
-        if message.role == "system":
+        if message.role in {"system", "developer"}:
             if message.content is None:
                 raise ValueError("system messages need text content")
             system_parts.append(message.content)

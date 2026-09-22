@@ -35,7 +35,7 @@ from exp.optimize.router.judging.contracts import (
 )
 from exp.optimize.router.judging.protocol import TemplateJudgeClient
 from exp.runtime.models.providers.errors import ProviderRetryableResponseError
-from exp.simulation.engines.text.recording import Utf8UpperBoundTokenCounter
+from exp.simulation.engines.text.tokens import Utf8UpperBoundTokenCounter
 
 
 class ReservedJudgeClient:
@@ -78,6 +78,11 @@ class ReservedJudgeClient:
         self._calls = 0
         self._economics: list[OperationEconomics] = []
         self._counter = Utf8UpperBoundTokenCounter()
+
+    @property
+    def model(self) -> ModelSnapshot:
+        """Return the provider identity verified against the frozen reservation at construction."""
+        return self._reservation.model
 
     @property
     def calls(self) -> int:
@@ -168,6 +173,19 @@ class AutomaticRouterJudge:
         self._code_revision = code_revision
         self._maximum_input_tokens = maximum_input_tokens
         self._maximum_output_tokens = maximum_output_tokens
+
+    @property
+    def model(self) -> ModelSnapshot:
+        """Expose the actual reserved provider identity for pre-dispatch evaluation checks.
+
+        Raises:
+            ManualJudgeError: The client is unbound or differs from the persisted judge setup.
+        """
+        if not isinstance(self._client, ReservedJudgeClient):
+            raise ManualJudgeError("evaluation requires a reservation-bound judge client")
+        if self._client.model != self._setup.judge_model:
+            raise ManualJudgeError("reserved judge model differs from the finalized judge setup")
+        return self._client.model
 
     @property
     def provider_economics(self) -> tuple[OperationEconomics, ...]:
