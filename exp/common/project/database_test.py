@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import exp.common.project.database as database_module
 from exp.common.core.artifacts import ArtifactEnvelope, sha256_json
 from exp.common.project import ProjectConfig, ProjectStore, ProjectStoreError, write_project_config
 from exp.common.project.database import content_database_path, project_connection
@@ -168,3 +169,22 @@ def test_unsupported_folder_state_is_preserved_without_silent_cutover(tmp_path: 
     with pytest.raises(ValueError, match="unsupported folder layout"):
         ProjectStore(tmp_path, "project-a").initialize(ProjectConfig(project_id="project-a"))
     assert (project_directory / "project.toml").read_bytes() == original
+
+
+def test_wal_initialization_and_begin_share_one_admission_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BEGIN cannot restart the busy timeout already consumed by WAL initialization."""
+    now = [100.0]
+    original = database_module.enable_wal_mode
+
+    def initialize_wal(connection: sqlite3.Connection, *, deadline: float) -> None:
+        """Charge initialization time to the same finite transaction admission budget."""
+        original(connection, deadline=deadline)
+        now[0] += 0.4
+
+    monkeypatch.setattr(database_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(database_module, "enable_wal_mode", initialize_wal)
+    with project_connection(tmp_path, write=True, timeout_s=0.5) as connection:
+        remaining_ms = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+        assert 0 < remaining_ms <= 100

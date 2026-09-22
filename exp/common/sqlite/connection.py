@@ -101,7 +101,7 @@ def close_idle_connections() -> int:
     return closed
 
 
-def enable_wal_mode(connection: sqlite3.Connection, *, timeout_s: float) -> None:
+def enable_wal_mode(connection: sqlite3.Connection, *, deadline: float) -> None:
     """Enable WAL with a finite retry when another process initializes the same database.
 
     SQLite journal-mode changes can return SQLITE_BUSY immediately without invoking
@@ -110,12 +110,13 @@ def enable_wal_mode(connection: sqlite3.Connection, *, timeout_s: float) -> None
 
     Args:
         connection: Open database whose complete schema has already been validated.
-        timeout_s: Maximum total wait for enabling durable WAL mode.
+        deadline: Absolute monotonic deadline shared with all write admission stages.
     """
-    deadline = time.monotonic() + max(0.0, timeout_s)
     while True:
         try:
+            set_busy_deadline(connection, deadline=deadline)
             if connection.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+                set_busy_deadline(connection, deadline=deadline)
                 connection.execute("PRAGMA journal_mode=WAL").fetchone()
             return
         except sqlite3.OperationalError as error:
@@ -123,3 +124,9 @@ def enable_wal_mode(connection: sqlite3.Connection, *, timeout_s: float) -> None
             if error.sqlite_errorcode & 0xFF != sqlite3.SQLITE_BUSY or remaining <= 0:
                 raise
             time.sleep(min(0.01, remaining))
+
+
+def set_busy_deadline(connection: sqlite3.Connection, *, deadline: float) -> None:
+    """Set the next SQLite lock wait to only the unspent monotonic admission budget."""
+    milliseconds = max(0, int((deadline - time.monotonic()) * 1000))
+    connection.execute(f"PRAGMA busy_timeout={milliseconds}")

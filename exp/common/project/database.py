@@ -6,13 +6,14 @@ import os
 import sqlite3
 import stat
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
 from exp.common.project.sqlite_schema import initialize_project_schema
-from exp.common.sqlite.connection import enable_wal_mode
+from exp.common.sqlite.connection import enable_wal_mode, set_busy_deadline
 from exp.common.sqlite.schema import validate_content_tables
 from exp.common.sqlite.writers import writer_turn
 
@@ -99,6 +100,7 @@ def project_connection(
         else:
             active.connection.execute("RELEASE project_nested")
         return
+    deadline = time.monotonic() + max(0.0, timeout_s)
     admission = writer_turn(path, timeout_s=timeout_s) if write else nullcontext(timeout_s)
     with admission as remaining_s:
         if write:
@@ -116,8 +118,9 @@ def project_connection(
             connection.execute("PRAGMA foreign_keys=ON")
             validate_content_tables(connection)
             if write:
-                enable_wal_mode(connection, timeout_s=remaining_s)
+                enable_wal_mode(connection, deadline=deadline)
                 connection.execute("PRAGMA synchronous=FULL")
+            set_busy_deadline(connection, deadline=deadline)
             connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             tables = validate_content_tables(connection)
             if write and "project_store_schema" not in tables:
