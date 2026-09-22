@@ -3252,6 +3252,21 @@ def test_rust_failure_taxonomy_matches_public_failure_error() -> None:
             assert actual["retry_after_seconds"] == expected.retry_after_seconds, failure_class
 
 
+def test_rust_chat_fixture_preserves_the_incomplete_tool_diagnostic() -> None:
+    """Keep the cause distinct from a provider-declared output limit."""
+    native = pytest.importorskip("exp_gateway_native")
+    fixture = json.dumps([{"kind": "incomplete", "incomplete_reason": "tool_arguments_incomplete"}])
+    frames = native.encode_chat_fixture("request-cut", "coding", 1, False, fixture)
+    payloads = [
+        json.loads(frame.removeprefix("data: ").strip())
+        for frame in frames
+        if frame.startswith("data: {")
+    ]
+    terminal = next(value for value in payloads if value["choices"][0]["finish_reason"])
+    assert terminal["choices"][0]["finish_reason"] == "length"
+    assert terminal["x-experiential-incomplete-reason"] == "tool_arguments_incomplete"
+
+
 def test_rust_chat_sse_frames_match_python_and_the_committed_golden() -> None:
     """Rust Chat SSE frames equal the committed golden and the shared encoder.
 
