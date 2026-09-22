@@ -68,7 +68,7 @@ def _plan_and_setup() -> tuple[EvaluationPlan, EvaluationCell, RouterEvaluationS
         agent_id="agent-a",
         simulator_id="text-world-model-v1",
         world_model=_snapshot("world-model-a"),
-        simulator_prompt_id="world-model-text-v1",
+        simulator_prompt_id="world-model-text-v2",
         rubric_id="rubric-a",
         judge_calibration_id="calibration-a",
         pricing_snapshot_id="pricing-a",
