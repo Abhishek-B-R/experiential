@@ -51,6 +51,12 @@ pub(super) fn json_bytes(value: &Value) -> usize {
 /// Charge retained tree nodes as well as string and vector capacity.
 /// Objects enter through serde, without caller-controlled spare map capacity.
 pub(super) fn heap_bytes(value: &Value) -> usize {
+    // serde-grown ordered maps can reserve three entry slots for the first key.
+    // Charge four slots plus index/control storage per key, using actual node sizes.
+    const MAP_ENTRY_BYTES: usize = 4
+        * (std::mem::size_of::<Value>()
+            + std::mem::size_of::<String>()
+            + 2 * std::mem::size_of::<usize>());
     match value {
         Value::String(text) => text.capacity(),
         Value::Array(values) => values.iter().fold(
@@ -59,14 +65,13 @@ pub(super) fn heap_bytes(value: &Value) -> usize {
                 .saturating_mul(std::mem::size_of::<Value>()),
             |size, value| size.saturating_add(heap_bytes(value)),
         ),
-        Value::Object(values) => {
-            values
-                .iter()
-                .fold(values.len().saturating_mul(256), |size, (key, value)| {
-                    size.saturating_add(key.capacity())
-                        .saturating_add(heap_bytes(value))
-                })
-        }
+        Value::Object(values) => values.iter().fold(
+            values.len().saturating_mul(MAP_ENTRY_BYTES),
+            |size, (key, value)| {
+                size.saturating_add(key.capacity())
+                    .saturating_add(heap_bytes(value))
+            },
+        ),
         _ => 0,
     }
 }

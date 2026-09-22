@@ -38,3 +38,12 @@ fn node_heavy_trees_and_spare_vectors_are_charged() {
     let nodes = Value::Array(vec![Value::Null; 1000]);
     assert!(heap_bytes(&nodes) > json_bytes(&nodes));
 }
+
+#[test]
+fn small_ordered_maps_include_minimum_entry_and_index_allocations() {
+    let value: Value = serde_json::from_str(r#"{"x":null}"#).unwrap();
+    let entry =
+        std::mem::size_of::<String>() + std::mem::size_of::<Value>() + std::mem::size_of::<usize>();
+    let minimum_allocation = 3 * entry + 4 * std::mem::size_of::<usize>() + 16;
+    assert!(heap_bytes(&value) >= minimum_allocation);
+}
