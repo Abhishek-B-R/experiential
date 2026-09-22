@@ -406,6 +406,7 @@ pub struct Normalizer {
     // terminal frame can then finish normally instead of failing malformed.
     emitted_output: bool,
     accumulated_tool_bytes: usize,
+    accumulated_image_bytes: usize,
     accumulated_summary_bytes: usize,
     reasoning_summaries: BTreeMap<(u32, u32), String>,
     openai_output_items: BTreeMap<u32, (ProviderOutputItemKind, Option<String>)>,
@@ -471,6 +472,7 @@ impl Normalizer {
             terminal: false,
             emitted_output: false,
             accumulated_tool_bytes: 0,
+            accumulated_image_bytes: 0,
             accumulated_summary_bytes: 0,
             reasoning_summaries: BTreeMap::new(),
             openai_output_items: BTreeMap::new(),
@@ -534,12 +536,19 @@ impl Normalizer {
         self.upstream_provider = Some(trimmed.to_string());
     }
 
+    /// Bound aggregate image output even when images are delivered incrementally.
+    fn reserve_image_bytes(&mut self, additional: usize) -> Result<(), Failure> {
+        self.accumulated_image_bytes = self.accumulated_image_bytes.saturating_add(additional);
+        self.reserve_tool_bytes(0)
+    }
+
     /// Reserve retained-output budget for accumulated tool-argument text.
     fn reserve_tool_bytes(&mut self, additional: usize) -> Result<(), Failure> {
         self.accumulated_tool_bytes = self.accumulated_tool_bytes.saturating_add(additional);
         if self
             .accumulated_tool_bytes
             .saturating_add(self.accumulated_summary_bytes)
+            .saturating_add(self.accumulated_image_bytes)
             > MAXIMUM_RETAINED_OUTPUT_BYTES
         {
             return Err(Failure::new(
@@ -556,6 +565,7 @@ impl Normalizer {
         if self
             .accumulated_tool_bytes
             .saturating_add(self.accumulated_summary_bytes)
+            .saturating_add(self.accumulated_image_bytes)
             > MAXIMUM_RETAINED_OUTPUT_BYTES
         {
             return Err(Failure::new(

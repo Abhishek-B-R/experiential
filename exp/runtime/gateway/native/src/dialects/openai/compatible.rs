@@ -235,6 +235,16 @@ impl Normalizer {
                 events.push(Event::TextDelta(content.clone()));
             }
         }
+        if let Some(images) = delta.get("images").filter(|value| !value.is_null()) {
+            let images = images
+                .as_array()
+                .ok_or_else(|| malformed("Chat images must be an array"))?;
+            for image in images {
+                let url = crate::image_output::chat_image(image)?;
+                self.reserve_image_bytes(url.len())?;
+                events.push(Event::Image(url));
+            }
+        }
         if let Some(Value::String(refusal)) = delta.get("refusal") {
             self.refusal_seen = true;
             events.push(Event::RefusalDelta(refusal.clone()));

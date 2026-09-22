@@ -39,7 +39,7 @@ pub fn collection_public_error(failure: &Failure) -> PublicError {
 /// streamed deltas.
 pub fn event_retained_bytes(event: &Event) -> usize {
     match event {
-        Event::TextDelta(text) | Event::RefusalDelta(text) => text.len(),
+        Event::TextDelta(text) | Event::RefusalDelta(text) | Event::Image(text) => text.len(),
         Event::ProviderTextDelta { delta, .. } | Event::ProviderRefusalDelta { delta, .. } => {
             delta.len()
         }
@@ -228,6 +228,13 @@ pub struct UpstreamRelay {
 }
 
 impl UpstreamRelay {
+    /// Image models put a complete encoded image in one SSE frame.
+    pub fn allow_image_output(&mut self) {
+        if let FrameDecoder::Sse(decoder) = &mut self.decoder {
+            decoder.allow_image_output();
+        }
+    }
+
     pub fn new(
         response: reqwest::Response,
         dialect: Dialect,

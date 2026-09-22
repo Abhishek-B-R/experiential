@@ -146,6 +146,8 @@ impl ProviderAssistantMessagePhase {
 #[derive(Debug, Clone)]
 pub enum Event {
     TextDelta(String),
+    /// One complete generated image, encoded as a validated inline data URL.
+    Image(String),
     RefusalDelta(String),
     /// Ordered probability metadata for one Chat choice. This is independent
     /// of text because providers may send a metadata-only chunk.
@@ -387,7 +389,7 @@ impl Event {
     /// not output tokens either.
     pub fn is_output_token(&self) -> bool {
         match self {
-            Event::TextDelta(text) | Event::RefusalDelta(text) => !text.is_empty(),
+            Event::TextDelta(text) | Event::RefusalDelta(text) | Event::Image(text) => !text.is_empty(),
             Event::ProviderTextDelta { delta, .. }
             | Event::ProviderRefusalDelta { delta, .. }
             | Event::ReasoningSummaryDelta { delta, .. }
@@ -410,6 +412,7 @@ impl Event {
 /// the failure class and safe message for terminal failures.
 pub fn simplified_event(event: &Event) -> Value {
     match event {
+        Event::Image(url) => serde_json::json!({"kind": "image", "url": url}),
         Event::TextDelta(text) => serde_json::json!({"kind": "text_delta", "text": text}),
         Event::RefusalDelta(text) => serde_json::json!({"kind": "refusal_delta", "text": text}),
         Event::ChoiceLogprobsDelta(delta) => {

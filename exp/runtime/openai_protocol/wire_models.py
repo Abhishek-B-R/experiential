@@ -375,15 +375,15 @@ class _Message(_WireModel):
                 "reasoning_content, reasoning, and reasoning_details are valid only "
                 "for assistant messages"
             )
-        # Tool results carry images (agents report screenshots there); other roles stay text-only.
+        # User input, tool screenshots, and generated assistant images retain their parts.
         media = {type(part) for part in self.image_capable_parts} - {_TextPart}
-        if media and self.role not in ("user", "tool"):
+        if media and self.role not in ("user", "tool", "assistant"):
             raise ValueError(
                 "image, video, and audio parts are valid only for user messages "
                 "(a tool message may carry image parts beside its text)"
             )
-        if self.role == "tool" and media - {_ChatImagePart, _ResponsesImagePart}:
-            raise ValueError("tool messages carry only text and image parts")
+        if self.role in ("tool", "assistant") and media - {_ChatImagePart, _ResponsesImagePart}:
+            raise ValueError(f"{self.role} messages carry only text and image parts")
         call_ids = tuple(call.id for call in self.history_tool_calls)
         if len(call_ids) != len(set(call_ids)):
             raise ValueError("assistant tool call IDs must be unique")

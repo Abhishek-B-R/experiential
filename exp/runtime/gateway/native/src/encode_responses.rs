@@ -266,6 +266,9 @@ impl ResponsesSseEncoder {
             Event::ChoiceLogprobsDelta(_) => Err(invalid_provider_stream(
                 "Chat token probabilities cannot be projected on this surface.",
             )),
+            Event::Image(_) => Err(invalid_provider_stream(
+                "Generated image output requires Chat Completions or the Images API.",
+            )),
             Event::TextDelta(delta) => self.content_delta(MessageKey::Synthetic, None, true, delta),
             Event::RefusalDelta(delta) => {
                 self.content_delta(MessageKey::Synthetic, None, false, delta)
