@@ -109,8 +109,8 @@ while releasing the GIL; a blocked destination cannot extend that caller's deadl
 A drain timeout returns false and leaves accepted delivery records queued, including
 producers already waiting for space. It does not purge them. The host must keep the
 process alive to finish draining; this memory queue is not a crash-recovery journal.
-Unsettled hosted records still expire or are discarded on close because no durable
-content permission has been granted. Per-record size limits and explicit retention
+Unsettled hosted records remain pending until permission arrives or their TTL expires;
+closing does not grant permission or purge them. Per-record size limits and explicit retention
 policies still apply; this overload guarantee does not mean unlimited retention.
 
 Destinations must enforce their own current consent, identity ownership, consent

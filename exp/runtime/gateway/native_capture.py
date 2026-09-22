@@ -20,7 +20,13 @@ Identifier = Annotated[str, Field(min_length=1, max_length=512)]
 
 
 class CaptureDeliveryLimits(ContractModel):
-    """Budgets include the record currently being written by the destination."""
+    """Budgets include the record currently being written by the destination.
+
+    Attributes:
+        maximum_records: Queued and actively written records, defaulting to 256.
+        maximum_bytes: Retained delivery memory, defaulting to 64 MiB.
+        maximum_record_bytes: Final encoded payload ceiling, defaulting to 8 MiB.
+    """
 
     maximum_records: int = Field(default=256, strict=True, ge=1, le=4096)
     maximum_bytes: int = Field(default=64 * 1024 * 1024, strict=True, ge=1, le=256 * 1024 * 1024)
@@ -37,7 +43,17 @@ class CaptureDeliveryLimits(ContractModel):
 
 
 class CaptureConfiguration(ContractModel):
-    """Bounded native collection, with hosted settlement eligibility enabled by default."""
+    """Bounded native collection, with hosted settlement eligibility enabled by default.
+
+    Attributes:
+        delivery: Destination queue limits, using CaptureDeliveryLimits defaults.
+        maximum_pending_records: In-flight request ceiling, defaulting to 2048.
+        maximum_pending_bytes: In-flight memory ceiling, defaulting to 64 MiB.
+        maximum_request_bytes: Encoded request ceiling, defaulting to 1 MiB.
+        maximum_response_bytes: Response buffer ceiling, defaulting to 3,670,016 bytes.
+        ttl_seconds: Unsettled request lifetime, defaulting to 1800 seconds.
+        settlement_required: Require hosted retention permission, true by default.
+    """
 
     delivery: CaptureDeliveryLimits = Field(default_factory=CaptureDeliveryLimits)
     maximum_pending_records: int = Field(default=2048, strict=True, ge=1, le=4096)
@@ -60,7 +76,13 @@ class CaptureConfiguration(ContractModel):
 
 
 class CaptureScope(ContractModel):
-    """Authenticated identity plus its explicitly configured application binding."""
+    """Authenticated identity plus its explicitly configured application binding.
+
+    Attributes:
+        organization_id: Authenticated organization identifier.
+        identity_id: Authenticated gateway identity identifier.
+        application_id: Host-configured application identifier for this identity.
+    """
 
     organization_id: Identifier
     identity_id: Identifier
@@ -68,7 +90,15 @@ class CaptureScope(ContractModel):
 
 
 class CaptureRequest(ContractModel):
-    """Versioned effective context, independent of transport credentials."""
+    """Versioned effective context, independent of transport credentials.
+
+    Attributes:
+        request_id: Unique authenticated request identifier.
+        scope: Authority-derived organization, identity and application binding.
+        protocol: Public HTTP request surface.
+        model_id: Selected model identifier, unknown before routing.
+        context: Effective post-guardrail request and capture-only provider evidence.
+    """
 
     request_id: Identifier
     scope: CaptureScope
@@ -78,7 +108,14 @@ class CaptureRequest(ContractModel):
 
 
 class CaptureJsonResponse(ContractModel):
-    """A complete JSON response body, before host-specific presentation decoration."""
+    """A complete JSON response body, before host-specific presentation decoration.
+
+    Attributes:
+        kind: JSON response discriminator, always json.
+        status: Observed HTTP response status.
+        body: Queryable response projection.
+        source_json: Exact escaped source when normalization was needed, otherwise None.
+    """
 
     kind: Literal["json"] = "json"
     status: int = Field(ge=100, le=599)
@@ -87,7 +124,16 @@ class CaptureJsonResponse(ContractModel):
 
 
 class CaptureSseResponse(ContractModel):
-    """Ordered SSE data payloads with explicit loss and disconnect indicators."""
+    """Ordered SSE data payloads with explicit loss and disconnect indicators.
+
+    Attributes:
+        kind: Streaming response discriminator, always sse.
+        status: Observed HTTP response status.
+        frames: Ordered complete SSE data payloads.
+        truncated: Whether capture limits excluded part of the response.
+        client_disconnected: Whether the consumer stopped before body completion.
+        source_json: Exact escaped frames when normalization was needed, otherwise None.
+    """
 
     kind: Literal["sse"] = "sse"
     status: int = Field(ge=100, le=599)
@@ -138,7 +184,21 @@ class CaptureMetrics(ContractModel):
 
 
 class CaptureRecord(ContractModel):
-    """One idempotent update delivered to a local or hosted persistence adapter."""
+    """One idempotent update delivered to a local or hosted persistence adapter.
+
+    Attributes:
+        schema_version: Persisted contract version, always 1.
+        request: Authenticated scope and effective request context.
+        response: Eligible observed output, otherwise None.
+        deployment_id: Selected provider deployment identifier, when available.
+        provider_reasoning: Permitted exposed reasoning, defaulting to None.
+        provider_reasoning_source_json: Exact exceptional reasoning, defaulting to None.
+        provider_tool_calls_json: Exact completed tool-call records, defaulting to None.
+        captured_at: Admission timestamp as Unix seconds.
+        metrics: Winning-attempt observations only when response retention permits them.
+        gemini_thought_parts: Ordered provider summary and signature evidence, not full CoT.
+        gemini_thought_parts_source_json: Exact exceptional parts, otherwise None.
+    """
 
     schema_version: Literal[1]
     request: CaptureRequest
