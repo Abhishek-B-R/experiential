@@ -139,6 +139,10 @@ pub(crate) struct Record<R = Response> {
     /// Exact completed tool calls, escaped once so JSONB cannot alter their text.
     pub provider_tool_calls_json: Option<String>,
     pub deployment_id: Option<String>,
+    pub metrics: Option<super::metrics::Metrics>,
+    /// Provider parts in order; `thought: true` text is a summary, never full CoT.
+    pub gemini_thought_parts: Vec<Arc<Value>>,
+    pub gemini_thought_parts_source_json: Option<String>,
     pub captured_at: f64,
 }
 
@@ -149,6 +153,35 @@ pub(crate) struct Reasoning<'a> {
 }
 
 impl<R> Record<R> {
+    pub(crate) fn durable_gemini_parts(&self) -> (Cow<'_, [Arc<Value>]>, Option<Cow<'_, str>>) {
+        if !self
+            .gemini_thought_parts
+            .iter()
+            .any(|part| super::response::contains_nul(part))
+        {
+            return (
+                Cow::Borrowed(&self.gemini_thought_parts),
+                self.gemini_thought_parts_source_json
+                    .as_deref()
+                    .map(Cow::Borrowed),
+            );
+        }
+        let mut value = Value::Array(
+            self.gemini_thought_parts
+                .iter()
+                .map(|part| (**part).clone())
+                .collect(),
+        );
+        let source = super::response::lossless_projection(&mut value);
+        let Value::Array(parts) = value else {
+            unreachable!()
+        };
+        (
+            Cow::Owned(parts.into_iter().map(Arc::new).collect()),
+            source.map(Cow::Owned),
+        )
+    }
+
     pub(crate) fn durable_reasoning(&self) -> Result<Reasoning<'_>, serde_json::Error> {
         if let Some(text) = self
             .provider_reasoning
@@ -174,7 +207,8 @@ impl<R: Serialize> Serialize for Record<R> {
     /// Project only exceptional reasoning text; never clone the request or response.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let reasoning = self.durable_reasoning().map_err(S::Error::custom)?;
-        let mut record = serializer.serialize_struct("Record", 8)?;
+        let (parts, parts_source) = self.durable_gemini_parts();
+        let mut record = serializer.serialize_struct("Record", 11)?;
         record.serialize_field("schema_version", &self.schema_version)?;
         record.serialize_field("request", &self.request)?;
         record.serialize_field("response", &self.response)?;
@@ -182,6 +216,9 @@ impl<R: Serialize> Serialize for Record<R> {
         record.serialize_field("provider_reasoning_source_json", &reasoning.source_json)?;
         record.serialize_field("provider_tool_calls_json", &self.provider_tool_calls_json)?;
         record.serialize_field("deployment_id", &self.deployment_id)?;
+        record.serialize_field("metrics", &self.metrics)?;
+        record.serialize_field("gemini_thought_parts", &parts)?;
+        record.serialize_field("gemini_thought_parts_source_json", &parts_source)?;
         record.serialize_field("captured_at", &self.captured_at)?;
         record.end()
     }
@@ -246,6 +283,16 @@ impl Record {
                 .as_ref()
                 .map_or(0, String::capacity)
             + self.deployment_id.as_ref().map_or(0, String::capacity)
+            + self.gemini_thought_parts.capacity() * std::mem::size_of::<Arc<Value>>()
+            + self
+                .gemini_thought_parts
+                .iter()
+                .map(|part| budget::heap_bytes(part) + 64)
+                .sum::<usize>()
+            + self
+                .gemini_thought_parts_source_json
+                .as_ref()
+                .map_or(0, String::capacity)
     }
 }
 

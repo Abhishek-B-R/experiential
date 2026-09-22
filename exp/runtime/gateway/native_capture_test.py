@@ -268,5 +268,16 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     }
     assert all(record.request.scope.identity_id == "default" for record in completed)
     assert all(record.request.model_id is not None for record in completed)
+    for record in completed:
+        assert record.metrics is not None
+        assert record.metrics.terminal_at is not None
+        assert record.metrics.terminal_at >= record.metrics.started_at
+        assert record.metrics.first_token_at is not None
+        assert record.metrics.first_token_at >= record.metrics.started_at
+        assert record.metrics.duration_ms is not None and record.metrics.duration_ms > 0
+        assert record.metrics.usage_complete
+        assert record.metrics.usage is not None
+        assert record.metrics.usage.input_tokens is not None
+        assert record.metrics.usage.output_tokens is not None
     assert "provider-secret" not in "".join(records)
     assert raw_key not in "".join(records)

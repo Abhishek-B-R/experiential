@@ -68,6 +68,65 @@ fn drain(collector: &Collector, receiver: mpsc::Receiver<Record>) -> Vec<Record>
 }
 
 #[test]
+fn winning_metrics_and_gemini_parts_survive_storage_without_public_reasoning() {
+    use crate::events::{Event, Usage};
+    use crate::settlement::Observation;
+    let (collector, receiver) = collector(config());
+    let observation = Observation::default();
+    assert!(collector.begin(request("measured")));
+    collector.observe_attempt("measured", observation.clone());
+    let part = Arc::new(json!({"thought":true,"text":"summary\0雪","thoughtSignature":"opaque=="}));
+    collector.gemini_thought_part("measured", part.clone());
+    {
+        let pending = collector.pending.lock().unwrap();
+        assert!(Arc::ptr_eq(
+            &part,
+            &pending.entries["measured"].record.gemini_thought_parts[0]
+        ));
+    }
+    observation.record_first_token(Some(SystemTime::now()));
+    observation.record(&Event::Usage(Usage {
+        input_tokens: Some(9),
+        output_tokens: Some(6),
+        reasoning_tokens: Some(4),
+        ..Usage::default()
+    }));
+    observation.record(&Event::Completed);
+    collector.settle("measured", true, true);
+    assert!(collector.finish("measured", Some(response()), Some("gemini".into())));
+    let records = drain(&collector, receiver);
+    let record = &records[0];
+    assert!(record.provider_reasoning.is_none());
+    let restored: Vec<serde_json::Value> =
+        serde_json::from_str(record.gemini_thought_parts_source_json.as_ref().unwrap()).unwrap();
+    assert_eq!(restored[0], *part);
+    let metrics = record.metrics.as_ref().unwrap();
+    assert!(metrics.usage_complete);
+    assert_eq!(metrics.usage.as_ref().unwrap().reasoning_tokens, Some(4));
+    assert!(metrics.duration_ms.unwrap() >= 0.0);
+}
+
+#[test]
+fn denied_response_never_persists_gemini_parts_in_either_settlement_order() {
+    for before in [true, false] {
+        let (collector, receiver) = collector(config());
+        assert!(collector.begin(request("denied")));
+        collector.gemini_thought_part("denied", Arc::new(json!({"thoughtSignature":"private"})));
+        if before {
+            collector.settle("denied", true, false);
+        }
+        collector.finish("denied", Some(response()), None);
+        if !before {
+            collector.settle("denied", true, false);
+        }
+        let records = drain(&collector, receiver);
+        assert_eq!(records.len(), 1);
+        assert!(records[0].response.is_none());
+        assert!(records[0].gemini_thought_parts.is_empty());
+    }
+}
+
+#[test]
 fn routing_provenance_is_optional_until_selected_and_then_immutable() {
     let (collector, receiver) = collector(config());
     let mut input = request("request");

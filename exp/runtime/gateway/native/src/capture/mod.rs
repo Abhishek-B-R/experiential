@@ -3,6 +3,7 @@
 pub(crate) mod budget;
 pub(crate) mod collector;
 pub(crate) mod delivery;
+pub(crate) mod metrics;
 pub(crate) mod python;
 pub(crate) mod reasoning;
 pub(crate) mod record;

@@ -306,7 +306,7 @@ fn data_frames(bytes: &[u8]) -> Vec<Value> {
 }
 
 /// Preserve exact JSON text whenever storage requires a normalized projection.
-fn lossless_projection(value: &mut Value) -> Option<String> {
+pub(super) fn lossless_projection(value: &mut Value) -> Option<String> {
     if !contains_nul(value) {
         return None;
     }
@@ -316,7 +316,7 @@ fn lossless_projection(value: &mut Value) -> Option<String> {
 }
 
 /// Inspect decoded text without allocating a complete JSON representation.
-fn contains_nul(value: &Value) -> bool {
+pub(super) fn contains_nul(value: &Value) -> bool {
     match value {
         Value::String(text) => text.contains('\0'),
         Value::Array(values) => values.iter().any(contains_nul),

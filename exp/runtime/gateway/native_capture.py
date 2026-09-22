@@ -97,6 +97,37 @@ class CaptureSseResponse(ContractModel):
     source_json: str | None = None
 
 
+class CaptureUsage(ContractModel):
+    """Native observed counts, with every absent counter remaining unknown."""
+
+    input_tokens: int | None = Field(ge=0)
+    output_tokens: int | None = Field(ge=0)
+    cached_input_tokens: int | None = Field(ge=0)
+    reasoning_tokens: int | None = Field(ge=0)
+    cache_creation_input_tokens: int | None = Field(default=None, ge=0)
+    cache_creation_1h_input_tokens: int | None = Field(default=None, ge=0)
+
+
+class CaptureMetrics(ContractModel):
+    """Winning attempt observations, not aggregate billing across fallback attempts.
+
+    Attributes:
+        started_at: Attempt start as Unix seconds.
+        first_token_at: Existing native first output-token observation, if any.
+        terminal_at: Provider terminal time, absent for an interrupted stream.
+        duration_ms: Monotonic attempt duration, absent before a provider terminal.
+        usage: Observed normalized provider counts; unknown fields remain None.
+        usage_complete: Whether a terminal and both total token counts were observed.
+    """
+
+    started_at: float = Field(ge=0, allow_inf_nan=False)
+    first_token_at: float | None
+    terminal_at: float | None
+    duration_ms: float | None = Field(ge=0, allow_inf_nan=False)
+    usage: CaptureUsage | None
+    usage_complete: bool
+
+
 class CaptureRecord(ContractModel):
     """One idempotent update delivered to a local or hosted persistence adapter."""
 
@@ -110,6 +141,9 @@ class CaptureRecord(ContractModel):
     provider_reasoning_source_json: str | None = None
     provider_tool_calls_json: str | None = None
     captured_at: float = Field(ge=0, allow_inf_nan=False)
+    metrics: CaptureMetrics | None
+    gemini_thought_parts: tuple[JsonObject, ...]
+    gemini_thought_parts_source_json: str | None
 
 
 class CaptureController:

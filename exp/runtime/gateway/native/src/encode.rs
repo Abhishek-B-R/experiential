@@ -318,6 +318,7 @@ impl ChatSseEncoder {
             Event::ProviderOutputItemStarted { .. }
             | Event::ProviderOutputItemCompleted { .. }
             | Event::ReasoningSummaryDelta { .. }
+            | Event::GeminiThoughtPart(_)
             | Event::ThinkingDelta { .. }
             | Event::ThinkingSignature { .. }
             | Event::RedactedThinking { .. }

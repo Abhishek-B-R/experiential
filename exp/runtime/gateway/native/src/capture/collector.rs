@@ -54,6 +54,8 @@ impl Drop for Admission {
 struct Entry {
     _admission: Admission,
     record: Record,
+    observation: Option<crate::settlement::Observation>,
+    gemini_part_bytes: usize,
     wire: Option<WireResponse>,
     request_bytes: usize,
     expires: Instant,
@@ -144,6 +146,9 @@ impl Collector {
             provider_reasoning_source_json: None,
             provider_tool_calls_json: None,
             deployment_id: None,
+            metrics: None,
+            gemini_thought_parts: Vec::new(),
+            gemini_thought_parts_source_json: None,
             captured_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_secs_f64())
@@ -173,6 +178,8 @@ impl Collector {
             Entry {
                 _admission: Admission(self.admissions.clone()),
                 record,
+                observation: None,
+                gemini_part_bytes: 0,
                 wire: None,
                 request_bytes,
                 expires: Instant::now() + Duration::from_secs(self.config.ttl_seconds),
@@ -229,6 +236,19 @@ impl Collector {
         Some(entry.response_discarded.clone())
     }
 
+    /// Share only the selected attempt's accounting, never a losing rung's content or meter.
+    pub(crate) fn observe_attempt(
+        &self,
+        request_id: &str,
+        observation: crate::settlement::Observation,
+    ) {
+        if let Ok(mut pending) = self.pending.lock() {
+            if let Some(entry) = pending.entries.get_mut(request_id) {
+                entry.observation = Some(observation);
+            }
+        }
+    }
+
     /// Hosted terminal eligibility precedes durable content, so a dropped BYOK
     /// discard can never leave a previously queued prompt behind.
     pub(crate) fn settle(&self, request_id: &str, keep_prompt: bool, keep_response: bool) {
@@ -249,6 +269,7 @@ impl Collector {
             entry.record.response = None;
             entry.record.provider_reasoning = None;
             entry.record.provider_tool_calls_json = None;
+            entry.record.gemini_thought_parts.clear();
             drop(pending);
             self.emit(entry.record, None);
             return;
@@ -312,8 +333,13 @@ impl Collector {
         if entry.record.response.is_none() && entry.wire.is_none() {
             entry.record.provider_reasoning = None;
             entry.record.provider_tool_calls_json = None;
+            entry.record.gemini_thought_parts.clear();
         }
         entry.record.deployment_id = deployment_id;
+        entry.record.metrics = entry
+            .observation
+            .as_ref()
+            .map(super::metrics::Metrics::observed);
         entry.output_finished = true;
         entry.bytes = entry.bytes.saturating_add(response_heap);
         if entry.response_allowed {
@@ -387,6 +413,49 @@ impl Collector {
             return;
         }
         text.push_str(delta);
+        pending.bytes += entry.bytes;
+        pending.entries.insert(request_id.to_owned(), entry);
+    }
+
+    /// Share bounded provider parts without JSON encoding or copying their content.
+    pub(crate) fn gemini_thought_part(&self, request_id: &str, part: Arc<serde_json::Value>) {
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        self.expire(&mut pending);
+        let Some(mut entry) = pending.entries.remove(request_id) else {
+            return;
+        };
+        pending.bytes -= entry.bytes;
+        let previous = entry.record.gemini_thought_parts.capacity()
+            * std::mem::size_of::<Arc<serde_json::Value>>();
+        let heap = super::budget::heap_bytes(&part) + 64;
+        let part_bytes = super::budget::json_bytes(&part);
+        if entry.gemini_part_bytes.saturating_add(part_bytes) > self.config.maximum_response_bytes
+            || pending
+                .bytes
+                .saturating_add(entry.bytes)
+                .saturating_add(heap + 64)
+                > self.config.maximum_pending_bytes
+            || entry
+                .record
+                .gemini_thought_parts
+                .try_reserve_exact(1)
+                .is_err()
+        {
+            self.skip();
+            return;
+        }
+        entry.record.gemini_thought_parts.push(part);
+        entry.gemini_part_bytes += part_bytes;
+        entry.bytes += heap
+            + entry.record.gemini_thought_parts.capacity()
+                * std::mem::size_of::<Arc<serde_json::Value>>()
+            - previous;
+        if pending.bytes.saturating_add(entry.bytes) > self.config.maximum_pending_bytes {
+            self.skip();
+            return;
+        }
         pending.bytes += entry.bytes;
         pending.entries.insert(request_id.to_owned(), entry);
     }

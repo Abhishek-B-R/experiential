@@ -92,9 +92,10 @@ async fn stalled_writer_backpressures_complete_responses_without_blocking_the_ru
                         maximum_record_bytes: 8192,
                     },
                     maximum_pending_records: 8,
-                    maximum_pending_bytes: 16384,
+                    // Eight request trees plus the two admitted response bodies.
+                    maximum_pending_bytes: 32768,
                     maximum_request_bytes: 2048,
-                    maximum_response_bytes: 8192,
+                    maximum_response_bytes: 16384,
                     ttl_seconds: 30,
                     settlement_required: false,
                 },

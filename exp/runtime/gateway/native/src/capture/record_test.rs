@@ -21,6 +21,9 @@ fn record<R>(response: R) -> Record<R> {
         provider_reasoning_source_json: None,
         provider_tool_calls_json: None,
         deployment_id: None,
+        metrics: None,
+        gemini_thought_parts: Vec::new(),
+        gemini_thought_parts_source_json: None,
         captured_at: 1.0,
     }
 }
