@@ -47,9 +47,8 @@ fn borrowed_payload_preserves_schema_content_sidecars_and_exact_limit() {
                     "gemini_thought_parts_source_json":null,
                 },"previous_response_id":"parent"
             },"response":response,
-            "provenance":{"source_kind":"traffic","source_id":"request","model_id":"model",
-                "model_revision":null,"deployment_id":"deployment","policy_revision":null,
-                "source_experience_ids":[]},"exact_tokens":null,
+            "provenance":{"source_id":"request","model_id":"model",
+                "deployment_id":"deployment"},
         })
     );
     assert_eq!(

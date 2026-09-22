@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-from exp.common.claas import CapturePolicy, ClaasScope
-from exp.runtime.claas.capture import CaptureBinding, CaptureConfiguration
+from exp_gateway_native import CaptureCollector
+
 from exp.runtime.gateway.contracts import AuthorizationSnapshot
+from exp.runtime.gateway.local_capture_config import CaptureBinding, CaptureConfiguration
+from exp.runtime.gateway.local_capture_contracts import CapturePolicy, LocalCaptureScope
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_capture import (
     CaptureConfiguration as CollectorConfiguration,
@@ -17,9 +18,6 @@ from exp.runtime.gateway.native_capture import (
     CaptureDeliveryLimits,
 )
 
-if TYPE_CHECKING:
-    from exp_gateway_native import CaptureCollector
-
 GATEWAY_CAPTURE_APPLICATION = "gateway"
 
 
@@ -27,8 +25,6 @@ def open_local_capture(configuration: CaptureConfiguration | None) -> CaptureCon
     """Bind local policy and SQLite to the common native collector, never a second tap."""
     if configuration is None:
         return None
-    from exp_gateway_native import CaptureCollector
-
     collector_configuration = CollectorConfiguration(
         settlement_required=False,
         delivery=CaptureDeliveryLimits(maximum_records=configuration.queue_capacity),
@@ -74,7 +70,7 @@ def local_capture_configuration(root: Path, *, ghost: bool = False) -> CaptureCo
         CaptureBinding(
             alias=grant.alias_name,
             policy=CapturePolicy(
-                scope=ClaasScope(
+                scope=LocalCaptureScope(
                     user_id=grant.identity_id,
                     application_id=GATEWAY_CAPTURE_APPLICATION,
                 ),

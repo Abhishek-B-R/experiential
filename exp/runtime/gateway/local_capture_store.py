@@ -1,33 +1,38 @@
-"""Read-only scoped consumption of the native durable experience database."""
+"""Read-only identity-scoped consumption of the native gateway capture database."""
 
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from exp.common.claas import ClaasScope, Experience
+from exp.runtime.gateway.local_capture_contracts import CapturedExchange, LocalCaptureScope
 
 
 @dataclass(frozen=True)
-class ExperienceRow:
-    """One durable experience and its monotonically increasing consumer cursor."""
+class CaptureRow:
+    """One durable gateway exchange and its monotonically increasing cursor.
+
+    Attributes:
+        sequence: Database-local cursor; retention can leave gaps.
+        experience: Validated exchange in the reader's identity/application scope.
+    """
 
     sequence: int
-    experience: Experience
+    experience: CapturedExchange
 
 
-class ExperienceStore:
+class LocalCaptureStore:
     """Read bounded pages without acquiring write authority over captured traffic.
 
     Cursors are local to one database. Retention may create gaps; consumers must
     checkpoint the last returned sequence rather than assume contiguous IDs.
     """
 
-    def __init__(self, database_path: Path, scope: ClaasScope) -> None:
+    def __init__(self, database_path: Path, scope: LocalCaptureScope) -> None:
         """Bind an existing local content database and an explicit application scope."""
         self._path = database_path.resolve()
         self._scope = scope
 
-    def read_after(self, sequence: int = 0, *, limit: int = 100) -> tuple[ExperienceRow, ...]:
+    def read_after(self, sequence: int = 0, *, limit: int = 100) -> tuple[CaptureRow, ...]:
         """Return at most one bounded page for the bound application.
 
         Args:
@@ -42,7 +47,7 @@ class ExperienceStore:
         connection = sqlite3.connect(f"{self._path.as_uri()}?mode=ro", uri=True, timeout=1.0)
         try:
             rows = connection.execute(
-                "SELECT sequence, payload FROM claas_experiences "
+                "SELECT sequence, payload FROM gateway_captures "
                 "WHERE user_id = ? AND application_id = ? AND sequence > ? "
                 "AND expires_at > unixepoch() ORDER BY sequence LIMIT ?",
                 (self._scope.user_id, self._scope.application_id, sequence, limit),
@@ -50,7 +55,7 @@ class ExperienceStore:
         finally:
             connection.close()
         result = tuple(
-            ExperienceRow(sequence=row[0], experience=Experience.model_validate_json(row[1]))
+            CaptureRow(sequence=row[0], experience=CapturedExchange.model_validate_json(row[1]))
             for row in rows
         )
         if any(row.experience.scope != self._scope for row in result):

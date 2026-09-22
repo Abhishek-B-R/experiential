@@ -31,7 +31,7 @@ fn pending(id: &str, policy: Policy) -> Pending {
 #[test]
 fn sqlite_retention_deduplication_and_scope_are_independent() {
     let path = std::env::temp_dir().join(format!(
-        "claas-test-{}-{}.db",
+        "capture-test-{}-{}.db",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -48,7 +48,7 @@ fn sqlite_retention_deduplication_and_scope_are_independent() {
     persist(&mut connection, pending("other", other)).unwrap();
     persist(&mut connection, pending("three", app.clone())).unwrap();
     let ids: Vec<String> = connection
-        .prepare("SELECT experience_id FROM claas_experiences ORDER BY sequence")
+        .prepare("SELECT experience_id FROM gateway_captures ORDER BY sequence")
         .unwrap()
         .query_map([], |row| row.get(0))
         .unwrap()
@@ -57,7 +57,7 @@ fn sqlite_retention_deduplication_and_scope_are_independent() {
     assert_eq!(ids, ["two", "other", "three"]);
     prune(&connection, &app, now() + 61).unwrap();
     let count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM claas_experiences", [], |row| {
+        .query_row("SELECT COUNT(*) FROM gateway_captures", [], |row| {
             row.get(0)
         })
         .unwrap();
@@ -70,7 +70,7 @@ fn sqlite_retention_deduplication_and_scope_are_independent() {
 fn disabled_capture_never_creates_a_database() {
     let mut disabled = policy();
     disabled.enabled = false;
-    let path = std::env::temp_dir().join(format!("claas-disabled-{}.db", std::process::id()));
+    let path = std::env::temp_dir().join(format!("capture-disabled-{}.db", std::process::id()));
     let config = CaptureConfiguration {
         database_path: path.to_string_lossy().into(),
         bindings: vec![Binding {
@@ -84,13 +84,38 @@ fn disabled_capture_never_creates_a_database() {
 }
 
 #[test]
+fn another_database_schema_is_rejected_without_modifying_evidence() {
+    let path = std::env::temp_dir().join(format!(
+        "capture-schema-{}-{}.db",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let existing = Connection::open(&path).unwrap();
+    existing
+        .execute_batch(
+            "CREATE TABLE other_records(payload TEXT NOT NULL);
+         INSERT INTO other_records VALUES ('preserve this evidence');",
+        )
+        .unwrap();
+    drop(existing);
+    let before = std::fs::read(&path).unwrap();
+    let error = open_database(&path).unwrap_err();
+    assert!(error.contains("use a fresh traffic database"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn conflicting_alias_policies_are_rejected_before_any_pruning() {
     let first = policy();
     let mut second = first.clone();
     second.retention_seconds = 1;
     let config = CaptureConfiguration {
         database_path: std::env::temp_dir()
-            .join("claas-conflict.db")
+            .join("capture-conflict.db")
             .to_string_lossy()
             .into(),
         bindings: vec![
@@ -126,9 +151,7 @@ fn expired_content_is_removed_from_database_and_wal_after_readers_release() {
     let reader = Connection::open(&path).unwrap();
     reader.execute_batch("BEGIN").unwrap();
     let _: String = reader
-        .query_row("SELECT payload FROM claas_experiences", [], |row| {
-            row.get(0)
-        })
+        .query_row("SELECT payload FROM gateway_captures", [], |row| row.get(0))
         .unwrap();
     assert!(prune(&writer, &policy(), now() + 61).is_err());
     // The reader still holds the original pages. A new committed capture must
@@ -140,7 +163,7 @@ fn expired_content_is_removed_from_database_and_wal_after_readers_release() {
     assert!(outcome.maintenance_failed);
     let count: i64 = writer
         .query_row(
-            "SELECT COUNT(*) FROM claas_experiences WHERE response_id='fresh-two'",
+            "SELECT COUNT(*) FROM gateway_captures WHERE response_id='fresh-two'",
             [],
             |row| row.get(0),
         )

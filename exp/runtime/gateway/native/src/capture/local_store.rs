@@ -19,7 +19,7 @@ pub(super) struct Persisted {
 }
 
 fn safe_error(_: rusqlite::Error) -> String {
-    "CLaaS capture database operation failed".into()
+    "local gateway capture database operation failed".into()
 }
 
 pub(super) fn now() -> u64 {
@@ -30,7 +30,7 @@ pub(super) fn now() -> u64 {
 }
 
 pub(super) fn validate(config: &CaptureConfiguration) -> Result<(), String> {
-    let invalid = || "invalid bounded CLaaS capture configuration".to_string();
+    let invalid = || "invalid bounded local gateway capture configuration".to_string();
     if !Path::new(&config.database_path).is_absolute()
         || !(1..=4096).contains(&config.queue_capacity)
     {
@@ -81,24 +81,38 @@ pub(super) fn open_database(path: &Path) -> Result<Connection, String> {
     match options.open(path) {
         Ok(file) => drop(file),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(_) => return Err("cannot create CLaaS capture database".into()),
+        Err(_) => return Err("cannot create local gateway capture database".into()),
     }
     let connection = Connection::open(path).map_err(safe_error)?;
+    let foreign_tables: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table'
+             AND name NOT LIKE 'sqlite_%' AND name != 'gateway_captures')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(safe_error)?;
+    if foreign_tables {
+        return Err(
+            "unsupported local capture database schema; preserve this file and use a fresh traffic database"
+                .into(),
+        );
+    }
     connection
         .busy_timeout(Duration::from_millis(100))
         .map_err(safe_error)?;
     connection
         .execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;
-         CREATE TABLE IF NOT EXISTS claas_experiences (
+         CREATE TABLE IF NOT EXISTS gateway_captures (
            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
            experience_id TEXT NOT NULL UNIQUE,
            user_id TEXT NOT NULL, application_id TEXT NOT NULL,
            response_id TEXT NOT NULL, captured_at INTEGER NOT NULL,
            expires_at INTEGER NOT NULL, payload_bytes INTEGER NOT NULL, payload TEXT NOT NULL,
            UNIQUE(user_id, application_id, response_id));
-         CREATE INDEX IF NOT EXISTS claas_scope_sequence
-           ON claas_experiences(user_id, application_id, sequence);",
+         CREATE INDEX IF NOT EXISTS gateway_capture_scope_sequence
+           ON gateway_captures(user_id, application_id, sequence);",
         )
         .map_err(safe_error)?;
     Ok(connection)
@@ -107,7 +121,7 @@ pub(super) fn open_database(path: &Path) -> Result<Connection, String> {
 pub(super) fn persist(connection: &mut Connection, item: Pending) -> rusqlite::Result<Persisted> {
     let transaction = connection.transaction()?;
     transaction.execute(
-        "INSERT INTO claas_experiences
+        "INSERT INTO gateway_captures
          (experience_id,user_id,application_id,response_id,captured_at,expires_at,payload_bytes,payload)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT DO NOTHING",
         params![item.experience_id, item.policy.scope.user_id, item.policy.scope.application_id,
@@ -146,7 +160,7 @@ fn truncate_wal(connection: &Connection) -> rusqlite::Result<()> {
 
 fn prune_rows(connection: &Connection, policy: &Policy, timestamp: u64) -> rusqlite::Result<usize> {
     let expired = connection.execute(
-        "DELETE FROM claas_experiences WHERE user_id=?1 AND application_id=?2 AND expires_at<=?3",
+        "DELETE FROM gateway_captures WHERE user_id=?1 AND application_id=?2 AND expires_at<=?3",
         params![
             policy.scope.user_id,
             policy.scope.application_id,
@@ -154,11 +168,11 @@ fn prune_rows(connection: &Connection, policy: &Policy, timestamp: u64) -> rusql
         ],
     )?;
     let evicted = connection.execute(
-        "DELETE FROM claas_experiences WHERE sequence IN (
+        "DELETE FROM gateway_captures WHERE sequence IN (
            SELECT sequence FROM (
              SELECT sequence, ROW_NUMBER() OVER (ORDER BY sequence DESC) AS rank,
                SUM(payload_bytes) OVER (ORDER BY sequence DESC) AS bytes
-             FROM claas_experiences WHERE user_id=?1 AND application_id=?2
+             FROM gateway_captures WHERE user_id=?1 AND application_id=?2
            ) WHERE rank>?3 OR bytes>?4)",
         params![
             policy.scope.user_id,

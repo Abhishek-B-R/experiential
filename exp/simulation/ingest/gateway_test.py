@@ -7,15 +7,19 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.claas import ClaasScope, Experience, ExperienceProvenance
 from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.capture_context import capture_request_context
+from exp.runtime.gateway.local_capture_contracts import (
+    CapturedExchange,
+    CaptureProvenance,
+    LocalCaptureScope,
+)
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
 from exp.simulation.ingest.gateway import load_gateway_capture
 from exp.simulation.ingest.sources import TraceSourceError, load_trace_source
 
 
-def _experience(identity: str = "developer") -> Experience:
+def _experience(identity: str = "developer") -> CapturedExchange:
     """Build one tool-using exchange with explicit matching call/result IDs."""
     request = decode_chat(
         {
@@ -46,10 +50,10 @@ def _experience(identity: str = "developer") -> Experience:
             ],
         }
     ).request
-    return Experience(
+    return CapturedExchange(
         experience_id=f"experience-{identity}",
         response_id=f"response-{identity}",
-        scope=ClaasScope(user_id=identity, application_id="gateway"),
+        scope=LocalCaptureScope(user_id=identity, application_id="gateway"),
         protocol="chat_completions",
         captured_at=datetime.now(UTC),
         request={"exp_context": capture_request_context(request)},
@@ -61,22 +65,20 @@ def _experience(identity: str = "developer") -> Experience:
                 }
             ]
         },
-        provenance=ExperienceProvenance(
-            source_kind="traffic", source_id="request", model_id="worker"
-        ),
+        provenance=CaptureProvenance(source_id="request", model_id="worker"),
     )
 
 
-def _database(path: Path, experiences: tuple[Experience, ...]) -> None:
+def _database(path: Path, experiences: tuple[CapturedExchange, ...]) -> None:
     """Persist exact native-compatible rows, then close before independent ingestion."""
     with sqlite3.connect(path) as connection:
         connection.execute(
-            "CREATE TABLE claas_experiences (sequence INTEGER PRIMARY KEY, user_id TEXT, "
+            "CREATE TABLE gateway_captures (sequence INTEGER PRIMARY KEY, user_id TEXT, "
             "application_id TEXT, expires_at INTEGER, payload TEXT)"
         )
         for index, experience in enumerate(experiences, start=1):
             connection.execute(
-                "INSERT INTO claas_experiences VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO gateway_captures VALUES (?, ?, ?, ?, ?)",
                 (
                     index,
                     experience.scope.user_id,

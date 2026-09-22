@@ -31,6 +31,14 @@ continues through the existing mining, world-model, evaluation and router
 surfaces with their normal cost estimates and consent. Ingestion itself performs
 no provider calls.
 
+Capture configuration, record contracts and the read-only store live under
+`exp/runtime/gateway/`; trace normalization remains in `exp/simulation/ingest/`.
+The local store contains observed exchanges only, with no training-token contracts,
+adapter registry, model activation, or rollback machinery. This unreleased capture
+format has no migration from earlier development databases. Preserve those files
+separately and collect fresh traffic; startup rejects other database schemas rather
+than silently hiding their records or modifying their contents.
+
 ## Privacy and retention
 
 `exp run --ghost` disables content collection while retaining content-free

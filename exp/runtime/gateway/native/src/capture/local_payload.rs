@@ -31,13 +31,9 @@ struct Request<'a> {
 
 #[derive(Serialize)]
 struct Provenance<'a> {
-    source_kind: &'static str,
     source_id: &'a str,
     model_id: &'a Option<String>,
-    model_revision: Option<&'a str>,
     deployment_id: &'a Option<String>,
-    policy_revision: Option<&'a str>,
-    source_experience_ids: &'a [&'a str],
 }
 
 #[derive(Serialize)]
@@ -53,7 +49,6 @@ struct Experience<'a> {
     request: Request<'a>,
     response: &'a Value,
     provenance: Provenance<'a>,
-    exact_tokens: Option<u64>,
 }
 
 pub(super) fn encode(
@@ -97,15 +92,10 @@ pub(super) fn encode(
         },
         response,
         provenance: Provenance {
-            source_kind: "traffic",
             source_id: &record.request.request_id,
             model_id: &record.request.model_id,
-            model_revision: None,
             deployment_id: &record.deployment_id,
-            policy_revision: None,
-            source_experience_ids: &[],
         },
-        exact_tokens: None,
     };
     super::budget::encode(&experience, maximum)
 }

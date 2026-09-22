@@ -7,13 +7,13 @@ from pathlib import Path
 
 from pydantic import JsonValue
 
-from exp.common.claas import ClaasScope, Experience
 from exp.common.core.artifacts import JsonObject, SourceIdentity, sha256_json
 from exp.runtime.anthropic_protocol.requests import decode_messages
-from exp.runtime.claas.store import ExperienceStore
 from exp.runtime.gateway.capture_context import restore_capture_context
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.local_capture import GATEWAY_CAPTURE_APPLICATION
+from exp.runtime.gateway.local_capture_contracts import CapturedExchange, LocalCaptureScope
+from exp.runtime.gateway.local_capture_store import LocalCaptureStore
 from exp.runtime.gateway.native_capture import CaptureMetrics
 from exp.runtime.gateway.replay_identity import provider_replay_authority
 from exp.runtime.openai_protocol.requests import decode_responses
@@ -31,8 +31,8 @@ def load_gateway_capture(
     Explicit response links remain provenance; unrelated chats are never joined by
     matching their text. Missing context is an exclusion, not fabricated evidence.
     """
-    scope = ClaasScope(user_id=identity_id, application_id=GATEWAY_CAPTURE_APPLICATION)
-    rows = ExperienceStore(path, scope).read_after(limit=limit)
+    scope = LocalCaptureScope(user_id=identity_id, application_id=GATEWAY_CAPTURE_APPLICATION)
+    rows = LocalCaptureStore(path, scope).read_after(limit=limit)
     by_response_id = {row.experience.response_id: row.experience for row in rows}
     documents: list[JsonValue] = []
     issues: list[TraceNormalizationIssue] = []
@@ -59,7 +59,9 @@ def load_gateway_capture(
     return apply_gateway_metrics(normalized)
 
 
-def _conversation(experience: Experience, by_response_id: dict[str, Experience]) -> JsonObject:
+def _conversation(
+    experience: CapturedExchange, by_response_id: dict[str, CapturedExchange]
+) -> JsonObject:
     """Retain the full source exchange and expose observed messages and tool schemas."""
     output = experience.request.get("exp_capture_output")
     if isinstance(output, dict) and output.get("metrics") is not None:
@@ -131,7 +133,9 @@ def _conversation(experience: Experience, by_response_id: dict[str, Experience])
 
 
 def _restore_linked_reasoning(
-    messages: list[JsonObject], experience: Experience, by_response_id: dict[str, Experience]
+    messages: list[JsonObject],
+    experience: CapturedExchange,
+    by_response_id: dict[str, CapturedExchange],
 ) -> tuple[list[JsonValue], str | None]:
     """Recover observed reasoning only through explicit, identity-scoped response links.
 
@@ -168,7 +172,7 @@ def _restore_linked_reasoning(
     return lineage, None
 
 
-def _linked_output_turns(experience: Experience) -> list[JsonObject]:
+def _linked_output_turns(experience: CapturedExchange) -> list[JsonObject]:
     """Match public output items to the gateway's retained assistant segments.
 
     A retained segment combines one text item with adjacent function calls.
@@ -236,7 +240,7 @@ def _visible_turn(message: JsonObject) -> JsonObject:
     }
 
 
-def _output_messages(experience: Experience) -> list[JsonObject]:
+def _output_messages(experience: CapturedExchange) -> list[JsonObject]:
     """Normalize public completed output, without asserting agent task success."""
     if experience.protocol == "responses":
         output = experience.response.get("output")
@@ -305,7 +309,7 @@ def _restore_output_tools(messages: list[JsonObject], output: JsonObject) -> Non
                     function["arguments"] = captured["raw_arguments"]
 
 
-def _chat_output(experience: Experience) -> list[JsonObject]:
+def _chat_output(experience: CapturedExchange) -> list[JsonObject]:
     """Read exactly one complete public Chat assistant turn."""
     choices = experience.response.get("choices")
     if not isinstance(choices, list) or len(choices) != 1:

@@ -1,4 +1,4 @@
-"""Checks for explicit native capture configuration."""
+"""Checks for explicit native local capture configuration and real delivery."""
 
 import threading
 from http.server import ThreadingHTTPServer
@@ -8,11 +8,11 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from exp.common.claas import CapturePolicy, ClaasScope
-from exp.runtime.claas.capture import CaptureBinding, CaptureConfiguration
-from exp.runtime.claas.store import ExperienceStore
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.local_capture import open_local_capture
+from exp.runtime.gateway.local_capture_config import CaptureBinding, CaptureConfiguration
+from exp.runtime.gateway.local_capture_contracts import CapturePolicy, LocalCaptureScope
+from exp.runtime.gateway.local_capture_store import LocalCaptureStore
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.native_server import serve_native_gateway
 from exp.runtime.gateway.tests.launch_test import (
@@ -29,7 +29,7 @@ def test_capture_bindings_cannot_ambiguously_assign_an_application(tmp_path: Pat
     """A single request cannot acquire two different application authorities."""
     binding = CaptureBinding(
         alias="model",
-        policy=CapturePolicy(scope=ClaasScope(user_id="user", application_id="app")),
+        policy=CapturePolicy(scope=LocalCaptureScope(user_id="user", application_id="app")),
     )
     with pytest.raises(ValidationError):
         CaptureConfiguration(database_path=tmp_path / "experience.db", bindings=(binding, binding))
@@ -49,7 +49,7 @@ def test_real_native_gateway_capture_is_opt_in_and_ghost_stays_content_free(
     )
     components = load_gateway_components(tmp_path)
     _organization, user_id = components.store.authenticated_identity(raw_key=raw_key)
-    scope = ClaasScope(user_id=user_id, application_id="claims-agent")
+    scope = LocalCaptureScope(user_id=user_id, application_id="claims-agent")
     database = tmp_path / "experiences.sqlite3"
     capture = CaptureConfiguration(
         database_path=database,
@@ -104,17 +104,17 @@ def test_real_native_gateway_capture_is_opt_in_and_ghost_stays_content_free(
     assert not failures
     assert not gateway_thread.is_alive()
     if enabled and not ghost:
-        experiences = ExperienceStore(database, scope).read_after()
+        experiences = LocalCaptureStore(database, scope).read_after()
         assert len(experiences) == 4
         assert {row.experience.protocol for row in experiences} == {"chat_completions", "responses"}
-        assert all(row.experience.exact_tokens is None for row in experiences)
+        assert all("exact_tokens" not in row.experience.model_dump() for row in experiences)
         assert all(row.experience.scope == scope for row in experiences)
         serialized = "".join(row.experience.model_dump_json() for row in experiences)
         assert raw_key not in serialized
         assert "provider-secret" not in serialized
         assert (
-            ExperienceStore(
-                database, ClaasScope(user_id=user_id, application_id="other")
+            LocalCaptureStore(
+                database, LocalCaptureScope(user_id=user_id, application_id="other")
             ).read_after()
             == ()
         )
@@ -124,7 +124,7 @@ def test_real_native_gateway_capture_is_opt_in_and_ghost_stays_content_free(
 
 def test_aliases_sharing_application_cannot_conflict_on_retention(tmp_path: Path) -> None:
     """A second alias cannot silently shorten another alias's retained evidence."""
-    scope = ClaasScope(user_id="user", application_id="app")
+    scope = LocalCaptureScope(user_id="user", application_id="app")
     policy = CapturePolicy(scope=scope, enabled=True)
     with pytest.raises(ValueError, match="share one capture policy"):
         CaptureConfiguration(

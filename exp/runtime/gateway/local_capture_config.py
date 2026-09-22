@@ -6,13 +6,17 @@ from pathlib import Path
 
 from pydantic import Field, model_validator
 
-from exp.common.claas import CapturePolicy
-from exp.common.claas.contracts import Identifier
 from exp.common.core.artifacts import ContractModel
+from exp.runtime.gateway.local_capture_contracts import CapturePolicy, Identifier
 
 
 class CaptureBinding(ContractModel):
-    """Bind one authenticated user and gateway alias to one agent application."""
+    """Bind one authenticated identity and gateway alias to a capture application.
+
+    Attributes:
+        alias: Exact granted gateway alias, never a path component.
+        policy: Identity/application capture consent and retention bounds.
+    """
 
     alias: Identifier
     policy: CapturePolicy
@@ -23,6 +27,11 @@ class CaptureConfiguration(ContractModel):
 
     The operator supplies a path explicitly. Scope identifiers never become path
     components. Each user/alias pair has at most one application binding.
+
+    Attributes:
+        database_path: Absolute path to the separate traffic content database.
+        bindings: Explicit identity/alias policies, with no ambiguous bindings.
+        queue_capacity: Maximum queued records, from 1 to 4096; defaults to 256.
     """
 
     database_path: Path
