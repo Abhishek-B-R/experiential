@@ -446,7 +446,7 @@ class RecordingCandidateClient:
             )
             for action in candidate_rag_actions(candidate_response.output)
         )
-        query_bytes = sum(
+        query_bytes = max(
             len(
                 render_rag_key(
                     task=query.task, initial_context=query.initial_context, action=query.action
@@ -458,7 +458,7 @@ class RecordingCandidateClient:
             raise _text_failure(
                 StopReason.MAXIMUM_COST,
                 FailureCode.BUDGET,
-                "tool grounding batch exceeds its reserved input-token ceiling",
+                "grounding query exceeds its reserved input-token ceiling",
                 phase="query_embedding_budget",
             )
         query_economics = combine_economics(
