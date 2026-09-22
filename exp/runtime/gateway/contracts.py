@@ -425,9 +425,7 @@ class GatewayMessage(ContractModel):
             if (self.content or "") not in ("".join(texts), "\n\n".join(texts)):
                 raise ValueError("provider text blocks must flatten to the message content")
         if self.content_parts:
-            # Tool messages carry attachments too: Anthropic tool_result blocks
-            # accept image sub-blocks (tool screenshots), and the block is baked
-            # into caller history, so the canonical model must be able to hold it.
+            # Retain tool screenshots and generated assistant images as caller-owned history.
             if self.role not in ("user", "tool", "assistant"):
                 raise ValueError(
                     "content parts are valid only for user, tool, and assistant messages"
