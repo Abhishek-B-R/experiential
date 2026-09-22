@@ -88,7 +88,7 @@ fn routing_provenance_is_optional_until_selected_and_then_immutable() {
 fn collector_forwards_destination_cleanup_failure_without_losing_write_success() {
     struct CleanupFailure;
     impl Sink for CleanupFailure {
-        fn write(&mut self, _: &str) -> Result<(), ()> {
+        fn write(&mut self, _: &Record, _: usize) -> Result<(), ()> {
             Ok(())
         }
         fn take_maintenance_failures(&mut self) -> u64 {

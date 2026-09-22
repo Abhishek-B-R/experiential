@@ -129,7 +129,7 @@ fn failed_destination_releases_budget_and_records_no_sensitive_error() {
 fn committed_write_and_cleanup_failures_have_separate_counters() {
     struct CleanupFailure;
     impl Sink for CleanupFailure {
-        fn write(&mut self, _: &str) -> Result<(), ()> {
+        fn write(&mut self, _: &Record, _: usize) -> Result<(), ()> {
             Ok(())
         }
         fn take_maintenance_failures(&mut self) -> u64 {
@@ -140,7 +140,7 @@ fn committed_write_and_cleanup_failures_have_separate_counters() {
         }
     }
     let delivery = Delivery::new(limits(), CleanupFailure).unwrap();
-    assert!(delivery.submit("saved".into()));
+    assert!(delivery.submit(record("saved")));
     let until = Instant::now() + Duration::from_secs(5);
     while delivery.maintenance_failures() < 2 && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(5));

@@ -4,6 +4,7 @@ pub(crate) mod budget;
 pub(crate) mod collector;
 pub(crate) mod delivery;
 mod local;
+mod local_payload;
 mod local_store;
 mod messages;
 mod projection;

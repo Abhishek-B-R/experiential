@@ -71,8 +71,7 @@ impl SqliteSink {
 }
 
 impl Sink for SqliteSink {
-    fn write(&mut self, encoded: &str) -> Result<(), ()> {
-        let record: Record = serde_json::from_str(encoded).map_err(|_| ())?;
+    fn write(&mut self, record: &Record, maximum_bytes: usize) -> Result<(), ()> {
         let scope = &record.request.scope;
         let policy = self
             .policies
@@ -82,7 +81,7 @@ impl Sink for SqliteSink {
                     && policy.scope.application_id == scope.application_id
             })
             .ok_or(())?;
-        let Some(response) = projection::completed_response(&record) else {
+        let Some(response) = projection::completed_response(record) else {
             return Ok(());
         };
         let response_id = response
@@ -102,33 +101,13 @@ impl Sink for SqliteSink {
                 .map_err(|_| ())?
             )
         );
-        let request = json!({
-            "exp_context": record.request.context,
-            "exp_capture_output": {
-                "response": record.response,
-                "provider_reasoning": record.provider_reasoning,
-                "provider_reasoning_source_json": record.provider_reasoning_source_json,
-                "provider_tool_calls_json": record.provider_tool_calls_json,
-            },
-            "previous_response_id": record.request.context["request"]["previous_response_id"]
-        });
-        let experience = json!({
-            "schema_version": 1, "experience_id": experience_id, "response_id": response_id,
-            "episode_id": record.request.context["request"]["metadata"]["conversation_id"]
-                .as_str().filter(|value| !value.trim().is_empty() && value.len() <= 512),
-            "parent_response_id": request["previous_response_id"],
-            "scope": {"user_id": scope.identity_id, "application_id": scope.application_id},
-            "protocol": protocol, "captured_at": record.captured_at, "request": request,
-            "response": response,
-            "provenance": {"source_kind": "traffic", "source_id": record.request.request_id,
-                "model_id": record.request.model_id, "model_revision": null,
-                "deployment_id": record.deployment_id, "policy_revision": null,
-                "source_experience_ids": []}, "exact_tokens": null
-        });
-        let payload = serde_json::to_string(&experience).map_err(|_| ())?;
-        if payload.len() > policy.maximum_experience_bytes {
-            return Err(());
-        }
+        let payload = super::local_payload::encode(
+            record,
+            &response,
+            &experience_id,
+            maximum_bytes.min(policy.maximum_experience_bytes),
+        )
+        .ok_or(())?;
         let persisted = local_store::persist(
             &mut self.connection,
             local_store::Pending {

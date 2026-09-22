@@ -1,9 +1,10 @@
 //! Completed public protocol projection for the local evidence destination.
 use super::record::{Protocol, Record, Response};
 use serde_json::{json, Map, Value};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
-pub(super) fn completed_response(record: &Record) -> Option<Value> {
+pub(super) fn completed_response(record: &Record) -> Option<Cow<'_, Value>> {
     let protocol = &record.request.protocol;
     match record.response.as_ref()? {
         Response::Json {
@@ -11,10 +12,11 @@ pub(super) fn completed_response(record: &Record) -> Option<Value> {
             body,
             source_json,
         } => {
-            let restored = source_json
+            let body = source_json
                 .as_ref()
-                .and_then(|source| serde_json::from_str::<Value>(source).ok());
-            let body = restored.as_ref().unwrap_or(body);
+                .and_then(|source| serde_json::from_str::<Value>(source).ok())
+                .map(Cow::Owned)
+                .unwrap_or(Cow::Borrowed(body));
             if body.get("error").is_some_and(|value| !value.is_null()) {
                 return None;
             }
@@ -38,7 +40,7 @@ pub(super) fn completed_response(record: &Record) -> Option<Value> {
             ) {
                 return None;
             }
-            Some(body.clone())
+            Some(body)
         }
         Response::Sse {
             status: 200..=299,
@@ -47,10 +49,11 @@ pub(super) fn completed_response(record: &Record) -> Option<Value> {
             client_disconnected: false,
             source_json,
         } => {
-            let restored = source_json
+            let frames = source_json
                 .as_ref()
-                .and_then(|source| serde_json::from_str::<Vec<Value>>(source).ok());
-            let frames = restored.as_ref().unwrap_or(frames);
+                .and_then(|source| serde_json::from_str::<Vec<Value>>(source).ok())
+                .map(Cow::Owned)
+                .unwrap_or(Cow::Borrowed(frames.as_slice()));
             if frames.iter().any(|value| {
                 value.get("error").is_some_and(|value| !value.is_null())
                     || matches!(
@@ -61,36 +64,42 @@ pub(super) fn completed_response(record: &Record) -> Option<Value> {
                 return None;
             }
             if matches!(protocol, Protocol::Responses) {
-                frames
-                    .iter()
-                    .rev()
-                    .find(|value| {
-                        matches!(
-                            value.get("type").and_then(Value::as_str),
-                            Some("response.completed" | "response.incomplete")
-                        )
-                    })?
-                    .get("response")
-                    .filter(|value| value.is_object())
-                    .cloned()
+                match frames {
+                    Cow::Borrowed(frames) => terminal_response(frames).map(Cow::Borrowed),
+                    Cow::Owned(frames) => terminal_response(&frames).cloned().map(Cow::Owned),
+                }
             } else if matches!(protocol, Protocol::Messages) {
-                super::messages::assemble(frames)
+                super::messages::assemble(&frames).map(Cow::Owned)
             } else {
                 if frames.last().and_then(Value::as_str) != Some("[DONE]") {
                     return None;
                 }
-                assemble_chat(frames[..frames.len() - 1].to_vec())
+                assemble_chat(&frames[..frames.len() - 1]).map(Cow::Owned)
             }
         }
         _ => None,
     }
 }
-fn assemble_chat(chunks: Vec<Value>) -> Option<Value> {
+
+fn terminal_response(frames: &[Value]) -> Option<&Value> {
+    frames
+        .iter()
+        .rev()
+        .find(|value| {
+            matches!(
+                value.get("type").and_then(Value::as_str),
+                Some("response.completed" | "response.incomplete")
+            )
+        })?
+        .get("response")
+        .filter(|value| value.is_object())
+}
+fn assemble_chat(chunks: &[Value]) -> Option<Value> {
     let first = chunks.first()?;
     let mut result = json!({"id": first.get("id")?, "object": "chat.completion",
         "model": first.get("model")?, "created": first.get("created").unwrap_or(&Value::Null)});
     let mut choices: BTreeMap<u64, Value> = BTreeMap::new();
-    for chunk in &chunks {
+    for chunk in chunks {
         if let Some(usage) = chunk.get("usage").filter(|value| !value.is_null()) {
             result["usage"] = usage.clone();
         }
@@ -228,8 +237,8 @@ mod tests {
         let last = json!({"id":"completion","model":"model","choices":[{"index":0,
             "delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]},
             "finish_reason":"tool_calls"}]});
-        assert!(assemble_chat(vec![first.clone()]).is_none());
-        let result = assemble_chat(vec![first, last]).unwrap();
+        assert!(assemble_chat(std::slice::from_ref(&first)).is_none());
+        let result = assemble_chat(&[first, last]).unwrap();
         assert_eq!(
             result["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
             "{}"
