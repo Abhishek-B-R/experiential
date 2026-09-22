@@ -23,6 +23,7 @@ from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayApiSurfa
 from exp.runtime.gateway.native_admission import shape_parallel_tool_calls
 from exp.runtime.gateway.native_dispatch import frozen_dispatch
 from exp.runtime.gateway.native_execution import FrozenDispatchBinding, deployment_wire_entry
+from exp.runtime.gateway.native_image_output import image_aware_stream_payload
 from exp.runtime.gateway.reasoning_carrier import (
     ReasoningCarrierAuthority,
     reasoning_carrier_authority,
@@ -46,7 +47,6 @@ from exp.runtime.models.providers.openrouter_routing import (
     openrouter_metadata_headers,
 )
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
-from exp.runtime.models.providers.streaming_requests import dialect_stream_payload
 from exp.runtime.models.providers.wire_messages import anthropic_request_headers
 
 ZDR_CONSTRAINT_CAPABILITY = "zero_data_retention_constraint"
@@ -117,7 +117,9 @@ def build_rung_dispatch(
     if rung_request.surface == GatewayApiSurface.CHAT_COMPLETIONS:
         require_chat_logprobs((profile,), rung_request)
     require_responses_logprobs((profile,), rung_request)
-    upstream_payload = dialect_stream_payload(profile, rung_request)
+    upstream_payload = image_aware_stream_payload(
+        profile, rung_request, capabilities, deployment.provider
+    )
     if rung_request.provider_preferences is not None and _openrouter_wire(deployment, profile):
         # The caller's routing preferences reach the one wire that defines
         # them; every other dialect's builder never emits the field.

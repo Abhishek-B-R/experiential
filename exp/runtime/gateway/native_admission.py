@@ -34,6 +34,7 @@ from exp.runtime.gateway.native_execution import (
     select_route_deployments,
 )
 from exp.runtime.gateway.native_fallback_rules import require_unrestricted_rung
+from exp.runtime.gateway.native_image_output import image_aware_stream_payload
 from exp.runtime.gateway.native_reasoning import rung_provider_request
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.prompt_cache_affinity import provider_prompt_cache_key
@@ -63,7 +64,6 @@ from exp.runtime.models.providers.generation_route_compat import (
 )
 from exp.runtime.models.providers.protocol import NativeWireClient
 from exp.runtime.models.providers.streaming_requests import (
-    dialect_stream_payload,
     route_generation_parameter_requests,
 )
 from exp.runtime.openai_protocol.state import ProtocolNamespace, episode_namespace
@@ -648,7 +648,7 @@ def protocol_compatible_indexes(
                     profile.dialect, emulate_parallel_tool_calls=emulate_parallel_tool_calls
                 ),
             )
-            dialect_stream_payload(profile, rung_request)
+            image_aware_stream_payload(profile, rung_request, capabilities, deployment.provider)
         except (ProviderParameterError, ProviderCapabilityError) as exc:
             errors.append(exc)
             continue
