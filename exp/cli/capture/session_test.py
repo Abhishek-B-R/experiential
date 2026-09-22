@@ -1,6 +1,7 @@
 """Foreground failures and cancellation release interception before uploads."""
 
 import asyncio
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
@@ -211,8 +212,10 @@ def test_waiting_notice_respects_startup_completion(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("exhaust_deadline", [False, True])
 def test_waiting_notice_does_not_extend_startup_deadline(
     monkeypatch: pytest.MonkeyPatch,
+    exhaust_deadline: bool,
 ) -> None:
     """The second wait consumes only the original approval window's remaining time."""
     monkeypatch.setattr(session, "_WAITING_NOTICE_DELAY", 0.02)
@@ -236,6 +239,12 @@ def test_waiting_notice_does_not_extend_startup_deadline(
 
     monkeypatch.setattr(session.asyncio, "wait", wait)
 
+    def on_waiting() -> None:
+        """Exercise both a prompt notice and a notice that exhausts the startup budget."""
+        notices.append("waiting")
+        if exhaust_deadline:
+            time.sleep(session._STARTUP_TIMEOUT)
+
     async def run() -> None:
         """Leave startup pending through the notice and the finite approval deadline."""
         task = asyncio.create_task(asyncio.sleep(1.0))
@@ -245,11 +254,13 @@ def test_waiting_notice_does_not_extend_startup_deadline(
                     task,
                     asyncio.Event(),
                     asyncio.Event(),
-                    on_waiting=lambda: notices.append("waiting"),
+                    on_waiting=on_waiting,
                 )
             assert notices == ["waiting"]
             assert len(timeouts) == 2
-            assert 0 < timeouts[1] <= timeouts[0] - session._WAITING_NOTICE_DELAY
+            assert 0 <= timeouts[1] <= max(0, timeouts[0] - session._WAITING_NOTICE_DELAY)
+            if exhaust_deadline:
+                assert timeouts[1] == 0
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
