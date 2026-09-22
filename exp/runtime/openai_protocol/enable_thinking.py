@@ -5,11 +5,11 @@ Clients express "turn thinking on" several non-canonical ways on
 OpenRouter's unified ``reasoning:{enabled, max_tokens, exclude}``, the
 Anthropic-style ``thinking:{type}`` (``enabled`` or ``adaptive``), the vLLM-native
 ``chat_template_kwargs:{enable_thinking}``, and DashScope's top-level
-``enable_thinking``. Each is admitted and translated here to the canonical flat
-``reasoning_effort`` (never dropped — dropping would leave thinking silently
-off), so one caller payload works in any shape. The model-aware default effort
-for a level-less enable is resolved later, at the route adaptation seam, via
-``GatewayRequest.thinking_default_enable``.
+``enable_thinking``. Bare enable controls translate to canonical
+``reasoning_effort``; the route resolves level-less enables through
+``GatewayRequest.thinking_default_enable``. Explicit nested Anthropic budgets
+remain exact thinking configurations for model-aware admission, while
+OpenRouter numeric budgets receive a named compatibility refusal.
 """
 
 from __future__ import annotations
