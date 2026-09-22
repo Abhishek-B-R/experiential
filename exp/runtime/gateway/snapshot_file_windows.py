@@ -266,8 +266,9 @@ def windows_snapshot_anchor(stream: BinaryIO) -> int:
     """Keep file identity without retaining the operation's deny-write sharing policy.
 
     CreateFileW permits metadata access with desired access zero. All three share
-    flags preserve the publisher's same-directory atomic replace operation. The
-    live strict operation handle protects the path while this identity is checked.
+    flags permit the publisher's FileRenameInfoEx POSIX replacement, whereas an
+    ordinary MoveFileEx replacement can still refuse this open destination.
+    The live strict operation handle protects the path while identity is checked.
     """
     if os.name != "nt":
         raise RuntimeError("Windows snapshot anchors require Windows")

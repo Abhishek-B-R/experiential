@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import subprocess
 import sys
@@ -9,9 +10,15 @@ from pathlib import Path
 
 import pytest
 
+from exp.common.core import files as atomic_files
 from exp.common.core.files import write_bytes_atomic
 from exp.runtime.gateway import snapshot_file
 from exp.runtime.gateway.model_chain_authority import SnapshotClassificationMemo
+from exp.runtime.gateway.snapshot_file_windows import _WindowsFiles
+
+if sys.platform == "win32":
+    import msvcrt
+
 from exp.runtime.gateway.snapshot_file import (
     prepare_snapshot_file,
     read_snapshot_bytes,
@@ -54,6 +61,121 @@ def test_windows_memo_anchor_allows_publication_and_detects_change_time(
             assert not memo.matches(key, (first, second))
     finally:
         memo.close()
+
+
+def test_windows_atomic_publisher_preserves_strict_reader_exclusion(tmp_path: Path) -> None:
+    """Both normal and POSIX replacement refuse while a strict operation denies delete sharing."""
+    path = tmp_path / "snapshot.json"
+    path.write_bytes(b"old")
+    staging = tmp_path / "manual.partial"
+    staging.write_bytes(b"new")
+    with snapshot_stream(tmp_path, path.name) as stream:
+        with pytest.raises(OSError):
+            write_bytes_atomic(path, b"new")
+        assert stream.read() == b"old"
+        assert not list(tmp_path.glob(".snapshot.json.*.partial"))
+        with pytest.raises(OSError):
+            atomic_files._windows_replace_open_target(staging, path)
+        assert path.read_bytes() == b"old" and staging.read_bytes() == b"new"
+    staging.unlink()
+    write_bytes_atomic(path, b"new")
+    assert path.read_bytes() == b"new"
+
+
+@pytest.mark.parametrize("payload", [b"", b"new bytes"])
+@pytest.mark.parametrize("long_path", [False, True])
+def test_windows_posix_atomic_replace_preserves_open_old_inode_and_unicode_path(
+    tmp_path: Path, payload: bytes, long_path: bool
+) -> None:
+    """A permissive read handle retains old bytes while later opens see the complete new payload."""
+    assert os.name == "nt"
+    directory = tmp_path / "nested-日\U0001f30d"
+    if long_path:
+        directory = directory / ("nested" * 20) / ("deeper" * 20)
+    directory.mkdir(parents=True)
+    path = directory / "state-é\U0001f680.json"
+    path.write_bytes(b"old")
+    api = _WindowsFiles()
+    # Metadata-only anchor is the production case; a delete-shared data reader
+    # separately proves old bytes stay intact rather than being overwritten in place.
+    handle = api.api.CreateFileW(str(path), 0x80000000, 7, None, 3, 0, None)
+    assert handle is not None and handle != ctypes.c_void_p(-1).value
+    try:
+        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+    except BaseException:
+        api.close(handle)
+        raise
+    with os.fdopen(descriptor, "rb") as old:
+        write_bytes_atomic(path, payload)
+        assert old.read() == b"old"
+        assert path.read_bytes() == payload
+        assert not list(directory.glob("*.partial"))
+
+
+def test_windows_atomic_replace_unsupported_kernel_preserves_old_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Failure of the atomic kernel operation never falls through to delete or in-place writes."""
+    path = tmp_path / "snapshot.json"
+    path.write_bytes(b"old")
+    memo = SnapshotClassificationMemo()
+    with (
+        prepare_snapshot_file(tmp_path, path.name, 1024) as first,
+        prepare_snapshot_file(tmp_path, "absent.models.json", 1024) as second,
+    ):
+        memo.remember(("db", path.name, 1024), (first, second))
+
+    def unsupported(staging: Path, destination: Path) -> None:
+        """Represent an unsupported FileRenameInfoEx operation after staging completed."""
+        assert staging.read_bytes() == b"new" and destination == path
+        raise OSError("FileRenameInfoEx unsupported")
+
+    try:
+        monkeypatch.setattr(atomic_files, "_windows_replace_open_target", unsupported)
+        with pytest.raises(OSError, match="unsupported"):
+            write_bytes_atomic(path, b"new")
+        assert path.read_bytes() == b"old"
+        assert not list(tmp_path.glob("*.partial"))
+    finally:
+        memo.close()
+
+
+def test_windows_atomic_replace_keeps_readonly_and_nofollow_policy(tmp_path: Path) -> None:
+    """POSIX replacement never ignores read-only attributes or follows a protected pointer link."""
+    path = tmp_path / "readonly.json"
+    path.write_bytes(b"old")
+    path.chmod(0o444)
+    try:
+        with pytest.raises(OSError):
+            write_bytes_atomic(path, b"new")
+        assert path.read_bytes() == b"old"
+        assert not list(tmp_path.glob("*.partial"))
+    finally:
+        path.chmod(0o666)
+    victim = tmp_path / "victim.json"
+    victim.write_bytes(b"victim")
+    pointer = tmp_path / "pointer.json"
+    try:
+        pointer.symlink_to(victim)
+    except OSError:
+        pytest.skip("symlink creation is unavailable for this Windows account")
+    write_bytes_atomic(pointer, b"selection", follow_symlinks=False)
+    assert not pointer.is_symlink() and pointer.read_bytes() == b"selection"
+    assert victim.read_bytes() == b"victim"
+    pointer.unlink()
+    pointer.symlink_to(victim)
+    staging = tmp_path / "pointer.partial"
+    staging.write_bytes(b"direct")
+    atomic_files._windows_replace_open_target(staging, pointer)
+    assert not pointer.is_symlink() and pointer.read_bytes() == b"direct"
+    assert victim.read_bytes() == b"victim"
+    staging.symlink_to(victim)
+    victim_mode = victim.stat().st_mode
+    with pytest.raises(OSError, match="non-reparse"):
+        atomic_files._windows_replace_open_target(staging, pointer)
+    assert staging.is_symlink() and victim.read_bytes() == b"victim"
+    assert victim.stat().st_mode == victim_mode
+    staging.unlink()
 
 
 def test_windows_missing_change_time_disables_memo_not_secure_reads(
