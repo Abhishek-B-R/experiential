@@ -24,6 +24,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.reasoning_carrier import FIREWORKS_REASONING_CONTENT_PREFIX
+from exp.runtime.gateway.replay_identity import canonical_request_sha256
 from exp.runtime.models.providers.streaming_requests import openai_responses_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.model_adapter import model_request
@@ -4068,95 +4069,42 @@ def test_forced_tool_choice_decodes_canonically_on_both_openai_surfaces() -> Non
     assert responses_named.request.tool_choice == GatewayNamedToolChoice(name="lookup")
 
 
-def test_tool_description_bounds_are_uniform_and_named_on_both_surfaces() -> None:
-    """65,536-char descriptions serve; 65,537 is a self-explanatory named 400.
-
-    Prod report: an 8,292-char tool description 400d every agentic turn at
-    the old 8,192 bound while the provider itself serves 66,000+ (probed
-    live 2026-09-05). The bound now matches the Messages surface and the
-    canonical GatewayToolDefinition, and the over-limit rejection states the
-    limit and the arriving length instead of forcing the caller to bisect.
-    """
-    reporter_sized = "x" * 8_292
-    at_bound = "x" * 65_536
-    over_bound = "x" * 65_537
-
-    for description in (reporter_sized, at_bound):
-        decoded = decode_chat(
-            {
-                "model": "coding",
-                "messages": [{"role": "user", "content": "hi"}],
-                "tools": [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "t",
-                            "description": description,
-                            "parameters": {"type": "object"},
-                        },
-                    }
-                ],
-            }
-        )
-        assert decoded.request.tools[0].description == description
-
-    with pytest.raises(OpenAIProtocolError) as chat_over:
-        decode_chat(
-            {
-                "model": "coding",
-                "messages": [{"role": "user", "content": "hi"}],
-                "tools": [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "t",
-                            "description": over_bound,
-                            "parameters": {"type": "object"},
-                        },
-                    }
-                ],
-            }
-        )
-    assert chat_over.value.detail.param == "tools.0.function.description"
-    assert "at most 65,536 characters" in str(chat_over.value.detail.message)
-    assert "65,537" in str(chat_over.value.detail.message)
-
-    decoded = decode_responses(
+@pytest.mark.parametrize("length", [65_537, 119_825, 262_145, 1_048_576])
+def test_tool_descriptions_are_preserved_without_a_per_field_limit(length: int) -> None:
+    """Both OpenAI surfaces preserve descriptions beyond diagnostic preview sizes."""
+    description = "x" * (length - 1) + "界"
+    function: JsonObject = {
+        "name": "t",
+        "description": description,
+        "parameters": {"type": "object"},
+    }
+    chat = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": function}],
+        }
+    )
+    responses = decode_responses(
         {
             "model": "coding",
             "input": "hi",
-            "tools": [
-                {
-                    "type": "function",
-                    "name": "t",
-                    "description": at_bound,
-                    "parameters": {"type": "object"},
-                }
-            ],
+            "tools": [{"type": "function", **function}],
         }
     )
-    assert decoded.request.tools[0].description == at_bound
-    with pytest.raises(OpenAIProtocolError) as responses_over:
-        decode_responses(
-            {
-                "model": "coding",
-                "input": "hi",
-                "tools": [
-                    {
-                        "type": "function",
-                        "name": "t",
-                        "description": over_bound,
-                        "parameters": {"type": "object"},
-                    }
-                ],
-            }
+    for decoded in (chat, responses):
+        assert decoded.request.tools[0].description == description
+        changed_tool = decoded.request.tools[0].model_copy(
+            update={"description": description[:-1] + "語"}
         )
-    assert responses_over.value.detail.param == "tools.0.description"
-    assert "at most 65,536 characters" in str(responses_over.value.detail.message)
+        changed_request = decoded.request.model_copy(update={"tools": (changed_tool,)})
+        assert canonical_request_sha256(decoded.request) != canonical_request_sha256(
+            changed_request
+        )
 
 
 def test_structured_format_description_bounds_are_uniform_and_named() -> None:
-    """The response_format and text.format description bounds match the tools'."""
+    """Structured-format descriptions retain their own bound on both surfaces."""
     at_bound = "x" * 65_536
     over_bound = "x" * 65_537
 

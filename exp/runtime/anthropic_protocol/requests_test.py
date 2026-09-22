@@ -1178,18 +1178,16 @@ def test_caller_beta_tokens_partition_into_allowlist_and_disclosures() -> None:
     assert raised.value.detail.param == "anthropic-beta"
 
 
-def test_a_real_toolset_tool_description_over_8k_decodes() -> None:
-    """Tool descriptions bound generously: a real Claude Code toolset
-    carried a description past the earlier 8k cap and 400ed with
-    "Invalid value for 'tools.1.description'" while the provider accepts
-    40k-character descriptions live (verified 2026-08-30)."""
+@pytest.mark.parametrize("length", [65_537, 119_825, 262_145, 1_048_576])
+def test_tool_descriptions_are_preserved_without_a_per_field_limit(length: int) -> None:
+    """Messages preserves large descriptions, including their final Unicode character."""
+    description = "y" * (length - 1) + "界"
     tools = [
         {"name": "small", "description": "x", "input_schema": {"type": "object"}},
-        {"name": "large", "description": "y" * 40_000, "input_schema": {"type": "object"}},
+        {"name": "large", "description": description, "input_schema": {"type": "object"}},
     ]
     decoded = decode_messages(_body(tools=tools))
-    description = decoded.request.tools[1].description
-    assert description is not None and len(description) == 40_000
+    assert decoded.request.tools[1].description == description
 
 
 def test_decode_accepts_the_live_eager_input_streaming_tool_shape() -> None:
