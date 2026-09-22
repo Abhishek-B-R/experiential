@@ -96,17 +96,16 @@ impl Observation {
         }
     }
 
-    /// Stop-sequence filtering can refine a buffered provider terminal.
+    /// Stamp the effective terminal after normalized output delivery. A queued
+    /// terminal still supplies cancellation evidence before this point.
     pub(crate) fn record_effective_terminal(&self, event: &Event) {
         if event.is_terminal() {
             let mut observed = self
                 .0
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if observed.terminal_at.is_none() {
-                observed.terminal_at = Some(SystemTime::now());
-                observed.duration = Some(observed.started.elapsed());
-            }
+            observed.terminal_at = Some(SystemTime::now());
+            observed.duration = Some(observed.started.elapsed());
             observed.terminal = Some(event.clone());
         }
     }
@@ -132,6 +131,21 @@ impl Observation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffered_terminal_time_finishes_after_the_visible_first_token() {
+        let observation = Observation::default();
+        // A complete provider frame can queue its terminal before the relay
+        // yields the frame's first visible token.
+        observation.record(&Event::Completed);
+        std::thread::sleep(Duration::from_millis(1));
+        let first_token_at = SystemTime::now();
+        observation.record_first_token(Some(first_token_at));
+        observation.record_effective_terminal(&Event::Completed);
+        let snapshot = observation.snapshot();
+        assert!(snapshot.terminal_at.unwrap() >= first_token_at);
+        assert!(snapshot.duration.unwrap() >= Duration::from_millis(1));
+    }
 
     #[test]
     fn cancellation_preserves_partial_usage_and_terminal_precedence() {
