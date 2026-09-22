@@ -1,13 +1,14 @@
 //! Count- and byte-bounded delivery, isolated from request and bridge executors.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
 use super::record::Record;
+use super::response::WireResponse;
 
 /// Local SQLite and hosted persistence implement the same off-path destination.
 pub(crate) trait Sink: Send + 'static {
@@ -48,18 +49,28 @@ struct Counters {
     dropped: AtomicU64,
     persisted: AtomicU64,
     failed: AtomicU64,
+    capacity: Mutex<()>,
+    available: Condvar,
 }
 
 struct Pending {
     value: Record,
+    wire: Option<WireResponse>,
     bytes: usize,
     counters: Arc<Counters>,
+    completed: Option<mpsc::SyncSender<bool>>,
 }
 
 impl Drop for Pending {
     fn drop(&mut self) {
+        let _capacity = self
+            .counters
+            .capacity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         self.counters.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
         self.counters.pending.fetch_sub(1, Ordering::AcqRel);
+        self.counters.available.notify_all();
     }
 }
 
@@ -67,7 +78,6 @@ pub(crate) struct Delivery {
     limits: Limits,
     sender: Mutex<Option<mpsc::SyncSender<Pending>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
-    deadline: Arc<Mutex<Option<Instant>>>,
     counters: Arc<Counters>,
 }
 
@@ -78,22 +88,11 @@ impl Delivery {
         let counters = Arc::new(Counters::default());
         let worker_counters = counters.clone();
         let maximum_record_bytes = limits.maximum_record_bytes;
-        let deadline = Arc::new(Mutex::new(None::<Instant>));
-        let worker_deadline = deadline.clone();
         let worker = std::thread::Builder::new()
             .name("exp-capture".into())
             .spawn(move || {
                 let mut maintained = Instant::now();
                 loop {
-                    if worker_deadline
-                        .lock()
-                        .map_or(true, |bound| bound.is_some_and(|at| Instant::now() >= at))
-                    {
-                        for _ in receiver.try_iter() {
-                            worker_counters.dropped.fetch_add(1, Ordering::Relaxed);
-                        }
-                        break;
-                    }
                     if maintained.elapsed() >= Duration::from_secs(1) {
                         if sink.maintain().is_err() {
                             worker_counters.failed.fetch_add(1, Ordering::Relaxed);
@@ -101,13 +100,24 @@ impl Delivery {
                         maintained = Instant::now();
                     }
                     match receiver.recv_timeout(Duration::from_millis(100)) {
-                        Ok(item) => {
-                            let counter = if sink.write(&item.value, maximum_record_bytes).is_ok() {
+                        Ok(mut item) => {
+                            if let Some(wire) = item.wire.take() {
+                                item.value.response = wire.decode();
+                                if item.value.response.is_none() {
+                                    item.value.provider_reasoning = None;
+                                    item.value.provider_tool_calls_json = None;
+                                }
+                            }
+                            let persisted = sink.write(&item.value, maximum_record_bytes).is_ok();
+                            let counter = if persisted {
                                 &worker_counters.persisted
                             } else {
                                 &worker_counters.failed
                             };
                             counter.fetch_add(1, Ordering::Relaxed);
+                            if let Some(completed) = &item.completed {
+                                let _ = completed.send(persisted);
+                            }
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -119,41 +129,67 @@ impl Delivery {
             limits,
             sender: Mutex::new(Some(sender)),
             worker: Mutex::new(Some(worker)),
-            deadline,
             counters,
         })
     }
 
-    /// Drop on saturation. The budget includes the record a slow sink is writing.
+    /// Wait for capacity; accepted records are never discarded to make room.
+    #[cfg(test)]
     pub(crate) fn submit(&self, value: Record) -> bool {
-        let bytes = value.heap_bytes();
-        if self
-            .counters
-            .bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                held.checked_add(bytes)
-                    .filter(|total| *total <= self.limits.maximum_bytes)
-            })
-            .is_err()
-        {
+        self.enqueue(value, None, None)
+    }
+
+    /// A successful completion means the destination has persisted this update.
+    pub(super) fn submit_wait(&self, value: Record, wire: Option<WireResponse>) -> bool {
+        let (completed, outcome) = mpsc::sync_channel(1);
+        self.enqueue(value, wire, Some(completed)) && outcome.recv().unwrap_or(false)
+    }
+
+    fn enqueue(
+        &self,
+        value: Record,
+        wire: Option<WireResponse>,
+        completed: Option<mpsc::SyncSender<bool>>,
+    ) -> bool {
+        let bytes = value.heap_bytes() + wire.as_ref().map_or(0, WireResponse::heap_bytes);
+        if bytes > self.limits.maximum_bytes {
             return self.dropped();
         }
-        let previous = self.counters.pending.fetch_add(1, Ordering::AcqRel);
+        // Clone before waiting. Shutdown closes new admissions, while producers
+        // already waiting retain their right to deliver and keep the worker alive.
+        let Some(sender) = self.sender.lock().ok().and_then(|sender| sender.clone()) else {
+            return self.dropped();
+        };
+        let mut capacity = self
+            .counters
+            .capacity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        while self.counters.pending.load(Ordering::Acquire) >= self.limits.maximum_records
+            || self
+                .counters
+                .bytes
+                .load(Ordering::Acquire)
+                .saturating_add(bytes)
+                > self.limits.maximum_bytes
+        {
+            capacity = self
+                .counters
+                .available
+                .wait(capacity)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        self.counters.bytes.fetch_add(bytes, Ordering::AcqRel);
+        self.counters.pending.fetch_add(1, Ordering::AcqRel);
+        drop(capacity);
         let item = Pending {
             value,
+            wire,
             bytes,
             counters: self.counters.clone(),
+            completed,
         };
-        if previous >= self.limits.maximum_records {
-            return self.dropped();
-        }
-        let Ok(sender) = self.sender.lock() else {
-            return self.dropped();
-        };
-        if sender
-            .as_ref()
-            .is_none_or(|sender| sender.try_send(item).is_err())
-        {
+        if sender.send(item).is_err() {
             return self.dropped();
         }
         true
@@ -164,11 +200,8 @@ impl Delivery {
         false
     }
 
-    /// Stop accepting records and drain within a fixed budget, including a stuck sink.
+    /// Stop new submissions; a timeout reports an unfinished drain without purging it.
     pub(crate) fn close_until(&self, until: Instant) -> bool {
-        if let Ok(mut deadline) = self.deadline.lock() {
-            *deadline = Some(deadline.map_or(until, |old| old.min(until)));
-        }
         if let Ok(mut sender) = self.sender.lock() {
             sender.take();
         }

@@ -91,6 +91,7 @@ from exp.runtime.models.providers.server_tools import (
     anthropic_server_tools_present,
     disclose_dropped_server_tools,
 )
+from exp.runtime.models.providers.thinking_budget import require_thinking_budget_support
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
@@ -158,6 +159,7 @@ def route_generation_parameter_requests(
     if not profiles:
         raise ValueError("generation parameter shaping requires at least one wire profile")
     for profile in profiles:
+        require_thinking_budget_support(profile, request)
         if fireworks_continuation_required(profile, request):
             require_responses_continuation_channel(request)
 

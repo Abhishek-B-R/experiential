@@ -1,15 +1,17 @@
 //! Bounded rendezvous of authenticated input, terminal policy and observed output.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::budget::string_bytes;
 use super::delivery::{Delivery, Limits, Sink};
 use super::record::{Record, Request, Response, SCHEMA_VERSION};
+use super::response::WireResponse;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +32,7 @@ impl Configuration {
             || !(1..=1024 * 1024).contains(&self.maximum_request_bytes)
             || !(1..=4 * 1024 * 1024).contains(&self.maximum_response_bytes)
             || self.maximum_pending_bytes < self.maximum_request_bytes
+            || self.maximum_pending_bytes < self.maximum_response_bytes
             || self.maximum_pending_bytes > 256 * 1024 * 1024
             || !(1..=3600).contains(&self.ttl_seconds)
         {
@@ -41,12 +44,14 @@ impl Configuration {
 
 struct Entry {
     record: Record,
+    wire: Option<WireResponse>,
     request_bytes: usize,
     expires: Instant,
     bytes: usize,
     attached: bool,
     output_finished: bool,
     response_allowed: bool,
+    response_discarded: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -94,6 +99,7 @@ pub(crate) struct Collector {
     pending: Arc<Mutex<Pending>>,
     skipped: Arc<AtomicU64>,
     body_bytes: AtomicUsize,
+    body_capacity: Arc<Semaphore>,
 }
 
 impl Collector {
@@ -108,6 +114,7 @@ impl Collector {
         };
         Ok(Self {
             delivery: Delivery::new(config.delivery.clone(), sink)?,
+            body_capacity: Arc::new(Semaphore::new(config.maximum_pending_bytes)),
             config,
             pending,
             skipped,
@@ -152,12 +159,14 @@ impl Collector {
             record.request.request_id.clone(),
             Entry {
                 record,
+                wire: None,
                 request_bytes,
                 expires: Instant::now() + Duration::from_secs(self.config.ttl_seconds),
                 bytes,
                 attached: false,
                 output_finished: false,
                 response_allowed: !self.config.settlement_required,
+                response_discarded: Arc::new(AtomicBool::new(false)),
             },
         );
         true
@@ -193,19 +202,17 @@ impl Collector {
     }
 
     /// Exactly one original response can attach; keyed replays cannot capture twice.
-    pub(crate) fn attach(&self, request_id: &str) -> bool {
+    pub(crate) fn attach(&self, request_id: &str) -> Option<Arc<AtomicBool>> {
         let Ok(mut pending) = self.pending.lock() else {
-            return false;
+            return None;
         };
         self.expire(&mut pending);
-        let Some(entry) = pending.entries.get_mut(request_id) else {
-            return false;
-        };
+        let entry = pending.entries.get_mut(request_id)?;
         if entry.attached {
-            return false;
+            return None;
         }
         entry.attached = true;
-        true
+        Some(entry.response_discarded.clone())
     }
 
     /// Hosted terminal eligibility precedes durable content, so a dropped BYOK
@@ -220,33 +227,27 @@ impl Collector {
         };
         pending.bytes -= entry.bytes;
         if !keep_prompt {
+            entry.response_discarded.store(true, Ordering::Release);
             return;
         }
         if !keep_response {
+            entry.response_discarded.store(true, Ordering::Release);
             entry.record.response = None;
             entry.record.provider_reasoning = None;
             entry.record.provider_tool_calls_json = None;
-            self.emit(entry.record);
+            drop(pending);
+            self.emit(entry.record, None);
             return;
         }
         entry.response_allowed = true;
         if !entry.output_finished {
-            // Only the small envelope is copied. Both updates share the immutable
-            // request tree; provider output is published only with the response.
-            self.emit(Record {
-                schema_version: entry.record.schema_version,
-                request: entry.record.request.clone(),
-                response: None,
-                provider_reasoning: None,
-                provider_reasoning_source_json: None,
-                provider_tool_calls_json: None,
-                deployment_id: None,
-                captured_at: entry.record.captured_at,
-            });
+            // Emit once at response completion. A preliminary prompt write could
+            // otherwise overtake the response after releasing the pending lock.
             pending.bytes += entry.bytes;
             pending.entries.insert(request_id.to_owned(), entry);
         } else {
-            self.emit(entry.record);
+            drop(pending);
+            self.emit(entry.record, entry.wire);
         }
     }
 
@@ -256,24 +257,45 @@ impl Collector {
         request_id: &str,
         response: Option<Response>,
         deployment_id: Option<String>,
-    ) {
+    ) -> bool {
+        self.finish_output(request_id, response, None, deployment_id)
+    }
+
+    /// Transfer bounded wire bytes; only the destination worker builds JSON trees.
+    pub(super) fn finish_wire(
+        &self,
+        request_id: &str,
+        wire: WireResponse,
+        deployment_id: Option<String>,
+    ) -> bool {
+        self.finish_output(request_id, None, Some(wire), deployment_id)
+    }
+
+    fn finish_output(
+        &self,
+        request_id: &str,
+        response: Option<Response>,
+        wire: Option<WireResponse>,
+        deployment_id: Option<String>,
+    ) -> bool {
         let response_bytes = response.as_ref().map_or(0, Response::json_bytes);
         let response_heap = response.as_ref().map_or(0, Response::heap_bytes)
+            + wire.as_ref().map_or(0, WireResponse::heap_bytes)
             + deployment_id.as_ref().map_or(0, String::capacity);
         let Ok(mut pending) = self.pending.lock() else {
-            return;
+            return false;
         };
         self.expire(&mut pending);
         let Some(mut entry) = pending.entries.remove(request_id) else {
-            return;
+            return false;
         };
         pending.bytes -= entry.bytes;
         if response_bytes > self.config.maximum_response_bytes {
-            self.skip();
-            return;
+            return self.skip();
         }
         entry.record.response = response;
-        if entry.record.response.is_none() {
+        entry.wire = wire;
+        if entry.record.response.is_none() && entry.wire.is_none() {
             entry.record.provider_reasoning = None;
             entry.record.provider_tool_calls_json = None;
         }
@@ -281,17 +303,37 @@ impl Collector {
         entry.output_finished = true;
         entry.bytes = entry.bytes.saturating_add(response_heap);
         if entry.response_allowed {
-            self.emit(entry.record);
+            drop(pending);
+            self.emit(entry.record, entry.wire)
         } else if pending.bytes.saturating_add(entry.bytes) <= self.config.maximum_pending_bytes {
             pending.bytes += entry.bytes;
             pending.entries.insert(request_id.to_owned(), entry);
+            true
         } else {
-            self.skip();
+            self.skip()
         }
     }
 
-    fn emit(&self, record: Record) {
-        self.delivery.submit(record);
+    fn emit(&self, record: Record, wire: Option<WireResponse>) -> bool {
+        let deliver = || self.delivery.submit_wait(record, wire);
+        // A blocked destination must not occupy a Tokio executor thread or a
+        // collector lock. Python entrypoints already release the interpreter.
+        if tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+            runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        }) {
+            tokio::task::block_in_place(deliver)
+        } else {
+            deliver()
+        }
+    }
+
+    /// Reserve one complete bounded response before consuming any provider bytes.
+    pub(crate) async fn body_permit(&self) -> Option<OwnedSemaphorePermit> {
+        self.body_capacity
+            .clone()
+            .acquire_many_owned(self.config.maximum_response_bytes as u32)
+            .await
+            .ok()
     }
 
     /// Append only authorized winning-rung reasoning, charging allocated capacity.

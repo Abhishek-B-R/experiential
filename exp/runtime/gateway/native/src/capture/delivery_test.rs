@@ -59,44 +59,58 @@ fn record(id: &str) -> Record {
 }
 
 #[test]
-fn saturated_destination_never_blocks_serving_or_exceeds_total_byte_budget() {
+fn saturated_destination_waits_without_losing_records_or_exceeding_queued_budget() {
     let (delivery, entered, resume) = paused(limits(), false);
+    let delivery = Arc::new(delivery);
     assert!(delivery.submit(record("12345678")));
     assert_eq!(
         entered.recv_timeout(Duration::from_secs(1)).unwrap(),
         "12345678"
     );
     assert!(delivery.submit(record("abcdefgh")));
-    for _ in 0..1000 {
-        assert!(!delivery.submit(record("x")));
-    }
+    let (returned, result) = mpsc::channel();
+    let producer = delivery.clone();
+    let waiting = std::thread::spawn(move || returned.send(producer.submit(record("x"))).unwrap());
+    assert!(result.recv_timeout(Duration::from_millis(30)).is_err());
     assert_eq!(
         delivery.counts(),
-        [2, limits().maximum_bytes as u64, 0, 0, 1000]
+        [2, limits().maximum_bytes as u64, 0, 0, 0]
     );
     resume.send(()).unwrap();
+    assert!(result.recv_timeout(Duration::from_secs(1)).unwrap());
+    waiting.join().unwrap();
     assert_eq!(
         entered.recv_timeout(Duration::from_secs(1)).unwrap(),
         "abcdefgh"
     );
     resume.send(()).unwrap();
+    assert_eq!(entered.recv_timeout(Duration::from_secs(1)).unwrap(), "x");
+    resume.send(()).unwrap();
     assert!(delivery.close_until(Instant::now() + Duration::from_secs(1)));
-    assert_eq!(delivery.counts(), [0, 0, 2, 0, 1000]);
+    assert_eq!(delivery.counts(), [0, 0, 3, 0, 0]);
     assert!(!delivery.submit(record("closed")));
-    assert_eq!(delivery.counts(), [0, 0, 2, 0, 1001]);
+    assert_eq!(delivery.counts(), [0, 0, 3, 0, 1]);
 }
 
 #[test]
 fn record_count_is_bounded_even_for_tiny_records() {
     let (delivery, entered, resume) = paused(limits(), false);
+    let delivery = Arc::new(delivery);
     assert!(delivery.submit(record("a")));
     entered.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(delivery.submit(record("b")));
-    assert!(!delivery.submit(record("c")));
+    let (returned, result) = mpsc::channel();
+    let producer = delivery.clone();
+    let waiting = std::thread::spawn(move || returned.send(producer.submit(record("c"))).unwrap());
+    assert!(result.recv_timeout(Duration::from_millis(30)).is_err());
     assert_eq!(
         delivery.counts(),
-        [2, (record("a").heap_bytes() * 2) as u64, 0, 0, 1]
+        [2, (record("a").heap_bytes() * 2) as u64, 0, 0, 0]
     );
+    resume.send(()).unwrap();
+    assert!(result.recv_timeout(Duration::from_secs(1)).unwrap());
+    waiting.join().unwrap();
+    entered.recv_timeout(Duration::from_secs(1)).unwrap();
     resume.send(()).unwrap();
     entered.recv_timeout(Duration::from_secs(1)).unwrap();
     resume.send(()).unwrap();
@@ -126,17 +140,57 @@ fn failed_destination_releases_budget_and_records_no_sensitive_error() {
 }
 
 #[test]
-fn shutdown_returns_while_sink_is_blocked_and_expires_queued_records() {
+fn shutdown_timeout_reports_incomplete_drain_without_purging_accepted_records() {
     let (delivery, entered, resume) = paused(limits(), false);
+    let delivery = Arc::new(delivery);
     assert!(delivery.submit(record("active")));
     entered.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(delivery.submit(record("queued")));
+    let (returned, result) = mpsc::channel();
+    let producer = delivery.clone();
+    let waiting =
+        std::thread::spawn(move || returned.send(producer.submit(record("waiting"))).unwrap());
+    assert!(result.recv_timeout(Duration::from_millis(30)).is_err());
     assert!(!delivery.close_until(Instant::now()));
     assert!(!delivery.submit(record("late")));
     resume.send(()).unwrap();
+    assert!(result.recv_timeout(Duration::from_secs(1)).unwrap());
+    waiting.join().unwrap();
+    assert_eq!(
+        entered.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "queued"
+    );
+    resume.send(()).unwrap();
+    assert_eq!(
+        entered.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "waiting"
+    );
+    resume.send(()).unwrap();
     assert!(delivery.close_until(Instant::now() + Duration::from_secs(1)));
-    assert_eq!(delivery.counts(), [0, 0, 1, 0, 2]);
+    assert_eq!(delivery.counts(), [0, 0, 3, 0, 1]);
     assert!(entered.try_recv().is_err());
+}
+
+#[test]
+fn synchronous_completion_waits_for_durable_success_and_reports_writer_failure() {
+    for fail in [false, true] {
+        let (delivery, entered, resume) = paused(limits(), fail);
+        let delivery = Arc::new(delivery);
+        let (returned, result) = mpsc::channel();
+        let producer = delivery.clone();
+        let waiting = std::thread::spawn(move || {
+            returned
+                .send(producer.submit_wait(record("ack"), None))
+                .unwrap();
+        });
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(result.recv_timeout(Duration::from_millis(30)).is_err());
+        resume.send(()).unwrap();
+        assert_eq!(result.recv_timeout(Duration::from_secs(1)).unwrap(), !fail);
+        waiting.join().unwrap();
+        assert!(delivery.close_until(Instant::now() + Duration::from_secs(1)));
+        assert_eq!(delivery.counts()[4], 0);
+    }
 }
 
 #[test]

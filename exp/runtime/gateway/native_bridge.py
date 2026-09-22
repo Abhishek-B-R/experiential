@@ -416,7 +416,15 @@ class NativeControlPlane(
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
 
-        begin_capture(self._capture, authorization, captured_request)
+        if not begin_capture(self._capture, authorization, captured_request):
+            message = "Traffic capture is unavailable or at capacity. Restore capacity and retry."
+            self._accounting.finish_request_quietly(
+                authorization,
+                GatewayFailure(failure_class=GatewayFailureClass.UNAVAILABLE, safe_message=message),
+            )
+            raise NativeBridgeError(
+                OpenAIProtocolError(status_code=503, code="capture_unavailable", message=message)
+            )
         # Escalation finishes the accepted request quietly before returning, so it is
         # accounted content-free and never billed. Routing failures found by
         # the probe are raised against the accepted request below.

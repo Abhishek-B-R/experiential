@@ -2093,3 +2093,52 @@ def test_media_cache_markers_order_and_disclose_routes(
         "messages.content.cache_control->not_forwarded" in value
         for value in public.ignored_parameters
     )
+
+
+def test_chat_thinking_budget_selects_only_the_native_qwen_rung() -> None:
+    """A mixed route retains the explicit cap and excludes rungs that would drop it."""
+    request = decode_chat(
+        {
+            "model": "qwen3.8-max",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking_budget": 4096,
+        }
+    ).request
+    gateway = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    deployments = (
+        _deployment("effort-only", gateway=gateway),
+        _deployment("qwen", gateway=gateway),
+    )
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    client = cast(NativeWireClient, object())
+    wires = (
+        (GatewayWireProfile(dialect="openai_compatible", url="https://relay.test/v1"), client),
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
+                model_id="qwen3.8-max",
+                supports_reasoning=True,
+                reasoning_wire_format="reasoning_effort",
+                supported_reasoning_efforts=("low", "medium", "xhigh"),
+            ),
+            client,
+        ),
+    )
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    accounting = _AdmissionCoercionCounter()
+    narrowed, retained, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert narrowed.deployment.deployment_id == "qwen"
+    assert len(retained) == 1
+    assert public.thinking_budget == provider.thinking_budget == 4096
+    assert provider.reasoning_effort is None
+    assert accounting.recorded == 0
