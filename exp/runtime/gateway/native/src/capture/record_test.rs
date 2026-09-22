@@ -14,7 +14,7 @@ fn record<R>(response: R) -> Record<R> {
             },
             protocol: Protocol::ChatCompletions,
             model_id: None,
-            context: json!({"schema_version":1,"request":{"messages":[]}}),
+            context: Arc::new(json!({"schema_version":1,"request":{"messages":[]}})),
         },
         response: Some(response),
         provider_reasoning: None,
@@ -26,16 +26,20 @@ fn record<R>(response: R) -> Record<R> {
 }
 
 #[test]
-fn preencoded_response_is_embedded_verbatim_without_reformatting() {
-    // Whitespace inside raw JSON survives only if the envelope reuses the encoded bytes.
-    let raw = r#"{"kind":"json", "status":200, "body": {"text": "雪"}, "source_json":null}"#;
-    let encoded = EncodedResponse(RawValue::from_string(raw.into()).unwrap());
-    assert_eq!(encoded.len(), raw.len());
-    let record = record(encoded);
+fn structured_response_is_encoded_only_at_the_destination() {
+    let response = Response::Json {
+        status: 200,
+        body: json!({"text":"雪"}),
+        source_json: None,
+    };
+    assert_eq!(
+        response.json_bytes(),
+        serde_json::to_string(&response).unwrap().len()
+    );
+    let record = record(response);
     let first = record.encode(4096).unwrap();
     let second = record.encode(4096).unwrap();
     assert_eq!(first, second);
-    assert!(first.contains(raw));
     let decoded: Record = serde_json::from_str(&first).unwrap();
     let Response::Json { body, .. } = decoded.response.unwrap() else {
         panic!()
@@ -43,6 +47,67 @@ fn preencoded_response_is_embedded_verbatim_without_reformatting() {
     assert_eq!(body["text"], "雪");
     assert!(record.encode(first.len() - 1).is_none());
     assert_eq!(record.encode(first.len()).unwrap(), first);
+}
+
+#[test]
+fn cloned_request_shares_content_and_charges_spare_capacity() {
+    let mut input = record(Response::Json {
+        status: 200,
+        body: json!({}),
+        source_json: None,
+    });
+    let copy = input.request.clone();
+    assert!(Arc::ptr_eq(&copy.context, &input.request.context));
+    let initial = input.heap_bytes();
+    let mut text = String::with_capacity(32768);
+    text.push('x');
+    input.provider_reasoning = Some(text);
+    assert!(input.heap_bytes() >= initial + 32768);
+}
+
+#[test]
+fn all_protocol_and_response_sizes_match_final_json() {
+    let mut item = record(Response::Json {
+        status: 200,
+        body: json!({"control":"\0\n\r\t\u{8}\u{c}", "unicode":"雪😀"}),
+        source_json: Some("\\u0000\"".into()),
+    });
+    for protocol in [
+        Protocol::ChatCompletions,
+        Protocol::Responses,
+        Protocol::Messages,
+    ] {
+        item.request.protocol = protocol;
+        for model in [None, Some("snow-雪-\"quoted\"".to_owned())] {
+            item.request.model_id = model;
+            assert_eq!(
+                item.request.json_bytes(),
+                serde_json::to_vec(&item.request).unwrap().len()
+            );
+        }
+    }
+    let response = item.response.unwrap();
+    assert_eq!(
+        response.json_bytes(),
+        serde_json::to_vec(&response).unwrap().len()
+    );
+    for truncated in [true, false] {
+        for client_disconnected in [true, false] {
+            for frames in [vec![], vec![json!({"x":"\0雪"}), json!("[DONE]")]] {
+                let response = Response::Sse {
+                    status: 200,
+                    frames,
+                    truncated,
+                    client_disconnected,
+                    source_json: None,
+                };
+                assert_eq!(
+                    response.json_bytes(),
+                    serde_json::to_vec(&response).unwrap().len()
+                );
+            }
+        }
+    }
 }
 
 struct SerializeOnce<'a>(&'a Cell<usize>);

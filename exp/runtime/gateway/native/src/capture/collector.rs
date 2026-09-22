@@ -7,8 +7,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
+use super::budget::string_bytes;
 use super::delivery::{Delivery, Limits, Sink};
-use super::record::{EncodedResponse, Record, Request, SCHEMA_VERSION};
+use super::record::{Record, Request, Response, SCHEMA_VERSION};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,7 +40,7 @@ impl Configuration {
 }
 
 struct Entry {
-    record: Record<EncodedResponse>,
+    record: Record,
     request_bytes: usize,
     expires: Instant,
     bytes: usize,
@@ -62,8 +63,8 @@ struct MaintainedSink<S> {
 }
 
 impl<S: Sink> Sink for MaintainedSink<S> {
-    fn write(&mut self, record: &str) -> Result<(), ()> {
-        self.sink.write(record)
+    fn write(&mut self, record: &Record, maximum_bytes: usize) -> Result<(), ()> {
+        self.sink.write(record, maximum_bytes)
     }
 
     fn take_maintenance_failures(&mut self) -> u64 {
@@ -133,11 +134,12 @@ impl Collector {
                 .map(|duration| duration.as_secs_f64())
                 .unwrap_or(0.0),
         };
-        let Some(encoded) = record.encode(self.config.maximum_request_bytes) else {
+        let request_bytes = record.request.json_bytes();
+        if !record.valid() || request_bytes > self.config.maximum_request_bytes {
             return self.skip();
-        };
+        }
         // Node and identifier overhead is charged even for an empty context.
-        let bytes = encoded.len() + 512;
+        let bytes = record.heap_bytes() + record.request.request_id.capacity() + 512;
         let Ok(mut pending) = self.pending.lock() else {
             return self.skip();
         };
@@ -154,7 +156,7 @@ impl Collector {
             record.request.request_id.clone(),
             Entry {
                 record,
-                request_bytes: encoded.len(),
+                request_bytes,
                 expires: Instant::now() + Duration::from_secs(self.config.ttl_seconds),
                 bytes,
                 attached: false,
@@ -177,14 +179,11 @@ impl Collector {
             };
             pending.bytes -= entry.bytes;
             if entry.record.request.model_id.is_none() && !entry.attached {
-                let Ok(encoded_model) = serde_json::to_string(model_id) else {
-                    self.skip();
-                    return;
-                };
                 // Replace the original JSON null, including escapes in the selected id.
-                entry.request_bytes = entry.request_bytes - 4 + encoded_model.len();
-                entry.bytes = entry.bytes - 4 + encoded_model.len();
-                entry.record.request.model_id = Some(model_id.to_owned());
+                entry.request_bytes = entry.request_bytes - 4 + string_bytes(model_id);
+                let model = model_id.to_owned();
+                entry.bytes += model.capacity();
+                entry.record.request.model_id = Some(model);
             }
             if pending.bytes.saturating_add(entry.bytes) > self.config.maximum_pending_bytes
                 || entry.request_bytes > self.config.maximum_request_bytes
@@ -231,14 +230,27 @@ impl Collector {
             entry.record.response = None;
             entry.record.provider_reasoning = None;
             entry.record.provider_tool_calls_json = None;
-            self.emit(&entry.record);
+            self.emit(entry.record);
             return;
         }
         entry.response_allowed = true;
-        self.emit(&entry.record);
         if !entry.output_finished {
+            // Only the small envelope is copied. Both updates share the immutable
+            // request tree; provider output is published only with the response.
+            self.emit(Record {
+                schema_version: entry.record.schema_version,
+                request: entry.record.request.clone(),
+                response: None,
+                provider_reasoning: None,
+                provider_reasoning_source_json: None,
+                provider_tool_calls_json: None,
+                deployment_id: None,
+                captured_at: entry.record.captured_at,
+            });
             pending.bytes += entry.bytes;
             pending.entries.insert(request_id.to_owned(), entry);
+        } else {
+            self.emit(entry.record);
         }
     }
 
@@ -246,10 +258,12 @@ impl Collector {
     pub(crate) fn finish(
         &self,
         request_id: &str,
-        response: Option<EncodedResponse>,
+        response: Option<Response>,
         deployment_id: Option<String>,
     ) {
-        let response_bytes = response.as_ref().map_or(0, EncodedResponse::len);
+        let response_bytes = response.as_ref().map_or(0, Response::json_bytes);
+        let response_heap = response.as_ref().map_or(0, Response::heap_bytes)
+            + deployment_id.as_ref().map_or(0, String::capacity);
         let Ok(mut pending) = self.pending.lock() else {
             return;
         };
@@ -269,9 +283,9 @@ impl Collector {
         }
         entry.record.deployment_id = deployment_id;
         entry.output_finished = true;
-        entry.bytes = entry.bytes.saturating_add(response_bytes);
+        entry.bytes = entry.bytes.saturating_add(response_heap);
         if entry.response_allowed {
-            self.emit(&entry.record);
+            self.emit(entry.record);
         } else if pending.bytes.saturating_add(entry.bytes) <= self.config.maximum_pending_bytes {
             pending.bytes += entry.bytes;
             pending.entries.insert(request_id.to_owned(), entry);
@@ -280,12 +294,8 @@ impl Collector {
         }
     }
 
-    fn emit(&self, record: &Record<EncodedResponse>) {
-        if let Some(encoded) = record.encode(self.config.delivery.maximum_record_bytes) {
-            self.delivery.submit(encoded);
-        } else {
-            self.skip();
-        }
+    fn emit(&self, record: Record) {
+        self.delivery.submit(record);
     }
 
     /// Append only authorized winning-rung reasoning, charging allocated capacity.
