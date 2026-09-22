@@ -17,6 +17,8 @@ pub(in crate::dialects) use relay_finish::{
 };
 mod gemini;
 mod openai;
+mod responses_logprobs;
+pub(crate) use responses_logprobs::records_retained_bytes;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -446,6 +448,8 @@ pub struct Normalizer {
     // opted into its response metadata. First non-empty value wins; a label
     // only (bounded, printable ASCII), never content.
     upstream_provider: Option<String>,
+    chat_logprobs: bool,
+    responses_logprobs: bool,
 }
 
 /// Longest upstream label kept from a stream (mirrors the python settlement bound).
@@ -489,7 +493,17 @@ impl Normalizer {
             anthropic_stopped_tools: BTreeSet::new(),
             dropped_cut_call: false,
             upstream_provider: None,
+            chat_logprobs: false,
+            responses_logprobs: false,
         }
+    }
+
+    pub fn enable_responses_logprobs(&mut self, enabled: bool) {
+        self.responses_logprobs = enabled;
+    }
+
+    pub fn enable_chat_logprobs(&mut self, enabled: bool) {
+        self.chat_logprobs = enabled;
     }
 
     /// The upstream an aggregator named as serving this stream, if any chunk said.

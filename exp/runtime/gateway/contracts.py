@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, StrictBool, StrictInt, field_validator, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256
 from exp.common.models.content import (
@@ -47,6 +47,12 @@ from exp.runtime.gateway.reasoning_blocks import (
     ThinkingBlock as ThinkingBlock,
 )
 from exp.runtime.gateway.stream_contracts import (
+    ChoiceLogprobs as ChoiceLogprobs,
+)
+from exp.runtime.gateway.stream_contracts import (
+    ChoiceLogprobsDelta as ChoiceLogprobsDelta,
+)
+from exp.runtime.gateway.stream_contracts import (
     GatewayEvent as GatewayEvent,
 )
 from exp.runtime.gateway.stream_contracts import (
@@ -63,6 +69,12 @@ from exp.runtime.gateway.stream_contracts import (
 )
 from exp.runtime.gateway.stream_contracts import (
     GatewayUsage as GatewayUsage,
+)
+from exp.runtime.gateway.stream_contracts import (
+    LogprobCandidate as LogprobCandidate,
+)
+from exp.runtime.gateway.stream_contracts import (
+    TokenLogprob as TokenLogprob,
 )
 from exp.runtime.gateway.tool_search.contracts import GatewayToolSearch, gateway_tool_search_name
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearch
@@ -109,26 +121,20 @@ class GatewayApiSurface(StrEnum):
 
 
 class GatewayToolDefinition(ContractModel):
-    """One caller-defined function tool with its exact JSON Schema declaration.
-
-    Descriptions are preserved without a per-field size limit. The gateway's
-    total request-body cap and provider context limits still apply.
+    """A caller-defined function with exact schema and provider-owned carriers.
 
     Attributes:
-        name: Function name, between 1 and 256 characters.
-        description: Full caller description, or None when omitted.
-        parameters: Exact caller JSON Schema for function arguments.
-        strict: Whether the provider must enforce the argument schema.
-        cache_control: Optional Anthropic caching hint, excluded from serialization
-            and replay identity; dropped with disclosure on other wires.
-        eager_input_streaming: Optional Anthropic fine-grained tool-input streaming
-            selector, excluded from serialization but included in replay identity.
-        defer_loading: Optional Anthropic deferred-loading selector. The provider
-            owns validity rules for combinations of deferred tools.
-        allowed_callers: Optional Anthropic programmatic-tool caller allowlist.
-            The provider owns validity rules for caller combinations.
-        input_examples: Optional Anthropic example inputs. Excluded from ordinary
-            serialization, included in replay identity and reservation sizing.
+        name: Function name, bounded to 256 characters.
+        description: Unbounded caller description; body and provider context limits apply.
+        parameters: The caller JSON Schema, unchanged.
+        strict: Whether the provider must enforce the schema.
+        cache_control: Validated caching hint, excluded from replay identity.
+        eager_input_streaming: Native Anthropic streaming selector.
+        defer_loading: Native deferred-loading selector; provider validates combinations.
+        allowed_callers: Native programmatic-tool caller allowlist.
+        input_examples: Provider-visible example inputs counted in reservation.
+
+    Native carriers join replay identity except caching hints, which change cost only.
     """
 
     name: str = Field(min_length=1, max_length=256)
@@ -161,15 +167,11 @@ class StructuredTextFormat(ContractModel):
 
 
 class GatewayProviderNativeTool(ContractModel):
-    """One verbatim non-function OpenAI Responses tool declaration.
+    """A provider-owned native Responses tool carried only on its own wire.
 
-    Codex ships ``custom`` (freeform grammar), ``namespace`` (nested tool tree),
-    ``web_search``, and ``tool_search`` declarations whose shapes exist on no
-    other wire; each is validated shallowly at decode and re-emitted byte-for-byte
-    on native Responses rungs only, with the provider owning the declaration's
-    internal shape (each type captured live from Codex 0.151.0 and accepted with
-    a plain API key, 2026-09-01). ``index`` is the declaration's position in the
-    caller's ``tools`` array so re-emission preserves the caller's interleaving.
+    Attributes:
+        index: Caller tools-array position, preserving mixed declaration order.
+        tool: Shallowly validated declaration; provider owns the internal schema.
     """
 
     index: int = Field(ge=0)
@@ -477,7 +479,11 @@ on wires without a native error flag (see
 
 
 class GatewayRequest(ContractModel):
-    """Lossless canonical request shared by protocol and provider implementations."""
+    """Lossless canonical request shared by protocol and provider implementations.
+
+    Attributes:
+        include_output_text_logprobs: Responses probability selector (default false).
+    """
 
     surface: GatewayApiSurface
     messages: tuple[GatewayMessage, ...] = Field(min_length=1)
@@ -486,14 +492,7 @@ class GatewayRequest(ContractModel):
     parallel_tool_calls: bool | None = None
     structured_text: StructuredTextFormat | None = None
     json_object_output: bool = Field(default=False, exclude=True)
-    """Caller ``response_format: {"type": "json_object"}`` from the Chat surface.
-
-    A schema-free "answer with one JSON object" mode, distinct from
-    ``structured_text``: no schema exists to enforce, so each wire dialect
-    honors it its own way (a native JSON mode where the provider has one, a
-    system instruction otherwise). Mutually exclusive with ``structured_text``.
-    Serialized only in replay identity when enabled.
-    """
+    # Native JSON mode or disclosed instruction; enabled mode joins replay identity.
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens_parameter: (
         Literal["max_tokens", "max_completion_tokens", "max_output_tokens"] | None
@@ -505,8 +504,9 @@ class GatewayRequest(ContractModel):
     top_k: int | None = Field(default=None, ge=0)
     frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
     presence_penalty: float | None = Field(default=None, ge=-2, le=2)
-    logprobs: bool | None = None
-    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    logprobs: StrictBool | None = None
+    top_logprobs: StrictInt | None = Field(default=None, ge=0, le=20)
+    include_output_text_logprobs: bool = Field(default=False, exclude=True)
     reasoning_effort: ReasoningEffort | None = None
     reasoning_effort_parameter: (
         Literal["reasoning_effort", "reasoning.effort", "output_config.effort"] | None
@@ -853,6 +853,8 @@ class GatewayRequest(ContractModel):
             raise ValueError("reasoning_summary is valid only for Responses requests")
         if self.response_store is not None and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("response_store is valid only for Responses requests")
+        if self.include_output_text_logprobs and self.surface != GatewayApiSurface.RESPONSES:
+            raise ValueError("include_output_text_logprobs is valid only for Responses requests")
         if self.include_encrypted_reasoning and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("include_encrypted_reasoning is valid only for Responses requests")
         if self.reasoning_context is not None and self.surface != GatewayApiSurface.RESPONSES:

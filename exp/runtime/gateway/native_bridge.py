@@ -136,6 +136,7 @@ from exp.runtime.models.providers.errors import (
     ProviderParameterError,
     normalized_provider_failure,
 )
+from exp.runtime.models.providers.logprobs import require_unmodified_probability_output
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 from exp.runtime.openai_protocol.errors import (
     OpenAIProtocolError,
@@ -541,6 +542,7 @@ class NativeControlPlane(
                     continuation=continuation_context,
                 )
             )
+            require_unmodified_probability_output(request, bool(policy and policy.output_checks))
             wire_route: list[JsonObject] = []
             parallel_disclosures: set[str] = set()
             output_bounds: list[int] = []

@@ -507,6 +507,12 @@ def coerce_generation_parameters(
         The disclosed substitution to retry with, or ``None`` when nothing
         coercible applies.
     """
+    if (
+        request.logprobs is True
+        or request.include_output_text_logprobs
+        or request.top_logprobs is not None
+    ):
+        return None
     adaptive_budget = _coerce_adaptive_budget(profiles, request)
     if adaptive_budget is not None:
         if admits is not None and not admits(adaptive_budget.request):

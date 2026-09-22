@@ -13,6 +13,92 @@ fn hosted_frame(payload: serde_json::Value) -> SseEvent {
     }
 }
 
+#[test]
+fn terminal_response_preserves_authoritative_output_probabilities() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    normalizer.enable_responses_logprobs(true);
+    let terminal = hosted_frame(serde_json::json!({
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "output": [{
+                "id": "msg_1",
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "OK",
+                    "logprobs": [{"token": "OK", "logprob": -0.125, "bytes": [79, 75]}]
+                }]
+            }]
+        }
+    }));
+    let events = normalizer.feed(&terminal).expect("terminal normalizes");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::ProviderResponsesLogprobs { phase, records, output_index: 0, .. }
+        if phase == "terminal" && records[0]["token"] == "OK"
+    )));
+}
+
+#[test]
+fn message_item_done_preserves_each_content_part_probability_record() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    normalizer.enable_responses_logprobs(true);
+    let done = hosted_frame(serde_json::json!({
+        "type": "response.output_item.done",
+        "output_index": 2,
+        "item": {
+            "id": "msg_2",
+            "type": "message",
+            "status": "completed",
+            "content": [
+                {"type": "output_text", "text": "A", "logprobs": [{"token": "A", "logprob": -0.1}]},
+                {"type": "output_text", "text": "B", "logprobs": [{"token": "B", "logprob": -0.2}]}
+            ]
+        }
+    }));
+    let events = normalizer.feed(&done).expect("item completion normalizes");
+    let probabilities: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ProviderResponsesLogprobs {
+                content_index,
+                phase,
+                records,
+                ..
+            } => Some((*content_index, phase.as_str(), records)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(probabilities.len(), 2);
+    assert_eq!(probabilities[0].0, 0);
+    assert_eq!(probabilities[0].1, "item_done");
+    assert_eq!(probabilities[0].2[0]["token"], "A");
+    assert_eq!(probabilities[1].0, 1);
+    assert_eq!(probabilities[1].2[0]["token"], "B");
+}
+
+#[test]
+fn malformed_responses_probability_records_fail_closed() {
+    for records in [
+        serde_json::json!([{"token": 7, "logprob": -0.1}]),
+        serde_json::json!([{"token": "x", "logprob": "bad"}]),
+        serde_json::json!([{"token": "x", "logprob": -0.1, "top_logprobs": [{"token": "y", "logprob": "bad"}]}]),
+    ] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        normalizer.enable_responses_logprobs(true);
+        let frame = hosted_frame(serde_json::json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "item_id": "msg_bad",
+            "content_index": 0,
+            "delta": "x",
+            "logprobs": records,
+        }));
+        assert!(normalizer.feed(&frame).is_err());
+    }
+}
+
 /// Frame shapes mirror the documented Responses web_search lifecycle
 /// (`output_item.added`, the three `response.web_search_call.*` status
 /// events, `output_item.done` with the final `action`, and a cited answer;
@@ -21,6 +107,7 @@ fn hosted_frame(payload: serde_json::Value) -> SseEvent {
 #[test]
 fn web_search_call_items_pass_through_verbatim_with_their_lifecycle() {
     let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    normalizer.enable_responses_logprobs(true);
     let added = hosted_frame(serde_json::json!({
         "type": "response.output_item.added",
         "output_index": 0,
@@ -92,9 +179,32 @@ fn web_search_call_items_pass_through_verbatim_with_their_lifecycle() {
         "output_index": 1,
         "content_index": 0,
         "delta": "Python 3.14.7.",
+        "logprobs": [{"token": "Python", "logprob": -0.25, "bytes": [80, 121]}],
     }));
     let events = normalizer.feed(&text).expect("text normalizes");
-    assert_eq!(events.len(), 2, "message start plus text delta");
+    assert_eq!(
+        events.len(),
+        3,
+        "message start plus probability and text delta"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::ProviderResponsesLogprobs { phase, content_index: 0, .. }
+        if phase == "delta"
+    )));
+    let part_done = hosted_frame(serde_json::json!({
+        "type": "response.content_part.done",
+        "item_id": "msg_1",
+        "output_index": 1,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": "Python 3.14.7.", "logprobs": []},
+    }));
+    let events = normalizer.feed(&part_done).expect("part done normalizes");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::ProviderResponsesLogprobs { phase, records, .. }
+        if phase == "content_part_done" && records == &serde_json::json!([])
+    )));
     let annotation = hosted_frame(serde_json::json!({
         "type": "response.output_text.annotation.added",
         "item_id": "msg_1",
@@ -148,6 +258,7 @@ fn web_search_call_items_pass_through_verbatim_with_their_lifecycle() {
 #[test]
 fn mcp_items_pass_through_with_argument_deltas() {
     let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    normalizer.enable_responses_logprobs(true);
     let listing = hosted_frame(serde_json::json!({
         "type": "response.output_item.added",
         "output_index": 0,
@@ -244,6 +355,7 @@ fn mcp_items_pass_through_with_argument_deltas() {
 #[test]
 fn unknown_output_item_types_fail_with_the_type_named() {
     let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    normalizer.enable_responses_logprobs(true);
     let added = hosted_frame(serde_json::json!({
         "type": "response.output_item.added",
         "output_index": 0,
@@ -259,6 +371,7 @@ fn unknown_output_item_types_fail_with_the_type_named() {
     );
 
     let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    normalizer.enable_responses_logprobs(true);
     let hostile = hosted_frame(serde_json::json!({
         "type": "response.output_item.added",
         "output_index": 0,
@@ -279,6 +392,7 @@ fn unknown_output_item_types_fail_with_the_type_named() {
 #[test]
 fn hosted_items_without_done_close_at_the_terminal_with_the_last_seen_item() {
     let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    normalizer.enable_responses_logprobs(true);
     let added = hosted_frame(serde_json::json!({
         "type": "response.output_item.added",
         "output_index": 0,
@@ -310,6 +424,7 @@ fn hosted_items_without_done_close_at_the_terminal_with_the_last_seen_item() {
 #[test]
 fn hosted_progress_before_its_item_fails_with_the_event_named() {
     let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    normalizer.enable_responses_logprobs(true);
     let frame = hosted_frame(serde_json::json!({
         "type": "response.mcp_call.completed",
         "item_id": "mcp_9",
@@ -332,6 +447,7 @@ fn hosted_progress_before_its_item_fails_with_the_event_named() {
 #[test]
 fn a_cyber_policy_response_failed_carries_the_reason_on_both_surfaces() {
     let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    normalizer.enable_responses_logprobs(true);
     let failed = hosted_frame(serde_json::json!({
         "type": "response.failed",
         "response": {
@@ -384,6 +500,7 @@ fn a_cyber_policy_response_failed_carries_the_reason_on_both_surfaces() {
 #[test]
 fn a_failed_terminal_reports_its_billed_usage() {
     let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    normalizer.enable_responses_logprobs(true);
     let failed = hosted_frame(serde_json::json!({
         "type": "response.failed",
         "response": {
@@ -412,6 +529,7 @@ fn a_failed_terminal_reports_its_billed_usage() {
 #[test]
 fn hosted_progress_after_done_is_dropped_not_fatal() {
     let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    normalizer.enable_responses_logprobs(true);
     let added = hosted_frame(serde_json::json!({
         "type": "response.output_item.added",
         "output_index": 0,
@@ -434,4 +552,96 @@ fn hosted_progress_after_done_is_dropped_not_fatal() {
         .feed(&late)
         .expect("a trailing status frame is dropped")
         .is_empty());
+}
+
+#[test]
+fn malformed_terminal_probabilities_preserve_reported_billing_usage() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    normalizer.enable_responses_logprobs(true);
+    let frame = hosted_frame(serde_json::json!({
+        "type": "response.completed", "response": {
+            "status": "completed", "usage": {"input_tokens": 17, "output_tokens": 4},
+            "output": [{"type": "message", "id": "msg-bad", "content": [
+                {"type": "output_text", "text": "A", "logprobs": [{"token": "A"}]}
+            ]}]
+        }
+    }));
+    assert!(normalizer.feed(&frame).is_err());
+    let usage = normalizer
+        .observed_usage()
+        .expect("usage survives validation failure");
+    assert_eq!(usage.input_tokens, Some(17));
+    assert_eq!(usage.output_tokens, Some(4));
+}
+
+#[test]
+fn terminal_probability_indices_reject_overflow_and_malformed_values_without_losing_usage() {
+    for output_index in [
+        serde_json::json!(u64::from(u32::MAX) + 1),
+        serde_json::json!(-1),
+        serde_json::json!("0"),
+        serde_json::json!(1.5),
+        serde_json::json!(false),
+        serde_json::Value::Null,
+    ] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        normalizer.enable_responses_logprobs(true);
+        let frame = hosted_frame(serde_json::json!({
+            "type": "response.completed", "response": {
+                "status": "completed", "usage": {"input_tokens": 17, "output_tokens": 4},
+                "output": [{"type": "message", "id": "msg-bad", "output_index": output_index,
+                    "content": [{"type": "output_text", "text": "A", "logprobs": []}]}]
+            }
+        }));
+        let failure = normalizer
+            .feed(&frame)
+            .expect_err("present invalid index must not fall back or wrap");
+        assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+        let usage = normalizer
+            .observed_usage()
+            .expect("meter survives index refusal");
+        assert_eq!(usage.input_tokens, Some(17));
+        assert_eq!(usage.output_tokens, Some(4));
+    }
+}
+
+#[test]
+fn terminal_probability_indices_preserve_valid_values_and_fall_back_only_when_absent() {
+    for explicit in [None, Some(u32::MAX)] {
+        let mut item = serde_json::json!({"type":"message", "id":"msg-ok", "content":[
+            {"type":"output_text", "text":"A", "logprobs":[]}
+        ]});
+        if let Some(index) = explicit {
+            item["output_index"] = serde_json::json!(index);
+        }
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        normalizer.enable_responses_logprobs(true);
+        let frame = hosted_frame(serde_json::json!({"type":"response.completed", "response":{
+            "status":"completed", "output":[{"type":"function_call"}, item]
+        }}));
+        let events = normalizer
+            .feed(&frame)
+            .expect("valid index remains distinct");
+        assert!(events.iter().any(|event| matches!(event,
+            Event::ProviderResponsesLogprobs { output_index, .. } if *output_index == explicit.unwrap_or(1)
+        )));
+    }
+}
+
+#[test]
+fn nullable_probabilities_are_accepted_only_on_optional_completed_parts() {
+    for event_type in [
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+    ] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        normalizer.enable_responses_logprobs(true);
+        let frame = hosted_frame(serde_json::json!({
+            "type": event_type, "output_index": 0, "item_id": "msg-null", "content_index": 0,
+            "delta": "", "logprobs": null,
+        }));
+        let result = normalizer.feed(&frame);
+        assert_eq!(result.is_ok(), event_type == "response.content_part.done");
+    }
 }

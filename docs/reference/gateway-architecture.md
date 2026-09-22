@@ -856,7 +856,8 @@ nothing to honor at any effort. `top_k` prefers a carrying rung; when no rung su
 admission drops it with `top_k->dropped(unsupported_by_provider)` because defaults still serve.
 `frequency_penalty` and `presence_penalty` follow their per-rung capability truth and otherwise
 drop with `<parameter>->dropped(unsupported_by_provider)`. These are soft preferences.
-`top_logprobs` remains a named rejection until the response contract can project logprob arrays.
+Chat token probabilities are opt-in on verified compatible rungs; see [Chat token probabilities](chat-logprobs.md).
+Native Responses probabilities use their own capability and selector; see [Responses output probabilities](responses-logprobs.md).
 A caller
 `response_format: {type: "json_object"}` requests schema-free JSON output. OpenAI-compatible
 rungs use native JSON mode, Responses rungs use `text.format: {type: "json_object"}`, and

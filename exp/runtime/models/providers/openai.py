@@ -289,6 +289,7 @@ class OpenAIClient(OpenAIEmbeddingMixin):
             supports_top_p=self._supports_top_p,
             supports_top_k=self._supports_top_k,
             supports_logprobs=self._supports_logprobs,
+            supports_responses_logprobs=self._supports_logprobs,
             supports_frequency_penalty=self._supports_frequency_penalty,
             supports_presence_penalty=self._supports_presence_penalty,
             supports_reasoning=self._supports_reasoning,

@@ -31,6 +31,8 @@ from typing import cast
 
 import httpx
 import pytest
+from openai import OpenAI
+from websockets.sync.client import connect
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelCapabilities
@@ -417,6 +419,207 @@ class _ResponsesUpstream(BaseHTTPRequestHandler):
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
         try:
+            if "count-only" in json.dumps(payload):
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_text.delta",
+                            "output_index": 0,
+                            "item_id": "msg_count",
+                            "content_index": 0,
+                            "delta": "count",
+                            "logprobs": [],
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_text.done",
+                            "output_index": 0,
+                            "item_id": "msg_count",
+                            "content_index": 0,
+                            "text": "count",
+                            "logprobs": [],
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "status": "completed",
+                                "output": [
+                                    {
+                                        "id": "msg_count",
+                                        "type": "message",
+                                        "status": "completed",
+                                        "content": [
+                                            {
+                                                "type": "output_text",
+                                                "text": "count",
+                                                "logprobs": [],
+                                            }
+                                        ],
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
+            include = payload.get("include", [])
+            if "probability-regression" in json.dumps(payload) or (
+                isinstance(include, list) and "message.output_text.logprobs" in include
+            ):
+                terminal_status = (
+                    "incomplete" if "probability-incomplete" in json.dumps(payload) else "completed"
+                )
+                terminal_event = f"response.{terminal_status}"
+                records = [{"token": "OK", "logprob": -0.125, "bytes": [79, 75]}]
+                text_done_records = [{"token": "OK", "logprob": -0.1250001, "bytes": [79, 75]}]
+                item_done_records = [{"token": "OK", "logprob": -0.1250002, "bytes": [79, 75]}]
+                terminal_records = [{"token": "OK", "logprob": -0.125000123, "bytes": [79, 75]}]
+                if "probability-empty-first" in json.dumps(payload):
+                    self.wfile.write(
+                        _sse_frame(
+                            {
+                                "type": "response.output_text.delta",
+                                "output_index": 0,
+                                "item_id": "msg_probability",
+                                "content_index": 0,
+                                "delta": "",
+                                "logprobs": [],
+                            }
+                        )
+                    )
+                if "probability-done-first" in json.dumps(payload):
+                    self.wfile.write(
+                        _sse_frame(
+                            {
+                                "type": "response.output_text.done",
+                                "output_index": 0,
+                                "item_id": "msg_probability",
+                                "content_index": 0,
+                                "text": "",
+                                "logprobs": records,
+                            }
+                        )
+                    )
+                if "probability-first" in json.dumps(payload):
+                    self.wfile.write(
+                        _sse_frame(
+                            {
+                                "type": "response.output_text.delta",
+                                "output_index": 0,
+                                "item_id": "msg_probability",
+                                "content_index": 0,
+                                "delta": "",
+                                "logprobs": records,
+                            }
+                        )
+                    )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_text.delta",
+                            "output_index": 0,
+                            "item_id": "msg_probability",
+                            "content_index": 0,
+                            "delta": "OK",
+                            "logprobs": []
+                            if "probability-first" in json.dumps(payload)
+                            else records,
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_text.done",
+                            "output_index": 0,
+                            "item_id": "msg_probability",
+                            "content_index": 0,
+                            "text": "OK",
+                            "logprobs": text_done_records,
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.content_part.done",
+                            "output_index": 0,
+                            "item_id": "msg_probability",
+                            "content_index": 0,
+                            "part": {
+                                "type": "output_text",
+                                "text": "OK",
+                                "logprobs": None
+                                if "probability-null" in json.dumps(payload)
+                                else [],
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": 0,
+                            "item": {
+                                "id": "msg_probability",
+                                "type": "message",
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "OK",
+                                        "logprobs": None
+                                        if "probability-null" in json.dumps(payload)
+                                        else item_done_records,
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": terminal_event,
+                            "response": {
+                                "status": terminal_status,
+                                "incomplete_details": {"reason": "max_output_tokens"},
+                                "output": [
+                                    {
+                                        "id": "msg_probability",
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "status": "completed",
+                                        "content": [
+                                            {
+                                                "type": "output_text",
+                                                "text": "OK",
+                                                "logprobs": None
+                                                if "probability-null" in json.dumps(payload)
+                                                else terminal_records,
+                                            }
+                                        ],
+                                    }
+                                ],
+                                "usage": {"input_tokens": 1, "output_tokens": 1},
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
             if hosted_echoed:
                 # Turn 2 of the hosted lane: the continuation replayed the
                 # verbatim web_search_call item, so answer with plain text.
@@ -880,10 +1083,12 @@ def _responses_engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Ser
             supports_tools=True,
             supports_temperature=False,
             maximum_output_tokens=128_000,
+            supports_logprobs=True,
         ),
         gateway_capabilities=GatewayDeploymentCapabilities(
             supports_streaming=True,
             supports_streaming_tool_arguments=True,
+            supports_responses_logprobs=True,
         ),
         prices=GatewayTokenPrices(),
         pricing_source=None,
@@ -1595,6 +1800,184 @@ def test_responses_stream_zero_output_keeps_terminal_usage(
     assert usage["output_tokens"] == 0
 
 
+def test_responses_sdk_stream_preserves_probability_phases_and_final_json(
+    responses_engine: _ServingEngine,
+) -> None:
+    """The served native SSE path retains rich phase observations and final records."""
+    client = OpenAI(
+        base_url=f"{responses_engine.base}/v1",
+        api_key=responses_engine.raw_key,
+    )
+    with client.responses.stream(
+        model="responses",
+        input="probability-regression",
+        include=["message.output_text.logprobs"],
+        top_logprobs=0,
+        store=False,
+    ) as stream:
+        events = list(stream)
+        final = stream.get_final_response()
+    event_types = [event.type for event in events]
+    assert "response.output_text.delta" in event_types
+    assert "response.output_text.done" in event_types
+    assert "response.output_item.done" in event_types
+    delta_event = next(
+        event.model_dump() for event in events if event.type == "response.output_text.delta"
+    )
+    assert delta_event["logprobs"][0]["bytes"] == [79, 75]
+    text_done = next(
+        event.model_dump() for event in events if event.type == "response.output_text.done"
+    )
+    assert text_done["logprobs"][0]["token"] == "OK"
+    item_done = next(
+        event.model_dump() for event in events if event.type == "response.output_item.done"
+    )
+    assert item_done["item"]["content"][0]["logprobs"][0]["token"] == "OK"
+    assert item_done["item"]["content"][0]["logprobs"][0]["logprob"] == -0.1250002
+    body = final.model_dump()
+    assert body["output"][0]["content"][0]["text"] == "OK"
+    assert body["output"][0]["content"][0]["logprobs"]
+    assert body["output"][0]["content"][0]["logprobs"][0]["token"] == "OK"
+    assert body["output"][0]["content"][0]["logprobs"][0]["bytes"] == [79, 75]
+    assert body["output"][0]["content"][0]["logprobs"][0]["logprob"] == -0.125000123
+
+
+def test_responses_count_only_does_not_add_include_or_records(
+    responses_engine: _ServingEngine,
+) -> None:
+    """A count alone forwards no selector and returns no probability records."""
+    with _ResponsesUpstream.payloads_lock:
+        _ResponsesUpstream.payloads.clear()
+    response = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={"model": "responses", "input": "count-only", "top_logprobs": 2},
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["output"][0]["content"][0]["logprobs"] == []
+    with _ResponsesUpstream.payloads_lock:
+        dispatched = tuple(_ResponsesUpstream.payloads)
+    assert dispatched
+    include = dispatched[-1].get("include", [])
+    assert isinstance(include, list)
+    assert "message.output_text.logprobs" not in include
+    assert dispatched[-1]["top_logprobs"] == 2
+
+
+def test_responses_ws_probability_generation_preserves_phases(
+    responses_engine: _ServingEngine,
+) -> None:
+    """Generating Responses WebSocket retains delta and terminal probabilities."""
+    with connect(
+        f"ws://{responses_engine.base.removeprefix('http://')}/v1/responses",
+        additional_headers={"Authorization": f"Bearer {responses_engine.raw_key}"},
+    ) as socket:
+        socket.send(
+            json.dumps(
+                {
+                    "type": "response.create",
+                    "model": "responses",
+                    "input": "probability-regression",
+                    "include": ["message.output_text.logprobs"],
+                    "top_logprobs": 0,
+                }
+            )
+        )
+        events: list[JsonObject] = []
+        while True:
+            event = json.loads(socket.recv(timeout=30))
+            assert isinstance(event, dict)
+            events.append(event)
+            if event["type"] in {"response.completed", "response.incomplete"}:
+                break
+    delta = next(event for event in events if event["type"] == "response.output_text.delta")
+    delta_records = delta.get("logprobs")
+    assert isinstance(delta_records, list) and isinstance(delta_records[0], dict)
+    assert delta_records[0].get("bytes") == [79, 75]
+    done = next(event for event in events if event["type"] == "response.output_text.done")
+    done_records = done.get("logprobs")
+    assert isinstance(done_records, list) and isinstance(done_records[0], dict)
+    assert done_records[0].get("logprob") == -0.1250001
+    terminal = events[-1]
+    response = terminal.get("response")
+    assert isinstance(response, dict)
+    output = response.get("output")
+    assert isinstance(output, list) and isinstance(output[0], dict)
+    content = output[0].get("content")
+    assert isinstance(content, list) and isinstance(content[0], dict)
+    terminal_records = content[0].get("logprobs")
+    assert isinstance(terminal_records, list) and isinstance(terminal_records[0], dict)
+    record = terminal_records[0]
+    assert record["logprob"] == -0.125000123
+    assert record["bytes"] == [79, 75]
+
+
+def test_responses_probability_incomplete_nonstream_preserves_terminal_records(
+    responses_engine: _ServingEngine,
+) -> None:
+    """A nonstream incomplete terminal still carries provider probabilities."""
+    response = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={
+            "model": "responses",
+            "input": "probability-incomplete",
+            "include": ["message.output_text.logprobs"],
+            "top_logprobs": 0,
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "incomplete", body
+    record = body["output"][0]["content"][0]["logprobs"][0]
+    assert record == {"token": "OK", "logprob": -0.125000123, "bytes": [79, 75]}
+
+
+def test_responses_probability_continuation_replays_history_without_logprobs(
+    responses_engine: _ServingEngine,
+) -> None:
+    """Continuation history keeps text and bytes while omitting provider metadata."""
+    with _ResponsesUpstream.payloads_lock:
+        _ResponsesUpstream.payloads.clear()
+    headers = {"authorization": f"Bearer {responses_engine.raw_key}"}
+    first = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers=headers,
+        json={
+            "model": "responses",
+            "input": "probability-regression",
+            "include": ["message.output_text.logprobs"],
+            "top_logprobs": 0,
+        },
+        timeout=30.0,
+    )
+    assert first.status_code == 200
+    first_body = first.json()
+    second = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers=headers,
+        json={
+            "model": "responses",
+            "previous_response_id": first_body["id"],
+            "input": "probability-regression-continue",
+            "include": ["message.output_text.logprobs"],
+            "top_logprobs": 0,
+        },
+        timeout=30.0,
+    )
+    assert second.status_code == 200
+    second_body = second.json()
+    assert second_body["output"][0]["content"][0]["logprobs"][0]["bytes"] == [79, 75]
+    with _ResponsesUpstream.payloads_lock:
+        dispatched = tuple(_ResponsesUpstream.payloads)
+    assert len(dispatched) == 2
+    replayed = cast(list[JsonObject], dispatched[1]["input"])
+    assert all("logprobs" not in json.dumps(item) for item in replayed), replayed
+
+
 @pytest.mark.parametrize(("prompt", "stop_reason"), _ZERO_OUTPUT_MESSAGES_CASES)
 def test_messages_non_stream_zero_output_keeps_real_input_tokens(
     engine: _ServingEngine,
@@ -1896,7 +2279,7 @@ def test_responses_capped_silent_stop_is_incomplete_max_output_tokens(
     )
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["status"] == "incomplete"
+    assert body["status"] == "incomplete", body
     assert body["incomplete_details"] == {"reason": "max_output_tokens"}
     assert body["output"] == []
 
@@ -2481,6 +2864,82 @@ def test_invalid_chat_verbosity_is_rejected_before_provider_dispatch(
     assert response.json()["error"]["code"] == "invalid_parameter"
     with _SseUpstream.payloads_lock:
         assert len(_SseUpstream.payloads) == before
+
+
+@pytest.mark.parametrize("surface", ["chat/completions", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_ordinary_responses_rung_ignores_unrequested_probability_fields(
+    responses_engine: _ServingEngine, surface: str, stream: bool
+) -> None:
+    """Standard empty upstream probability arrays never break cross-surface output."""
+    response = httpx.post(
+        f"{responses_engine.base}/v1/{surface}",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={
+            "model": "responses",
+            "messages": [{"role": "user", "content": "count-only"}],
+            "max_tokens": 64,
+            "stream": stream,
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    assert "count" in response.text
+    assert "invalid_provider_stream" not in response.text
+    assert "server_error" not in response.text
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "first", ["probability-first", "probability-empty-first", "probability-done-first"]
+)
+def test_probability_only_delta_binds_identity_for_later_text_and_completion(
+    responses_engine: _ServingEngine, stream: bool, first: str
+) -> None:
+    """A populated probability-only first frame does not double-start its message."""
+    response = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={
+            "model": "responses",
+            "input": first,
+            "include": ["message.output_text.logprobs"],
+            "stream": stream,
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "response.completed" in response.text
+        assert "response.failed" not in response.text
+    else:
+        assert response.json()["output"][0]["content"][0]["text"] == "OK"
+        assert response.json()["output"][0]["content"][0]["logprobs"][0]["token"] == "OK"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_nullable_completed_probability_phases_are_preserved(
+    responses_engine: _ServingEngine, stream: bool
+) -> None:
+    """Optional final-part arrays remain null without erasing distinct delta observations."""
+    response = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={
+            "model": "responses",
+            "input": "probability-null",
+            "include": ["message.output_text.logprobs"],
+            "stream": stream,
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "response.completed" in response.text
+        assert "response.failed" not in response.text
+        assert '"logprobs":null' in response.text
+    else:
+        assert response.json()["output"][0]["content"][0]["logprobs"] is None
 
 
 @pytest.mark.parametrize("surface", ["chat/completions", "responses", "messages"])
