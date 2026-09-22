@@ -15,6 +15,13 @@ struct PythonSink(Py<PyAny>);
 impl Sink for PythonSink {
     type Prepared = Py<PyAny>;
 
+    fn preparation_bytes(maximum_record_bytes: usize) -> usize {
+        // CPython may use four bytes per character even in mostly-ASCII JSON
+        // when one supplementary Unicode character occurs. Include the UTF-8
+        // encoding that overlaps construction, plus object header/slack.
+        maximum_record_bytes.saturating_mul(5).saturating_add(256)
+    }
+
     fn prepare(record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
         let encoded = record.encode(maximum_bytes).ok_or(())?;
         Python::try_attach(|py| {

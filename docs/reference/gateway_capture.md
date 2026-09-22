@@ -86,8 +86,14 @@ the structure directly. Request admission still crosses the Python/Rust boundary
 as JSON; exceptional lossless sidecars and raw tool-call strings also use JSON.
 
 Delivery limits bound record count, each final encoded payload and retained record
-memory, including a record currently held by a slow destination. String/vector
-capacity and conservative object-node charges are included; shared trees are charged
+memory, including a record currently held by a slow destination. One destination
+worker also reserves space for its prepared payload before any queue admission.
+The Python destination reserves five times the encoded-payload limit plus 256 bytes:
+one UTF-8 encoding, a worst-case four-byte Unicode string and object overhead.
+Queued content uses the remaining budget, so a full queue cannot prevent preparing
+its first record. Configurations without room for both are rejected. The reservation
+is included in retained-byte counters while the worker prepares or retries a write.
+String/vector capacity and conservative object-node charges are included; shared trees are charged
 in every owning queue. The writer additionally owns one bounded response's decoded
 tree while encoding and persisting it. Separate bounds cover in-flight entry count and memory, total response-buffer capacity
 and request lifetime. Expiration runs on collector operations and once per second

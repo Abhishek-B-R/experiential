@@ -11,15 +11,20 @@ use std::time::{Duration, Instant};
 
 struct MemorySink(mpsc::Sender<Record>);
 impl Sink for MemorySink {
-    type Prepared = Record;
+    type Prepared = String;
+
+    fn preparation_bytes(maximum_record_bytes: usize) -> usize {
+        maximum_record_bytes
+    }
 
     fn prepare(record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
-        let encoded = record.encode(maximum_bytes).ok_or(())?;
-        serde_json::from_str(&encoded).map_err(|_| ())
+        record.encode(maximum_bytes).ok_or(())
     }
 
     fn write(&mut self, record: &Self::Prepared) -> Result<(), ()> {
-        self.0.send(record.clone()).map_err(|_| ())
+        self.0
+            .send(serde_json::from_str(record).map_err(|_| ())?)
+            .map_err(|_| ())
     }
 }
 
@@ -66,10 +71,14 @@ struct HeldSink {
 }
 
 impl Sink for HeldSink {
-    type Prepared = Record;
+    type Prepared = String;
 
-    fn prepare(record: &Record, _maximum_bytes: usize) -> Result<Self::Prepared, ()> {
-        Ok(record.clone())
+    fn preparation_bytes(maximum_record_bytes: usize) -> usize {
+        maximum_record_bytes
+    }
+
+    fn prepare(record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
+        record.encode(maximum_bytes).ok_or(())
     }
 
     fn write(&mut self, record: &Self::Prepared) -> Result<(), ()> {
@@ -83,7 +92,9 @@ impl Sink for HeldSink {
             self.fail = false;
             Err(())
         } else {
-            self.records.send(record.clone()).map_err(|_| ())
+            self.records
+                .send(serde_json::from_str(record).map_err(|_| ())?)
+                .map_err(|_| ())
         }
     }
 }
@@ -99,7 +110,7 @@ async fn stalled_writer_backpressures_complete_responses_without_blocking_the_ru
                 Configuration {
                     delivery: Limits {
                         maximum_records: 1,
-                        maximum_bytes: 16384,
+                        maximum_bytes: 32768,
                         maximum_record_bytes: 8192,
                     },
                     maximum_pending_records: 8,

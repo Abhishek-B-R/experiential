@@ -82,6 +82,10 @@ struct MaintainedSink<S> {
 impl<S: Sink> Sink for MaintainedSink<S> {
     type Prepared = S::Prepared;
 
+    fn preparation_bytes(maximum_record_bytes: usize) -> usize {
+        S::preparation_bytes(maximum_record_bytes)
+    }
+
     fn prepare(record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
         S::prepare(record, maximum_bytes)
     }

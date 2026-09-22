@@ -7,16 +7,18 @@ struct PausedSink {
 }
 
 impl Sink for PausedSink {
-    type Prepared = Record;
+    type Prepared = String;
+
+    fn preparation_bytes(_maximum_record_bytes: usize) -> usize {
+        512
+    }
 
     fn prepare(record: &Record, _maximum_bytes: usize) -> Result<Self::Prepared, ()> {
-        Ok(record.clone())
+        Ok(record.request.request_id.clone())
     }
 
     fn write(&mut self, record: &Self::Prepared) -> Result<(), ()> {
-        self.entered
-            .send(record.request.request_id.clone())
-            .map_err(|_| ())?;
+        self.entered.send(record.clone()).map_err(|_| ())?;
         self.resume
             .recv_timeout(Duration::from_secs(5))
             .map_err(|_| ())?;
@@ -47,7 +49,7 @@ fn paused(limits: Limits, fail: bool) -> (Delivery, mpsc::Receiver<String>, mpsc
 fn limits() -> Limits {
     Limits {
         maximum_records: 2,
-        maximum_bytes: record("12345678").heap_bytes() * 2,
+        maximum_bytes: record("12345678").heap_bytes() * 2 + 512,
         maximum_record_bytes: 1024,
     }
 }
@@ -113,7 +115,7 @@ fn record_count_is_bounded_even_for_tiny_records() {
     assert!(result.recv_timeout(Duration::from_millis(30)).is_err());
     assert_eq!(
         delivery.counts(),
-        [2, (record("a").heap_bytes() * 2) as u64, 0, 0, 0]
+        [2, (record("a").heap_bytes() * 2 + 512) as u64, 0, 0, 0]
     );
     resume.send(()).unwrap();
     assert!(result.recv_timeout(Duration::from_secs(1)).unwrap());
@@ -150,7 +152,7 @@ fn failed_destination_retains_budget_and_retries_the_same_record_after_close_tim
     assert!(!delivery.close_until(Instant::now()));
     assert_eq!(
         delivery.counts(),
-        [1, record("private").heap_bytes() as u64, 0, 1, 0]
+        [1, (record("private").heap_bytes() + 512) as u64, 0, 1, 0]
     );
     resume.send(()).unwrap();
     assert!(delivery.close_until(Instant::now() + Duration::from_secs(1)));
