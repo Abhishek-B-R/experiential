@@ -17,7 +17,11 @@ class SimulatedToolUseError(RuntimeError):
 
 @dataclass(frozen=True)
 class SimulatedEnvironmentSession:
-    """Deliver generated results without invoking any external tool implementation."""
+    """Deliver generated results without invoking any external tool implementation.
+
+    Attributes:
+        observe: Required callback resolving an exact pending call into its generated result.
+    """
 
     observe: Callable[[ToolCall], Observation]
 
@@ -28,7 +32,11 @@ class SimulatedEnvironmentSession:
 
 @dataclass(frozen=True)
 class SimulatedEnvironmentRuntime:
-    """Open an execute-only facade over one rollout's generated tool observations."""
+    """Open an execute-only facade over one rollout's generated tool observations.
+
+    Attributes:
+        observe: Required rollout-local callback shared with the opened session.
+    """
 
     observe: Callable[[ToolCall], Observation]
 

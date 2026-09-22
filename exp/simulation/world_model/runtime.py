@@ -48,7 +48,13 @@ from exp.simulation.world_model.artifact import (
 
 @dataclass(frozen=True)
 class PreparedGroundedWorldModelCall:
-    """One retrieved and framed grounded request before provider dispatch."""
+    """One retrieved and framed grounded request before provider dispatch.
+
+    Attributes:
+        request: Fully framed world-model request ready for dispatch.
+        matches: Ordered grounding examples selected for the action.
+        action: Exact candidate action whose call IDs constrain generated results.
+    """
 
     request: ModelRequest
     matches: tuple[RAGMatch, ...]
@@ -57,7 +63,14 @@ class PreparedGroundedWorldModelCall:
 
 @dataclass(frozen=True)
 class DispatchedGroundedWorldModelCall:
-    """One artifact-bound response paired with its exact request and retrieval evidence."""
+    """One artifact-bound response paired with its exact request and retrieval evidence.
+
+    Attributes:
+        request: Exact dispatched world-model request.
+        response: Provider response awaiting protocol validation.
+        matches: Grounding evidence included in the request.
+        action: Exact candidate action used when validating generated result identities.
+    """
 
     request: ModelRequest
     response: ModelResponse
