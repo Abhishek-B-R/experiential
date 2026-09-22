@@ -63,6 +63,20 @@ def test_python_sink_runs_off_caller_thread_and_close_releases_gil() -> None:
     assert collector.maintenance_failures() == 0
 
 
+def test_close_timeout_preserves_accepted_content_for_later_host_settlement() -> None:
+    """Timing out the Python boundary cannot purge accepted but undecided content."""
+    records: list[str] = []
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), records.append)
+    assert collector.begin(_request_json())
+    assert not collector.close(0)
+    assert collector.counts() == (0, 0, 0, 0, 0, 0)
+    collector.settle("request", True, False)
+    assert collector.close(1)
+    assert len(records) == 1
+    assert CaptureRecord.model_validate_json(records[0]).request.request_id == "request"
+    assert collector.counts() == (0, 0, 1, 0, 0, 0)
+
+
 def test_python_sink_failure_never_logs_exception_content(
     capfd: pytest.CaptureFixture[str],
 ) -> None:
@@ -141,7 +155,7 @@ def test_accepted_routing_failure_keeps_effective_prompt_without_inventing_model
     assert "retained task" in records[0]
 
 
-@pytest.mark.parametrize("policy", ["local", "hosted", "off", "broken", "full"])
+@pytest.mark.parametrize("policy", ["local", "hosted", "hosted-late", "off", "broken", "full"])
 def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy: str
 ) -> None:
@@ -156,7 +170,7 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     )
     components = load_gateway_components(tmp_path)
     records: list[str] = []
-    configuration = CaptureConfiguration(settlement_required=policy == "hosted")
+    configuration = CaptureConfiguration(settlement_required=policy in {"hosted", "hosted-late"})
     collector = native.CaptureCollector(configuration.model_dump_json(), records.append)
     if policy == "full":
         assert collector.close(1)
@@ -188,6 +202,7 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
 
     worker = threading.Thread(target=run, daemon=True)
     worker.start()
+    awaiting_settlement: list[str] = []
     try:
         _wait_ready(port, worker)
         for surface in ("chat/completions", "responses", "messages"):
@@ -216,6 +231,14 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
                 assert "hello " in response.text and "world" in response.text
                 if policy == "hosted":
                     collector.settle(response.headers["x-request-id"], True, True)
+                elif policy == "hosted-late":
+                    awaiting_settlement.append(response.headers["x-request-id"])
+        if policy == "hosted-late":
+            assert not collector.close(0)
+            assert not records
+            assert collector.counts()[5] == 0
+            for request_id in awaiting_settlement:
+                collector.settle(request_id, True, True)
     finally:
         shutdown.request_shutdown()
         worker.join(timeout=10)

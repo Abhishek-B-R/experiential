@@ -330,3 +330,63 @@ fn local_capture_does_not_require_hosted_settlement() {
     collector.finish("request", Some(response()), None);
     assert_eq!(drain(&collector, receiver).len(), 1);
 }
+
+#[test]
+fn shutdown_timeout_preserves_pending_history_and_accepts_late_settlement() {
+    let (collector, receiver) = collector(config());
+    assert!(collector.begin(request("waiting")));
+    assert!(collector.finish("waiting", Some(response()), None));
+    let bytes = collector.pending.lock().unwrap().bytes;
+    assert!(!collector.close_until(Instant::now()));
+    {
+        let pending = collector.pending.lock().unwrap();
+        assert!(pending.entries.contains_key("waiting"));
+        assert_eq!(pending.bytes, bytes);
+    }
+    assert_eq!(collector.counts()[5], 0);
+    assert!(!collector.begin(request("late")));
+    collector.settle("waiting", true, true);
+    let records = drain(&collector, receiver);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].request.request_id, "waiting");
+    assert!(records[0].response.is_some());
+    assert_eq!(collector.counts(), [0, 0, 1, 0, 0, 1]);
+}
+
+#[test]
+fn shutdown_waits_for_an_accepted_response_instead_of_closing_its_destination() {
+    let mut configuration = config();
+    configuration.settlement_required = false;
+    let (collector, receiver) = collector(configuration);
+    assert!(collector.begin(request("active")));
+    let closing = collector.clone();
+    let thread =
+        std::thread::spawn(move || closing.close_until(Instant::now() + Duration::from_secs(2)));
+    let until = Instant::now() + Duration::from_secs(1);
+    while !collector.pending.lock().unwrap().closed && Instant::now() < until {
+        std::thread::yield_now();
+    }
+    assert!(collector.pending.lock().unwrap().closed);
+    assert!(collector.finish("active", Some(response()), None));
+    assert!(thread.join().unwrap());
+    assert_eq!(receiver.try_iter().count(), 1);
+    assert_eq!(collector.counts(), [0, 0, 1, 0, 0, 0]);
+}
+
+#[test]
+fn shutdown_keeps_delivery_open_during_the_pending_map_handoff() {
+    let (collector, receiver) = collector(config());
+    assert!(collector.begin(request("handoff")));
+    // Pause exactly where finish/settle releases the map lock before emit().
+    let entry = {
+        let mut pending = collector.pending.lock().unwrap();
+        let entry = pending.entries.remove("handoff").unwrap();
+        pending.bytes -= entry.bytes;
+        entry
+    };
+    assert!(!collector.close_until(Instant::now()));
+    assert!(collector.emit(entry.record, None));
+    drop(entry._admission);
+    assert_eq!(drain(&collector, receiver).len(), 1);
+    assert_eq!(collector.counts(), [0, 0, 1, 0, 0, 0]);
+}
