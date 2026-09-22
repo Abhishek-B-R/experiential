@@ -153,6 +153,25 @@ fn routing_provenance_is_optional_until_selected_and_then_immutable() {
 }
 
 #[test]
+fn collector_forwards_destination_cleanup_failure_without_losing_write_success() {
+    struct CleanupFailure;
+    impl Sink for CleanupFailure {
+        fn write(&mut self, _: &Record, _: usize) -> Result<(), ()> {
+            Ok(())
+        }
+        fn take_maintenance_failures(&mut self) -> u64 {
+            1
+        }
+    }
+    let collector = Collector::new(config(), CleanupFailure).unwrap();
+    assert!(collector.begin(request("saved")));
+    collector.settle("saved", true, false);
+    assert!(collector.close_until(Instant::now() + Duration::from_secs(1)));
+    assert_eq!(collector.counts(), [0, 0, 1, 0, 0, 0]);
+    assert_eq!(collector.maintenance_failures(), 1);
+}
+
+#[test]
 fn selected_model_uses_cached_request_size_including_json_escapes() {
     let mut configuration = config();
     configuration.maximum_request_bytes = 1024;

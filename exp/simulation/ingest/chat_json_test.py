@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from exp.common.core.artifacts import JsonObject, SourceIdentity
 from exp.simulation.ingest.chat_json import CHAT_JSON_SOURCE
 from exp.simulation.ingest.vendor_trace import SYNTHETIC_TIME_ATTRIBUTE
 
@@ -44,7 +45,9 @@ def test_load_chat_json_file_keeps_synthetic_timing_and_source_metadata(tmp_path
     result = CHAT_JSON_SOURCE.load(path)
 
     trace = result.traces[0]
-    assert trace.initial_context == {}
+    assert trace.initial_context == {
+        "instruction_messages": [{"role": "system", "content": "You are helpful."}]
+    }
     call, completion = trace.spans[0], trace.spans[2]
     assert completion.attributes["gen_ai.completion"] == "It is 18C in Paris."
     assert call.attributes[SYNTHETIC_TIME_ATTRIBUTE] is True
@@ -122,3 +125,56 @@ def test_load_chat_json_file_rejects_partial_model_identity(tmp_path: Path) -> N
 
     assert result.traces == ()
     assert "provider" in result.issues[0].message
+
+
+def test_reused_call_id_keeps_each_unnamed_result_with_its_preceding_tool() -> None:
+    """Later call-ID reuse cannot rewrite an earlier tool result or mutate the source export."""
+    conversation: JsonObject = {
+        "trace_id": "reused-call-id",
+        "messages": [
+            {"role": "user", "content": "Search and extract the company website."},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "parallel_search", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "Search result"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "parallel_extract", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "Extract result"},
+            {"role": "assistant", "content": "Done."},
+        ],
+    }
+    original = json.dumps(conversation, sort_keys=True)
+
+    result = CHAT_JSON_SOURCE.normalize(
+        (conversation,), source=SourceIdentity(kind="manual", source_id="reused-call-id")
+    )
+
+    assert not result.issues
+    assert len(result.traces) == 1
+    search_call, search_result, extract_call, extract_result, _ = result.traces[0].spans
+    tool_spans = (search_call, search_result, extract_call, extract_result)
+    assert [span.attributes["gen_ai.tool.name"] for span in tool_spans] == [
+        "parallel_search",
+        "parallel_search",
+        "parallel_extract",
+        "parallel_extract",
+    ]
+    assert search_result.parent_span_id == search_call.span_id
+    assert extract_result.parent_span_id == extract_call.span_id
+    assert all(span.attributes["gen_ai.tool.call.id"] == "call-1" for span in tool_spans)
+    assert json.dumps(conversation, sort_keys=True) == original

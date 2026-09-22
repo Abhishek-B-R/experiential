@@ -141,6 +141,31 @@ fn failed_destination_releases_budget_and_records_no_sensitive_error() {
 }
 
 #[test]
+fn committed_write_and_cleanup_failures_have_separate_counters() {
+    struct CleanupFailure;
+    impl Sink for CleanupFailure {
+        fn write(&mut self, _: &Record, _: usize) -> Result<(), ()> {
+            Ok(())
+        }
+        fn take_maintenance_failures(&mut self) -> u64 {
+            1
+        }
+        fn maintain(&mut self) -> Result<(), ()> {
+            Err(())
+        }
+    }
+    let delivery = Delivery::new(limits(), CleanupFailure).unwrap();
+    assert!(delivery.submit(record("saved")));
+    let until = Instant::now() + Duration::from_secs(5);
+    while delivery.maintenance_failures() < 2 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(delivery.close_until(until));
+    assert_eq!(delivery.counts(), [0, 0, 1, 0, 0]);
+    assert!(delivery.maintenance_failures() >= 2);
+}
+
+#[test]
 fn shutdown_timeout_reports_incomplete_drain_without_purging_accepted_records() {
     let (delivery, entered, resume) = paused(limits(), false);
     let delivery = Arc::new(delivery);

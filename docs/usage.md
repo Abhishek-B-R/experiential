@@ -11,6 +11,8 @@ The root surface is deliberately small:
 | `exp login [--root ROOT]` | Sign in to Experiential Cloud through the Platform browser approval flow, save the returned organization key, and synchronize the authenticated account's model identities. | User-local credential plus secret-free hosted provider/model records in `.exp/models.toml`. |
 | `exp run [PROJECT] [--root ROOT] [--check]` | Start the local gateway directly, optionally with one project-backed alias. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
 | `exp eval [PROJECT] --models ALIAS,ALIAS` | Compare models on the project scenarios, or open the terminal project picker. | Saved resumable run, JSON evidence, and offline Pareto report. |
+
+| `exp ingest PROJECT --traces PATH --source chat-json` | Import canonical file or gateway traces. | Immutable imports and project associations in `gateway/traffic.db`. |
 | `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Launch the guided end-to-end build when traces are omitted, or use one explicit local source for automation. | Simulation, serving RAG, fit RAG, syllabus, evaluation evidence, and a runnable automatic router. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
 | `exp optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
@@ -38,9 +40,9 @@ product telemetry, which may send unless disabled. Gateway startup makes no prov
 build calls only the configured embedder; automatic router optimization separately executes the
 bounded candidate, world-model, and judge schedule shown in its cost preflight.
 An authenticated gateway request is the explicit online model-call boundary. Project selectors
-remain frozen for the process lifetime and return only an exact model pool. `--ghost` remains a
-compatibility flag for project-journal behavior; gateway authentication, replay, attempts, and
-usage accounting stay enabled.
+remain frozen for the process lifetime and return only an exact model pool. `--ghost` disables
+local traffic content capture; gateway authentication, replay, attempts, and usage accounting
+stay enabled.
 
 The default and project gateway forms use one gateway lifecycle. It binds only `127.0.0.1`, starts with no
 provider call, and requires an explicit provider environment reference, exact model alias, identity,
@@ -56,7 +58,9 @@ specific variables avoid overwriting an upstream provider's `OPENAI_API_KEY`. Th
 unavailable alias and provider configuration; fix that configuration and rerun `exp`. If the
 one-time key was not saved, issue a replacement with
 `exp config gateway key issue IDENTITY --key-id KEY --json`.
-The gateway writes no prompts, responses, tool arguments, raw keys, or provider secrets to SQLite.
+The accounting database stays content-free. Local traffic content is captured separately by default;
+use `--ghost` to disable it. See [local traffic capture](reference/local_gateway_traffic.md).
+Raw virtual keys and resolved provider credentials are never copied into capture or accounting.
 `GET /usage` and `GET /usage.json` expose the same schema-v2 content-free overall and per-identity
 counts, token usage, latency, terminal states, and attributed estimated cost. Their attempt-only
 `by_billing_source` buckets conserve attempts, tokens, known cost, unknown-cost attempts, and
@@ -271,3 +275,34 @@ shared valid cohort; invalid/incomplete coverage and total experiment spend rema
 Assistant cost per task reprices recorded successful-rollout tokens at the frozen catalog rates.
 It excludes simulation, judging, invalid attempts, and hypothetical retry reservations.
 Conservative experiment-spend accounting remains separate from the report's operating cost.
+
+### Ingest a trace export
+
+```bash
+exp ingest powerset --traces rollouts.jsonl --source chat-json --root .exp
+exp ingest powerset --source gateway --identity default --root .exp
+```
+
+Ingest stores canonical traces in `.exp/gateway/traffic.db`, alongside native gateway captures.
+It preserves initial system/developer instructions, declared tool schemas, paired tool results,
+source provenance, normalization exclusions and model identity evidence. The receipt identifies
+an immutable import associated with the project. Repeating an unchanged import reuses its records
+and association; changed source content produces a new import without overwriting earlier evidence.
+
+No model setup, embedding, simulation or judging runs. No project folder is created.
+`--dry-run` validates the source and reports accepted/excluded records without writing anything.
+A terminal can prompt for the source file and format; automation supplies `--traces` explicitly.
+OTel sources (`otlp`, `otel-genai`) and completed exported chat captures (`experiential`) use the
+same persistence path. See [trace input and storage](reference/ingest.md) for the Python API.
+
+Native capture exports must contain completed JSON Chat Completions responses. Export stream
+captures as reconstructed `chat-json`, or use `--source gateway` to consume the native database's
+JSON/SSE captures. Incomplete or refused exports appear as explicit exclusions. Chat exports
+without timestamps retain synthetic ordering markers and do not imply measured latency.
+There is no minimum or maximum import count.
+
+### Local gateway traffic
+
+See [local traffic capture](reference/local_gateway_traffic.md) for default-on,
+identity-scoped collection. `--source gateway` reads every retained record for the required
+identity from one consistent snapshot, including corpora larger than one page.

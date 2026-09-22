@@ -23,6 +23,7 @@ CLI_PACKAGES = frozenset(
         "config",
         "evaluation",
         "gateway",
+        "ingest",
         "judge",
         "optimize",
         "providers",

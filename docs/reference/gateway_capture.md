@@ -119,3 +119,23 @@ admission policy is a performance gate, not a replacement for those checks. Capt
 does not alter user-visible content, provider attribution, billing or the content-free
 accounting ledger. The local CLI integration supplies the same collector with
 identity/application bindings and a SQLite sink, without a hosted settlement gate.
+
+The local sink captures completed Chat, Responses, and Messages exchanges, including
+Messages SSE thinking signatures, tool blocks, and stop reasons. The stored exchange
+also retains the original captured output frames and loss indicators. The canonical
+trace exposes exact input/output messages, reasoning, raw tool arguments, and tool
+error flags; tool failure is not evidence of whole-task failure or success.
+
+Each exchange includes the full submitted or explicitly expanded history. Responses
+parent links can recover earlier observed reasoning within the same identity. Missing
+parents are labeled; unrelated Chat requests are never joined by matching prefixes.
+Callers may optionally use request `metadata.conversation_id` to label an episode;
+it takes precedence over `X-Session-Id`. Otherwise the captured session header
+becomes the episode ID. Both remain scoped to authenticated identity and application.
+Neither is required to capture a full submitted conversation.
+
+Local retention enables SQLite secure deletion and checkpoints/truncates its WAL
+after pruning. A concurrent reader can temporarily prevent WAL truncation; this is
+reported as a maintenance failure and retried on idle maintenance, not claimed as
+successful physical erasure. OS snapshots, backups, and storage-device remanence are
+outside this database lifecycle. Expired rows are never returned by the reader API.
