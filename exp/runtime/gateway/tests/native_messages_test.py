@@ -72,7 +72,24 @@ _DRIVER_SOURCE = textwrap.dedent(
             Path(config["root"]),
             environment=environment,
         )
-        control_plane = NativeControlPlane(
+        control_plane_type = NativeControlPlane
+        if "qwen_mock_url" in config:
+            class LoopbackQwenControlPlane(NativeControlPlane):
+                """Redirect only the admitted network destination to the local mock."""
+
+                def admit(self, argument: str) -> str:
+                    """Keep real decoding, admission and frozen payloads; replace the URL."""
+                    admitted = json.loads(super().admit(argument))
+                    for rung in admitted["route"]:
+                        assert rung["url"] == (
+                            "https://token-plan.ap-southeast-1.maas.aliyuncs.com"
+                            "/compatible-mode/v1/chat/completions"
+                        )
+                        rung["url"] = config["qwen_mock_url"]
+                    return json.dumps(admitted)
+
+            control_plane_type = LoopbackQwenControlPlane
+        control_plane = control_plane_type(
             components,
             request_timeout_seconds=config["request_timeout_seconds"],
         )
@@ -729,25 +746,35 @@ def _messages_body(prompt: str, *, stream: bool = False, tools: bool = False) ->
 
 
 @pytest.fixture(scope="module", name="engine")
-def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine]:
+def _engine(
+    tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest
+) -> Iterator[_ServingEngine]:
     """Serve one shared native engine subprocess over a seeded root.
 
     Yields:
         The live serving facts as a :class:`_ServingEngine`.
     """
+    qwen_budget = getattr(request, "param", None) == "qwen-budget"
     root = tmp_path_factory.mktemp("native-messages-root")
     with _SseUpstream.payloads_lock:
         _SseUpstream.payloads.clear()
     upstream = ThreadingHTTPServer((_HOST, 0), _SseUpstream)
     upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
     upstream_thread.start()
+    mock_url = f"http://{_HOST}:{upstream.server_address[1]}/v1"
     _manager, raw_key = _configured_gateway(
         root,
-        base_url=f"http://{_HOST}:{upstream.server_address[1]}/v1",
+        base_url=(
+            "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+            if qwen_budget
+            else mock_url
+        ),
+        provider_model="qwen3.8-max" if qwen_budget else "provider-model-exact",
         capabilities=ModelCapabilities(
             chat_max_tokens_field="max_completion_tokens",
             maximum_output_tokens=128,
             maximum_temperature=1.0,
+            supports_reasoning=qwen_budget,
         ),
     )
     driver = root / "native_messages_driver.py"
@@ -756,6 +783,7 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         {
             "root": str(root),
             "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS,
+            **({"qwen_mock_url": f"{mock_url}/chat/completions"} if qwen_budget else {}),
         }
     )
     stderr_log = root / "driver-stderr.log"
@@ -2504,3 +2532,74 @@ def test_large_tool_description_reaches_provider_unchanged(
     forwarded = cast(JsonObject, tools[0]["function"])
     assert forwarded["description"] == description
     assert marker not in (engine.root / "driver-stderr.log").read_text()
+
+
+@pytest.mark.parametrize("stream", (False, True))
+def test_chat_responses_spelling_of_output_limit_serves(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """The Chat endpoint accepts max_output_tokens and retains length-stop semantics."""
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "silent-stop-token"}],
+            "max_output_tokens": 40,
+            "stream": stream,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        chunks = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert any(
+            choice.get("finish_reason") == "length"
+            for chunk in chunks
+            for choice in chunk.get("choices", [])
+        )
+    else:
+        assert response.json()["choices"][0]["finish_reason"] == "length"
+
+
+@pytest.mark.parametrize("engine", ("qwen-budget",), indirect=True)
+@pytest.mark.parametrize("stream", (False, True))
+def test_chat_thinking_budget_survives_native_http_dispatch(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """Both client modes deliver the exact budget and total cap to the mock Qwen server."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking_budget": 32,
+            "enable_thinking": True,
+            "max_output_tokens": 64,
+            "stream": stream,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "data: [DONE]" in response.text
+    else:
+        assert response.json()["choices"][0]["message"]["content"] == "hello world"
+    with _SseUpstream.payloads_lock:
+        captured = list(_SseUpstream.payloads)
+    assert len(captured) == 1
+    assert captured[0]["model"] == "qwen3.8-max"
+    assert captured[0]["thinking_budget"] == 32
+    assert captured[0]["enable_thinking"] is True
+    assert captured[0]["max_completion_tokens"] == 64
+    assert "max_tokens" not in captured[0]
+    assert "max_output_tokens" not in captured[0]
+    assert "reasoning_effort" not in captured[0]
+    assert "reasoning" not in captured[0]

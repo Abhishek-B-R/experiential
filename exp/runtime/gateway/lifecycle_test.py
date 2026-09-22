@@ -1047,6 +1047,7 @@ def _configured_gateway(
     gateway_capabilities: GatewayDeploymentCapabilities | None = None,
     provider: str = "openai-compatible",
     api_version: str | None = None,
+    provider_model: str = "provider-model-exact",
 ) -> tuple[GatewayManagement, str]:
     """Create one explicit direct alias, identity, grant, and key in real SQLite."""
     manager = GatewayManagement(root)
@@ -1067,7 +1068,7 @@ def _configured_gateway(
         root,
         deployment_alias="coding",
         connection_name="provider-main",
-        provider_model="provider-model-exact",
+        provider_model=provider_model,
         exact_model_id="model-revision-exact",
         revision=None,
         capabilities=capabilities or ModelCapabilities(maximum_output_tokens=128_000),

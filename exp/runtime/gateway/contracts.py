@@ -518,6 +518,8 @@ class GatewayRequest(ContractModel):
     own recovery finds the field it sent. ``None`` means the surface default
     (see :attr:`caller_effort_parameter`)."""
     # Level-less enable-thinking; the route seam resolves the concrete effort.
+    thinking_budget: int | None = Field(default=None, gt=0, strict=True, exclude=True)
+    """Explicit Chat reasoning-token cap, forwarded only to budget-capable wires."""
     thinking_default_enable: bool = False
     reasoning_summary: Literal["auto", "concise", "detailed"] | None = None
     reasoning_summary_parameters: tuple[
@@ -979,8 +981,7 @@ class ExecutionSnapshot(ContractModel):
     pool_id: ExactModelPoolId
     deployment_ids: tuple[DeploymentId, ...] = Field(min_length=1)
     # The pool's per-model failover policy, carried onto the route so the
-    # per-attempt retry/failover decision can honor it. Defaults to the
-    # historical maximize_availability.
+    # per-attempt retry/failover decision can honor it.
     failover_mode: FailoverMode = "maximize_availability"
     # The pool's cache-stakes throttle control, carried alongside so the
     # per-attempt decision can weigh the requesting organization's observed
@@ -989,8 +990,7 @@ class ExecutionSnapshot(ContractModel):
     throttle_cache_threshold: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
     # The pool's backoff-and-redial schedule for throttled rungs, carried so
     # the admission can hand the data plane its frozen retry facts and the
-    # per-attempt decision can honor a post-backoff redial. ``None`` keeps
-    # throttles failover-only.
+    # per-attempt decision can honor a post-backoff redial.
     throttle_redial: GatewayThrottleRedialPolicy | None = None
     # Rungs the host flagged for OpenRouter's per-request ZDR constraint; the
     # dispatch builder tightens each and fails closed on a wire that cannot.
