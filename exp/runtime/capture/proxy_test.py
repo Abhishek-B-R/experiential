@@ -432,7 +432,11 @@ def test_client_certificate_alert_stops_once_without_exposing_error(
     proxy.tls_failed_client(data)
     assert shutdowns == [True]
     assert proxy._tls_failure is not None
-    assert "api.openai.com" in proxy._tls_failure
+    assert proxy._tls_failure == (
+        "Capture stopped because a client rejected its certificate for api.openai.com. "
+        "Retry or reload the affected app. Configure the client to trust Capture's CA "
+        "before running exp capture again."
+    )
     assert "private-handshake-detail" not in proxy._tls_failure
     assert "OpenSSL" not in proxy._tls_failure
 
