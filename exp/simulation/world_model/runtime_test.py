@@ -8,10 +8,16 @@ import math
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
-from exp.common.core.artifacts import SourceIdentity, canonical_json_bytes, sha256_json
+from exp.common.core.artifacts import (
+    ArtifactInput,
+    SourceIdentity,
+    canonical_json_bytes,
+    sha256_json,
+)
 from exp.common.models import (
     AssistantAction,
     BillingSource,
@@ -21,17 +27,23 @@ from exp.common.models import (
     ModelResponse,
     ModelSnapshot,
     OperationEconomics,
+    ToolCall,
 )
 from exp.common.project import ProjectConfig, ProjectStore, artifact_input
+from exp.common.tasks import ToolSchema
 from exp.common.traces import Trace, TraceDataset, TraceSource, TraceSpan
 from exp.simulation.engines.text.prompt import (
     WORLD_MODEL_TEXT_SYSTEM_PROMPT,
+    TextWorldModelProtocolError,
     text_prompt_sha256,
 )
 from exp.simulation.retrieval import (
     RAGAction,
     RAGEmbedderBinding,
     RAGLineageBinding,
+    RAGMatch,
+    RAGQuery,
+    TraceRAGRetriever,
     load_fit_rag_retriever,
     load_rag_index,
     persist_trace_rag,
@@ -43,10 +55,13 @@ from exp.simulation.world_model import (
 )
 from exp.simulation.world_model.artifact import (
     GROUNDED_WORLD_MODEL_ARTIFACT_TYPE,
+    GROUNDED_WORLD_MODEL_PROMPT_VERSION,
     GROUNDED_WORLD_MODEL_SYSTEM_PROMPT,
     WORLD_MODEL_ARTIFACT_PATH,
+    GroundedWorldModelArtifact,
     grounded_world_model_prompt_sha256,
 )
+from exp.simulation.world_model.runtime import GroundedWorldModel
 
 
 class _Embedder:
@@ -73,13 +88,19 @@ class _Embedder:
 class _WorldClient:
     """Capture the grounded request and return one strict protocol transition."""
 
-    def __init__(self, snapshot: ModelSnapshot) -> None:
+    def __init__(
+        self,
+        snapshot: ModelSnapshot,
+        output: str = '{"message":"Use the saved email.","terminal":false}',
+    ) -> None:
         """Record requests under one exact fixture model identity.
 
         Args:
             snapshot: Frozen world-model identity returned with every response.
+            output: Simulated provider transition returned to the runtime.
         """
         self.snapshot = snapshot
+        self.output = output
         self.requests: list[ModelRequest] = []
 
     def complete(self, request: ModelRequest) -> ModelResponse:
@@ -93,7 +114,7 @@ class _WorldClient:
         """
         self.requests.append(request)
         return ModelResponse(
-            output=AssistantAction(content='{"message":"Use the saved email.","terminal":false}'),
+            output=AssistantAction(content=self.output),
             model=self.snapshot,
             economics=OperationEconomics(),
         )
@@ -186,7 +207,7 @@ def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: 
     )
     transition = runtime.step(
         task="Reset my password",
-        action=RAGAction(kind="message", content="What email is associated with the account?"),
+        action=AssistantAction(content="What email is associated with the account?"),
     )
 
     assert transition.message == "Use the saved email."
@@ -313,3 +334,155 @@ def _trace(created_at: datetime) -> Trace:
             ),
         ),
     )
+
+
+class _Retriever:
+    """Record grounding queries without dispatching an embedding provider.
+
+    Attributes:
+        queries: Submitted retrieval queries in call order, initially empty.
+    """
+
+    def __init__(self) -> None:
+        """Start with no observed grounding requests."""
+        self.queries: list[RAGQuery] = []
+
+    def retrieve(self, query: RAGQuery) -> tuple[RAGMatch, ...]:
+        """Record the query and return an empty but valid grounding corpus."""
+        self.queries.append(query)
+        return ()
+
+
+def _runtime(output: str) -> tuple[GroundedWorldModel, _Retriever, _WorldClient]:
+    """Build an isolated runtime with observable retrieval and completion dispatches.
+
+    Args:
+        output: Exact response text returned by the simulated world-model provider.
+
+    Returns:
+        Runtime, query recorder, and completion recorder.
+    """
+    rag_input = ArtifactInput(artifact_id="serving-rag", sha256="a" * 64)
+    snapshot = ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
+        provider="fixture",
+        model_id="world",
+        capabilities_sha256=sha256_json(ModelCapabilities()),
+        connection_sha256=sha256_json({"connection": "world"}),
+    )
+    retriever = _Retriever()
+    client = _WorldClient(snapshot, output)
+    runtime = GroundedWorldModel(
+        artifact_input=ArtifactInput(artifact_id="world-model", sha256="b" * 64),
+        artifact=GroundedWorldModelArtifact(
+            schema_version=1,
+            created_at=datetime(2026, 8, 13, tzinfo=UTC),
+            inputs=(rag_input,),
+            code_revision="test-revision",
+            world_model_id="world-model",
+            serving_rag=rag_input,
+            model_alias="world",
+            model=snapshot,
+            prompt_version=GROUNDED_WORLD_MODEL_PROMPT_VERSION,
+            prompt_sha256=grounded_world_model_prompt_sha256(),
+            top_k=5,
+        ),
+        retriever=cast(TraceRAGRetriever, retriever),
+        client=client,
+    )
+    return runtime, retriever, client
+
+
+def test_step_rejects_unsolicited_tool_results_for_text_action() -> None:
+    """A valid transition envelope cannot invent tools the assistant never called."""
+    runtime, _, _ = _runtime('{"tool_results":[{"call_id":"invented","content":"ok"}]}')
+    with pytest.raises(TextWorldModelProtocolError, match="match every candidate call_id"):
+        runtime.step(task="Research", action=AssistantAction(content="Done"))
+
+
+def test_step_returns_exact_parallel_tool_results_with_canonical_grounding() -> None:
+    """The convenience API retains schemas, call IDs, exclusion pins, and provider framing."""
+    tool = ToolSchema(name="lookup", description="Look up a company", input_schema={})
+    calls = tuple(
+        ToolCall(call_id=identifier, name="lookup", arguments={"query": name})
+        for identifier, name in (("a", "Acme"), ("b", "Beta"))
+    )
+    runtime, retriever, client = _runtime(
+        '{"tool_results":[{"call_id":"a","content":"Acme"},'
+        '{"call_id":"b","content":"Beta"}],"state":{"lookups":2}}'
+    )
+    action = AssistantAction(tool_calls=calls)
+    transition = runtime.step(
+        task="Research",
+        action=action,
+        tools=(tool,),
+        initial_context={"tenant": "support"},
+        excluded_lineage_ids=("source-lineage",),
+        maximum_output_tokens=8_192,
+    )
+    assert [result.call_id for result in transition.tool_results] == ["a", "b"]
+    assert [result.content for result in transition.tool_results] == ["Acme", "Beta"]
+    assert transition.state == {"lookups": 2}
+    assert not transition.terminal
+    assert [query.action.tool_arguments for query in retriever.queries] == [
+        {"query": "Acme"},
+        {"query": "Beta"},
+    ]
+    assert all(query.excluded_lineage_ids == ("source-lineage",) for query in retriever.queries)
+    request = client.requests[0]
+    assert request.maximum_output_tokens == 8_192
+    assert request.tools == ()
+    assert request.tool_choice == "none"
+    payload = json.loads(request.messages[1].content or "")
+    assert payload["candidate_response"] == action.model_dump(mode="json", exclude_none=True)
+    assert payload["task"]["tools"] == [tool.model_dump(mode="json")]
+    assert payload["task"]["initial_context"] == {"tenant": "support"}
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        '{"message":"wrong role","terminal":true}',
+        '{"tool_results":[{"call_id":"a","content":"missing b"}]}',
+        '{"tool_results":[{"call_id":"b","content":"b"},{"call_id":"a","content":"a"}]}',
+        '{"tool_results":[{"call_id":"a","content":"a"},{"call_id":"a","content":"a"}]}',
+        '{"tool_results":[{"call_id":"a","content":"a"},{"call_id":"b","content":"b"}],'
+        '"terminal":true}',
+    ],
+)
+def test_step_rejects_tool_results_that_do_not_match_the_action(output: str) -> None:
+    """Missing, reordered, repeated, or terminal tool observations never escape validation."""
+    runtime, _, _ = _runtime(output)
+    with pytest.raises(TextWorldModelProtocolError):
+        runtime.step(
+            task="Research",
+            action=AssistantAction(
+                tool_calls=tuple(ToolCall(call_id=item, name="lookup") for item in ("a", "b"))
+            ),
+            tools=(ToolSchema(name="lookup", description="Look up a company", input_schema={}),),
+        )
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        RAGAction(kind="tool_call", tool_name="lookup", tool_arguments={}),
+        AssistantAction(tool_calls=(ToolCall(call_id="a", name="undeclared"),)),
+        AssistantAction(
+            tool_calls=(ToolCall(call_id="a", name="lookup"), ToolCall(call_id="a", name="lookup"))
+        ),
+    ],
+)
+def test_step_rejects_invalid_action_before_any_paid_dispatch(
+    action: RAGAction | AssistantAction,
+) -> None:
+    """Unknown tools, repeated IDs, and ID-free actions fail before retrieval or completion."""
+    runtime, retriever, client = _runtime('{"message":"Done","terminal":true}')
+    with pytest.raises((TypeError, ValueError)):
+        runtime.step(
+            task="Research",
+            action=cast(AssistantAction, action),
+            tools=(ToolSchema(name="lookup", description="Look up a company", input_schema={}),),
+        )
+    assert retriever.queries == []
+    assert client.requests == []
