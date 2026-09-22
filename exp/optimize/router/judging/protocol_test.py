@@ -42,7 +42,7 @@ from exp.optimize.router.judging.service import (
     prepare_manual_judge_setup,
 )
 from exp.optimize.router.judging.service_test import _TIME, _built_store, _catalog, _template
-from exp.simulation.engines.text.recording import Utf8UpperBoundTokenCounter
+from exp.simulation.engines.text.tokens import Utf8UpperBoundTokenCounter
 
 
 def _response(content: str) -> ModelResponse:

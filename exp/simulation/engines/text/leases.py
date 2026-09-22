@@ -172,6 +172,7 @@ class TextCellLeaseStore:
         observed_spend_usd: Callable[[], float | None],
         stop_on_overspend: bool = False,
         cancelled: Callable[[], bool] | None = None,
+        reservation_cost_usd: float | None = None,
     ) -> TextCellLeaseClaim:
         """Atomically reserve one paid cell, or wait for its completed immutable artifact.
 
@@ -188,6 +189,7 @@ class TextCellLeaseStore:
             stop_on_overspend: When true, unknown or ceiling-reaching spend blocks admission;
                 by default the authorized run continues with a logged warning.
             cancelled: Optional cooperative cancellation probe checked before and during waits.
+            reservation_cost_usd: Optional frozen whole-cell bound enabling parallel admission.
 
         Returns:
             An owned claim, completed follower result, budget block, or stale recovery result.
@@ -197,6 +199,10 @@ class TextCellLeaseStore:
         """
         if maximum_cost_usd is not None and maximum_cost_usd <= 0:
             raise ValueError("text-cell maximum_cost_usd must be positive")
+        if reservation_cost_usd is not None and (
+            not math.isfinite(reservation_cost_usd) or reservation_cost_usd <= 0
+        ):
+            raise ValueError("cell reservation must be finite and positive")
         deadline = self._monotonic() + self._wait_timeout_seconds
         is_cancelled = (lambda: False) if cancelled is None else cancelled
         while True:
@@ -216,6 +222,7 @@ class TextCellLeaseStore:
                     rollout_completed=rollout_completed,
                     observed_spend_usd=observed_spend_usd,
                     stop_on_overspend=stop_on_overspend,
+                    reservation_cost_usd=reservation_cost_usd,
                     lock_timeout_seconds=min(self._poll_interval_seconds, remaining),
                 )
             except FileLockTimeout:
@@ -324,6 +331,7 @@ class TextCellLeaseStore:
         observed_spend_usd: Callable[[], float | None],
         stop_on_overspend: bool,
         lock_timeout_seconds: float,
+        reservation_cost_usd: float | None = None,
     ) -> TextCellLeaseClaim | None:
         """Make one lock-protected admission attempt, returning ``None`` for a live follower."""
         self._ensure_directory()
@@ -367,6 +375,7 @@ class TextCellLeaseStore:
                 observed_spend_usd=spend,
                 active_leases=active_leases,
                 stop_on_overspend=stop_on_overspend,
+                reservation_cost_usd=reservation_cost_usd,
             )
             if contended:
                 return None
@@ -395,6 +404,7 @@ class TextCellLeaseStore:
         observed_spend_usd: float | None,
         active_leases: tuple[TextCellLease, ...],
         stop_on_overspend: bool,
+        reservation_cost_usd: float | None = None,
     ) -> tuple[float | None, bool]:
         """Reserve budget for one paid cell under the selected overspend policy.
 
@@ -403,8 +413,8 @@ class TextCellLeaseStore:
         spend unknown, the cell is admitted with a logged warning and a conservative
         whole-budget reservation. In stop mode unknown or ceiling-reaching spend yields no
         reservation, so the caller blocks the cell instead of dispatching it. Finite-budget
-        cells serialize on live reservations in both modes so spend reconciliation stays
-        exact.
+        cells without a per-cell reservation serialize. Stop-mode cells with frozen
+        reservations can overlap while the total reserved and observed spend stays in budget.
         """
         if maximum_cost_usd is None:
             return None, False
@@ -420,6 +430,12 @@ class TextCellLeaseStore:
         if stop_on_overspend:
             if observed_spend_usd is None:
                 return None, False
+            if reservation_cost_usd is not None:
+                reserved = math.fsum(lease.reserved_cost_usd or 0 for lease in active_leases)
+                available = maximum_cost_usd - observed_spend_usd - reserved
+                if reservation_cost_usd <= available + 1e-9:
+                    return reservation_cost_usd, False
+                return None, bool(active_leases)
             if active_leases:
                 return None, True
             remaining_ceiling = maximum_cost_usd - observed_spend_usd

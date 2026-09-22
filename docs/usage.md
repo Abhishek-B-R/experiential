@@ -7,6 +7,8 @@ The root surface is deliberately small:
 | `exp` | Open the branded home screen. `Run Gateway` is the first option and runs setup when needed. | Interactive gateway menu, or the default gateway in a non-interactive terminal. |
 | `exp login [--root ROOT]` | Sign in to Experiential Cloud through the Platform browser approval flow, save the returned organization key, and synchronize the authenticated account's model identities. | User-local credential plus secret-free hosted provider/model records in `.exp/models.toml`. |
 | `exp run [PROJECT] [--root ROOT] [--check]` | Start the local gateway directly, optionally with one project-backed alias. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
+| `exp ingest PROJECT --traces PATH --source chat-json` | Normalize and ground a trace export for evaluation. | Frozen scenarios and project world-model/judge roles. |
+| `exp eval [PROJECT] --models ALIAS,ALIAS` | Compare models on the project scenarios, or open the terminal project picker. | Saved resumable run, JSON evidence, and offline Pareto report. |
 | `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Launch the guided end-to-end build when traces are omitted, or use one explicit local source for automation. | Simulation, serving RAG, fit RAG, syllabus, evaluation evidence, and a runnable automatic router. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
 | `exp optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
@@ -240,3 +242,31 @@ by `world.step(session.id, assistant_message)`. Each result exposes `messages`, 
 of OpenAI user or tool messages, and `terminal`. Tool observations are nonterminal so the agent can
 consume them before producing its final answer. World-model artifacts pin the v2 prompt; rebuild
 projects created with a different prompt before running them.
+
+### Evaluate a project
+
+`exp ingest powerset --traces rollouts.jsonl --source chat-json` normalizes traces, preserves
+initial instructions and declared tool schemas, mines scenarios, and builds the grounded world
+model. It never runs router optimization. OTel sources (`otlp`, `otel-genai`) and completed native
+chat captures (`experiential`) use the same pipeline. Stream captures must first be exported as
+reconstructed `chat-json`; incomplete captures appear as explicit exclusions.
+
+`exp eval powerset --models gpt-5.6-luna,deepseek-v4.1-flash` prepares and reviews the model matrix,
+then simulates, judges, and writes a report. Model names are configured catalog aliases; project
+world-model and judge choices come from ingestion. Existing authored/calibrated project judges
+are selected automatically. Otherwise the task-success judge is explicitly provisional.
+
+`exp eval powerset` opens the terminal project screen: select models, configure repeats and
+budgets, resume saved work, or inspect results. The default minimum is 20 distinct scenarios,
+with one repeat, eight parallel workers, 100 steps, and 1,000,000 generated tokens per rollout.
+Retries are separate from repeats. Settings are saved in the project's `evaluation.json`.
+
+Use `--dry-run` for provider-free preparation, `--resume RUN_ID` for exact saved execution, and
+`--report RUN_ID` for read-only results. Ctrl-C cancels queued work and drains active rollouts;
+completed cells remain immutable and resume does not repeat them. Unknown in-flight provider
+outcomes remain invalid evidence, with their cost reservation retained by the engine.
+
+Each completed run writes `report.json`, `rollouts.jsonl`, and a standalone offline `report.html`
+under `.exp/projects/PROJECT/runtime/evaluations/RUN_ID/`. The HTML contains a cost-quality Pareto
+plot and one tile per scenario with model and repeat selectors. Assistant cost and quality use the
+shared valid cohort; invalid/incomplete coverage and total experiment spend remain visible.

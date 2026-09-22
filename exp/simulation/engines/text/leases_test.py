@@ -10,6 +10,7 @@ import pytest
 from exp.common.core.locks import file_write_lock
 from exp.common.project import ArtifactStore, ProjectPaths
 from exp.simulation.engines.text.leases import (
+    TextCellLeaseClaim,
     TextCellLeaseError,
     TextCellLeaseState,
     TextCellLeaseStatus,
@@ -485,3 +486,36 @@ def test_stale_tombstone_rejects_symlink_swap_without_touching_victim(tmp_path: 
 
     assert victim.read_text(encoding="utf-8") == "do not overwrite"
     assert lease_path.is_symlink()
+
+
+def test_parallel_cell_reservations_share_but_never_duplicate_remaining_budget(
+    tmp_path: Path,
+) -> None:
+    """Two bounded attempts may overlap; a third cannot claim already reserved dollars."""
+    store = TextCellLeaseStore(
+        tmp_path, clock=lambda: _TIME, wait_timeout_seconds=0.001, poll_interval_seconds=0.001
+    )
+
+    def acquire(suffix: str) -> TextCellLeaseClaim:
+        """Request forty cents from a shared one-dollar ceiling."""
+        return store.acquire(
+            lease_id=f"lease-{suffix}",
+            resolution_id="resolution-a",
+            simulation_id="simulation-a",
+            rollout_id=f"rollout-{suffix}",
+            binding_sha256=_DIGEST,
+            maximum_cost_usd=1.0,
+            reservation_cost_usd=0.4,
+            stop_on_overspend=True,
+            rollout_completed=lambda _: False,
+            observed_spend_usd=lambda: 0.1,
+        )
+
+    first, second = acquire("a"), acquire("b")
+    assert first.state == second.state == TextCellLeaseState.OWNED
+    assert first.lease is not None and second.lease is not None
+    assert first.lease.reserved_cost_usd == second.lease.reserved_cost_usd == 0.4
+    third = acquire("c")
+    assert third.state == TextCellLeaseState.CONTENDED
+    store.release(first.lease)
+    assert acquire("c").state == TextCellLeaseState.OWNED

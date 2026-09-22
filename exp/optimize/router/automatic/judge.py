@@ -35,7 +35,7 @@ from exp.optimize.router.judging.contracts import (
 )
 from exp.optimize.router.judging.protocol import TemplateJudgeClient
 from exp.runtime.models.providers.errors import ProviderRetryableResponseError
-from exp.simulation.engines.text.recording import Utf8UpperBoundTokenCounter
+from exp.simulation.engines.text.tokens import Utf8UpperBoundTokenCounter
 
 
 class ReservedJudgeClient:

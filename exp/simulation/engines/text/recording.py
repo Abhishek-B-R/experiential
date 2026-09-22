@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from threading import Lock
-from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, cast
 
 from pydantic import JsonValue
 
@@ -59,6 +59,7 @@ from exp.simulation.engines.text.prompt import (
     text_prompt_sha256,
 )
 from exp.simulation.engines.text.redaction import redact_json
+from exp.simulation.engines.text.tokens import TokenCounter
 from exp.simulation.retrieval import RAGQuery
 from exp.simulation.retrieval.transitions import render_rag_key
 
@@ -75,38 +76,6 @@ class TextSimulationError(RuntimeError):
         super().__init__(failure.message)
         self.stop_reason = stop_reason
         self.failure = failure
-
-
-@runtime_checkable
-class TokenCounter(Protocol):
-    """Counts the full serialized request before a model client can send it."""
-
-    def count(self, request: ModelRequest) -> int:
-        """Return a conservative number of context tokens required by one request.
-
-        Args:
-            request: Complete provider-neutral request before provider conversion.
-
-        Returns:
-            A nonnegative count that includes all visible request content.
-        """
-        ...
-
-
-class Utf8UpperBoundTokenCounter:
-    """Provider-neutral byte upper bound used when no exact tokenizer is supplied."""
-
-    def count(self, request: ModelRequest) -> int:
-        """Count UTF-8 request bytes plus per-message framing as a conservative token bound.
-
-        Args:
-            request: Complete provider-neutral request to preflight.
-
-        Returns:
-            A conservative nonnegative bound that never silently shortens request content.
-        """
-        rendered = request.model_dump_json(exclude_none=False)
-        return len(rendered.encode("utf-8")) + 4 * len(request.messages)
 
 
 @dataclass(frozen=True)

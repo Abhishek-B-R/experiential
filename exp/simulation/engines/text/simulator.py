@@ -51,6 +51,7 @@ from exp.simulation.engines.text.continuation import (
     rebind_completed,
     retain_lineage,
 )
+from exp.simulation.engines.text.dispatch import cell_reservation, dispatch_cells
 from exp.simulation.engines.text.episode_loop import execute_text_episode_loop
 from exp.simulation.engines.text.errors import (
     SimulationConfigurationError,
@@ -76,8 +77,6 @@ from exp.simulation.engines.text.lineage_spend import lineage_spend, prefix_retr
 from exp.simulation.engines.text.prompt import WORLD_MODEL_TEXT_PROMPT_VERSION
 from exp.simulation.engines.text.recording import (
     RecordingCandidateClient,
-    TokenCounter,
-    Utf8UpperBoundTokenCounter,
     text_prompt_digest,
 )
 from exp.simulation.engines.text.redaction import redact_rollout_secrets, redacted_field_set
@@ -100,6 +99,7 @@ from exp.simulation.engines.text.rollout_support import (
     orchestration_economics,
 )
 from exp.simulation.engines.text.spec_persistence import persist_canonical_specification
+from exp.simulation.engines.text.tokens import TokenCounter, Utf8UpperBoundTokenCounter
 from exp.simulation.orchestration import require_implemented_mode
 from exp.simulation.retrieval import TraceRAGRetriever
 from exp.simulation.specs import SimulationSpec
@@ -256,8 +256,10 @@ class WorldModelSimulator:
 
         observe_cells = cell_progress_reporter(self._progress, cells, completed)
         observe_cells()
-        for cell in pending:
-            completed[cell.cell_id] = self._execute_and_persist_cell(
+
+        def execute(cell: EvaluationCell) -> RolloutArtifact:
+            """Claim and persist a cell under the shared reservation ledger."""
+            return self._execute_and_persist_cell(
                 spec,
                 cell,
                 world_model,
@@ -267,7 +269,14 @@ class WorldModelSimulator:
                 resolution_input,
                 bindings,
             )
-            observe_cells()
+
+        dispatch_cells(
+            pending,
+            workers=spec.maximum_concurrency,
+            execute=execute,
+            completed=completed,
+            observe=observe_cells,
+        )
         ordered_rollouts = tuple(completed[cell.cell_id] for cell in cells)
         return persist_artifact_set(
             store=self._store,
@@ -567,6 +576,12 @@ class WorldModelSimulator:
                 rollout_completed=lambda item: load_optional_rollout(self._store, item) is not None,
                 observed_spend_usd=lambda: self._known_resolution_spend(bindings, resolution_input),
                 stop_on_overspend=spec.stop_on_overspend,
+                reservation_cost_usd=cell_reservation(
+                    spec,
+                    cell,
+                    self._completion_contract,
+                    has_tools=bool(self._tasks[cell.task_id].tools),
+                ),
             )
         except TextCellLeaseError as exc:
             raise SimulationResumeError(
@@ -603,7 +618,9 @@ class WorldModelSimulator:
             raise SimulationResumeError("owned text-cell admission omitted its durable lease")
         try:
             observed_spend = claim.observed_spend_usd or 0.0
-            maximum_cell_cost_usd = (spec.maximum_cost_usd or 0.0) - observed_spend
+            maximum_cell_cost_usd = claim.lease.reserved_cost_usd or (
+                (spec.maximum_cost_usd or 0.0) - observed_spend
+            )
             rollout = self._execute_cell(
                 spec,
                 cell,

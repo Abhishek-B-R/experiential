@@ -320,7 +320,7 @@ class AssistantAction(ContractModel):
 class ModelMessage(ContractModel):
     """One request-visible message exchanged with a model."""
 
-    role: Literal["system", "user", "assistant", "tool"]
+    role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | None = None
     tool_call_id: str | None = None
     assistant_action: AssistantAction | None = None

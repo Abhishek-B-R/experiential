@@ -121,9 +121,20 @@ def estimate_model_evaluation(
     retrieval_reservation = maximum_query_reservation(retrieval).cost_usd
     assert retrieval_reservation is not None
     retrieval_cost = steps * workers * retrieval_reservation.value
+    # Each generated tool call requires output tokens, so the per-response output limit
+    # bounds query count without imposing a separate arbitrary tool-call ceiling.
+    tool_tasks = sum(bool(task.tools) for task in tasks)
+    query_count = (
+        setup.repeats
+        * setup.maximum_steps
+        * sum(
+            tool_tasks * request.maximum_output_tokens + count - tool_tasks
+            for request in requests.values()
+        )
+    )
     retrieval_component = EvaluationCostComponent(
         estimated_cost_usd=retrieval_cost,
-        maximum_cost_usd=retrieval_cost * MAXIMUM_CELL_ATTEMPTS,
+        maximum_cost_usd=query_count * retrieval_reservation.value * MAXIMUM_CELL_ATTEMPTS,
     )
     judge_count = count * workers * setup.repeats
     judge_component = _sum_completion(
