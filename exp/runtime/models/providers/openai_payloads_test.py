@@ -15,6 +15,7 @@ from exp.runtime.gateway.contracts import (
     GatewayToolDefinition,
 )
 from exp.runtime.models.providers.openai_payloads import (
+    _replayable_native_item,
     openai_compatible_stream_payload,
     openai_responses_stream_payload,
 )
@@ -467,8 +468,7 @@ def test_responses_wire_emits_instruction_only_requests_as_input_items() -> None
 
 
 def test_replayed_message_strips_only_output_text_probabilities() -> None:
-    from exp.runtime.models.providers.openai_payloads import _replayable_native_item
-
+    """Strip model probability metadata while retaining opaque customer tool fields."""
     item: JsonObject = {
         "type": "message",
         "id": "msg_1",

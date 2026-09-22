@@ -5,12 +5,13 @@ from __future__ import annotations
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import cast
 
 import pytest
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
+from pydantic import TypeAdapter
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelCapabilities
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.tests.launch_test import _provider_frame, _ServedGateway, _unused_port
@@ -24,14 +25,12 @@ def test_served_chat_logprobs_preserve_nonstream_and_sdk_streaming(
     class Provider(BaseHTTPRequestHandler):
         """Serve a deterministic OpenAI-compatible probability stream."""
 
-        requests: list[dict[str, object]] = []
+        requests: list[JsonObject] = []
 
         def do_POST(self) -> None:  # noqa: N802
             """Capture the frozen request and return bounded probability frames."""
-            import json
-
             length = int(self.headers.get("content-length", "0"))
-            payload = cast(dict[str, object], json.loads(self.rfile.read(length)))
+            payload = TypeAdapter(JsonObject).validate_json(self.rfile.read(length))
             type(self).requests.append(payload)
             frames = (
                 _provider_frame({"choices": []})

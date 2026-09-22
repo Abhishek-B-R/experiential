@@ -10,6 +10,8 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.model import ToolCall
 from exp.runtime.gateway.contracts import (
+    ChoiceLogprobs,
+    ChoiceLogprobsDelta,
     GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
@@ -18,6 +20,7 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
     GatewayUsage,
+    TokenLogprob,
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.streaming import (
@@ -341,8 +344,6 @@ def test_responses_failure_closes_visible_content_then_emits_one_failed_terminal
 
 def test_chat_stream_projects_choice_logprobs_metadata_events() -> None:
     """Emit typed probability observations as ordinary Chat choice fields."""
-    from exp.runtime.gateway.contracts import ChoiceLogprobs, ChoiceLogprobsDelta, TokenLogprob
-
     record = TokenLogprob(token="é", logprob=-0.25, bytes=(195, 169), top_logprobs=())
     event = GatewayEvent(
         kind=GatewayEventKind.CHOICE_LOGPROBS_DELTA,
