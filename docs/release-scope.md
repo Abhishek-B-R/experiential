@@ -18,9 +18,12 @@ on the exact release checkout.
   The signed Mitmproxy Redirector app and its approved Network Extension own interception for the
   foreground backend's lifetime. Capture does not edit hosts, DNS, or system proxy settings and
   has no reset subcommand. Each selected host set gets a CA with critical certificate-level
-  name constraints and persistent current-user SSL trust. Client certificate rejection or a
-  burst of handshake disconnects stops interception with a diagnostic. Synthetic provider and
-  backend lifecycle tests are separate from real client testing.
+  name constraints and persistent current-user SSL trust. Client certificate rejection or repeated
+  handshake failures switch the affected process and host to encrypted pass-through for the run;
+  missing process identity or exhausted capacity uses an explicit host-wide exclusion. Other capture
+  continues, and the terminal names excluded targets and retains a partial-capture indicator.
+  Backend failure still stops Capture. Synthetic provider and backend lifecycle tests are separate
+  from real client testing.
 - The local gateway supports explicit provider references, identities, virtual keys, grants,
   singleton and certified ordered exact-model pools, frozen-project aliases, bounded precommit
   provider fallback, Chat Completions, Responses (over HTTP and as the Responses-over-WebSocket
