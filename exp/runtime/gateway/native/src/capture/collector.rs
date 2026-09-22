@@ -273,6 +273,7 @@ impl Collector {
             entry.record.response = None;
             entry.record.provider_reasoning = None;
             entry.record.provider_tool_calls_json = None;
+            entry.record.metrics = None;
             entry.record.gemini_thought_parts.clear();
             drop(pending);
             self.emit(entry.record, None);
@@ -340,10 +341,14 @@ impl Collector {
             entry.record.gemini_thought_parts.clear();
         }
         entry.record.deployment_id = deployment_id;
-        entry.record.metrics = entry
-            .observation
-            .as_ref()
-            .map(super::metrics::Metrics::observed);
+        entry.record.metrics = if entry.record.response.is_some() || entry.wire.is_some() {
+            entry
+                .observation
+                .as_ref()
+                .map(super::metrics::Metrics::observed)
+        } else {
+            None
+        };
         entry.output_finished = true;
         entry.bytes = entry.bytes.saturating_add(response_heap);
         if entry.response_allowed {

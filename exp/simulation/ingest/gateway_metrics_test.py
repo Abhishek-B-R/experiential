@@ -96,3 +96,20 @@ def test_missing_and_partial_meters_never_become_zero_or_final() -> None:
     assert first.usage is None
     assert first.attributes["exp.gateway.usage.complete"] is False
     assert first.attributes["exp.source.time.synthetic"] is True
+
+
+def test_noncredible_zero_meter_remains_raw_without_zero_cost_trace_usage() -> None:
+    """Native settlement's all-zero credibility decision survives trace export."""
+    meter = _metrics().usage
+    assert meter is not None
+    metrics = _metrics().model_copy(
+        update={
+            "usage_complete": False,
+            "usage": meter.model_copy(update={"input_tokens": 0, "output_tokens": 0}),
+        }
+    )
+    first = apply_gateway_metrics(_result(metrics)).traces[0].spans[1]
+    assert first.usage is None
+    assert first.attributes["exp.gateway.usage.complete"] is False
+    assert first.attributes["exp.gateway.metrics"] == metrics.model_dump(mode="json")
+    assert first.attributes["exp.source.time.synthetic"] is False

@@ -98,7 +98,16 @@ class CaptureSseResponse(ContractModel):
 
 
 class CaptureUsage(ContractModel):
-    """Native observed counts, with every absent counter remaining unknown."""
+    """Native reported counts, with every absent counter remaining unknown.
+
+    Attributes:
+        input_tokens: Total input tokens, including cache subsets when reported.
+        output_tokens: Total output tokens, including the reasoning subset.
+        cached_input_tokens: Observed cache-read subset, otherwise None.
+        reasoning_tokens: Observed reasoning subset, otherwise None.
+        cache_creation_input_tokens: Cache-write subset, otherwise None.
+        cache_creation_1h_input_tokens: One-hour cache-write subset, otherwise None.
+    """
 
     input_tokens: int | None = Field(ge=0)
     output_tokens: int | None = Field(ge=0)
@@ -117,12 +126,12 @@ class CaptureMetrics(ContractModel):
         terminal_at: Provider terminal time, absent for an interrupted stream.
         duration_ms: Monotonic attempt duration, absent before a provider terminal.
         usage: Observed normalized provider counts; unknown fields remain None.
-        usage_complete: Whether a terminal and both total token counts were observed.
+        usage_complete: Whether a terminal and credible complete token totals were observed.
     """
 
     started_at: float = Field(ge=0, allow_inf_nan=False)
-    first_token_at: float | None
-    terminal_at: float | None
+    first_token_at: float | None = Field(ge=0, allow_inf_nan=False)
+    terminal_at: float | None = Field(ge=0, allow_inf_nan=False)
     duration_ms: float | None = Field(ge=0, allow_inf_nan=False)
     usage: CaptureUsage | None
     usage_complete: bool
