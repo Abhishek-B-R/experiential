@@ -197,8 +197,9 @@ Tool descriptions have no per-field character limit and reach providers unchange
 request-body limit and provider context limits still apply. Gateway accounting and diagnostic logs
 remain content-free. A downstream host that opts into logging tool descriptions must cap each
 logging-only preview at the first 262,144 Unicode characters and record the original character
-count and whether truncation occurred. This policy applies only to diagnostic copies: provider
-payloads, request hashes, and durable replay evidence retain the complete description.
+count and whether truncation occurred. This policy applies only to diagnostic copies. Provider
+payloads contain the complete description, and request identity hashes include its full content.
+Durable gateway request records store that digest without retaining the description itself.
 
 The content-free ledger accepts the logical request before learned project selection. Selection or
 direct resolution then produces an execution snapshot containing the exact model, pool, and ordered
