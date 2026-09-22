@@ -194,23 +194,27 @@ def prepare_model_evaluation(
         RoutedCandidateSnapshot(alias=alias, model=static.snapshot(alias)[0])
         for alias in sorted(worker_aliases)
     )
-    capacities = tuple(
-        static.snapshot(alias)[1].maximum_output_tokens
+    capacities = {
+        alias: static.snapshot(alias)[1].maximum_output_tokens
         for alias in (*worker_aliases, world.model_alias)
-    )
-    if any(value is None for value in capacities):
+    }
+    if any(value is None for value in capacities.values()):
         raise ValueError("evaluation requires declared worker and world-model output capacities")
     maximum_output_tokens = options.maximum_output_tokens or max(
-        value for value in capacities if value is not None
+        value for value in capacities.values() if value is not None
     )
     traces = load_trace_dataset(project.artifacts, completed.trace_dataset.artifact_id).traces
-    estimated_input = simulation_input_token_estimate(
-        traces,
-        retrieved_transition_count=world.top_k,
-        maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
-        maximum_output_tokens=maximum_output_tokens,
-    )
-    if estimated_input is None:
+    input_estimates = {
+        alias: simulation_input_token_estimate(
+            traces,
+            retrieved_transition_count=world.top_k,
+            maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
+            maximum_output_tokens=min(maximum_output_tokens, capacity),
+        )
+        for alias, capacity in capacities.items()
+        if capacity is not None
+    }
+    if any(value is None for value in input_estimates.values()):
         raise ValueError("evaluation requires captured source traces for a cost estimate")
     attempts = RetryPolicy().maximum_attempts
     problems: list[str] = []
@@ -221,7 +225,9 @@ def prepare_model_evaluation(
         world_alias=world.model_alias,
         world=world.model,
         maximum_attempts=attempts,
-        estimated_input_tokens=estimated_input,
+        estimated_input_tokens={
+            alias: value for alias, value in input_estimates.items() if value is not None
+        },
         maximum_output_tokens=maximum_output_tokens,
     )
     retrieval = retrieval_embedding_reservation(

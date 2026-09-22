@@ -20,6 +20,7 @@ from exp.optimize.router.automatic.service_test import (
 )
 from exp.runtime.agents import ChatAgentRuntime, agent_factory_sha256
 from exp.runtime.models.providers.transport import RetryPolicy
+from exp.simulation.specs import load_simulation_completion_contract
 
 
 def _prepare(
@@ -129,3 +130,47 @@ def test_rollout_defaults_and_large_explicit_limits() -> None:
     assert ModelEvaluationOptions(maximum_steps=1000).maximum_steps == 1000
     ChatAgentRuntime(maximum_model_calls=1000)
     assert agent_factory_sha256(None, maximum_model_calls=1000)
+
+
+@pytest.mark.parametrize("output_ceiling", [None, 1_000_000])
+def test_heterogeneous_capacities_use_model_specific_input_estimates(
+    tmp_path: Path,
+    output_ceiling: int | None,
+) -> None:
+    """A large worker's output capacity cannot crowd a smaller worker out of preparation."""
+    project, catalog, _, initial = _prepare(tmp_path)
+    models = dict(catalog.models)
+    for alias, context, output in (
+        ("candidate-a", 65_536, 4_096),
+        ("candidate-b", 2_000_000, 128_000),
+    ):
+        capabilities = models[alias].capabilities
+        assert capabilities is not None
+        models[alias] = models[alias].model_copy(
+            update={
+                "capabilities": capabilities.model_copy(
+                    update={"context_window_tokens": context, "maximum_output_tokens": output},
+                )
+            }
+        )
+    catalog = catalog.model_copy(update={"models": models})
+    prepared = prepare_model_evaluation(
+        project,
+        catalog,
+        ("candidate-a", "candidate-b"),
+        judge_setup=initial.judge_setup,
+        calibration_id=initial.setup.simulation_protocol.judge_calibration_id,
+        embedder_alias="embedder",
+        options=ModelEvaluationOptions(maximum_steps=1, maximum_output_tokens=output_ceiling),
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    pointer = prepared.setup.simulation_completion_input
+    assert pointer is not None
+    contract, _ = load_simulation_completion_contract(project.artifacts, pointer.artifact_id)
+    reservations = {item.candidate_alias: item.request for item in contract.candidate_requests}
+    small, large = reservations["candidate-a"], reservations["candidate-b"]
+    assert small.maximum_output_tokens == 4_096
+    assert large.maximum_output_tokens == 128_000
+    assert small.planning_input_tokens() < small.maximum_input_tokens
+    assert large.planning_input_tokens() - small.planning_input_tokens() == 128_000 - 4_096

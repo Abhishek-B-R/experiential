@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -290,7 +291,7 @@ def simulation_completion_reservations(
     world_alias: str | None,
     world: ModelSnapshot | None,
     maximum_attempts: int,
-    estimated_input_tokens: int,
+    estimated_input_tokens: int | Mapping[str, int],
     maximum_output_tokens: int,
 ) -> tuple[tuple[CandidateCompletionReservation, ...], CompletionCostReservation | None]:
     """Freeze candidate and world call reservations from exact catalog declarations.
@@ -302,7 +303,7 @@ def simulation_completion_reservations(
         world_alias: Build-frozen world-model alias.
         world: Exact world-model snapshot.
         maximum_attempts: Active completion retry ceiling.
-        estimated_input_tokens: Trace-derived realistic per-call input planning size.
+        estimated_input_tokens: Uniform or alias-specific per-call input planning estimates.
         maximum_output_tokens: Per-turn candidate and world output ceiling.
 
     Returns:
@@ -317,7 +318,11 @@ def simulation_completion_reservations(
             model=candidate.model,
             label="candidate",
             maximum_attempts=maximum_attempts,
-            estimated_input_tokens=estimated_input_tokens,
+            estimated_input_tokens=(
+                estimated_input_tokens
+                if isinstance(estimated_input_tokens, int)
+                else estimated_input_tokens[candidate.alias]
+            ),
             maximum_output_tokens=maximum_output_tokens,
         )
         if request is not None:
@@ -335,7 +340,11 @@ def simulation_completion_reservations(
             model=world,
             label="world model",
             maximum_attempts=maximum_attempts,
-            estimated_input_tokens=estimated_input_tokens,
+            estimated_input_tokens=(
+                estimated_input_tokens
+                if isinstance(estimated_input_tokens, int)
+                else estimated_input_tokens[world_alias]
+            ),
             maximum_output_tokens=maximum_output_tokens,
         )
         if world_alias is not None and world is not None
