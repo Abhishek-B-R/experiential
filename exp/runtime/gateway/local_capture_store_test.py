@@ -219,6 +219,33 @@ def test_reader_refuses_an_absent_database_without_opening_the_name(
     assert not (tmp_path / "absent.db").exists()
 
 
+def test_reader_without_no_follow_opens_still_refuses_a_link_and_reads_a_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows has no no-follow open or directory descriptor, so it takes the portable path.
+
+    That path cannot pin anything, so it cannot witness a replacement race. It
+    must still refuse the substitution the reader exists to catch, and must
+    still serve an ordinary database.
+    """
+    monkeypatch.setattr(os, "name", "nt")
+    scope = LocalCaptureScope(user_id="user", application_id="app")
+    elsewhere = tmp_path / "elsewhere.db"
+    _seed_capture(elsewhere, scope, "not-ours")
+    link = tmp_path / "linked.db"
+    link.symlink_to(elsewhere)
+    with pytest.raises(ValueError, match="regular file"):
+        LocalCaptureStore(link, scope).read_after()
+
+    with pytest.raises(ValueError, match="not present"):
+        LocalCaptureStore(tmp_path / "absent.db", scope).read_after()
+
+    ordinary = tmp_path / "capture.db"
+    _seed_capture(ordinary, scope, "ours")
+    rows = LocalCaptureStore(ordinary, scope).read_after()
+    assert [row.experience.experience_id for row in rows] == ["ours"]
+
+
 def test_reader_serves_an_unswapped_database_normally(tmp_path: Path) -> None:
     """The identity check must not refuse the ordinary case it guards."""
     scope = LocalCaptureScope(user_id="user", application_id="app")

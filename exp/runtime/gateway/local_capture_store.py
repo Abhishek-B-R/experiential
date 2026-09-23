@@ -28,14 +28,18 @@ class _PinnedEntry:
     """One capture entry and its directory, held open across the database open.
 
     Attributes:
-        descriptor: Read-only descriptor on the validated final entry.
-        directory: Read-only descriptor on the directory holding that entry.
-        directory_change_ns: That directory's change time when the entry was pinned.
+        descriptor: Read-only descriptor on the validated final entry, or
+            ``None`` where no-follow opens do not exist and the entry was
+            validated by its metadata instead.
+        directory: Read-only descriptor on the directory holding that entry,
+            or ``None`` on the same platforms.
+        directory_change_ns: That directory's change time when the entry was
+            pinned, or ``None`` when the directory could not be pinned.
     """
 
-    descriptor: int
-    directory: int
-    directory_change_ns: int
+    descriptor: int | None
+    directory: int | None
+    directory_change_ns: int | None
 
 
 def _pin_capture_entry(path: Path) -> _PinnedEntry:
@@ -60,13 +64,22 @@ def _pin_capture_entry(path: Path) -> _PinnedEntry:
     Args:
         path: Capture database whose final entry has not been resolved.
 
+    Windows has neither no-follow opens nor directory descriptors, so there the
+    entry is validated by its own metadata without following it and nothing is
+    pinned. That is the same split the trace store already makes: the portable
+    check refuses a link, and the race hardening is POSIX-only.
+
     Returns:
-        The pinned entry, its directory, and that directory's change time.
+        The pinned entry, its directory, and that directory's change time, or a
+        metadata-validated entry holding no descriptors on Windows.
 
     Raises:
         OSError: The entry cannot be opened for a reason other than absence.
         ValueError: The path is absent, a symlink, or another non-regular file.
     """
+    if os.name == "nt":
+        _require_regular_entry(path)
+        return _PinnedEntry(descriptor=None, directory=None, directory_change_ns=None)
     directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
         # Read before the entry is opened, so any swap that races the database
@@ -81,6 +94,28 @@ def _pin_capture_entry(path: Path) -> _PinnedEntry:
         directory=directory,
         directory_change_ns=directory_change_ns,
     )
+
+
+def _require_regular_entry(path: Path) -> None:
+    """Refuse a link or another non-regular entry without following it.
+
+    The portable floor, used where a no-follow open is unavailable. It closes
+    the substitution the issue reported; it cannot close a replacement that
+    races the database open, which needs descriptors this platform lacks.
+
+    Args:
+        path: Capture database whose final entry has not been resolved.
+
+    Raises:
+        OSError: The entry's metadata cannot be read.
+        ValueError: The path is absent, a symlink, or another non-regular file.
+    """
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError as error:
+        raise ValueError(_ABSENT_DATABASE) from error
+    if not stat.S_ISREG(mode):
+        raise ValueError(_NOT_A_REGULAR_FILE)
 
 
 def _pin_regular_file(path: Path) -> int:
@@ -120,11 +155,13 @@ def _pin_regular_file(path: Path) -> int:
 
 
 def _close_pinned_entry(pinned: _PinnedEntry) -> None:
-    """Release both descriptors held for one read."""
+    """Release whichever descriptors were held for one read."""
     try:
-        os.close(pinned.descriptor)
+        if pinned.descriptor is not None:
+            os.close(pinned.descriptor)
     finally:
-        os.close(pinned.directory)
+        if pinned.directory is not None:
+            os.close(pinned.directory)
 
 
 def _require_pinned_identity(path: Path, pinned: _PinnedEntry) -> None:
@@ -160,6 +197,11 @@ def _require_pinned_identity(path: Path, pinned: _PinnedEntry) -> None:
         ValueError: The entry was replaced, or its directory was restaged,
             while the database was being opened.
     """
+    if pinned.descriptor is None or pinned.directory is None:
+        # Nothing was pinned, so there is nothing to compare against. The entry
+        # was already refused unless it was a regular file, which is the whole
+        # guard this platform can offer.
+        return
     entry = os.fstat(pinned.descriptor)
     current = path.stat()
     if (current.st_dev, current.st_ino) != (entry.st_dev, entry.st_ino):
