@@ -10,7 +10,7 @@ The root surface is deliberately small:
 | `exp` | Open the branded home screen. `Run Gateway` is the first option and runs setup when needed. | Interactive gateway menu, or the default gateway in a non-interactive terminal. |
 | `exp login [--root ROOT]` | Sign in to Experiential Cloud through the Platform browser approval flow, save the returned organization key, and synchronize the authenticated account's model identities. | User-local credential plus secret-free hosted provider/model records in `.exp/models.toml`. |
 | `exp run [PROJECT] [--root ROOT] [--check]` | Start the local gateway directly, optionally with one project-backed alias. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
-| `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Launch the guided end-to-end build when traces are omitted, or use one explicit local source for automation. | Simulation, serving RAG, fit RAG, syllabus, evaluation evidence, and a runnable automatic router. |
+| `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Import file or gateway traces, mine scenarios, and prepare world-model grounding; omitting traces opens the guided build. | Canonical imports in `gateway/traffic.db`, versioned scenarios, serving RAG, fit RAG and a grounded world model. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
 | `exp optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
 | `exp --root ROOT [--check]` | Validate or start the initialized authenticated default gateway on loopback; the native data plane serves every route, including Chat Completions, Responses, and Anthropic Messages. | OpenAI-compatible and Anthropic Messages endpoints, readiness routes, and content-free usage view. |
@@ -131,6 +131,85 @@ team --assigned-cost-nano-usd COST --root ROOT --non-interactive` settles each u
 attempt at an explicit assigned cost and restores service with exact per-attempt attribution.
 There is no budget reset job and no budgets dashboard.
 
+## Standalone model evaluation in Python
+
+Rollouts default to 100 candidate steps and 1,000,000 cumulative candidate output tokens.
+Both are configurable without a fixed engine step ceiling. `maximum_output_tokens` is a
+separate optional per-request setting; omitting it uses each model's declared output capacity.
+Explicit limits are clamped to that capacity
+and, for candidates, the remaining rollout token budget. Provider output usage includes
+reasoning; it is not counted twice. Missing usage blocks further candidate dispatch.
+
+Budget exhaustion and truncated output are `incomplete`, excluded from judging, quality and
+operating-cost comparisons. Actual incurred spend remains in execution accounting. A complete,
+secret-free text-world turn saves a checkpoint. To continue the built-in chat runtime, prepare
+another evaluation with `continuation_of=previous.simulation_spec.simulation_id` and larger
+`ModelEvaluationOptions(maximum_steps=200, maximum_rollout_output_tokens=2_000_000)`.
+Keep the same workers, judge setup/calibration, prompts, retrieval, per-call reservations and
+producer revision; then authorize its quote with `run_prepared_model_evaluation` as usual.
+This creates a new immutable execution and parent-linked rollouts. Completed candidate/world
+work is retained without redispatch; cumulative costs include the retained prefix. Exact replay
+of the child also reuses its judgments. Continuation does not restore arbitrary custom-agent
+process state, truncated generations, interrupted world turns, or redacted transcript content;
+those require a fresh evaluation. No prior artifact is edited.
+
+Declared tools run against generated environment observations, not real external tool
+implementations. A safe checkpoint preserves ordered tool results and private world state;
+continuing does not re-execute completed tool turns. The retrieval estimate assumes one query
+per turn, while its maximum reserves for multiple tool calls using each worker's output limit.
+
+For a completed grounded project, `exp.prepare_model_evaluation` freezes a worker matrix and
+prices its simulation, retrieval and judge requests without calling providers. The default judge
+is binary task success with explicitly provisional provenance. Pass both `judge_setup` and
+`calibration_id` to use a saved authored or calibrated judge instead. No router is fitted or
+activated.
+
+```python
+from datetime import UTC, datetime
+
+from exp import (
+    EvaluationBudget,
+    ModelEvaluationOptions,
+    prepare_model_evaluation,
+    run_prepared_model_evaluation,
+)
+
+# project is a completed ProjectStore; catalog is its secret-free ModelCatalog.
+prepared = prepare_model_evaluation(
+    project,
+    catalog,
+    ("worker-a", "worker-b"),
+    embedder_alias="embedder",
+    options=ModelEvaluationOptions(maximum_steps=8),
+    created_at=datetime.now(UTC),
+    code_revision=engine_revision,
+)
+
+# Display prepared.cost. A host reserves sufficient credits atomically and obtains
+# consent before constructing its credential-backed runtime_catalog and executing.
+result = run_prepared_model_evaluation(
+    project,
+    prepared,
+    runtime_catalog,
+    budget=EvaluationBudget(
+        maximum_cost_usd=prepared.cost.maximum_cost_usd,
+        maximum_judgments=prepared.cost.judgment_count,
+    ),
+    provider_spend_consented=consent_after_credit_reservation,
+    created_at=run_started_at,
+    code_revision=engine_revision,
+)
+```
+
+`result.report` contains the common-cohort model metrics, explicit exclusions and cost-quality
+frontier. The chart's cost is worker operating cost, not the cost of generating the report.
+`result.cost_usd` reconciles simulation and judging charges. Exact replay dispatches no new model
+calls. The quote and result exclude earlier trace mining and grounding costs; a host must include
+those separately before offering a complete trace-to-report price. Credit conversion, promotions,
+identity authorization and job persistence remain hosting responsibilities.
+
+## Gateway clients
+
 Official OpenAI SDK clients use the issued virtual key and loopback base URL:
 
 ```python
@@ -145,12 +224,13 @@ Completions plus Responses, and stream plus non-stream calls. Provider protocol 
 deterministic. Hosted-provider runs require credentials and are reported separately in
 [`release-scope.md`](release-scope.md); fixture success is not presented as a live-provider result.
 
-The guided build uses one bounded consent to create simulation evidence, separate serving and fit
-RAG indexes, a judge syllabus, closed-loop candidate evaluations, and a runnable router. Human
-judge calibration is recommended but optional: provisional judgment provenance remains visible,
-and later approval plus another build creates an immutable human-calibrated successor. Running the
-endpoint records traffic by default so a later optimization can use newly attributed outcomes.
-Explicit trace automation can still stop after the grounded build, then use
+The guided build defaults to importing traces, mining scenarios, and creating separate serving
+and fit RAG indexes with world-model grounding. Judge editing, calibration, and router optimization
+are explicit optional steps. Selecting router optimization uses one bounded consent for the
+combined build and evaluation schedule. Human judge calibration is recommended but optional:
+provisional judgment provenance remains visible, and later approval creates an immutable
+human-calibrated successor. Running the endpoint records traffic by default so a later optimization
+can use newly attributed outcomes. Completed grounded projects can use
 [`router-optimization.json`](reference/router_optimization_config.md) with `exp optimize router`.
 Router fitting never invokes world-model fidelity testing. Applications that need a world-model
 quality measurement can call the separate `build_fidelity_evaluation_plan` and
@@ -171,7 +251,38 @@ of OpenAI user or tool messages, and `terminal`. Tool observations are nontermin
 consume them before producing its final answer. World-model artifacts pin the v2 prompt; rebuild
 projects created with a different prompt before running them.
 
+### Build scenarios from traces
+
+```bash
+exp build powerset --traces rollouts.jsonl --source chat-json --root .exp
+exp build powerset --source gateway --identity default --root .exp
+```
+
+Build first stores canonical traces in `.exp/gateway/traffic.db`, alongside native gateway captures.
+It preserves initial system/developer instructions, declared tool schemas, paired tool results,
+source provenance, normalization exclusions and model identity evidence. The receipt identifies
+an immutable import associated with the project. Repeating an unchanged import reuses its records
+and association; changed source content produces a new import without overwriting earlier evidence.
+
+It then mines scenarios from that saved evidence, writes immutable task sets and prepares
+world-model grounding. Model roles belong to the project; embedding work uses the normal cost
+preflight. An unchanged completed build reuses its scenarios and indexes without new provider calls.
+`--dry-run` uses temporary SQLite for source ingestion and may checkpoint deterministic project
+evidence, but makes no provider calls, durable trace imports, or completed-build selection.
+The interactive build prompts for an explicit source file; automation supplies `--traces`.
+OTel sources (`otlp`, `otel-genai`) and completed exported chat captures (`experiential`) use the
+same persistence path. See [trace input and storage](reference/ingest.md) for the Python API.
+
+Native capture exports must contain completed JSON Chat Completions responses. Export stream
+captures as reconstructed `chat-json`, or use `--source gateway` to consume the native database's
+JSON/SSE captures. Incomplete or refused exports appear as explicit exclusions. Chat exports
+without timestamps retain synthetic ordering markers and do not imply measured latency.
+There is no minimum or maximum import count; a build requires at least one valid trace.
+Source ingestion streams through disk-backed staging. Scenario mining and RAG preparation
+currently materialize the canonical corpus, so the whole build's memory grows with that corpus.
+
 ### Local gateway traffic
 
 See [local traffic capture](reference/local_gateway_traffic.md) for default-on,
-identity-scoped collection and `exp build --source gateway --identity ID`.
+identity-scoped collection. `--source gateway` reads every retained record for the required
+identity from one consistent snapshot, including corpora larger than one page.

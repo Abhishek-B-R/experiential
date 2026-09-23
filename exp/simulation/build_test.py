@@ -26,8 +26,8 @@ from exp.common.project import (
 )
 from exp.common.project.paths import ProjectPaths
 from exp.common.traces import Trace, TraceSource, TraceSpan
+from exp.common.traces.ingest.otlp import TraceNormalizationIssue, TraceNormalizationResult
 from exp.simulation.build import build_project, build_task_set
-from exp.simulation.ingest.otlp import TraceNormalizationIssue, TraceNormalizationResult
 from exp.simulation.mining.service import MiningSpec
 
 _PROVIDER_FREE_REVISION = "a" * 40

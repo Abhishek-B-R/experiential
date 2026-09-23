@@ -36,6 +36,8 @@ from exp.common.models import (
 from exp.common.project import ProjectModelConfiguration
 from exp.common.routing import KnnRouterPolicy
 from exp.common.tasks import TaskCase, load_task_set
+from exp.common.traces.sqlite import SQLiteTraceStore
+from exp.common.traces.sqlite_schema import trace_database_path
 from exp.optimize.router.activation import load_project_router
 from exp.optimize.router.automatic.replay import AutomaticRouterReplay
 from exp.optimize.router.automatic.service import AutomaticRouterOptions
@@ -335,11 +337,42 @@ def _default_trace_corpus(tmp_path: Path) -> Path:
     return default
 
 
-def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
+def test_default_build_prepares_saved_scenarios_without_rollouts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Accepting the wizard defaults saves source evidence and grounding with no completions."""
+    _default_trace_corpus(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    state = _ProviderState()
+    _install_integrated_runtime(monkeypatch, state)
+    root = tmp_path / ".exp"
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support", "--root", str(root), "--provider", "openai"],
+        input="\ntraces.otel.jsonl\n\ny\n",
+        env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
+    )
+    assert result.exit_code == 0, result.output
+    assert "Scenarios and world-model grounding are ready" in unstyle(result.output)
+    assert state.embedding_calls and not state.completion_calls
+    store = wizard.ProjectStore(root, "support")
+    selected = store.load_project().build
+    assert selected is not None
+    assert len(load_task_set(store.artifacts, selected.task_set.artifact_id).tasks) == 12
+    assert len(SQLiteTraceStore(trace_database_path(root)).list_imports("support")) == 1
+    artifact_types = {
+        store.artifacts.read(artifact_id).manifest.artifact_type
+        for artifact_id in store.artifacts.list_ids()
+    }
+    assert "grounded-world-model" in artifact_types
+    assert "router-policy" not in artifact_types
+
+
+def test_explicit_router_selection_builds_and_composes_provisional_router(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The minimal transcript completes every artifact through the shared router service.
+    """An explicit router selection completes every artifact through the shared router service.
 
     Args:
         tmp_path: Isolated current directory and EXP root.
@@ -355,7 +388,7 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
     result = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(root), "--provider", "openai"],
-        input="\ntraces.otel.jsonl\n\ny\n",
+        input="1,2,5\ntraces.otel.jsonl\n\ny\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
 
@@ -485,6 +518,7 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
         max_active_requests: int = 64,
         graceful_timeout_seconds: float = 10.0,
         native_usage_enabled: bool = True,
+        capture: object | None = None,
         shutdown: object | None = None,
         on_listening: Callable[[], None] | None = None,
     ) -> None:
@@ -500,11 +534,12 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
             max_active_requests: Native concurrent-admission bound, unused.
             graceful_timeout_seconds: Drain bound, unused.
             native_usage_enabled: Usage-route ownership flag, unused.
+            capture: Optional native capture collector, unused.
             shutdown: Optional embedder stop handle, unused.
             on_listening: Bound-listener readiness callback.
         """
         del control_plane, max_active_requests, graceful_timeout_seconds
-        del native_usage_enabled, shutdown
+        del native_usage_enabled, capture, shutdown
         served.append((host, port))
         if on_listening is not None:
             on_listening()
@@ -551,7 +586,7 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
     successor = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(root)],
-        input="\ny\n",
+        input="1,2,5\ny\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
     assert successor.exit_code == 0, successor.output
@@ -629,7 +664,7 @@ def test_fresh_wizard_refusal_after_discovery_makes_no_paid_calls_or_selected_bu
     result = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(root)],
-        input="\ntraces.otel.jsonl\n1\n\n\nn\n",
+        input="1,2,5\ntraces.otel.jsonl\n2\n\n\nn\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
 
@@ -675,7 +710,7 @@ def test_explicit_router_cap_below_required_fails_before_consent_or_paid_calls(
             "--max-router-cost-usd",
             "0.01",
         ],
-        input="\ntraces.otel.jsonl\n1\n\n\n",
+        input="1,2,5\ntraces.otel.jsonl\n2\n\n\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
 
@@ -717,7 +752,7 @@ def test_explicit_router_cap_above_required_consents_only_to_exact_plan(
             "--max-router-cost-usd",
             "5000",
         ],
-        input="\ntraces.otel.jsonl\n1\n\n\ny\n",
+        input="1,2,5\ntraces.otel.jsonl\n2\n\n\ny\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
 
@@ -799,7 +834,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
     explicit = _RUNNER.invoke(
         app,
         ["build", "explicit", "-t", str(traces), "--root", str(root)],
-        input="1\n\n1\n\n1\n\n1\n1,2\n\n\n\n1\ny\n",
+        input="2\n\n1\n\n1\n\n1\n1,2\n\n\n\n1\ny\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
     assert explicit.exit_code == 0, explicit.output
@@ -807,7 +842,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
     guided = _RUNNER.invoke(
         app,
         ["build", "guided", "--root", str(root)],
-        input=f"\n{traces}\ny\n",
+        input=f"1,2,5\n{traces}\ny\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
     assert guided.exit_code == 0, guided.output
@@ -901,7 +936,7 @@ def test_interrupted_wizard_resumes_durable_stages_without_duplicate_build_calls
     first = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(root)],
-        input="\ntraces.otel.jsonl\n1\n\n\ny\n",
+        input="1,2,5\ntraces.otel.jsonl\n2\n\n\ny\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
     assert first.exit_code == 1
@@ -915,7 +950,7 @@ def test_interrupted_wizard_resumes_durable_stages_without_duplicate_build_calls
     resumed = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(root)],
-        input="\ny\n",
+        input="1,2,5\ny\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
 
@@ -968,7 +1003,7 @@ def test_approved_calibration_resume_builds_human_calibrated_successor(
     result = _RUNNER.invoke(
         app,
         ["build", "support", "--root", str(store.paths.root)],
-        input="\ny\n",
+        input="1,2,5\ny\n",
         env={"FIXTURE_API_KEY": "fixture-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
 
@@ -1027,10 +1062,6 @@ def test_invalid_traces_fail_before_provider_discovery(
     """
     source = tmp_path / "traces.otel.jsonl"
     source.write_text("{}\n")
-    monkeypatch.setattr(
-        "exp.cli.build.app._load_canonical_traces",
-        lambda *_args, **_kwargs: SimpleNamespace(traces=()),
-    )
 
     def unexpected(*_args: object, **_kwargs: object) -> None:
         """Fail if invalid traces reach authenticated provider discovery."""
@@ -1185,7 +1216,7 @@ def test_refused_named_consent_stops_before_paid_provider_stages(
     monkeypatch.setattr(
         screens.Prompt,
         "ask",
-        lambda *_args, **kwargs: cast(str, kwargs.get("default", "")),
+        lambda *_args, **_kwargs: "1,2,5",
     )
     monkeypatch.setattr(wizard, "_completed_build_plan", lambda *_args, **_kwargs: _plan(catalog))
     monkeypatch.setattr(wizard, "_ensure_router_defaults", lambda *_args, **_kwargs: catalog)

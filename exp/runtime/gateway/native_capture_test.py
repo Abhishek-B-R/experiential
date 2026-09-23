@@ -18,6 +18,7 @@ from exp.common.models.gateway_chains import (
     GatewayModelReferenceRung,
 )
 from exp.runtime.gateway.contracts import AuthorizationSnapshot
+from exp.runtime.gateway.ingest.conversion import load_gateway_capture
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.local_capture_config import CaptureBinding
 from exp.runtime.gateway.local_capture_config import (
@@ -50,7 +51,6 @@ from exp.runtime.gateway.tests.launch_test import (
 )
 from exp.runtime.gateway.tests.native_chat_images_test import _PNG_BASE64
 from exp.runtime.gateway.tests.native_waterfall_test import _content_chunk, _terminal_frames
-from exp.simulation.ingest.gateway import load_gateway_capture
 
 native = pytest.importorskip("exp_gateway_native")
 

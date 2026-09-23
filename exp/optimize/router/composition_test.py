@@ -59,6 +59,7 @@ from exp.common.project import (
 from exp.common.rollouts import SimulationArtifactSet, StopReason
 from exp.common.routing import KnnGuard
 from exp.common.tasks import load_task_set
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.router.composition import (
     ApprovedRouterReview,
     RouterCompositionBudget,
@@ -90,7 +91,6 @@ from exp.simulation.engines.text.simulator_test import (
     _response,
     _ScriptedClient,
 )
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 from exp.simulation.mining.service import MiningSpec
 from exp.simulation.orchestration import Simulator
 from exp.simulation.retrieval import (

@@ -44,6 +44,8 @@ from exp.common.project import (
 )
 from exp.common.routing import RouterFeatureExtractor, RoutingDecision
 from exp.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
+from exp.common.traces.ingest.dataset import PersistedTraceDataset, persist_trace_dataset
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.runtime.router import RuntimeAcceptedEvent, RuntimeInteractionJournal
 from exp.runtime.router.economics import (
     BillingSourceEconomics,
@@ -55,8 +57,6 @@ from exp.runtime.router.economics import (
 )
 from exp.runtime.router.journal import RuntimeAcceptance, _interaction_identity
 from exp.simulation.build import build_task_set
-from exp.simulation.ingest.dataset import PersistedTraceDataset, persist_trace_dataset
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 from exp.simulation.mining.service import MiningSpec
 from exp.simulation.retrieval import (
     PersistedRuntimeRAGRefresh,
