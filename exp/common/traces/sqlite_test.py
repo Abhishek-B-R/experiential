@@ -3,6 +3,7 @@
 import sqlite3
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -184,3 +185,57 @@ def test_concurrent_identical_imports_publish_one_complete_identity(tmp_path: Pa
     assert sum(receipt.new_records for receipt in receipts) == len(traces)
     assert sum(receipt.already_linked for receipt in receipts) == 1
     assert store.read_import(receipts[0].import_id).traces == traces
+
+
+def test_wal_startup_retries_real_contention_before_publishing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real rollback-journal reader blocks WAL until the import releases and retries."""
+    store = SQLiteTraceStore(tmp_path / "traffic.db")
+    reader = sqlite3.connect(store.path)
+    retries: list[float] = []
+    try:
+        reader.execute("CREATE TABLE gateway_captures(payload TEXT)")
+        reader.execute("BEGIN")
+        reader.execute("SELECT * FROM gateway_captures").fetchall()
+
+        def release_reader(delay: float) -> None:
+            """Release the real shared lock only after SQLite has returned BUSY."""
+            retries.append(delay)
+            reader.rollback()
+
+        monkeypatch.setattr("exp.common.traces.sqlite.sleep", release_reader)
+        receipt = _save(store, (_trace(),))
+        assert len(retries) == 1 and 0 < retries[0] <= 0.01
+        assert store.read_import(receipt.import_id).traces == (_trace(),)
+        with closing(sqlite3.connect(store.path)) as reopened:
+            assert reopened.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+    finally:
+        reader.close()
+
+
+def test_wal_startup_contention_stops_at_the_existing_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A persistent lock exhausts the setup deadline without publishing partial evidence."""
+    store = SQLiteTraceStore(tmp_path / "traffic.db")
+    reader = sqlite3.connect(store.path)
+    ticks = iter((0.0, 5.0))
+    try:
+        reader.execute("CREATE TABLE gateway_captures(payload TEXT)")
+        reader.execute("BEGIN")
+        reader.execute("SELECT * FROM gateway_captures").fetchall()
+
+        def elapsed() -> float:
+            """Advance the setup clock to its deadline after the first real busy result."""
+            return next(ticks)
+
+        monkeypatch.setattr("exp.common.traces.sqlite.monotonic", elapsed)
+        with pytest.raises(TraceStoreError) as raised:
+            _save(store, (_trace(),))
+        assert isinstance(raised.value.__cause__, sqlite3.OperationalError)
+        assert raised.value.__cause__.sqlite_errorcode == sqlite3.SQLITE_BUSY
+        assert store.list_imports("powerset") == ()
+        assert reader.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+    finally:
+        reader.close()

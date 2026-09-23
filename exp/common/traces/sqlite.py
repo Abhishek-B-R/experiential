@@ -8,6 +8,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic, sleep
 
 from pydantic import AwareDatetime, Field, TypeAdapter, ValidationError
 
@@ -25,6 +26,38 @@ from exp.common.traces.sqlite_schema import TraceStoreError, initialize_schema, 
 from exp.common.traces.trace import Trace, TraceSource
 
 _JSON_OBJECT = TypeAdapter(JsonObject)
+
+
+def _enable_wal(connection: sqlite3.Connection) -> None:
+    """Retry WAL startup contention within the connection's existing busy timeout.
+
+    SQLite can return BUSY immediately while promoting the journal lock, bypassing
+    its busy handler. No import transaction has begun, so retrying this setup is safe.
+    Ordinary statements retain the caller's busy timeout after setup completes.
+
+    Args:
+        connection: Validated database connection with no active transaction.
+
+    Raises:
+        sqlite3.OperationalError: The lock deadline expires or SQLite rejects setup.
+        TraceStoreError: SQLite does not enable write-ahead logging.
+    """
+    timeout_ms = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+    deadline = monotonic() + timeout_ms / 1000
+    connection.execute("PRAGMA busy_timeout=0")
+    try:
+        while True:
+            try:
+                if connection.execute("PRAGMA journal_mode=WAL").fetchone() != ("wal",):
+                    raise TraceStoreError("Cannot enable WAL for the trace database.")
+                return
+            except sqlite3.OperationalError as exc:
+                remaining = deadline - monotonic()
+                if exc.sqlite_errorcode & 0xFF != sqlite3.SQLITE_BUSY or remaining <= 0:
+                    raise
+                sleep(min(0.01, remaining))
+    finally:
+        connection.execute(f"PRAGMA busy_timeout={timeout_ms}")
 
 
 class StoredTraceImport(ContractModel):
@@ -122,7 +155,7 @@ class SQLiteTraceStore:
                 connection.execute("PRAGMA foreign_keys=ON")
                 validate_schema(connection)
                 if write:
-                    connection.execute("PRAGMA journal_mode=WAL")
+                    _enable_wal(connection)
                     connection.execute("PRAGMA synchronous=FULL")
                     connection.execute("BEGIN IMMEDIATE")
                     initialize_schema(connection)
