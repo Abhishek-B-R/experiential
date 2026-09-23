@@ -315,34 +315,9 @@ class NativeAttemptAccounting:
     def start_attempt(self, argument: str) -> str:
         """Reserve one physical dispatch immediately before network work.
 
-        Candidate selection mirrors the executor: the first dispatch claims
-        the first healthy route in authored order (with bounded last-resort
-        and forced claims through open circuits), a classified failure either
-        redials the same deployment or advances to the next claimable one,
-        and a deployment whose hard monthly allocation cannot admit this call
-        is skipped. Exhaustion finalizes the accepted request here, so the
-        data plane only has to answer with the last classified failure.
-
-        Args:
-            argument: JSON object with ``request_id``, ``attempt_ordinal``
-                (the count of physical dispatches already reserved), optional
-                ``current_depth`` (the route position of the failed dispatch,
-                absent for the first), the optional classified ``failure``
-                with its ``retryable_same_deployment`` and
-                ``failover_eligible`` flags, and optional ``throttle_backoff``
-                (true when the data plane waited the pool's ``throttle_redial``
-                backoff and asks to redial the throttled rung).
-
-        Returns:
-            ``{"attempt_id", "route_depth"}`` for one durably reserved
-            dispatch, or ``{"exhausted": true, "failure": {...}}`` after the
-            request was finalized with that failure.
-
-        Raises:
-            NativeBridgeError: The request is unknown, its deadline passed, a
-                non-deployment budget scope rejected the reservation, or the
-                reservation write failed; the request is finalized before the
-                error is raised.
+        Each callback carries the ordinal, prior depth, failure and dispatch reason.
+        Returns a durable attempt or finalized exhaustion; authority, deadline and
+        accounting refusals raise NativeBridgeError.
         """
         data = json.loads(argument)
         request_id = str(data["request_id"])
@@ -366,15 +341,15 @@ class NativeAttemptAccounting:
             raise NativeBridgeError(public_failure_error(failure))
         failure = failure_from_boundary_payload(data.get("failure"))
         current_depth = data.get("current_depth")
-        ladder = eligible_ladder(route, failure)  # The depths this walk may claim at all.
-        # Rung dispatch policies shed a claimed rung SIDEWAYS to the next
-        # claimable one instead of queueing on it. Each shed is remembered so
-        # the dispatched attempt can disclose the bypassed rung, and so a ladder
-        # exhausted ONLY by sheds can force-admit past the bound, never fail.
+        selected_first = route.resolved_route_id is not None and entry.total_attempts == 0
+        ladder = (0,) if selected_first else eligible_ladder(route, failure)
+        # A caller-selected first dial cannot spill or override health and load gates.
+        # Other ladders may spill sideways or use their operator-authored overflow.
         policy_sheds: list[tuple[int, str]] = []
         disposition: ThrottleDisposition | None = None
         redial_depth: int | None = None  # The rung a post-backoff redial re-dials.
         tool_search_round = False
+        reasoning_repair = data.get("reasoning_repair") is True and isinstance(current_depth, int)
         if failure is not None and isinstance(current_depth, int):
             candidate, disposition = failed_dispatch_candidate(
                 health=self._health,
@@ -398,15 +373,21 @@ class NativeAttemptAccounting:
                 policy_sheds.append((current_depth, THROTTLE_FAILOVER_COLD))
             last_failure: GatewayFailure | None = failure
         else:
-            # A gateway tool-search round re-dials the rung that just served
-            # the withheld search call (its conversation now extended); the
-            # claim starts there and only moves on if that rung went unhealthy.
+            # Semantic tool turns prefer the preceding rung; repairs stay on that rung.
             tool_search_round = data.get("tool_search_round") is True and isinstance(
                 current_depth, int
             )
-            candidate = claim_route_from(
-                self._health, keys, current_depth if tool_search_round else 0, ladder
-            )
+            if selected_first:
+                candidate = 0 if self._health.claim(keys[0]) else None
+            else:
+                candidate = claim_route_from(
+                    self._health,
+                    keys,
+                    current_depth if tool_search_round or reasoning_repair else 0,
+                    (current_depth,) if reasoning_repair else ladder,
+                )
+            if reasoning_repair:
+                ladder = (current_depth,)
             last_failure = None
         forced_overflow = False
         shed_records: dict[int, RungShed] = {}
@@ -416,7 +397,11 @@ class NativeAttemptAccounting:
         while True:
             if candidate is None:
                 if policy_sheds and last_failure is None and not forced_overflow:
-                    candidate = overflow_target(route, policy_sheds, shed_records)
+                    candidate = (
+                        None
+                        if selected_first
+                        else overflow_target(route, policy_sheds, shed_records)
+                    )
                     forced_overflow = candidate is not None
                     if candidate is None:
                         last_failure = lane_saturated_failure()
@@ -425,6 +410,19 @@ class NativeAttemptAccounting:
                         break
                 else:
                     break
+            if not entry.attempt_policy.permits(
+                entry.total_attempts, entry.attempt_counts[candidate]
+            ):
+                last_failure = last_failure or GatewayFailure(
+                    failure_class=GatewayFailureClass.INVALID_REQUEST,
+                    safe_message=(
+                        "The request exhausted gateway.retry attempt limits before "
+                        "producing an answer. Increase the requested limits and resend."
+                    ),
+                    rejected_parameter="gateway.retry",
+                )
+                self._health.release_probe(keys[candidate])
+                break
             deployment = deployment_priced_for_service_tier(
                 route.deployments[candidate],
                 getattr(entry.request, "service_tier", None),
@@ -450,7 +448,7 @@ class NativeAttemptAccounting:
                 policy_sheds.append((candidate, ticket.reason))
                 shed_records.setdefault(candidate, ticket)
                 self._health.release_probe(keys[candidate])
-                forced_overflow = shed_keeps_rung(
+                forced_overflow = not selected_first and shed_keeps_rung(
                     route, candidate, redial_depth, last_failure, ticket.reason
                 )
                 if not forced_overflow:
@@ -543,6 +541,8 @@ class NativeAttemptAccounting:
                 elif forced_overflow:
                     self._throttle_backoff_forced += 1
                 entry.attempt_counts[candidate] += 1
+                if not tool_search_round and not reasoning_repair:
+                    entry.ordinary_attempt_counts[candidate] += 1
                 if throttle_backoff:
                     entry.throttle_redials[candidate] += 1
                 entry.total_attempts += 1

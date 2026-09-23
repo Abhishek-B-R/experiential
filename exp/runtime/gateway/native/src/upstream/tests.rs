@@ -3,6 +3,42 @@
 use super::*;
 
 #[tokio::test]
+async fn h2_refused_stream_never_redials_beneath_the_waterfall() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let recorded = calls.clone();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(socket).await.unwrap();
+        while let Some(Ok((_request, mut response))) = connection.accept().await {
+            recorded.fetch_add(1, Ordering::SeqCst);
+            response.send_reset(h2::Reason::REFUSED_STREAM);
+        }
+    });
+    let client = client_builder(Duration::from_secs(1))
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        client
+            .post(format!("http://{address}/v1/chat/completions"))
+            .body("{}")
+            .send(),
+    )
+    .await
+    .unwrap();
+    assert!(result.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
 async fn decision_wire_omits_all_idempotency_keys_without_changing_chat_headers() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     for dialect in [Dialect::TypesafeSystemone, Dialect::OpenAiCompatible] {

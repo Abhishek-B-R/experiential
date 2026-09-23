@@ -18,11 +18,11 @@ async fn parsed_usage_wins_stale_consumer_usage_on_local_failure() {
         );
         guard.rebind(format!("attempt-{ordinal}"));
         guard.mark_opened();
-        guard.begin_dial_observation().record_dial_total(Usage {
+        guard.begin_dial_observation().record(&Event::Usage(Usage {
             input_tokens: Some(13),
             output_tokens: fresh,
             ..Usage::default()
-        });
+        }));
         let stale = Usage {
             input_tokens: Some(13),
             output_tokens: Some(0),
@@ -146,9 +146,13 @@ async fn observed_terminal_wins_disconnect_once_and_rebind_clears_facts() {
     );
     guard.rebind("one".into());
     let old = guard.begin_dial_observation();
+    old.record(&Event::TextDelta("first physical attempt".into()));
     old.record(&Event::Completed);
     guard.rebind("two".into());
     assert!(guard.observation.snapshot().terminal.is_none());
+    assert!(guard.observation.snapshot().streamed_output.text.is_empty());
+    old.record(&Event::TextDelta("late first attempt".into()));
+    assert!(guard.observation.snapshot().streamed_output.text.is_empty());
     guard.disarm_finalized("completed");
 }
 

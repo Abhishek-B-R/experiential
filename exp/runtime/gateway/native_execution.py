@@ -41,6 +41,7 @@ from exp.runtime.gateway.native_fallback_rules import FallbackRules, eligible_de
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_settlement import deployment_operation_key
 from exp.runtime.gateway.reasoning_carrier import ReasoningCarrierAuthority
+from exp.runtime.gateway.request_policy import RequestAttemptPolicy, attempt_policy
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.rung_admission import RungLoadKey
 from exp.runtime.gateway.tool_search.plan import ToolSearchState
@@ -48,7 +49,7 @@ from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.cache_policy import cache_markers
-from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 
 if TYPE_CHECKING:
@@ -58,47 +59,11 @@ if TYPE_CHECKING:
 MAXIMUM_TOTAL_ATTEMPTS = 8
 MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS = 2
 
-# The failure classes whose failover is a cache-stakes decision rather than a
-# fixed rule. A throttle (429) leaves the rung's prompt cache intact but
-# unreachable for this request right now: an immediate re-claim is refused
-# (the 429 sets the rung's throttle window before the next candidate is
-# chosen), and failing over cold abandons the cache the provider just built,
-# strips the conversation's reasoning carry-over, and rebills the whole
-# context. Without a ``throttle_redial`` schedule the only two moves are to
-# SURFACE the throttle (the caller retries the warm rung after the provider's
-# backoff) or to ADVANCE cold, and which is better depends on how much warm
-# cache is actually at stake. A pool authoring ``throttle_cache_threshold``
-# decides per request by ``throttle_disposition`` below: surface when the
-# requesting organization's observed cached fraction on the throttled rung
-# meets the threshold, advance otherwise (an organization with no cache
-# evidence reads as 0 and advances, so a request is never stranded to protect
-# cache that does not exist). With no threshold the mode's fixed rule stands:
-# ``maximize_cache`` surfaces every throttle, ``maximize_availability`` and
-# ``maximize_cache_affinity`` advance.
-#
-# A pool authoring ``throttle_redial`` adds the third move and removes the
-# surfacing one: the data plane waits out a backoff and asks to redial the SAME
-# rung (``throttle_backoff`` on its reservation), which passes the throttle
-# window because this request is the one deliberately probing the rung back;
-# once the redial cap is spent the ladder advances cold, and a throttle
-# surfaces only when every rung is exhausted. The cache-stakes gate then means
-# "how long to wait here" rather than "surface": it is applied at admission
-# per rung as a redial budget (``DeploymentWire.throttle_redial_budget``), the
-# full schedule at or above the threshold, a proportional share below it, and
-# zero with no cache evidence, so a rung with little at stake fails over
-# sooner and one with nothing at stake fails over at once.
-#
-# TIMEOUT is deliberately NOT in this set. The classifier already decides, per
-# timeout, whether the same rung may be redialed: a genuine retryable timeout
-# (provider 408) carries retryable_same_deployment=True and so redials the warm
-# rung in BOTH modes via the retryable-same branch below, needing no policy
-# override. The only timeouts that reach here with retryable_same_deployment=False
-# are the first-byte and header-phase stalls (relay.first_byte_timeout_failure /
-# upstream.open_timeout_failure), which are dead-lane signals: the lane accepted
-# the connection but never answered, so it must fail over. Folding the whole
-# TIMEOUT class into this set would suppress that failover and strand a stalled
-# request on a lane that never answered -- there is no warm cache to preserve on a
-# lane that never answered.
+# Only throttles trade prompt-cache continuity against immediate failover.
+# Operator schedules permit bounded redials; absent a schedule the cache
+# threshold or failover mode decides whether to advance or surface the 429.
+# Timeouts keep their classifier's retry flags: a 408 can retry; a silent
+# first-byte stall must advance and is not a cache-preserving failure.
 _CACHE_PRESERVING_NO_FAILOVER_CLASSES = frozenset({GatewayFailureClass.THROTTLED})
 
 ThrottleDisposition = Literal[
@@ -175,6 +140,11 @@ class InflightRequest:
     physical dispatch (the frozen route, the provider request for budget
     sizing, and the per-deployment attempt counters) plus the retention
     facts the terminal settlement consumes.
+
+    Attributes:
+        ordinary_attempt_counts: Per-route failure-retry counts, initialized from physical
+            counts; semantic tool turns and reasoning-repair successors do not increment them.
+        attempt_policy: Effective caller bounds, defaulting to the operator's retry mechanics.
     """
 
     authorization: AuthorizationSnapshot
@@ -182,6 +152,8 @@ class InflightRequest:
     request: ServingRequest
     deadline_monotonic: float
     attempt_counts: list[int] = field(default_factory=list)
+    ordinary_attempt_counts: list[int] = field(default_factory=list)
+    attempt_policy: RequestAttemptPolicy = field(default_factory=RequestAttemptPolicy)
     # Post-backoff redials reserved per route depth, and the budget each
     # depth was given at admission (the schedule scaled by the cache at
     # stake); only these redials spend it, never a retryable-class redial of
@@ -233,8 +205,12 @@ class InflightRequest:
 
     def __post_init__(self) -> None:
         """Size the per-deployment attempt counters to the frozen route."""
+        if isinstance(self.request, GatewayRequest):
+            self.attempt_policy = attempt_policy(self.request.gateway)
         if not self.attempt_counts:
             self.attempt_counts = [0 for _ in self.route.deployments]
+        if not self.ordinary_attempt_counts:
+            self.ordinary_attempt_counts = list(self.attempt_counts)
         if not self.throttle_redials:
             self.throttle_redials = [0 for _ in self.route.deployments]
         if not self.throttle_redial_budgets:
@@ -413,6 +389,8 @@ def next_route_candidate(
     maximum_total_attempts: int = MAXIMUM_TOTAL_ATTEMPTS,
     maximum_same_deployment_attempts: int = MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
     fallback_rules: FallbackRules = (),
+    physical_route_cap: int | None = None,
+    physical_attempt_counts: list[int] | None = None,
 ) -> int | None:
     """Choose a safe retry or later exact deployment without changing logical model.
 
@@ -492,8 +470,13 @@ def next_route_candidate(
     """
     if total_attempts >= maximum_total_attempts:
         return None
+    physical_counts = physical_attempt_counts or attempt_counts
+    same_permitted = (
+        physical_route_cap is None or physical_counts[current_depth] < physical_route_cap
+    )
     if (
-        failure.retryable_same_deployment
+        same_permitted
+        and failure.retryable_same_deployment
         and attempt_counts[current_depth] < maximum_same_deployment_attempts
         and health.claim(keys[current_depth])
     ):
@@ -504,6 +487,7 @@ def next_route_candidate(
         # through its own throttle window while the redial cap allows.
         if (
             throttle_backoff
+            and same_permitted
             and throttle_redial_budget > 0
             and health.claim_throttle_redial(keys[current_depth])
         ):
@@ -748,6 +732,15 @@ def select_route_deployments(
         ValueError: The selection is empty, unordered, repeated, or out of range.
     """
     deployments = route.deployments
+    if route.resolved_route_id is not None and 0 not in indexes:
+        raise ProviderParameterError(
+            message=(
+                "The requested route cannot serve this request. "
+                "Choose another route or omit gateway.routing.route_id."
+            ),
+            param="gateway.routing.route_id",
+            code="invalid_parameter",
+        )
     if not indexes:
         raise ValueError("a narrowed route requires at least one deployment")
     if indexes != tuple(sorted(set(indexes))):
@@ -766,6 +759,7 @@ def select_route_deployments(
         route_reason=route.route_reason,
         fallback_reason=route.fallback_reason,
         reasoning_pinned_deployment_id=route.reasoning_pinned_deployment_id,
+        resolved_route_id=route.resolved_route_id,
     )
 
 
@@ -810,6 +804,7 @@ def reorder_route_deployments(
         route_reason=route.route_reason,
         fallback_reason=route.fallback_reason,
         reasoning_pinned_deployment_id=route.reasoning_pinned_deployment_id,
+        resolved_route_id=route.resolved_route_id,
     )
 
 

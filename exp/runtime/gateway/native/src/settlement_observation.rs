@@ -167,18 +167,6 @@ impl Observation {
         }
     }
 
-    /// Replace an across-dial aggregate, where a newly unknown leg must not
-    /// inherit the earlier dial's known subtotal through cumulative merging.
-    pub(crate) fn record_dial_total(&self, usage: Usage) {
-        let mut observed = self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if observed.terminal.is_none() {
-            observed.usage = Some(usage);
-        }
-    }
-
     /// Stamp the effective terminal after normalized output delivery. A queued
     /// terminal still supplies cancellation evidence before this point.
     pub(crate) fn record_effective_terminal(&self, event: &Event) {
