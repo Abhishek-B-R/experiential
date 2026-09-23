@@ -74,7 +74,11 @@ same provider is edited again. Runtime commands never prompt. They resolve an ex
 caller-supplied environment mapping first, then a non-empty process environment value, then
 the stored key for that connection ID. Environment values override the store without rewriting
 it. Missing credentials fail with the environment name and a recovery that points at
-`exp config providers`. Bedrock stays on the AWS credential chain. Current provider revisions
+`exp config providers`. The model picker accepts multiple models from each provider (Space toggles
+selections). Selected models stay in the catalog for evaluation even without a build role.
+Reasoning choices come from the selected deployment or maintained provider contract; DeepSeek
+shows its distinct off (`none`), low, high, and max modes instead of compatibility aliases.
+Bedrock stays on the AWS credential chain. Current provider revisions
 live in SQLite; immutable serving snapshots bind exact revisions while build and evaluation
 artifacts remain in the project artifact store.
 

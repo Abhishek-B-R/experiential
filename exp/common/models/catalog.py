@@ -661,6 +661,9 @@ class ModelRecord(ContractModel):
     ``served_model_id`` accepts an alternate identifier the provider echoes in responses when it
     differs from the requested ``model``, for example a vLLM endpoint that publishes an alias in
     ``/models`` but reports its canonical served name in every completion.
+
+    ``supported_reasoning_efforts`` preserves discovery choices for setup without changing
+    the identity-bearing capability snapshot. ``None`` means the listing did not declare them.
     """
 
     connection: str = Field(min_length=1, max_length=128)
@@ -669,6 +672,7 @@ class ModelRecord(ContractModel):
     served_model_id: str | None = Field(default=None, min_length=1, max_length=2_048)
     billing_source: BillingSource
     capabilities: ModelCapabilities | None = None
+    supported_reasoning_efforts: tuple[ReasoningEffort, ...] | None = None
     gateway: GatewayDeploymentMetadata | None = None
     sft_provenance: SFTModelProvenance | None = None
 

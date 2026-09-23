@@ -55,7 +55,12 @@ def test_login_refreshes_unknown_models_from_the_cloud_catalog_without_new_alias
                                     "status": "active",
                                     "input_nano_usd_per_million": 200000000,
                                     "output_nano_usd_per_million": 1200000000,
-                                    "capabilities": {"supports_structured_output": True},
+                                    "capabilities": {
+                                        "supports_structured_output": True,
+                                        "supports_reasoning": True,
+                                        "reasoning_default_effort": "high",
+                                        "supported_reasoning_efforts": ["low", "high", "max"],
+                                    },
                                 }
                             ],
                             "default_provider_ids": ["primary"],
@@ -83,6 +88,8 @@ def test_login_refreshes_unknown_models_from_the_cloud_catalog_without_new_alias
     assert serves_role(capabilities, SetupRole.JUDGE)
     assert capabilities.input_cost_per_million_tokens_usd == 0.2
     assert capabilities.output_cost_per_million_tokens_usd == 1.2
+    assert saved.models["my-model"].supported_reasoning_efforts == ("low", "high", "max")
+    assert capabilities.reasoning_effort == "high"
     assert "secret-key" not in (tmp_path / "models.toml").read_text()
     assert len(transport.requests) == 2
     assert all(not request.payload for request in transport.requests)

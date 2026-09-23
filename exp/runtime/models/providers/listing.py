@@ -347,6 +347,9 @@ def _openai_compatible_model(provider: str, identity: str, entry: JsonObject) ->
         supports_presence_penalty=_strict_bool(entry.get("supports_presence_penalty")),
         supports_reasoning=_strict_bool(entry.get("supports_reasoning")),
         reasoning_effort=_reasoning_effort(entry.get("reasoning_effort")),
+        supported_reasoning_efforts=_reasoning_effort_choices(
+            entry.get("supported_reasoning_efforts")
+        ),
         sampling_requires_reasoning_none=_strict_bool(
             entry.get("sampling_requires_reasoning_none")
         ),
@@ -521,6 +524,16 @@ def _strict_positive_int(value: object) -> int | None:
 def _strict_bool(value: object) -> bool | None:
     """Read one exact boolean, rejecting truthy integers and other shapes."""
     return value if isinstance(value, bool) else None
+
+
+def _reasoning_effort_choices(value: object) -> tuple[ReasoningEffort, ...] | None:
+    """Preserve an explicit effort list, rejecting malformed or unknown declarations."""
+    if not isinstance(value, list):
+        return None
+    efforts = tuple(_reasoning_effort(item) for item in value)
+    if any(effort is None for effort in efforts) or len(set(efforts)) != len(efforts):
+        return None
+    return tuple(effort for effort in efforts if effort is not None)
 
 
 def _reasoning_effort(value: object) -> ReasoningEffort | None:

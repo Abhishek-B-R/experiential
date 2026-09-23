@@ -865,7 +865,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
     explicit = _RUNNER.invoke(
         app,
         ["build", "explicit", "-t", str(traces), "--root", str(root)],
-        input="2\n\n1\n\n1\n\n1\n1,2\n\n\n\n1\ny\n",
+        input="2\n\nall\n\n1\n\n1\n\n1\n1,2\n\n\n\n1\ny\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
     assert explicit.exit_code == 0, explicit.output

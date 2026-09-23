@@ -7,8 +7,6 @@ and never guesses tools, structured output, token limits, or prices.
 
 from __future__ import annotations
 
-from typing import get_args
-
 from rich.console import Console
 from rich.prompt import Confirm, IntPrompt
 
@@ -20,6 +18,7 @@ from exp.cli.providers.provider_picker import (
     ask_price,
     ask_text,
 )
+from exp.cli.providers.reasoning import REASONING_DISPLAY_ORDER
 from exp.cli.shared.picker import PickerAction, PickerOption, choose_one
 from exp.common.models import (
     ModelCapabilities,
@@ -33,7 +32,7 @@ from exp.common.models import (
 )
 
 _NO_REASONING_EFFORT = "__unset_reasoning_effort__"
-_REASONING_EFFORTS: tuple[ReasoningEffort, ...] = get_args(ReasoningEffort)
+_REASONING_EFFORTS = REASONING_DISPLAY_ORDER
 _COMPLETION_PRICE_FIELDS = (
     ("input_cost_per_million_tokens_usd", "Input cost per million tokens in USD"),
     ("output_cost_per_million_tokens_usd", "Output cost per million tokens in USD"),
@@ -153,6 +152,7 @@ def declare_role_metadata(
         configured=item.configured,
         retainable_roles=item.retainable_roles,
         published=item.published,
+        supported_reasoning_efforts=item.supported_reasoning_efforts,
     )
 
 

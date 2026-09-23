@@ -130,7 +130,11 @@ class ProviderSetupResult:
 
 @dataclass(frozen=True)
 class AvailableModel:
-    """One model the user can configure, either already in the catalog or newly discovered."""
+    """One model the user can configure, either already in the catalog or newly discovered.
+
+    Attributes:
+        supported_reasoning_efforts: Saved discovery choices, separate from capability identity.
+    """
 
     alias: str
     connection: str
@@ -141,6 +145,7 @@ class AvailableModel:
     configured: bool
     retainable_roles: frozenset[SetupRole] = frozenset()
     published: DiscoveredModel | None = None
+    supported_reasoning_efforts: tuple[ReasoningEffort, ...] | None = None
 
     def label(self) -> str:
         """Describe this model as one picker row by its shorthand alias."""
@@ -286,7 +291,7 @@ def select_providers(
             PickerOption(
                 value=_CONFIGURED_ONLY,
                 label="Keep the models already configured",
-                detail="roles only",
+                detail="choose models and roles",
             ),
         )
     preselected = list(session.providers)
@@ -826,6 +831,9 @@ def _discover_models(
                     ),
                     configured=False,
                     published=published.get(model.model),
+                    supported_reasoning_efforts=(
+                        published[model.model].supported_reasoning_efforts
+                    ),
                 )
             )
         return _ProviderDiscoveryResult(endpoint, tuple(models))
