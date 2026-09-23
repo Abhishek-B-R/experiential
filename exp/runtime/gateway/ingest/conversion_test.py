@@ -71,6 +71,7 @@ def _experience(identity: str = "developer") -> CapturedExchange:
 
 def _database(path: Path, experiences: tuple[CapturedExchange, ...]) -> None:
     """Persist exact native-compatible rows, then close before independent ingestion."""
+    path.touch(mode=0o600)
     with sqlite3.connect(path) as connection:
         connection.execute(
             "CREATE TABLE gateway_captures (sequence INTEGER PRIMARY KEY, user_id TEXT, "

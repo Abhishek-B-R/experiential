@@ -1,5 +1,6 @@
 """Immutable import identity, atomicity, and evidence integrity in real SQLite."""
 
+import os
 import sqlite3
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -61,6 +62,88 @@ def test_repeat_reopen_overlap_and_project_membership(tmp_path: Path) -> None:
     third = _save(store, (changed,))
     assert third.new_records == 1 and third.import_id != first.import_id
     assert store.read_import(first.import_id) == saved
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix mode bits require owner-only storage")
+@pytest.mark.parametrize("mode", [0o644, 0o620, 0o604])
+def test_import_rejects_nonprivate_database_without_changing_it(tmp_path: Path, mode: int) -> None:
+    """Import cannot expose prompt content through an existing nonprivate file."""
+    path = tmp_path / "traffic.db"
+    path.touch(mode=mode)
+    path.chmod(mode)
+    with pytest.raises(TraceStoreError, match="owner-only"):
+        SQLiteTraceStore(path).list_imports("powerset")
+    with pytest.raises(TraceStoreError, match="owner-only"):
+        _save(SQLiteTraceStore(path), (_trace(),))
+    assert path.read_bytes() == b""
+    assert path.stat().st_mode & 0o777 == mode
+    assert not Path(f"{path}-wal").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Symlink fixtures require Unix support")
+@pytest.mark.parametrize("target_exists", [False, True])
+def test_import_rejects_final_symlink_without_touching_target(
+    tmp_path: Path, target_exists: bool
+) -> None:
+    """Resolving directory aliases never erases evidence of a final file symlink."""
+    target = tmp_path / "target.db"
+    if target_exists:
+        target.touch(mode=0o600)
+    path = tmp_path / "traffic.db"
+    path.symlink_to(target)
+    with pytest.raises(TraceStoreError, match="regular file"):
+        SQLiteTraceStore(path).list_imports("powerset")
+    with pytest.raises(TraceStoreError, match="regular file"):
+        _save(SQLiteTraceStore(path), (_trace(),))
+    assert path.is_symlink()
+    assert target.exists() == target_exists
+    if target_exists:
+        assert target.read_bytes() == b""
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Private sidecar fixtures require Unix support")
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+@pytest.mark.parametrize("database_exists", [False, True])
+@pytest.mark.parametrize("symlink", [False, True])
+def test_import_rejects_unsafe_sidecar_before_database_creation(
+    tmp_path: Path, suffix: str, database_exists: bool, symlink: bool
+) -> None:
+    """Unsafe orphaned and existing sidecars survive rejection without shared writes."""
+    path = tmp_path / "traffic.db"
+    if database_exists:
+        path.touch(mode=0o600)
+    sidecar = Path(f"{path}{suffix}")
+    target = tmp_path / "sidecar-target"
+    if symlink:
+        target.write_bytes(b"unchanged sidecar target")
+        sidecar.symlink_to(target)
+    else:
+        sidecar.write_bytes(b"unchanged sidecar fixture")
+        sidecar.chmod(0o644)
+    before = sidecar.read_bytes()
+    with pytest.raises(TraceStoreError, match="regular file" if symlink else "owner-only"):
+        _save(SQLiteTraceStore(path), (_trace(),))
+    assert path.exists() == database_exists
+    if database_exists:
+        assert path.read_bytes() == b""
+    assert sidecar.read_bytes() == before
+    assert sidecar.is_symlink() == symlink
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Directory aliases require Unix symlinks")
+def test_private_import_accepts_parent_alias_and_creates_private_sidecars(tmp_path: Path) -> None:
+    """Normal directory aliases remain usable and SQLite sidecars inherit private mode."""
+    directory = tmp_path / "real"
+    directory.mkdir(mode=0o700)
+    alias = tmp_path / "alias"
+    alias.symlink_to(directory, target_is_directory=True)
+    store = SQLiteTraceStore(alias / "traffic.db")
+    with store._connect(write=True) as connection:
+        connection.execute("CREATE TABLE gateway_captures (sequence INTEGER PRIMARY KEY)")
+        for suffix in ("", "-wal", "-shm"):
+            assert Path(f"{store.path}{suffix}").stat().st_mode & 0o777 == 0o600
+    assert store.path == directory / "traffic.db"
+    assert _save(store, (_trace(),)).trace_count == 1
 
 
 def test_write_failure_keeps_staging_hidden_and_retryable(tmp_path: Path) -> None:
@@ -192,6 +275,7 @@ def test_wal_startup_retries_real_contention_before_publishing(
 ) -> None:
     """A real rollback-journal reader blocks WAL until the import releases and retries."""
     store = SQLiteTraceStore(tmp_path / "traffic.db")
+    store.path.touch(mode=0o600)
     reader = sqlite3.connect(store.path)
     retries: list[float] = []
     try:
@@ -219,6 +303,7 @@ def test_wal_startup_contention_stops_at_the_existing_timeout(
 ) -> None:
     """A persistent lock exhausts the setup deadline without publishing partial evidence."""
     store = SQLiteTraceStore(tmp_path / "traffic.db")
+    store.path.touch(mode=0o600)
     reader = sqlite3.connect(store.path)
     ticks = iter((0.0, 5.0))
     try:

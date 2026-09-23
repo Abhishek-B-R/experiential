@@ -21,6 +21,7 @@ from exp.common.traces.trace_test import _trace
 def test_unrecognized_database_is_preserved(tmp_path: Path, schema: str, message: str) -> None:
     """Unrelated evidence is not converted or changed into a trace store."""
     path = tmp_path / "existing.db"
+    path.touch(mode=0o600)
     with sqlite3.connect(path) as connection:
         connection.execute(schema)
     before = path.read_bytes()
@@ -60,6 +61,7 @@ def test_trace_schema_can_join_capture_and_rejects_unknown_version(tmp_path: Pat
 def test_complete_names_do_not_accept_incompatible_definitions(tmp_path: Path, change: str) -> None:
     """Matching names/version cannot hide missing constraints or a changed table shape."""
     path = tmp_path / "traffic.db"
+    path.touch(mode=0o600)
     with sqlite3.connect(path) as connection:
         initialize_schema(connection)
         connection.executescript(change)

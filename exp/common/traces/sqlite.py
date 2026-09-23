@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import stat
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -26,6 +27,33 @@ from exp.common.traces.sqlite_schema import TraceStoreError, initialize_schema, 
 from exp.common.traces.trace import Trace, TraceSource
 
 _JSON_OBJECT = TypeAdapter(JsonObject)
+
+
+def _require_private_file(path: Path, *, optional: bool = False) -> None:
+    """Reject unsafe storage without following symlinks or changing existing files.
+
+    Args:
+        path: Database or sidecar in an operator-controlled directory.
+        optional: Allow an absent sidecar before SQLite creates it.
+
+    Raises:
+        OSError: Storage metadata cannot be read, or a required file is absent.
+        TraceStoreError: Storage is not a regular file or grants group/other access.
+    """
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        if optional:
+            return
+        raise
+    if not stat.S_ISREG(mode):
+        raise TraceStoreError(
+            "Trace storage must be a regular file; use a database path without a file symlink."
+        )
+    if os.name == "posix" and mode & 0o077:
+        raise TraceStoreError(
+            "Trace storage requires owner-only file permissions; correct its permissions first."
+        )
 
 
 def _enable_wal(connection: sqlite3.Connection) -> None:
@@ -135,12 +163,16 @@ class SQLiteTraceStore:
 
     def __init__(self, database_path: Path) -> None:
         """Bind the content database path without opening or creating it."""
-        self.path = database_path.resolve()
+        # Resolve directory aliases without hiding a symlink at the final filename.
+        self.path = database_path.parent.resolve() / database_path.name
 
     @contextmanager
     def _connect(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
         """Own one connection and report storage errors without exposing trace payloads."""
         try:
+            # Reject unsafe orphaned sidecars before even creating an empty database.
+            for suffix in ("-wal", "-shm", "-journal"):
+                _require_private_file(Path(f"{self.path}{suffix}"), optional=True)
             if write:
                 self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 try:
@@ -149,6 +181,7 @@ class SQLiteTraceStore:
                     pass
                 else:
                     os.close(descriptor)
+            _require_private_file(self.path)
             mode = "rw" if write else "ro"
             connection = sqlite3.connect(f"{self.path.as_uri()}?mode={mode}", uri=True, timeout=5)
             try:
@@ -309,7 +342,7 @@ class SQLiteTraceStore:
     def list_imports(self, project_id: str) -> tuple[str, ...]:
         """Read project import identities in selection order without creating missing storage."""
         validate_artifact_id(project_id)
-        if not self.path.exists():
+        if not self.path.exists() and not self.path.is_symlink():
             return ()
         with self._connect() as connection:
             if not connection.execute(
