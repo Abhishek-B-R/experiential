@@ -6,7 +6,7 @@ The root surface is deliberately small:
 |---|---|---|
 | `exp` | Open the branded home screen. `Run Gateway` is the first option and runs setup when needed. | Interactive gateway menu, or the default gateway in a non-interactive terminal. |
 | `exp login [--root ROOT]` | Sign in to Experiential Cloud through the Platform browser approval flow, save the returned organization key, and synchronize the authenticated account's model identities. | User-local credential plus secret-free hosted provider/model records in `.exp/models.toml`. |
-| `exp capture [--verbose] [--domain HOST ...]` | Capture supported OpenAI and Anthropic traffic across macOS apps until Ctrl+C, reusing `exp login`. | Cloud traces and bounded private retry batches. |
+| `exp capture [--verbose] [--domain HOST ...]` | Temporarily disabled pending verified macOS network recovery. | Exits before login or network setup. |
 | `exp run [PROJECT] [--root ROOT] [--check]` | Start the local gateway directly, optionally with one project-backed alias. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
 | `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Launch the guided end-to-end build when traces are omitted, or use one explicit local source for automation. | Simulation, serving RAG, fit RAG, syllabus, evaluation evidence, and a runnable automatic router. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
@@ -22,6 +22,10 @@ The root surface is deliberately small:
 | `exp config telemetry status\|enable\|disable` | Read or update aggregate product telemetry preference. | Local `.exp/settings.toml`. |
 
 ## Direct provider capture on macOS
+
+System Capture is temporarily disabled while macOS network recovery is fixed. `exp capture`
+exits before login, certificate setup, or network interception. Update Experiential after a
+verified fix is released. The intended workflow below remains unavailable until then.
 
 Run `exp capture` in a terminal and leave it open while using your AI applications. It captures
 supported traffic across apps using `api.openai.com`, `chatgpt.com`, and `api.anthropic.com`,
@@ -47,8 +51,6 @@ when macOS asks. Before login, Capture verifies the packaged app and extension s
 mitmproxy's expected signing identity, verifies any installed copy it will reuse, and checks the
 supported macOS version and installation access. If your account cannot install or update the app
 in `/Applications`, ask your administrator for installation access, then retry as your normal user.
-This branch requires a signed redirector with Capture safety protocol 1. That native update is
-not released yet; older packages are rejected before interception starts.
 
 Advanced users can repeat `--domain HOST` to replace the defaults with an exact set, for example
 `exp capture --domain api.openai.com`. The filter applies across applications. Only supported
@@ -89,12 +91,9 @@ If the native capture backend itself exits, Capture stops and reports that failu
 Capture quietly checks provider DNS before starting and every few seconds while running.
 Two consecutive failures for the same provider stop interception automatically. A final check
 reports whether DNS recovered; Capture does not restart itself or request additional permissions.
-The native extension leaves UDP and TCP connections outside port 443 with macOS, including
-ordinary DNS regardless of which app requested it. Its independent 15-second lease expires if
-Capture's serving loop stops renewing it. The signed helper survives Capture long enough to stop
-its own session and verify DNS, then exits. These protections do not guarantee uninterrupted
-connections or repair an unrelated network outage. Capture does not change DNS settings or reset
-system services.
+The macOS DNS responder process is excluded from interception. DNS attributed to other apps can
+still traverse the redirector, so this guard detects resolver failures rather than guaranteeing
+uninterrupted application connections. It does not change DNS settings or reset system services.
 
 Run the CLI as your normal user, without `sudo`. Mitmproxy Redirector's Network Extension provides
 system-wide interception while the foreground backend is running. Ctrl+C ends that interception;
@@ -104,7 +103,7 @@ installed, and the local CA trust remains in the current user's trust store betw
 Existing intercepted connections may close when Capture stops. Restart an application if its
 existing connections prevent a new run from observing requests. Certificate-pinned apps and
 unsupported model protocols are not collected. UDP traffic, including QUIC/HTTP3 and DNS,
-stays outside Capture; model trace collection currently supports HTTPS over TCP on port 443.
+passes through without inspection; model trace collection currently supports HTTPS over TCP.
 
 Upload failures do not stall model responses. The collector retains bounded private retry files
 under the origin-and-organization-specific `capture/spool` directory. The next capture run with

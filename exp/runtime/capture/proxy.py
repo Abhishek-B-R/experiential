@@ -9,7 +9,6 @@ import re
 import time
 from collections import deque
 from collections.abc import Callable
-from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -28,7 +27,6 @@ from exp.runtime.capture.normalization import CapturedExchange, CaptureProtocol,
 from exp.runtime.capture.policy import validate_domains
 from exp.runtime.capture.redirector import capture_server_closed, stop_capture_servers
 from exp.runtime.capture.transports import guard_native_writer
-from exp.runtime.capture.watchdog import capture_watchdog
 
 logger = logging.getLogger(__name__)
 _MAX_TLS_BYPASSES = 128
@@ -180,10 +178,7 @@ class CaptureProxy:
             opts.update(ssl_verify_upstream_trusted_ca=str(self._upstream_ca_file))
         proxyserver = master.addons.get("proxyserver")
         assert isinstance(proxyserver, Proxyserver)
-        supervision = AsyncExitStack()
         try:
-            if any(mode == "local" or mode.startswith("local:") for mode in opts.mode):
-                await supervision.enter_async_context(capture_watchdog(tuple(self._domains)))
             if not await proxyserver.setup_servers():
                 raise RuntimeError(
                     "Capture could not start the network extension. Approve Mitmproxy "
@@ -202,14 +197,11 @@ class CaptureProxy:
                 await stop_capture_servers(proxyserver)
             finally:
                 try:
-                    await supervision.aclose()
+                    await master.done()
                 finally:
-                    try:
-                        await master.done()
-                    finally:
-                        self._master = None
-                        self._finish_pending()
-                        self._transport_failures.clear()
+                    self._master = None
+                    self._finish_pending()
+                    self._transport_failures.clear()
 
     def _finish_pending(self) -> None:
         """Account for interrupted captures even when backend cleanup reports failure."""

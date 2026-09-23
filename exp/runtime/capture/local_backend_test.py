@@ -21,11 +21,7 @@ from exp.runtime.capture import local_backend
 
 
 def _archive(
-    directory: Path,
-    *,
-    app_version: str = "12.0",
-    extension_version: str = "12.0",
-    safety: str = "1",
+    directory: Path, *, app_version: str = "12.0", extension_version: str = "12.0"
 ) -> Path:
     """Create metadata-only dependency packaging without an executable or real extension."""
     package = directory / "mitmproxy_macos"
@@ -36,9 +32,7 @@ def _archive(
             (local_backend._APP_PLIST, app_version),
             (local_backend._EXTENSION_PLIST, extension_version),
         ):
-            payload = plistlib.dumps(
-                {"LSMinimumSystemVersion": version, "CaptureSafetyProtocol": safety}
-            )
+            payload = plistlib.dumps({"LSMinimumSystemVersion": version})
             member = tarfile.TarInfo(name)
             member.size = len(payload)
             bundle.addfile(member, io.BytesIO(payload))
@@ -63,6 +57,8 @@ def backend_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, codesig
     monkeypatch.setattr(local_backend.os, "geteuid", lambda: 501)
     monkeypatch.setattr(local_backend.platform, "mac_ver", lambda: ("15.0", ("", "", ""), ""))
     monkeypatch.delenv("MITMPROXY_KEEP_REDIRECTOR", raising=False)
+    # Exercise prerequisite validation independently of the temporary release block.
+    monkeypatch.setattr(local_backend, "_require_network_recovery", lambda: None)
     package = Distribution.at(tmp_path / "mitmproxy_macos-0.12.11.dist-info")
     monkeypatch.setattr(local_backend, "distribution", lambda name: package)
     return applications
@@ -186,10 +182,7 @@ def _installed_app(applications: Path, archive: Path, *, current: bool) -> Path:
     contents = app / "Contents"
     (contents / "MacOS").mkdir(parents=True)
     plist = contents / "Info.plist"
-    plist.write_bytes(plistlib.dumps({"CaptureSafetyProtocol": "1"}))
-    extension_contents = app / local_backend._EXTENSION_PATH / "Contents"
-    extension_contents.mkdir(parents=True)
-    (extension_contents / "Info.plist").write_bytes(plistlib.dumps({"CaptureSafetyProtocol": "1"}))
+    plist.write_bytes(b"metadata")
     timestamp = archive.stat().st_mtime_ns + (0 if current else 1)
     os.utime(plist, ns=(timestamp, timestamp))
     executable = contents / "MacOS/Mitmproxy Redirector"
@@ -641,26 +634,3 @@ def test_foreground_lock_normalizes_only_capture_directory(capture_home: Path) -
     with local_backend.capture_instance():
         assert stat.S_IMODE(directory.stat().st_mode) == 0o700
         assert stat.S_IMODE(library.stat().st_mode) == 0o755
-
-
-@pytest.mark.parametrize("safety", ["", "0", "2"])
-def test_preflight_rejects_unsupervised_signed_package(
-    backend_environment: Path, tmp_path: Path, safety: str
-) -> None:
-    """A valid signature alone cannot enable the older unsafe interception path."""
-    _archive(tmp_path, safety=safety)
-    with pytest.raises(RuntimeError, match="updated, signed macOS redirector"):
-        local_backend.require_local_backend()
-    assert not list(backend_environment.iterdir())
-
-
-def test_reused_install_requires_extension_safety(
-    backend_environment: Path, tmp_path: Path
-) -> None:
-    """A reused app cannot conceal an older extension with no native lease or DNS bypass."""
-    archive = _archive(tmp_path)
-    app = _installed_app(backend_environment, archive, current=True)
-    extension_plist = app / local_backend._EXTENSION_PATH / "Contents/Info.plist"
-    extension_plist.write_bytes(plistlib.dumps({}))
-    with pytest.raises(RuntimeError, match="updated, signed macOS redirector"):
-        local_backend.require_local_backend()
