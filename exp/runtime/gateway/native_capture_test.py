@@ -61,6 +61,7 @@ def test_python_sink_runs_off_caller_thread_and_close_releases_gil() -> None:
     assert threads and threads[0] != threading.get_ident()
     assert CaptureRecord.model_validate_json(records[0]).request.scope.identity_id == "identity"
     assert collector.counts() == (0, 0, 1, 0, 0, 0)
+    assert collector.maintenance_failures() == 0
 
 
 def test_close_timeout_preserves_accepted_content_for_later_host_settlement() -> None:

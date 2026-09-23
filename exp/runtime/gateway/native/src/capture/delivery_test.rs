@@ -13,7 +13,7 @@ impl Sink for PausedSink {
         512
     }
 
-    fn prepare(record: &Record, _maximum_bytes: usize) -> Result<Self::Prepared, ()> {
+    fn prepare(&self, record: &Record, _maximum_bytes: usize) -> Result<Self::Prepared, ()> {
         Ok(record.request.request_id.clone())
     }
 
@@ -157,6 +157,38 @@ fn failed_destination_retains_budget_and_retries_the_same_record_after_close_tim
     resume.send(()).unwrap();
     assert!(delivery.close_until(Instant::now() + Duration::from_secs(1)));
     assert_eq!(delivery.counts(), [0, 0, 1, 1, 0]);
+}
+
+#[test]
+fn committed_write_and_cleanup_failures_have_separate_counters() {
+    struct CleanupFailure;
+    impl Sink for CleanupFailure {
+        type Prepared = ();
+        fn preparation_bytes(_: usize) -> usize {
+            0
+        }
+        fn prepare(&self, _: &Record, _: usize) -> Result<(), ()> {
+            Ok(())
+        }
+        fn write(&mut self, _: &()) -> Result<(), ()> {
+            Ok(())
+        }
+        fn take_maintenance_failures(&mut self) -> u64 {
+            1
+        }
+        fn maintain(&mut self) -> Result<(), ()> {
+            Err(())
+        }
+    }
+    let delivery = Delivery::new(limits(), CleanupFailure).unwrap();
+    assert!(delivery.submit(record("saved")));
+    let until = Instant::now() + Duration::from_secs(5);
+    while delivery.maintenance_failures() < 2 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(delivery.close_until(until));
+    assert_eq!(delivery.counts(), [0, 0, 1, 0, 0]);
+    assert!(delivery.maintenance_failures() >= 2);
 }
 
 #[test]

@@ -17,7 +17,7 @@ impl Sink for MemorySink {
         maximum_record_bytes
     }
 
-    fn prepare(record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
+    fn prepare(&self, record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
         record.encode(maximum_bytes).ok_or(())
     }
 
@@ -77,7 +77,7 @@ impl Sink for HeldSink {
         maximum_record_bytes
     }
 
-    fn prepare(record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
+    fn prepare(&self, record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
         record.encode(maximum_bytes).ok_or(())
     }
 

@@ -86,12 +86,16 @@ impl<S: Sink> Sink for MaintainedSink<S> {
         S::preparation_bytes(maximum_record_bytes)
     }
 
-    fn prepare(record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
-        S::prepare(record, maximum_bytes)
+    fn prepare(&self, record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
+        self.sink.prepare(record, maximum_bytes)
     }
 
     fn write(&mut self, prepared: &Self::Prepared) -> Result<(), ()> {
         self.sink.write(prepared)
+    }
+
+    fn take_maintenance_failures(&mut self) -> u64 {
+        self.sink.take_maintenance_failures()
     }
 
     fn maintain(&mut self) -> Result<(), ()> {
@@ -577,6 +581,10 @@ impl Collector {
             dropped,
             self.skipped.load(Ordering::Relaxed),
         ]
+    }
+
+    pub(crate) fn maintenance_failures(&self) -> u64 {
+        self.delivery.maintenance_failures()
     }
 }
 

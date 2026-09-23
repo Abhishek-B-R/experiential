@@ -18,11 +18,16 @@ pub(crate) trait Sink: Send + 'static {
     fn preparation_bytes(maximum_record_bytes: usize) -> usize;
 
     /// Prepare once, off serving; retrying storage must not re-encode the record.
-    fn prepare(record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()>;
+    fn prepare(&self, record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()>;
 
     /// Acknowledge an idempotent write or intentional policy exclusion. An error
     /// retains the payload for retry; error details must never include content.
     fn write(&mut self, prepared: &Self::Prepared) -> Result<(), ()>;
+
+    /// Drain cleanup failures discovered after a successful durable write.
+    fn take_maintenance_failures(&mut self) -> u64 {
+        0
+    }
 
     /// Run retention maintenance without adding storage work to serving.
     fn maintain(&mut self) -> Result<(), ()> {
@@ -59,6 +64,7 @@ struct Counters {
     dropped: AtomicU64,
     persisted: AtomicU64,
     failed: AtomicU64,
+    maintenance_failed: AtomicU64,
     capacity: Mutex<()>,
     available: Condvar,
 }
@@ -121,7 +127,9 @@ impl Delivery {
                 loop {
                     if maintained.elapsed() >= Duration::from_secs(1) {
                         if sink.maintain().is_err() {
-                            worker_counters.failed.fetch_add(1, Ordering::Relaxed);
+                            worker_counters
+                                .maintenance_failed
+                                .fetch_add(1, Ordering::Relaxed);
                         }
                         maintained = Instant::now();
                     }
@@ -138,7 +146,7 @@ impl Delivery {
                                     item.value.provider_tool_calls_json = None;
                                 }
                             }
-                            let persisted = match S::prepare(&item.value, maximum_record_bytes) {
+                            let persisted = match sink.prepare(&item.value, maximum_record_bytes) {
                                 Ok(prepared) => {
                                     let mut delay = Duration::from_millis(25);
                                     while sink.write(&prepared).is_err() {
@@ -151,7 +159,7 @@ impl Delivery {
                                         if maintained.elapsed() >= Duration::from_secs(1) {
                                             if sink.maintain().is_err() {
                                                 worker_counters
-                                                    .failed
+                                                    .maintenance_failed
                                                     .fetch_add(1, Ordering::Relaxed);
                                             }
                                             maintained = Instant::now();
@@ -167,6 +175,9 @@ impl Delivery {
                                 &worker_counters.failed
                             };
                             counter.fetch_add(1, Ordering::Relaxed);
+                            worker_counters
+                                .maintenance_failed
+                                .fetch_add(sink.take_maintenance_failures(), Ordering::Relaxed);
                             if let Some(completed) = &item.completed {
                                 let _ = completed.send(persisted);
                             }
@@ -282,6 +293,10 @@ impl Delivery {
             self.counters.failed.load(Ordering::Relaxed),
             self.counters.dropped.load(Ordering::Relaxed),
         ]
+    }
+
+    pub(crate) fn maintenance_failures(&self) -> u64 {
+        self.counters.maintenance_failed.load(Ordering::Relaxed)
     }
 }
 

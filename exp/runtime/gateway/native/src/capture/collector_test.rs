@@ -12,7 +12,7 @@ impl Sink for MemorySink {
         maximum_record_bytes
     }
 
-    fn prepare(record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
+    fn prepare(&self, record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
         record.encode(maximum_bytes).ok_or(())
     }
 
@@ -159,6 +159,32 @@ fn routing_provenance_is_optional_until_selected_and_then_immutable() {
     let records = drain(&collector, receiver);
     assert_eq!(records[0].request.model_id.as_deref(), Some("selected"));
     assert_eq!(records[1].request.model_id, None);
+}
+
+#[test]
+fn collector_forwards_destination_cleanup_failure_without_losing_write_success() {
+    struct CleanupFailure;
+    impl Sink for CleanupFailure {
+        type Prepared = ();
+        fn preparation_bytes(_: usize) -> usize {
+            0
+        }
+        fn prepare(&self, _: &Record, _: usize) -> Result<(), ()> {
+            Ok(())
+        }
+        fn write(&mut self, _: &()) -> Result<(), ()> {
+            Ok(())
+        }
+        fn take_maintenance_failures(&mut self) -> u64 {
+            1
+        }
+    }
+    let collector = Collector::new(config(), CleanupFailure).unwrap();
+    assert!(collector.begin(request("saved")));
+    collector.settle("saved", true, false);
+    assert!(collector.close_until(Instant::now() + Duration::from_secs(1)));
+    assert_eq!(collector.counts(), [0, 0, 1, 0, 0, 0]);
+    assert_eq!(collector.maintenance_failures(), 1);
 }
 
 #[test]
