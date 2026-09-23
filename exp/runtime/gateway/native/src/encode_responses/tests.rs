@@ -838,6 +838,42 @@ fn provider_annotations_attach_to_the_message_text_part() {
     );
 }
 
+#[test]
+fn terminal_probability_observation_is_included_once_in_aggregate_output() {
+    let body = completed_responses_body(
+        "request-probability",
+        "coding",
+        1_700_000_000,
+        ResponsesEnvelope::default(),
+        &[
+            Event::ProviderOutputItemStarted {
+                output_index: 0,
+                item_id: Some("msg_1".to_string()),
+                kind: ProviderOutputItemKind::Message,
+                status: None,
+                phase: None,
+            },
+            Event::ProviderTextDelta {
+                output_index: 0,
+                item_id: "msg_1".to_string(),
+                delta: "OK".to_string(),
+            },
+            Event::ProviderResponsesLogprobs {
+                output_index: 0,
+                item_id: "msg_1".to_string(),
+                content_index: 0,
+                phase: "terminal".to_string(),
+                records: json!([{"token":"OK","logprob":-0.125,"bytes":[79,75]}]),
+            },
+            Event::Completed,
+        ],
+    )
+    .expect("aggregate output encodes");
+    let content = &body.body["output"][0]["content"][0];
+    assert_eq!(content["logprobs"][0]["token"], "OK");
+    assert_eq!(content["logprobs"][0]["bytes"], json!([79, 75]));
+}
+
 /// Results, approvals, and opaque conversation items are served in the
 /// output but never recorded as invoked tools: only `*_call` item types
 /// name an invocation that actually occurred.
@@ -957,3 +993,6 @@ fn caller_attributed_tool_call_items_re_emit_caller_to_the_caller() {
     .expect("completed body must encode");
     assert_eq!(completed.body["output"][0]["caller"], caller);
 }
+
+#[path = "probabilities_tests.rs"]
+mod probabilities_tests;

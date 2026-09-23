@@ -193,6 +193,14 @@ model; operational fallback can only move among certified deployments for that m
 
 ## Request, route, and provider attempts
 
+Tool descriptions have no per-field character limit and reach providers unchanged. The 64 MiB
+request-body limit and provider context limits still apply. Gateway accounting and diagnostic logs
+remain content-free. A downstream host that opts into logging tool descriptions must cap each
+logging-only preview at the first 262,144 Unicode characters and record the original character
+count and whether truncation occurred. This policy applies only to diagnostic copies. Provider
+payloads contain the complete description, and request identity hashes include its full content.
+Durable gateway request records store that digest without retaining the description itself.
+
 The content-free ledger accepts the logical request before learned project selection. Selection or
 direct resolution then produces an execution snapshot containing the exact model, pool, and ordered
 deployment IDs. Each physical provider dispatch gets its own durable attempt row immediately before
@@ -312,8 +320,8 @@ channel. On Messages, a numeric `max_tokens` reasoning budget becomes an exact b
 replace another explicit numeric budget. Unsupported hard constraints are refused before
 dispatch. `exclude` retains its disclosed omission policy. The Chat surface accepts effort
 and enable controls beside `thinking`, `chat_template_kwargs`, and DashScope's top-level
-`enable_thinking`; numeric reasoning budgets receive a named compatibility refusal instead
-of a nearest-tier approximation. See [generation controls](gateway-generation.md). Chat also
+`enable_thinking`; numeric budgets travel unchanged on qualified Anthropic, Gemini 2.5 and Qwen Cloud
+routes. Unsupported budgets are refused; see [generation controls](gateway-generation.md). Chat also
 replays OpenRouter's `reasoning` / `reasoning_details` (the `reasoning.text` blocks) as the
 same caller-owned plaintext history a `reasoning_content` echo is; mid-conversation `system` turns keep their position on wires that express
 them (instruction-hoisting rungs narrow out), and `thinking.display` rides the verbatim thinking
@@ -465,7 +473,7 @@ of `output_tokens`; cache reads and writes are disjoint subsets of `input_tokens
 its own rate; the local SQLite cost estimate still lacks a separate cache-write rate. Wires that report reasoning outside
 their output total are folded by the native usage mappers before the counts leave the data plane:
 Gemini `thoughtsTokenCount` is additive by Google's definition and always folds into
-`output_tokens`; on the OpenAI-shaped wires (Chat Completions and Responses) the provider's own
+`output_tokens` in the native and Python Gemini paths; on Chat and Responses, the provider's own
 `total_tokens` decides: `input + output` is the subset shape (OpenAI, OpenRouter, Fireworks,
 DeepSeek) and passes through untouched, `input + output + reasoning` is the additive shape (xAI,
 natively or relayed by Azure Foundry) and folds; without a decisive total, a reasoning count above
@@ -714,19 +722,14 @@ reasoning model such as GPT-6 Astra) is dropped and disclosed (`temperature->dro
 so the model still answers with its own default; the 400 remains only for a value outside a
 supporting route's declared range, which is a genuine caller error.
 
-**An Anthropic-shaped `thinking` object on the Chat wire is a reasoning control, `adaptive`
-included.** Clients configured for Claude send `thinking: {type: "adaptive"}` (the 4.6+
-generation's only on-mode) to `/v1/chat/completions` on every model; the decoder reads `adaptive`
-and `enabled` alike as "think at the route's default depth" (`thinking->translated(reasoning_effort)`:
-the LANE default, the first rung in route order pinning a catalog `reasoning_default_effort` every
-rung can serve, as on the Messages surface; a route pinning none takes its one required default or
-the lowest portable tier), `disabled` as
-`reasoning_effort: none`, and a `budget_tokens` beside either as not carried. An Anthropic rung
-then receives the adaptive object plus `output_config.effort`; every other reasoning rung receives
-its own effort field; a route with no reasoning effort at all still refuses by name. A `type`
-outside the three members is refused naming the members, never the arriving JSON type (3,935
-Chat requests over 7 days died at decode as "expected one of 'enabled' or 'disabled', but got a
-string instead", 2026-09-15).
+**An Anthropic-shaped `thinking` object on Chat retains its requested depth.** Bare
+`enabled` and `adaptive` select the route's default effort with
+`thinking->translated(reasoning_effort)` disclosure; `disabled` selects `reasoning_effort: none`.
+An enabled `budget_tokens` instead travels unchanged on qualified numeric-budget rungs,
+without an effort approximation. The budget must be an integer of at least 1024 and below
+the output ceiling. Adaptive/off modes and competing effort or budget controls are rejected.
+Top-level Chat `thinking_budget` also exposes Gemini zero/dynamic controls. Unsupported routes return an actionable
+`thinking.budget_tokens` error before dispatch. See [generation controls](gateway-generation.md).
 
 **`parallel_tool_calls` is honoured on every route.** A rung whose wire carries the control forwards it.
 On a rung without it (Gemini, Bedrock, an OpenAI-compatible server that ignores the field), `true` is
@@ -848,7 +851,8 @@ nothing to honor at any effort. `top_k` prefers a carrying rung; when no rung su
 admission drops it with `top_k->dropped(unsupported_by_provider)` because defaults still serve.
 `frequency_penalty` and `presence_penalty` follow their per-rung capability truth and otherwise
 drop with `<parameter>->dropped(unsupported_by_provider)`. These are soft preferences.
-`top_logprobs` remains a named rejection until the response contract can project logprob arrays.
+Chat token probabilities are opt-in on verified compatible rungs; see [Chat token probabilities](chat-logprobs.md).
+Native Responses probabilities use their own capability and selector; see [Responses output probabilities](responses-logprobs.md).
 A caller
 `response_format: {type: "json_object"}` requests schema-free JSON output. OpenAI-compatible
 rungs use native JSON mode, Responses rungs use `text.format: {type: "json_object"}`, and
@@ -918,9 +922,10 @@ SDK accumulators (Python and TypeScript) copy every usage field present on `mess
 their final message shows the true counts. The estimate is display-only: the encoder keeps it
 apart from the usage it settles from, so it never reaches `message_delta` or the ledger, which
 bill the provider's report.
-The per-deployment `capability_parity` export joins catalog declarations with the engine's
-provider-family ground truth so a catalog can pre-warn on gaps and route around them before a
-caller hits that 400.
+The per-deployment `capability_parity` export joins catalog declarations with provider-family ground truth so catalogs can warn about gaps and route around them.
+Schema version 7 additionally projects `supports_prompt_cache_boundaries`, `supports_custom_tools`, `supports_grammar_tools`, `supports_tool_call_limit`, `reports_model_status`, and the existing `reports_reasoning_tokens` declaration.
+These declarations default false and never enable a request feature. Cache boundaries mean explicit breakpoints and retention, not implicit prefix caching. Read tool flags with the row's `dialect` and public API surface: Chat still refuses custom and grammar tools; Responses still refuses `max_tool_calls`.
+Gemini `modelStatus` is not preserved; catalogs must leave `reports_model_status` false until the response contract carries it.
 
 Commit-independent headers are available before streaming begins. Route-dependent headers are
 emitted only after an execution snapshot exists. Stable public IDs do not expose raw key,
@@ -956,9 +961,9 @@ or eviction returns an explicit unavailable error and never reconstructs content
 
 ## Content-free observability and lifecycle
 
-SQLite stores hashes, frozen authority, route identity, state transitions, token counts, latency,
-and estimated cost. It never stores prompts, responses, raw tool arguments, raw virtual keys, or
-provider secrets. `GET /usage` and `GET /usage.json` are two renderings of the same schema-v2 report
+The accounting SQLite stores hashes, frozen authority, route identity, state transitions, tokens,
+latency and estimated cost, never content or keys. Separate [local capture](local_gateway_traffic.md)
+is default-on (`--ghost` disables it). `GET /usage` and `GET /usage.json` render the same schema-v2 report
 and expose only aggregate, per-identity, and physical-attempt `by_billing_source` accounting.
 An anonymous request reads the organization-wide report; a request carrying a virtual key as
 `Authorization: Bearer <key>` reads the report scoped to that key's identity, and an invalid

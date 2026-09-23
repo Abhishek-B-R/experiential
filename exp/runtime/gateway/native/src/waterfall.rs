@@ -662,9 +662,13 @@ async fn run_attempt(
             ),
             None => UpstreamRelay::new(response, dialect, first_token_deadline),
         };
+        if wire.image_output {
+            relay.allow_image_output();
+        }
         relay.set_observation(observation);
         relay.set_carried_usage(carried_usage.take());
         relay.set_stop_sequences(wire.stop_sequences.iter().cloned());
+        relay.set_probability_output(ctx.chat_logprobs, &wire.upstream_payload);
         relay.set_serialize_tool_calls(wire.serialize_tool_calls);
         relay.set_native_tool_translation(wire.native_tool_translation.clone());
         relay.set_tool_search_tool_name(ctx.tool_search.map(|search| search.tool_name.clone()));
@@ -725,38 +729,50 @@ async fn run_attempt(
                 relay.private_progress();
                 continue;
             }
-            let refusal_text = match &event {
-                Event::RefusalDelta(text) | Event::ProviderRefusalDelta { delta: text, .. } => {
-                    Some(text)
-                }
-                _ => None,
-            };
-            if let Some(text) = refusal_text {
-                if refusal_failover {
-                    let event_bytes = text.len();
-                    if withheld_bytes + event_bytes > MAXIMUM_WITHHELD_REFUSAL_BYTES
-                        || withheld.len() + 1 > MAXIMUM_WITHHELD_REFUSAL_EVENTS
+            if matches!(event, Event::GeminiThoughtPart(_))
+                || crate::logprobs::withhold_before_commit(&event, refusal_failover)
+            {
+                let event_bytes = crate::relay::event_retained_bytes(&event);
+                if withheld_bytes.saturating_add(event_bytes) > MAXIMUM_WITHHELD_REFUSAL_BYTES
+                    || withheld.len() + 1 > MAXIMUM_WITHHELD_REFUSAL_EVENTS
+                {
+                    let visible_refusal = withheld.iter().any(crate::logprobs::is_refusal_text)
+                        || crate::logprobs::is_refusal_text(&event);
+                    if !withheld.iter().any(crate::logprobs::is_refusal)
+                        && !crate::logprobs::is_refusal(&event)
                     {
-                        // Buffer overflow commits and flushes.
-                        let prefix = private_reasoning.prefix(&mut withheld, event, usage.as_ref());
-                        let tool_search_dropped_after_output = relay.withheld_search_call_seen();
-                        relay.commit();
-                        return AttemptEnd::Committed(Box::new(CommittedAttempt {
-                            depth,
-                            prefix,
-                            relay,
+                        return AttemptEnd::Ladder {
+                            failure: Failure::new(
+                                FailureClass::MalformedResponse,
+                                crate::dialects::OUTPUT_OVERFLOW_MESSAGE,
+                            )
+                            .with_retry(false, true),
+                            refusal_eligible: false,
+                            exhaustion_flush: Vec::new(),
                             usage,
                             tool_names,
-                            visible_refusal: true,
+                            opened: true,
                             encrypted_reasoning_stripped,
-                            tool_search_rounds: Vec::new(),
-                            tool_search_dropped_after_output,
-                        }));
+                        };
                     }
-                    withheld_bytes += event_bytes;
-                    withheld.push(event);
-                    continue;
+                    let prefix = private_reasoning.prefix(&mut withheld, event, usage.as_ref());
+                    let tool_search_dropped_after_output = relay.withheld_search_call_seen();
+                    relay.commit();
+                    return AttemptEnd::Committed(Box::new(CommittedAttempt {
+                        depth,
+                        prefix,
+                        relay,
+                        usage,
+                        tool_names,
+                        visible_refusal,
+                        encrypted_reasoning_stripped,
+                        tool_search_rounds: Vec::new(),
+                        tool_search_dropped_after_output,
+                    }));
                 }
+                withheld_bytes += event_bytes;
+                withheld.push(event);
+                continue;
             }
             if is_semantic(&event)
                 || (private_reasoning.completes(&event) && !relay.withheld_search_call_seen())
@@ -764,11 +780,8 @@ async fn run_attempt(
                 // Outward output freezes this deployment. A private-only
                 // successful terminal retains its existing encoding and seal
                 // contract; a private-only failure remains failover-safe.
-                let visible_refusal = !withheld.is_empty()
-                    || matches!(
-                        event,
-                        Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
-                    );
+                let visible_refusal = withheld.iter().any(crate::logprobs::is_refusal_text)
+                    || crate::logprobs::is_refusal_text(&event);
                 let prefix = private_reasoning.prefix(&mut withheld, event, usage.as_ref());
                 // A search call withheld in the same turn is dropped: the
                 // rung is frozen on this output, and the caller is told.
@@ -787,14 +800,16 @@ async fn run_attempt(
                 }));
             }
             if !event.is_terminal() {
-                // Pre-commit non-semantic events are dropped from the outward
-                // stream (usage stays tracked), matching the python executor.
+                // Usage stays tracked; other precommit bookkeeping stays private.
                 continue;
             }
             match &event {
                 Event::Failed(failure) => {
                     usage = relay.usage_before_failure(usage);
-                    if !redialed && withheld.is_empty() && repair.repair_after(failure) {
+                    if !redialed
+                        && !withheld.iter().any(crate::logprobs::is_refusal)
+                        && repair.repair_after(failure)
+                    {
                         // The rung opened the stream and refused the replayed
                         // encrypted reasoning on its first frame: the same repair
                         // as a pre-stream 4xx, nothing outward was committed.
@@ -805,7 +820,9 @@ async fn run_attempt(
                         continue 'dial;
                     }
                     let typed_refusal = failure.failure_class == FailureClass::Refusal;
-                    let exhaustion_flush = if !withheld.is_empty() && !typed_refusal {
+                    let exhaustion_flush = if withheld.iter().any(crate::logprobs::is_refusal_text)
+                        && !typed_refusal
+                    {
                         let mut flush = std::mem::take(&mut withheld);
                         flush.push(event.clone());
                         flush
@@ -824,7 +841,7 @@ async fn run_attempt(
                     };
                 }
                 _ => {
-                    if !withheld.is_empty() {
+                    if withheld.iter().any(crate::logprobs::is_refusal) {
                         // A refusal-only stream that terminated successfully is
                         // a provider refusal: withhold the output and advance,
                         // matching the python executor's converted terminal.
@@ -901,6 +918,7 @@ async fn run_attempt(
                                 ctx,
                                 guard,
                                 Event::Incomplete,
+                                withheld,
                                 usage,
                                 tool_names,
                                 depth,
@@ -931,6 +949,7 @@ async fn run_attempt(
                         ctx,
                         guard,
                         event,
+                        withheld,
                         usage,
                         tool_names,
                         depth,

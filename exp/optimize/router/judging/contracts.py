@@ -30,7 +30,15 @@ class ManualJudgeError(ValueError):
 
 
 class ManualJudgeLabel(ContractModel):
-    """One human score or typed pairwise preference for real trace evidence."""
+    """One human score or typed pairwise preference for real trace evidence.
+
+    Attributes:
+        trace_id: Assessed trace identity, from 1 through 512 characters.
+        reference_trace_id: Distinct comparison trace for pairwise labels, otherwise None.
+        dimension_id: Axis whose rubric defines the score range.
+        score: Signed scalar score, or None when winner is supplied.
+        winner: Pairwise preference, or None when score is supplied.
+    """
 
     trace_id: str = Field(min_length=1, max_length=512)
     reference_trace_id: str | None = Field(default=None, min_length=1, max_length=512)
@@ -282,7 +290,15 @@ class JudgeRunEvidence(ContractModel):
 
 
 class JudgeAxisProposal(ContractModel):
-    """One configured-judge proposal retained before a human decision."""
+    """One configured-judge proposal retained before a human decision.
+
+    Attributes:
+        dimension_id: Proposed rubric axis.
+        proposed_score: Signed score checked against the configured axis at review.
+        proposed_judgment: Proposed explanation, empty when omitted.
+        cited_trace_evidence: Unique nonempty trace-span IDs, empty when omitted.
+        cited_reference_trace_evidence: Corresponding pairwise-reference citations.
+    """
 
     dimension_id: ArtifactId
     proposed_score: int
@@ -328,14 +344,28 @@ class JudgeAxisProposal(ContractModel):
 
 
 class HumanJudgeCorrection(ContractModel):
-    """A human-authored replacement for one judge score and judgment."""
+    """A human-authored replacement for one judge score and judgment.
+
+    Attributes:
+        corrected_score: Signed replacement score checked against the configured axis.
+        corrected_judgment: Nonempty replacement explanation, or None to retain the proposal.
+    """
 
     corrected_score: int
     corrected_judgment: str | None = Field(default=None, min_length=1)
 
 
 class FinalAcceptedJudgeLabel(ContractModel):
-    """The label authorized by a human after reviewing a judge proposal."""
+    """The label authorized by a human after reviewing a judge proposal.
+
+    Attributes:
+        score: Accepted signed score within the configured axis.
+        judgment: Accepted explanation, empty when omitted.
+        cited_trace_evidence: Unique nonempty supporting span IDs, empty when omitted.
+        cited_reference_trace_evidence: Corresponding pairwise-reference citations.
+        score_source: Whether the score came from the judge or a human correction.
+        judgment_source: Whether the explanation came from the judge or a human correction.
+    """
 
     score: int
     judgment: str = ""

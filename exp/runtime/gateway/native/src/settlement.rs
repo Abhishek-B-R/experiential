@@ -302,7 +302,12 @@ impl AttemptGuard {
     }
 
     pub(crate) fn begin_dial_observation(&mut self) -> Observation {
-        self.observation = Observation::default();
+        self.observation = self.observation.next_dial();
+        self.observation.clone()
+    }
+
+    /// Share the selected attempt's meter without another JSON boundary or token count.
+    pub(crate) fn capture_observation(&self) -> Observation {
         self.observation.clone()
     }
 
@@ -378,6 +383,11 @@ impl AttemptGuard {
     /// serving it (an aggregator's per-chunk provider label), for settlement.
     pub fn record_upstream_provider(&mut self, provider: Option<String>) {
         self.upstream_provider = provider;
+    }
+
+    /// Preserve independently validated decision usage before answer validation.
+    pub fn record_decision_usage(&mut self, usage: Usage) {
+        self.observation.record(&Event::Usage(usage));
     }
 
     /// Record this request's terminal outcome and duration exactly once, at

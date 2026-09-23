@@ -590,7 +590,7 @@ def _spec(
         "world_model": WorldModelSettings(
             world_model_alias="world-model-a",
             grounded_world_model_input=grounded_input,
-            prompt_version="text-world-model-v1",
+            prompt_version="text-world-model-v2",
             query_embedding=query_embedding or _query_embedding(),
         ),
         "seed": 11,
@@ -949,7 +949,7 @@ def test_worst_case_query_reservation_never_blocks_an_episode_with_spend_remaini
     settings = WorldModelSettings(
         world_model_alias="world-model-a",
         grounded_world_model_input=_grounded_world_model_input(),
-        prompt_version="text-world-model-v1",
+        prompt_version="text-world-model-v2",
         query_embedding=_query_embedding(price=100.0),
     )
 
@@ -1022,7 +1022,7 @@ def test_expensive_episode_estimate_dispatches_until_actual_spend_reaches_the_ce
     settings = WorldModelSettings(
         world_model_alias="world-model-a",
         grounded_world_model_input=_grounded_world_model_input(),
-        prompt_version="text-world-model-v1",
+        prompt_version="text-world-model-v2",
         query_embedding=_query_embedding(),
     )
 
@@ -1088,7 +1088,7 @@ def test_query_embedding_catalog_drift_blocks_every_dispatch(
     settings = WorldModelSettings(
         world_model_alias="world-model-a",
         grounded_world_model_input=_grounded_world_model_input(),
-        prompt_version="text-world-model-v1",
+        prompt_version="text-world-model-v2",
         query_embedding=_query_embedding(
             price=price,
             maximum_attempts=maximum_attempts,
@@ -1106,10 +1106,10 @@ def test_query_embedding_catalog_drift_blocks_every_dispatch(
     assert retriever.queries == []
 
 
-def test_text_simulation_records_tool_tasks_and_context_overflow_as_failed_cells(
+def test_text_simulation_rejects_dropped_tool_schemas_and_context_overflow(
     tmp_path: Path,
 ) -> None:
-    """Neither a declared tool nor an overflowing request reaches a remote provider silently."""
+    """A runtime cannot drop declared tool schemas or send an overflowing request."""
     tool = ToolSchema(
         name="lookup",
         description="Lookup an account.",
@@ -1139,7 +1139,7 @@ def test_text_simulation_records_tool_tasks_and_context_overflow_as_failed_cells
     overflow_rollout = simulator._load_rollout(artifact_set.artifact_ids[1])
 
     assert tool_rollout.failure is not None
-    assert tool_rollout.failure.code.value == "unsupported"
+    assert tool_rollout.failure.code.value == "validation"
     assert overflow_rollout.stop_reason == StopReason.CONTEXT_OVERFLOW
     assert overflow_rollout.failure is not None
     assert overflow_rollout.failure.code.value == "context_overflow"
@@ -2171,3 +2171,233 @@ def test_two_finite_budget_runners_complete_each_cell_exactly_once(tmp_path: Pat
     assert len(world_client.requests) == 2
     rollouts = tuple(runners[0]._load_rollout(item) for item in artifact_sets[0].artifact_ids)
     assert all(rollout.stop_reason == StopReason.COMPLETED for rollout in rollouts)
+
+
+def test_tool_history_after_nonterminal_text_stays_ordered_once(tmp_path: Path) -> None:
+    """Restarted chat agents retain older turns before their local tool-call suffix."""
+    from exp.runtime.agents.chat import ChatAgentRuntime
+
+    task = _task(
+        "task-a", tools=(ToolSchema(name="lookup", description="Look up a fact", input_schema={}),)
+    )
+    cell = _cell("cell-a", task.task_id)
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_input = _persist_task_set(store, {task.task_id: task})
+    calls = tuple(ToolCall(call_id=f"call-{index}", name="lookup") for index in range(2))
+    candidate = _ScriptedClient(
+        [
+            _response("Initial answer.", snapshot=_snapshot("candidate-a")),
+            *(
+                _response("", snapshot=_snapshot("candidate-a")).model_copy(
+                    update={"output": AssistantAction(tool_calls=(call,))}
+                )
+                for call in calls
+            ),
+            _response("Verified answer.", snapshot=_snapshot("candidate-a")),
+        ]
+    )
+    world = _ScriptedClient(
+        [
+            _response(
+                '{"message":"Please verify it.","terminal":false}',
+                snapshot=_snapshot("world-model-a"),
+            ),
+            *(
+                _response(
+                    json.dumps({"tool_results": [{"call_id": call.call_id, "content": "fact"}]}),
+                    snapshot=_snapshot("world-model-a"),
+                )
+                for call in calls
+            ),
+            _response('{"message":"","terminal":true}', snapshot=_snapshot("world-model-a")),
+        ]
+    )
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_input,
+        candidate,
+        world,
+        agent_factory=lambda: ChatAgentRuntime(system_prompt="Verify the answer."),
+    )
+    result = simulator.run(_spec(plan_input, task_input, (cell.cell_id,), maximum_steps=4))
+    assert simulator._load_rollout(result.artifact_ids[0]).stop_reason == StopReason.COMPLETED
+    for index in (2, 3):
+        messages = candidate.requests[index].messages
+        assert [message.role for message in messages] == [
+            "system",
+            "user",
+            "assistant",
+            "user",
+            *(["assistant", "tool"] * (index - 1)),
+        ]
+        assert messages[2].assistant_action == AssistantAction(content="Initial answer.")
+        assert messages[3].content == "Please verify it."
+        assert [message.tool_call_id for message in messages if message.role == "tool"] == [
+            call.call_id for call in calls[: index - 1]
+        ]
+
+
+@pytest.mark.parametrize("query_padding", ["", "x" * 5_500])
+def test_simulated_tools_parallel_errors_state_and_replay(
+    tmp_path: Path, query_padding: str
+) -> None:
+    """Run a tool-using chat agent entirely against generated observations, then replay it."""
+    from exp.runtime.agents.chat import ChatAgentRuntime
+
+    tool = ToolSchema(name="research", description="Research or record a company", input_schema={})
+    task = _task("task-a", tools=(tool,))
+    cell = _cell("cell-a", task.task_id)
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_input = _persist_task_set(store, {task.task_id: task})
+    calls = (
+        ToolCall(call_id="search-a", name="research", arguments={"query": "Acme" + query_padding}),
+        ToolCall(call_id="search-b", name="research", arguments={"query": query_padding}),
+    )
+    record_call = ToolCall(call_id="record-a", name="research", arguments={"record": "Acme"})
+    candidate_client = _ScriptedClient(
+        [
+            _response("", snapshot=_snapshot("candidate-a")).model_copy(
+                update={
+                    "output": AssistantAction(tool_calls=calls),
+                    "finish_reason": ModelFinishReason.COMPLETED,
+                }
+            ),
+            _response("", snapshot=_snapshot("candidate-a")).model_copy(
+                update={
+                    "output": AssistantAction(tool_calls=(record_call,)),
+                    "finish_reason": ModelFinishReason.COMPLETED,
+                }
+            ),
+            _response("Research recorded.", snapshot=_snapshot("candidate-a")),
+        ]
+    )
+    world_client = _ScriptedClient(
+        [
+            _response(
+                json.dumps(
+                    {
+                        "tool_results": [
+                            {"call_id": "search-a", "content": '{"company":"Acme"}'},
+                            {
+                                "call_id": "search-b",
+                                "content": "query must not be blank",
+                                "is_error": True,
+                            },
+                        ],
+                        "state": {"company": "Acme", "saved": False},
+                    }
+                ),
+                snapshot=_snapshot("world-model-a"),
+            ),
+            _response(
+                json.dumps(
+                    {
+                        "tool_results": [
+                            {"call_id": "record-a", "content": "saved"},
+                        ],
+                        "state": {"company": "Acme", "saved": True},
+                    }
+                ),
+                snapshot=_snapshot("world-model-a"),
+            ),
+            _response('{"message":"","terminal":true}', snapshot=_snapshot("world-model-a")),
+        ]
+    )
+    retriever = _FitRetriever(_fit_rag_input())
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_input,
+        candidate_client,
+        world_client,
+        fit_retriever=retriever,
+        agent_factory=lambda: ChatAgentRuntime(system_prompt="Use the declared research tool."),
+    )
+    spec = _spec(plan_input, task_input, (cell.cell_id,), maximum_steps=4)
+    result = simulator.run(spec)
+    rollout = simulator._load_rollout(result.artifact_ids[0])
+    assert rollout.stop_reason == StopReason.COMPLETED, rollout.failure
+    assert rollout.failure is None
+    assert len(candidate_client.requests) == len(world_client.requests) == 3
+    assert all(request.tools == (tool,) for request in candidate_client.requests)
+    second = candidate_client.requests[1]
+    assert [message.role for message in second.messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "tool",
+    ]
+    assert [message.tool_call_id for message in second.messages[-2:]] == ["search-a", "search-b"]
+    assert second.messages[-1].content == "query must not be blank"
+    evidence = json.loads(world_client.requests[1].messages[1].content or "")
+    assert evidence["environment_state"] == {"company": "Acme", "saved": False}
+    assert evidence["task"]["tools"][0]["name"] == "research"
+    assert json.loads(world_client.requests[2].messages[1].content or "")["environment_state"][
+        "saved"
+    ]
+    assert [query.action.tool_name for query in retriever.queries[:2]] == ["research", "research"]
+    assert all(query.action.kind == "tool_call" for query in retriever.queries[:3])
+    assert all(request.tools == () for request in world_client.requests)
+    assert rollout.candidate_economics.cost_usd is not None
+    assert rollout.world_model_economics is not None
+    assert rollout.world_model_economics.cost_usd is not None
+    assert rollout.candidate_economics.cost_usd.value == pytest.approx(0.3)
+    assert rollout.world_model_economics.cost_usd.value == pytest.approx(0.3)
+    assert simulator.run(spec).artifact_ids == result.artifact_ids
+    assert len(candidate_client.requests) == len(world_client.requests) == 3
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"message": "Here are results"},
+        {"tool_results": [{"call_id": "wrong", "content": "result"}]},
+        {"tool_results": [{"call_id": "call-a", "content": "result"}], "terminal": True},
+        {
+            "tool_results": [
+                {"call_id": "call-a", "content": "a"},
+                {"call_id": "call-a", "content": "b"},
+            ]
+        },
+    ],
+)
+def test_simulated_tool_protocol_errors_are_invalid_not_success(
+    tmp_path: Path,
+    payload: dict[str, object],
+) -> None:
+    """Malformed, incomplete, or premature terminal tool batches cannot complete a rollout."""
+    from exp.runtime.agents.chat import ChatAgentRuntime
+
+    tool = ToolSchema(name="lookup", description="Look up a fact", input_schema={})
+    task = _task("task-a", tools=(tool,))
+    cell = _cell("cell-a", task.task_id)
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_input = _persist_task_set(store, {task.task_id: task})
+    response = _response("", snapshot=_snapshot("candidate-a")).model_copy(
+        update={
+            "output": AssistantAction(tool_calls=(ToolCall(call_id="call-a", name="lookup"),)),
+            "finish_reason": ModelFinishReason.COMPLETED,
+        }
+    )
+    candidate = _ScriptedClient([response])
+    world = _ScriptedClient([_response(json.dumps(payload), snapshot=_snapshot("world-model-a"))])
+    simulator = _simulator(
+        store, plan, plan_input, task_input, candidate, world, agent_factory=ChatAgentRuntime
+    )
+    result = simulator.run(_spec(plan_input, task_input, (cell.cell_id,)))
+    rollout = simulator._load_rollout(result.artifact_ids[0])
+    assert rollout.stop_reason == StopReason.FAILURE
+    assert rollout.failure is not None
+    assert rollout.failure.details["phase"] == "world_model_protocol"
+    assert rollout.failure.retryable
+    assert len(candidate.requests) == 1

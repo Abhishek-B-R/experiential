@@ -346,12 +346,14 @@ class ModelMessage(ContractModel):
         if self.content_parts:
             # Tool results carry screenshots too (Bedrock toolResult image
             # blocks); the Gemini and Bedrock wires build from this contract.
-            if self.role not in ("user", "tool"):
-                raise ValueError("content parts are valid only for user and tool messages")
-            if self.role == "tool" and any(
+            if self.role not in ("user", "tool", "assistant"):
+                raise ValueError(
+                    "content parts are valid only for user, tool, and assistant messages"
+                )
+            if self.role in ("tool", "assistant") and any(
                 part.kind not in ("text", "image") for part in self.content_parts
             ):
-                raise ValueError("tool messages carry only text and image parts")
+                raise ValueError(f"{self.role} messages carry only text and image parts")
             texts = [part.text for part in self.content_parts if part.kind == "text"]
             if (self.content or "") != "".join(texts):
                 raise ValueError("content parts must flatten to the message content")
@@ -453,7 +455,7 @@ class ModelCapabilities(ContractModel):
     temperature capability for ``top_p`` and omit the less portable controls. Reasoning models
     that pin their sampling reject temperature and nucleus sampling, so clients omit both when
     the route says they are unsupported. ``supports_logprobs`` remains provider metadata, but
-    public logprob requests fail locally until normalized responses can expose their values.
+    direct model responses cannot return probabilities; gateway Chat has its own lossless contract.
     ``supports_reasoning`` is an explicit wire capability, not an inference from
     ``reasoning_effort``. ``reasoning_effort`` pins an explicit reasoning-effort level only when
     that capability is true.
@@ -464,15 +466,9 @@ class ModelCapabilities(ContractModel):
     # Image generation is served only on a positive claim, like embeddings:
     # ``None`` is unknown and never dispatches to the images surface.
     supports_image_generation: bool | None = None
-    # The model EMITS images inside a chat/Responses turn (a text+image model
-    # such as gpt-5.4-image-2 or the gemini image lanes). A data-plane lane
-    # fact only: the chat normalizers carry no image event, so such a turn
-    # ends output-less, and the waterfall answers its empty completion at
-    # once instead of redialing a second whole image. NEVER an admission
-    # signal -- ``/v1/images`` stays gated on ``supports_image_generation``
-    # plus an Images-API wire (the 2026-09-15 lesson: reusing that claim for
-    # chat lanes admitted image generations onto OpenRouter, whose wire
-    # profile carries an ``images_url`` unconditionally).
+    # Mixed text/image output on Chat Completions. This drives native output
+    # admission and stream bounds independently of the dedicated Images API,
+    # whose admission is controlled by supports_image_generation.
     emits_images: bool = False
     supports_structured_output: bool = False
     supports_completions: bool | None = None
@@ -661,8 +657,8 @@ class ModelRequest(ContractModel):
         temperature: Optional sampling temperature.
         top_p: Optional nucleus-sampling probability mass in ``[0, 1]``.
         top_k: Optional maximum number of candidate tokens considered during sampling.
-        logprobs: Optional request for token log probabilities. Gateway serving rejects a true
-            request until normalized responses can return them losslessly.
+        logprobs: Optional probability control, unsupported by direct ModelResponse projection.
+            Gateway Chat serving uses a separate lossless response contract.
         top_logprobs: Optional count for alternate token probabilities, subject to the same
             lossless-response requirement as ``logprobs``.
         reasoning_effort: Optional caller-selected reasoning effort, preserved only on routes that

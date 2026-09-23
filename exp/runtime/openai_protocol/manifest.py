@@ -30,6 +30,7 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "messages",
                 "max_tokens",
                 "max_completion_tokens",
+                "max_output_tokens",
                 "temperature",
                 "top_p",
                 "stream",
@@ -67,6 +68,7 @@ CHAT_MANIFEST = CompatibilityManifest(
         # DashScope's top-level spelling of the same switch (Qwen-family clients
         # send it via extra_body); translated exactly like chat_template_kwargs.
         _field("enable_thinking", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
+        _field("thinking_budget", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
         _field("logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
         # Sampling penalties: admitted and adapted per rung — honored where the
@@ -84,11 +86,7 @@ CHAT_MANIFEST = CompatibilityManifest(
         # any rung, so false is already satisfied and store:true is rejected:
         # silently dropping a retention request would be dishonest.
         _field("store", CompatibilityDisposition.SUPPORTED),
-        # top_logprobs stays UNSUPPORTED: the gateway response contract does not
-        # project logprob arrays yet, so it cannot be honored on any rung —
-        # rejecting is the honest outcome (never a silent drop of a probability
-        # request). Admit it only once response normalization emits logprobs.
-        _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),
+        _field("top_logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         # End-user attribution (OpenAI spec). Accepted and recorded gateway-side,
         # never forwarded to the model: `safety_identifier` is the current
@@ -121,6 +119,21 @@ CHAT_MANIFEST = CompatibilityManifest(
         # Audio INPUT rides ``messages`` as an ``input_audio`` content part and
         # is admitted per route; ``audio`` and ``modalities`` request audio
         # OUTPUT, which no route serves.
+        # Explicit prompt-cache boundaries: Chat callers can name cache
+        # breakpoints and retention. No rung honors those selectors yet, so
+        # both stay refused rather than silently dropped. The
+        # ``prompt_cache_boundaries`` capability records that decision for
+        # catalog metadata; implicit prefix caching is a different fact.
+        _field(
+            "prompt_cache_options",
+            CompatibilityDisposition.UNSUPPORTED,
+            "prompt_cache_boundaries",
+        ),
+        _field(
+            "prompt_cache_retention",
+            CompatibilityDisposition.UNSUPPORTED,
+            "prompt_cache_boundaries",
+        ),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
@@ -131,8 +144,6 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "modalities",
                 "moderation",
                 "prediction",
-                "prompt_cache_options",
-                "prompt_cache_retention",
                 "seed",
             )
         ),
@@ -175,7 +186,7 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         ),
         _field("reasoning", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
-        _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),
+        _field("top_logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
         # Accepted only at their no-op values (the wire models enforce them):
         # Copilot hardcodes truncation:"disabled" and
         # prompt_cache_options:{"mode":"implicit"} on every Responses request,
@@ -183,6 +194,9 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         # (context is never truncated; served routes cache implicitly).
         _field("truncation", CompatibilityDisposition.SUPPORTED),
         _field("prompt_cache_options", CompatibilityDisposition.SUPPORTED),
+        # The Responses tool-call cap is refused until a route can honor it.
+        # ``tool_call_limit`` is the catalog vocabulary for that decision.
+        _field("max_tool_calls", CompatibilityDisposition.UNSUPPORTED, "tool_call_limit"),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         # End-user attribution / cache hints (OpenAI spec), same handling as the
         # Chat surface: accepted and recorded gateway-side, never forwarded.
@@ -200,7 +214,6 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "background",
                 "context_management",
                 "conversation",
-                "max_tool_calls",
                 "moderation",
                 "prompt",
                 "prompt_cache_retention",
@@ -235,7 +248,9 @@ RESPONSES_REASONING_CONTEXTS_ACCEPTED = frozenset({"auto", "current_turn", "all_
 RESPONSES_REASONING_SUMMARIES_ACCEPTED = frozenset({"auto", "concise", "detailed"})
 """``reasoning.summary`` and ``generate_summary`` values the decoder accepts."""
 
-RESPONSES_INCLUDE_PATHS_ACCEPTED = frozenset({"reasoning.encrypted_content"})
+RESPONSES_INCLUDE_PATHS_ACCEPTED = frozenset(
+    {"reasoning.encrypted_content", "message.output_text.logprobs"}
+)
 """``include`` selectors the gateway honors."""
 
 RESPONSES_INCLUDE_PATHS_REJECTED = frozenset(
@@ -244,7 +259,6 @@ RESPONSES_INCLUDE_PATHS_REJECTED = frozenset(
         "computer_call_output.output.image_url",
         "file_search_call.results",
         "message.input_image.image_url",
-        "message.output_text.logprobs",
         "web_search_call.action.sources",
         "web_search_call.results",
     }

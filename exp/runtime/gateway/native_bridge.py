@@ -1,20 +1,13 @@
 """Python control plane for the native (Rust) gateway data plane.
 
-The native engine (`exp_gateway_native`) owns sockets, upstream streaming,
-normalization, and SSE encoding. Shared Python contracts own decoding,
-authorization, payload construction, continuation state, and durable ledger
-transactions. Every boundary call takes and returns one JSON string.
-Admission returns the full ordered certified route (one wire configuration
-per deployment) plus the frozen retry-policy facts, accepting the request
-without starting any attempt. The data plane then reserves each physical
-dispatch through ``start_attempt`` immediately before network work and lands
-each attempt's durable terminal through ``settle`` (finalizing the request
-only on the terminal attempt); candidate selection stays here: the frozen
-waterfall policy, health circuits, and budget skipping.
+Rust owns sockets, streaming and normalization. Python owns authorization,
+payloads, continuations and ledger transactions. Boundaries use JSON.
+Admission returns the certified route without starting an attempt; Rust reserves
+each dispatch through ``start_attempt`` and records its durable terminal through
+``settle``. Candidate selection, health circuits and budget skipping stay here.
 Boundary errors raise :class:`NativeBridgeError`, whose ``public_error_json``
-attribute carries the sanitized OpenAI-shaped error the data plane returns to
-the caller through the shared boundary mapping. Requests the native path
-cannot serve (resolved clients exposing no native wire profile) are answered
+attribute carries the sanitized OpenAI-shaped error returned to the caller.
+Requests the native path cannot serve (clients without a wire profile) return
 with an ``{"escalate": reason}`` admission disposition after the accepted
 request is finalized content-free; the data plane classifies the reason for
 metrics and fails the request closed with the shared internal error.
@@ -72,6 +65,11 @@ from exp.runtime.gateway.native_bridge_errors import (
 )
 from exp.runtime.gateway.native_bridge_errors import (
     public_capability_error as _public_capability_error,
+)
+from exp.runtime.gateway.native_capture import (
+    CaptureController,
+    begin_capture,
+    select_capture_model,
 )
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
 from exp.runtime.gateway.native_continuation import (
@@ -138,6 +136,7 @@ from exp.runtime.models.providers.errors import (
     ProviderParameterError,
     normalized_provider_failure,
 )
+from exp.runtime.models.providers.logprobs import require_unmodified_probability_output
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 from exp.runtime.openai_protocol.errors import (
     OpenAIProtocolError,
@@ -188,6 +187,7 @@ class NativeControlPlane(
         cache_sample_gate: Callable[[str], bool] | None = None,
         native_route_eligible: Callable[[GatewayRoute, GatewayRequest], bool] | None = None,
         guardrails: GuardrailEngine | None = None,
+        capture: CaptureController | None = None,
         web_search: WebSearchBackend | None = None,
         default_lane_bound: int | None = None,
     ) -> None:
@@ -211,6 +211,7 @@ class NativeControlPlane(
                 admits every sample; a raising gate skips the sample.
             native_route_eligible: Optional hosted policy for complete native semantics.
             guardrails: Optional identity-scoped engine. ``None`` leaves traffic unguarded.
+            capture: Optional identity-scoped native capture controller.
             web_search: Gateway web-search backend; ``None`` binds Exa from ``EXA_API_KEY``.
             default_lane_bound: Per-worker in-flight cap for rungs that author
                 no ``concurrency_bound`` (``lane_saturation.default_lane_bound``
@@ -220,6 +221,7 @@ class NativeControlPlane(
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
+        self._capture = capture
         # The optional batch lane: hosts without it leave every batch route
         # answering the uniform not-enabled error below.
         self._batches = getattr(components, "batches", None)
@@ -279,9 +281,6 @@ class NativeControlPlane(
 
     def admit(self, argument: str) -> str:
         """Decode, authorize, inspect, route, and durably accept one request.
-
-        Shared decoders and payload builders preserve protocol parity.
-        Each physical dispatch is reserved separately by :meth:`start_attempt`.
 
         Args:
             argument: JSON object with ``raw_key``, ``body`` (raw request
@@ -369,6 +368,7 @@ class NativeControlPlane(
             )
         except GuardrailRejected as exc:
             raise NativeBridgeError(public_failure_error(exc.failure)) from exc
+        captured_request = request
         retention_request = strip_stale_reasoning_history(request)
         try:
             request, verified_reasoning_route = unseal_reasoning_history(
@@ -417,8 +417,21 @@ class NativeControlPlane(
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
 
-        # Escalation runs after acceptance; the accepted request is finished
-        # quietly before the disposition returns, so an unservable request is
+        if not begin_capture(
+            self._capture,
+            authorization,
+            captured_request,
+            session_id=optional_text(data.get("capture_session_id")),
+        ):
+            message = "Traffic capture is unavailable or at capacity. Restore capacity and retry."
+            self._accounting.finish_request_quietly(
+                authorization,
+                GatewayFailure(failure_class=GatewayFailureClass.UNAVAILABLE, safe_message=message),
+            )
+            raise NativeBridgeError(
+                OpenAIProtocolError(status_code=503, code="capture_unavailable", message=message)
+            )
+        # Escalation finishes the accepted request quietly before returning, so it is
         # accounted content-free and never billed. Routing failures found by
         # the probe are raised against the accepted request below.
         probe_failure: Exception | None = None
@@ -534,6 +547,7 @@ class NativeControlPlane(
                     continuation=continuation_context,
                 )
             )
+            require_unmodified_probability_output(request, bool(policy and policy.output_checks))
             wire_route: list[JsonObject] = []
             parallel_disclosures: set[str] = set()
             output_bounds: list[int] = []
@@ -686,6 +700,7 @@ class NativeControlPlane(
                 tool_search=tool_search_state,
             )
         )
+        select_capture_model(self._capture, authorization.request_id, route.snapshot.exact_model_id)
         response: JsonObject = {
             "request_id": authorization.request_id,
             "alias": authorization.alias,
@@ -699,7 +714,12 @@ class NativeControlPlane(
             "maximum_total_attempts": MAXIMUM_TOTAL_ATTEMPTS,
             "maximum_same_deployment_attempts": MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
             "refusal_failover": authorization.refusal_failover,
-            "output_guardrail": native_output_mode(self._guardrails, policy, public_request).value,
+            "output_guardrail": native_output_mode(
+                self._guardrails,
+                policy,
+                public_request,
+                image_output=any(wire.get("image_output") is True for wire in wire_route),
+            ).value,
             "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
         }
         if route.snapshot.throttle_redial is not None:

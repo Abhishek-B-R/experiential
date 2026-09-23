@@ -51,6 +51,11 @@ class RawDimensionJudgment(ContractModel):
 
     Retired citation-era fields such as ``feedback`` and ``evidence_span_ids``
     are rejected. Rebuild or re-run the judge under the current schema.
+
+    Attributes:
+        dimension_id: Identity of the axis assessed by the model.
+        raw_score: Signed integer validated against the frozen rubric before acceptance.
+        rationale: Optional explanation, defaulting to None.
     """
 
     dimension_id: ArtifactId

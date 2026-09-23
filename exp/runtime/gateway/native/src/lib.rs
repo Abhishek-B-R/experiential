@@ -7,6 +7,7 @@
 
 mod admission;
 mod bridge;
+mod capture;
 mod codex_native_inversion;
 mod dialects;
 mod encode;
@@ -18,6 +19,10 @@ mod events;
 mod eventstream;
 mod first_token_bound;
 mod guardrails;
+mod image_output;
+mod logprobs;
+#[cfg(test)]
+mod logprobs_tests;
 mod memory;
 mod metrics;
 mod param_attribution;
@@ -187,7 +192,7 @@ fn shutdown_handle() -> ShutdownHandle {
 /// `RegexDetector`, so an admission whose output chain is deterministic runs
 /// entirely in the data plane instead of calling `enforce_output`.
 #[pyfunction]
-#[pyo3(signature = (control_plane, config_json, shutdown=None, on_listening=None, guardrail_detectors=None))]
+#[pyo3(signature = (control_plane, config_json, shutdown=None, on_listening=None, guardrail_detectors=None, capture=None))]
 fn serve(
     py: Python<'_>,
     control_plane: Py<PyAny>,
@@ -195,6 +200,7 @@ fn serve(
     shutdown: Option<&ShutdownHandle>,
     on_listening: Option<Py<PyAny>>,
     guardrail_detectors: Option<&Bound<'_, PyDict>>,
+    capture: Option<&capture::python::CaptureCollector>,
 ) -> PyResult<()> {
     let config: ServeConfig = serde_json::from_str(config_json)
         .map_err(|error| PyValueError::new_err(format!("invalid serve config: {error}")))?;
@@ -203,12 +209,20 @@ fn serve(
         Bridge::new(control_plane, config.callback_permits).map_err(PyRuntimeError::new_err)?,
     );
     let stop = shutdown.and_then(ShutdownHandle::take_receiver);
+    let capture = capture.map(|collector| collector.inner.clone());
     let outcome = py.detach(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|error| format!("tokio runtime construction failed: {error}"))?;
-        runtime.block_on(server::run(bridge, config, stop, on_listening, detectors))
+        runtime.block_on(server::run(
+            bridge,
+            config,
+            stop,
+            on_listening,
+            detectors,
+            capture,
+        ))
     });
     outcome.map_err(PyRuntimeError::new_err)
 }
@@ -453,8 +467,27 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
             None => Err("provider output item requires item_type".to_string()),
         };
         let event = match kind {
+            "image" => events::Event::Image(
+                object
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("image requires url")?
+                    .to_string(),
+            ),
             "text_delta" => events::Event::TextDelta(text),
             "refusal_delta" => events::Event::RefusalDelta(text),
+            "choice_logprobs_delta" => {
+                let choice_index = object
+                    .get("choice_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|index| *index == 0)
+                    .ok_or("choice logprobs requires choice_index 0")?;
+                events::Event::ChoiceLogprobsDelta(
+                    crate::logprobs::parse(object.get("logprobs"), choice_index as u32)
+                        .map_err(|failure| failure.safe_message)?
+                        .ok_or("choice logprobs requires logprobs")?,
+                )
+            }
             "provider_text_delta" => events::Event::ProviderTextDelta {
                 output_index,
                 item_id: item_id.ok_or("provider text delta requires item_id")?,
@@ -772,6 +805,7 @@ fn error_payload(error: &errors::PublicError) -> String {
 fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ShutdownHandle>()?;
     module.add_class::<RegexDetector>()?;
+    module.add_class::<capture::python::CaptureCollector>()?;
     module.add_function(wrap_pyfunction!(shutdown_handle, module)?)?;
     module.add_function(wrap_pyfunction!(serve, module)?)?;
     module.add_function(wrap_pyfunction!(metrics_snapshot_json, module)?)?;

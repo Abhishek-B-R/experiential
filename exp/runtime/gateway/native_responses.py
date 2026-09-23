@@ -412,7 +412,10 @@ def remember_turn(
         indexed_natives.append(
             (
                 output_index,
-                GatewayMessage(role="assistant", provider_native_item=hosted_item),
+                GatewayMessage(
+                    role="assistant",
+                    provider_native_item=hosted_item,
+                ),
             )
         )
     raw_carrier = data.get("reasoning_content_carrier")

@@ -1698,10 +1698,13 @@ def test_sweep_replays_the_original_completed_settlement(tmp_path: Path) -> None
 
 def test_abandoned_inflight_attempts_are_swept_after_the_deadline(tmp_path: Path) -> None:
     """An admitted request the data plane never settles is closed by the sweep."""
-    control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.01)
-    abandoned = _admit_started(control, raw_key, _chat_body())
-    time.sleep(0.05)
-    with mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0):
+    control, raw_key = _control_plane(tmp_path, request_timeout_seconds=1.0)
+    with mock.patch("exp.runtime.gateway.native_accounting.time.monotonic", return_value=100.0):
+        abandoned = _admit_started(control, raw_key, _chat_body())
+    with (
+        mock.patch("exp.runtime.gateway.native_accounting.time.monotonic", return_value=102.0),
+        mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0),
+    ):
         second = _admit(control, raw_key, _chat_body())
     assert control._accounting.entry(str(abandoned["request_id"])) is None  # noqa: SLF001
     assert control._accounting.entry(str(second["request_id"])) is not None  # noqa: SLF001

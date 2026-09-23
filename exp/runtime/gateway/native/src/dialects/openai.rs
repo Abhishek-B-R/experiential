@@ -17,9 +17,10 @@ use crate::events::{
 const MAXIMUM_OPENAI_ID_CHARS: usize = 256;
 
 mod hosted;
+use super::responses_logprobs::{item_done_events, terminal_events};
 use hosted::{is_openai_hosted_item_type, is_openai_hosted_progress_event};
 
-fn openai_identity(
+pub(super) fn openai_identity(
     object: &serde_json::Map<String, Value>,
     key: &str,
     label: &str,
@@ -74,7 +75,7 @@ fn openai_message_phase(
     }
 }
 
-fn openai_index(
+pub(super) fn openai_index(
     object: &serde_json::Map<String, Value>,
     key: &str,
     label: &str,
@@ -133,29 +134,7 @@ impl Normalizer {
         let mut events = Vec::new();
         match event_type.as_str() {
             "response.output_text.delta" => {
-                let output_index = openai_index(&payload, "output_index", "OpenAI output_index")?;
-                let item_id = openai_identity(&payload, "item_id", "OpenAI message item ID")?;
-                if self.bind_openai_output_item(
-                    output_index,
-                    ProviderOutputItemKind::Message,
-                    Some(item_id.clone()),
-                )? {
-                    events.push(Event::ProviderOutputItemStarted {
-                        output_index,
-                        item_id: Some(item_id.clone()),
-                        kind: ProviderOutputItemKind::Message,
-                        status: None,
-                        phase: None,
-                    });
-                }
-                let delta = optional_text(&payload, "delta", "OpenAI text delta")?;
-                if !delta.is_empty() {
-                    events.push(Event::ProviderTextDelta {
-                        output_index,
-                        item_id,
-                        delta,
-                    });
-                }
+                events.extend(self.responses_probability_text_delta(&payload)?);
             }
             "response.refusal.delta" => {
                 let output_index = openai_index(&payload, "output_index", "OpenAI output_index")?;
@@ -180,6 +159,9 @@ impl Normalizer {
                     item_id,
                     delta,
                 });
+            }
+            "response.output_text.done" | "response.content_part.done" => {
+                events.extend(self.responses_probability_part_done(&payload, &event_type)?);
             }
             "response.output_text.annotation.added" => {
                 events.extend(self.openai_text_annotation(&payload)?);
@@ -604,6 +586,9 @@ impl Normalizer {
                                 phase,
                             });
                         }
+                        if self.responses_logprobs {
+                            events.extend(item_done_events(index, item)?);
+                        }
                         events.push(Event::ProviderOutputItemCompleted {
                             output_index: index,
                             item_id: Some(item_id),
@@ -746,6 +731,13 @@ impl Normalizer {
                     .get("response")
                     .and_then(Value::as_object)
                     .ok_or_else(|| malformed("OpenAI terminal response must be an object"))?;
+                let terminal_usage = self
+                    .openai_usage
+                    .update_responses(response.get("usage"))
+                    .map_err(|message| malformed(&message))?;
+                if let Some(usage) = &terminal_usage {
+                    self.usage = Some(usage.clone());
+                }
                 let is_incomplete = event_type == "response.incomplete"
                     || response.get("status").and_then(Value::as_str) == Some("incomplete");
                 let terminal_item_status = if is_incomplete {
@@ -753,6 +745,9 @@ impl Normalizer {
                 } else {
                     ProviderOutputItemStatus::Completed
                 };
+                if self.responses_logprobs {
+                    events.extend(terminal_events(response)?);
+                }
                 events.extend(self.openai_close_unfinished_items(terminal_item_status));
                 // Every incomplete terminal is the provider declaring it cut
                 // the output early, so a call still open mid-fragment is
@@ -775,11 +770,7 @@ impl Normalizer {
                     self.dropped_cut_call |= dropped;
                     tool_events
                 });
-                if let Some(usage) = self
-                    .openai_usage
-                    .update_responses(response.get("usage"))
-                    .map_err(|message| malformed(&message))?
-                {
+                if let Some(usage) = terminal_usage {
                     events.push(Event::Usage(usage));
                 }
                 if !is_incomplete {

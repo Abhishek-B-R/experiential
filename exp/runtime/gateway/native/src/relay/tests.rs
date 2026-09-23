@@ -216,6 +216,65 @@ async fn a_gemini_partial_then_abnormal_frame_ends_incomplete_not_failed() {
 }
 
 #[tokio::test]
+async fn invalid_gemini_images_keep_their_nonretryable_failure_before_and_after_text() {
+    for preceding_text in [false, true] {
+        for (image, message) in [
+            (
+                serde_json::json!({"mimeType": "image/png", "data": "iVBORw0KGgo="}),
+                "provider returned an invalid generated image",
+            ),
+            (
+                serde_json::json!({"mimeType": "image/png"}),
+                "Gemini image requires base64 data",
+            ),
+            (
+                serde_json::json!({"data": "iVBORw0KGgo="}),
+                "Gemini image requires a media type",
+            ),
+        ] {
+            let mut frames = Vec::new();
+            if preceding_text {
+                frames.push(Ok::<_, reqwest::Error>(Bytes::from(
+                    "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n\n",
+                )));
+            }
+            let payload = serde_json::json!({
+                "candidates": [{"content": {"parts": [{"inlineData": image}]}}],
+                "usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 100}
+            });
+            frames.push(Ok(Bytes::from(format!("data: {payload}\n\n"))));
+            let started = Instant::now();
+            let deadline = started + Duration::from_secs(30);
+            let per_chunk = Duration::from_secs(5);
+            let mut relay = UpstreamRelay::from_stream(
+                stream::iter(frames).boxed(),
+                Dialect::GeminiGenerateContent,
+                deadline,
+            );
+            relay.allow_image_output();
+            if preceding_text {
+                assert!(matches!(
+                    relay.next_event(deadline, per_chunk, started).await.unwrap(),
+                    Some(Event::TextDelta(text)) if text == "partial"
+                ));
+            }
+            let failure = relay
+                .next_event(deadline, per_chunk, started)
+                .await
+                .expect_err("an invalid image must not recover to a partial completion");
+            assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+            assert_eq!(failure.safe_message, message);
+            assert!(!failure.retryable_same_deployment);
+            assert!(!failure.failover_eligible);
+            assert_eq!(
+                relay.usage_before_failure(None).unwrap().output_tokens,
+                Some(100)
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_stalled_first_byte_trips_the_ttft_bound_not_the_chunk_timeout() {
     // A provider that opened the stream but never sends a byte must fail
     // over in about the time-to-first-byte window, not the (far larger)

@@ -1,7 +1,4 @@
-//! Incremental upstream relay: one provider response decoded and normalized
-//! into gateway events, plus the shared collection helpers that bound and
-//! classify what the relay yields. The waterfall commits a relay to one
-//! deployment; the HTTP surfaces then drain it live or to completion.
+//! Bounded provider events, committed to one deployment and drained by HTTP surfaces.
 
 mod progress;
 
@@ -24,8 +21,7 @@ use crate::tool_search::{ToolSearchWithholder, WithheldSearchCall};
 use crate::tool_serialization::ToolCallSerializer;
 use crate::waterfall::CommittedAttempt;
 
-/// Map one collection failure to its public error, honoring the shared
-/// aggregate-output overflow contract.
+/// Map collection failures to public errors, honoring aggregate-output bounds.
 pub fn collection_public_error(failure: &Failure) -> PublicError {
     if failure.safe_message == OUTPUT_OVERFLOW_MESSAGE {
         return PublicError::provider_output_too_large();
@@ -33,13 +29,13 @@ pub fn collection_public_error(failure: &Failure) -> PublicError {
     failure.public_error()
 }
 
-/// Approximate retained size of one aggregated event, in bytes. Completed
-/// tool calls charge their full argument text, matching the python engine's
-/// bounded aggregation, which also charges the completed call after its
-/// streamed deltas.
+/// Approximate retained event bytes. Completed calls charge their full arguments
+/// again after streamed deltas, matching the Python bounded aggregator.
 pub fn event_retained_bytes(event: &Event) -> usize {
     match event {
-        Event::TextDelta(text) | Event::RefusalDelta(text) => text.len(),
+        Event::GeminiThoughtPart(part) => crate::dialects::records_retained_bytes(part)
+            .unwrap_or(MAXIMUM_RETAINED_OUTPUT_BYTES.saturating_add(1)),
+        Event::TextDelta(text) | Event::RefusalDelta(text) | Event::Image(text) => text.len(),
         Event::ProviderTextDelta { delta, .. } | Event::ProviderRefusalDelta { delta, .. } => {
             delta.len()
         }
@@ -64,6 +60,21 @@ pub fn event_retained_bytes(event: &Event) -> usize {
         }
         Event::HostedToolItemProgress { payload, .. } => payload.len(),
         Event::ProviderTextAnnotation { annotation, .. } => annotation.len(),
+        Event::ProviderOutputItemStarted { item_id, .. } => {
+            64usize.saturating_add(item_id.as_deref().map_or(0, str::len))
+        }
+        Event::ChoiceLogprobsDelta(delta) => delta.retained_bytes(),
+        Event::ProviderResponsesLogprobs {
+            item_id,
+            phase,
+            records,
+            ..
+        } => crate::dialects::records_retained_bytes(records)
+            .map(|size| {
+                size.saturating_add(item_id.len())
+                    .saturating_add(phase.len())
+            })
+            .unwrap_or(MAXIMUM_RETAINED_OUTPUT_BYTES.saturating_add(1)),
         _ => 64,
     }
 }
@@ -83,18 +94,10 @@ pub fn stream_timeout_failure(deadline: Instant) -> Failure {
     }
 }
 
-/// Classify a provider that accepted the connection but did not stream its
-/// first TOKEN (the first semantic event) within the fail-fast first-token
-/// bound. Headers, keepalive comments and role-only frames do not count. A
-/// stalled lead deployment must not hold the request for its full per-chunk
-/// timeout, so this is a transient, capacity-shaped failure that is
-/// failover-eligible.
-///
-/// It is deliberately *not* same-deployment retryable: a lane that accepted
-/// the connection but never answered is the clearest dead-lane signal, and
-/// redialing it would only stall again for another window. Skipping the redial
-/// and advancing straight to the next certified deployment is what keeps a
-/// fresh pod's cost on a dead lane near one fail-fast window instead of several.
+/// Classify a provider missing its first semantic token within the fail-fast bound.
+/// Headers, keepalives and role-only frames do not count. Advance to the next
+/// certified deployment without redialing the stalled lane, limiting its cost
+/// to one first-token window rather than the full per-chunk timeout.
 pub fn first_byte_timeout_failure() -> Failure {
     Failure::new(
         FailureClass::Timeout,
@@ -210,9 +213,17 @@ pub struct UpstreamRelay {
     /// the reservation settles both dials' tokens as one.
     carried_usage: Option<Usage>,
     observation: Option<crate::settlement::Observation>,
+    capture_reasoning: Option<crate::capture::reasoning::Observer>,
 }
 
 impl UpstreamRelay {
+    /// Image models put a complete encoded image in one SSE frame.
+    pub fn allow_image_output(&mut self) {
+        if let FrameDecoder::Sse(decoder) = &mut self.decoder {
+            decoder.allow_image_output();
+        }
+    }
+
     pub fn new(
         response: reqwest::Response,
         dialect: Dialect,
@@ -275,11 +286,16 @@ impl UpstreamRelay {
             tool_search: ToolSearchWithholder::default(),
             carried_usage: None,
             observation: None,
+            capture_reasoning: None,
         }
     }
 
     pub(crate) fn set_observation(&mut self, observation: crate::settlement::Observation) {
         self.observation = Some(observation);
+    }
+
+    pub(crate) fn set_capture_reasoning(&mut self, observer: crate::capture::reasoning::Observer) {
+        self.capture_reasoning = Some(observer);
     }
 
     /// Close the network body before any settlement callback is awaited.
@@ -484,8 +500,21 @@ impl UpstreamRelay {
         self.carried_usage = carried;
     }
 
-    /// Enforce the caller's stop sequences on this relay's visible text.
-    /// Installed before the first event is yielded; an empty set is a no-op.
+    /// Enable the probability output requested in the frozen provider payload.
+    pub fn set_probability_output(&mut self, chat: bool, payload: &serde_json::Value) {
+        self.normalizer.enable_chat_logprobs(
+            chat && payload.get("logprobs").and_then(serde_json::Value::as_bool) == Some(true),
+        );
+        self.normalizer.enable_responses_logprobs(
+            payload.get("top_logprobs").is_some_and(|v| !v.is_null())
+                || payload
+                    .get("include")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|items| items.iter().any(|v| v == "message.output_text.logprobs")),
+        );
+    }
+
+    /// Enforce stop sequences before yielding events; an empty set is a no-op.
     pub fn set_stop_sequences<I, S>(&mut self, sequences: I)
     where
         I: IntoIterator<Item = S>,
@@ -589,6 +618,9 @@ impl UpstreamRelay {
                     observation.record_effective_terminal(&event);
                 }
                 self.yielded_at = Some(Instant::now());
+                if let Some(observer) = &self.capture_reasoning {
+                    observer.observe(&event);
+                }
                 return Ok(Some(event));
             }
             if self.guard_next_pending() {
@@ -724,8 +756,7 @@ impl Drop for UpstreamRelay {
     }
 }
 
-/// Drain one committed attempt to completion for non-streaming responses,
-/// bounding total retained output like the python service's aggregation.
+/// Drain one non-streaming attempt, bounding output like the Python aggregation.
 pub async fn collect_committed(
     committed: &mut CommittedAttempt,
     deadline: Instant,

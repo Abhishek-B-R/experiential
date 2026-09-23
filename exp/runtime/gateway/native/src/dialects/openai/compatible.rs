@@ -203,6 +203,19 @@ impl Normalizer {
         let choice = choices[0]
             .as_object()
             .ok_or_else(|| malformed("OpenAI-compatible choice must be an object"))?;
+        let choice_index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
+        if self.chat_logprobs
+            && (choice_index != 0 || choice.get("index").is_some_and(|value| !value.is_u64()))
+        {
+            return Err(malformed("OpenAI-compatible stream choice index must be 0"));
+        }
+        if self.chat_logprobs {
+            if let Some(event) =
+                crate::logprobs::parse(choice.get("logprobs"), choice_index as u32)?
+            {
+                events.push(Event::ChoiceLogprobsDelta(event));
+            }
+        }
         // Azure asynchronous content-filter annotations carry no delta. Treat
         // their metadata-only choice as an empty delta, then still process the
         // finish reason below: an annotation can terminate with content_filter.
@@ -222,12 +235,26 @@ impl Normalizer {
                 events.push(Event::TextDelta(content.clone()));
             }
         }
+        if let Some(images) = delta.get("images").filter(|value| !value.is_null()) {
+            let images = images.as_array().ok_or_else(|| {
+                malformed("Chat images must be an array").with_retry(false, false)
+            })?;
+            for image in images {
+                let url = crate::image_output::chat_image(image)?;
+                self.reserve_image_bytes(url.len())?;
+                events.push(Event::Image(url));
+            }
+        }
         if let Some(Value::String(refusal)) = delta.get("refusal") {
             self.refusal_seen = true;
             events.push(Event::RefusalDelta(refusal.clone()));
         }
         if let Some(route_sha256) = self.reasoning_content_route_sha256.clone() {
-            if let Some(value) = delta.get("reasoning_content") {
+            if let Some(value) = delta
+                .get("reasoning_content")
+                .filter(|value| !value.is_null())
+                .or_else(|| delta.get("reasoning"))
+            {
                 let reasoning = match value {
                     Value::Null => None,
                     Value::String(text) => Some(text),

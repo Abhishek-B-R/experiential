@@ -34,6 +34,8 @@ use serde_json::Value;
 
 use crate::errors::Failure;
 
+pub use crate::logprobs::{ChoiceLogprobs, ChoiceLogprobsDelta};
+
 /// Normalized token usage mirroring `GatewayUsage` semantics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
@@ -49,12 +51,6 @@ pub struct Usage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_1h_input_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
-}
-
-impl Usage {
-    pub fn has_token_counts(&self) -> bool {
-        self.input_tokens.is_some() && self.output_tokens.is_some()
-    }
 }
 
 /// One completed tool call with provider-order raw argument text.
@@ -143,13 +139,30 @@ impl ProviderAssistantMessagePhase {
 /// One ordered provider-neutral stream event.
 #[derive(Debug, Clone)]
 pub enum Event {
+    /// Capture-only Gemini part. Thought text is a summary; signatures are opaque.
+    GeminiThoughtPart(std::sync::Arc<Value>),
     TextDelta(String),
+    /// One complete generated image, encoded as a validated inline data URL.
+    Image(String),
     RefusalDelta(String),
+    /// Ordered probability metadata for one Chat choice. This is independent
+    /// of text because providers may send a metadata-only chunk.
+    ChoiceLogprobsDelta(ChoiceLogprobsDelta),
     /// One text delta for a specific provider-owned assistant message item.
     ProviderTextDelta {
         output_index: u32,
         item_id: String,
         delta: String,
+    },
+    /// One native Responses output-text probability observation. The raw
+    /// provider record is retained by phase; terminal reconciliation owns any
+    /// structural comparison and never synthesizes token bytes.
+    ProviderResponsesLogprobs {
+        output_index: u32,
+        item_id: String,
+        content_index: u32,
+        phase: String,
+        records: Value,
     },
     /// One refusal delta for a specific provider-owned assistant message item.
     ProviderRefusalDelta {
@@ -342,6 +355,15 @@ impl Event {
             return true;
         }
         match self {
+            Event::GeminiThoughtPart(part) => {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+                    || part
+                        .get("thoughtSignature")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+            }
             Event::ThinkingSignature { signature, .. } => !signature.is_empty(),
             Event::RedactedThinking { data, .. } => !data.is_empty(),
             Event::EncryptedReasoning {
@@ -358,21 +380,15 @@ impl Event {
         }
     }
 
-    /// Whether this event carries the first visible model output, used to
-    /// stamp time-to-first-token. A content, refusal, reasoning, or tool-argument
-    /// delta counts only when it carries at least one character: an empty delta
-    /// (a role-establishing or empty refusal frame) is not a visible token and
-    /// must not stamp TTFT early. A tool-call start is itself the first token of
-    /// a tool-only turn, so it counts even before any arguments stream. Purely
-    /// structural frames are excluded so TTFT is not stamped early: the Responses
-    /// `ProviderOutputItemStarted` reserves a slot at the item-start boundary
-    /// *before* the first delta arrives, and the opaque reasoning-carrier frames
-    /// (`ThinkingSignature`, `RedactedThinking`, `EncryptedReasoning`) never lead
-    /// a turn on their own. Usage, item-close, and lifecycle/terminal frames are
-    /// not output tokens either.
+    /// Whether this event starts visible output for time-to-first-token accounting.
+    /// Empty text, refusal, reasoning, and tool-argument deltas do not count.
+    /// A tool-call or hosted-tool start counts even before arguments arrive.
+    /// Structural `ProviderOutputItemStarted` frames only reserve slots and do not
+    /// count. Neither do opaque reasoning carriers (`ThinkingSignature`,
+    /// `RedactedThinking`, `EncryptedReasoning`), usage, closes, or terminal frames.
     pub fn is_output_token(&self) -> bool {
         match self {
-            Event::TextDelta(text) | Event::RefusalDelta(text) => !text.is_empty(),
+            Event::TextDelta(text) | Event::RefusalDelta(text) | Event::Image(text) => !text.is_empty(),
             Event::ProviderTextDelta { delta, .. }
             | Event::ProviderRefusalDelta { delta, .. }
             | Event::ReasoningSummaryDelta { delta, .. }
@@ -395,8 +411,15 @@ impl Event {
 /// the failure class and safe message for terminal failures.
 pub fn simplified_event(event: &Event) -> Value {
     match event {
+        Event::GeminiThoughtPart(part) => {
+            serde_json::json!({"kind": "gemini_thought_part", "part": part})
+        }
+        Event::Image(url) => serde_json::json!({"kind": "image", "url": url}),
         Event::TextDelta(text) => serde_json::json!({"kind": "text_delta", "text": text}),
         Event::RefusalDelta(text) => serde_json::json!({"kind": "refusal_delta", "text": text}),
+        Event::ChoiceLogprobsDelta(delta) => {
+            serde_json::json!({"kind": "choice_logprobs_delta", "choice_index": delta.choice_index, "logprobs": delta.logprobs})
+        }
         Event::ProviderTextDelta {
             output_index,
             item_id,
@@ -406,6 +429,20 @@ pub fn simplified_event(event: &Event) -> Value {
             "output_index": output_index,
             "item_id": item_id,
             "text": delta,
+        }),
+        Event::ProviderResponsesLogprobs {
+            output_index,
+            item_id,
+            content_index,
+            phase,
+            records,
+        } => serde_json::json!({
+            "kind": "provider_responses_logprobs",
+            "output_index": output_index,
+            "item_id": item_id,
+            "content_index": content_index,
+            "phase": phase,
+            "records": records,
         }),
         Event::ProviderRefusalDelta {
             output_index,
@@ -671,32 +708,9 @@ pub fn simplified_event(event: &Event) -> Value {
     }
 }
 
-fn add_provider_item_metadata(
-    payload: &mut Value,
-    item_id: &Option<String>,
-    status: Option<ProviderOutputItemStatus>,
-    phase: Option<ProviderAssistantMessagePhase>,
-) {
-    if let Some(item_id) = item_id {
-        payload["item_id"] = Value::String(item_id.clone());
-    }
-    if let Some(status) = status {
-        payload["status"] = Value::String(status.as_str().to_string());
-    }
-    if let Some(phase) = phase {
-        payload["phase"] = Value::String(phase.as_str().to_string());
-    }
-}
-
-/// Whether one hosted Responses item type names a tool INVOCATION.
-///
-/// Only invocations join the ledger's tool names: the hosted union also
-/// carries results (`*_call_output`), approvals, listings, and opaque
-/// conversation items (`additional_tools`, `compaction`), and recording one
-/// of those would report a tool call that never occurred.
-pub fn hosted_item_type_is_invocation(item_type: &str) -> bool {
-    item_type.ends_with("_call")
-}
+mod item_metadata;
+use item_metadata::add_provider_item_metadata;
+pub use item_metadata::hosted_item_type_is_invocation;
 
 /// Validate one raw tool-argument accumulation as a single JSON object.
 ///

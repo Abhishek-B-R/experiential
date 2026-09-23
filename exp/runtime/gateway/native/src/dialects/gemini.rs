@@ -7,8 +7,8 @@ use crate::errors::{Failure, FailureClass};
 use crate::events::{gemini_usage, require_string, Event, ToolAccumulator};
 
 impl Normalizer {
-    /// Normalize one Gemini `streamGenerateContent` SSE frame: reasoning parts
-    /// are skipped, whole function calls expand to start/arguments/completed,
+    /// Normalize one Gemini `streamGenerateContent` SSE frame: thought parts
+    /// stay capture-only, whole function calls expand to start/arguments/completed,
     /// and the terminal candidate flushes the latest usage before its finish
     /// reason maps to the shared completion, incomplete, refusal, or
     /// provider-internal outcome. A prompt-level block (`promptFeedback.
@@ -98,8 +98,19 @@ impl Normalizer {
                     let part = raw_part
                         .as_object()
                         .ok_or_else(|| malformed("Gemini candidate part must be an object"))?;
-                    // Reasoning parts (thought text and thought signatures)
-                    // are not gateway-visible output.
+                    // Google exposes thought summaries, not full CoT. Preserve the
+                    // whole signed part so a signature remains paired with its
+                    // text or functionCall, without treating it as readable output.
+                    if part.get("thought") == Some(&Value::Bool(true))
+                        || part.contains_key("thoughtSignature")
+                    {
+                        let bytes = crate::dialects::records_retained_bytes(raw_part)
+                            .ok_or_else(|| malformed(super::OUTPUT_OVERFLOW_MESSAGE))?;
+                        self.reserve_summary_bytes(bytes.max(64))?;
+                        events.push(Event::GeminiThoughtPart(std::sync::Arc::new(
+                            raw_part.clone(),
+                        )));
+                    }
                     if part.get("thought") == Some(&Value::Bool(true)) {
                         continue;
                     }
@@ -108,6 +119,23 @@ impl Normalizer {
                             events.extend(self.gemini_tool_events(call)?);
                             continue;
                         }
+                    }
+                    if let Some(image) = part.get("inlineData") {
+                        let media_type =
+                            image
+                                .get("mimeType")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| {
+                                    malformed("Gemini image requires a media type")
+                                        .with_retry(false, false)
+                                })?;
+                        let data = image.get("data").and_then(Value::as_str).ok_or_else(|| {
+                            malformed("Gemini image requires base64 data").with_retry(false, false)
+                        })?;
+                        let url = crate::image_output::inline_image(media_type, data)?;
+                        self.reserve_image_bytes(url.len())?;
+                        events.push(Event::Image(url));
+                        continue;
                     }
                     match part.get("text") {
                         Some(Value::String(text)) => {
@@ -247,6 +275,36 @@ mod gemini_tests {
     }
 
     #[test]
+    fn thought_summaries_and_signatures_keep_their_exact_part_association() {
+        let parts = vec![
+            json!({"thought":true,"text":"Summary, not full CoT. 雪"}),
+            json!({"functionCall":{"name":"lookup","args":{"id":"a"}},"thoughtSignature":"tool-signature=="}),
+            json!({"text":"answer","thoughtSignature":"text-signature=="}),
+            json!({"thoughtSignature":"standalone=="}),
+        ];
+        let chunk = sse(&json!({"candidates":[{"content":{"parts":parts},"finishReason":"STOP"}]}));
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &[chunk.as_slice()]);
+        assert!(failure.is_none());
+        let captured: Vec<_> = events
+            .iter()
+            .filter(|event| event["kind"] == "gemini_thought_part")
+            .map(|event| event["part"].clone())
+            .collect();
+        assert_eq!(captured, parts);
+        assert!(!events
+            .iter()
+            .any(|event| event["kind"] == "reasoning_content_delta"));
+        let visible: Vec<_> = events
+            .iter()
+            .filter(|event| event["kind"] == "text_delta")
+            .collect();
+        assert_eq!(visible, vec![&json!({"kind":"text_delta","text":"answer"})]);
+        let private = Event::GeminiThoughtPart(std::sync::Arc::new(parts[0].clone()));
+        assert!(!private.is_output_token());
+        assert!(private.is_generation_progress());
+    }
+
+    #[test]
     fn gemini_golden_stream_normalizes_text_tools_usage_and_completion() {
         // Golden fixture: raw provider bytes in, exact canonical events out.
         // `native_dialect_parity_test.py` holds the python-mapper comparison.
@@ -281,6 +339,7 @@ mod gemini_tests {
             events,
             vec![
                 json!({"kind": "text_delta", "text": "Hel"}),
+                json!({"kind": "gemini_thought_part", "part": {"thought":true,"text":"hidden reasoning"}}),
                 json!({"kind": "text_delta", "text": "lo"}),
                 json!({"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "lookup"}),
                 json!({"kind": "tool_arguments_delta", "index": 0, "text": raw_arguments}),
@@ -351,6 +410,7 @@ mod gemini_tests {
             events,
             vec![
                 json!({"kind": "text_delta", "text": "Sunlight scatters off air "}),
+                json!({"kind": "gemini_thought_part", "part": {"text":"molecules.","thoughtSignature":"CikB"}}),
                 json!({"kind": "text_delta", "text": "molecules."}),
                 json!({
                     "kind": "usage",
