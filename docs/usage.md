@@ -47,6 +47,8 @@ when macOS asks. Before login, Capture verifies the packaged app and extension s
 mitmproxy's expected signing identity, verifies any installed copy it will reuse, and checks the
 supported macOS version and installation access. If your account cannot install or update the app
 in `/Applications`, ask your administrator for installation access, then retry as your normal user.
+This branch requires a signed redirector with Capture safety protocol 1. That native update is
+not released yet; older packages are rejected before interception starts.
 
 Advanced users can repeat `--domain HOST` to replace the defaults with an exact set, for example
 `exp capture --domain api.openai.com`. The filter applies across applications. Only supported
@@ -87,9 +89,12 @@ If the native capture backend itself exits, Capture stops and reports that failu
 Capture quietly checks provider DNS before starting and every few seconds while running.
 Two consecutive failures for the same provider stop interception automatically. A final check
 reports whether DNS recovered; Capture does not restart itself or request additional permissions.
-The macOS DNS responder process is excluded from interception. DNS attributed to other apps can
-still traverse the redirector, so this guard detects resolver failures rather than guaranteeing
-uninterrupted application connections. It does not change DNS settings or reset system services.
+The native extension leaves UDP and TCP connections outside port 443 with macOS, including
+ordinary DNS regardless of which app requested it. Its independent 15-second lease expires if
+Capture's serving loop stops renewing it. The signed helper survives Capture long enough to stop
+its own session and verify DNS, then exits. These protections do not guarantee uninterrupted
+connections or repair an unrelated network outage. Capture does not change DNS settings or reset
+system services.
 
 Run the CLI as your normal user, without `sudo`. Mitmproxy Redirector's Network Extension provides
 system-wide interception while the foreground backend is running. Ctrl+C ends that interception;
@@ -99,7 +104,7 @@ installed, and the local CA trust remains in the current user's trust store betw
 Existing intercepted connections may close when Capture stops. Restart an application if its
 existing connections prevent a new run from observing requests. Certificate-pinned apps and
 unsupported model protocols are not collected. UDP traffic, including QUIC/HTTP3 and DNS,
-passes through without inspection; model trace collection currently supports HTTPS over TCP.
+stays outside Capture; model trace collection currently supports HTTPS over TCP on port 443.
 
 Upload failures do not stall model responses. The collector retains bounded private retry files
 under the origin-and-organization-specific `capture/spool` directory. The next capture run with

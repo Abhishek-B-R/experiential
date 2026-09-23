@@ -237,6 +237,7 @@ def _verify_packaged_app(archive: Path) -> None:
             destination = Path(temporary)
             _extract_verification_bundle(archive, destination)
             _verify_bundle_signature(destination / _APP_NAME)
+            _require_capture_safety(destination / _APP_NAME)
     except (OSError, ValueError, tarfile.TarError) as exc:
         raise RuntimeError(_REINSTALL) from exc
 
@@ -338,6 +339,7 @@ def _require_install_access(archive: Path) -> None:
         if plist.is_file() and plist.stat().st_mtime_ns == archive.stat().st_mtime_ns:
             if executable.is_file() and os.access(executable, os.X_OK):
                 _verify_bundle_signature(app)
+                _require_capture_safety(app)
                 return
             raise RuntimeError(
                 "The installed Mitmproxy Redirector app is incomplete. Ask an administrator "
@@ -357,3 +359,26 @@ def _require_install_access(archive: Path) -> None:
 def _writable_directory(path: Path) -> bool:
     """Inspect access without creating files or requesting elevated privileges."""
     return path.is_dir() and os.access(path, os.W_OK | os.X_OK)
+
+
+def _require_capture_safety(app: Path) -> None:
+    """Require signed capability metadata for both halves of the native watchdog.
+
+    Signature validation must precede this check. An older signed redirector is
+    valid mitmproxy software but cannot provide Capture's DNS bypass and recovery
+    contract; it must never be used as a fallback.
+    """
+    for bundle in (app, app / _EXTENSION_PATH):
+        try:
+            with (bundle / "Contents/Info.plist").open("rb") as source:
+                payload = source.read(65537)
+            if len(payload) > 65536:
+                raise ValueError("oversized bundle metadata")
+            metadata = plistlib.loads(payload)
+        except (OSError, ValueError, plistlib.InvalidFileException, ExpatError) as exc:
+            raise RuntimeError(_REINSTALL) from exc
+        if not isinstance(metadata, dict) or metadata.get("CaptureSafetyProtocol") != "1":
+            raise RuntimeError(
+                "Capture needs an updated, signed macOS redirector with recovery support. "
+                "This build cannot start safely. Update Experiential when that build is available."
+            )

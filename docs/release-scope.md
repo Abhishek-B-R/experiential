@@ -23,9 +23,12 @@ on the exact release checkout.
   missing process identity or exhausted capacity uses an explicit host-wide exclusion. Other capture
   continues, and the terminal names excluded targets and retains a partial-capture indicator.
   Backend failure still stops Capture. A quiet DNS guard checks selected providers before startup,
-  stops after repeated lookup failures, and checks recovery after shutdown. The native selector
-  excludes the macOS DNS responder process. Synthetic provider, DNS, and backend lifecycle tests
-  are separate from real client testing; the guard does not prove application TLS compatibility.
+  stops after repeated lookup failures, and checks recovery after shutdown. Capture requires the
+  unreleased signed native safety update; older redirectors fail preflight. The native extension
+  leaves UDP and non-443 TCP with macOS, and its independent lease releases interception if the
+  serving loop hangs. The signed helper checks session cleanup and DNS after the owner exits.
+  Synthetic provider, DNS, and backend lifecycle tests are separate from signed-extension and real
+  client testing; the watchdog does not prove application TLS compatibility.
 - The local gateway supports explicit provider references, identities, virtual keys, grants,
   singleton and certified ordered exact-model pools, frozen-project aliases, bounded precommit
   provider fallback, Chat Completions, Responses (over HTTP and as the Responses-over-WebSocket

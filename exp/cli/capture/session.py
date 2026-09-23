@@ -15,7 +15,7 @@ from exp.runtime.capture.health import CaptureHealth, CaptureHealthFailure
 from exp.runtime.capture.proxy import CaptureBypassReason, CaptureProxy
 from exp.runtime.capture.upload import CaptureUploader, UploadStats
 
-_SHUTDOWN_TIMEOUT = 5.0
+_SHUTDOWN_TIMEOUT = 30.0
 _STARTUP_TIMEOUT = 180.0
 _WAITING_NOTICE_DELAY = 3.0
 
