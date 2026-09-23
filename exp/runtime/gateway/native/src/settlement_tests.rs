@@ -18,11 +18,11 @@ async fn parsed_usage_wins_stale_consumer_usage_on_local_failure() {
         );
         guard.rebind(format!("attempt-{ordinal}"));
         guard.mark_opened();
-        guard.begin_dial_observation().record_dial_total(Usage {
+        guard.begin_dial_observation().record(&Event::Usage(Usage {
             input_tokens: Some(13),
             output_tokens: fresh,
             ..Usage::default()
-        });
+        }));
         let stale = Usage {
             input_tokens: Some(13),
             output_tokens: Some(0),

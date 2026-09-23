@@ -24,13 +24,20 @@ use crate::rate_limit_headers::{harvest_rate_limit_headers, retry_after_seconds}
 /// host never accepts the connection fails over after this window instead of
 /// hanging on the per-deployment request timeout.
 pub fn build_client(connect_timeout: Duration) -> Result<reqwest::Client, String> {
+    client_builder(connect_timeout)
+        .build()
+        .map_err(|error| format!("upstream client construction failed: {error}"))
+}
+
+/// One transport configuration shared by production and protocol-level tests.
+fn client_builder(connect_timeout: Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .pool_max_idle_per_host(64)
         .connect_timeout(connect_timeout)
         .redirect(reqwest::redirect::Policy::none())
+        // The waterfall owns every physical retry and its reservation, including H2 nacks.
+        .retry(reqwest::retry::never())
         .use_rustls_tls()
-        .build()
-        .map_err(|error| format!("upstream client construction failed: {error}"))
 }
 
 /// Classify one sanitized HTTP or connection failure by status only,

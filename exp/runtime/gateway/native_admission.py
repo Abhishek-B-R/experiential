@@ -431,6 +431,8 @@ def _keeps_issuing_rung_first(route: GatewayRoute) -> bool:
     dead the pin is stale: every surviving rung runs without the reasoning,
     so the pool's normal ordering applies to them.
     """
+    if route.resolved_route_id is not None:
+        return True
     pinned = route.reasoning_pinned_deployment_id
     return pinned is not None and any(
         deployment.deployment_id == pinned for deployment in route.deployments

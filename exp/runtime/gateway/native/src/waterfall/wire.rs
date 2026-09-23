@@ -130,6 +130,28 @@ pub struct RoutePolicy {
     /// The pool's backoff-and-redial schedule for throttled rungs, when
     /// authored.
     pub throttle_redial: Option<ThrottleRedial>,
+    pub physical_route_cap: Option<u32>,
+    pub backoff: Option<crate::request_policy::Backoff>,
+}
+
+impl RoutePolicy {
+    /// Every dispatch must fit the server caps and any explicit caller cap.
+    pub fn permits(self, total: u32, physical_at_route: u32) -> bool {
+        total < self.maximum_total_attempts.min(8)
+            && self
+                .physical_route_cap
+                .is_none_or(|cap| physical_at_route < cap.min(4))
+    }
+
+    /// Reject a malformed internal admission rather than silently widening it.
+    pub fn valid(self) -> bool {
+        (1..=8).contains(&self.maximum_total_attempts)
+            && (1..=4).contains(&self.maximum_same_deployment_attempts)
+            && self
+                .physical_route_cap
+                .is_none_or(|cap| (1..=4).contains(&cap))
+            && self.backoff.is_none_or(|backoff| backoff.valid())
+    }
 }
 
 /// Everything one waterfall run needs besides its request guard.

@@ -886,6 +886,84 @@ class TestLaneSaturation:
         assert registry.rung_admission_counters() == (1, 0, 1)
 
 
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        None,
+        GatewayRungDispatchPolicy(concurrency_bound=1),
+        GatewayRungDispatchPolicy(concurrency_bound=1, saturation="refuse"),
+        GatewayRungDispatchPolicy(requests_per_minute=1),
+    ],
+)
+@pytest.mark.parametrize("reasoning_pinned", [False, True])
+def test_selected_first_route_refuses_load_shed_without_spill_or_overflow(
+    dispatch: GatewayRungDispatchPolicy | None, reasoning_pinned: bool
+) -> None:
+    """A caller selector neither moves sideways nor overrides any lane load ceiling."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+    deployments = (
+        _deployment("deployment-a", connection_sha256="b" * 64, dispatch=dispatch),
+        _deployment("deployment-b", connection_sha256="c" * 64),
+    )
+    _admit(registry, deployments, request_id="occupied")
+    selected = _admit(
+        registry,
+        deployments,
+        request_id="selected",
+        reasoning_pinned_deployment_id="deployment-a" if reasoning_pinned else None,
+    )
+    selected.route = selected.route.model_copy(update={"resolved_route_id": "route_" + "a" * 64})
+    assert _start(registry, ordinal=0, request_id="occupied")["route_depth"] == 0
+    if dispatch is not None and dispatch.requests_per_minute is not None:
+        # Release concurrency so this arm exercises only the retained rate window.
+        _settle(
+            registry,
+            attempt_id=str(ledger.started[0]["attempt_id"]),
+            outcome="completed",
+            finalize=True,
+            request_id="occupied",
+        )
+    refused = _start(registry, ordinal=0, request_id="selected")
+    assert refused["exhausted"] is True
+    failure = refused["failure"]
+    assert isinstance(failure, dict)
+    assert failure["failure_class"] == "throttled"
+    assert failure["retry_after_seconds"] == THROTTLED_RETRY_AFTER_SECONDS
+    assert len(ledger.started) == 1
+    assert registry.rung_admission_counters() == (1, 0, 1)
+    assert registry.entry("selected") is None
+
+
+@pytest.mark.parametrize("probe_occupied", [False, True])
+def test_selected_first_route_does_not_force_an_open_health_circuit(
+    probe_occupied: bool,
+) -> None:
+    """Selecting a suppressed lead never converts a healthy sibling into circuit override."""
+    registry, ledger, selected = _registry()
+    selected.route = selected.route.model_copy(update={"resolved_route_id": "route_" + "a" * 64})
+    key = deployment_health_key(selected.authorization, selected.route.deployment)
+    registry.health.failed(
+        key,
+        GatewayFailure(
+            failure_class=GatewayFailureClass.PROVIDER_AUTHENTICATION,
+            safe_message="provider rejected its credential",
+        ),
+    )
+    if probe_occupied:
+        assert registry.health.claim_last_resort(key)
+    refused = _start(registry, ordinal=0)
+    assert refused["exhausted"] is True
+    failure = refused["failure"]
+    assert isinstance(failure, dict)
+    assert failure["failure_class"] == "provider_internal"
+    assert not ledger.started
+    assert registry.entry(selected.authorization.request_id) is None
+    ordinary = _admit(registry, selected.route.deployments, request_id="ordinary")
+    assert _start(registry, ordinal=0, request_id="ordinary")["route_depth"] == 1
+    assert ordinary.total_attempts == 1
+
+
 class TestRungDispatchPolicy:
     """Bounded-queue spill, fair-share sheds, overflow, and their disclosures."""
 

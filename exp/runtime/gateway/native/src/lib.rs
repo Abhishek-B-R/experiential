@@ -31,6 +31,7 @@ mod rejection_shapes;
 mod relay;
 mod replay;
 mod replay_repair;
+mod request_policy;
 mod respond;
 mod responses_retention;
 mod route_batches;

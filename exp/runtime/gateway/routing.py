@@ -31,6 +31,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.discovery import PublishedAliasMetadata, published_alias_metadata
 from exp.runtime.gateway.interfaces import ProjectTargetResolver
+from exp.runtime.gateway.request_policy import RequestedRouteId
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded, RequestDeadline
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 from exp.runtime.router.runtime import RouterRuntime
@@ -58,13 +59,18 @@ so the ledger shows the request ran without its thinking continuity.
 
 
 class GatewayRoute(ContractModel):
-    """One immutable ordered exact-model route ready for provider execution."""
+    """One immutable ordered exact-model route ready for provider execution.
+
+    Attributes:
+        resolved_route_id: Optional host attestation that the requested public handle leads.
+    """
 
     snapshot: ExecutionSnapshot
     deployment: ExactModelDeployment
     fallback_deployments: tuple[ExactModelDeployment, ...] = ()
     route_reason: str
     fallback_reason: str | None = None
+    resolved_route_id: RequestedRouteId | None = None
     reasoning_pinned_deployment_id: str | None = None
     """The deployment whose credential sealed the request's active reasoning.
 
