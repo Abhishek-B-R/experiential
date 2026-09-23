@@ -60,7 +60,11 @@ native = pytest.importorskip("exp_gateway_native")
 @pytest.mark.parametrize("winner", ["child", "root_suffix"])
 @pytest.mark.parametrize(
     ("destination", "policy"),
-    [("hosted", policy) for policy in ("keep", "off", "byok", "prompt_only", "cancel")]
+    [
+        (destination, policy)
+        for destination in ("hosted", "batch")
+        for policy in ("keep", "off", "byok", "prompt_only", "cancel")
+    ]
     + [("sqlite", "keep"), ("sqlite", "cancel")],
 )
 def test_nested_capture_separates_root_from_winner_and_does_not_recapture_replay(
@@ -151,7 +155,19 @@ def test_nested_capture_separates_root_from_winner_and_does_not_recapture_replay
     records: list[str] = []
     scope = LocalCaptureScope(user_id=manager.grants()[0].identity_id, application_id="gateway")
     traffic_path = tmp_path / "nested-traffic.db"
-    if destination == "sqlite":
+
+    def write_batch(encoded: tuple[str, ...]) -> list[bool]:
+        """Acknowledge only strict current records with retained root and winner facts."""
+        for value in encoded:
+            CaptureRecord.model_validate_json(value)
+        records.extend(encoded)
+        return [True] * len(encoded)
+
+    if destination == "batch":
+        collector = native.CaptureCollector.batched(
+            CaptureConfiguration().model_dump_json(), write_batch
+        )
+    elif destination == "sqlite":
         local = LocalCaptureConfiguration(
             database_path=traffic_path,
             bindings=(
@@ -280,7 +296,7 @@ def test_nested_capture_separates_root_from_winner_and_does_not_recapture_replay
             assert record["metrics"]["terminal_at"] is None
 
 
-@pytest.mark.parametrize("destination", ["off", "hosted", "sqlite"])
+@pytest.mark.parametrize("destination", ["off", "hosted", "batch", "sqlite"])
 @pytest.mark.parametrize("shape", ["large", "fragments", "signed_text", "signed_image", "oversize"])
 def test_gemini_capture_only_evidence_never_retries_or_fails_visible_inference(
     tmp_path: Path,
@@ -363,7 +379,17 @@ def test_gemini_capture_only_evidence_never_retries_or_fails_visible_inference(
     configuration = CaptureConfiguration(maximum_response_bytes=100_000, settlement_required=False)
     scope = LocalCaptureScope(user_id=manager.grants()[0].identity_id, application_id="gateway")
     traffic_path = tmp_path / "gemini-traffic.db"
-    if destination == "sqlite":
+
+    def write_batch(encoded: tuple[str, ...]) -> list[bool]:
+        """Retain bounded schema2 evidence and acknowledge each prepared record independently."""
+        for value in encoded:
+            CaptureRecord.model_validate_json(value)
+        records.extend(encoded)
+        return [True] * len(encoded)
+
+    if destination == "batch":
+        collector = native.CaptureCollector.batched(configuration.model_dump_json(), write_batch)
+    elif destination == "sqlite":
         local = LocalCaptureConfiguration(
             database_path=traffic_path,
             bindings=(
@@ -783,6 +809,150 @@ def test_python_sink_rechecks_policy_after_an_uncertain_commit() -> None:
     assert collector.close(1)
     assert attempts == 2 and not rows
     assert collector.counts() == (0, 0, 1, 1, 0, 0)
+
+
+def test_batched_sink_preserves_strings_and_retries_only_unacknowledged_members() -> None:
+    """One failed record cannot hold healthy peers; retries reuse prepared objects."""
+    entered = threading.Event()
+    release = threading.Event()
+    recover = threading.Event()
+    healthy = threading.Event()
+    batches: list[tuple[str, ...]] = []
+    persisted: set[str] = set()
+    failed_strings: list[str] = []
+
+    def write(records: tuple[str, ...]) -> list[bool]:
+        """Keep one record unavailable while acknowledging all of its neighbors."""
+        assert threading.current_thread() is not threading.main_thread()
+        batches.append(records)
+        entered.set()
+        assert release.wait(5)
+        outcomes = []
+        for encoded in records:
+            request_id = CaptureRecord.model_validate_json(encoded).request.request_id
+            if request_id == "request-0":
+                failed_strings.append(encoded)
+                if not recover.is_set():
+                    outcomes.append(False)
+                    continue
+            assert request_id not in persisted
+            persisted.add(request_id)
+            outcomes.append(True)
+        if len(persisted) >= 15:
+            healthy.set()
+        return outcomes
+
+    collector = native.CaptureCollector.batched(CaptureConfiguration().model_dump_json(), write)
+    threads = []
+    for index in range(16):
+        request_id = f"request-{index}"
+        assert collector.begin(_request_json().replace('"request"', json.dumps(request_id), 1))
+        thread = threading.Thread(target=collector.settle, args=(request_id, True, False))
+        thread.start()
+        threads.append(thread)
+        if index == 0:
+            assert entered.wait(3)
+    try:
+        assert not collector.close(0.01)
+        release.set()
+        assert healthy.wait(5)
+        assert "request-0" not in persisted
+        assert not collector.close(0.01)
+    finally:
+        release.set()
+        recover.set()
+        for thread in threads:
+            thread.join(5)
+    assert all(not thread.is_alive() for thread in threads)
+    assert collector.close(3)
+    assert len(persisted) == 16
+    assert any(len(batch) > 1 for batch in batches)
+    assert len(failed_strings) > 1
+    assert all(encoded is failed_strings[0] for encoded in failed_strings)
+    assert collector.counts()[0:3] == (0, 0, 16)
+    assert collector.counts()[4:] == (0, 0)
+
+
+def test_batched_sink_invalid_acknowledgements_never_release_records() -> None:
+    """Exceptions and mismatched receipt counts retain the same prepared payload."""
+    seen: list[str] = []
+
+    def write(records: tuple[str, ...]) -> list[bool]:
+        """Recover only after exercising both invalid callback outcomes."""
+        seen.append(records[0])
+        if len(seen) == 1:
+            raise RuntimeError("private destination error")
+        if len(seen) == 2:
+            return []
+        return [True]
+
+    collector = native.CaptureCollector.batched(CaptureConfiguration().model_dump_json(), write)
+    assert collector.begin(_request_json())
+    collector.settle("request", True, False)
+    assert collector.close(1)
+    assert len(seen) == 3 and all(encoded is seen[0] for encoded in seen)
+    assert collector.counts() == (0, 0, 1, 2, 0, 0)
+
+
+@pytest.mark.parametrize(("count", "size"), [(80, 0), (8, 600_000)])
+def test_batched_sink_bounds_count_and_bytes(count: int, size: int) -> None:
+    """Queued work fills bounded batches without a timer or losing Unicode content."""
+    entered, release = threading.Event(), threading.Event()
+    batches: list[tuple[str, ...]] = []
+
+    def write(records: tuple[str, ...]) -> list[bool]:
+        batches.append(records)
+        entered.set()
+        assert release.wait(5)
+        assert len(records) <= 64
+        assert sum(len(record.encode()) for record in records) <= 9 * 1024 * 1024
+        if len(records) > 1:
+            assert sum(len(record.encode()) for record in records[:-1]) < 1024 * 1024
+        return [True] * len(records)
+
+    collector = native.CaptureCollector.batched(CaptureConfiguration().model_dump_json(), write)
+    threads = []
+    try:
+        for index in range(count):
+            request = json.loads(_request_json())
+            request["request_id"] = f"bounded-{index}"
+            request["context"]["request"]["messages"] = [
+                {"role": "user", "content": "x" * size + "🌏"}
+            ]
+            assert collector.begin(json.dumps(request))
+            thread = threading.Thread(
+                target=collector.settle, args=(request["request_id"], True, False)
+            )
+            thread.start()
+            threads.append(thread)
+            if index == 0:
+                assert entered.wait(3)
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(5)
+    assert all(not thread.is_alive() for thread in threads)
+    assert collector.close(3)
+    assert sum(map(len, batches)) == count
+    assert any(len(batch) > 1 for batch in batches)
+    for batch in batches:
+        for encoded in batch:
+            assert json.loads(encoded)["request"]["context"]["request"]["messages"] == [
+                {"role": "user", "content": "x" * size + "🌏"}
+            ]
+    assert collector.counts() == (0, 0, count, 0, 0, 0)
+
+
+def test_batched_sink_rejects_insufficient_preparation_budget() -> None:
+    """A valid single-record budget may be too small for the batch reservation."""
+    config = CaptureConfiguration().model_dump(mode="json")
+    config["delivery"] = {
+        "maximum_records": 64,
+        "maximum_record_bytes": 1024,
+        "maximum_bytes": 6 * 1024 + 256,
+    }
+    with pytest.raises(ValueError, match="preparation"):
+        native.CaptureCollector.batched(json.dumps(config), lambda values: [True] * len(values))
 
 
 def test_python_and_rust_configuration_fail_closed() -> None:

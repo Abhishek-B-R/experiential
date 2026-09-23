@@ -43,11 +43,26 @@ impl Configuration {
 }
 
 /// Stay live through the pending-to-delivery handoff, including capacity waits.
-struct Admission(Arc<AtomicUsize>);
+struct Admission {
+    count: Arc<AtomicUsize>,
+    handoff_bytes: Arc<AtomicUsize>,
+    retained_bytes: usize,
+}
+
+impl Admission {
+    /// Transfer the map's charge before releasing its lock, without a capacity gap.
+    fn handoff(&mut self, bytes: usize) {
+        debug_assert_eq!(self.retained_bytes, 0);
+        self.handoff_bytes.fetch_add(bytes, Ordering::AcqRel);
+        self.retained_bytes = bytes;
+    }
+}
 
 impl Drop for Admission {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.handoff_bytes
+            .fetch_sub(self.retained_bytes, Ordering::AcqRel);
+        self.count.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -71,27 +86,8 @@ struct Entry {
 #[derive(Default)]
 struct Pending {
     entries: HashMap<String, Entry>,
-    handoffs: usize,
     bytes: usize,
     closed: bool,
-}
-
-/// Retain source ownership until the destination has charged its own capacity.
-/// Drop runs outside both queue locks, including unsuccessful submission paths.
-pub(super) struct Handoff {
-    pending: Arc<Mutex<Pending>>,
-    bytes: usize,
-}
-
-impl Drop for Handoff {
-    fn drop(&mut self) {
-        let mut pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        pending.bytes -= self.bytes;
-        pending.handoffs -= 1;
-    }
 }
 
 struct MaintainedSink<S> {
@@ -113,6 +109,22 @@ impl<S: Sink> Sink for MaintainedSink<S> {
 
     fn write(&mut self, prepared: &Self::Prepared) -> Result<(), ()> {
         self.sink.write(prepared)
+    }
+
+    fn batch_records(&self) -> usize {
+        self.sink.batch_records()
+    }
+
+    fn batch_bytes(&self) -> usize {
+        self.sink.batch_bytes()
+    }
+
+    fn prepared_bytes(&self, prepared: &Self::Prepared) -> usize {
+        self.sink.prepared_bytes(prepared)
+    }
+
+    fn write_batch(&mut self, prepared: &[&Self::Prepared]) -> Vec<bool> {
+        self.sink.write_batch(prepared)
     }
 
     fn take_maintenance_failures(&mut self) -> u64 {
@@ -146,6 +158,7 @@ pub(crate) struct Collector {
     pending: Arc<Mutex<Pending>>,
     skipped: Arc<AtomicU64>,
     admissions: Arc<AtomicUsize>,
+    handoff_bytes: Arc<AtomicUsize>,
     body_bytes: AtomicUsize,
     body_capacity: Arc<Semaphore>,
 }
@@ -167,6 +180,7 @@ impl Collector {
             pending,
             skipped,
             admissions: Arc::new(AtomicUsize::new(0)),
+            handoff_bytes: Arc::new(AtomicUsize::new(0)),
             body_bytes: AtomicUsize::new(0),
         })
     }
@@ -202,8 +216,9 @@ impl Collector {
         };
         self.expire(&mut pending);
         if pending.closed
-            || pending.entries.len() + pending.handoffs >= self.config.maximum_pending_records
-            || pending.bytes.saturating_add(bytes) > self.config.maximum_pending_bytes
+            || self.admissions.load(Ordering::Acquire) >= self.config.maximum_pending_records
+            || self.retained_bytes(&pending).saturating_add(bytes)
+                > self.config.maximum_pending_bytes
             || pending.entries.contains_key(&record.request.request_id)
         {
             return self.skip();
@@ -213,7 +228,11 @@ impl Collector {
         pending.entries.insert(
             record.request.request_id.clone(),
             Entry {
-                _admission: Admission(self.admissions.clone()),
+                _admission: Admission {
+                    count: self.admissions.clone(),
+                    handoff_bytes: self.handoff_bytes.clone(),
+                    retained_bytes: 0,
+                },
                 record,
                 observation: None,
                 winning_model: None,
@@ -250,7 +269,8 @@ impl Collector {
                 entry.bytes += model.capacity();
                 entry.record.request.model_id = Some(model);
             }
-            if pending.bytes.saturating_add(entry.bytes) > self.config.maximum_pending_bytes
+            if self.retained_bytes(&pending).saturating_add(entry.bytes)
+                > self.config.maximum_pending_bytes
                 || entry.request_bytes > self.config.maximum_request_bytes
             {
                 self.skip();
@@ -304,7 +324,9 @@ impl Collector {
                 entry.bytes += model.capacity();
                 entry.winning_model = Some(model);
             }
-            if pending.bytes.saturating_add(entry.bytes) > self.config.maximum_pending_bytes {
+            if self.retained_bytes(&pending).saturating_add(entry.bytes)
+                > self.config.maximum_pending_bytes
+            {
                 self.skip();
                 return;
             }
@@ -336,9 +358,9 @@ impl Collector {
             entry.record.metrics = None;
             entry.record.gemini_thought_parts.clear();
             entry.record.gemini_thought_parts_truncated = None;
-            let handoff = self.handoff(&mut pending, entry.bytes);
+            entry._admission.handoff(entry.bytes);
             drop(pending);
-            self.emit(entry.record, None, handoff);
+            self.emit(entry.record, None);
             return;
         }
         entry.response_allowed = true;
@@ -348,9 +370,9 @@ impl Collector {
             pending.bytes += entry.bytes;
             pending.entries.insert(request_id.to_owned(), entry);
         } else {
-            let handoff = self.handoff(&mut pending, entry.bytes);
+            entry._admission.handoff(entry.bytes);
             drop(pending);
-            self.emit(entry.record, entry.wire, handoff);
+            self.emit(entry.record, entry.wire);
         }
     }
 
@@ -417,10 +439,12 @@ impl Collector {
         entry.output_finished = true;
         entry.bytes = entry.bytes.saturating_add(response_heap);
         if entry.response_allowed {
-            let handoff = self.handoff(&mut pending, entry.bytes);
+            entry._admission.handoff(entry.bytes);
             drop(pending);
-            self.emit(entry.record, entry.wire, handoff)
-        } else if pending.bytes.saturating_add(entry.bytes) <= self.config.maximum_pending_bytes {
+            self.emit(entry.record, entry.wire)
+        } else if self.retained_bytes(&pending).saturating_add(entry.bytes)
+            <= self.config.maximum_pending_bytes
+        {
             pending.bytes += entry.bytes;
             pending.entries.insert(request_id.to_owned(), entry);
             true
@@ -429,17 +453,8 @@ impl Collector {
         }
     }
 
-    fn handoff(&self, pending: &mut Pending, bytes: usize) -> Handoff {
-        pending.bytes += bytes;
-        pending.handoffs += 1;
-        Handoff {
-            pending: self.pending.clone(),
-            bytes,
-        }
-    }
-
-    fn emit(&self, record: Record, wire: Option<WireResponse>, handoff: Handoff) -> bool {
-        let deliver = || self.delivery.submit_wait_handoff(record, wire, handoff);
+    fn emit(&self, record: Record, wire: Option<WireResponse>) -> bool {
+        let deliver = || self.delivery.submit_wait(record, wire);
         // A blocked destination must not occupy a Tokio executor thread or a
         // collector lock. Python entrypoints already release the interpreter.
         if tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
@@ -481,8 +496,8 @@ impl Collector {
         let previous = text.capacity();
         let required = text.len().saturating_add(delta.len());
         if required > self.config.maximum_response_bytes
-            || pending
-                .bytes
+            || self
+                .retained_bytes(&pending)
                 .saturating_add(entry.bytes)
                 .saturating_add(delta.len())
                 > self.config.maximum_pending_bytes
@@ -492,7 +507,9 @@ impl Collector {
             return;
         }
         entry.bytes += text.capacity() - previous;
-        if pending.bytes.saturating_add(entry.bytes) > self.config.maximum_pending_bytes {
+        if self.retained_bytes(&pending).saturating_add(entry.bytes)
+            > self.config.maximum_pending_bytes
+        {
             self.skip();
             return;
         }
@@ -560,8 +577,8 @@ impl Collector {
         let part_bytes = super::budget::json_bytes(part);
         if entry.gemini_part_bytes.saturating_add(part_bytes) > self.config.maximum_response_bytes
             || entry.record.gemini_thought_parts.len() >= 4096
-            || pending
-                .bytes
+            || self
+                .retained_bytes(&pending)
                 .saturating_add(entry.bytes)
                 .saturating_add(heap + 64)
                 > self.config.maximum_pending_bytes
@@ -584,7 +601,9 @@ impl Collector {
                     * std::mem::size_of::<Arc<serde_json::Value>>()
                 - previous;
             entry.record.gemini_thought_parts_truncated = Some(false);
-            if pending.bytes.saturating_add(entry.bytes) > self.config.maximum_pending_bytes {
+            if self.retained_bytes(&pending).saturating_add(entry.bytes)
+                > self.config.maximum_pending_bytes
+            {
                 Self::clear_gemini(&mut entry);
                 entry.record.gemini_thought_parts_truncated = Some(true);
             }
@@ -595,6 +614,13 @@ impl Collector {
 
     fn expire(&self, pending: &mut Pending) {
         expire_pending(pending, &self.skipped);
+    }
+
+    /// Include values waiting for destination capacity or acknowledgement.
+    fn retained_bytes(&self, pending: &Pending) -> usize {
+        pending
+            .bytes
+            .saturating_add(self.handoff_bytes.load(Ordering::Acquire))
     }
 
     /// Retain provider-order argument text even when a public protocol parses it.
@@ -622,8 +648,8 @@ impl Collector {
         let previous = text.capacity();
         let extra = encoded.len() + 1;
         if text.len().saturating_add(extra) > self.config.maximum_response_bytes
-            || pending
-                .bytes
+            || self
+                .retained_bytes(&pending)
                 .saturating_add(entry.bytes)
                 .saturating_add(extra + 2)
                 > self.config.maximum_pending_bytes
@@ -634,7 +660,9 @@ impl Collector {
         }
         // Charge the initial [] as well as actual allocator growth.
         entry.bytes += text.capacity() - previous + if text == "[]" { previous } else { 0 };
-        if pending.bytes.saturating_add(entry.bytes) > self.config.maximum_pending_bytes {
+        if self.retained_bytes(&pending).saturating_add(entry.bytes)
+            > self.config.maximum_pending_bytes
+        {
             self.skip();
             return;
         }

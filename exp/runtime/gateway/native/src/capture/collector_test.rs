@@ -491,7 +491,7 @@ fn unscoped_unknown_duplicate_and_expired_content_is_not_persisted() {
 }
 
 #[test]
-fn blocked_handoff_keeps_source_count_and_bytes_until_delivery_owns_record() {
+fn blocked_handoff_keeps_admission_count_and_bytes_until_each_record_is_acknowledged() {
     for byte_bound in [false, true] {
         for fail_sink in [false, true] {
             struct PausedSink {
@@ -531,8 +531,9 @@ fn blocked_handoff_keeps_source_count_and_bytes_until_delivery_owns_record() {
             let (records, written) = mpsc::channel();
             let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
             let mut configuration = config();
-            configuration.maximum_pending_records = if byte_bound { 4 } else { 1 };
-            configuration.maximum_pending_bytes = if byte_bound { 16384 } else { 32768 };
+            // Both the writing first record and waiting second retain admission now.
+            configuration.maximum_pending_records = if byte_bound { 4 } else { 2 };
+            configuration.maximum_pending_bytes = if byte_bound { 24000 } else { 32768 };
             configuration.maximum_request_bytes = 16384;
             configuration.delivery.maximum_records = 1;
             configuration.delivery.maximum_bytes = 32768;
@@ -602,6 +603,8 @@ fn blocked_handoff_keeps_source_count_and_bytes_until_delivery_owns_record() {
             assert_eq!(collector.counts()[3], u64::from(fail_sink));
             assert_eq!(collector.counts()[4], 0);
             assert_eq!(collector.pending.lock().unwrap().bytes, 0);
+            assert_eq!(collector.handoff_bytes.load(Ordering::Acquire), 0);
+            assert_eq!(collector.admissions.load(Ordering::Acquire), 0);
             if let Err(error) = outcome {
                 std::panic::resume_unwind(error);
             }
@@ -679,16 +682,106 @@ fn shutdown_keeps_delivery_open_during_the_pending_map_handoff() {
     let (collector, receiver) = collector(config());
     assert!(collector.begin(request("handoff")));
     // Pause exactly where finish/settle releases the map lock before emit().
-    let (entry, handoff) = {
+    let entry = {
         let mut pending = collector.pending.lock().unwrap();
-        let entry = pending.entries.remove("handoff").unwrap();
+        let mut entry = pending.entries.remove("handoff").unwrap();
         pending.bytes -= entry.bytes;
-        let handoff = collector.handoff(&mut pending, entry.bytes);
-        (entry, handoff)
+        entry._admission.handoff(entry.bytes);
+        entry
     };
     assert!(!collector.close_until(Instant::now()));
-    assert!(collector.emit(entry.record, None, handoff));
+    assert!(collector.emit(entry.record, None));
     drop(entry._admission);
     assert_eq!(drain(&collector, receiver).len(), 1);
     assert_eq!(collector.counts(), [0, 0, 1, 0, 0, 0]);
+}
+
+struct PausedSink {
+    entered: mpsc::Sender<()>,
+    released: Arc<AtomicBool>,
+    records: MemorySink,
+}
+
+impl Sink for PausedSink {
+    type Prepared = String;
+
+    fn preparation_bytes(maximum_record_bytes: usize) -> usize {
+        MemorySink::preparation_bytes(maximum_record_bytes)
+    }
+
+    fn prepare(&self, record: &Record, maximum_bytes: usize) -> Result<String, ()> {
+        self.records.prepare(record, maximum_bytes)
+    }
+
+    fn write(&mut self, record: &String) -> Result<(), ()> {
+        if !self.released.load(Ordering::Acquire) {
+            let _ = self.entered.send(());
+            return Err(());
+        }
+        self.records.write(record)
+    }
+}
+
+#[test]
+fn stalled_handoffs_remain_inside_admission_count_and_byte_limits() {
+    for bytes_bound in [false, true] {
+        for mode in ["prompt", "response_first", "settle_first", "local"] {
+            let mut configuration = config();
+            configuration.maximum_pending_records = if bytes_bound { 32 } else { 1 };
+            configuration.maximum_pending_bytes = 8192;
+            configuration.maximum_request_bytes = 6144;
+            configuration.maximum_response_bytes = 1024;
+            configuration.settlement_required = mode != "local";
+            let (entered, started) = mpsc::channel();
+            let (records, receiver) = mpsc::channel();
+            let released = Arc::new(AtomicBool::new(false));
+            let collector = Arc::new(
+                Collector::new(
+                    configuration,
+                    PausedSink {
+                        entered,
+                        released: released.clone(),
+                        records: MemorySink(records),
+                    },
+                )
+                .unwrap(),
+            );
+            let mut input = request("first");
+            input.context = Arc::new(json!({"schema_version":1,"request": {
+                "messages":[{"role":"user","content":"x".repeat(2000)}]
+            }}));
+            assert!(collector.begin(input.clone()));
+            if mode == "response_first" {
+                assert!(collector.finish("first", Some(response()), None));
+            } else if mode == "settle_first" {
+                collector.settle("first", true, true);
+            }
+            let writer = collector.clone();
+            let thread = std::thread::spawn(move || match mode {
+                "prompt" => writer.settle("first", true, false),
+                "response_first" => writer.settle("first", true, true),
+                _ => {
+                    assert!(writer.finish("first", Some(response()), None));
+                }
+            });
+            let reached_destination = started.recv_timeout(Duration::from_secs(2)).is_ok();
+            input.request_id = "overflow".into();
+            let admitted_while_stalled = collector.begin(input.clone());
+            if admitted_while_stalled {
+                collector.settle("overflow", false, false);
+            }
+            // Always recover and join before asserting the regression: failures
+            // must not strand a native retry worker or leak a test thread.
+            released.store(true, Ordering::Release);
+            thread.join().unwrap();
+            assert!(reached_destination, "mode={mode} bytes={bytes_bound}");
+            assert!(!admitted_while_stalled, "mode={mode} bytes={bytes_bound}");
+            assert_eq!(collector.handoff_bytes.load(Ordering::Acquire), 0);
+            assert_eq!(collector.admissions.load(Ordering::Acquire), 0);
+            assert!(collector.begin(input));
+            collector.settle("overflow", false, false);
+            assert_eq!(drain(&collector, receiver).len(), 1);
+            assert_eq!(collector.counts()[4], 0);
+        }
+    }
 }
