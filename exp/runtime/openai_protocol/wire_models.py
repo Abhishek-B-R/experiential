@@ -1,4 +1,8 @@
-"""Private Chat and Responses request schemas with strict field-level validation."""
+"""Strict private wire models for the public Chat and Responses surfaces.
+
+Closed models own field validation; ``requests`` owns manifest gating,
+official-SDK cross-checks and canonical translation.
+"""
 
 from __future__ import annotations
 
@@ -26,6 +30,7 @@ from exp.common.models.content import (
 )
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort
 from exp.runtime.gateway.reasoning_carrier import MAXIMUM_REASONING_CARRIER_BYTES
+from exp.runtime.gateway.request_policy import GatewayRequestPolicy
 from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.cache_control import EphemeralCacheControl
 from exp.runtime.openai_protocol.native_tools import NativeResponseTool
@@ -611,6 +616,7 @@ class _ChatRequest(_WireModel):
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None
     provider: ProviderRoutingPreferences | None = None
+    gateway: GatewayRequestPolicy | None = None
     """Provider processing tier, forwarded only on BYOK OpenAI-family rungs."""
     web_search_options: WebSearchOptions | None = None
     plugins: tuple[ChatPlugin, ...] = ()
@@ -995,4 +1001,5 @@ class _ResponsesRequest(_WireModel):
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None
     provider: ProviderRoutingPreferences | None = None
+    gateway: GatewayRequestPolicy | None = None
     """Provider processing tier, forwarded only on BYOK OpenAI-family rungs."""

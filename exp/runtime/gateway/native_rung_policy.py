@@ -170,7 +170,7 @@ def failed_dispatch_candidate(
         keys=keys,
         failure=failure,
         current_depth=current_depth,
-        attempt_counts=entry.attempt_counts,
+        attempt_counts=entry.ordinary_attempt_counts,
         total_attempts=entry.total_attempts,
         refusal_failover=entry.authorization.refusal_failover,
         failover_mode=route.snapshot.failover_mode,
@@ -182,6 +182,10 @@ def failed_dispatch_candidate(
             entry.throttle_redial_budgets[current_depth] - entry.throttle_redials[current_depth]
         ),
         fallback_rules=route_fallback_rules(route),
+        maximum_total_attempts=entry.attempt_policy.maximum_total_attempts,
+        maximum_same_deployment_attempts=entry.attempt_policy.maximum_same_deployment_attempts,
+        physical_route_cap=entry.attempt_policy.physical_route_cap,
+        physical_attempt_counts=entry.attempt_counts,
     )
     disposition = throttle_disposition(
         failure,

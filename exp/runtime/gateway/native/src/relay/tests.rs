@@ -653,7 +653,7 @@ async fn provider_tool_phase_preserves_byte_idle_then_resumes_progress_idle() {
 }
 
 #[tokio::test]
-async fn failure_usage_prefers_latest_cumulative_counts_and_adds_redial_once() {
+async fn failure_usage_prefers_latest_cumulative_counts() {
     let chunks = stream::iter(vec![Ok::<_, reqwest::Error>(Bytes::from_static(
         b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9}}\n\n",
     ))]).chain(stream::pending()).boxed();
@@ -668,7 +668,6 @@ async fn failure_usage_prefers_latest_cumulative_counts_and_adds_redial_once() {
         output_tokens: Some(20),
         ..Default::default()
     };
-    relay.set_carried_usage(Some(carried.clone()));
     relay
         .next_event(
             started + Duration::from_secs(2),
@@ -678,35 +677,23 @@ async fn failure_usage_prefers_latest_cumulative_counts_and_adds_redial_once() {
         .await
         .unwrap_err();
     let observed = relay.usage_before_failure(Some(carried)).unwrap();
-    assert_eq!(observed.input_tokens, Some(17));
-    assert_eq!(observed.output_tokens, Some(29));
+    assert_eq!(observed.input_tokens, Some(7));
+    assert_eq!(observed.output_tokens, Some(9));
     let again = relay.usage_before_failure(Some(observed)).unwrap();
-    assert_eq!(again.input_tokens, Some(17));
-    assert_eq!(again.output_tokens, Some(29));
+    assert_eq!(again.input_tokens, Some(7));
+    assert_eq!(again.output_tokens, Some(9));
 }
 
 #[test]
 fn failure_without_current_usage_keeps_the_attempt_total_unknown() {
-    let mut relay = UpstreamRelay::from_stream(
+    let relay = UpstreamRelay::from_stream(
         stream::pending().boxed(),
         Dialect::OpenAiCompatible,
         Instant::now(),
     );
     assert!(relay.usage_before_failure(None).is_none());
-    relay.set_carried_usage(Some(Usage {
-        input_tokens: Some(10),
-        output_tokens: Some(20),
-        ..Default::default()
-    }));
-    // A repaired dial has also dispatched: its missing meter cannot be
-    // replaced by the earlier dial's subtotal as if that were a full total.
-    let unknown = relay.usage_before_failure(None).unwrap();
-    assert_eq!(unknown.input_tokens, None);
-    assert_eq!(unknown.output_tokens, None);
-    let again = relay.usage_before_failure(Some(unknown)).unwrap();
-    assert_eq!(again.input_tokens, None);
-    assert_eq!(again.output_tokens, None);
-    assert!(again.cached_input_tokens.is_none());
+    // A separate physical attempt cannot borrow another dial's usage.
+    assert!(relay.usage_before_failure(None).is_none());
 }
 
 #[test]

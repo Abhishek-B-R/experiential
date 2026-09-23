@@ -49,8 +49,11 @@ class CaptureConfiguration(ContractModel):
 
     Attributes:
         delivery: Destination queue limits, using CaptureDeliveryLimits defaults.
-        maximum_pending_records: In-flight request ceiling, defaulting to 2048.
-        maximum_pending_bytes: In-flight memory ceiling, defaulting to 64 MiB.
+        maximum_pending_records: In-flight request ceiling through destination
+            acknowledgement, defaulting to 2048.
+        maximum_pending_bytes: Pending request and handoff memory ceiling,
+            defaulting to 64 MiB. Handoffs keep their charge while waiting for
+            destination capacity or acknowledgement.
         maximum_request_bytes: Encoded request ceiling, defaulting to 1 MiB.
         maximum_response_bytes: Response buffer ceiling, defaulting to 3,670,016 bytes.
         ttl_seconds: Unsettled request lifetime, defaulting to 1800 seconds.

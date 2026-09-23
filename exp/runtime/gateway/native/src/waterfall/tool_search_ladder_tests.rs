@@ -227,6 +227,8 @@ impl SearchHarness {
                 maximum_same_deployment_attempts: 2,
                 refusal_failover: false,
                 throttle_redial: None,
+                physical_route_cap: None,
+                backoff: None,
             },
             deadline: Instant::now() + Duration::from_secs(60),
             time_to_first_byte: Duration::from_secs(5),

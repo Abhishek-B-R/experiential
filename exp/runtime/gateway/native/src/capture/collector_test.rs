@@ -474,3 +474,93 @@ fn shutdown_keeps_delivery_open_during_the_pending_map_handoff() {
     assert_eq!(drain(&collector, receiver).len(), 1);
     assert_eq!(collector.counts(), [0, 0, 1, 0, 0, 0]);
 }
+
+struct PausedSink {
+    entered: mpsc::Sender<()>,
+    released: Arc<AtomicBool>,
+    records: MemorySink,
+}
+
+impl Sink for PausedSink {
+    type Prepared = String;
+
+    fn preparation_bytes(maximum_record_bytes: usize) -> usize {
+        MemorySink::preparation_bytes(maximum_record_bytes)
+    }
+
+    fn prepare(&self, record: &Record, maximum_bytes: usize) -> Result<String, ()> {
+        self.records.prepare(record, maximum_bytes)
+    }
+
+    fn write(&mut self, record: &String) -> Result<(), ()> {
+        if !self.released.load(Ordering::Acquire) {
+            let _ = self.entered.send(());
+            return Err(());
+        }
+        self.records.write(record)
+    }
+}
+
+#[test]
+fn stalled_handoffs_remain_inside_admission_count_and_byte_limits() {
+    for bytes_bound in [false, true] {
+        for mode in ["prompt", "response_first", "settle_first", "local"] {
+            let mut configuration = config();
+            configuration.maximum_pending_records = if bytes_bound { 32 } else { 1 };
+            configuration.maximum_pending_bytes = 8192;
+            configuration.maximum_request_bytes = 6144;
+            configuration.maximum_response_bytes = 1024;
+            configuration.settlement_required = mode != "local";
+            let (entered, started) = mpsc::channel();
+            let (records, receiver) = mpsc::channel();
+            let released = Arc::new(AtomicBool::new(false));
+            let collector = Arc::new(
+                Collector::new(
+                    configuration,
+                    PausedSink {
+                        entered,
+                        released: released.clone(),
+                        records: MemorySink(records),
+                    },
+                )
+                .unwrap(),
+            );
+            let mut input = request("first");
+            input.context = Arc::new(json!({"schema_version":1,"request": {
+                "messages":[{"role":"user","content":"x".repeat(2000)}]
+            }}));
+            assert!(collector.begin(input.clone()));
+            if mode == "response_first" {
+                assert!(collector.finish("first", Some(response()), None));
+            } else if mode == "settle_first" {
+                collector.settle("first", true, true);
+            }
+            let writer = collector.clone();
+            let thread = std::thread::spawn(move || match mode {
+                "prompt" => writer.settle("first", true, false),
+                "response_first" => writer.settle("first", true, true),
+                _ => {
+                    assert!(writer.finish("first", Some(response()), None));
+                }
+            });
+            let reached_destination = started.recv_timeout(Duration::from_secs(2)).is_ok();
+            input.request_id = "overflow".into();
+            let admitted_while_stalled = collector.begin(input.clone());
+            if admitted_while_stalled {
+                collector.settle("overflow", false, false);
+            }
+            // Always recover and join before asserting the regression: failures
+            // must not strand a native retry worker or leak a test thread.
+            released.store(true, Ordering::Release);
+            thread.join().unwrap();
+            assert!(reached_destination, "mode={mode} bytes={bytes_bound}");
+            assert!(!admitted_while_stalled, "mode={mode} bytes={bytes_bound}");
+            assert_eq!(collector.handoff_bytes.load(Ordering::Acquire), 0);
+            assert_eq!(collector.admissions.load(Ordering::Acquire), 0);
+            assert!(collector.begin(input));
+            collector.settle("overflow", false, false);
+            assert_eq!(drain(&collector, receiver).len(), 1);
+            assert_eq!(collector.counts()[4], 0);
+        }
+    }
+}

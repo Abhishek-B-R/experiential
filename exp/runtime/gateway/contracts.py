@@ -46,6 +46,7 @@ from exp.runtime.gateway.reasoning_blocks import (
 from exp.runtime.gateway.reasoning_blocks import (
     ThinkingBlock as ThinkingBlock,
 )
+from exp.runtime.gateway.request_policy import GatewayRequestPolicy, RequestedRouteId
 from exp.runtime.gateway.stream_contracts import (
     ChoiceLogprobs as ChoiceLogprobs,
 )
@@ -488,6 +489,7 @@ class GatewayRequest(ContractModel):
             defines zero and -1 semantics. Excluded from serialization, retained in replay identity.
         reasoning_effort_parameter: Optional exact caller spelling of the effort control;
             omission uses the surface default when reporting unsupported parameters.
+        gateway: Optional request routing/retry policy; excluded from provider serialization.
     """
 
     surface: GatewayApiSurface
@@ -668,6 +670,7 @@ class GatewayRequest(ContractModel):
     # Verbatim caller `provider` object: forwarded to OpenRouter rungs (tightened
     # when the rung is constrained), dropped on every other wire.
     provider_preferences: JsonObject | None = Field(default=None, exclude=True)
+    gateway: GatewayRequestPolicy | None = Field(default=None, exclude=True)
     stream: bool = False
     include_usage: bool = False
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
@@ -932,7 +935,11 @@ class ProjectSelection(ContractModel):
 
 
 class AuthorizationSnapshot(ContractModel):
-    """Immutable authority and alias target frozen before learned model selection."""
+    """Immutable authority and alias target frozen before learned model selection.
+
+    Attributes:
+        requested_route_id: Optional public selector, excluded from durable serialization.
+    """
 
     request_id: RequestId
     organization_id: OrganizationId
@@ -945,6 +952,7 @@ class AuthorizationSnapshot(ContractModel):
     catalog_sha256: Sha256
     canonical_request_sha256: Sha256
     caller_operation_sha256: Sha256 | None = None
+    requested_route_id: RequestedRouteId | None = Field(default=None, exclude=True)
     refusal_failover: bool = False
     deadline_monotonic: float = Field(gt=0)
     app_referer: str | None = Field(default=None, max_length=2_048)
@@ -964,13 +972,7 @@ class AuthorizationSnapshot(ContractModel):
     # The request demanded ZDR routing (GatewayRequest.zdr_requested), carried
     # here so every resolver entry point can tighten the org's posture filter.
     zdr_requested: bool = False
-    """Relative weight of this organization for fair-share rung admission.
-
-    Populated by the hosted store's ``authorize_request`` from its own org data
-    (paying tiers heavier than promo/free); the default 1 gives every caller an
-    equal share, which is byte-identical to pre-fair-share behavior. Read only
-    on rungs whose ``GatewayRungDispatchPolicy.fair_share`` is authored on.
-    """
+    # Fair-share weights default to equal shares and apply only on opted-in rungs.
 
 
 class ExecutionSnapshot(ContractModel):
@@ -983,10 +985,7 @@ class ExecutionSnapshot(ContractModel):
     # The pool's per-model failover policy, carried onto the route so the
     # per-attempt retry/failover decision can honor it.
     failover_mode: FailoverMode = "maximize_availability"
-    # The pool's cache-stakes throttle control, carried alongside so the
-    # per-attempt decision can weigh the requesting organization's observed
-    # cached fraction on the throttled rung against it. ``None`` leaves the
-    # failover mode's own throttle rule in force.
+    # Optional cache-stakes threshold; otherwise the failover mode decides.
     throttle_cache_threshold: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
     # The pool's backoff-and-redial schedule for throttled rungs, carried so
     # the admission can hand the data plane its frozen retry facts and the
