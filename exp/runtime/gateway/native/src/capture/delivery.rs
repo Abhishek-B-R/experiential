@@ -92,7 +92,7 @@ struct Counters {
 }
 
 struct Pending {
-    value: Record,
+    value: Option<Record>,
     wire: Option<WireResponse>,
     bytes: usize,
     counters: Arc<Counters>,
@@ -143,16 +143,25 @@ fn run_worker<S: Sink>(
             while index < pending.len() {
                 let entry = &mut pending[index];
                 if entry.value.is_none() && (bytes == 0 || bytes < sink.batch_bytes()) {
+                    let record = entry
+                        .item
+                        .value
+                        .as_mut()
+                        .expect("unprepared record retained");
                     if let Some(wire) = entry.item.wire.take() {
-                        entry.item.value.response = wire.decode();
-                        if entry.item.value.response.is_none() {
-                            entry.item.value.provider_reasoning = None;
-                            entry.item.value.provider_tool_calls_json = None;
+                        record.response = wire.decode();
+                        if record.response.is_none() {
+                            record.provider_reasoning = None;
+                            record.provider_tool_calls_json = None;
                         }
                     }
-                    entry.value = sink.prepare(&entry.item.value, maximum_record_bytes).ok();
+                    entry.value = sink.prepare(record, maximum_record_bytes).ok();
                     if let Some(value) = &entry.value {
                         bytes += sink.prepared_bytes(value);
+                        // The prepared payload owns all retry evidence now. Free
+                        // the decoded tree before preparing the next batch member,
+                        // but keep its admission charge until durable acknowledgement.
+                        entry.item.value = None;
                     } else {
                         counters.failed.fetch_add(1, Ordering::Relaxed);
                     }
@@ -314,7 +323,7 @@ impl Delivery {
         self.counters.pending.fetch_add(1, Ordering::AcqRel);
         drop(capacity);
         let item = Pending {
-            value,
+            value: Some(value),
             wire,
             bytes,
             counters: self.counters.clone(),

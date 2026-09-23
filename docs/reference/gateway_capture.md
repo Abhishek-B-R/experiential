@@ -91,6 +91,8 @@ booleans in the same order: `True` acknowledges durable storage or an intentiona
 privacy exclusion, and `False` retains that record for retry. Exceptions or an
 incorrect receipt count acknowledge nothing. Failed members retain the exact same
 prepared string object; acknowledged members are released independently.
+Once preparation succeeds, the redundant decoded record tree is released before
+preparing the next member. Its admission charge remains until acknowledgement.
 
 Batches gather only already queued work, with no fill delay, up to 64 records.
 Gathering stops after reaching a soft 1 MiB encoded-byte target; its final record

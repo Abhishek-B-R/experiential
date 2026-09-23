@@ -69,6 +69,71 @@ fn record(id: &str) -> Record {
 }
 
 #[test]
+fn preparation_releases_decoded_trees_but_keeps_admission_charged_until_ack() {
+    let (delivery, entered, resume) = paused(limits(), false);
+    let value = record("tree");
+    let context = Arc::downgrade(&value.request.context);
+    assert!(delivery.submit(value));
+    entered.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(context.upgrade().is_none());
+    assert_eq!(delivery.counts()[0], 1);
+    assert!(delivery.counts()[1] > 0);
+    assert!(!delivery.close_until(Instant::now()));
+    resume.send(()).unwrap();
+    assert!(delivery.close_until(Instant::now() + Duration::from_secs(1)));
+    assert_eq!(delivery.counts(), [0, 0, 1, 0, 0]);
+}
+
+#[test]
+fn preparation_failure_retains_input_for_retry_without_a_false_ack() {
+    struct RecoveringPreparation {
+        recover: Arc<std::sync::atomic::AtomicBool>,
+        attempted: mpsc::Sender<()>,
+    }
+    impl Sink for RecoveringPreparation {
+        type Prepared = String;
+        fn preparation_bytes(_: usize) -> usize {
+            512
+        }
+        fn prepare(&self, record: &Record, _: usize) -> Result<String, ()> {
+            let _ = self.attempted.send(());
+            if self.recover.load(Ordering::Acquire) {
+                Ok(record.request.request_id.clone())
+            } else {
+                Err(())
+            }
+        }
+        fn write(&mut self, value: &String) -> Result<(), ()> {
+            assert_eq!(value, "retry");
+            Ok(())
+        }
+    }
+    let recover = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (attempted, observed) = mpsc::channel();
+    let delivery = Delivery::new(
+        limits(),
+        RecoveringPreparation {
+            recover: recover.clone(),
+            attempted,
+        },
+    )
+    .unwrap();
+    let value = record("retry");
+    let context = Arc::downgrade(&value.request.context);
+    assert!(delivery.submit(value));
+    observed.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(context.upgrade().is_some());
+    assert!(!delivery.close_until(Instant::now()));
+    assert_eq!(delivery.counts()[0], 1);
+    assert_eq!(delivery.counts()[2], 0);
+    recover.store(true, Ordering::Release);
+    assert!(delivery.close_until(Instant::now() + Duration::from_secs(1)));
+    assert!(context.upgrade().is_none());
+    assert_eq!(delivery.counts()[2], 1);
+    assert_eq!(delivery.counts()[4], 0);
+}
+
+#[test]
 fn saturated_destination_waits_without_losing_records_or_exceeding_queued_budget() {
     let (delivery, entered, resume) = paused(limits(), false);
     let delivery = Arc::new(delivery);
