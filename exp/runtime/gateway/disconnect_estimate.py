@@ -12,15 +12,51 @@ labelled ``estimated`` (never ``observed``) wherever it lands.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.attempt_tokens import counted_input_tokens
-from exp.runtime.gateway.contracts import GatewayApiSurface
+from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayFailure
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
-from exp.runtime.gateway.native_settlement import StreamedOutput
+from exp.runtime.gateway.native_settlement import (
+    StreamedOutput,
+    streamed_output_from_settlement,
+    terminal_from_settlement,
+)
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.stream_contracts import GatewayEvent, GatewayUsage
 
+if TYPE_CHECKING:
+    from exp.runtime.gateway.native_execution import InflightRequest
+
 FALLBACK_CHARACTERS_PER_TOKEN = 4
 """Characters per token assumed for overflow text when nothing was retained to calibrate on."""
+
+
+def settled_terminal(
+    data: JsonObject, entry: InflightRequest
+) -> tuple[GatewayEvent, GatewayFailure | None]:
+    """Build one in-flight request's terminal from its settlement, disconnect estimate applied.
+
+    Deterministic over the retained payload, so the direct settle and the
+    sweep's replay of the same settlement produce the same meter.
+
+    Args:
+        data: Parsed native settlement payload.
+        entry: The owning in-flight request (its prompt and frozen surface).
+
+    Returns:
+        The normalized terminal event and optional failure.
+    """
+    terminal, failure = terminal_from_settlement(data, surface=entry.authorization.surface)
+    terminal = estimate_disconnect_usage(
+        terminal,
+        request=entry.request,
+        surface=entry.authorization.surface,
+        opened=data.get("opened") is True,
+        streamed=streamed_output_from_settlement(data),
+    )
+    return terminal, failure
 
 
 def estimate_disconnect_usage(

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from exp.runtime.gateway.contracts import GatewayUsage
+from exp.runtime.gateway.contracts import GatewayEvent, GatewayUsage
 
 MAXIMUM_NANO_USD = 9_223_372_036_854_775_807
 """Largest nano-USD amount the signed 64-bit ledger columns (SQLite INTEGER,
@@ -108,6 +108,43 @@ def estimated_cost_nano_usd(
         return None
     numerator = sum(tokens * (rate or 0) for tokens, rate in dimensions)
     return require_representable_nano_usd((numerator + 500_000) // 1_000_000, what="attempt cost")
+
+
+def settle_pricing(
+    row: sqlite3.Row,
+    usage: GatewayUsage | None,
+    terminal_event: GatewayEvent | None,
+    *,
+    prefix: str,
+) -> tuple[int | None, int | None, str]:
+    """Price one settlement: ``(cost, budget_settlement, usage_source)``.
+
+    Partial disconnect usage remains evidence, not a final provider cost: its
+    counts are preserved while the conservative reserved bound is consumed
+    and the cost stays unknown. When the accounting registry completed that
+    meter with the gateway's own tokenizer (``usage_estimated``), the estimate
+    prices the work the provider billed, settles that figure and releases the
+    rest of the bound, labelled ``estimated``. Every other settlement prices
+    its observed usage, or consumes the bound when no cost can be derived.
+
+    Args:
+        row: Attempt row containing the frozen schedule and reserved bound.
+        usage: The usage the settlement carries, if any.
+        terminal_event: The terminal event, carrying the disconnect markers.
+        prefix: Column namespace of the frozen schedule.
+
+    Returns:
+        The attributed cost (or None), the budget settlement, and the label.
+    """
+    estimated = terminal_event is not None and terminal_event.usage_estimated
+    partial = (
+        terminal_event is not None
+        and terminal_event.usage_incomplete_due_to_disconnect
+        and not estimated
+    )
+    cost = None if partial else frozen_usage_cost(row, usage, prefix=prefix)
+    budget_settlement = cost if cost is not None else optional_int(row["budget_reserved_nano_usd"])
+    return cost, budget_settlement, usage_source_label(usage, estimated=estimated)
 
 
 def usage_source_label(usage: GatewayUsage | None, *, estimated: bool) -> str:
