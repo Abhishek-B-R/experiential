@@ -12,8 +12,17 @@ use super::response::WireResponse;
 
 /// Local SQLite and hosted persistence implement the same off-path destination.
 pub(crate) trait Sink: Send + 'static {
-    /// Persist one versioned record. Errors are deliberately content-free.
-    fn write(&mut self, record: &Record, maximum_bytes: usize) -> Result<(), ()>;
+    type Prepared;
+
+    /// Maximum retained preparation allocation, reserved before queue admission.
+    fn preparation_bytes(maximum_record_bytes: usize) -> usize;
+
+    /// Prepare once, off serving; retrying storage must not re-encode the record.
+    fn prepare(record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()>;
+
+    /// Acknowledge an idempotent write or intentional policy exclusion. An error
+    /// retains the payload for retry; error details must never include content.
+    fn write(&mut self, prepared: &Self::Prepared) -> Result<(), ()>;
 
     /// Run retention maintenance without adding storage work to serving.
     fn maintain(&mut self) -> Result<(), ()> {
@@ -45,12 +54,22 @@ impl Limits {
 #[derive(Default)]
 struct Counters {
     bytes: AtomicUsize,
+    preparation_bytes: AtomicUsize,
     pending: AtomicUsize,
     dropped: AtomicU64,
     persisted: AtomicU64,
     failed: AtomicU64,
     capacity: Mutex<()>,
     available: Condvar,
+}
+
+/// One worker prepares at a time. Its workspace cannot compete with a full queue.
+struct PreparationBudget(Arc<Counters>);
+
+impl Drop for PreparationBudget {
+    fn drop(&mut self) {
+        self.0.preparation_bytes.store(0, Ordering::Release);
+    }
 }
 
 struct Pending {
@@ -76,14 +95,21 @@ impl Drop for Pending {
 
 pub(crate) struct Delivery {
     limits: Limits,
+    maximum_queued_bytes: usize,
     sender: Mutex<Option<mpsc::SyncSender<Pending>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     counters: Arc<Counters>,
 }
 
 impl Delivery {
-    pub(crate) fn new(limits: Limits, mut sink: impl Sink) -> Result<Self, &'static str> {
+    pub(crate) fn new<S: Sink>(limits: Limits, mut sink: S) -> Result<Self, &'static str> {
         limits.validate()?;
+        let preparation_bytes = S::preparation_bytes(limits.maximum_record_bytes);
+        let maximum_queued_bytes = limits
+            .maximum_bytes
+            .checked_sub(preparation_bytes)
+            .filter(|available| *available >= limits.maximum_record_bytes)
+            .ok_or("capture byte budget must fit destination preparation and one record")?;
         let (sender, receiver) = mpsc::sync_channel::<Pending>(limits.maximum_records);
         let counters = Arc::new(Counters::default());
         let worker_counters = counters.clone();
@@ -101,6 +127,10 @@ impl Delivery {
                     }
                     match receiver.recv_timeout(Duration::from_millis(100)) {
                         Ok(mut item) => {
+                            worker_counters
+                                .preparation_bytes
+                                .store(preparation_bytes, Ordering::Release);
+                            let _preparation = PreparationBudget(worker_counters.clone());
                             if let Some(wire) = item.wire.take() {
                                 item.value.response = wire.decode();
                                 if item.value.response.is_none() {
@@ -108,7 +138,29 @@ impl Delivery {
                                     item.value.provider_tool_calls_json = None;
                                 }
                             }
-                            let persisted = sink.write(&item.value, maximum_record_bytes).is_ok();
+                            let persisted = match S::prepare(&item.value, maximum_record_bytes) {
+                                Ok(prepared) => {
+                                    let mut delay = Duration::from_millis(25);
+                                    while sink.write(&prepared).is_err() {
+                                        worker_counters.failed.fetch_add(1, Ordering::Relaxed);
+                                        // Hold the same queue slot and byte charge until
+                                        // acknowledged, including across close timeouts.
+                                        // Bound retry frequency, never expire accepted data.
+                                        std::thread::sleep(delay);
+                                        delay = (delay * 2).min(Duration::from_secs(1));
+                                        if maintained.elapsed() >= Duration::from_secs(1) {
+                                            if sink.maintain().is_err() {
+                                                worker_counters
+                                                    .failed
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            maintained = Instant::now();
+                                        }
+                                    }
+                                    true
+                                }
+                                Err(()) => false,
+                            };
                             let counter = if persisted {
                                 &worker_counters.persisted
                             } else {
@@ -127,6 +179,7 @@ impl Delivery {
             .map_err(|_| "cannot start capture delivery worker")?;
         Ok(Self {
             limits,
+            maximum_queued_bytes,
             sender: Mutex::new(Some(sender)),
             worker: Mutex::new(Some(worker)),
             counters,
@@ -152,7 +205,7 @@ impl Delivery {
         completed: Option<mpsc::SyncSender<bool>>,
     ) -> bool {
         let bytes = value.heap_bytes() + wire.as_ref().map_or(0, WireResponse::heap_bytes);
-        if bytes > self.limits.maximum_bytes {
+        if bytes > self.maximum_queued_bytes {
             return self.dropped();
         }
         // Clone before waiting. Shutdown closes new admissions, while producers
@@ -171,7 +224,7 @@ impl Delivery {
                 .bytes
                 .load(Ordering::Acquire)
                 .saturating_add(bytes)
-                > self.limits.maximum_bytes
+                > self.maximum_queued_bytes
         {
             capacity = self
                 .counters
@@ -223,7 +276,8 @@ impl Delivery {
     pub(crate) fn counts(&self) -> [u64; 5] {
         [
             self.counters.pending.load(Ordering::Acquire) as u64,
-            self.counters.bytes.load(Ordering::Acquire) as u64,
+            self.counters.bytes.load(Ordering::Acquire) as u64
+                + self.counters.preparation_bytes.load(Ordering::Acquire) as u64,
             self.counters.persisted.load(Ordering::Relaxed),
             self.counters.failed.load(Ordering::Relaxed),
             self.counters.dropped.load(Ordering::Relaxed),

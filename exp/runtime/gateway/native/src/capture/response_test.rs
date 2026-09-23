@@ -11,10 +11,19 @@ use std::time::{Duration, Instant};
 
 struct MemorySink(mpsc::Sender<Record>);
 impl Sink for MemorySink {
-    fn write(&mut self, record: &Record, maximum_bytes: usize) -> Result<(), ()> {
-        let encoded = record.encode(maximum_bytes).ok_or(())?;
+    type Prepared = String;
+
+    fn preparation_bytes(maximum_record_bytes: usize) -> usize {
+        maximum_record_bytes
+    }
+
+    fn prepare(record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
+        record.encode(maximum_bytes).ok_or(())
+    }
+
+    fn write(&mut self, record: &Self::Prepared) -> Result<(), ()> {
         self.0
-            .send(serde_json::from_str(&encoded).map_err(|_| ())?)
+            .send(serde_json::from_str(record).map_err(|_| ())?)
             .map_err(|_| ())
     }
 }
@@ -62,7 +71,17 @@ struct HeldSink {
 }
 
 impl Sink for HeldSink {
-    fn write(&mut self, record: &Record, _maximum_bytes: usize) -> Result<(), ()> {
+    type Prepared = String;
+
+    fn preparation_bytes(maximum_record_bytes: usize) -> usize {
+        maximum_record_bytes
+    }
+
+    fn prepare(record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
+        record.encode(maximum_bytes).ok_or(())
+    }
+
+    fn write(&mut self, record: &Self::Prepared) -> Result<(), ()> {
         if let Some(entered) = self.entered.take() {
             let _ = entered.send(());
             self.resume
@@ -70,9 +89,12 @@ impl Sink for HeldSink {
                 .map_err(|_| ())?;
         }
         if self.fail {
+            self.fail = false;
             Err(())
         } else {
-            self.records.send(record.clone()).map_err(|_| ())
+            self.records
+                .send(serde_json::from_str(record).map_err(|_| ())?)
+                .map_err(|_| ())
         }
     }
 }
@@ -88,7 +110,7 @@ async fn stalled_writer_backpressures_complete_responses_without_blocking_the_ru
                 Configuration {
                     delivery: Limits {
                         maximum_records: 1,
-                        maximum_bytes: 16384,
+                        maximum_bytes: 32768,
                         maximum_record_bytes: 8192,
                     },
                     maximum_pending_records: 8,
@@ -148,11 +170,7 @@ async fn stalled_writer_backpressures_complete_responses_without_blocking_the_ru
                 .into_body()
                 .collect()
                 .await;
-                if fail {
-                    assert!(actual.is_err());
-                } else {
-                    assert_eq!(actual.unwrap().to_bytes().as_ref(), expected.as_slice());
-                }
+                assert_eq!(actual.unwrap().to_bytes().as_ref(), expected.as_slice());
             }));
         }
         tokio::time::timeout(Duration::from_secs(1), entered)
@@ -177,14 +195,14 @@ async fn stalled_writer_backpressures_complete_responses_without_blocking_the_ru
         }
         assert!(collector.close_until(Instant::now() + Duration::from_secs(1)));
         let rows: Vec<_> = observed.try_iter().collect();
-        assert_eq!(rows.len(), if fail { 0 } else { 8 });
+        assert_eq!(rows.len(), 8);
         assert!(rows
             .iter()
             .all(|record| matches!(record.response, Some(CapturedResponse::Json { .. }))));
         assert_eq!(
             collector.counts(),
             if fail {
-                [0, 0, 0, 8, 0, 0]
+                [0, 0, 8, 1, 0, 0]
             } else {
                 [0, 0, 8, 0, 0, 0]
             }

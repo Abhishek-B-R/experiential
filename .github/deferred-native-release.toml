@@ -1,0 +1,4 @@
+# Accumulate native source changes without publishing these existing versions.
+# The combined release must remove this marker and bump both distributions.
+experiential = "0.7.106"
+exp-gateway-native = "0.3.96"
