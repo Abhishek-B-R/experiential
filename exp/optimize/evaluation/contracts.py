@@ -16,7 +16,25 @@ from exp.simulation.specs import WorldModelSettings
 
 
 class EvaluationSetup(ContractModel):
-    """Frozen worker, environment, judge and execution inputs independent of router fitting."""
+    """Frozen worker, environment, judge and execution inputs independent of router fitting.
+
+    Attributes:
+        candidates: Nonempty collection of frozen worker model identities.
+        observed_cells: Historical cells, empty for standalone model evaluation.
+        production_protocol: Build-bound production evidence protocol.
+        simulation_protocol: Shared worker simulation and judging protocol.
+        fit_rag_input: Immutable fit-only retrieval index.
+        pricing_snapshot_id: Frozen catalog prices used for the comparison.
+        judgment_status: Actual provisional or human-calibrated provenance.
+        world_model_settings: Grounded environment and retrieval configuration.
+        simulation_completion_input: Frozen request reservations, required for quoting.
+        agent_id: Selected runtime identity, from 1 through 256 characters.
+        seed: Reproducible simulation seed.
+        maximum_steps: Positive per-rollout step ceiling.
+        continuation_of: Exact parent specification, or None for a fresh evaluation.
+        maximum_rollout_output_tokens: Positive cumulative worker output cap, default 1,000,000.
+        maximum_concurrency: Positive ceiling on concurrently admitted rollouts.
+    """
 
     candidates: tuple[RoutedCandidateSnapshot, ...] = Field(min_length=1)
     observed_cells: tuple[ObservedProductionCell, ...] = ()
@@ -36,14 +54,25 @@ class EvaluationSetup(ContractModel):
 
 
 class EvaluationBudget(ContractModel):
-    """Finite ceilings for simulation plus judging; execution never opts out of enforcement."""
+    """Finite ceilings for simulation plus judging; execution never opts out of enforcement.
+
+    Attributes:
+        maximum_cost_usd: Positive finite provider-spend ceiling.
+        maximum_judgments: Positive ceiling on durable cell judgments.
+    """
 
     maximum_cost_usd: float = Field(gt=0, allow_inf_nan=False)
     maximum_judgments: int = Field(gt=0)
 
 
 class EvaluationExecutionContract(ArtifactEnvelope):
-    """Hash-bound execution settings and authorization included in the evaluation identity."""
+    """Hash-bound execution settings and authorization included in the evaluation identity.
+
+    Attributes:
+        contract_id: Content-derived execution identity.
+        setup: Frozen model, environment and judge inputs.
+        budget: Authorized finite execution ceilings.
+    """
 
     contract_id: ArtifactId
     setup: EvaluationSetup
@@ -64,7 +93,12 @@ class JudgmentReferences(Protocol):
 
 @dataclass(frozen=True)
 class EvaluationJudge:
-    """Verified persisted judge references, never caller-authored calibration evidence."""
+    """Verified persisted judge references, never caller-authored calibration evidence.
+
+    Attributes:
+        rubric_id: Verified immutable rubric identity.
+        calibration_id: Verified immutable calibration identity.
+    """
 
     rubric_id: str
     calibration_id: str
@@ -72,7 +106,13 @@ class EvaluationJudge:
 
 @dataclass(frozen=True)
 class EvaluationServices:
-    """Injected model-backed services; evaluation orchestration remains Experiential-owned."""
+    """Injected model-backed services; evaluation orchestration remains Experiential-owned.
+
+    Attributes:
+        simulator_factory: Builds the selected simulation engine for one frozen plan.
+        judge: Provider-bound, reservation-enforcing judge.
+        plan_inputs: Additional immutable execution inputs, empty by default.
+    """
 
     simulator_factory: SimulatorFactory
     judge: EvaluationRuntimeJudge

@@ -171,6 +171,7 @@ pub(crate) async fn messages(
         "surface": "messages",
         "anthropic_beta": anthropic_beta,
         "client_ip": client_ip(&headers),
+        "capture_session_id": crate::capture::session_id(&headers),
     }));
     let admission_text = match state.bridge.call("admit", admit_argument).await {
         Ok(text) => text,
@@ -226,8 +227,11 @@ pub(crate) async fn messages(
     };
     let mut won = acquire_attempt(&context, &mut guard).await;
     adopt_outcome(&mut admission, &mut won);
+    crate::capture::reasoning::observe_winner(state.capture.clone(), &admission, &guard, &mut won);
 
-    match won {
+    let capture = state.capture.clone();
+    let capture_request_id = admission.request_id.clone();
+    let response = match won {
         Won::Failed(error) => messages_error_response(&error),
         Won::Settled(settled) => settled_messages_response(&admission, settled).await,
         Won::Committed(committed) => {
@@ -241,7 +245,8 @@ pub(crate) async fn messages(
                 completed_messages(admission, guard, committed, deadline, permit).await
             }
         }
-    }
+    };
+    crate::capture::response::capture_response(capture, &capture_request_id, response)
 }
 
 /// Abandon a durably accepted request whose admission reply failed to parse,

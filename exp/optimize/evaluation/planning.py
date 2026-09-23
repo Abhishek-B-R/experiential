@@ -20,7 +20,12 @@ from exp.simulation.specs import load_simulation_completion_contract
 
 
 class EvaluationCostComponent(ContractModel):
-    """Planning estimate and hard context/retry bound for one already prepared stage."""
+    """Planning estimate and hard context/retry bound for one already prepared stage.
+
+    Attributes:
+        estimated_cost_usd: Nonnegative finite planning estimate.
+        maximum_cost_usd: Nonnegative finite token and retry ceiling.
+    """
 
     estimated_cost_usd: float = Field(ge=0, allow_inf_nan=False)
     maximum_cost_usd: float = Field(ge=0, allow_inf_nan=False)
@@ -32,6 +37,18 @@ class EvaluationCostPlan(ContractModel):
     Mining and grounding are already completed inputs to this API and are not included.
     Hosting must add their quote before presenting the entire trace-to-report price.
     Credit conversion and promotions are hosting concerns, never engine price inputs.
+
+    Attributes:
+        quote_sha256: Digest of the immutable inputs and judge reservation.
+        scenario_count: Positive number of distinct scenarios.
+        worker_count: Positive number of selected worker models.
+        judgment_count: Positive number of cell judgments.
+        workers: Worker-model estimates and maximum spend.
+        simulation: World-model estimates and maximum spend.
+        retrieval: Retrieval-embedding estimates and maximum spend.
+        judge: Judge-model estimates and maximum spend.
+        estimated_cost_usd: Nonnegative finite sum of stage estimates.
+        maximum_cost_usd: Nonnegative finite sum of stage ceilings.
     """
 
     quote_sha256: Sha256
@@ -121,9 +138,16 @@ def estimate_model_evaluation(
     retrieval_reservation = maximum_query_reservation(retrieval).cost_usd
     assert retrieval_reservation is not None
     retrieval_cost = steps * workers * retrieval_reservation.value
+    # Generated tool calls consume output tokens, so the request output ceiling
+    # bounds retrieval count without an unrelated fixed tool-call limit.
+    tool_tasks = sum(bool(task.tools) for task in tasks)
+    query_count = setup.maximum_steps * sum(
+        tool_tasks * request.maximum_output_tokens + count - tool_tasks
+        for request in requests.values()
+    )
     retrieval_component = EvaluationCostComponent(
         estimated_cost_usd=retrieval_cost,
-        maximum_cost_usd=retrieval_cost * MAXIMUM_CELL_ATTEMPTS,
+        maximum_cost_usd=query_count * retrieval_reservation.value * MAXIMUM_CELL_ATTEMPTS,
     )
     judge_count = count * workers
     judge_component = _sum_completion(

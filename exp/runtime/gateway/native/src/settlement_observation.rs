@@ -1,7 +1,7 @@
 //! Bounded provider facts retained across cancellation of an owning future.
 
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::events::{Event, Usage};
 use crate::relay::track_event;
@@ -10,15 +10,47 @@ use crate::relay::track_event;
 #[derive(Clone, Default)]
 pub(crate) struct Observation(Arc<Mutex<Observed>>);
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct Observed {
+    pub started_at: SystemTime,
+    started: Instant,
+    pub terminal_at: Option<SystemTime>,
+    pub duration: Option<Duration>,
     pub usage: Option<Usage>,
     pub tool_names: Vec<String>,
     pub terminal: Option<Event>,
     pub first_token_at: Option<SystemTime>,
 }
 
+impl Default for Observed {
+    fn default() -> Self {
+        Self {
+            started_at: SystemTime::now(),
+            started: Instant::now(),
+            terminal_at: None,
+            duration: None,
+            usage: None,
+            tool_names: Vec::new(),
+            terminal: None,
+            first_token_at: None,
+        }
+    }
+}
+
 impl Observation {
+    /// A repaired dial resets its meter but retains the physical attempt's start.
+    pub(crate) fn next_dial(&self) -> Self {
+        let previous = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self(Arc::new(Mutex::new(Observed {
+            started_at: previous.started_at,
+            started: previous.started,
+            ..Observed::default()
+        })))
+    }
+
     /// Remember normalized facts before public delivery can suspend or fail.
     pub(crate) fn record(&self, event: &Event) {
         let mut observed = self
@@ -47,6 +79,8 @@ impl Observation {
         }
         if event.is_terminal() {
             observed.terminal = Some(event.clone());
+            observed.terminal_at = Some(SystemTime::now());
+            observed.duration = Some(observed.started.elapsed());
         }
     }
 
@@ -62,13 +96,17 @@ impl Observation {
         }
     }
 
-    /// Stop-sequence filtering can refine a buffered provider terminal.
+    /// Stamp the effective terminal after normalized output delivery. A queued
+    /// terminal still supplies cancellation evidence before this point.
     pub(crate) fn record_effective_terminal(&self, event: &Event) {
         if event.is_terminal() {
-            self.0
+            let mut observed = self
+                .0
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .terminal = Some(event.clone());
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            observed.terminal_at = Some(SystemTime::now());
+            observed.duration = Some(observed.started.elapsed());
+            observed.terminal = Some(event.clone());
         }
     }
 
@@ -93,6 +131,21 @@ impl Observation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffered_terminal_time_finishes_after_the_visible_first_token() {
+        let observation = Observation::default();
+        // A complete provider frame can queue its terminal before the relay
+        // yields the frame's first visible token.
+        observation.record(&Event::Completed);
+        std::thread::sleep(Duration::from_millis(1));
+        let first_token_at = SystemTime::now();
+        observation.record_first_token(Some(first_token_at));
+        observation.record_effective_terminal(&Event::Completed);
+        let snapshot = observation.snapshot();
+        assert!(snapshot.terminal_at.unwrap() >= first_token_at);
+        assert!(snapshot.duration.unwrap() >= Duration::from_millis(1));
+    }
 
     #[test]
     fn cancellation_preserves_partial_usage_and_terminal_precedence() {

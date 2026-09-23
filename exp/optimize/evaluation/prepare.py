@@ -52,7 +52,18 @@ from exp.simulation.world_model.runtime import load_grounded_world_model_artifac
 
 
 class ModelEvaluationOptions(ContractModel):
-    """Bounded execution controls independent of router fitting and activation."""
+    """Bounded execution controls independent of router fitting and activation.
+
+    Attributes:
+        maximum_steps: Positive per-rollout step cap, default 100.
+        maximum_rollout_output_tokens: Positive cumulative worker output cap, default 1,000,000.
+        maximum_concurrency: Rollout concurrency from 1 through 32, default 1.
+        maximum_output_tokens: Optional positive per-request cap; None uses model capacity.
+        maximum_judge_input_tokens: Positive judge input reservation, default 32,768.
+        maximum_judge_output_tokens: Positive judge output reservation, default 8,192.
+        maximum_retrieval_query_tokens: Positive query token reservation, default 32,768.
+        seed: Reproducible simulation seed, default 0.
+    """
 
     maximum_steps: int = Field(default=100, ge=1)
     maximum_rollout_output_tokens: int = Field(default=1_000_000, gt=0)
@@ -65,7 +76,17 @@ class ModelEvaluationOptions(ContractModel):
 
 
 class PreparedModelEvaluation(ContractModel):
-    """Serializable frozen execution inputs and engine-owned price plan for hosting."""
+    """Serializable frozen execution inputs and engine-owned price plan for hosting.
+
+    Attributes:
+        setup: Frozen model, environment, judge and execution inputs.
+        judge_setup: Immutable authored or default judge setup.
+        judge_request: Runtime-enforced judge request reservation.
+        embedder_alias: Nonempty alias of the retrieval embedding model.
+        agent_factory_sha256: Digest of the exact worker runtime configuration.
+        redacted_field_names: Project privacy fields pinned before execution.
+        cost: Engine-owned immutable stage estimates and maximum provider spend.
+    """
 
     setup: EvaluationSetup
     judge_setup: ArtifactInput

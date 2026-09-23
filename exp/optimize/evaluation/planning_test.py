@@ -5,10 +5,56 @@ from pathlib import Path
 import pytest
 
 from exp.common.judging import verify_persisted_calibration
+from exp.common.models import ModelSnapshot
+from exp.common.tasks import ToolSchema
+from exp.common.traces import Trace
 from exp.optimize.evaluation.planning import estimate_model_evaluation
+from exp.optimize.evaluation.prepare_test import _prepare
 from exp.optimize.evaluation.service_test import _prepared
+from exp.optimize.router.automatic import service_test as build_fixtures
 from exp.optimize.router.composition_test import _completion_reservation
+from exp.simulation.engines.text.grounding import maximum_query_reservation
 from exp.simulation.engines.text.resume import MAXIMUM_CELL_ATTEMPTS
+from exp.simulation.specs import load_simulation_completion_contract
+
+
+@pytest.mark.parametrize("tools", [False, True])
+def test_quote_bounds_parallel_tool_retrieval_by_worker_output_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tools: bool
+) -> None:
+    """A tool-bearing turn can need multiple retrievals; a text turn still needs only one."""
+    original_trace = build_fixtures._trace
+    tool = ToolSchema(name="lookup", description="Look up an account.", input_schema={})
+
+    def trace(index: int, model: ModelSnapshot) -> Trace:
+        """Build immutable scenarios with or without declared tool schemas."""
+        return original_trace(index, model).model_copy(update={"tools": (tool,) if tools else ()})
+
+    monkeypatch.setattr(build_fixtures, "_trace", trace)
+    project, _, _, prepared = _prepare(tmp_path)
+    setup = prepared.setup
+    query = setup.world_model_settings.query_embedding
+    assert query is not None and setup.simulation_completion_input is not None
+    unit = maximum_query_reservation(query).cost_usd
+    assert unit is not None
+    completion, _ = load_simulation_completion_contract(
+        project.artifacts, setup.simulation_completion_input.artifact_id
+    )
+    queries_per_step = sum(
+        request.request.maximum_output_tokens if tools else 1
+        for request in completion.candidate_requests
+    )
+    expected = (
+        prepared.cost.scenario_count
+        * setup.maximum_steps
+        * queries_per_step
+        * unit.value
+        * MAXIMUM_CELL_ATTEMPTS
+    )
+    assert prepared.cost.retrieval.maximum_cost_usd == pytest.approx(expected)
+    assert prepared.cost.retrieval.estimated_cost_usd == pytest.approx(
+        prepared.cost.scenario_count * setup.maximum_steps * prepared.cost.worker_count * unit.value
+    )
 
 
 def test_evaluation_quote_is_read_only_and_prices_every_stage(tmp_path: Path) -> None:

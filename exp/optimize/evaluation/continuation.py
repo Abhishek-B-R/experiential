@@ -9,7 +9,12 @@ from exp.simulation.specs import SimulationSpec
 
 
 class EvaluationRuntimeContract(ArtifactEnvelope):
-    """Immutable runtime, judge and quote binding included in the evaluation identity."""
+    """Immutable runtime, judge and quote binding included in the evaluation identity.
+
+    Attributes:
+        contract_id: Immutable runtime contract identity.
+        prepared: Exact authorized inputs and quote retained for replay and continuation.
+    """
 
     contract_id: str
     prepared: PreparedModelEvaluation

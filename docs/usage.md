@@ -1,5 +1,8 @@
 # CLI usage
 
+Gateway embedders can use the [capture hosting interface](reference/gateway_capture.md)
+with their own consent policy and storage destination.
+
 The root surface is deliberately small:
 
 | Command | Purpose | Local result |
@@ -34,9 +37,9 @@ product telemetry, which may send unless disabled. Gateway startup makes no prov
 build calls only the configured embedder; automatic router optimization separately executes the
 bounded candidate, world-model, and judge schedule shown in its cost preflight.
 An authenticated gateway request is the explicit online model-call boundary. Project selectors
-remain frozen for the process lifetime and return only an exact model pool. `--ghost` remains a
-compatibility flag for project-journal behavior; gateway authentication, replay, attempts, and
-usage accounting stay enabled.
+remain frozen for the process lifetime and return only an exact model pool. `--ghost` disables
+local traffic content capture; gateway authentication, replay, attempts, and usage accounting
+stay enabled.
 
 The default and project gateway forms use one gateway lifecycle. It binds only `127.0.0.1`, starts with no
 provider call, and requires an explicit provider environment reference, exact model alias, identity,
@@ -52,7 +55,9 @@ specific variables avoid overwriting an upstream provider's `OPENAI_API_KEY`. Th
 unavailable alias and provider configuration; fix that configuration and rerun `exp`. If the
 one-time key was not saved, issue a replacement with
 `exp config gateway key issue IDENTITY --key-id KEY --json`.
-The gateway writes no prompts, responses, tool arguments, raw keys, or provider secrets to SQLite.
+The accounting database stays content-free. Local traffic content is captured separately by default;
+use `--ghost` to disable it. See [local traffic capture](reference/local_gateway_traffic.md).
+Raw virtual keys and resolved provider credentials are never copied into capture or accounting.
 `GET /usage` and `GET /usage.json` expose the same schema-v2 content-free overall and per-identity
 counts, token usage, latency, terminal states, and attributed estimated cost. Their attempt-only
 `by_billing_source` buckets conserve attempts, tokens, known cost, unknown-cost attempts, and
@@ -148,6 +153,10 @@ of the child also reuses its judgments. Continuation does not restore arbitrary 
 process state, truncated generations, interrupted world turns, or redacted transcript content;
 those require a fresh evaluation. No prior artifact is edited.
 
+Declared tools run against generated environment observations, not real external tool
+implementations. A safe checkpoint preserves ordered tool results and private world state;
+continuing does not re-execute completed tool turns. The retrieval estimate assumes one query
+per turn, while its maximum reserves for multiple tool calls using each worker's output limit.
 
 For a completed grounded project, `exp.prepare_model_evaluation` freezes a worker matrix and
 prices its simulation, retrieval and judge requests without calling providers. The default judge
@@ -240,3 +249,8 @@ by `world.step(session.id, assistant_message)`. Each result exposes `messages`, 
 of OpenAI user or tool messages, and `terminal`. Tool observations are nonterminal so the agent can
 consume them before producing its final answer. World-model artifacts pin the v2 prompt; rebuild
 projects created with a different prompt before running them.
+
+### Local gateway traffic
+
+See [local traffic capture](reference/local_gateway_traffic.md) for default-on,
+identity-scoped collection and `exp build --source gateway --identity ID`.

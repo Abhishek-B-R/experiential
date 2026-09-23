@@ -25,7 +25,18 @@ from exp.common.project import (
 
 
 class HumanScore(ContractModel):
-    """One immutable human rating, optionally correcting an earlier rating."""
+    """One immutable human rating, optionally correcting an earlier rating.
+
+    Attributes:
+        label_id: Unique identity of this label revision.
+        rubric_id: Immutable rubric defining the score range.
+        rollout_id: Rollout assessed by the reviewer.
+        lineage_id: Source lineage used to separate fit and held-out evidence.
+        dimension_id: Scored rubric axis.
+        score: Signed integer checked against the axis before persistence.
+        created_at: Timezone-aware time the reviewer authored this score.
+        supersedes_label_id: Earlier active label being corrected, or None for a new label.
+    """
 
     label_id: ArtifactId
     rubric_id: ArtifactId

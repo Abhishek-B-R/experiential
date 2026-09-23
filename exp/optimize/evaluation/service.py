@@ -38,7 +38,16 @@ from exp.simulation.specs import SimulationSpec
 
 @dataclass(frozen=True)
 class ModelEvaluationResult:
-    """Completed immutable evaluation artifacts and reconciled simulation/judging spend."""
+    """Completed immutable evaluation artifacts and reconciled simulation/judging spend.
+
+    Attributes:
+        plan: Frozen worker and scenario matrix.
+        simulation_spec: Exact executed simulation settings.
+        evaluation_id: Persisted evaluation dataset identity.
+        report: Shared-cohort model quality and operating-cost comparison.
+        simulation_cost_usd: Reconciled worker, world-model and retrieval spend.
+        judge_cost_usd: Reconciled durable judgment spend.
+    """
 
     plan: EvaluationPlan
     simulation_spec: SimulationSpec
