@@ -54,6 +54,7 @@ from exp.runtime.gateway.native_admission import (
     log_reasoning_continuation_rejection,
     record_dead_admission_rungs,
     resolve_admission_route,
+    select_single_route_before_search,
 )
 from exp.runtime.gateway.native_authentication import NativeAuthenticationMixin
 from exp.runtime.gateway.native_batches import NativeBatchRelayMixin
@@ -90,8 +91,6 @@ from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_b
 from exp.runtime.gateway.native_dispatch_signing import NativeDispatchSigningMixin
 from exp.runtime.gateway.native_embeddings import NativeEmbeddingsMixin
 from exp.runtime.gateway.native_execution import (
-    MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
-    MAXIMUM_TOTAL_ATTEMPTS,
     FrozenDispatchBinding,
     InflightRequest,
     NativeDialectUnavailableError,
@@ -109,6 +108,7 @@ from exp.runtime.gateway.native_reasoning import (
     strip_stale_reasoning_history,
     unseal_reasoning_history,
 )
+from exp.runtime.gateway.native_request_policy import require_route_authority
 from exp.runtime.gateway.native_responses import (
     ContinuationContext,
     continuation_route_binding,
@@ -125,6 +125,7 @@ from exp.runtime.gateway.native_tool_search import NativeToolSearchMixin
 from exp.runtime.gateway.reasoning_carrier import (
     ReasoningCarrierAuthority,
 )
+from exp.runtime.gateway.request_policy import attempt_policy
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.tool_search.plan import plan_tool_search
@@ -328,9 +329,7 @@ class NativeControlPlane(
                 raise pointer from exc
             raise mapped from exc
 
-        # Responses continuation resolves after authorization and before any
-        # ledger write; unavailable, expired, evicted, or cross-namespace
-        # state fails closed here.
+        # Resolve continuation after authorization and before any durable acceptance.
         continuation_context: ContinuationContext | None = None
         if request.surface == GatewayApiSurface.RESPONSES:
             try:
@@ -349,6 +348,8 @@ class NativeControlPlane(
                 authorization,
                 request,
             )
+        except ProviderParameterError as exc:
+            raise NativeBridgeError(invalid_field(exc.param, str(exc))) from exc
         except Exception as exc:  # noqa: BLE001 - one public shape prevents an oracle.
             log_reasoning_continuation_rejection(authorization, "authenticate", exc)
             error = invalid_field(
@@ -376,6 +377,8 @@ class NativeControlPlane(
                 authorization,
                 request,
             )
+        except ProviderParameterError as exc:
+            raise NativeBridgeError(invalid_field(exc.param, str(exc))) from exc
         except Exception as exc:  # noqa: BLE001 - one public shape prevents an oracle.
             log_reasoning_continuation_rejection(authorization, "unseal", exc)
             error = invalid_field(
@@ -446,6 +449,7 @@ class NativeControlPlane(
                 request,
                 continuation=continuation_context,
             )
+            require_route_authority(authorization, request, route)
             route = _select_bound_continuation_route(
                 route,
                 None
@@ -468,16 +472,21 @@ class NativeControlPlane(
                     and continuation_context.required_route_binding is not None
                 ):
                     raise _continuation_binding_error()
-                # Every certified rung was operationally dead at admission;
-                # there is nothing live to serve, so the accepted request is
-                # finished closed.
+                # No dispatchable rung remains; finalize the accepted request closed.
                 return self._escalate_accepted(
                     authorization,
                     "every certified deployment was unavailable at admission",
                 )
             route = select_route_deployments(route, dispatchable.indexes)
             resolved_wires = dispatchable.resolved_wires
-            # Caller-requested web search against the admitted route (see web_search.plan).
+            route, resolved_wires, selected_placement = select_single_route_before_search(
+                route,
+                resolved_wires,
+                request,
+                accounting=self._accounting,
+                authorization=authorization,
+                continuation=continuation_context,
+            )
             searched = plan_web_search(
                 request,
                 [profile.dialect for profile, _client in resolved_wires],
@@ -547,6 +556,8 @@ class NativeControlPlane(
                     continuation=continuation_context,
                 )
             )
+            placement = selected_placement or placement
+            require_route_authority(authorization, request, route)
             require_unmodified_probability_output(request, bool(policy and policy.output_checks))
             wire_route: list[JsonObject] = []
             parallel_disclosures: set[str] = set()
@@ -711,8 +722,7 @@ class NativeControlPlane(
             "route_reason": route.route_reason,
             "route": wire_route,
             "ignored_parameters": list(public_request.ignored_parameters),
-            "maximum_total_attempts": MAXIMUM_TOTAL_ATTEMPTS,
-            "maximum_same_deployment_attempts": MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
+            **attempt_policy(request.gateway).model_dump(mode="json"),
             "refusal_failover": authorization.refusal_failover,
             "output_guardrail": native_output_mode(
                 self._guardrails,

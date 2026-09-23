@@ -707,6 +707,13 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             alias_revision_id=str(row["active_revision_id"]),
             target=target,
             catalog_sha256=str(row["catalog_sha256"]),
+            requested_route_id=(
+                request.gateway.routing.route_id
+                if isinstance(request, GatewayRequest)
+                and request.gateway is not None
+                and request.gateway.routing is not None
+                else None
+            ),
             canonical_request_sha256=canonical_request_sha256(request),
             deadline_monotonic=deadline_monotonic,
             surface=request.surface,

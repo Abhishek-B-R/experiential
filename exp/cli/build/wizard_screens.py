@@ -16,8 +16,8 @@ from rich.prompt import Prompt
 from exp.common.models import ModelCatalog
 from exp.common.project import ProjectModelConfiguration
 from exp.common.tasks import TaskCase
+from exp.common.traces.ingest.sources import CANONICAL_TRACE_SOURCES
 from exp.simulation.build import ProjectBuild
-from exp.simulation.ingest.sources import CANONICAL_TRACE_SOURCES
 
 
 @dataclass(frozen=True)
@@ -28,15 +28,15 @@ class WizardWorkflowSelection:
     build: bool = True
     judge_rubric: bool = False
     judge_calibration: bool = False
-    router: bool = True
+    router: bool = False
 
 
 _WORKFLOW_STEPS: tuple[tuple[str, str, bool], ...] = (
     ("providers", "connect providers and assign model roles", True),
-    ("build", "ingest traces and build the world model", True),
+    ("build", "import traces, mine scenarios and prepare the world model", True),
     ("judge rubric", "edit the judge rubric; off keeps the task-success default", False),
     ("judge calibration", "review and approve judge examples by hand", False),
-    ("router optimization", "simulate, judge, and fit the router", True),
+    ("router optimization", "simulate, judge, and fit the router", False),
 )
 
 
@@ -109,10 +109,10 @@ def select_trace(initial_source: str, *, console: Console) -> tuple[str, Path]:
         Canonical source name and validated local path.
     """
     source = initial_source.strip().casefold()
-    if source not in CANONICAL_TRACE_SOURCES:
+    if source not in (*CANONICAL_TRACE_SOURCES, "gateway"):
         source = Prompt.ask(
             "Trace source",
-            choices=list(CANONICAL_TRACE_SOURCES),
+            choices=sorted((*CANONICAL_TRACE_SOURCES, "gateway")),
             default="otlp",
             console=console,
         )

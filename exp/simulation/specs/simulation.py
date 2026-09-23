@@ -63,7 +63,7 @@ class MixedRealitySettings(ContractModel):
 class SimulationSpec(ArtifactEnvelope):
     """One immutable sparse selection of evaluation cells and exactly one simulator mode.
 
-    Args:
+    Attributes:
         simulation_id: Stable identity for the persisted simulation specification.
         evaluation_plan_id: Immutable plan whose cells this run explicitly selects.
         cell_ids: Sorted exact simulated plan cell IDs.  The simulator never expands this set.
@@ -74,6 +74,9 @@ class SimulationSpec(ArtifactEnvelope):
         mixed_reality: Reserved settings for an intentionally unimplemented future mode.
         seed: Pinned random seed preserved in each rollout artifact.
         maximum_steps: Strict upper bound on candidate model turns per episode.
+        continuation_of: Exact parent simulation to continue, or None for a fresh run.
+        maximum_rollout_output_tokens: Positive cumulative candidate output allowance,
+            including reasoning tokens, default 1,000,000. The world model is bounded separately.
         maximum_concurrency: Maximum number of episode workers allowed at once.
         maximum_cost_usd: Optional run-wide provider spend ceiling in US dollars.
         stop_on_overspend: When true, reconciled spend reaching ``maximum_cost_usd`` blocks
@@ -90,6 +93,8 @@ class SimulationSpec(ArtifactEnvelope):
     mixed_reality: MixedRealitySettings | None = None
     seed: int
     maximum_steps: int = Field(ge=1)
+    continuation_of: ArtifactInput | None = None
+    maximum_rollout_output_tokens: int = Field(default=1_000_000, gt=0)
     maximum_concurrency: int = Field(default=1, ge=1)
     maximum_cost_usd: float | None = Field(default=None, gt=0)
     stop_on_overspend: bool = False
