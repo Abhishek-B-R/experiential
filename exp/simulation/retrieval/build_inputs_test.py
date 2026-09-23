@@ -23,13 +23,13 @@ from exp.common.project.manifests import file_digest
 from exp.common.project.paths import ProjectPaths
 from exp.common.tasks import TaskSet
 from exp.common.traces import Trace, TraceDataset, TraceSource, TraceSpan
-from exp.simulation.build import TaskSetBuild, build_task_set
-from exp.simulation.ingest.dataset import (
+from exp.common.traces.ingest.dataset import (
     MODEL_IDENTITY_EVIDENCE_PATH,
     current_trace_dataset_id,
     persist_trace_dataset,
 )
-from exp.simulation.ingest.otlp import TraceNormalizationResult
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
+from exp.simulation.build import TaskSetBuild, build_task_set
 from exp.simulation.mining.bindings import (
     LINEAGE_BINDINGS_PATH,
     TaskSetLineageBindings,

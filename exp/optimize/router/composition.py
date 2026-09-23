@@ -41,6 +41,7 @@ from exp.common.project import (
 )
 from exp.common.routing import KnnGuard, KnnRouterPolicy
 from exp.common.routing.bank import KnnBankManifest
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.evaluation.contracts import EvaluationSetup
 from exp.optimize.evaluation.simulation import SimulatorFactory, run_or_load_simulation
 from exp.optimize.router.activation import load_project_router
@@ -66,7 +67,6 @@ from exp.optimize.router.judgment_budget import complete_cell_evidence
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.router import RouterRuntime
 from exp.simulation.build import ProjectBuild
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 from exp.simulation.specs import SimulationSpec
 
 logger = logging.getLogger(__name__)

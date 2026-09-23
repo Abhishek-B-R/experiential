@@ -39,6 +39,7 @@ from exp.common.models import (
 from exp.common.project import ProjectConfig, ProjectStore, artifact_input
 from exp.common.routing import FrozenEmbedding, FrozenEmbeddingSet, KnnGuard, RouterFeatureExtractor
 from exp.common.tasks import load_task_set
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.router.composition import (
     ApprovedRouterReview,
     RouterCompositionBudget,
@@ -61,7 +62,6 @@ from exp.simulation.engines.text.simulator_test import (
     _response,
     _ScriptedClient,
 )
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 from exp.simulation.orchestration import Simulator
 from exp.simulation.retrieval import load_fit_rag_retriever, load_rag_index
 from exp.simulation.retrieval.tests.retrieval_test import _message_trace as _trace

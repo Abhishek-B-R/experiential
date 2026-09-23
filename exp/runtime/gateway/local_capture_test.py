@@ -7,6 +7,12 @@ from pathlib import Path
 import httpx
 import pytest
 
+from exp.common.traces.ingest.persistence import read_ingested_traces
+from exp.common.traces.sqlite import SQLiteTraceStore
+from exp.common.traces.sqlite_test import _save
+from exp.common.traces.trace_test import _trace
+from exp.runtime.gateway.ingest.conversion import load_gateway_capture
+from exp.runtime.gateway.ingest.streaming import ingest_gateway_capture
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.local_capture import (
     local_capture_configuration,
@@ -21,7 +27,6 @@ from exp.runtime.gateway.tests.launch_test import (
     _unused_port,
     _wait_ready,
 )
-from exp.simulation.ingest.gateway import load_gateway_capture
 
 exp_gateway_native = pytest.importorskip("exp_gateway_native")
 
@@ -62,6 +67,9 @@ def test_real_gateway_traffic_reopens_as_scoped_build_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ghost: bool
 ) -> None:
     """Drive real JSON/SSE sockets and consume durable traffic after graceful shutdown."""
+    retained = None
+    if not ghost:
+        retained = _save(SQLiteTraceStore(local_capture_path(tmp_path)), (_trace(),))
     monkeypatch.setenv("LOOPBACK_PROVIDER_KEY", "provider-secret")
     provider = ThreadingHTTPServer(("127.0.0.1", 0), _LoopbackProvider)
     provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
@@ -145,9 +153,19 @@ def test_real_gateway_traffic_reopens_as_scoped_build_evidence(
     if ghost:
         assert not database.exists()
     else:
+        assert retained is not None
+        assert SQLiteTraceStore(database).read_import(retained.import_id).traces == (_trace(),)
         result = load_gateway_capture(database, identity_id="default")
         assert not result.issues
         assert len(result.traces) == 7
+        summary, receipt = ingest_gateway_capture(
+            "streamed-capture",
+            root=tmp_path,
+            path=database,
+            identity_id="default",
+        )
+        assert receipt is not None and summary.trace_count == 7
+        assert read_ingested_traces(tmp_path, receipt.import_id) == result
         assert sum(bool(trace.tools) for trace in result.traces) == 2
         continuations = [
             trace for trace in result.traces if trace.initial_context["parent_response_id"]

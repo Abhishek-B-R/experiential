@@ -51,6 +51,7 @@ from exp.common.project import (
 )
 from exp.common.routing import KnnRouterPolicy
 from exp.common.routing.bank import KnnBankManifest
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.router.attempt_authority import (
     FileHostedAttemptAuthorityStore,
     HostedAttemptAuthorityError,
@@ -89,7 +90,6 @@ from exp.optimize.router.spend import (
 )
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from exp.simulation.build import build_project
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 from exp.simulation.mining.service import MiningSpec
 from exp.simulation.retrieval import (
     RAGEmbedderBinding,

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from exp_gateway_native import CaptureCollector
 
+from exp.common.traces.sqlite_schema import trace_database_path
 from exp.runtime.gateway.contracts import AuthorizationSnapshot
 from exp.runtime.gateway.local_capture_config import CaptureBinding, CaptureConfiguration
 from exp.runtime.gateway.local_capture_contracts import CapturePolicy, LocalCaptureScope
@@ -51,7 +52,7 @@ def open_local_capture(configuration: CaptureConfiguration | None) -> CaptureCon
 
 def local_capture_path(root: Path) -> Path:
     """Return the separate content database, never the accounting database."""
-    return root.resolve() / "gateway" / "traffic.db"
+    return trace_database_path(root)
 
 
 def local_capture_configuration(root: Path, *, ghost: bool = False) -> CaptureConfiguration | None:
