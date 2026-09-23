@@ -29,7 +29,7 @@ impl Configuration {
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         self.delivery.validate()?;
         if !(1..=4096).contains(&self.maximum_pending_records)
-            || !(1..=1024 * 1024).contains(&self.maximum_request_bytes)
+            || !(1..=4 * 1024 * 1024).contains(&self.maximum_request_bytes)
             || !(1..=4 * 1024 * 1024).contains(&self.maximum_response_bytes)
             || self.maximum_pending_bytes < self.maximum_request_bytes
             || self.maximum_pending_bytes < self.maximum_response_bytes
@@ -302,8 +302,43 @@ impl Collector {
         }
     }
 
-    /// Hosted terminal eligibility precedes durable content, so a dropped BYOK
-    /// discard can never leave a previously queued prompt behind.
+    /// Checkpoint a hosted prompt after the winning host-funded lane is frozen.
+    /// The destination must recheck consent and merge this idempotent update
+    /// without replacing a later response. Keep the shared request tree live
+    /// until terminal settlement; no provider response belongs in this write.
+    pub(crate) fn checkpoint(&self, request_id: &str) -> bool {
+        // The local experience sink projects completed exchanges, not prompt
+        // records. It must never acknowledge a checkpoint it cannot persist.
+        if !self.config.settlement_required {
+            return true;
+        }
+        let record = {
+            let Ok(pending) = self.pending.lock() else {
+                return false;
+            };
+            let Some(entry) = pending.entries.get(request_id) else {
+                // Capture-off, ZDR and declined identities have no admission.
+                return true;
+            };
+            Record {
+                schema_version: SCHEMA_VERSION,
+                request: entry.record.request.clone(),
+                response: None,
+                provider_reasoning: None,
+                provider_reasoning_source_json: None,
+                provider_tool_calls_json: None,
+                deployment_id: None,
+                metrics: None,
+                gemini_thought_parts: Vec::new(),
+                gemini_thought_parts_source_json: None,
+                captured_at: entry.record.captured_at,
+            }
+        };
+        self.emit(record, None)
+    }
+
+    /// Terminal policy controls response retention; the winning lane was frozen
+    /// before any hosted prompt checkpoint. The sink rechecks live consent.
     pub(crate) fn settle(&self, request_id: &str, keep_prompt: bool, keep_response: bool) {
         let Ok(mut pending) = self.pending.lock() else {
             return;
@@ -331,8 +366,7 @@ impl Collector {
         }
         entry.response_allowed = true;
         if !entry.output_finished {
-            // Emit once at response completion. A preliminary prompt write could
-            // otherwise overtake the response after releasing the pending lock.
+            // The terminal update supplies output to the earlier prompt checkpoint.
             pending.bytes += entry.bytes;
             pending.entries.insert(request_id.to_owned(), entry);
         } else {
@@ -343,6 +377,7 @@ impl Collector {
     }
 
     /// Output may arrive before or after settlement; unpermitted output stays bounded.
+    #[cfg(test)]
     pub(crate) fn finish(
         &self,
         request_id: &str,

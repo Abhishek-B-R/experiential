@@ -7,6 +7,23 @@ use crate::admission::Admission;
 use crate::events::Event;
 use crate::waterfall::Won;
 
+/// Preserve a hosted prompt before any committed output becomes client-visible.
+/// Losing lanes never checkpoint: a later BYOK winner must not inherit a
+/// host-funded lane's capture. SQL remains the final live-consent authority.
+pub(crate) fn checkpoint_winner(
+    collector: Option<&Arc<Collector>>,
+    admission: &Admission,
+    won: &Won,
+) -> bool {
+    let (Some(collector), Won::Committed(attempt)) = (collector, won) else {
+        return true;
+    };
+    let Some(wire) = admission.route.get(attempt.depth) else {
+        return false;
+    };
+    wire.billing_customer_managed || collector.checkpoint(&admission.request_id)
+}
+
 pub(crate) struct Observer {
     collector: Arc<Collector>,
     request_id: String,

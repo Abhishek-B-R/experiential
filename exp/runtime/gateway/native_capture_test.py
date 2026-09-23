@@ -78,6 +78,21 @@ def test_close_timeout_preserves_accepted_content_for_later_host_settlement() ->
     assert collector.counts() == (0, 0, 1, 0, 0, 0)
 
 
+@pytest.mark.parametrize("content", ["x" * 1_100_000, "雪" * 400_000])
+def test_default_admission_keeps_large_inputs_whole(content: str) -> None:
+    """The former one-MiB cutoff and ASCII escaping must not discard valid prompts."""
+    records: list[str] = []
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), records.append)
+    request = json.loads(_request_json())
+    request["context"]["request"]["messages"] = [{"role": "user", "content": content}]
+    encoded = json.dumps(request, ensure_ascii=False)
+    assert collector.begin(encoded)
+    collector.settle("request", True, False)
+    assert collector.close(1)
+    persisted = CaptureRecord.model_validate_json(records[0])
+    assert persisted.request.context["request"] == request["context"]["request"]
+
+
 def test_python_sink_retries_without_losing_content_or_acknowledging_failure(
     capfd: pytest.CaptureFixture[str],
 ) -> None:
@@ -421,7 +436,9 @@ def test_accepted_routing_failure_keeps_effective_prompt_without_inventing_model
     assert "retained task" in records[0]
 
 
-@pytest.mark.parametrize("policy", ["local", "hosted", "hosted-late", "off", "broken", "full"])
+@pytest.mark.parametrize(
+    "policy", ["local", "hosted", "hosted-late", "hosted-byok", "off", "broken", "full"]
+)
 def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy: str
 ) -> None:
@@ -436,7 +453,7 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     )
     components = load_gateway_components(tmp_path)
     records: list[str] = []
-    configuration = CaptureConfiguration(settlement_required=policy in {"hosted", "hosted-late"})
+    configuration = CaptureConfiguration(settlement_required=policy.startswith("hosted"))
     collector = native.CaptureCollector(configuration.model_dump_json(), records.append)
     if policy == "full":
         assert collector.close(1)
@@ -452,12 +469,24 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     port = _unused_port()
     shutdown = native.shutdown_handle()
     failures: list[BaseException] = []
+    control = NativeControlPlane(components, capture=capture)
+    admit = control.admit
+
+    def funding_admit(argument: str) -> str:
+        """Model a hosted-funded test lane; local provider fixtures otherwise use BYOK."""
+        result = json.loads(admit(argument))
+        if policy in {"hosted", "hosted-late"}:
+            for wire in result["route"]:
+                wire["billing_customer_managed"] = False
+        return json.dumps(result)
+
+    monkeypatch.setattr(control, "admit", funding_admit)
 
     def run() -> None:
         """Serve the real data plane and preserve startup failures for assertions."""
         try:
             serve_native_gateway(
-                NativeControlPlane(components, capture=capture),
+                control,
                 host="127.0.0.1",
                 port=port,
                 capture=collector,
@@ -503,9 +532,17 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
                     collector.settle(response.headers["x-request-id"], True, True)
                 elif policy == "hosted-late":
                     awaiting_settlement.append(response.headers["x-request-id"])
+                elif policy == "hosted-byok":
+                    assert not records, "BYOK must not checkpoint before its terminal verdict"
+                    collector.settle(response.headers["x-request-id"], False, False)
         if policy == "hosted-late":
             assert not collector.close(0)
-            assert not records
+            # Native output cannot precede durable prompt ownership. Terminal
+            # permission adds the response later without discarding the prompt.
+            checkpoints = [CaptureRecord.model_validate_json(value) for value in records]
+            assert len(checkpoints) == 6
+            assert all(record.response is None for record in checkpoints)
+            assert {record.request.request_id for record in checkpoints} == set(awaiting_settlement)
             assert collector.counts()[5] == 0
             for request_id in awaiting_settlement:
                 collector.settle(request_id, True, True)
@@ -520,7 +557,7 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     assert not worker.is_alive()
     assert collector.close(1)
     assert _LoopbackProvider.calls == (0 if policy in {"broken", "full"} else 6)
-    if policy in {"off", "broken", "full"}:
+    if policy in {"off", "broken", "full", "hosted-byok"}:
         assert records == []
         return
     parsed = [CaptureRecord.model_validate_json(value) for value in records]

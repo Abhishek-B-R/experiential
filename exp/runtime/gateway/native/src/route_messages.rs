@@ -227,6 +227,16 @@ pub(crate) async fn messages(
     };
     let mut won = acquire_attempt(&context, &mut guard).await;
     adopt_outcome(&mut admission, &mut won);
+    if !crate::capture::reasoning::checkpoint_winner(state.capture.as_ref(), &admission, &won) {
+        drop(won);
+        guard
+            .abandon(&Failure::new(
+                FailureClass::Internal,
+                "capture checkpoint failed",
+            ))
+            .await;
+        won = Won::Failed(PublicError::internal());
+    }
     crate::capture::reasoning::observe_winner(state.capture.clone(), &admission, &guard, &mut won);
 
     let capture = state.capture.clone();

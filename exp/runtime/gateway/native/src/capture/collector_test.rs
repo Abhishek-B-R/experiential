@@ -162,6 +162,51 @@ fn routing_provenance_is_optional_until_selected_and_then_immutable() {
 }
 
 #[test]
+fn hosted_checkpoint_is_durable_before_terminal_and_shares_effective_input() {
+    let (collector, receiver) = collector(config());
+    assert!(collector.begin(request("checkpoint")));
+    collector.reasoning("checkpoint", "not yet eligible output");
+    assert!(collector.checkpoint("checkpoint"));
+    let prompt = receiver
+        .try_recv()
+        .expect("checkpoint returned before durable write");
+    assert_eq!(prompt.request.request_id, "checkpoint");
+    assert!(prompt.response.is_none());
+    assert!(prompt.provider_reasoning.is_none());
+    assert!(prompt.metrics.is_none());
+    {
+        let pending = collector.pending.lock().unwrap();
+        // The test sink encodes and decodes, but the collector still owns its input.
+        assert_eq!(
+            prompt.request.context,
+            pending.entries["checkpoint"].record.request.context
+        );
+    }
+    collector.settle("checkpoint", true, true);
+    assert!(collector.finish("checkpoint", Some(response()), None));
+    let records = drain(&collector, receiver);
+    assert_eq!(records.len(), 1);
+    assert!(records[0].response.is_some());
+    assert_eq!(records[0].request.context, prompt.request.context);
+    assert_eq!(records[0].captured_at, prompt.captured_at);
+}
+
+#[test]
+fn unregistered_and_local_requests_do_not_pretend_to_checkpoint() {
+    let (hosted, receiver) = collector(config());
+    assert!(hosted.checkpoint("capture-off"));
+    assert!(drain(&hosted, receiver).is_empty());
+    let mut configuration = config();
+    configuration.settlement_required = false;
+    let (local, receiver) = collector(configuration);
+    assert!(local.begin(request("local")));
+    assert!(local.checkpoint("local"));
+    assert!(receiver.try_recv().is_err());
+    assert!(local.finish("local", Some(response()), None));
+    assert_eq!(drain(&local, receiver).len(), 1);
+}
+
+#[test]
 fn collector_forwards_destination_cleanup_failure_without_losing_write_success() {
     struct CleanupFailure;
     impl Sink for CleanupFailure {
