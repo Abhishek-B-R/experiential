@@ -1,8 +1,4 @@
-"""Strict private wire models for the public Chat and Responses surfaces.
-
-Closed models own field validation; ``requests`` owns manifest gating,
-official-SDK cross-checks and canonical translation.
-"""
+"""Strict private field schemas; request translation and SDK checks live in requests."""
 
 from __future__ import annotations
 
@@ -114,12 +110,7 @@ _MAXIMUM_FORMAT_DESCRIPTION_CHARACTERS = 65_536
 
 
 class _ResponsesImagePart(_WireModel):
-    """One Responses ``input_image`` content part.
-
-    Responses carries the reference as a bare ``image_url`` string, or as the
-    ``file_id`` of an image the caller already uploaded to OpenAI Files.
-    Exactly one of the two is present.
-    """
+    """Responses ``input_image`` with exactly one ``image_url`` or uploaded ``file_id``."""
 
     type: Literal["input_image"]
     image_url: str | None = Field(
