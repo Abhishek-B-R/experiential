@@ -36,11 +36,14 @@ from exp.runtime.gateway.native_execution import (
 from exp.runtime.gateway.native_fallback_rules import require_unrestricted_rung
 from exp.runtime.gateway.native_image_output import image_aware_stream_payload
 from exp.runtime.gateway.native_reasoning import rung_provider_request
+from exp.runtime.gateway.native_request_policy import restrict_fallbacks
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.prompt_cache_affinity import provider_prompt_cache_key
 from exp.runtime.gateway.prompt_size import context_window_compatible_indexes
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.sticky_affinity import AffinityPlacement, sticky_first_order
+from exp.runtime.gateway.tool_search.plan import plan_tool_search
+from exp.runtime.gateway.web_search.plan import strip_search_carriers
 from exp.runtime.models.providers import (
     emulated_gateway_capabilities,
     preflight_gateway_request,
@@ -131,6 +134,78 @@ def admitted_route_requests(
             it to the exact public request field.
         GatewayRoutingError: No rung is protocol-compatible and none named a
             rejection.
+    """
+    route, resolved_wires, public_request, provider_request, disclosures = prepare_route_requests(
+        route, resolved_wires, request
+    )
+    if disclosures:
+        record_admission_coercions(accounting, authorization, disclosures)
+    provider_request = _with_cache_affinity(provider_request, authorization)
+    route, resolved_wires = _prefer_cache_capable_rungs(route, resolved_wires, provider_request)
+    route, resolved_wires, placement = _affinity_ordered_rungs(
+        route,
+        resolved_wires,
+        provider_request,
+        accounting=accounting,
+        authorization=authorization,
+        continuation=continuation,
+    )
+    # Every surviving rung failover-only would leave nothing to dial first:
+    # fail closed here, named, instead of exhausting a ladder that dialed nothing.
+    require_unrestricted_rung(route)
+    return route, resolved_wires, public_request, provider_request, placement
+
+
+def select_single_route_before_search(
+    route: GatewayRoute,
+    resolved_wires: _ResolvedWires,
+    request: GatewayRequest,
+    *,
+    accounting: NativeAttemptAccounting,
+    authorization: AuthorizationSnapshot,
+    continuation: ContinuationContext | None,
+) -> tuple[GatewayRoute, _ResolvedWires, AffinityPlacement | None]:
+    """Select a no-fallback route before search can perform work or drop native tools.
+
+    A pure preview removes web-search carriers and shapes emulated tool discovery
+    solely for capability eligibility. Its disclosures never escape and it calls no
+    backend. After filtering and the normal route ordering, only the winner reaches
+    effectful search planning with the original request. Final admission runs once
+    on that singleton, recording only its actual coercions.
+    """
+    routing = None if request.gateway is None else request.gateway.routing
+    if routing is None or routing.allow_fallbacks:
+        return route, resolved_wires, None
+    if route.resolved_route_id is not None:
+        return restrict_fallbacks(request, route), resolved_wires[:1], None
+    preview = strip_search_carriers(request) if request.web_search is not None else request
+    preview = plan_tool_search(preview, [profile.dialect for profile, _ in resolved_wires]).request
+    route, resolved_wires, _, prepared, _ = prepare_route_requests(route, resolved_wires, preview)
+    route, resolved_wires = _prefer_cache_capable_rungs(route, resolved_wires, prepared)
+    route, resolved_wires, placement = _affinity_ordered_rungs(
+        route,
+        resolved_wires,
+        prepared,
+        accounting=accounting,
+        authorization=authorization,
+        continuation=continuation,
+    )
+    require_unrestricted_rung(route)
+    restricted = restrict_fallbacks(request, route)
+    index = route.deployments.index(restricted.deployment)
+    return restricted, (resolved_wires[index],), placement
+
+
+def prepare_route_requests(
+    route: GatewayRoute,
+    resolved_wires: _ResolvedWires,
+    request: GatewayRequest,
+) -> tuple[GatewayRoute, _ResolvedWires, GatewayRequest, GatewayRequest, tuple[str, ...]]:
+    """Pure capability filtering and shaping, with disclosures returned but never recorded.
+
+    This is the shared selection primitive for final admission and no-fallback
+    preselection. It executes no provider or search work and mutates no accounting,
+    affinity, health or request state.
     """
     # flex/priority are the tiers we price as an OPT-IN pass-through, so they
     # fail CLOSED before any reservation when no rung can BILL the requested one:
@@ -328,7 +403,6 @@ def admitted_route_requests(
             update={"stream": True, "include_usage": True}
         )
     if coercion_disclosures:
-        record_admission_coercions(accounting, authorization, coercion_disclosures)
         public_request = public_request.model_copy(
             update={
                 "ignored_parameters": tuple(
@@ -336,20 +410,7 @@ def admitted_route_requests(
                 )
             }
         )
-    provider_request = _with_cache_affinity(provider_request, authorization)
-    route, resolved_wires = _prefer_cache_capable_rungs(route, resolved_wires, provider_request)
-    route, resolved_wires, placement = _affinity_ordered_rungs(
-        route,
-        resolved_wires,
-        provider_request,
-        accounting=accounting,
-        authorization=authorization,
-        continuation=continuation,
-    )
-    # Every surviving rung failover-only would leave nothing to dial first:
-    # fail closed here, named, instead of exhausting a ladder that dialed nothing.
-    require_unrestricted_rung(route)
-    return route, resolved_wires, public_request, provider_request, placement
+    return route, resolved_wires, public_request, provider_request, coercion_disclosures
 
 
 def route_rejection(

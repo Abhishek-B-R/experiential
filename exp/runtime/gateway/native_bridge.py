@@ -54,6 +54,7 @@ from exp.runtime.gateway.native_admission import (
     log_reasoning_continuation_rejection,
     record_dead_admission_rungs,
     resolve_admission_route,
+    select_single_route_before_search,
 )
 from exp.runtime.gateway.native_authentication import NativeAuthenticationMixin
 from exp.runtime.gateway.native_batches import NativeBatchRelayMixin
@@ -107,7 +108,7 @@ from exp.runtime.gateway.native_reasoning import (
     strip_stale_reasoning_history,
     unseal_reasoning_history,
 )
-from exp.runtime.gateway.native_request_policy import require_route_authority, restrict_fallbacks
+from exp.runtime.gateway.native_request_policy import require_route_authority
 from exp.runtime.gateway.native_responses import (
     ContinuationContext,
     continuation_route_binding,
@@ -471,18 +472,21 @@ class NativeControlPlane(
                     and continuation_context.required_route_binding is not None
                 ):
                     raise _continuation_binding_error()
-                # Every certified rung was operationally dead at admission;
-                # there is nothing live to serve, so the accepted request is
-                # finished closed.
+                # No dispatchable rung remains; finalize the accepted request closed.
                 return self._escalate_accepted(
                     authorization,
                     "every certified deployment was unavailable at admission",
                 )
             route = select_route_deployments(route, dispatchable.indexes)
             resolved_wires = dispatchable.resolved_wires
-            if route.resolved_route_id is not None:
-                route = restrict_fallbacks(request, route)
-                resolved_wires = resolved_wires[: len(route.deployments)]
+            route, resolved_wires, selected_placement = select_single_route_before_search(
+                route,
+                resolved_wires,
+                request,
+                accounting=self._accounting,
+                authorization=authorization,
+                continuation=continuation_context,
+            )
             searched = plan_web_search(
                 request,
                 [profile.dialect for profile, _client in resolved_wires],
@@ -552,12 +556,8 @@ class NativeControlPlane(
                     continuation=continuation_context,
                 )
             )
+            placement = selected_placement or placement
             require_route_authority(authorization, request, route)
-            wire_by_id = dict(
-                zip((item.deployment_id for item in route.deployments), resolved_wires, strict=True)
-            )
-            route = restrict_fallbacks(request, route)
-            resolved_wires = tuple(wire_by_id[item.deployment_id] for item in route.deployments)
             require_unmodified_probability_output(request, bool(policy and policy.output_checks))
             wire_route: list[JsonObject] = []
             parallel_disclosures: set[str] = set()

@@ -42,6 +42,8 @@ FORBIDDEN_REQUIREMENTS = frozenset(
 )
 REQUIRED_CORE_REQUIREMENTS = frozenset(
     {
+        "anyio",
+        "ijson",
         "boto3",
         "botocore",
         "click",
@@ -94,6 +96,7 @@ REQUIRED_SDIST_MEMBERS = frozenset(
         "README.md",
         "assets/experiential-workflow.png",
         "docs/reference/gateway-architecture.md",
+        "docs/reference/gateway-request-policy.md",
         "docs/release-scope.md",
         "docs/usage.md",
         "pyproject.toml",
@@ -286,6 +289,7 @@ def _tracked_sdist_members() -> frozenset[str]:
             "README.md",
             "assets",
             "docs/reference/gateway-architecture.md",
+            "docs/reference/gateway-request-policy.md",
             "docs/release-scope.md",
             "docs/usage.md",
             "pyproject.toml",

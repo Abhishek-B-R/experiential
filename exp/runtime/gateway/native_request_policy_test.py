@@ -9,7 +9,8 @@ from unittest.mock import patch
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import GatewayDeploymentCapabilities
+from exp.common.models import GatewayDeploymentCapabilities, ModelCapabilities
+from exp.runtime.gateway.affinity import affinity_fingerprint
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.native_accounting import NativeBridgeError
@@ -21,7 +22,8 @@ from exp.runtime.gateway.native_execution import DispatchableRoute, dispatchable
 from exp.runtime.gateway.native_request_policy import require_route_authority
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.routing import GatewayRoute
-from exp.runtime.gateway.web_search.backend import WebSearchBackend
+from exp.runtime.gateway.sticky_affinity import sticky_first_order
+from exp.runtime.gateway.web_search.backend import StaticWebSearchBackend, WebSearchBackend
 from exp.runtime.gateway.web_search.plan import WebSearchPlan, plan_web_search
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
@@ -64,16 +66,46 @@ def test_no_fallback_selects_unrestricted_wire_and_credentials(tmp_path: Path) -
     assert wire["upstream_payload"]["model"] == "beta-model-exact"
 
 
-def test_selected_only_route_plans_search_without_discarded_fallback(tmp_path: Path) -> None:
+@pytest.mark.parametrize("selected", [False, True])
+@pytest.mark.parametrize("search_kind", ["web_search", "tool_search"])
+def test_selected_only_route_plans_search_without_discarded_fallback(
+    tmp_path: Path, selected: bool, search_kind: str
+) -> None:
     """No-fallback planning retains provider-native search on the chosen wire."""
-    plane, key = _pool_control_plane(tmp_path)
+    caps = ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000)
+    wire_caps = GatewayDeploymentCapabilities(
+        supports_streaming=True, supports_streaming_tool_arguments=True
+    )
+    plane, key = _pool_control_plane(
+        tmp_path, model_capabilities=(caps, caps), gateway_capabilities=(wire_caps, wire_caps)
+    )
+    backend = StaticWebSearchBackend(())
+    plane._web_search = backend  # noqa: SLF001
     components = plane._components  # noqa: SLF001
-    selector = "route_" + "b" * 64
+    selector = "route_" + "b" * 64 if selected else None
     body: JsonObject = {
         "model": "coding",
         "input": "search",
-        "tools": [{"type": "web_search"}],
-        "gateway": {"routing": {"route_id": selector, "allow_fallbacks": False}},
+        "tools": [
+            {"type": search_kind},
+            *(
+                [
+                    {
+                        "type": "function",
+                        "name": "weather",
+                        "description": "weather",
+                        "parameters": {"type": "object"},
+                        "defer_loading": True,
+                    }
+                ]
+                if search_kind == "tool_search"
+                else []
+            ),
+        ],
+        "gateway": {
+            "routing": {"route_id": selector, "allow_fallbacks": False},
+            "retry": {"max_total_attempts": 1},
+        },
     }
     request = decode_responses(body).request
     authorization = components.store.authorize_request(
@@ -128,8 +160,98 @@ def test_selected_only_route_plans_search_without_discarded_fallback(tmp_path: P
             )
         )
     assert seen == ["openai_responses"]
-    assert "web_search" not in admitted
-    assert admitted["route"][0]["upstream_payload"]["tools"] == [{"type": "web_search"}]
+    assert "web_search" not in admitted and "tool_search" not in admitted
+    assert any(
+        tool["type"] == search_kind for tool in admitted["route"][0]["upstream_payload"]["tools"]
+    )
+    assert backend.queries == []
+    assert admitted["maximum_total_attempts"] == 1
+
+
+def test_no_fallback_skips_incapable_lead_before_search(tmp_path: Path) -> None:
+    """The no-fallback choice is the first eligible rung, not the first catalog row."""
+    caps = ModelCapabilities(maximum_output_tokens=128_000)
+    plane, key = _pool_control_plane(
+        tmp_path,
+        model_capabilities=(
+            caps.model_copy(update={"supports_vision": False}),
+            caps.model_copy(update={"supports_vision": True}),
+        ),
+        gateway_capabilities=(
+            GatewayDeploymentCapabilities(supports_streaming=True),
+            GatewayDeploymentCapabilities(
+                supports_streaming=True, supports_image_input=True, supports_image_url_input=True
+            ),
+        ),
+    )
+    body: JsonObject = {
+        "model": "coding",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
+                ],
+            }
+        ],
+        "gateway": {"routing": {"allow_fallbacks": False}},
+    }
+    admitted = json.loads(plane.admit(json.dumps({"raw_key": key, "body": json.dumps(body)})))
+    assert [wire["deployment_id"] for wire in admitted["route"]] == ["beta"]
+
+
+def test_no_fallback_preserves_sticky_placement_with_one_lookup(tmp_path: Path) -> None:
+    """Pure eligibility does not double-record ordering or lose sticky attribution."""
+    plane, key = _pool_control_plane(tmp_path)
+    components = plane._components  # noqa: SLF001
+    request = decode_chat(
+        json.loads(_body({"routing": {"allow_fallbacks": False}}))
+    ).request.model_copy(update={"prompt_cache_key": "session"})
+    authorization = components.store.authorize_request(
+        raw_key=key, alias="coding", request=request, deadline_monotonic=999999999
+    )
+    fingerprint = affinity_fingerprint(
+        organization_id=authorization.organization_id,
+        identity_id=authorization.identity_id,
+        material="session",
+    )
+    plane._accounting.sticky.bind(fingerprint, "beta", ttl_seconds=120)  # noqa: SLF001
+
+    def resolve(
+        bound: NativeGatewayComponents,
+        authority: AuthorizationSnapshot,
+        incoming: GatewayRequest,
+        *,
+        continuation: ContinuationContext | None = None,
+    ) -> GatewayRoute:
+        """Supply an operator-authored affinity pool without changing its deployments."""
+        route = resolve_admission_route(bound, authority, incoming, continuation=continuation)
+        return route.model_copy(
+            update={
+                "snapshot": route.snapshot.model_copy(
+                    update={"failover_mode": "maximize_cache_affinity"}
+                )
+            }
+        )
+
+    body: JsonObject = {
+        "model": "coding",
+        "messages": [{"role": "user", "content": "hi"}],
+        "prompt_cache_key": "session",
+        "gateway": {"routing": {"allow_fallbacks": False}},
+    }
+    with (
+        patch("exp.runtime.gateway.native_bridge.resolve_admission_route", resolve),
+        patch(
+            "exp.runtime.gateway.native_admission.sticky_first_order", wraps=sticky_first_order
+        ) as order,
+    ):
+        admitted = json.loads(plane.admit(json.dumps({"raw_key": key, "body": json.dumps(body)})))
+    entry = plane._accounting.entry(admitted["request_id"])  # noqa: SLF001
+    assert entry is not None and entry.sticky_preferred
+    assert [wire["deployment_id"] for wire in admitted["route"]] == ["beta"]
+    assert order.call_count == 1
 
 
 def test_unhandled_standalone_route_is_a_field_error(tmp_path: Path) -> None:
