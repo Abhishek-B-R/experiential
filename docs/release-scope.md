@@ -19,7 +19,7 @@ on the exact release checkout.
   Redirector app and its approved Network Extension own interception. Capture does not edit
   hosts, DNS, or system proxy settings and has no reset subcommand. Each selected host set gets
   a CA with critical certificate-level name constraints and persistent current-user SSL trust.
-  Client certificate rejection or repeated handshake failures switch the affected process and
+  Explicit client certificate rejection switches the affected process and
   host to encrypted pass-through for the run; missing process identity or exhausted capacity
   uses an explicit host-wide exclusion. Other capture continues, and the terminal names excluded
   targets and retains a partial-capture indicator. Backend failure still stops Capture. A quiet

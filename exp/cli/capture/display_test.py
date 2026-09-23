@@ -315,7 +315,7 @@ def test_token_units_round_without_precision_loss_or_scientific_notation(
 
 
 @pytest.mark.parametrize("terminal", [False, True])
-@pytest.mark.parametrize("reason", ["certificate", "handshake"])
+@pytest.mark.parametrize("reason", ["certificate"])
 def test_bypassed_targets_remain_visible_as_partial_capture(
     monkeypatch: pytest.MonkeyPatch, terminal: bool, reason: CaptureBypassReason
 ) -> None:
@@ -334,15 +334,8 @@ def test_bypassed_targets_remain_visible_as_partial_capture(
         before = output.getvalue()
         display.bypassed("Codex [Helper]", "chatgpt.com", reason)
         assert output.getvalue() == before
-        diagnosis = (
-            "certificate rejected"
-            if reason == "certificate"
-            else "repeated TLS connection failures"
-        )
-        warning = f"Not capturing Codex [Helper] on chatgpt.com: {diagnosis}."
+        warning = "Not capturing Codex [Helper] on chatgpt.com: certificate rejected."
         assert warning in Text.from_ansi(before).plain
-        if reason == "handshake":
-            assert "certificate" not in Text.from_ansi(before).plain
 
         display.progress(replace(stats, captured_exchanges=9, usage_exchanges=9))
         progress = Text.from_ansi(output.getvalue()[len(before) :]).plain
@@ -367,3 +360,16 @@ def test_host_wide_bypass_is_explicit_before_any_requests() -> None:
     text = output.getvalue()
     assert "Not capturing All apps on chatgpt.com" in text
     assert "0 requests captured · partial capture: 1 target not captured" in text
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+def test_diagnostics_are_timestamped_and_opt_in(verbose: bool) -> None:
+    """Quiet Capture never gains connection noise and verbose output remains literal."""
+    output = io.StringIO()
+    display = CaptureDisplay(Console(file=output), verbose=verbose)
+    display.diagnostic("tls_client_ready · chatgpt.com · connection abc123")
+    if verbose:
+        assert "tls_client_ready · chatgpt.com · connection abc123" in output.getvalue()
+        assert output.getvalue()[:8].count(":") == 2
+    else:
+        assert not output.getvalue()

@@ -32,6 +32,7 @@ async def run_session(
     on_warning: Callable[[str], None],
     on_waiting: Callable[[], None] | None = None,
     on_bypass: Callable[[str, str, CaptureBypassReason], None] | None = None,
+    on_diagnostic: Callable[[str], None] | None = None,
 ) -> UploadStats:
     """Serve provider traffic until interrupted, always releasing interception.
 
@@ -46,6 +47,7 @@ async def run_session(
         on_warning: Terminal callback for recoverable upload failures.
         on_waiting: Optional callback when network startup remains pending.
         on_bypass: Optional callback naming an app and host excluded after trust rejection.
+        on_diagnostic: Optional content-free transport events for verbose output.
 
     Returns:
         Final upload counters after bounded flushing.
@@ -56,7 +58,9 @@ async def run_session(
     stop = asyncio.Event()
     ready = asyncio.Event()
     loop = asyncio.get_running_loop()
-    proxy = CaptureProxy(sink=uploader.submit, domains=domains, on_bypass=on_bypass)
+    proxy = CaptureProxy(
+        sink=uploader.submit, domains=domains, on_bypass=on_bypass, on_diagnostic=on_diagnostic
+    )
     health = CaptureHealth(domains)
     original_signals = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
     for sig in original_signals:

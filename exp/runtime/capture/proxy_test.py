@@ -7,7 +7,6 @@ import ssl
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import Mock
 from uuid import uuid4
 
@@ -636,7 +635,6 @@ def test_client_tls_callbacks_after_requested_shutdown_cannot_change_stop_reason
     for _ in range(3):
         proxy.tls_failed_client(tls.TlsData(client, ctx))
     assert not proxy._host_bypasses and not proxy._app_bypasses
-    assert not proxy._tls_disconnects.get((None, "api.openai.com"), ())
 
 
 @pytest.mark.parametrize("cancel_task", [False, True])
@@ -720,7 +718,6 @@ def test_real_incomplete_handshakes_closed_during_shutdown_are_not_ca_failures(
                 for error in failures
             )
             assert not proxy._host_bypasses and not proxy._app_bypasses
-            assert not proxy._tls_disconnects.get((None, host), ())
             assert proxy._master is None
         finally:
             for writer in writers:
@@ -772,7 +769,6 @@ def test_native_failure_does_not_misclassify_generic_tls_disconnect(
     proxy._transport_failures.add(client.id)
     for _ in range(3):
         proxy.tls_failed_client(tls.TlsData(client, ctx))
-    assert not proxy._tls_disconnects.get((None, "api.openai.com"), ())
     assert not shutdowns
     if error == "unknown ca":
         assert proxy._host_bypasses == {"api.openai.com"}
@@ -909,8 +905,8 @@ def test_transport_failure_history_is_bounded_by_active_client_lifetimes() -> No
         assert not proxy._transport_failures
 
 
-def test_one_native_failure_does_not_suppress_sibling_tls_disconnect_burst() -> None:
-    """Only the failed client's generic disconnect is excluded from the selected-host guard."""
+def test_native_and_sibling_disconnects_do_not_disable_capture() -> None:
+    """Native transport failures and ambiguous sibling disconnects stay connection-local."""
     proxy = CaptureProxy(sink=lambda exchange: True, domains=("api.openai.com",))
     manager = Proxyserver()
     master = Mock(spec=DumpMaster, addons=Mock())
@@ -925,7 +921,6 @@ def test_one_native_failure_does_not_suppress_sibling_tls_disconnect_burst() -> 
     manager.connections[failed.id] = Mock(spec=ProxyConnectionHandler, client=failed, transports={})
     proxy._record_transport_failure(failed.id)
     proxy.tls_failed_client(tls.TlsData(failed, context.Context(failed, options.Options())))
-    assert not proxy._tls_disconnects.get((None, "api.openai.com"), ())
     for attempt in range(3):
         sibling = connection.Client(
             peername=("127.0.0.1", attempt + 2),
@@ -934,57 +929,25 @@ def test_one_native_failure_does_not_suppress_sibling_tls_disconnect_burst() -> 
             error="The client disconnected during the handshake.",
         )
         proxy.tls_failed_client(tls.TlsData(sibling, context.Context(sibling, options.Options())))
-        assert len(proxy._tls_disconnects.get((None, "api.openai.com"), ())) == attempt + 1
     master.shutdown.assert_not_called()
-    assert proxy._host_bypasses == {"api.openai.com"}
+    assert not proxy._host_bypasses
     proxy.client_disconnected(failed)
     assert not proxy._transport_failures
 
 
-def test_handshake_disconnects_are_bounded_by_host_and_time(
-    monkeypatch: pytest.MonkeyPatch,
+def test_real_silent_tls_failures_do_not_exclude_trusted_clients(
+    tmp_path: Path, regular_proxy: None
 ) -> None:
-    """One-off cancellations and expired failures cannot trigger the burst safeguard."""
-    proxy = CaptureProxy(
-        sink=lambda exchange: True, domains=("api.openai.com", "api.anthropic.com")
-    )
-    shutdowns: list[bool] = []
-    monkeypatch.setattr(proxy, "shutdown", lambda: shutdowns.append(True))
-    now = 100.0
-    monkeypatch.setattr(capture_module, "time", SimpleNamespace(monotonic=lambda: now))
-    client = connection.Client(
-        peername=("127.0.0.1", 1),
-        sockname=("127.0.0.1", 2),
-        sni="api.openai.com",
-        error="The client disconnected during the handshake. private-detail",
-    )
-    ctx = context.Context(client, options.Options())
-    data = tls.TlsData(client, ctx)
-    proxy.tls_failed_client(data)
-    assert not shutdowns
-    now += 31
-    proxy.tls_failed_client(data)
-    now += 1
-    proxy.tls_failed_client(data)
-    assert not shutdowns
-    assert len(proxy._tls_disconnects.get((None, "api.openai.com"), ())) == 2
-    assert not proxy._tls_disconnects.get((None, "api.anthropic.com"), ())
-    now += 1
-    proxy.tls_failed_client(data)
-    assert not shutdowns
-    assert proxy._host_bypasses == {"api.openai.com"}
-    assert len(proxy._tls_disconnects.get((None, "api.openai.com"), ())) == 3
-    assert proxy._tls_disconnects[(None, "api.openai.com")].maxlen == 3
-
-
-def test_real_silent_ca_rejection_burst_bypasses_host(tmp_path: Path, regular_proxy: None) -> None:
-    """Three real silent trust failures isolate the host without stopping Capture."""
+    """Real ambiguous TLS failures leave later trusted connections eligible for capture."""
 
     async def run() -> None:
         """Retry untrusted handshakes through an explicitly addressed loopback proxy only."""
         hostname = "api.openai.com"
         _, _, unrelated_ca = _certificate(tmp_path / "unrelated", "unrelated.example")
-        proxy = CaptureProxy(sink=lambda exchange: True, domains=(hostname,))
+        diagnostics: list[str] = []
+        proxy = CaptureProxy(
+            sink=lambda exchange: True, domains=(hostname,), on_diagnostic=diagnostics.append
+        )
         ready = asyncio.Event()
         proxy_task = asyncio.create_task(
             proxy.serve(ca_directory=tmp_path / "proxy", ready=ready.set)
@@ -1011,26 +974,18 @@ def test_real_silent_ca_rejection_burst_bypasses_host(tmp_path: Path, regular_pr
                     writer.close()
                     with suppress(OSError):
                         await writer.wait_closed()
-                if attempt < 2:
-                    # Let the failed-client hook finish, rather than checking before delivery.
-                    deadline = asyncio.get_running_loop().time() + 2
-                    while len(proxy._tls_disconnects.get((None, hostname), ())) < attempt + 1:
-                        assert asyncio.get_running_loop().time() < deadline
-                        await asyncio.sleep(0.01)
-                    assert not proxy_task.done()
-                    if attempt == 0:
-                        # A working SDK client must not conceal another client's retry burst.
-                        _, trusted_writer, _ = await _connect_tls(
-                            proxy, 1, hostname, tmp_path / "proxy/mitmproxy-ca-cert.pem"
-                        )
-                        trusted_writer.close()
-                        with suppress(ConnectionError):
-                            await trusted_writer.wait_closed()
-                        assert len(proxy._tls_disconnects.get((None, hostname), ())) == 1
-            deadline = asyncio.get_running_loop().time() + 2
-            while hostname not in proxy._host_bypasses:
-                assert asyncio.get_running_loop().time() < deadline
-                await asyncio.sleep(0.01)
+                # Wait for the real TLS callback before checking continued availability.
+                deadline = asyncio.get_running_loop().time() + 2
+                while sum("tls_client_failed:" in event for event in diagnostics) < attempt + 1:
+                    assert asyncio.get_running_loop().time() < deadline
+                    await asyncio.sleep(0.01)
+                assert not proxy._host_bypasses and not proxy._app_bypasses
+                _, trusted_writer, _ = await _connect_tls(
+                    proxy, 1, hostname, tmp_path / "proxy/mitmproxy-ca-cert.pem"
+                )
+                trusted_writer.close()
+                with suppress(ConnectionError):
+                    await trusted_writer.wait_closed()
             assert not proxy_task.done()
             assert proxy._master is not None
             assert all(instance.is_running for instance in proxyserver.servers)
@@ -1157,7 +1112,7 @@ def test_bypass_capacity_falls_back_to_selected_host_only(monkeypatch: pytest.Mo
     assert len(warnings) == 3 and warnings[-1] == ("All apps", "api.openai.com", "certificate")
 
 
-def test_generic_handshake_failures_are_counted_per_app_and_reported_neutrally(
+def test_generic_handshake_bursts_do_not_disable_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Two apps' isolated cancellations do not combine into a false shared trust failure."""
@@ -1182,17 +1137,29 @@ def test_generic_handshake_failures_are_counted_per_app_and_reported_neutrally(
     assert not warnings
     identity = (1, "/app")
     proxy.tls_failed_client(data)
-    assert warnings == [("app", "api.openai.com", "handshake")]
-    assert proxy._app_bypasses == {((1, "/app"), "api.openai.com")}
+    assert not warnings
+    assert not proxy._app_bypasses
     assert not proxy._host_bypasses
 
 
-def test_websocket_request_completion_retains_no_flow_message_history() -> None:
+@pytest.mark.parametrize("broken_diagnostics", [False, True])
+def test_websocket_capture_survives_handshake_bursts_and_safe_diagnostics(
+    broken_diagnostics: bool,
+) -> None:
     """Capture completed Responses messages without retaining websocket history."""
     captured: list[CapturedExchange] = []
+    diagnostics: list[str] = []
+
+    def diagnostic(message: str) -> None:
+        """Exercise both recording and a broken console without affecting inference."""
+        diagnostics.append(message)
+        if broken_diagnostics:
+            raise OSError("synthetic console failure")
+
     proxy = CaptureProxy(
         sink=lambda exchange: captured.append(exchange) is None,
         domains=("api.openai.com",),
+        on_diagnostic=diagnostic,
     )
     flow = http.HTTPFlow(
         connection.Client(
@@ -1203,12 +1170,21 @@ def test_websocket_request_completion_retains_no_flow_message_history() -> None:
     flow.request = http.Request.make(
         "GET", "https://api.openai.com/v1/responses", headers={"Host": "api.openai.com"}
     )
+    flow.request.headers["Authorization"] = "Bearer secret-credential"
+    flow.request.path += "?secret-query=1"
+    flow.client_conn.error = "The client disconnected during the handshake. secret-error"
+    ctx = context.Context(flow.client_conn, options.Options())
+    for _ in range(4):
+        proxy.tls_failed_client(tls.TlsData(flow.client_conn, ctx))
+    hello = tls.ClientHelloData(ctx, Mock(spec=tls.ClientHello, sni="api.openai.com"))
+    proxy.tls_clienthello(hello)
+    assert not hello.ignore_connection
     asyncio.run(proxy.requestheaders(flow))
     flow.response = http.Response.make(101)
     proxy.responseheaders(flow)
     flow.websocket = websocket.WebSocketData()
     frames = [
-        (True, {"type": "response.create", "model": "test", "input": "hello"}),
+        (True, {"type": "response.create", "model": "test", "input": "secret-prompt"}),
         (False, {"type": "response.created", "response": {"id": "r1"}}),
         (
             False,
@@ -1224,7 +1200,11 @@ def test_websocket_request_completion_retains_no_flow_message_history() -> None:
         assert not message.dropped
         assert not flow.websocket.messages
     assert len(captured) == 1
-    assert json.loads(captured[0].request)["input"] == "hello"
+    assert json.loads(captured[0].request)["input"] == "secret-prompt"
+
+    assert any("websocket_request_started" in event for event in diagnostics)
+    assert any("websocket_request_completed" in event for event in diagnostics)
+    assert not any("secret" in event or "Bearer" in event for event in diagnostics)
 
 
 @pytest.mark.parametrize(

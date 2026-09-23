@@ -30,7 +30,7 @@ from exp.runtime.capture.transports import guard_native_writer
 
 logger = logging.getLogger(__name__)
 _MAX_TLS_BYPASSES = 128
-CaptureBypassReason = Literal["certificate", "handshake"]
+CaptureBypassReason = Literal["certificate"]
 
 
 class _CaptureTlsConfig(TlsConfig):
@@ -121,6 +121,7 @@ class CaptureProxy:
         max_active_flows: int = 16,
         upstream_ca_file: Path | None = None,
         on_bypass: Callable[[str, str, CaptureBypassReason], None] | None = None,
+        on_diagnostic: Callable[[str], None] | None = None,
     ) -> None:
         """Configure finite capture state and a nonblocking exchange sink.
 
@@ -135,12 +136,12 @@ class CaptureProxy:
         self._max_active_flows = max_active_flows
         self._upstream_ca_file = upstream_ca_file
         self._on_bypass = on_bypass
+        self._on_diagnostic = on_diagnostic
         self._app_bypasses: set[tuple[tuple[int, str], str]] = set()
         self._host_bypasses: set[str] = set()
         self._captures: dict[str, _Capture] = {}
         self._master: DumpMaster | None = None
         self._stopping = False
-        self._tls_disconnects: dict[tuple[tuple[int, str] | None, str], deque[float]] = {}
         self._transport_failures: set[str] = set()
         self.dropped_exchanges = 0
 
@@ -257,10 +258,13 @@ class CaptureProxy:
         assert isinstance(proxyserver, Proxyserver)
         handler = proxyserver.connections.get(client_id)
         if handler is not None and handler.client.timestamp_end is None:
+            if client_id not in self._transport_failures:
+                self._diagnostic("native_transport_failed", handler.client)
             self._transport_failures.add(client_id)
 
     def client_disconnected(self, client: connection.Client) -> None:
         """Release failure attribution with the owning connection's lifetime."""
+        self._diagnostic("connection_closed", client)
         self._transport_failures.discard(client.id)
 
     def _client_identity(self, client: connection.Client) -> tuple[int, str] | None:
@@ -284,19 +288,19 @@ class CaptureProxy:
         host = (data.client_hello.sni or "").lower().rstrip(".")
         if host not in self._domains:
             return
+        self._diagnostic("tls_client_hello", data.context.client)
         identity = self._client_identity(data.context.client)
         if host in self._host_bypasses or (
             identity is not None and (identity, host) in self._app_bypasses
         ):
             data.ignore_connection = True
+            self._diagnostic("tls_passthrough", data.context.client)
 
     def _bypass_client(
         self,
         client: connection.Client,
         host: str,
         reason: CaptureBypassReason,
-        *,
-        host_wide: bool = False,
     ) -> None:
         """Remember rejected app/host pairs for this run, with bounded host fallback."""
         if host in self._host_bypasses:
@@ -304,7 +308,7 @@ class CaptureProxy:
         identity = self._client_identity(client)
         if identity is not None and (identity, host) in self._app_bypasses:
             return
-        if host_wide or identity is None or len(self._app_bypasses) >= _MAX_TLS_BYPASSES:
+        if identity is None or len(self._app_bypasses) >= _MAX_TLS_BYPASSES:
             self._host_bypasses.add(host)
             application = "All apps"
         else:
@@ -316,7 +320,7 @@ class CaptureProxy:
             self._on_bypass(application, host, reason)
 
     def tls_failed_client(self, data: tls.TlsData) -> None:
-        """Isolate trust rejection and repeated handshake failures to their app and host.
+        """Bypass explicit trust rejection, keeping ambiguous disconnects connection-local.
 
         The failed handshake cannot be repaired or replayed as encrypted pass-through.
         Future connections from that app to that host retain original TLS instead.
@@ -337,27 +341,43 @@ class CaptureProxy:
         if any(
             alert in error for alert in ("unknown ca", "bad certificate", "certificate unknown")
         ):
+            self._diagnostic("tls_client_failed: certificate", data.context.client)
             self._bypass_client(data.context.client, host, "certificate")
             return
-        elif error.startswith("the client disconnected during the handshake."):
-            if data.context.client.id in self._transport_failures:
-                # This disconnect follows a known native transport failure, not a
-                # client trust decision. Keep unrelated connections running.
-                return
-            now = time.monotonic()
-            for key, failures in tuple(self._tls_disconnects.items()):
-                while failures and failures[0] < now - 30:
-                    failures.popleft()
-                if not failures:
-                    del self._tls_disconnects[key]
-            key = (identity, host)
-            if key not in self._tls_disconnects and len(self._tls_disconnects) >= _MAX_TLS_BYPASSES:
-                key = (None, host)
-            failures = self._tls_disconnects.setdefault(key, deque(maxlen=3))
-            failures.append(now)
-            if len(failures) < 3:
-                return
-            self._bypass_client(data.context.client, host, "handshake", host_wide=key[0] is None)
+        # EOF is not a trust decision. Normal cancellations and native transport
+        # losses can produce the same callback, even for a working trusted app.
+        self._diagnostic(
+            "tls_client_failed: disconnected"
+            if error.startswith("the client disconnected during the handshake.")
+            else "tls_client_failed: negotiation",
+            data.context.client,
+        )
+
+    def _diagnostic(self, event: str, client: connection.Client) -> None:
+        """Emit only internal event labels, selected hosts, and opaque connection IDs.
+
+        Diagnostics cannot disrupt forwarding, even when their output sink fails.
+        No raw errors, URLs, headers, process arguments, or message bodies are emitted.
+        """
+        host = (client.sni or "").lower().rstrip(".")
+        if self._on_diagnostic is None or host not in self._domains:
+            return
+        try:
+            self._on_diagnostic(f"{event} · {host} · connection {client.id[:8]}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def tls_established_client(self, data: tls.TlsData) -> None:
+        """Record successful client trust and TLS negotiation without certificate content."""
+        self._diagnostic("tls_client_ready", data.context.client)
+
+    def tls_established_server(self, data: tls.TlsData) -> None:
+        """Record verified upstream TLS negotiation without peer certificate details."""
+        self._diagnostic("tls_upstream_ready", data.context.client)
+
+    def tls_failed_server(self, data: tls.TlsData) -> None:
+        """Distinguish upstream TLS failure from client trust without copying raw errors."""
+        self._diagnostic("tls_upstream_failed", data.context.client)
 
     def next_layer(self, nextlayer: layer.NextLayer) -> None:
         """Pass UDP, including QUIC and DNS, through without decrypting or recording it.
@@ -389,6 +409,7 @@ class CaptureProxy:
         ):
             return
         protocol = capture_protocol(flow.request.method, flow.request.path)
+        self._diagnostic(f"http_request: {protocol or 'unsupported endpoint'}", flow.client_conn)
         if protocol is None:
             return
         if len(self._captures) >= self._max_active_flows:
@@ -424,6 +445,7 @@ class CaptureProxy:
             capture.response_encoding = flow.response.headers.get("content-encoding", "")
             capture.response_content_type = flow.response.headers.get("content-type", "")
             capture.websocket = flow.response.status_code == 101
+            self._diagnostic(f"http_response: {capture.status}", flow.client_conn)
             if not capture.websocket:
                 flow.response.stream = capture.response.tee
 
@@ -441,6 +463,7 @@ class CaptureProxy:
             capture.failed = True
             capture.request_done = True
             capture.response_done = True
+            self._diagnostic("http_flow_failed", flow.client_conn)
             self._finish(flow.id, capture)
 
     def websocket_message(self, flow: http.HTTPFlow) -> None:
@@ -471,6 +494,7 @@ class CaptureProxy:
                 self.dropped_exchanges += 1
                 return
             capture.websocket_requests.append(_WebsocketRequest(message.content, time.time_ns()))
+            self._diagnostic("websocket_request_started", flow.client_conn)
         elif not message.from_client:
             response = event.get("response")
             if not isinstance(response, dict):
@@ -491,6 +515,7 @@ class CaptureProxy:
                         request.response_id is None and len(capture.websocket_requests) == 1
                     ):
                         capture.websocket_requests.remove(request)
+                        self._diagnostic("websocket_request_completed", flow.client_conn)
                         self._submit(
                             CapturedExchange(
                                 protocol="responses",

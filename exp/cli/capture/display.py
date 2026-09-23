@@ -82,19 +82,19 @@ class CaptureDisplay:
             self._console.print(line)
         self._last_stats = stats
 
+    def diagnostic(self, message: str) -> None:
+        """Show timestamped content-free connection events only when explicitly enabled."""
+        if self._verbose:
+            self._console.print(f"{time.strftime('%H:%M:%S')} {message}", markup=False, style="dim")
+
     def bypassed(self, application: str, host: str, reason: CaptureBypassReason) -> None:
         """Expose reduced coverage once and retain it beside the live request counters."""
         target = (application, host)
         if target in self._bypasses:
             return
         self._bypasses.add(target)
-        diagnosis = (
-            "certificate rejected"
-            if reason == "certificate"
-            else "repeated TLS connection failures"
-        )
         self._console.print(
-            f"Not capturing {application} on {host}: {diagnosis}. "
+            f"Not capturing {application} on {host}: certificate rejected. "
             "Retry the request; restart the app and Capture to retry tracing.",
             markup=False,
             style="yellow",

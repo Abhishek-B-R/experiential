@@ -23,7 +23,7 @@ VERBOSE_OPTION = typer.Option(
     False,
     "--verbose",
     "-v",
-    help="Show setup details, provider hosts, and the public CA certificate path.",
+    help="Show TLS and request events, upload counters, and setup details.",
 )
 capture_app = typer.Typer(
     help="Capture supported OpenAI and Anthropic traffic from all apps to Experiential.",

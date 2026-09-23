@@ -160,6 +160,7 @@ async def _capture_authenticated(
             on_warning=warning,
             on_waiting=waiting,
             on_bypass=display.bypassed,
+            on_diagnostic=display.diagnostic if verbose else None,
         )
         display.stopped(stats)
     finally:

@@ -41,7 +41,7 @@ Only one Capture process can run per macOS user, including across different prev
 The terminal shows setup progress, live capture counts, and provider-reported input/output tokens.
 Token totals use K, M, B, and T with up to two decimals, such as 1.75M for 1,752,000 tokens.
 Totals include cached input; missing usage is marked partial or unavailable. Use
-`exp capture --verbose` (or `-v`) for provider hosts, setup explanations, and the public CA certificate
+`exp capture --verbose` (or `-v`) for timestamped TLS and request events, upload counters, provider hosts, and the public CA certificate
 path. Approval requests and errors remain visible without verbose output. When macOS reports the
 extension awaiting approval, Capture opens Login Items & Extensions and continues once you enable
 Mitmproxy Redirector under Network Extensions.
@@ -82,12 +82,10 @@ reload the affected app after the first failed connection. Capture names the app
 partial coverage visible in the terminal, and continues capturing other apps and hosts. If native
 process identity is unavailable or the bounded app list is full, all apps pass through for that
 host, with the wider exclusion shown explicitly. No client verification or certificate pinning is
-disabled. Three unexplained handshake disconnects for the same app and host within 30 seconds also
-switch that target to pass-through, with neutral guidance rather than a certificate diagnosis.
-Restart the app and Capture to retry tracing, allowing restarted apps to reload certificate trust.
-Isolated disconnects and connections closed during shutdown do not trigger bypasses.
-Native write failures close only the affected connection; their resulting disconnects do not
-count as client certificate failures.
+disabled. Ambiguous handshake disconnects remain local to the failed connection and do not
+turn off capture for future requests. Native write failures also close only the affected connection.
+Verbose diagnostics include fixed event categories and opaque connection IDs, without request
+content, authentication headers, URL queries, or raw error strings.
 If the native capture backend itself exits, Capture stops and reports that failure.
 
 Capture quietly checks provider DNS before starting and every few seconds while running.

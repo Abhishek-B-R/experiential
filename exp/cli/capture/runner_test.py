@@ -183,6 +183,7 @@ def test_session_failure_ends_cloud_run_without_reusing_legacy_ca(
                 ),
             )
         )
+    assert (session.call_args.kwargs["on_diagnostic"] is not None) == verbose
     certificate = ca_directory / "mitmproxy-ca-cert.pem"
     assert certificate.is_file()
     trust.assert_called_once_with(certificate, domains=domains)
@@ -256,6 +257,7 @@ def test_runner_reports_pending_startup_then_real_activity(
         on_warning: Callable[[str], None],
         on_waiting: Callable[[], None],
         on_bypass: Callable[[str, str, CaptureBypassReason], None],
+        on_diagnostic: Callable[[str], None] | None,
     ) -> UploadStats:
         """Drive the actual console callbacks without activating native interception."""
         assert "Starting network extension" in output.getvalue()
