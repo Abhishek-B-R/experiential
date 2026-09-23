@@ -547,6 +547,44 @@ impl Sink for PausedSink {
 }
 
 #[test]
+fn checkpoint_backpressure_does_not_expire_the_terminal_response_owner() {
+    let (entered, started) = mpsc::channel();
+    let (records, receiver) = mpsc::channel();
+    let released = Arc::new(AtomicBool::new(false));
+    let collector = Arc::new(
+        Collector::new(
+            config(),
+            PausedSink {
+                entered,
+                released: released.clone(),
+                records: MemorySink(records),
+            },
+        )
+        .unwrap(),
+    );
+    assert!(collector.begin(request("slow-checkpoint")));
+    let writer = collector.clone();
+    let thread = std::thread::spawn(move || writer.checkpoint("slow-checkpoint"));
+    let waiting = started.recv_timeout(Duration::from_secs(2)).is_ok();
+    let retained = {
+        let mut pending = collector.pending.lock().unwrap();
+        pending.entries.get_mut("slow-checkpoint").unwrap().expires = Instant::now();
+        expire_pending(&mut pending, &collector.skipped);
+        pending.entries.contains_key("slow-checkpoint")
+    };
+    released.store(true, Ordering::Release);
+    let acknowledged = thread.join().unwrap();
+    assert!(waiting && retained && acknowledged);
+    collector.settle("slow-checkpoint", true, true);
+    assert!(collector.finish("slow-checkpoint", Some(response()), None));
+    let records = drain(&collector, receiver);
+    assert_eq!(records.len(), 2);
+    assert!(records[0].response.is_none());
+    assert!(records[1].response.is_some());
+    assert_eq!(collector.counts()[4..], [0, 0]);
+}
+
+#[test]
 fn stalled_handoffs_remain_inside_admission_count_and_byte_limits() {
     for bytes_bound in [false, true] {
         for mode in ["prompt", "response_first", "settle_first", "local"] {

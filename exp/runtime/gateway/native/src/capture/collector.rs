@@ -77,6 +77,7 @@ struct Entry {
     bytes: usize,
     attached: bool,
     output_finished: bool,
+    checkpointing: bool,
     response_allowed: bool,
     response_discarded: Arc<AtomicBool>,
 }
@@ -140,7 +141,7 @@ impl<S: Sink> Sink for MaintainedSink<S> {
 fn expire_pending(pending: &mut Pending, skipped: &AtomicU64) {
     let now = Instant::now();
     pending.entries.retain(|_, entry| {
-        if entry.expires <= now {
+        if entry.expires <= now && !entry.checkpointing {
             pending.bytes -= entry.bytes;
             skipped.fetch_add(1, Ordering::Relaxed);
             false
@@ -238,6 +239,7 @@ impl Collector {
                 bytes,
                 attached: false,
                 output_finished: false,
+                checkpointing: false,
                 response_allowed: !self.config.settlement_required,
                 response_discarded: Arc::new(AtomicBool::new(false)),
             },
@@ -313,13 +315,14 @@ impl Collector {
             return true;
         }
         let record = {
-            let Ok(pending) = self.pending.lock() else {
+            let Ok(mut pending) = self.pending.lock() else {
                 return false;
             };
-            let Some(entry) = pending.entries.get(request_id) else {
+            let Some(entry) = pending.entries.get_mut(request_id) else {
                 // Capture-off, ZDR and declined identities have no admission.
                 return true;
             };
+            entry.checkpointing = true;
             Record {
                 schema_version: SCHEMA_VERSION,
                 request: entry.record.request.clone(),
@@ -334,7 +337,15 @@ impl Collector {
                 captured_at: entry.record.captured_at,
             }
         };
-        self.emit(record, None)
+        let persisted = self.emit(record, None);
+        if let Ok(mut pending) = self.pending.lock() {
+            if let Some(entry) = pending.entries.get_mut(request_id) {
+                entry.checkpointing = false;
+                // Destination backpressure is not abandoned-request idle time.
+                entry.expires = Instant::now() + Duration::from_secs(self.config.ttl_seconds);
+            }
+        }
+        persisted
     }
 
     /// Terminal policy controls response retention; the winning lane was frozen

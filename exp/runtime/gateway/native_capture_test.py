@@ -437,7 +437,17 @@ def test_accepted_routing_failure_keeps_effective_prompt_without_inventing_model
 
 
 @pytest.mark.parametrize(
-    "policy", ["local", "hosted", "hosted-late", "hosted-byok", "off", "broken", "full"]
+    "policy",
+    [
+        "local",
+        "hosted",
+        "hosted-late",
+        "hosted-byok",
+        "hosted-checkpoint-failed",
+        "off",
+        "broken",
+        "full",
+    ],
 )
 def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy: str
@@ -453,7 +463,14 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     )
     components = load_gateway_components(tmp_path)
     records: list[str] = []
-    configuration = CaptureConfiguration(settlement_required=policy.startswith("hosted"))
+    configuration = CaptureConfiguration(
+        settlement_required=policy.startswith("hosted"),
+        delivery=(
+            CaptureDeliveryLimits(maximum_record_bytes=1024, maximum_bytes=6400)
+            if policy == "hosted-checkpoint-failed"
+            else CaptureDeliveryLimits()
+        ),
+    )
     collector = native.CaptureCollector(configuration.model_dump_json(), records.append)
     if policy == "full":
         assert collector.close(1)
@@ -475,12 +492,25 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     def funding_admit(argument: str) -> str:
         """Model a hosted-funded test lane; local provider fixtures otherwise use BYOK."""
         result = json.loads(admit(argument))
-        if policy in {"hosted", "hosted-late"}:
+        if policy in {"hosted", "hosted-late", "hosted-checkpoint-failed"}:
             for wire in result["route"]:
                 wire["billing_customer_managed"] = False
         return json.dumps(result)
 
     monkeypatch.setattr(control, "admit", funding_admit)
+    settlements: list[dict[str, object]] = []
+    settle = control.settle
+
+    def observed_settle(argument: str) -> str:
+        """Run real accounting and explicitly exclude a rejected capture in this test."""
+        result = settle(argument)
+        value = json.loads(argument)
+        settlements.append(value)
+        if policy == "hosted-checkpoint-failed":
+            collector.settle(value["request_id"], False, False)
+        return result
+
+    monkeypatch.setattr(control, "settle", observed_settle)
 
     def run() -> None:
         """Serve the real data plane and preserve startup failures for assertions."""
@@ -503,10 +533,11 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
         for surface in ("chat/completions", "responses", "messages"):
             for stream in (False, True):
                 payload: dict[str, object] = {"model": "coding", "stream": stream}
+                prompt = "capture task" * (400 if policy == "hosted-checkpoint-failed" else 1)
                 if surface == "responses":
-                    payload["input"] = "capture task"
+                    payload["input"] = prompt
                 else:
-                    payload["messages"] = [{"role": "user", "content": "capture task"}]
+                    payload["messages"] = [{"role": "user", "content": prompt}]
                 if surface == "messages":
                     payload["max_tokens"] = 128
                 response = httpx.post(
@@ -525,6 +556,15 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
                         "overloaded_error" if surface == "messages" else "capture_unavailable"
                     ) in response.text
                     assert "private policy" not in response.text
+                    continue
+                if policy == "hosted-checkpoint-failed":
+                    assert response.status_code == 500, response.text
+                    assert "hello " not in response.text
+                    assert len(settlements) == _LoopbackProvider.calls
+                    assert settlements[-1]["attempt_id"]
+                    assert settlements[-1]["outcome"] == "failed"
+                    assert settlements[-1]["finalize"] is True
+                    assert settlements[-1]["opened"] is True
                     continue
                 assert response.status_code == 200, response.text
                 assert "hello " in response.text and "world" in response.text
@@ -557,7 +597,7 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     assert not worker.is_alive()
     assert collector.close(1)
     assert _LoopbackProvider.calls == (0 if policy in {"broken", "full"} else 6)
-    if policy in {"off", "broken", "full", "hosted-byok"}:
+    if policy in {"off", "broken", "full", "hosted-byok", "hosted-checkpoint-failed"}:
         assert records == []
         return
     parsed = [CaptureRecord.model_validate_json(value) for value in records]
