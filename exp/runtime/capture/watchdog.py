@@ -77,8 +77,13 @@ async def capture_watchdog(domains: tuple[str, ...]) -> AsyncIterator[None]:
         try:
             if native is not None:
                 if cls._server is native:
+                    if cls._instance is not None:
+                        raise RuntimeError(
+                            "Capture could not confirm shutdown: another local redirector "
+                            "instance still owns its native handle. Stop that instance "
+                            "before retrying Capture."
+                        )
                     cls._server = None
-                    cls._instance = None
                 native.close()
                 await native.wait_closed()
         finally:
@@ -87,8 +92,13 @@ async def capture_watchdog(domains: tuple[str, ...]) -> AsyncIterator[None]:
 
 async def _renew(native: mitmproxy_rs.local.LocalRedirector) -> None:
     """Renew only this handle's current selector, never resuming a stopped owner."""
+    owner: LocalRedirectorInstance | None = None
     while LocalRedirectorInstance._server is native:
-        owner = LocalRedirectorInstance._instance
+        current = LocalRedirectorInstance._instance
+        if owner is None:
+            owner = current
+        elif current is not owner:
+            return
         if owner is not None:
             data = owner.mode.data
             spec = f"{data},!{os.getpid()}" if data else f"!{os.getpid()}"

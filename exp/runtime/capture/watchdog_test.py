@@ -199,3 +199,53 @@ def test_renewal_does_not_touch_replacement_handle(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(LocalRedirectorInstance, "_server", current)
     asyncio.run(watchdog._renew(cast(mitmproxy_rs.local.LocalRedirector, previous)))
     assert not previous.specs and not current.specs
+
+
+@pytest.mark.parametrize("replace", [False, True])
+def test_renewal_stops_when_its_instance_disappears_or_changes(
+    monkeypatch: pytest.MonkeyPatch, replace: bool
+) -> None:
+    """A reused native handle does not transfer the old owner's lease renewals."""
+    native = Native()
+    owner = LocalRedirectorInstance.make("local:123", Proxyserver())
+    replacement = LocalRedirectorInstance.make("local:456", Proxyserver())
+    monkeypatch.setattr(LocalRedirectorInstance, "_server", native)
+    monkeypatch.setattr(LocalRedirectorInstance, "_instance", owner)
+
+    async def scenario() -> None:
+        """Observe the first renewal, then revoke that specific instance's ownership."""
+        task = asyncio.create_task(
+            watchdog._renew(cast(mitmproxy_rs.local.LocalRedirector, native))
+        )
+        await asyncio.sleep(0)
+        assert native.specs == [f"123,!{os.getpid()}"]
+        LocalRedirectorInstance._instance = replacement if replace else None
+        await asyncio.wait_for(task, timeout=0.2)
+        assert native.specs == [f"123,!{os.getpid()}"]
+
+    asyncio.run(scenario())
+
+
+def test_exit_preserves_replacement_instance_reusing_native(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The old scope reports lost ownership without closing a replacement's handle."""
+    native = Native()
+    install_native(monkeypatch, native)
+    owner = LocalRedirectorInstance.make("local:123", Proxyserver())
+    replacement = LocalRedirectorInstance.make("local:456", Proxyserver())
+
+    async def scenario() -> None:
+        """Transfer the real mitmproxy singleton while the original context is open."""
+        async with watchdog.capture_watchdog(("chatgpt.com",)):
+            await owner.start()
+            await asyncio.sleep(0)
+            await owner.stop()
+            await replacement.start()
+
+    with pytest.raises(RuntimeError, match="another local redirector instance"):
+        asyncio.run(scenario())
+    assert LocalRedirectorInstance._server is native
+    assert LocalRedirectorInstance._instance is replacement
+    assert not native.closed and not native.waited
+    assert not watchdog._starting
