@@ -422,6 +422,7 @@ pub struct Normalizer {
     // mapper's local counter.
     gemini_tool_index: u32,
     gemini_capture: Option<crate::capture::reasoning::GeminiObserver>,
+    gemini_meter: Option<crate::settlement::Observation>,
     gemini_progress: bool,
     // Fireworks-only route identity authorizing reasoning_content capture.
     reasoning_content_route_sha256: Option<String>,
@@ -485,6 +486,7 @@ impl Normalizer {
             finish_reason: None,
             gemini_tool_index: 0,
             gemini_capture: None,
+            gemini_meter: None,
             gemini_progress: false,
             reasoning_content_route_sha256,
             request_words: Vec::new(),

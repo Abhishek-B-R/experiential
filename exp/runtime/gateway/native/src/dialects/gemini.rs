@@ -14,6 +14,10 @@ impl Normalizer {
         self.gemini_capture = observer;
     }
 
+    pub(crate) fn meter_gemini(&mut self, observation: crate::settlement::Observation) {
+        self.gemini_meter = Some(observation);
+    }
+
     pub(crate) fn take_gemini_progress(&mut self) -> bool {
         std::mem::take(&mut self.gemini_progress)
     }
@@ -128,6 +132,11 @@ impl Normalizer {
                         }
                     }
                     if part.get("thought") == Some(&Value::Bool(true)) {
+                        if let (Some(observation), Some(text)) =
+                            (&self.gemini_meter, part.get("text").and_then(Value::as_str))
+                        {
+                            observation.record_gemini_reasoning(text);
+                        }
                         continue;
                     }
                     if let Some(call) = part.get("functionCall") {

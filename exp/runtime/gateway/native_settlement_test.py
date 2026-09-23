@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.runtime.gateway.contracts import (
     GatewayEventKind,
     GatewayFailure,
@@ -17,12 +17,14 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.native_settlement import (
     NativeSettlementPayload,
+    StreamedOutput,
     _usage_from_payload,  # noqa: PLC2701 - direct unit coverage for normalization.
     accepts_keyword,
     exhausted_attempt_payload,
     first_token_at_from_settlement,
     settlement_metadata,
     settlement_rate_limit,
+    streamed_output_from_settlement,
     terminal_from_settlement,
     tool_search_requests_from_settlement,
     tool_search_requests_from_terminal,
@@ -63,6 +65,42 @@ def test_cancelled_disconnect_marker_retains_unknown_final_meter(usage: JsonObje
     assert "usage_incomplete_due_to_disconnect" not in terminal.model_dump()
     replayed, _ = terminal_from_settlement(data)
     assert replayed.usage_incomplete_due_to_disconnect is True
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (None, None),
+        ("Hello", None),
+        ({"text": 7}, None),
+        ({"text": "Hi", "text_overflow_chars": -1}, None),
+        ({}, StreamedOutput()),
+        (
+            {
+                "text": "Hi",
+                "reasoning": "hmm",
+                "text_overflow_chars": 0,
+                "reasoning_overflow_chars": 12,
+            },
+            StreamedOutput(text="Hi", reasoning="hmm", reasoning_overflow_chars=12),
+        ),
+        ({"images": 2}, StreamedOutput(images=2)),
+        ({"images": "2"}, None),
+        ({"unexpected": "text"}, None),
+        ({"single_dial": "true"}, None),
+        ({"single_dial": 1}, None),
+        ({"single_dial": True}, StreamedOutput(single_dial=True)),
+    ],
+)
+def test_streamed_output_parses_only_the_typed_shape(
+    payload: JsonValue | None, expected: StreamedOutput | None
+) -> None:
+    """Generated-text evidence is typed; a malformed object is dropped, never guessed at."""
+    data: JsonObject = {"outcome": "failed"}
+    if payload is not None:
+        data["streamed_output"] = payload
+    assert streamed_output_from_settlement(data) == expected
+    assert streamed_output_from_settlement(None) is None
 
 
 @pytest.mark.parametrize("marker", ["true", 1, None, [], {}])

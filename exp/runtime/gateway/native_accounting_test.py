@@ -21,7 +21,8 @@ from exp.common.models.catalog import (
 from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
 from exp.common.models.gateway_chains import ModelExecutionStage
-from exp.runtime.gateway import native_recovery
+from exp.runtime.gateway import disconnect_estimate, native_recovery
+from exp.runtime.gateway.attempt_tokens import counted_input_tokens
 from exp.runtime.gateway.budgets import (
     BudgetReservationRejected,
     BudgetScopeKind,
@@ -62,6 +63,7 @@ from exp.runtime.gateway.recovery import (
     SessionRecoveryRegistry,
 )
 from exp.runtime.gateway.recovery_test import Clock, eligible
+from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.rung_admission import RungShed
 from exp.runtime.openai_protocol.errors import (
@@ -432,6 +434,124 @@ def test_disconnect_usage_evidence_survives_every_settlement_path(
     if terminal.usage is not None:
         assert terminal.usage.input_tokens == 7
         assert terminal.usage.output_tokens == 3
+    assert registry.entry(entry.authorization.request_id) is None
+    assert len(ledger.finished) == 1
+
+
+@pytest.mark.parametrize("retry", ["direct", "sweep"])
+def test_estimated_disconnect_preserves_search_charges_and_receipt_time_without_cache_proof(
+    monkeypatch: pytest.MonkeyPatch, retry: str
+) -> None:
+    """Known request operations survive an absent meter exactly once, without estimated warmth."""
+    registry, ledger, entry = _registry()
+    registry.recovery_host = RecoveryHostFake()
+    started = _start(registry, ordinal=0)
+    attempt_id = str(started["attempt_id"])
+    clock = Clock()
+    clock.now = 1000
+    monkeypatch.setattr(registry.recovery, "observation_time", lambda: clock.now)
+    original = disconnect_estimate._text_tokens
+
+    def delayed_tokens(text: str, overflow: int) -> int:
+        """Tokenization happens only after the first validated receipt timestamp is retained."""
+        assert entry.recovery_observed_at[attempt_id] == 1000
+        clock.now = 1100
+        return original(text, overflow)
+
+    monkeypatch.setattr(disconnect_estimate, "_text_tokens", delayed_tokens)
+    payload = json.dumps(
+        {
+            "request_id": entry.authorization.request_id,
+            "attempt_id": attempt_id,
+            "outcome": "failed",
+            "failure": {"failure_class": "cancelled", "safe_message": "cut"},
+            "usage": None,
+            "tool_names": [],
+            "dispatched": True,
+            "opened": True,
+            "finalize": True,
+            "usage_incomplete_due_to_disconnect": True,
+            "streamed_output": {"single_dial": True, "text": "visible output"},
+            "web_search_requests": 2,
+            "tool_search_requests": 3,
+        }
+    )
+    if retry == "sweep":
+        ledger.fail_finishes = 1
+        with pytest.raises(NativeBridgeError):
+            registry.settle(payload)
+        registry.sweep_expired()
+    else:
+        registry.settle(payload)
+    registry.settle(payload)
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None and terminal.usage_estimated and terminal.usage is not None
+    assert terminal.usage.web_search_requests == 2 and terminal.usage.tool_search_requests == 3
+    assert ledger.web_search_requests[-1] == 2 and ledger.tool_search_requests[-1] == 3
+    assert len(ledger.finished) == 1
+    assert entry.recovery_observed_at[attempt_id] == 1000
+    assert not entry.recovery_recorded_attempts
+    assert not registry.recovery._sessions
+    assert (
+        registry.loads.cached_fraction(
+            rung_load_key(entry.route.deployment), entry.authorization.organization_id
+        )
+        == 0
+    )
+
+
+@pytest.mark.parametrize("retry", ["direct", "sweep"])
+@pytest.mark.parametrize(
+    "surface", [GatewayApiSurface.CHAT_COMPLETIONS, GatewayApiSurface.DECISIONS]
+)
+@pytest.mark.parametrize("opened", [False, True])
+def test_opened_disconnect_settles_an_estimated_meter_on_every_path(
+    opened: bool, surface: GatewayApiSurface, retry: str
+) -> None:
+    """An accepted request the caller abandoned prices its prompt and streamed text once."""
+    registry, ledger, entry = _registry()
+    entry.authorization = entry.authorization.model_copy(update={"surface": surface})
+    started = _start(registry, ordinal=0)
+    payload: JsonObject = {
+        "request_id": entry.authorization.request_id,
+        "attempt_id": started["attempt_id"],
+        "outcome": "failed",
+        "usage": None,
+        "failure": {"failure_class": "cancelled", "safe_message": "caller disconnected"},
+        "finalize": True,
+        "opened": opened,
+        "dispatched": True,
+        "usage_incomplete_due_to_disconnect": True,
+        "streamed_output": {
+            "single_dial": True,
+            "text": "The sky is blue because",
+            "reasoning": "",
+            "text_overflow_chars": 0,
+            "reasoning_overflow_chars": 0,
+        },
+    }
+    encoded = json.dumps(payload)
+    if retry == "sweep":
+        ledger.fail_finishes = 1
+        with pytest.raises(NativeBridgeError):
+            registry.settle(encoded)
+        registry.sweep_expired()
+    else:
+        registry.settle(encoded)
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None
+    assert terminal.usage_incomplete_due_to_disconnect is True
+    estimated = opened and surface is not GatewayApiSurface.DECISIONS
+    assert terminal.usage_estimated is estimated
+    if estimated:
+        assert terminal.usage is not None
+        assert terminal.usage.input_tokens == counted_input_tokens(entry.request) > 0
+        assert terminal.usage.output_tokens == len(
+            reservation_encoder().encode_ordinary("The sky is blue because")
+        )
+        assert terminal.usage.reasoning_tokens == 0
+    else:
+        assert terminal.usage is None
     assert registry.entry(entry.authorization.request_id) is None
     assert len(ledger.finished) == 1
 

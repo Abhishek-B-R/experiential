@@ -157,7 +157,7 @@ def observed_usage_cost(
     usage: GatewayUsage | None,
     terminal_event: GatewayEvent | None,
 ) -> int | None:
-    """Apply a frozen whole-request tier while preserving unknown partial-disconnect cost."""
+    """Price provider or explicitly estimated usage; unestimated disconnects remain unknown."""
     threshold = optional_int(row["long_context_threshold_tokens"])
     long_context = (
         threshold is not None
@@ -166,7 +166,11 @@ def observed_usage_cost(
         and usage.input_tokens >= threshold
     )
     prefix = "long_context_" if long_context else ""
-    partial = terminal_event is not None and terminal_event.usage_incomplete_due_to_disconnect
+    partial = (
+        terminal_event is not None
+        and terminal_event.usage_incomplete_due_to_disconnect
+        and not terminal_event.usage_estimated
+    )
     return None if partial else frozen_usage_cost(row, usage, prefix=prefix)
 
 
@@ -192,6 +196,24 @@ def budget_settlement_nano_usd(
     if budget_settlement is not None and budget_settlement > MAXIMUM_NANO_USD:
         raise GatewayLedgerError("attempt cost exceeds SQLite integer capacity")
     return budget_settlement
+
+
+def usage_source_label(usage: GatewayUsage | None, *, estimated: bool) -> str:
+    """The ledger's usage provenance for one settlement.
+
+    ``unknown`` without usage, ``estimated`` when the registry completed a
+    disconnect's meter with the gateway tokenizer, ``observed`` otherwise.
+
+    Args:
+        usage: The usage the settlement carries, if any.
+        estimated: Whether that usage is the gateway's disconnect estimate.
+
+    Returns:
+        One of the three ``usage_source`` labels every ledger schema accepts.
+    """
+    if usage is None:
+        return "unknown"
+    return "estimated" if estimated else "observed"
 
 
 def optional_int(value: int | None) -> int | None:

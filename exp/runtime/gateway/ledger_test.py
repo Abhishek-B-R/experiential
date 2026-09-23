@@ -44,6 +44,7 @@ from exp.runtime.gateway.ledger import (
     IdempotencyReplayUnavailableError,
     SQLiteAttemptLedger,
 )
+from exp.runtime.gateway.ledger_valuation import frozen_usage_cost
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 
 _CATALOG_DIGEST = "a" * 64
@@ -250,6 +251,77 @@ def test_disconnect_partial_usage_preserves_conservative_budget_exposure(
             route_depth=0,
             maximum_cost_nano_usd=300,
         )
+
+
+@pytest.mark.parametrize("group_commit", [False, True])
+def test_estimated_disconnect_usage_settles_at_its_priced_cost(
+    tmp_path: Path, group_commit: bool
+) -> None:
+    """A tokenizer-completed disconnect meter is priced as estimated and releases the bound."""
+    clock = FakeLedgerClock()
+    store, ledger, key = _authority_fixture(tmp_path, clock)
+    budgets = SQLiteBudgetStore(store.database_path, clock=clock)
+    budgets.set_limit(
+        organization_id="org-one",
+        period="2026-08",
+        scope=BudgetScope(kind=BudgetScopeKind.TEAM),
+        limit_nano_usd=400,
+    )
+    authorization = store.authorize_request(
+        raw_key=key,
+        alias="coding",
+        request=_request("cancel before final usage"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+        maximum_cost_nano_usd=300,
+    )
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.CANCELLED, safe_message="caller disconnected"
+    )
+    usage = GatewayUsage(input_tokens=19, output_tokens=7)
+    event = GatewayEvent(
+        kind=GatewayEventKind.FAILED,
+        sequence_number=0,
+        failure=failure,
+        usage=usage,
+        usage_incomplete_due_to_disconnect=True,
+        usage_estimated=True,
+    )
+    writer = GroupCommitAttemptLedger(ledger) if group_commit else None
+    sink = ledger if writer is None else SyncGroupCommitLedger(writer)
+    try:
+        sink.finish_attempt(attempt_id=attempt_id, terminal_event=event, failure=failure)
+        sink.finish_attempt(attempt_id=attempt_id, terminal_event=event, failure=failure)
+    finally:
+        if writer is not None:
+            writer.close()
+    with sqlite3.connect(store.database_path) as connection:
+        row = connection.execute(
+            "SELECT state, input_tokens, output_tokens, usage_source, estimated_cost_nano_usd, "
+            "budget_settled_nano_usd FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        cost = _attempt_row(tmp_path, attempt_id)
+        priced = frozen_usage_cost(cost, usage)
+        assert priced is not None
+        assert 0 < priced < 300
+        assert row == ("cancelled", 19, 7, "estimated", priced, priced)
+        assert connection.execute(
+            "SELECT reserved_nano_usd, settled_nano_usd FROM gateway_attempt_budget_charges"
+        ).fetchone() == (300, priced)
+    remaining = budgets.remaining(organization_id="org-one", period="2026-08")[0]
+    assert remaining.settled_nano_usd == remaining.charged_nano_usd == priced
+    assert remaining.remaining_nano_usd == 400 - priced
+    assert remaining.unknown_cost_attempts == 0
+    observed = ledger.usage(organization_id="org-one")[0]
+    assert observed.known_estimated_cost_nano_usd == priced
+    assert observed.unknown_cost_attempts == 0
 
 
 @pytest.mark.parametrize(

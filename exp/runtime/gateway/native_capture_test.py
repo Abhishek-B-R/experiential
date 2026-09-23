@@ -11,6 +11,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models import load_model_catalog, write_model_catalog
 from exp.common.models.gateway_chains import (
     GatewayDeploymentRung,
@@ -38,6 +39,7 @@ from exp.runtime.gateway.native_capture import (
     read_capture_record_json,
 )
 from exp.runtime.gateway.native_server import serve_native_gateway
+from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.gateway.tests.chain_authority_fixture_test import (
     chain_components,
@@ -464,6 +466,174 @@ def test_gemini_capture_only_evidence_never_retries_or_fails_visible_inference(
         assert len(parts) == (0 if shape == "oversize" else 257 if shape == "fragments" else 1)
     else:
         assert records == []
+
+
+@pytest.mark.parametrize("capture_enabled", [False, True])
+@pytest.mark.parametrize("shape", ["thought", "signed_text", "signature_only", "image", "terminal"])
+def test_gemini_disconnect_meter_is_independent_of_optional_capture(
+    tmp_path: Path, capture_enabled: bool, shape: str, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """Real private thought accounting neither becomes output nor depends on capture consent."""
+    closed = threading.Event()
+    calls: list[str] = []
+    private_text = "private-meter-canary"
+
+    class Gemini(BaseHTTPRequestHandler):
+        """Serve one bounded Gemini prefix then wait for the caller's cancellation."""
+
+        def do_POST(self) -> None:  # noqa: N802 - standard HTTP handler contract.
+            """Emit actual typed Gemini parts and observe upstream close without another attempt."""
+            self.rfile.read(int(self.headers["content-length"]))
+            calls.append(self.path)
+            parts: list[JsonObject] = [{"text": "visible"}]
+            if shape in {"thought", "terminal"}:
+                parts.insert(
+                    0,
+                    {"thought": True, "text": private_text, "thoughtSignature": "secret-signature"},
+                )
+            elif shape == "signed_text":
+                parts[0]["thoughtSignature"] = "secret-signature"
+            elif shape == "signature_only":
+                parts.insert(0, {"thoughtSignature": "secret-signature"})
+            else:
+                parts.insert(0, {"inlineData": {"mimeType": "image/png", "data": _PNG_BASE64}})
+            candidate: dict[str, object] = {"content": {"parts": parts}}
+            payload: dict[str, object] = {"candidates": [candidate]}
+            if shape == "terminal":
+                candidate["finishReason"] = "STOP"
+                payload["usageMetadata"] = {"promptTokenCount": 13, "candidatesTokenCount": 7}
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            try:
+                self.wfile.write(("data: " + json.dumps(payload) + "\n\n").encode())
+                self.wfile.flush()
+                while True:
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+                    time.sleep(0.01)
+            except OSError:
+                closed.set()
+
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), Gemini)
+    serving_provider = threading.Thread(target=provider.serve_forever, daemon=True)
+    serving_provider.start()
+    manager, key = _configured_pool_gateway(tmp_path, provider="gemini")
+    components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "test-only"})
+    records: list[str] = []
+    collector = (
+        native.CaptureCollector(
+            CaptureConfiguration(settlement_required=False).model_dump_json(), records.append
+        )
+        if capture_enabled
+        else None
+    )
+    capture = (
+        CaptureController(collector, application_for=lambda _auth: "app") if collector else None
+    )
+    settled = threading.Event()
+    raw_settlements: list[JsonObject] = []
+
+    class Plane(NativeControlPlane):
+        """Keep real admission and accounting, substituting only loopback transport."""
+
+        def admit(self, argument: str) -> str:
+            """Send validated Gemini wires to the finite local fixture."""
+            payload = json.loads(super().admit(argument))
+            for wire in payload["route"]:
+                wire["url"] = f"http://127.0.0.1:{provider.server_port}/{wire['deployment_id']}"
+            return json.dumps(payload)
+
+        def settle(self, argument: str) -> str:
+            """Retain only this synthetic fixture's payload and signal actual ledger completion."""
+            raw_settlements.append(json.loads(argument))
+            result = super().settle(argument)
+            settled.set()
+            return result
+
+    port, shutdown = _unused_port(), native.shutdown_handle()
+    failures: list[BaseException] = []
+
+    def serve() -> None:
+        """Run one native listener with its ordinary cancellation ownership."""
+        try:
+            serve_native_gateway(
+                Plane(components, capture=capture),
+                host="127.0.0.1",
+                port=port,
+                capture=collector,
+                shutdown=shutdown,
+            )
+        except BaseException as error:  # noqa: BLE001 - fail explicitly after shutdown.
+            failures.append(error)
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    try:
+        _wait_ready(port, worker)
+        with httpx.stream(
+            "POST",
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            headers={"authorization": f"Bearer {key}"},
+            json={
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+            timeout=10,
+        ) as response:
+            assert response.status_code == 200
+            request_id = response.headers["x-request-id"]
+            for line in response.iter_lines():
+                assert private_text not in line and "secret-signature" not in line
+                if "visible" in line:
+                    break
+        assert closed.wait(2)
+        assert settled.wait(2)
+    finally:
+        shutdown.request_shutdown()
+        worker.join(10)
+        components.write_ledger.close()
+        components.manager.close()
+        manager.close()
+        provider.shutdown()
+        provider.server_close()
+        serving_provider.join(5)
+    assert not failures and not worker.is_alive()
+    assert calls == ["/alpha"] and len(raw_settlements) == 1
+    raw = raw_settlements[0]
+    with sqlite3.connect(manager.database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM gateway_attempts WHERE request_id=?", (request_id,)
+        ).fetchone()
+    assert row is not None
+    if shape == "terminal":
+        assert row["state"] == "completed" and row["usage_source"] == "observed"
+        assert (row["input_tokens"], row["output_tokens"]) == (13, 7)
+        assert "streamed_output" not in raw
+    elif shape == "image":
+        assert row["state"] == "cancelled" and row["usage_source"] == "unknown"
+        assert row["output_tokens"] is None
+    else:
+        assert row["state"] == "cancelled" and row["usage_source"] == "estimated"
+        expected_reasoning = private_text if shape == "thought" else ""
+        assert row["reasoning_tokens"] == len(
+            reservation_encoder().encode_ordinary(expected_reasoning)
+        )
+        assert (
+            row["output_tokens"]
+            == len(reservation_encoder().encode_ordinary("visible")) + row["reasoning_tokens"]
+        )
+        streamed = raw["streamed_output"]
+        assert isinstance(streamed, dict)
+        assert streamed["reasoning"] == expected_reasoning and streamed["text"] == "visible"
+        assert streamed["single_dial"] is True
+    if collector:
+        assert collector.close(1)
+    else:
+        assert not records
+    assert private_text not in capfd.readouterr().err
 
 
 def _request_json() -> str:

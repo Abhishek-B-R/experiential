@@ -31,6 +31,56 @@ impl Drop for Source {
     }
 }
 
+#[test]
+fn repeated_close_meters_each_drained_delta_once() {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut relay = UpstreamRelay::from_stream(
+        futures_util::stream::pending().boxed(),
+        Dialect::OpenAiCompatible,
+        deadline,
+    );
+    let observed = Observation::default().next_dial();
+    relay.set_observation(observed.clone());
+    relay.ready.push_back(Event::TextDelta("once".into()));
+    relay.close_transport();
+    relay.close_transport();
+    drop(relay);
+    assert_eq!(observed.snapshot().streamed_output.text, "once");
+}
+
+#[test]
+fn private_gemini_meter_is_separate_from_visible_signatures_and_terminal() {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut relay = UpstreamRelay::from_stream(
+        futures_util::stream::pending().boxed(),
+        Dialect::GeminiGenerateContent,
+        deadline,
+    );
+    let observed = Observation::default().next_dial();
+    relay.set_observation(observed.clone());
+    let events = relay.normalizer.feed(&crate::sse::SseEvent {
+        event: None,
+        data: r#"{"candidates":[{"content":{"parts":[{"thought":true,"text":"private"},{"text":"visible","thoughtSignature":"not tokens"},{"thoughtSignature":"also not tokens"}]}}]}"#.into(),
+    }).unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(&events[0], Event::TextDelta(text) if text == "visible"));
+    relay.queue_events(events);
+    relay.close_transport();
+    let snapshot = observed.snapshot();
+    assert_eq!(snapshot.streamed_output.reasoning, "private");
+    assert_eq!(snapshot.streamed_output.text, "visible");
+    assert!(snapshot.first_token_at.is_none());
+    observed.record(&Event::Usage(Usage {
+        input_tokens: Some(13),
+        output_tokens: Some(7),
+        ..Usage::default()
+    }));
+    observed.record(&Event::Completed);
+    observed.record_gemini_reasoning("must not count after terminal");
+    assert_eq!(observed.snapshot().streamed_output.reasoning, "private");
+    assert_eq!(observed.snapshot().usage.unwrap().output_tokens, Some(7));
+}
+
 #[tokio::test]
 async fn buffered_usage_and_terminal_win_without_reading_after_close() {
     let polls = Arc::new(AtomicUsize::new(0));

@@ -289,6 +289,7 @@ impl UpstreamRelay {
     }
 
     pub(crate) fn set_observation(&mut self, observation: crate::settlement::Observation) {
+        self.normalizer.meter_gemini(observation.clone());
         self.observation = Some(observation);
     }
 
@@ -322,10 +323,11 @@ impl UpstreamRelay {
                 }
             }
         }
-        if let Some(observation) = &self.observation {
+        if let Some(observation) = self.observation.take() {
             for event in &self.ready {
                 // queue_events already recorded the newest meter, folded
                 // across dials. A raw buffered report can be older or partial.
+                // Detach after observing once; ready events remain available to drain.
                 if !matches!(event, Event::Usage(_)) {
                     observation.record(event);
                 }

@@ -287,6 +287,75 @@ def _accepted_chain(
     return model_execution_snapshot(catalog, authorization, root)
 
 
+@pytest.mark.parametrize("estimated", [False, True])
+def test_child_disconnect_settles_actual_stage_price_once_in_both_budget_scopes(
+    tmp_path: Path, estimated: bool
+) -> None:
+    """An estimate prices the selected child; an unknown multi-dial meter keeps both holds."""
+    clock = _Clock()
+    store, ledger, budgets, key = _authority(tmp_path, clock)
+    catalog = _activate_chain(store, tmp_path)
+    scopes = [
+        BudgetScope(kind=BudgetScopeKind.POOL, alias_id="coding", pool_id=pool)
+        for pool in ("pool", "child-pool")
+    ]
+    for scope in scopes:
+        budgets.set_limit(organization_id="org", period="2026-08", scope=scope, limit_nano_usd=1000)
+    snapshot = _accepted_chain(store, ledger, clock, key, catalog)
+    child = next(value for value in catalog.deployments if value.deployment_id == "child")
+    child = child.model_copy(
+        update={
+            "gateway": child.gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=3_000_000,
+                        output_nano_usd_per_million_tokens=5_000_000,
+                    )
+                }
+            )
+        }
+    )
+    attempt = ledger.start_attempt(
+        snapshot=snapshot,
+        deployment=child,
+        attempt_ordinal=0,
+        route_depth=snapshot.deployment_ids.index("child"),
+        maximum_cost_nano_usd=300,
+    )
+    failure = GatewayFailure(failure_class=GatewayFailureClass.CANCELLED, safe_message="cut")
+    event = GatewayEvent(
+        kind=GatewayEventKind.FAILED,
+        sequence_number=0,
+        failure=failure,
+        usage=GatewayUsage(input_tokens=13, output_tokens=7) if estimated else None,
+        usage_incomplete_due_to_disconnect=True,
+        usage_estimated=estimated,
+    )
+    ledger.finish_attempt(attempt_id=attempt, terminal_event=event, failure=failure)
+    ledger.finish_attempt(attempt_id=attempt, terminal_event=event, failure=failure)
+    expected = 13 * 3 + 7 * 5 if estimated else 300
+    with sqlite3.connect(ledger.database_path) as connection:
+        assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone() == (1,)
+        assert connection.execute(
+            "SELECT usage_source, estimated_cost_nano_usd, budget_settled_nano_usd "
+            "FROM gateway_attempts"
+        ).fetchone() == (
+            "estimated" if estimated else "unknown",
+            expected if estimated else None,
+            expected,
+        )
+        charges = connection.execute(
+            "SELECT reserved_nano_usd, settled_nano_usd FROM gateway_attempt_budget_charges "
+            "WHERE attempt_id=?",
+            (attempt,),
+        ).fetchall()
+        assert charges == [(300, expected), (300, expected)]
+    for remaining in budgets.remaining(organization_id="org", period="2026-08"):
+        assert remaining.reserved_nano_usd == 0
+        assert remaining.settled_nano_usd == expected
+        assert remaining.remaining_nano_usd == 1000 - expected
+
+
 @pytest.mark.parametrize("destination", ["primary", "child"])
 @pytest.mark.parametrize("cost_state", ["settled", "reserved", "unknown"])
 def test_new_root_limit_backfills_each_attempt_once(

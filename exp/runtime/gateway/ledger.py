@@ -51,6 +51,7 @@ from exp.runtime.gateway.ledger_valuation import (
     frozen_usage_cost,
     observed_usage_cost,
     optional_int,
+    usage_source_label,
 )
 from exp.runtime.gateway.ledger_valuation import terminal_values as _terminal_values
 from exp.runtime.gateway.model_chain_authority import (
@@ -653,6 +654,9 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
             raise GatewayLedgerError("attempt is already settled with another terminal state")
         cost = observed_usage_cost(row, usage, terminal_event)
         budget_settlement = budget_settlement_nano_usd(row, cost, usage, terminal_event)
+        usage_source = usage_source_label(
+            usage, estimated=terminal_event is not None and terminal_event.usage_estimated
+        )
         # Price the same observed usage at the preferred rung's frozen base rates.
         # This is telemetry, not billing; missing rates remain unknown.
         counterfactual_cost = (
@@ -689,7 +693,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 None if usage is None else usage.cache_creation_1h_input_tokens,
                 None if usage is None else usage.output_tokens,
                 None if usage is None else usage.reasoning_tokens,
-                "unknown" if usage is None else "observed",
+                usage_source,
                 cost,
                 counterfactual_cost,
                 budget_settlement,
