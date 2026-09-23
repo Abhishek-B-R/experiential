@@ -6,6 +6,8 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
+from exp.cli.evaluation import flow
+from exp.cli.shared.picker import PickerResult
 from exp.optimize.evaluation.prepare import ModelEvaluationOptions
 from exp.optimize.evaluation.runs import EvaluationDefaults, load_run, prepare_run
 from exp.optimize.evaluation.runs_test import _twenty_scenarios
@@ -38,9 +40,9 @@ def test_cli_review_and_resume_preserve_exact_preparation(tmp_path: Path) -> Non
         ],
     )
     assert result.exit_code == 0, result.output
-    assert "20 distinct scenarios" in result.output
+    assert "20 scenarios" in result.output
     assert (
-        "Assistant" in result.output and "World model" in result.output and "Judge" in result.output
+        "Models:" in result.output and "World model" in result.output and "Judge" in result.output
     )
     assert run.run_id in result.output
     assert load_run(project, run.run_id).status == "prepared"
@@ -53,3 +55,42 @@ def test_noninteractive_missing_or_conflicting_inputs_fail_clearly(args: list[st
     result = CliRunner().invoke(app, ["eval", *args, "--non-interactive"])
     assert result.exit_code != 0
     assert "PROJECT" in result.output or "frozen settings" in result.output
+
+
+def test_interactive_cancel_before_launch_never_constructs_providers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even an inexpensive prepared evaluation requires the explicit Start action."""
+    project, catalog, state = _twenty_scenarios(tmp_path)
+    run = prepare_run(
+        project,
+        catalog,
+        EvaluationDefaults(models=("candidate-a", "candidate-b")),
+        code_revision=_REVISION,
+    )
+    before = len(state.completion_calls), len(state.embedding_calls)
+    monkeypatch.setattr(flow, "can_prompt", lambda console: True)
+    monkeypatch.setattr(flow, "choose_one", lambda *args, **kwargs: PickerResult(values=("back",)))
+
+    def unexpected(*args: object, **kwargs: object) -> None:
+        """Fail if authorization or client construction happens after cancellation."""
+        pytest.fail("cancel reached provider construction or authorization")
+
+    monkeypatch.setattr(flow, "RuntimeModelCatalog", unexpected)
+    monkeypatch.setattr(flow, "require_spend_consent", unexpected)
+    result = CliRunner().invoke(
+        app, ["eval", "support", "--root", str(project.paths.root), "--resume", run.run_id]
+    )
+    assert result.exit_code == 0, result.output
+    assert load_run(project, run.run_id).status == "prepared"
+    assert before == (len(state.completion_calls), len(state.embedding_calls))
+
+
+def test_unbuilt_project_requires_build_before_setup(tmp_path: Path) -> None:
+    """Eval never imports traces, creates a project, or prompts for providers implicitly."""
+    result = CliRunner().invoke(
+        app, ["eval", "powerset", "--root", str(tmp_path), "--models", "a,b", "--non-interactive"]
+    )
+    assert result.exit_code != 0
+    assert "exp build powerset" in result.output
+    assert not list(tmp_path.iterdir())

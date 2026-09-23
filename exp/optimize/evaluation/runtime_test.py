@@ -1,23 +1,57 @@
 """Catalog-backed prepared evaluation through real simulator, LM judge and persisted reports."""
 
+import json
 from datetime import timedelta
 from pathlib import Path
 from typing import cast
 
 import pytest
 
+from exp.common.models import AssistantAction, ModelRequest, ModelResponse
 from exp.optimize.evaluation.contracts import EvaluationBudget
 from exp.optimize.evaluation.prepare_test import _prepare
 from exp.optimize.evaluation.runtime import run_prepared_model_evaluation
-from exp.optimize.router.automatic.service_test import _REVISION, _TIME, _RuntimeCatalog
+from exp.optimize.router.automatic.service_test import (
+    _REVISION,
+    _TIME,
+    _CompletionClient,
+    _RuntimeCatalog,
+)
 from exp.runtime.models import RuntimeModelCatalog
 
 
+@pytest.mark.parametrize("blank_worker", [False, True])
 def test_prepared_evaluation_runs_real_lm_judge_and_replays_without_model_calls(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    blank_worker: bool,
 ) -> None:
     """Only provider transport is deterministic; all evaluation execution is production code."""
     project, catalog, state, prepared = _prepare(tmp_path)
+    original_complete = _CompletionClient.complete
+
+    def complete(client: _CompletionClient, request: ModelRequest) -> ModelResponse:
+        """Keep blank worker replies in the scored cohort with a scripted failing judgment."""
+        response = original_complete(client, request)
+        if blank_worker and client._alias.startswith("candidate-"):
+            return response.model_copy(update={"output": AssistantAction(content="")})
+        if blank_worker and client._alias == "judge":
+            judgment = {
+                "dimensions": [
+                    {
+                        "dimension_id": "task-success",
+                        "raw_score": 0,
+                        "rationale": "The worker produced no answer.",
+                    }
+                ]
+            }
+            return response.model_copy(
+                update={"output": AssistantAction(content=json.dumps(judgment))}
+            )
+        return response
+
+    monkeypatch.setattr(_CompletionClient, "complete", complete)
+    embeddings_before = len(state.embedding_calls)
     runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
     budget = EvaluationBudget(
         maximum_cost_usd=prepared.cost.maximum_cost_usd,
@@ -33,7 +67,9 @@ def test_prepared_evaluation_runs_real_lm_judge_and_replays_without_model_calls(
         code_revision=_REVISION,
     )
     assert result.report.compared_cells == prepared.cost.scenario_count
-    assert all(row.quality == 1 for row in result.report.models)
+    assert all(row.quality == (0 if blank_worker else 1) for row in result.report.models)
+    if blank_worker:
+        assert len(state.embedding_calls) == embeddings_before
     assert {alias for alias, _ in state.completion_calls} == {
         "candidate-a",
         "candidate-b",

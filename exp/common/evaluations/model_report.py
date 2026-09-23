@@ -26,7 +26,21 @@ from exp.common.tasks import load_task_set
 
 
 class ModelEvaluationMetrics(ContractModel):
-    """One worker measured on the same cells as every other reported worker."""
+    """One worker measured on the same cells as every other reported worker.
+
+    Attributes:
+        candidate: Frozen worker identity.
+        planned_cells: Positive number of planned scenario/repeat coordinates.
+        scored_cells: Number of valid judgments.
+        failed_cells: Number of failed cells, distinct from incomplete cells.
+        incomplete_cells: Budget or length-limited cells, default 0.
+        not_run_cells: Cells without execution evidence.
+        compared_cells: Cells in the shared valid comparison cohort.
+        quality: Weighted unit-interval quality, or None without a shared cohort.
+        operating_cost_usd: Weighted candidate-only cost, or None without a shared cohort.
+        latency_seconds: Weighted candidate latency, or None when unavailable.
+        operating_cost_estimated: Whether any included cost is estimated, default False.
+    """
 
     candidate: RoutedCandidateSnapshot
     planned_cells: int = Field(ge=1)
@@ -42,7 +56,16 @@ class ModelEvaluationMetrics(ContractModel):
 
 
 class ModelEvaluationReport(ArtifactEnvelope):
-    """A descriptive Pareto comparison, with no router policy or activation authority."""
+    """A descriptive Pareto comparison, with no router policy or activation authority.
+
+    Attributes:
+        report_id: Content-derived immutable report identity.
+        evaluation_id: Source evaluation dataset identity.
+        compared_cells: Number of common valid scenario/repeat coordinates.
+        excluded_cells: Coordinates excluded from every worker's comparison.
+        models: Worker metrics with identical comparison denominators.
+        frontier_aliases: Non-dominated workers on the cost-quality frontier.
+    """
 
     report_id: ArtifactId
     evaluation_id: ArtifactId

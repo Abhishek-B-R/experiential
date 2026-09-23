@@ -33,7 +33,7 @@ from exp.common.rollouts import (
     StopReason,
 )
 from exp.runtime.agents import AgentRuntime
-from exp.runtime.agents.chat import ChatAgentRuntime
+from exp.runtime.agents.factory import is_builtin_chat_factory
 from exp.runtime.models import ResolvedModel
 from exp.simulation.engines.clock import timestamp, utc_now
 from exp.simulation.engines.text import dispatch
@@ -237,6 +237,8 @@ class WorldModelSimulator:
             SimulationResumeError: Existing immutable artifacts do not match this simulation.
         """
         require_implemented_mode(spec, SimulationMode.WORLD_MODEL)
+        if spec.continuation_of is not None and not is_builtin_chat_factory(self._agent_factory):
+            raise SimulationResumeError("continuation requires the built-in chat runtime")
         cells, world_model, grounded_world_model = self._validate_spec_and_bindings(spec)
         spec, spec_input = persist_canonical_specification(self._store, spec)
         resolution, resolution_input, bindings = self._persist_resolution(
@@ -246,9 +248,7 @@ class WorldModelSimulator:
             world_model,
             grounded_world_model,
         )
-        continuations = load_continuations(self._store, spec, tuple(cells), bindings)
-        if continuations and type(self._agent_factory()) is not ChatAgentRuntime:
-            raise SimulationResumeError("continuation requires the built-in chat runtime")
+        load_continuations(self._store, spec, tuple(cells), bindings)
         completed = self._load_completed_rollouts(cells, bindings, resolution_input)
         pending = tuple(cell for cell in cells if cell.cell_id not in completed)
         pending = self._stale_recovery_first(pending, resolution, resolution_input, bindings)

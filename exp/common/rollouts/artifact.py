@@ -154,7 +154,14 @@ class ProviderFreeSourceProvenance(ContractModel):
 
 
 class RolloutArtifact(SimulationArtifact):
-    """The v1 simulation artifact subtype that preserves one full agent episode."""
+    """The v1 simulation artifact subtype that preserves one full agent episode.
+
+    Attributes:
+        continuation_of: Exact immutable parent rollout, or None for an initial episode.
+            Continued evidence includes the paid parent prefix for complete replay.
+        text_checkpoint: Safe completed-turn state for built-in chat continuation, or None
+            when the runtime, redaction or interrupted turn prevents faithful restoration.
+    """
 
     artifact_kind: Literal["rollout"] = "rollout"
     rollout_id: ArtifactId

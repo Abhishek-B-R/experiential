@@ -56,6 +56,11 @@ from exp.common.project import (
 )
 from exp.common.project.manifests import file_digest
 from exp.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
+from exp.common.traces.ingest.model_identity import (
+    normalized_capabilities_sha256,
+    normalized_model_identity_evidence,
+)
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.router.activation import load_project_router
 from exp.optimize.router.automatic.attribution import (
     RouterObservedAttributionSet,
@@ -107,11 +112,6 @@ from exp.runtime.agents import ChatAgentRuntime
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from exp.runtime.router.application import RouterApplicationError
 from exp.simulation.build import build_project, select_completed_build
-from exp.simulation.ingest.model_identity import (
-    normalized_capabilities_sha256,
-    normalized_model_identity_evidence,
-)
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 from exp.simulation.mining.service import MiningSpec
 
 _TIME = datetime(2026, 8, 14, tzinfo=UTC)

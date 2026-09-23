@@ -11,6 +11,7 @@ import typer
 from rich.console import Console
 
 from exp.cli.build.cost import over_ceiling_message
+from exp.cli.build.traces import load_build_traces
 from exp.cli.providers.provider_picker import resolve_setup_providers
 from exp.cli.providers.setup import (
     ProviderSetupOptions,
@@ -43,6 +44,8 @@ from exp.common.project import (
     artifact_input,
 )
 from exp.common.release_revision import installed_release_revision
+from exp.common.traces.ingest.sources import CANONICAL_TRACE_SOURCES
+from exp.runtime.gateway.local_capture import local_capture_path
 from exp.runtime.models import (
     CapabilityRequirement,
     ModelCapabilityError,
@@ -54,8 +57,6 @@ from exp.runtime.models.preflight import preflight_capabilities
 from exp.runtime.models.providers.transport import ProviderTransportError, RetryPolicy
 from exp.simulation.build import ProjectBuild, TaskSetBuild, build_project, select_completed_build
 from exp.simulation.engines.text.errors import SimulationContentionError
-from exp.simulation.ingest.otlp import TraceNormalizationResult
-from exp.simulation.ingest.sources import CANONICAL_TRACE_SOURCES, load_trace_source
 from exp.simulation.retrieval import (
     RAGEmbedderBinding,
     RAGLineageBinding,
@@ -108,9 +109,12 @@ def build(
     source: str = typer.Option(
         "otlp",
         "--source",
-        help=f"Trace source format: {', '.join(CANONICAL_TRACE_SOURCES)}.",
+        help=f"Trace source format: {', '.join(sorted((*CANONICAL_TRACE_SOURCES, 'gateway')))}.",
     ),
     root: Path = ROOT_OPTION,
+    identity: str | None = typer.Option(
+        None, "--identity", help="Identity whose local gateway traffic supplies the build."
+    ),
     world_model: str | None = typer.Option(None, "--world-model", help="World-model alias."),
     judge: str | None = typer.Option(None, "--judge", help="Judge alias."),
     embedder: str | None = typer.Option(None, "--embedder", help="Embedding-capable alias."),
@@ -162,6 +166,7 @@ def build(
         trace_file: Explicit local canonical trace export, or ``None`` for the interactive wizard.
         source: Declared local-export format.
         root: Local ``.exp`` artifact root.
+        identity: Required local identity when using ``--source gateway``.
         world_model: Optional configured alias override for this project.
         judge: Optional configured alias override for this project.
         embedder: Optional configured alias override for this project.
@@ -180,6 +185,12 @@ def build(
         if trace_file is not None:
             raise typer.BadParameter("provide traces once, using -t/--traces or the trace path")
         trace_file = legacy_trace_file
+    if source.strip().casefold() == "gateway":
+        if identity is None:
+            raise typer.BadParameter("--source gateway requires --identity ID")
+        trace_file = trace_file or local_capture_path(root)
+    elif identity is not None:
+        raise typer.BadParameter("--identity requires --source gateway")
     if trace_file is None:
         if dry_run or no_interactive or not can_prompt(_console):
             raise typer.BadParameter(
@@ -246,16 +257,13 @@ def build(
             runtime_catalog,
             selected,
         )
-        _console.print("[dim]loading[/dim] Normalize trace evidence")
+        _console.print("[dim]loading[/dim] Import trace evidence and mine scenarios")
         path = _resolve_trace_file(trace_file)
         with progress_display(_console) as progress:
             report(progress, "normalization")
-            normalized = _load_canonical_traces(path, source)
-            if not normalized.traces:
-                raise ValueError(
-                    "no valid canonical traces were produced; inspect the input and provide at "
-                    f"least one valid {source.strip().casefold()} trace"
-                )
+            normalized = load_build_traces(
+                project, root=root, path=path, source=source, identity=identity, dry_run=dry_run
+            )
             record_count = len(normalized.traces) + len(normalized.issues)
             report(
                 progress,
@@ -828,23 +836,6 @@ def _resolve_trace_file(trace_file: Path) -> Path:
             f"--traces must name a trace export, not a directory: {trace_file}"
         )
     return trace_file
-
-
-def _load_canonical_traces(path: Path, source: str) -> TraceNormalizationResult:
-    """Read a raw source once through its explicit canonical loader.
-
-    Args:
-        path: Validated local trace export.
-        source: Explicit supported source format.
-
-    Returns:
-        Canonical normalized trace result.
-
-    Raises:
-        TraceSourceError: The format is unsupported or normalization fails; the command's
-            `usage_error` boundary converts it (a `ValueError`) into `typer.BadParameter`.
-    """
-    return load_trace_source(source, path)
 
 
 def _capture_local_build_telemetry(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import partial
 from importlib import import_module
 from typing import cast
 
@@ -16,6 +17,21 @@ AgentFactory = Callable[[], AgentRuntime]
 
 class AgentFactoryError(ValueError):
     """A configured customer agent factory cannot provide the runtime contract."""
+
+
+def is_builtin_chat_factory(factory: AgentFactory) -> bool:
+    """Recognize explicit built-in construction without calling arbitrary customer code.
+
+    Args:
+        factory: Constructor selected for each agent episode.
+
+    Returns:
+        True only for the built-in class or a partial applying arguments to that exact class.
+        Custom wrappers and subclasses cannot assert built-in continuation semantics.
+    """
+    return factory is ChatAgentRuntime or (
+        type(factory) is partial and factory.func is ChatAgentRuntime
+    )
 
 
 def agent_factory_sha256(
@@ -88,7 +104,8 @@ def resolve_agent_factory(
     """
     if configuration is None:
         prompt = normalize_chat_system_prompt(system_prompt)
-        return lambda: ChatAgentRuntime(
+        return partial(
+            ChatAgentRuntime,
             maximum_model_calls=maximum_model_calls,
             system_prompt=prompt,
         )

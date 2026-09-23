@@ -58,14 +58,25 @@ class EvaluationSetup(ContractModel):
 
 
 class EvaluationBudget(ContractModel):
-    """Finite ceilings for simulation plus judging; execution never opts out of enforcement."""
+    """Finite ceilings for simulation plus judging; execution never opts out of enforcement.
+
+    Attributes:
+        maximum_cost_usd: Positive finite provider-spend ceiling.
+        maximum_judgments: Positive ceiling on durable cell judgments.
+    """
 
     maximum_cost_usd: float = Field(gt=0, allow_inf_nan=False)
     maximum_judgments: int = Field(gt=0)
 
 
 class EvaluationExecutionContract(ArtifactEnvelope):
-    """Hash-bound execution settings and authorization included in the evaluation identity."""
+    """Hash-bound execution settings and authorization included in the evaluation identity.
+
+    Attributes:
+        contract_id: Content-derived execution identity.
+        setup: Frozen model, environment and judge inputs.
+        budget: Authorized finite execution ceilings.
+    """
 
     contract_id: ArtifactId
     setup: EvaluationSetup
@@ -86,7 +97,12 @@ class JudgmentReferences(Protocol):
 
 @dataclass(frozen=True)
 class EvaluationJudge:
-    """Verified persisted judge references, never caller-authored calibration evidence."""
+    """Verified persisted judge references, never caller-authored calibration evidence.
+
+    Attributes:
+        rubric_id: Verified immutable rubric identity.
+        calibration_id: Verified immutable calibration identity.
+    """
 
     rubric_id: str
     calibration_id: str
@@ -94,7 +110,13 @@ class EvaluationJudge:
 
 @dataclass(frozen=True)
 class EvaluationServices:
-    """Injected model-backed services; evaluation orchestration remains Experiential-owned."""
+    """Injected model-backed services; evaluation orchestration remains Experiential-owned.
+
+    Attributes:
+        simulator_factory: Builds the selected simulation engine for one frozen plan.
+        judge: Provider-bound, reservation-enforcing judge.
+        plan_inputs: Additional immutable execution inputs, empty by default.
+    """
 
     simulator_factory: SimulatorFactory
     judge: EvaluationRuntimeJudge

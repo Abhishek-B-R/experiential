@@ -26,6 +26,7 @@ from exp.common.models import (
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.traces import load_trace_dataset
 from exp.optimize.evaluation.contracts import EvaluationSetup
+from exp.optimize.evaluation.judge_selection import select_judge_model
 from exp.optimize.evaluation.planning import EvaluationCostPlan, estimate_model_evaluation
 from exp.optimize.router.automatic.provisional import (
     _judge_request_reservation,
@@ -78,7 +79,17 @@ class ModelEvaluationOptions(ContractModel):
 
 
 class PreparedModelEvaluation(ContractModel):
-    """Serializable frozen execution inputs and engine-owned price plan for hosting."""
+    """Serializable frozen execution inputs and engine-owned price plan for hosting.
+
+    Attributes:
+        setup: Frozen model, environment, judge and execution inputs.
+        judge_setup: Immutable authored or default judge setup.
+        judge_request: Runtime-enforced judge request reservation.
+        embedder_alias: Nonempty alias of the retrieval embedding model.
+        agent_factory_sha256: Digest of the exact worker runtime configuration.
+        redacted_field_names: Project privacy fields pinned before execution.
+        cost: Engine-owned immutable stage estimates and maximum provider spend.
+    """
 
     setup: EvaluationSetup
     judge_setup: ArtifactInput
@@ -136,6 +147,7 @@ def prepare_model_evaluation(
     continuation_of: str | None = None,
     run_id: str | None = None,
     judge_setup: ArtifactInput | None = None,
+    judge_alias: str | None = None,
     calibration_id: str | None = None,
     embedder_alias: str,
     options: ModelEvaluationOptions,
@@ -151,6 +163,7 @@ def prepare_model_evaluation(
         continuation_of: Prior simulation ID to continue under increased budgets.
         run_id: Optional distinct experiment identity; identical settings can run fresh evidence.
         judge_setup: Authored judge setup manifest, or omit both judge arguments for task success.
+        judge_alias: Optional model override retaining the syllabus with provisional calibration.
         calibration_id: Verified calibration identity paired with an explicit judge setup.
         embedder_alias: Catalog alias matching the completed fit-RAG embedder.
         options: Bounded execution controls.
@@ -194,6 +207,20 @@ def prepare_model_evaluation(
     ):
         raise ValueError("judge setup or calibration differs from the completed evaluation project")
     static = RuntimeModelCatalog(catalog, environment={})
+    if judge_alias is not None and judge_alias != selected.judge_alias:
+        judge_model, _ = static.snapshot(judge_alias)
+        judge_setup, calibration_id = select_judge_model(
+            project,
+            selected,
+            calibration,
+            alias=judge_alias,
+            model=judge_model,
+            created_at=created_at,
+            code_revision=code_revision,
+        )
+        selected = read_evaluation_judge(project, judge_setup)
+        calibration, _ = verify_persisted_calibration(project, calibration_id)
+        assert calibration.status == "provisional"
     judge_model, judge_caps = static.snapshot(selected.judge_alias)
     if judge_model != selected.judge_model:
         raise ValueError("judge catalog changed; prepare a new judge setup")

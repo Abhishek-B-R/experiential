@@ -31,6 +31,10 @@ from exp.common.project import (
 from exp.common.routing import router_embedding_reservation
 from exp.common.tasks import TaskCase, load_task_set
 from exp.common.traces import Trace, load_trace_dataset
+from exp.common.traces.ingest.dataset import (
+    read_trace_model_identity_evidence,
+    verify_current_trace_dataset,
+)
 from exp.optimize.router.automatic.attribution import resolve_router_observed_attributions
 from exp.optimize.router.automatic.reservations import (
     retrieval_embedding_reservation,
@@ -44,10 +48,6 @@ from exp.optimize.router.spend import (
 )
 from exp.runtime.models import CapabilityRequirement, ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.providers.transport import RetryPolicy
-from exp.simulation.ingest.dataset import (
-    read_trace_model_identity_evidence,
-    verify_current_trace_dataset,
-)
 from exp.simulation.mining.bindings import load_task_set_lineage_bindings
 from exp.simulation.retrieval import RAGLineageBinding
 from exp.simulation.retrieval.transitions import extract_real_transitions

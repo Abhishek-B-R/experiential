@@ -35,7 +35,7 @@ from exp.common.project import (
     artifact_input,
 )
 from exp.common.traces import Trace, TraceSource, TraceSpan
-from exp.simulation.ingest import (
+from exp.common.traces.ingest import (
     TraceNormalizationResult,
     persist_trace_dataset,
 )

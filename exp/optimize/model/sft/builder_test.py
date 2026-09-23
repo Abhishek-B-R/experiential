@@ -57,6 +57,8 @@ from exp.common.rollouts import (
 )
 from exp.common.tasks import TaskCase, TaskSet
 from exp.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
+from exp.common.traces.ingest.dataset import persist_trace_dataset
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.model.sft.builder import (
     SFTBuildError,
     SFTBuildSpec,
@@ -79,8 +81,6 @@ from exp.optimize.model.sft.contracts import (
     TeacherAcceptanceRule,
     TeacherSFTSource,
 )
-from exp.simulation.ingest.dataset import persist_trace_dataset
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 
 _DIGEST = "a" * 64
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)

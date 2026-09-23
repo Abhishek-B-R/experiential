@@ -36,7 +36,7 @@ add_deferred_typer(
     known_names=("router", "model"),
 )
 app.command("eval", help="Evaluate models on a project and inspect saved results.")(evaluate)
-app.command("build", help="Build a reusable grounded world model from local trace evidence.")(build)
+app.command("build", help="Import traces, mine scenarios, and build a grounded world model.")(build)
 app.command("run", help="Run the local gateway, optionally with one project-backed alias.")(run)
 app.command(
     "login",

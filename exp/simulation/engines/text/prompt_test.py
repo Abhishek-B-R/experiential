@@ -10,6 +10,7 @@ from exp.simulation.engines.text.prompt import (
     WORLD_MODEL_TEXT_PROMPT_VERSION,
     TextWorldModelProtocolError,
     build_world_model_request,
+    candidate_rag_actions,
     parse_world_model_transition,
     text_prompt_sha256,
 )
@@ -25,6 +26,11 @@ def _task() -> TaskCase:
         workload_weight=1.0,
         source_trace_ids=("trace-a",),
     )
+
+
+def test_blank_reply_has_no_retrievable_action() -> None:
+    """Keep the blank response for the world model without inventing a RAG message."""
+    assert candidate_rag_actions(AssistantAction(content="")) == ()
 
 
 def test_text_prompt_uses_visible_evidence_only_and_never_enables_tools() -> None:

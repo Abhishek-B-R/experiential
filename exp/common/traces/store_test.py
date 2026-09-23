@@ -13,9 +13,9 @@ from exp.common.core.artifacts import SourceIdentity, canonical_json_bytes
 from exp.common.models import BillingSource, ModelSnapshot
 from exp.common.project import ArtifactCorruptionError, ArtifactStore, ProjectPaths
 from exp.common.traces import Trace, TraceDataset, TraceSource, TraceSpan
+from exp.common.traces.ingest.dataset import persist_trace_dataset
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.common.traces.store import load_trace_dataset
-from exp.simulation.ingest.dataset import persist_trace_dataset
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 
 
 def _store(tmp_path: Path) -> ArtifactStore:

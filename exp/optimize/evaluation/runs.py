@@ -34,11 +34,13 @@ class EvaluationDefaults(ContractModel):
 
     Attributes:
         models: Selected configured worker aliases.
+        judge: Optional judge model override; None keeps the project judge and its calibration.
         options: Rollout budgets, parallelism, seed, and independent repeat count.
         minimum_scenarios: Required distinct scenarios, defaulting to twenty.
     """
 
     models: tuple[str, ...] = ()
+    judge: str | None = None
     options: ModelEvaluationOptions = Field(default_factory=ModelEvaluationOptions)
     minimum_scenarios: int = Field(default=20, ge=1)
 
@@ -103,6 +105,8 @@ def save_defaults(project: ProjectStore, defaults: EvaluationDefaults) -> None:
 
 def evaluation_tasks(project: ProjectStore) -> tuple[TaskCase, ...]:
     """Read the project's selected immutable scenarios or give the ingestion remedy."""
+    if not (project.paths.project_directory / "project.toml").is_file():
+        raise ValueError(f"project is not built; run exp build {project.paths.project_id} first")
     build = project.load_project().build
     if build is None:
         raise ValueError(
@@ -185,6 +189,7 @@ def prepare_run(
         options=defaults.options,
         run_id=run_id,
         judge_setup=setup,
+        judge_alias=defaults.judge,
         calibration_id=calibration.artifact_id if calibration else None,
         continuation_of=continuation_of,
         created_at=created_at,

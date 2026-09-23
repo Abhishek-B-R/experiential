@@ -54,6 +54,7 @@ from exp.common.project import (
     artifact_input,
 )
 from exp.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.router.judging.contracts import (
     JudgePromptTemplate,
     JudgeScoreProjection,
@@ -74,7 +75,6 @@ from exp.optimize.router.judging.service import (
 )
 from exp.runtime.models.registry import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from exp.simulation.build import ProjectBuild, build_project, select_completed_build
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 from exp.simulation.mining.service import MiningSpec
 
 _TIME = datetime(2026, 8, 13, tzinfo=UTC)

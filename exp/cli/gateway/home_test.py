@@ -60,7 +60,7 @@ def test_run_gateway_menu_starts_with_setup_allowed(
 
 @pytest.mark.parametrize(
     ("policy", "ghost"),
-    [("policy-a", False), (None, True)],
+    [("policy-a", False)],
 )
 def test_project_only_gateway_options_validate_before_home_menu(
     tmp_path: Path,
@@ -68,7 +68,7 @@ def test_project_only_gateway_options_validate_before_home_menu(
     ghost: bool,
 ) -> None:
     """Invalid project-only options fail before the interactive menu can ignore them."""
-    with pytest.raises(typer.BadParameter, match="require --project"):
+    with pytest.raises(typer.BadParameter, match="requires --project"):
         home.default_gateway(
             root=tmp_path,
             policy=policy,

@@ -664,6 +664,93 @@ def _simulator(
     )
 
 
+def test_continuation_rejects_custom_factory_without_constructing_it(tmp_path: Path) -> None:
+    """Reject unsupported continuation before custom initialization or new artifacts."""
+    cell = _cell("cell-a", "task-a")
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    candidate = _ScriptedClient([_response("Answer.", snapshot=_snapshot("candidate-a"))])
+    world = _ScriptedClient(
+        [_response('{"message":"Done.","terminal":true}', snapshot=_snapshot("world-model-a"))]
+    )
+    simulator = _simulator(store, plan, plan_input, task_input, candidate, world)
+    parent = _spec(plan_input, task_input, (cell.cell_id,))
+    simulator.run(parent)
+    child = parent.model_copy(
+        update={
+            "simulation_id": "continuation-child",
+            "continuation_of": artifact_input(store.read(parent.simulation_id).manifest),
+            "maximum_steps": parent.maximum_steps + 1,
+        }
+    )
+    constructions = 0
+
+    def custom_factory() -> AgentRuntime:
+        """Record any initialization that must not happen during admission."""
+        nonlocal constructions
+        constructions += 1
+        return _OneTurnAgent()
+
+    simulator = _simulator(
+        store, plan, plan_input, task_input, candidate, world, agent_factory=custom_factory
+    )
+    before = store.list_ids()
+    with pytest.raises(SimulationResumeError, match="built-in chat"):
+        simulator.run(child)
+    assert constructions == 0
+    assert store.list_ids() == before
+    assert len(candidate.requests) == len(world.requests) == 1
+
+
+def test_blank_worker_reply_is_durable_evidence_and_replays_without_calls(tmp_path: Path) -> None:
+    """Blank completed outputs remain scoreable with paid usage and no phantom retrieval."""
+    cell = _cell("cell-a", "task-a")
+    plan = _plan((cell,))
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    candidate = _ScriptedClient([_response("", snapshot=_snapshot("candidate-a"), cost=0.2)])
+    world = _ScriptedClient(
+        [
+            _response(
+                '{"message":"No answer received.","terminal":true}',
+                snapshot=_snapshot("world-model-a"),
+                cost=0.8,
+            )
+        ]
+    )
+    retriever = _FitRetriever(_fit_rag_input())
+    simulator = _simulator(
+        store, plan, plan_input, task_input, candidate, world, fit_retriever=retriever
+    )
+    spec = _spec(plan_input, task_input, (cell.cell_id,))
+
+    result = simulator.run(spec)
+    rollout = simulator._load_rollout(result.artifact_ids[0])
+    replay = simulator.run(spec)
+
+    assert rollout.stop_reason == StopReason.COMPLETED
+    assert rollout.failure is None
+    assert rollout.final_output == AssistantAction(content="")
+    assert rollout.candidate_economics.cost_usd == NumericMeasurement(
+        value=0.2, provenance="observed"
+    )
+    assert rollout.world_model_economics is not None
+    assert rollout.world_model_economics.cost_usd == NumericMeasurement(
+        value=0.8, provenance="observed"
+    )
+    assert rollout.retrieval_economics is not None
+    assert rollout.retrieval_economics.cost_usd == NumericMeasurement(
+        value=0, provenance="estimated"
+    )
+    assert retriever.queries == []
+    assert retriever.estimate_calls == 0
+    assert len(candidate.requests) == len(world.requests) == 1
+    assert replay == result
+
+
 def test_text_simulation_persists_separate_economics_and_resumes_without_duplicate_calls(
     tmp_path: Path,
 ) -> None:

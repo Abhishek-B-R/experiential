@@ -52,13 +52,19 @@ def test_trace_selection_always_prompts_and_never_discovers_local_files(
 def test_workflow_selection_defaults_and_explicit_steps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Every step is listed upfront; defaults keep rubric and calibration off.
+    """The default prepares scenarios; judge work and router execution require selection.
 
     Args:
         monkeypatch: Pytest patch fixture supplying deterministic prompt answers.
     """
-    answers = iter(("1,2,5", "0,9", "2,3,4"))
-    monkeypatch.setattr(screens.Prompt, "ask", lambda *_args, **_kwargs: next(answers))
+    answers = iter(("1,2", "0,9", "2,3,4"))
+
+    def answer(_prompt: str, *, default: str, console: Console) -> str:
+        """Verify the actual terminal default, then exercise explicit optional steps."""
+        assert default == "1,2"
+        return next(answers)
+
+    monkeypatch.setattr(screens.Prompt, "ask", answer)
     output = StringIO()
 
     default_selection = screens.select_workflow(console=Console(file=output, force_terminal=False))
@@ -68,7 +74,7 @@ def test_workflow_selection_defaults_and_explicit_steps(
         build=True,
         judge_rubric=False,
         judge_calibration=False,
-        router=True,
+        router=False,
     )
     printed = unstyle(output.getvalue())
     assert "providers" in printed

@@ -12,6 +12,7 @@ from exp.common.judging.judgment import Judgment
 from exp.common.judging.rubric import JudgeCalibration
 from exp.common.models import ModelCapabilities, ModelSnapshot
 from exp.common.project import ProjectConfig, ProjectStore
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.router.judging.contracts import (
     HumanJudgeCorrection,
     JudgeCalibrationBudget,
@@ -46,7 +47,6 @@ from exp.optimize.router.judging.service_test import (
 )
 from exp.runtime.models.registry import ResolvedModel, RuntimeModelCatalog
 from exp.simulation.build import build_project
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 from exp.simulation.mining.service import MiningSpec
 
 

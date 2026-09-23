@@ -42,7 +42,12 @@ class EvaluationProtocol(ContractModel):
 
 
 class EvaluationRow(ContractModel):
-    """One sparse, explicit task, candidate, and repeat measurement."""
+    """One sparse, explicit task, candidate, and repeat measurement.
+
+    Attributes:
+        status: Observed production, completed scored, failed, incomplete or unrun evidence.
+            Failed and incomplete rows retain their execution costs but cannot carry scores.
+    """
 
     cell_id: ArtifactId
     task_id: ArtifactId

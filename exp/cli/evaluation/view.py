@@ -1,114 +1,108 @@
-"""Terminal result tables and side-by-side rollout inspection."""
+"""Compact evaluation results with explicit access to reports and accounting."""
 
-from rich.columns import Columns
+import typer
 from rich.console import Console
-from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from exp.cli.shared.picker import PickerOption, choose_many, choose_one
+from exp.cli.shared.picker import PickerOption, choose_one
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.export import export_report, load_report_evidence, rollout_transcript
+from exp.optimize.evaluation.export import export_report, load_report_evidence
 from exp.optimize.evaluation.runs import EvaluationRun
 
 
+def heading(console: Console, project: str, subtitle: str) -> None:
+    """Replace the previous interactive screen with a short project heading."""
+    if console.is_terminal:
+        console.clear()
+    console.print(Text(f"\nexp eval · {project}", style="bold"))
+    console.print(Text(subtitle, style="dim"))
+    console.print()
+
+
 def render_report(console: Console, project: ProjectStore, run: EvaluationRun) -> None:
-    """Present measured quality, candidate cost, latency, coverage, and local report paths."""
+    """Show a small measured-results table without paths or implementation identifiers."""
     evidence = load_report_evidence(project, run)
     report = evidence.report
-    console.print(f"\n[bold]Results · {project.paths.project_id}[/bold]")
+    heading(console, project.paths.project_id, "Saved results")
     console.print(
-        f"{len(evidence.tasks)} distinct scenarios · "
-        f"{report.compared_cells} shared valid scenario/repeat pairs · "
-        f"{report.excluded_cells} excluded"
+        f"{len(evidence.tasks)} scenarios · {len(report.models)} models · "
+        f"{run.prepared.setup.repeats} runs per scenario\n"
     )
-    table = Table(
-        "Model",
-        "Quality /100",
-        "Assistant / task",
-        "Assistant latency",
-        "Valid",
-        "Invalid",
-        "Incomplete",
-        box=None,
-    )
+    table = Table(box=None, padding=(0, 2), expand=False)
+    table.add_column("Model", overflow="fold")
+    table.add_column("Score /100", justify="right", no_wrap=True)
+    table.add_column("$/task", justify="right", no_wrap=True)
+    table.add_column("Latency", justify="right", no_wrap=True)
     for metric in report.models:
         table.add_row(
-            metric.candidate.alias,
-            _number(metric.quality * 100 if metric.quality is not None else None, ""),
+            Text(metric.candidate.alias),
+            f"{metric.quality * 100:.1f}" if metric.quality is not None else "unavailable",
             _number(metric.operating_cost_usd, "$"),
-            _number(metric.latency_seconds, "", "s"),
-            str(metric.scored_cells),
-            str(metric.failed_cells),
-            str(metric.incomplete_cells),
+            _duration(metric.latency_seconds),
         )
     console.print(table)
-    json_path, html_path = export_report(project, run)
-    console.print(f"Report and Pareto plot: {html_path}", markup=False)
-    console.print(f"Portable data: {json_path}", markup=False)
-    console.print(
-        f"Accounted experiment spend: simulation {_number(run.simulation_cost_usd, '$')} · "
-        f"judge {_number(run.judge_cost_usd, '$')}"
-    )
+    console.print("\n[dim]Assistant cost and latency. Shared valid runs only.[/dim]")
+    if report.excluded_cells:
+        console.print(
+            f"[yellow]{report.excluded_cells} excluded pairs · "
+            f"{report.compared_cells} compared[/yellow]"
+        )
+    if run.prepared.setup.judgment_status == "provisional":
+        console.print("[dim]Provisional judge[/dim]")
 
 
 def inspect_report(console: Console, project: ProjectStore, run: EvaluationRun) -> None:
-    """Browse every scenario with one or two selected model traces in the terminal."""
-    evidence = load_report_evidence(project, run)
-    aliases = tuple(model.candidate.alias for model in evidence.report.models)
+    """Open the offline trace viewer or accounting details only when requested."""
+    _, html_path = export_report(project, run)
     while True:
-        task = choose_one(
+        render_report(console, project, run)
+        choice = choose_one(
             console,
-            title="Inspect a scenario (Esc to return)",
-            options=tuple(
-                PickerOption(item.task_id, item.instruction[:120], item.task_id)
-                for item in evidence.tasks
+            title="Results",
+            options=(
+                PickerOption("open", "Open report", "plots and traces"),
+                PickerOption("details", "Details"),
+                PickerOption("back", "Back"),
             ),
         )
-        if not task.values:
+        if not choice.values or choice.values[0] == "back":
             return
-        models = choose_many(
-            console,
-            title="Compare one or two models",
-            minimum=1,
-            options=tuple(PickerOption(alias, alias) for alias in aliases),
-            preselected=aliases[:2],
+        if choice.values[0] == "open":
+            if typer.launch(html_path.resolve().as_uri()) != 0:
+                console.print(Text(f"Open in your browser: {html_path}"))
+                console.input("Enter to return ")
+        else:
+            render_details(console, project, run)
+            console.input("\nEnter to return ")
+
+
+def render_details(console: Console, project: ProjectStore, run: EvaluationRun) -> None:
+    """Expose full coverage, separate experiment spend, and portable artifact paths."""
+    evidence = load_report_evidence(project, run)
+    heading(console, project.paths.project_id, "Result details")
+    console.print(Text(f"Run: {run.run_id}"))
+    console.print(f"{evidence.report.compared_cells} shared valid scenario/run pairs")
+    table = Table("Model", "Valid", "Invalid", "Incomplete", "Not run", box=None)
+    for metric in evidence.report.models:
+        table.add_row(
+            Text(metric.candidate.alias),
+            str(metric.scored_cells),
+            str(metric.failed_cells),
+            str(metric.incomplete_cells),
+            str(metric.not_run_cells),
         )
-        if not models.values:
-            continue
-        if len(models.values) > 2:
-            console.print("Choose at most two models for side-by-side inspection.")
-            continue
-        repeats = sorted({row.repeat for row in evidence.rows if row.task_id == task.values[0]})
-        repeat = choose_one(
-            console,
-            title="Repeat",
-            options=tuple(PickerOption(str(value), f"Run {value + 1}") for value in repeats),
-        )
-        if not repeat.values:
-            continue
-        panels = []
-        for alias in models.values:
-            matching = [
-                row
-                for row in evidence.rows
-                if row.task_id == task.values[0]
-                and row.candidate_alias == alias
-                and row.repeat == int(repeat.values[0])
-            ]
-            for row in matching:
-                rollout = next(
-                    (item for item in evidence.rollouts if item.rollout_id == row.rollout_id), None
-                )
-                text = rollout_transcript(rollout) if rollout else "No saved rollout"
-                panels.append(
-                    Panel(Text(text), title=f"{alias} · repeat {row.repeat + 1} · {row.status}")
-                )
-        console.print(Columns(panels, equal=True, expand=True))
+    console.print(table)
+    console.print(
+        f"\nExperiment spend: simulation {_number(run.simulation_cost_usd, '$')} · "
+        f"judge {_number(run.judge_cost_usd, '$')}"
+    )
+    json_path, html_path = export_report(project, run)
+    console.print(Text(f"\nHTML: {html_path}\nJSON: {json_path}"))
 
 
 def _number(value: float | None, prefix: str, suffix: str = "") -> str:
-    """Format a measurement without turning missing or small positive values into zero."""
+    """Format measurements without turning missing or small positive costs into zero."""
     if value is None:
         return "unavailable"
     precision = 6 if 0 < abs(value) < 0.001 else 4
@@ -116,3 +110,17 @@ def _number(value: float | None, prefix: str, suffix: str = "") -> str:
     if value != 0 and float(rendered) == 0:
         rendered = f"{value:.3g}"
     return f"{prefix}{rendered}{suffix}"
+
+
+def _duration(seconds: float | None) -> str:
+    """Show latency in readable units, preserving subsecond measurements."""
+    if seconds is None:
+        return "unavailable"
+    if seconds == 0:
+        return "0s"
+    if seconds < 1:
+        return f"{seconds * 1000:.2g}ms"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, remainder = divmod(round(seconds), 60)
+    return f"{minutes}m {remainder:02d}s"

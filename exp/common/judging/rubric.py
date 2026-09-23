@@ -21,14 +21,28 @@ MAX_AXIS_SCORE_POINTS = 101
 
 
 class ScoreAnchor(ContractModel):
-    """Plain-language meaning for one integer score on a rubric axis."""
+    """Plain-language meaning for one integer score on a rubric axis.
+
+    Attributes:
+        score: Signed integer on the owning axis.
+        description: Nonempty meaning of this score.
+    """
 
     score: int
     description: str = Field(min_length=1)
 
 
 class RubricDimension(ContractModel):
-    """One scored axis with an inclusive integer range and score meanings."""
+    """One scored axis with an inclusive integer range and score meanings.
+
+    Attributes:
+        dimension_id: Stable identity for this axis.
+        name: Display label, from 1 through 256 characters.
+        description: Nonempty description of the outcome being assessed.
+        min_score: Inclusive signed lower bound, strictly below max_score.
+        max_score: Inclusive upper bound, permitting at most 101 integer score points.
+        anchors: Increasing unique score meanings including both range endpoints.
+    """
 
     dimension_id: ArtifactId
     name: str = Field(min_length=1, max_length=256)
@@ -39,6 +53,7 @@ class RubricDimension(ContractModel):
 
     @model_validator(mode="after")
     def _require_valid_range_and_anchors(self) -> RubricDimension:
+        """Bound allocation and require ordered meanings inside the declared axis."""
         if self.min_score >= self.max_score:
             raise ValueError("rubric axis range must be inclusive with min_score below max_score")
         if self.max_score - self.min_score + 1 > MAX_AXIS_SCORE_POINTS:
@@ -232,7 +247,14 @@ class Rubric(ArtifactEnvelope):
 
 
 class DimensionScoreMap(ContractModel):
-    """A monotonic mapping from raw judge scores to expected human scores."""
+    """A monotonic mapping from raw judge scores to expected human scores.
+
+    Attributes:
+        dimension_id: Axis whose raw scores are mapped.
+        min_score: Inclusive signed lower bound, strictly below max_score.
+        max_score: Inclusive upper bound, permitting at most 101 score points.
+        calibrated_scores: Finite monotonic in-range values, one per integer score.
+    """
 
     dimension_id: ArtifactId
     min_score: int
@@ -241,6 +263,7 @@ class DimensionScoreMap(ContractModel):
 
     @model_validator(mode="after")
     def _require_monotonic_range_scores(self) -> DimensionScoreMap:
+        """Require a finite monotonic mapping covering the bounded score range."""
         if self.min_score >= self.max_score:
             raise ValueError("score-map range must be inclusive with min_score below max_score")
         expected_length = self.max_score - self.min_score + 1

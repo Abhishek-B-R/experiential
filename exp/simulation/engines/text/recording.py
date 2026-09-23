@@ -51,6 +51,7 @@ from exp.runtime.models.providers.errors import ProviderRefusalError
 from exp.runtime.models.providers.transport import classify_retry
 from exp.simulation.engines.clock import timestamp
 from exp.simulation.engines.text.environment import SimulatedToolUseError
+from exp.simulation.engines.text.grounding import estimate_retrieval_economics
 from exp.simulation.engines.text.prompt import (
     SimulatedToolResult,
     TextWorldModelProtocolError,
@@ -425,29 +426,23 @@ class RecordingCandidateClient:
             )
             for action in candidate_rag_actions(candidate_response.output)
         )
-        query_bytes = max(
+        if any(
             len(
                 render_rag_key(
                     task=query.task, initial_context=query.initial_context, action=query.action
                 ).encode("utf-8")
             )
+            > self._query_embedding.maximum_input_tokens
             for query in queries
-        )
-        if query_bytes > self._query_embedding.maximum_input_tokens:
+        ):
             raise _text_failure(
                 StopReason.MAXIMUM_COST,
                 FailureCode.BUDGET,
                 "grounding query exceeds its reserved input-token ceiling",
                 phase="query_embedding_budget",
             )
-        query_economics = combine_economics(
-            tuple(
-                self._grounded_world_model.retriever.estimate_query_economics(
-                    query, self._query_embedding
-                )
-                for query in queries
-            ),
-            require_complete_usage=False,
+        query_economics = estimate_retrieval_economics(
+            queries, self._grounded_world_model.retriever, self._query_embedding
         )
         self._check_spend_ceiling(role="query embedding")
         self._retrieval_economics.append(query_economics)

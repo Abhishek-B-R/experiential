@@ -18,6 +18,11 @@ class JudgeDefinition(ContractModel):
 
     This is authored criteria, not a claim of empirical calibration. Model, prompt,
     human-label provenance and calibration remain separate persisted run artifacts.
+
+    Attributes:
+        name: Visible display name, from 1 through 256 characters.
+        syllabus: Authored judging instructions, from 1 through 32,768 characters.
+        dimensions: One through five distinct axes, each defining every permitted score.
     """
 
     name: str = Field(min_length=1, max_length=256)

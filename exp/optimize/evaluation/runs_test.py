@@ -8,6 +8,7 @@ import pytest
 from exp.cli.build.app import _build_grounded_artifacts
 from exp.common.models import ModelCatalog
 from exp.common.project import ProjectStore
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.evaluation.export import export_report, load_report_evidence
 from exp.optimize.evaluation.prepare import ModelEvaluationOptions
 from exp.optimize.evaluation.runs import (
@@ -28,7 +29,6 @@ from exp.optimize.router.automatic.service_test import (
 )
 from exp.runtime.models import RuntimeModelCatalog
 from exp.simulation.build import build_project, select_completed_build
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 from exp.simulation.mining.service import MiningSpec
 
 

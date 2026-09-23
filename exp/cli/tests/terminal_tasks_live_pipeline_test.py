@@ -30,9 +30,9 @@ from exp.common.judging import Rubric
 from exp.common.judging.provenance import read_artifact_json
 from exp.common.models.catalog import load_model_catalog
 from exp.common.project import ProjectStore
+from exp.common.traces.ingest.environment_capture import canonicalize_environment_capture_payloads
 from exp.optimize.router.judging.service import prepare_manual_judge_calibration
 from exp.runtime.models.registry import RuntimeModelCatalog
-from exp.simulation.ingest.environment_capture import canonicalize_environment_capture_payloads
 
 TRACES_URL = (
     "https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces/resolve/"

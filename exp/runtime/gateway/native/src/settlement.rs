@@ -302,7 +302,12 @@ impl AttemptGuard {
     }
 
     pub(crate) fn begin_dial_observation(&mut self) -> Observation {
-        self.observation = Observation::default();
+        self.observation = self.observation.next_dial();
+        self.observation.clone()
+    }
+
+    /// Share the selected attempt's meter without another JSON boundary or token count.
+    pub(crate) fn capture_observation(&self) -> Observation {
         self.observation.clone()
     }
 

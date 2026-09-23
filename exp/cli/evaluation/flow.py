@@ -6,21 +6,22 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
-from rich.prompt import Confirm, IntPrompt
 from rich.table import Table
+from rich.text import Text
 
-from exp.cli.evaluation.view import inspect_report, render_report
+from exp.cli.evaluation.setup import configure_evaluation
+from exp.cli.evaluation.view import heading, inspect_report, render_report
 from exp.cli.shared.consent import can_prompt, require_spend_consent
 from exp.cli.shared.options import ROOT_OPTION, usage_error
-from exp.cli.shared.picker import PickerOption, choose_many, choose_one
+from exp.cli.shared.picker import PickerOption, choose_one
 from exp.cli.shared.progress import progress_display
 from exp.cli.shared.theme import EXP_THEME
-from exp.common.models import ModelCatalog, load_model_catalog
+from exp.common.models import load_model_catalog
+from exp.common.progress import ProgressEvent, ProgressHook
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_release_revision
-from exp.optimize.evaluation.prepare import ModelEvaluationOptions
+from exp.optimize.evaluation.export import export_report
 from exp.optimize.evaluation.runs import (
-    EvaluationDefaults,
     EvaluationRun,
     evaluation_tasks,
     execute_run,
@@ -99,14 +100,12 @@ def run_evaluation(
             if resume is not None or any(value is not None for value in overrides):
                 raise ValueError("--report cannot be combined with execution options")
             completed = load_run(store, report)
-            render_report(_console, store, completed)
-            if interactive:
-                inspect_report(_console, store, completed)
+            _results(store, completed, interactive=interactive)
             return
         if resume is not None and any(value is not None for value in overrides):
             raise ValueError("--resume uses frozen settings; start a new evaluation to change them")
+        evaluation_tasks(store)
         defaults = load_defaults(store)
-        catalog = load_model_catalog(store.model_catalog_path)
         if resume is None and interactive and models is None:
             resume = _project_screen(store)
             if resume == "exit":
@@ -114,9 +113,9 @@ def run_evaluation(
             if resume is not None:
                 selected = load_run(store, resume)
                 if selected.status == "completed":
-                    render_report(_console, store, selected)
-                    inspect_report(_console, store, selected)
+                    _results(store, selected, interactive=interactive)
                     return
+        catalog = load_model_catalog(store.model_catalog_path)
         if resume is not None:
             run = load_run(store, resume)
         else:
@@ -139,7 +138,9 @@ def run_evaluation(
             )
             selected_defaults = defaults.model_copy(update={"models": aliases, "options": options})
             if interactive and models is None:
-                selected_defaults = _configure(store, catalog, selected_defaults)
+                selected_defaults = configure_evaluation(
+                    _console, store, catalog, selected_defaults
+                )
                 if selected_defaults is None:
                     return
             run = prepare_run(
@@ -151,6 +152,8 @@ def run_evaluation(
             _console.print("Prepared without provider calls. Resume with:")
             _console.print(f"exp eval {project} --root {root} --resume {run.run_id}", markup=False)
             return
+        if interactive and not yes and not _review(store, run):
+            return
         if not require_spend_consent(
             _console,
             root=root,
@@ -160,17 +163,15 @@ def run_evaluation(
             non_interactive=not interactive,
         ):
             return
-        _console.print(
-            "Ctrl-C stops queued work and drains active rollouts; finished work stays saved."
-        )
+        heading(_console, project, "Running evaluation · Ctrl-C to pause")
         try:
-            with progress_display(_console) as progress:
+            with progress_display(_console, single_line=True) as progress:
                 execute_run(
                     store,
                     run,
                     RuntimeModelCatalog(catalog),
                     provider_spend_consented=True,
-                    progress=progress,
+                    progress=_compact_progress(progress),
                 )
         except KeyboardInterrupt:
             _console.print(
@@ -179,114 +180,111 @@ def run_evaluation(
             )
             raise typer.Exit(130) from None
         finished = load_run(store, run.run_id)
-        render_report(_console, store, finished)
-        if interactive:
-            inspect_report(_console, store, finished)
+        _results(store, finished, interactive=interactive)
+
+
+def _results(project: ProjectStore, run: EvaluationRun, *, interactive: bool) -> None:
+    """Choose the compact interactive report or a script-readable export receipt."""
+    if interactive:
+        inspect_report(_console, project, run)
+    else:
+        render_report(_console, project, run)
+        _, html = export_report(project, run)
+        _console.print(Text(f"\nReport: {html}"))
 
 
 def _project_screen(project: ProjectStore) -> str | None:
-    """Show project coverage and let the user resume or inspect saved work."""
+    """Keep starting work separate from browsing saved results and provider setup."""
     tasks = evaluation_tasks(project)
-    config = project.load_project()
-    _console.print(f"\n[bold]{project.paths.project_id}[/bold] · {len(tasks)} distinct scenarios")
-    if config.models:
-        _console.print(
-            f"Environment: {config.models.world_model} · Judge: {config.models.judge}", markup=False
+    while True:
+        heading(_console, project.paths.project_id, f"{len(tasks)} scenarios")
+        choices = [PickerOption("new", "New evaluation")]
+        runs = list_runs(project)
+        if runs:
+            choices.append(PickerOption("saved", "Saved evaluations"))
+        choices.extend(
+            (PickerOption("providers", "Configure providers"), PickerOption("exit", "Back"))
         )
-    runs = list_runs(project)
-    choices = [PickerOption("new", "New evaluation", "choose models and review settings")]
-    choices.extend(
-        PickerOption(run.run_id, f"{run.status.title()} · {run.run_id}", run.stage) for run in runs
-    )
-    choices.append(PickerOption("exit", "Back"))
-    choice = choose_one(_console, title="Model evaluations", options=choices)
-    if not choice.values:
-        return "exit"
-    return None if choice.values[0] == "new" else choice.values[0]
-
-
-def _configure(
-    project: ProjectStore, catalog: ModelCatalog, defaults: EvaluationDefaults
-) -> EvaluationDefaults | None:
-    """Collect model choices and explicit rollout budgets through terminal controls."""
-    del project
-    chosen = choose_many(
-        _console,
-        title="Models to evaluate",
-        minimum=2,
-        preselected=defaults.models,
-        options=tuple(
-            PickerOption(
-                alias,
-                alias,
-                f"{alias} · reasoning {model.capabilities.reasoning_effort or 'provider default'}",
-            )
-            for alias, model in sorted(catalog.models.items())
-            if model.capabilities is not None
-            and model.capabilities.supports_completions is not False
-        ),
-    )
-    if not chosen.values:
-        return None
-    options = defaults.options
-    repeats = IntPrompt.ask("Valid runs per scenario", default=options.repeats, console=_console)
-    concurrency = IntPrompt.ask(
-        "Parallel rollouts", default=options.maximum_concurrency, console=_console
-    )
-    steps = IntPrompt.ask(
-        "Maximum steps per rollout", default=options.maximum_steps, console=_console
-    )
-    tokens = IntPrompt.ask(
-        "Maximum generated tokens per rollout",
-        default=options.maximum_rollout_output_tokens,
-        console=_console,
-    )
-    parsed = ModelEvaluationOptions.model_validate(
-        {
-            **options.model_dump(),
-            "repeats": repeats,
-            "maximum_concurrency": concurrency,
-            "maximum_steps": steps,
-            "maximum_rollout_output_tokens": tokens,
-        }
-    )
-    if not Confirm.ask("Save these project defaults?", default=True, console=_console):
-        return None
-    return defaults.model_copy(update={"models": chosen.values, "options": parsed})
+        choice = choose_one(_console, title="Evaluations", options=choices)
+        if not choice.values or choice.values[0] == "exit":
+            return "exit"
+        if choice.values[0] == "new":
+            return None
+        heading(_console, project.paths.project_id, "Saved evaluations")
+        selected = choose_one(
+            _console,
+            title="Saved evaluations",
+            options=tuple(
+                PickerOption(
+                    run.run_id,
+                    f"{run.created_at.astimezone():%b %d, %H:%M:%S} · {run.status.title()}",
+                    f"{len(run.prepared.setup.candidates)} models",
+                )
+                for run in runs
+            ),
+        )
+        if selected.values:
+            return selected.values[0]
 
 
 def _preflight(project: ProjectStore, run: EvaluationRun) -> None:
-    """Display the exact matrix, judge, capacities, and separately priced execution stages."""
+    """Show the model matrix and costs in one short launch review."""
     cost = run.prepared.cost
     setup = run.prepared.setup
-    _console.print(f"\n[bold]Review evaluation · {project.paths.project_id}[/bold]")
+    heading(_console, project.paths.project_id, "Review evaluation")
     _console.print(
-        f"{cost.scenario_count} distinct scenarios × {cost.worker_count} models × "
-        f"{setup.repeats} repeats = {cost.judgment_count} planned rollouts"
+        f"{cost.scenario_count} scenarios × {cost.worker_count} models × "
+        f"{setup.repeats} runs = {cost.judgment_count} rollouts\n"
+    )
+    _console.print(Text("Models: " + ", ".join(candidate.alias for candidate in setup.candidates)))
+    _console.print(Text(f"World model: {setup.world_model_settings.world_model_alias}"))
+    _console.print(
+        Text(f"Judge: {run.prepared.judge_request.model.model_id} ({setup.judgment_status})")
     )
     _console.print(
-        f"{setup.maximum_steps} steps · "
-        f"{setup.maximum_rollout_output_tokens:,} output tokens/rollout · "
-        f"{setup.maximum_concurrency} parallel workers"
+        f"\nEstimated ${cost.estimated_cost_usd:,.2f} · Maximum ${cost.maximum_cost_usd:,.2f}"
     )
-    _console.print(
-        f"World model: {setup.world_model_settings.world_model_alias} · "
-        f"Judge: {run.prepared.judge_request.model.model_id}",
-        markup=False,
-    )
-    _console.print(
-        f"Judge status: {setup.judgment_status}. "
-        "Invalid attempts are excluded from quality and assistant cost."
-    )
-    table = Table("Stage", "Estimate", "Reserved maximum", box=None)
-    for label, component in (
-        ("Assistant", cost.workers),
-        ("World model", cost.simulation),
-        ("Retrieval", cost.retrieval),
-        ("Judge", cost.judge),
-    ):
-        table.add_row(
-            label, f"${component.estimated_cost_usd:.4f}", f"${component.maximum_cost_usd:.4f}"
+
+
+def _review(project: ProjectStore, run: EvaluationRun) -> bool:
+    """Require an explicit launch action, including when shared consent permits automatic spend."""
+    while True:
+        choice = choose_one(
+            _console,
+            title="Ready",
+            options=(
+                PickerOption("start", "Start evaluation"),
+                PickerOption("cost", "Cost details"),
+                PickerOption("back", "Back"),
+            ),
         )
-    _console.print(table)
-    _console.print(f"Run: {run.run_id}", markup=False)
+        if not choice.values or choice.values[0] == "back":
+            return False
+        if choice.values[0] == "start":
+            return True
+        heading(_console, project.paths.project_id, "Cost details")
+        table = Table("Stage", "Estimate", "Maximum", box=None)
+        for label, component in (
+            ("Assistant", run.prepared.cost.workers),
+            ("World model", run.prepared.cost.simulation),
+            ("Retrieval", run.prepared.cost.retrieval),
+            ("Judge", run.prepared.cost.judge),
+        ):
+            table.add_row(
+                label,
+                f"${component.estimated_cost_usd:,.4f}",
+                f"${component.maximum_cost_usd:,.4f}",
+            )
+        _console.print(table)
+        _console.input("\nEnter to return ")
+        _preflight(project, run)
+
+
+def _compact_progress(progress: ProgressHook) -> ProgressHook:
+    """Keep durable detailed events intact while rendering only the stage and counts."""
+
+    def observe(event: ProgressEvent) -> None:
+        """Forward a concise view of the engine's observed progress."""
+        progress(ProgressEvent(stage=event.stage, completed=event.completed, total=event.total))
+
+    return observe

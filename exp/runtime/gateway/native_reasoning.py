@@ -179,7 +179,10 @@ def _process_reasoning_history(
     verify_history: bool,
 ) -> tuple[GatewayRequest, GatewayRoute | None]:
     """Validate active Fireworks carriers and optionally recover their plaintext."""
-    request = strip_stale_reasoning_history(request)
+    # Authentication examines only active carriers; keep historical evidence
+    # until post-guardrail capture. Execution still strips stale state on reveal.
+    if reveal:
+        request = strip_stale_reasoning_history(request)
     last_user = max(
         (index for index, message in enumerate(request.messages) if message.role == "user"),
         default=-1,

@@ -279,6 +279,7 @@ fn classify(event: &Event) -> StreamAdmission {
         | Event::Incomplete
         | Event::StoppedAtSequence(_)
         | Event::PausedTurn
+        | Event::GeminiThoughtPart(_)
         | Event::Failed(_) => StreamAdmission::Passthrough,
     }
 }

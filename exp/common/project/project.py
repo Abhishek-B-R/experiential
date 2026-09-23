@@ -102,7 +102,14 @@ class ProjectModelConfiguration(ContractModel):
 
 
 class ProjectSystemConfiguration(ContractModel):
-    """Bounded built-in system supported by the hosted Project workflow."""
+    """Bounded built-in system supported by the hosted Project workflow.
+
+    Attributes:
+        kind: Built-in chat runtime selector.
+        system_prompt: Nonempty candidate-visible instructions, at most 20,000 characters.
+        maximum_model_calls: Positive finite per-episode call limit, default 100.
+            Execution also enforces the caller's admitted simulation budgets.
+    """
 
     kind: Literal["builtin_chat"] = "builtin_chat"
     system_prompt: str = Field(min_length=1, max_length=20_000)

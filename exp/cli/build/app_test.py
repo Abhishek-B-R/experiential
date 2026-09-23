@@ -38,9 +38,16 @@ from exp.common.models import (
     write_model_catalog,
 )
 from exp.common.project import ArtifactCorruptionError, ProjectStore, ProjectStoreError
+from exp.common.tasks import load_task_set
 from exp.common.traces import load_trace_dataset
+from exp.common.traces.ingest.dataset import read_trace_model_identity_evidence
+from exp.common.traces.ingest.persistence import read_ingested_traces
+from exp.common.traces.ingest.sources import load_trace_source
+from exp.common.traces.sqlite import SQLiteTraceStore
+from exp.common.traces.sqlite_schema import trace_database_path
+from exp.runtime.gateway.ingest import load_gateway_capture
+from exp.runtime.gateway.ingest.conversion_test import _database, _experience
 from exp.runtime.models import CatalogRoleName, ResolvedModel
-from exp.simulation.ingest.dataset import read_trace_model_identity_evidence
 from exp.simulation.retrieval import load_rag_index
 from exp.simulation.world_model import GroundedWorldModelArtifact
 
@@ -443,7 +450,7 @@ def test_first_build_configures_providers_and_models_through_the_picker(
     result = _RUNNER.invoke(
         app,
         ["build", "support", "--traces", str(source), "--root", str(root)],
-        input="1\n\n1\n\n1\n\n2\n\ny\n",
+        input="/openai\n1\n\n1\n\n1\n\n2\n\ny\n",
     )
 
     assert result.exit_code == 0, result.output
@@ -1270,7 +1277,7 @@ def test_build_help_describes_the_completed_grounded_artifact() -> None:
 
     assert result.exit_code == 0, result.output
     help_text = unstyle(result.output)
-    assert "Build a reusable grounded world model from local trace evidence." in help_text
+    assert "Import traces, mine scenarios, and build a grounded world model." in help_text
     assert "-t" in help_text
     assert "--traces" in help_text
     assert "--dry-run" in help_text
@@ -1378,9 +1385,85 @@ def test_dry_run_has_zero_calls_and_no_completed_selection(tmp_path: Path) -> No
     assert "dry run complete" in output
     assert "Proceed?" not in output
     assert _RESOLVE_CALLS == []
+    assert not trace_database_path(root).exists()
     store = ProjectStore(root, "support")
     assert store.load_project().build is None
     assert store.read_review() is None
+
+
+def test_build_stores_traces_and_mines_a_reusable_twenty_scenario_set(tmp_path: Path) -> None:
+    """Build reuses exact evidence and preserves earlier scenarios when the source grows."""
+    source = _otlp_export(tmp_path, count=20)
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root)
+    arguments = ["build", "support", "--traces", str(source), "--root", str(root)]
+    result = _RUNNER.invoke(app, arguments)
+    assert result.exit_code == 0, result.output
+    imports = SQLiteTraceStore(trace_database_path(root)).list_imports("support")
+    assert len(imports) == 1
+    imported = read_ingested_traces(root, imports[0])
+    assert imported == load_trace_source("otlp", source)
+    project = ProjectStore(root, "support")
+    selected = project.load_project().build
+    assert selected is not None
+    dataset = load_trace_dataset(project.artifacts, selected.trace_dataset.artifact_id)
+    assert dataset.traces == imported.traces
+    task_set = load_task_set(project.artifacts, selected.task_set.artifact_id)
+    assert len(task_set.tasks) == 20
+    resolves = list(_RESOLVE_CALLS)
+    repeated = _RUNNER.invoke(app, arguments)
+    assert repeated.exit_code == 0, repeated.output
+    assert _RESOLVE_CALLS == resolves
+    assert project.load_project().build == selected
+    assert SQLiteTraceStore(trace_database_path(root)).list_imports("support") == imports
+
+    _otlp_export(tmp_path, count=21)
+    updated = _RUNNER.invoke(app, arguments)
+    assert updated.exit_code == 0, updated.output
+    successor = project.load_project().build
+    assert successor is not None and successor != selected
+    assert len(load_task_set(project.artifacts, successor.task_set.artifact_id).tasks) == 21
+    assert load_task_set(project.artifacts, selected.task_set.artifact_id) == task_set
+    assert load_trace_dataset(project.artifacts, selected.trace_dataset.artifact_id) == dataset
+    assert len(SQLiteTraceStore(trace_database_path(root)).list_imports("support")) == 2
+    assert read_ingested_traces(root, imports[0]) == imported
+
+
+def test_build_from_gateway_mines_only_the_selected_identity(tmp_path: Path) -> None:
+    """Captured prompts and tools survive the single build command through task mining."""
+    source = tmp_path / "traffic.db"
+    _database(source, (_experience("developer"), _experience("other")))
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root)
+    result = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            "support",
+            "--traces",
+            str(source),
+            "--source",
+            "gateway",
+            "--identity",
+            "developer",
+            "--root",
+            str(root),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    imports = SQLiteTraceStore(trace_database_path(root)).list_imports("support")
+    assert len(imports) == 1
+    imported = read_ingested_traces(root, imports[0])
+    assert imported == load_gateway_capture(source, identity_id="developer")
+    project = ProjectStore(root, "support")
+    selected = project.load_project().build
+    assert selected is not None
+    dataset = load_trace_dataset(project.artifacts, selected.trace_dataset.artifact_id)
+    assert dataset.traces == imported.traces
+    assert dataset.traces[0].tools[0].name == "lookup"
+    assert len(load_task_set(project.artifacts, selected.task_set.artifact_id).tasks) == 1
 
 
 def test_wizard_preconsent_plan_persists_only_provider_free_unselected_evidence(
