@@ -6,7 +6,7 @@ The root surface is deliberately small:
 |---|---|---|
 | `exp` | Open the branded home screen. `Run Gateway` is the first option and runs setup when needed. | Interactive gateway menu, or the default gateway in a non-interactive terminal. |
 | `exp login [--root ROOT]` | Sign in to Experiential Cloud through the Platform browser approval flow, save the returned organization key, and synchronize the authenticated account's model identities. | User-local credential plus secret-free hosted provider/model records in `.exp/models.toml`. |
-| `exp capture [--verbose] [--domain HOST ...]` | Temporarily disabled pending verified macOS network recovery. | Exits before login or network setup. |
+| `exp capture [--verbose] [--domain HOST ...]` | Capture supported OpenAI and Anthropic traffic across macOS apps until Ctrl+C, reusing `exp login`. | Cloud traces and bounded private retry batches. |
 | `exp run [PROJECT] [--root ROOT] [--check]` | Start the local gateway directly, optionally with one project-backed alias. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
 | `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Launch the guided end-to-end build when traces are omitted, or use one explicit local source for automation. | Simulation, serving RAG, fit RAG, syllabus, evaluation evidence, and a runnable automatic router. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
@@ -23,9 +23,8 @@ The root surface is deliberately small:
 
 ## Direct provider capture on macOS
 
-System Capture is temporarily disabled while macOS network recovery is fixed. `exp capture`
-exits before login, certificate setup, or network interception. Update Experiential after a
-verified fix is released. The intended workflow below remains unavailable until then.
+Capture is experimental. Recent macOS trials encountered DNS failures; reliable interception
+and recovery after a crash or hung process remain under investigation.
 
 Run `exp capture` in a terminal and leave it open while using your AI applications. It captures
 supported traffic across apps using `api.openai.com`, `chatgpt.com`, and `api.anthropic.com`,

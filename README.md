@@ -69,14 +69,18 @@ with exp.load_router("my-project") as client:
 
 ## Capture Traffic
 
-System Capture is temporarily unavailable while macOS network recovery is fixed. `exp capture`
-exits before login or network setup. Update Experiential after a verified fix is released.
-
 Capture is designed to collect supported traces from the Codex and Claude Code desktop apps using
 your existing ChatGPT or Claude subscription, while requests go directly to OpenAI or Anthropic.
+It requires macOS, Python 3.13 or newer, and approval for its extension and certificate:
+
+```bash
+exp capture
+```
+
+Capture is experimental; macOS network reliability is still under investigation.
 
 Use Experiential's gateway as middleware to control costs, enforce guardrails, and optimize quality,
-costs, and speed.
+costs, and speed. Leave the terminal open while you work. Press Ctrl+C to stop capture.
 View your [capture telemetry](https://platform.experientiallabs.ai/api-keys?section=capture).
 
 ## Optimize from Traffic

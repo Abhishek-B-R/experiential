@@ -12,11 +12,22 @@ on the exact release checkout.
   organization key in the user-data credential file, and synchronizes the authenticated account's
   hosted provider/model identities into the secret-free project catalog; no credential value is
   written to the project.
-- `exp capture` is temporarily disabled pending verified macOS network recovery. It exits before
-  login, certificate setup, or network interception. The retained collector uses published
-  mitmproxy dependencies, with no Experiential-owned redirector fork. Its foreground UI,
-  OpenAI/Anthropic normalization, uploads, TLS pass-through, and DNS health checks have synthetic
-  coverage, but this does not establish reliable system-wide interception or recovery.
+- `exp capture` is an experimental foreground macOS HTTPS collector on Python 3.13+ with normal
+  Platform login, streamed OpenAI/Anthropic protocol capture, asynchronous trace uploads, and
+  bounded private retry files. It uses published mitmproxy dependencies and defaults to supported
+  provider hosts across all apps, with an optional exact-host override. The signed Mitmproxy
+  Redirector app and its approved Network Extension own interception. Capture does not edit
+  hosts, DNS, or system proxy settings and has no reset subcommand. Each selected host set gets
+  a CA with critical certificate-level name constraints and persistent current-user SSL trust.
+  Client certificate rejection or repeated handshake failures switch the affected process and
+  host to encrypted pass-through for the run; missing process identity or exhausted capacity
+  uses an explicit host-wide exclusion. Other capture continues, and the terminal names excluded
+  targets and retains a partial-capture indicator. Backend failure still stops Capture. A quiet
+  DNS guard checks selected providers before startup, stops after repeated lookup failures, and
+  checks recovery after shutdown. The native selector excludes the macOS DNS responder process,
+  but app-attributed DNS can still be intercepted. Recent macOS trials encountered DNS failures;
+  reliable interception and crash recovery remain unresolved. Synthetic tests do not establish
+  live client compatibility or guaranteed network recovery.
 - The local gateway supports explicit provider references, identities, virtual keys, grants,
   singleton and certified ordered exact-model pools, frozen-project aliases, bounded precommit
   provider fallback, Chat Completions, Responses (over HTTP and as the Responses-over-WebSocket

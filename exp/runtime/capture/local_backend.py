@@ -151,7 +151,6 @@ def require_local_backend() -> None:
     """
     if sys.platform != "darwin":
         raise RuntimeError("System Capture currently supports macOS only.")
-    _require_network_recovery()
     if os.geteuid() == 0:
         raise RuntimeError("Run exp capture as your normal user, not with sudo.")
     archive = _packaged_archive()
@@ -167,14 +166,6 @@ def require_local_backend() -> None:
         )
     _verify_packaged_app(archive)
     _require_install_access(archive)
-
-
-def _require_network_recovery() -> None:
-    """Block activation until the supported backend's network recovery is verified."""
-    raise RuntimeError(
-        "System Capture is temporarily disabled while macOS network recovery is fixed. "
-        "Update Experiential after a verified fix is released."
-    )
 
 
 def _packaged_archive() -> Path:

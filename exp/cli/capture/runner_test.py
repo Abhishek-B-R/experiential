@@ -15,7 +15,6 @@ from rich.live import Live
 from exp.cli.capture import display as display_module
 from exp.cli.capture import runner
 from exp.cli.capture.auth import CaptureCredentials
-from exp.runtime.capture import local_backend
 from exp.runtime.capture.certificates import capture_certificate_directory
 from exp.runtime.capture.control import CaptureRun, CaptureRunClient, Organization
 from exp.runtime.capture.proxy import CaptureBypassReason
@@ -65,22 +64,6 @@ def test_preflight_runs_before_login_or_cloud_requests(monkeypatch: pytest.Monke
     monkeypatch.setattr(runner, "require_local_backend", unavailable)
     with pytest.raises(RuntimeError, match="Synthetic missing redirector"):
         runner._capture(Console(), domains=("api.openai.com",), root=Path("/tmp/project"))
-
-
-def test_network_recovery_block_stops_before_setup(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
-) -> None:
-    """The real command cannot activate interception while network recovery is unresolved."""
-    monkeypatch.setattr(local_backend.sys, "platform", "darwin")
-    login = Mock(side_effect=AssertionError("must not open login"))
-    package = Mock(side_effect=AssertionError("must not inspect or install backend"))
-    monkeypatch.setattr(runner, "capture_credentials", login)
-    monkeypatch.setattr(local_backend, "_packaged_archive", package)
-    assert runner.main(["--root", str(tmp_path), "--domain", "api.openai.com"]) == 1
-    assert "System Capture is temporarily disabled" in capsys.readouterr().out
-    login.assert_not_called()
-    package.assert_not_called()
-    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize("fail_session", [False, True])

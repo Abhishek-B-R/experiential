@@ -57,8 +57,6 @@ def backend_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, codesig
     monkeypatch.setattr(local_backend.os, "geteuid", lambda: 501)
     monkeypatch.setattr(local_backend.platform, "mac_ver", lambda: ("15.0", ("", "", ""), ""))
     monkeypatch.delenv("MITMPROXY_KEEP_REDIRECTOR", raising=False)
-    # Exercise prerequisite validation independently of the temporary release block.
-    monkeypatch.setattr(local_backend, "_require_network_recovery", lambda: None)
     package = Distribution.at(tmp_path / "mitmproxy_macos-0.12.11.dist-info")
     monkeypatch.setattr(local_backend, "distribution", lambda name: package)
     return applications
