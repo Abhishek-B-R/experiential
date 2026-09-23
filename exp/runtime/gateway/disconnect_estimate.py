@@ -31,6 +31,9 @@ from exp.runtime.gateway.stream_contracts import GatewayEvent, GatewayUsage
 if TYPE_CHECKING:
     from exp.runtime.gateway.native_execution import InflightRequest
 
+FROZEN_CACHED_FRACTION_KEY = "estimated_cached_fraction"
+"""Settlement payload key holding the cache fraction the first estimate used, so a replay is exact."""
+
 FALLBACK_CHARACTERS_PER_TOKEN = 4
 """Characters per token assumed for overflow text when nothing was retained to calibrate on."""
 
@@ -43,9 +46,10 @@ def settled_terminal(
 ) -> tuple[GatewayEvent, GatewayFailure | None]:
     """Build one in-flight request's terminal from its settlement, disconnect estimate applied.
 
-    Deterministic over the retained payload and the registry's current cache
-    signal, so the direct settle and the sweep's replay of the same settlement
-    produce the same meter.
+    Deterministic over the retained payload: the cache fraction read from the
+    registry is frozen INTO the payload on first use, so the sweep's replay of
+    a retained settlement reproduces the original meter even after later
+    settlements moved the organization's live signal.
 
     Args:
         data: Parsed native settlement payload.
@@ -64,9 +68,21 @@ def settled_terminal(
         surface=entry.authorization.surface,
         opened=data.get("opened") is True,
         streamed=streamed_output_from_settlement(data),
-        cached_fraction=_recent_cached_fraction(loads, entry, data.get("attempt_id")),
+        cached_fraction=_frozen_cached_fraction(data, loads, entry),
     )
     return terminal, failure
+
+
+def _frozen_cached_fraction(
+    data: JsonObject, loads: RungLoadRegistry | None, entry: InflightRequest
+) -> float:
+    """Read the cache fraction frozen on the payload, freezing the live signal on first use."""
+    frozen = data.get(FROZEN_CACHED_FRACTION_KEY)
+    if isinstance(frozen, (int, float)) and not isinstance(frozen, bool):
+        return float(frozen)
+    fraction = _recent_cached_fraction(loads, entry, data.get("attempt_id"))
+    data[FROZEN_CACHED_FRACTION_KEY] = fraction
+    return fraction
 
 
 def _recent_cached_fraction(
