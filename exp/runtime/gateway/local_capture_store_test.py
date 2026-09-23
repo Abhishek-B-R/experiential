@@ -1,5 +1,6 @@
 """Scoped durable gateway capture reader regressions."""
 
+import os
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -161,8 +162,61 @@ def test_reader_fails_closed_when_the_entry_is_swapped_around_the_open(
 
     monkeypatch.setattr(sqlite3, "connect", swap_then_connect)
 
-    with pytest.raises(ValueError, match="changed identity"):
+    with pytest.raises(ValueError, match="was replaced"):
         store.read_after()
+
+
+def test_reader_fails_closed_when_the_swap_is_reverted_around_the_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The swap that undoes itself, which the entry's own identity cannot catch.
+
+    An attacker who puts a substitute in place for SQLite's open and restores
+    the original before the check leaves the pinned identity intact, so the
+    entry comparison passes. The directory is the only remaining witness: its
+    change time moved and cannot be set back.
+    """
+    scope = LocalCaptureScope(user_id="user", application_id="app")
+    path = tmp_path / "capture.db"
+    _seed_capture(path, scope, "ours")
+    elsewhere = tmp_path / "elsewhere.db"
+    _seed_capture(elsewhere, scope, "not-ours")
+    store = LocalCaptureStore(path, scope)
+    real_connect = sqlite3.connect
+    held = tmp_path / "held.db"
+
+    def swap_revert_then_connect(database: str, **kwargs: object) -> sqlite3.Connection:
+        pinned_before = path.stat()
+        os.rename(path, held)
+        os.rename(elsewhere, path)
+        connection = real_connect(database, uri=bool(kwargs.get("uri")), timeout=1.0)
+        os.rename(path, elsewhere)
+        os.rename(held, path)
+        # The entry check alone cannot see this: the name is back on the inode
+        # that was pinned, so only the directory still carries the evidence.
+        assert (path.stat().st_dev, path.stat().st_ino) == (
+            pinned_before.st_dev,
+            pinned_before.st_ino,
+        )
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", swap_revert_then_connect)
+
+    with pytest.raises(ValueError, match="was replaced"):
+        store.read_after()
+
+
+def test_reader_refuses_an_absent_database_without_opening_the_name(
+    tmp_path: Path,
+) -> None:
+    """An entry that appears after the check must not be opened unvalidated."""
+    scope = LocalCaptureScope(user_id="user", application_id="app")
+
+    store = LocalCaptureStore(tmp_path / "absent.db", scope)
+
+    with pytest.raises(ValueError, match="not present"):
+        store.read_after()
+    assert not (tmp_path / "absent.db").exists()
 
 
 def test_reader_serves_an_unswapped_database_normally(tmp_path: Path) -> None:
