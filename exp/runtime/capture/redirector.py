@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import Awaitable
 
 from mitmproxy.addons.proxyserver import Proxyserver
@@ -17,6 +18,8 @@ async def start_capture_watchdog(proxyserver: Proxyserver) -> CaptureWatchdog | 
     """Transfer control to an independent watchdog while interception is still disabled."""
     for server in proxyserver.servers:
         if isinstance(server, LocalRedirectorInstance):
+            if sys.platform != "darwin":
+                raise RuntimeError("Capture's network watchdog requires macOS.")
             native = type(server)._server
             if type(server)._instance is server and native is not None:
                 control = await native.take_control_socket()

@@ -13,6 +13,7 @@
 //! connection prewarm: it is answered with an empty completed response
 //! envelope and never touches admission or the ledger.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -115,14 +116,22 @@ fn request_headers(headers: &HeaderMap) -> HeaderMap {
 /// Serve one accepted connection: sequential request frames, each answered
 /// with its full event stream before the next frame is read.
 async fn serve_socket(state: AppState, headers: HeaderMap, mut socket: WebSocket) {
-    while let Some(message) = socket.recv().await {
+    let mut pending = VecDeque::new();
+    loop {
+        let received = match pending.pop_front() {
+            Some(message) => Some(Ok(message)),
+            None => socket.recv().await,
+        };
+        let Some(message) = received else {
+            return;
+        };
         let message = match message {
             Ok(message) => message,
             Err(_) => return,
         };
         match message {
             Message::Text(text) => {
-                if handle_frame(&state, &headers, &mut socket, text.as_str())
+                if handle_frame(&state, &headers, &mut socket, &mut pending, text.as_str())
                     .await
                     .is_err()
                 {
@@ -156,6 +165,7 @@ async fn handle_frame(
     state: &AppState,
     headers: &HeaderMap,
     socket: &mut WebSocket,
+    pending: &mut VecDeque<Message>,
     text: &str,
 ) -> Result<(), ()> {
     let mut value: Value = match serde_json::from_str(text) {
@@ -180,6 +190,16 @@ async fn handle_frame(
     // with an empty completed response and perform no model work.
     if let Some(generate) = body.remove("generate") {
         if generate == Value::Bool(false) {
+            if body.contains_key("gateway") {
+                let mut error = PublicError::new(
+                    400,
+                    "unsupported_parameter",
+                    "gateway requires generate=true. Remove gateway for a prewarm request.",
+                    "invalid_request_error",
+                );
+                error.param = Some("gateway".to_string());
+                return send_public_error(socket, &error).await;
+            }
             let probability_include =
                 body.get("include")
                     .and_then(Value::as_array)
@@ -226,7 +246,30 @@ async fn handle_frame(
         .body(axum::body::Body::from(compact_json(&value)))
         .expect("static request line is valid");
     *request.headers_mut() = headers.clone();
-    let response = responses(State(state.clone()), request).await;
+    let operation = responses(State(state.clone()), request);
+    tokio::pin!(operation);
+    let message_size = |message: &Message| match message {
+        Message::Text(text) => text.len(),
+        Message::Binary(bytes) | Message::Ping(bytes) | Message::Pong(bytes) => bytes.len(),
+        Message::Close(_) => 0,
+    };
+    let mut queued_bytes: usize = pending.iter().map(message_size).sum();
+    let response = loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                match incoming {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return Err(()),
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {},
+                    Some(Ok(message)) => {
+                        queued_bytes = queued_bytes.saturating_add(message_size(&message));
+                        if pending.len() >= 16 || queued_bytes > 8 * 1024 * 1024 { return Err(()); }
+                        pending.push_back(message);
+                    }
+                }
+            }
+            response = &mut operation => break response,
+        }
+    };
     relay_response(socket, response).await
 }
 

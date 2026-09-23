@@ -197,8 +197,12 @@ def canonical_request_sha256(request: ServingRequest) -> Sha256:
             return sha256_json(request)
         case GatewayRequest():
             envelope = provider_replay_authority(request)
-            if envelope is None:
+            policy = None if request.gateway is None else request.gateway.replay_identity()
+            if envelope is None and not policy:
                 return sha256_json(request)
-            return sha256_json({"request_sha256": sha256_json(request), **envelope})
+            identity: JsonObject = {"request_sha256": sha256_json(request), **(envelope or {})}
+            if policy:
+                identity["gateway"] = policy
+            return sha256_json(identity)
         case _:  # pragma: no cover - exhaustive over the ServingRequest union.
             assert_never(request)

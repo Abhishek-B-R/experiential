@@ -53,6 +53,8 @@ impl DecisionsAdmission {
             maximum_same_deployment_attempts: self.maximum_same_deployment_attempts.max(1),
             refusal_failover: false,
             throttle_redial: None,
+            physical_route_cap: None,
+            backoff: None,
         }
     }
 }

@@ -103,6 +103,7 @@ CHAT_MANIFEST = CompatibilityManifest(
         # on every route); the object forwards to OpenRouter rungs and is
         # dropped on wires that have no such field.
         _field("provider", CompatibilityDisposition.SUPPORTED),
+        _field("gateway", CompatibilityDisposition.SUPPORTED),
         # Both API surfaces share the native Responses output-length hint;
         # other routes omit it with disclosure. Values remain validated.
         _field("verbosity", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "verbosity"),
@@ -208,6 +209,7 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         # on every route); the object forwards to OpenRouter rungs and is
         # dropped on wires that have no such field.
         _field("provider", CompatibilityDisposition.SUPPORTED),
+        _field("gateway", CompatibilityDisposition.SUPPORTED),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (

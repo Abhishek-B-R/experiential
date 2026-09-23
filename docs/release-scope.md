@@ -14,7 +14,7 @@ on the exact release checkout.
   written to the project.
 - `exp capture` is an experimental foreground macOS HTTPS collector on Python 3.13+ with normal
   Platform login, streamed OpenAI/Anthropic protocol capture, asynchronous trace uploads, and
-  bounded private retry files. It uses published mitmproxy dependencies and defaults to supported
+  bounded private retry files. It uses pinned Experiential mitmproxy forks and defaults to supported
   provider hosts across all apps, with an optional exact-host override. The signed Mitmproxy
   Redirector app and its approved Network Extension own interception. Capture does not edit
   hosts, DNS, or system proxy settings and has no reset subcommand. Each selected host set gets
@@ -25,9 +25,13 @@ on the exact release checkout.
   targets and retains a partial-capture indicator. Backend failure still stops Capture. A quiet
   DNS guard checks selected providers before startup, stops after repeated lookup failures, and
   checks recovery after shutdown. The native selector excludes the macOS DNS responder process,
-  but app-attributed DNS can still be intercepted. Recent macOS trials encountered DNS failures;
-  reliable interception and crash recovery remain unresolved. Synthetic tests do not establish
-  live client compatibility or guaranteed network recovery.
+  but app-attributed DNS can still be intercepted. macOS UDP sockets follow application closure
+  rather than idle expiry, and native EOF releases their forwarding tasks. A separate watchdog
+  is armed before interception and disables it when the owner exits or its heartbeat expires.
+  Live Codex capture, idle DNS reuse, owner crash, frozen-owner recovery, restart, and Ctrl+C
+  shutdown have been exercised. These tests do not establish universal client compatibility or
+  guaranteed network recovery. Fork distributions must be published before a package release;
+  development checkouts use immutable source pins.
 - The local gateway supports explicit provider references, identities, virtual keys, grants,
   singleton and certified ordered exact-model pools, frozen-project aliases, bounded precommit
   provider fallback, Chat Completions, Responses (over HTTP and as the Responses-over-WebSocket

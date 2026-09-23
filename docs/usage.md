@@ -26,8 +26,8 @@ The root surface is deliberately small:
 
 ## Direct provider capture on macOS
 
-Capture is experimental. Recent macOS trials encountered DNS failures; reliable interception
-and recovery after a crash or hung process remain under investigation.
+Capture is experimental. Live Codex capture and recovery from a crashed or frozen Capture
+process have been exercised on macOS; broader application and network compatibility still needs testing.
 
 Run `exp capture` in a terminal and leave it open while using your AI applications. It captures
 supported traffic across apps using `api.openai.com`, `chatgpt.com`, and `api.anthropic.com`,
@@ -47,7 +47,8 @@ extension awaiting approval, Capture opens Login Items & Extensions and continue
 Mitmproxy Redirector under Network Extensions.
 
 Capture requires Python 3.13 or newer. Other SDK and CLI commands continue to support Python 3.12.
-In a checkout, use `uv run --python 3.13 exp capture`. The first run installs the bundled, signed
+In a checkout, use `uv run --python 3.13 exp capture`. The pinned fork dependencies may require
+Rust for the first source build. The first run installs the bundled, signed
 Mitmproxy Redirector app at `/Applications/Mitmproxy Redirector.app`. Approve its Network Extension
 when macOS asks. Before login, Capture verifies the packaged app and extension signatures against
 mitmproxy's expected signing identity, verifies any installed copy it will reuse, and checks the
@@ -95,6 +96,12 @@ reports whether DNS recovered; Capture does not restart itself or request additi
 The macOS DNS responder process is excluded from interception. DNS attributed to other apps can
 still traverse the redirector, so this guard detects resolver failures rather than guaranteeing
 uninterrupted application connections. It does not change DNS settings or reset system services.
+
+Interception starts only after an independent watchdog is ready. If the foreground process dies
+or its event loop stops sending heartbeats for 15 seconds, the watchdog disables interception
+and terminates a stalled owner. macOS UDP sockets remain open across idle periods until their
+application closes them or Capture stops. The pinned proxy forks provide that lifetime and
+cleanup behavior while retaining the original signed macOS extension.
 
 Run the CLI as your normal user, without `sudo`. Mitmproxy Redirector's Network Extension provides
 system-wide interception while the foreground backend is running. Ctrl+C ends that interception;
