@@ -118,6 +118,41 @@ def test_cache_legs_are_dropped_without_a_reported_input_total() -> None:
     assert usage.output_tokens == 3
 
 
+@pytest.mark.parametrize(
+    ("observed", "fraction", "expected_cached"),
+    [
+        (None, 0.9, "estimate"),
+        (None, 0.0, None),
+        (None, 1.7, "all"),
+        (GatewayUsage(input_tokens=1_000, output_tokens=1), 0.9, 900),
+        (GatewayUsage(input_tokens=1_000, output_tokens=1, cached_input_tokens=0), 0.9, 0),
+        (GatewayUsage(input_tokens=1_000, output_tokens=1, cached_input_tokens=250), 0.9, 250),
+    ],
+)
+def test_unreported_cache_reads_take_the_recent_cached_fraction(
+    observed: GatewayUsage | None, fraction: float, expected_cached: object
+) -> None:
+    """A missing cache-read leg is estimated at the organization's share; a reported one is kept."""
+    request = _request()
+    usage = estimate_disconnect_usage(
+        _disconnect(observed),
+        request=request,
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        opened=True,
+        streamed=StreamedOutput(text="partial"),
+        cached_fraction=fraction,
+    ).usage
+    assert usage is not None
+    assert usage.input_tokens is not None
+    if expected_cached == "estimate":
+        assert usage.cached_input_tokens == int(usage.input_tokens * fraction) > 0
+    elif expected_cached == "all":
+        assert usage.cached_input_tokens == usage.input_tokens
+    else:
+        assert usage.cached_input_tokens == expected_cached
+    assert usage.cache_creation_input_tokens is None
+
+
 def test_overflow_extrapolates_from_the_retained_ratio_or_the_fallback_density() -> None:
     """Text past the data plane's bound is counted, never forgotten."""
     retained = "alpha beta gamma delta " * 8

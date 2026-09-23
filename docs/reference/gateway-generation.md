@@ -140,8 +140,10 @@ even when partial counts are known, together with the generated text observed so
 with an overflow character count). When the provider had accepted the request (`opened`), the
 accounting registry completes the meter with the gateway's own tokenizer: the counted prompt fills
 a missing input total, the observed deltas fill a missing output total (reasoning folded in as an
-output subset), an observed leg is kept when it is at least the estimate, and cache legs stay
-unknown unless the provider reported an input total. The terminal then carries the internal
+output subset), an observed leg is kept when it is at least the estimate, an unreported cache-read leg is
+estimated at the organization's recent cached share of input on that rung (the same settled-meter
+EWMA the cache-priority term reads; zero without a live sample), and cache-write legs stay unknown
+unless the provider reported an input total. The terminal then carries the internal
 `usage_estimated` marker and settles at the estimated cost with `usage_source = estimated`,
 releasing the rest of the reserved bound; the local gateway's monthly allocation charges the same
 figure. A disconnect the provider never answered (not opened), or one on a DECISIONS request,
