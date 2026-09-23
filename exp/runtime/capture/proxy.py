@@ -25,8 +25,13 @@ from mitmproxy.tools.dump import DumpMaster
 
 from exp.runtime.capture.normalization import CapturedExchange, CaptureProtocol, capture_protocol
 from exp.runtime.capture.policy import validate_domains
-from exp.runtime.capture.redirector import capture_server_closed, stop_capture_servers
+from exp.runtime.capture.redirector import (
+    capture_server_closed,
+    start_capture_watchdog,
+    stop_capture_servers,
+)
 from exp.runtime.capture.transports import guard_native_writer
+from exp.runtime.capture.watchdog import CaptureWatchdog
 
 logger = logging.getLogger(__name__)
 _MAX_TLS_BYPASSES = 128
@@ -179,23 +184,33 @@ class CaptureProxy:
             opts.update(ssl_verify_upstream_trusted_ca=str(self._upstream_ca_file))
         proxyserver = master.addons.get("proxyserver")
         assert isinstance(proxyserver, Proxyserver)
+        watchdog: CaptureWatchdog | None = None
         try:
             if not await proxyserver.setup_servers():
                 raise RuntimeError(
                     "Capture could not start the network extension. Approve Mitmproxy "
                     "Redirector in macOS System Settings, then run exp capture again."
                 )
+            watchdog = await start_capture_watchdog(proxyserver)
             if not master.should_exit.is_set():
                 await master.running()
                 if not master.should_exit.is_set():
+                    if watchdog is not None:
+                        await watchdog.activate()
                     ready()
-                    await _wait_for_capture_stop(proxyserver, master.should_exit)
+                    await _wait_for_capture_stop(proxyserver, master.should_exit, watchdog)
         finally:
             self._stopping = True
             try:
                 # Stop redirection before releasing the proxy and upload lifetime.
                 # master.done() alone does not stop mitmproxy's local redirector.
-                await stop_capture_servers(proxyserver)
+                if watchdog is None:
+                    await stop_capture_servers(proxyserver)
+                else:
+                    try:
+                        await stop_capture_servers(proxyserver, watchdog)
+                    finally:
+                        await watchdog.close()
             finally:
                 try:
                     await master.done()
@@ -610,39 +625,37 @@ class CaptureProxy:
             logger.warning("Capture queue rejected an exchange; inference is unaffected")
 
 
-async def _wait_for_capture_stop(proxyserver: Proxyserver, stop: asyncio.Event) -> None:
-    """Observe native backend termination independently from per-connection errors.
-
-    Cancellation drops only this waiter's notification receiver. The server owner
-    retains responsibility for stopping interception and awaiting native closure.
-
-    Raises:
-        RuntimeError: The owned native backend exits before Capture requests a stop.
-    """
+async def _wait_for_capture_stop(
+    proxyserver: Proxyserver, stop: asyncio.Event, watchdog: CaptureWatchdog | None = None
+) -> None:
+    """Stop on a requested shutdown, lost backend, or failed independent watchdog."""
     closed = capture_server_closed(proxyserver)
-    if closed is None:
-        await stop.wait()
-        return
-    backend_task = asyncio.ensure_future(closed)
     stop_task = asyncio.create_task(stop.wait())
+    backend_task = asyncio.ensure_future(closed) if closed is not None else None
+    watchdog_task = asyncio.create_task(watchdog.wait_failed()) if watchdog is not None else None
+    tasks = [task for task in (stop_task, backend_task, watchdog_task) if task is not None]
     try:
-        done, _ = await asyncio.wait((backend_task, stop_task), return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        if watchdog_task in done and not stop.is_set():
+            assert watchdog_task is not None
+            watchdog_task.result()
         if backend_task in done and not stop.is_set():
+            assert backend_task is not None
             cause = None if backend_task.cancelled() else backend_task.exception()
             raise RuntimeError(
                 "Capture network backend stopped unexpectedly. Run exp capture again."
             ) from cause
     finally:
-        backend_task.cancel()
-        stop_task.cancel()
-        await asyncio.gather(backend_task, stop_task, return_exceptions=True)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _capture_options(domains: tuple[str, ...], ca_directory: Path) -> options.Options:
-    """Select provider TLS names and leave the macOS resolver process outside interception."""
+    """Select provider TLS names and start inactive until the independent watchdog is ready."""
     return options.Options(
         confdir=str(ca_directory),
-        mode=["local:!mDNSResponder"],
+        mode=["local:0,!0"],
         allow_hosts=[rf"^{re.escape(domain)}\.?:[0-9]+$" for domain in domains],
         show_ignored_hosts=False,
         ssl_insecure=False,

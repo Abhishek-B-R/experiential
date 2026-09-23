@@ -47,13 +47,13 @@ def regular_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(capture_module, "_capture_options", regular_options)
 
 
-def test_native_capture_excludes_system_resolver_but_keeps_provider_filter(tmp_path: Path) -> None:
-    """The system resolver stays outside native interception; other apps remain eligible."""
+def test_native_capture_starts_inactive_until_watchdog_owns_control(tmp_path: Path) -> None:
+    """No application can be intercepted before independent cleanup is armed."""
     configured = capture_module._capture_options(("api.openai.com",), tmp_path)
     assert len(configured.mode) == 1
     native_mode = ProxyMode.parse(configured.mode[0])
     assert native_mode.type_name == "local"
-    assert native_mode.data == "!mDNSResponder"
+    assert native_mode.data == "0,!0"
     assert configured.allow_hosts == [r"^api\.openai\.com\.?:[0-9]+$"]
     assert configured.ssl_insecure is False
 

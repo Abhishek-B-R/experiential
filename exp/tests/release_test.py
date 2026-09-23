@@ -63,7 +63,9 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
         "typer",
     }
 )
-REQUIRED_CAPTURE_REQUIREMENTS = frozenset({"brotli", "cryptography", "mitmproxy", "zstandard"})
+REQUIRED_CAPTURE_REQUIREMENTS = frozenset(
+    {"brotli", "cryptography", "exp-mitmproxy", "exp-mitmproxy-rs", "zstandard"}
+)
 REQUIRED_WHEEL_MODULES = frozenset(
     {
         "exp/cli/gateway/app.py",
@@ -3221,6 +3223,17 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
         environment=environment,
     )
     installed_python = virtual_environment / "bin" / "python"
+    # Exercise the exact prerelease forks in the isolated installation. The publishing
+    # workflow separately requires their normal PyPI requirements to resolve on 3.13.
+    capture_sources: list[str] = []
+    if sys.version_info >= (3, 13):
+        project = tomllib.loads((repository / "pyproject.toml").read_text(encoding="utf-8"))
+        for name in ("exp-mitmproxy", "exp-mitmproxy-rs"):
+            source = project["tool"]["uv"]["sources"][name]
+            location = f"git+{source['git']}@{source['rev']}"
+            if "subdirectory" in source:
+                location += f"#subdirectory={source['subdirectory']}"
+            capture_sources.append(f"{name} @ {location}")
     _run_checked(
         [
             uv,
@@ -3229,6 +3242,7 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
             "--python",
             str(installed_python),
             *(str(wheel) for wheel in wheels),
+            *capture_sources,
             "openai==3.0.0",
         ],
         cwd=execution,

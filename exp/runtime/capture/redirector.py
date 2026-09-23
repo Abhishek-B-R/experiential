@@ -8,7 +8,20 @@ from collections.abc import Awaitable
 from mitmproxy.addons.proxyserver import Proxyserver
 from mitmproxy.proxy.mode_servers import LocalRedirectorInstance
 
+from exp.runtime.capture.watchdog import CaptureWatchdog
+
 _CONNECTION_SHUTDOWN_TIMEOUT = 2.0
+
+
+async def start_capture_watchdog(proxyserver: Proxyserver) -> CaptureWatchdog | None:
+    """Transfer control to an independent watchdog while interception is still disabled."""
+    for server in proxyserver.servers:
+        if isinstance(server, LocalRedirectorInstance):
+            native = type(server)._server
+            if type(server)._instance is server and native is not None:
+                control = await native.take_control_socket()
+                return await CaptureWatchdog.start(control)
+    return None
 
 
 def capture_server_closed(proxyserver: Proxyserver) -> Awaitable[None] | None:
@@ -35,11 +48,14 @@ def capture_server_closed(proxyserver: Proxyserver) -> Awaitable[None] | None:
     return None
 
 
-async def stop_capture_servers(proxyserver: Proxyserver) -> None:
+async def stop_capture_servers(
+    proxyserver: Proxyserver, watchdog: CaptureWatchdog | None = None
+) -> None:
     """Stop each owned server and report cleanup failures after attempting all of them.
 
     Args:
         proxyserver: The server manager belonging to this foreground Capture process.
+        watchdog: The independent owner of this manager's control connection, when active.
 
     Raises:
         RuntimeError: A server could not confirm shutdown.
@@ -48,7 +64,7 @@ async def stop_capture_servers(proxyserver: Proxyserver) -> None:
     for server in tuple(proxyserver.servers):
         try:
             if isinstance(server, LocalRedirectorInstance):
-                await _stop_local_redirector(server, proxyserver)
+                await _stop_local_redirector(server, proxyserver, watchdog)
             elif server.is_running:
                 await server.stop()
         except Exception as exc:  # noqa: BLE001 - Attempt all owned cleanup before reporting failure.
@@ -60,7 +76,11 @@ async def stop_capture_servers(proxyserver: Proxyserver) -> None:
         ) from errors[0]
 
 
-async def _stop_local_redirector(server: LocalRedirectorInstance, proxyserver: Proxyserver) -> None:
+async def _stop_local_redirector(
+    server: LocalRedirectorInstance,
+    proxyserver: Proxyserver,
+    watchdog: CaptureWatchdog | None = None,
+) -> None:
     """Release only this instance's native redirector, including partial initialization.
 
     Mitmproxy 12's local mode stores its native handle and owner in class-level
@@ -82,7 +102,10 @@ async def _stop_local_redirector(server: LocalRedirectorInstance, proxyserver: P
     # releases its singleton directly before draining and closing the native handle.
     cls._instance = None
     try:
-        native.set_intercept("0,!0")
+        if watchdog is None:
+            native.set_intercept("0,!0")
+        else:
+            await watchdog.disable()
     finally:
         # Cleanup must never confer authority over a replacement owner.
         if cls._server is native and (cls._instance is None or cls._instance is server):
