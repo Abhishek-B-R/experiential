@@ -32,12 +32,21 @@ pub(crate) struct StreamedOutput {
 }
 
 impl StreamedOutput {
+    /// Retain as much of `delta` as still fits (cut at a character boundary)
+    /// and count the rest as overflow, so a delta crossing the bound neither
+    /// vanishes nor skews the density the overflow is extrapolated from.
     fn append(retained: &mut String, overflow: &mut u64, delta: &str) {
-        if retained.len() + delta.len() <= STREAMED_OUTPUT_RETAINED_BYTES {
+        let room = STREAMED_OUTPUT_RETAINED_BYTES.saturating_sub(retained.len());
+        if delta.len() <= room {
             retained.push_str(delta);
-        } else {
-            *overflow += delta.chars().count() as u64;
+            return;
         }
+        let mut cut = room;
+        while cut > 0 && !delta.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        retained.push_str(&delta[..cut]);
+        *overflow += delta[cut..].chars().count() as u64;
     }
 
     /// Retain one normalized event's generated text; anything that is not
@@ -252,6 +261,24 @@ mod tests {
         assert_eq!(bounded.text.len(), STREAMED_OUTPUT_RETAINED_BYTES);
         assert_eq!(bounded.text_overflow_chars, 3);
         assert_eq!(bounded.images, 0);
+
+        // A delta crossing the bound keeps the part that fits, cut at a
+        // character boundary, and counts only the remainder as overflow.
+        let mut crossing = StreamedOutput::default();
+        crossing.record(&Event::TextDelta(
+            "x".repeat(STREAMED_OUTPUT_RETAINED_BYTES - 1),
+        ));
+        crossing.record(&Event::TextDelta("abc".into()));
+        assert_eq!(crossing.text.len(), STREAMED_OUTPUT_RETAINED_BYTES);
+        assert!(crossing.text.ends_with("xa"));
+        assert_eq!(crossing.text_overflow_chars, 2);
+        let mut split = StreamedOutput::default();
+        split.record(&Event::TextDelta(
+            "x".repeat(STREAMED_OUTPUT_RETAINED_BYTES - 1),
+        ));
+        split.record(&Event::TextDelta("éé".into()));
+        assert_eq!(split.text.len(), STREAMED_OUTPUT_RETAINED_BYTES - 1);
+        assert_eq!(split.text_overflow_chars, 2);
     }
 
     #[test]
