@@ -109,6 +109,22 @@ impl<S: Sink> Sink for MaintainedSink<S> {
         self.sink.write(prepared)
     }
 
+    fn batch_records(&self) -> usize {
+        self.sink.batch_records()
+    }
+
+    fn batch_bytes(&self) -> usize {
+        self.sink.batch_bytes()
+    }
+
+    fn prepared_bytes(&self, prepared: &Self::Prepared) -> usize {
+        self.sink.prepared_bytes(prepared)
+    }
+
+    fn write_batch(&mut self, prepared: &[&Self::Prepared]) -> Vec<bool> {
+        self.sink.write_batch(prepared)
+    }
+
     fn take_maintenance_failures(&mut self) -> u64 {
         self.sink.take_maintenance_failures()
     }

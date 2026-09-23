@@ -5,12 +5,82 @@ use std::time::{Duration, Instant};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyTuple;
 
 use super::collector::{Collector, Configuration};
 use super::delivery::Sink;
 use super::record::{Record, Request};
 
 struct PythonSink(Py<PyAny>);
+
+const BATCH_RECORDS: usize = 64;
+const BATCH_BYTES: usize = 1024 * 1024;
+
+struct PythonBatchSink(Py<PyAny>);
+
+struct EncodedRecord {
+    value: Py<PyAny>,
+    bytes: usize,
+}
+
+impl Sink for PythonBatchSink {
+    type Prepared = EncodedRecord;
+
+    fn preparation_bytes(maximum_record_bytes: usize) -> usize {
+        // The last record may cross the soft batch target. Bound both strings
+        // (up to four bytes per character) and the concurrent UTF-8 encoding.
+        (maximum_record_bytes + BATCH_BYTES) * 5 + BATCH_RECORDS * 256
+    }
+
+    fn prepare(&self, record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
+        let encoded = record.encode(maximum_bytes).ok_or(())?;
+        let bytes = encoded.len();
+        Python::try_attach(|py| {
+            encoded.into_pyobject(py).map(|value| EncodedRecord {
+                value: value.into_any().unbind(),
+                bytes,
+            })
+        })
+        .ok_or(())?
+        .map_err(|_| ())
+    }
+
+    fn write(&mut self, prepared: &Self::Prepared) -> Result<(), ()> {
+        if self.write_batch(&[prepared]) == [true] {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    fn batch_records(&self) -> usize {
+        BATCH_RECORDS
+    }
+
+    fn batch_bytes(&self) -> usize {
+        BATCH_BYTES
+    }
+
+    fn prepared_bytes(&self, prepared: &Self::Prepared) -> usize {
+        prepared.bytes
+    }
+
+    fn write_batch(&mut self, prepared: &[&Self::Prepared]) -> Vec<bool> {
+        Python::try_attach(|py| {
+            // A tuple of references: payloads are never joined, parsed or encoded
+            // again for batching. The callback returns per-record durable acks.
+            let records = PyTuple::new(py, prepared.iter().map(|p| p.value.bind(py))).ok()?;
+            self.0
+                .bind(py)
+                .call1((records,))
+                .ok()?
+                .extract::<Vec<bool>>()
+                .ok()
+        })
+        .flatten()
+        .unwrap_or_default()
+    }
+}
 
 impl Sink for PythonSink {
     type Prepared = Py<PyAny>;
@@ -55,6 +125,21 @@ pub struct CaptureCollector {
 
 #[pymethods]
 impl CaptureCollector {
+    /// Deliver bounded groups of prepared JSON strings, with per-record acknowledgements.
+    #[staticmethod]
+    fn batched(py: Python<'_>, config_json: &str, sink: Py<PyAny>) -> PyResult<Self> {
+        if !sink.bind(py).is_callable() {
+            return Err(PyValueError::new_err("capture batch sink must be callable"));
+        }
+        let config: Configuration = serde_json::from_str(config_json)
+            .map_err(|_| PyValueError::new_err("invalid capture configuration"))?;
+        py.detach(|| Collector::new(config, PythonBatchSink(sink)))
+            .map(|collector| Self {
+                inner: Arc::new(collector),
+            })
+            .map_err(PyValueError::new_err)
+    }
+
     /// Use the same collector and delivery worker with a native local SQLite sink.
     #[staticmethod]
     fn sqlite(py: Python<'_>, config_json: &str, local_json: &str) -> PyResult<Option<Self>> {
