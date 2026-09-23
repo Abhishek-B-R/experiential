@@ -10,7 +10,7 @@ import stat
 import subprocess
 import sys
 import tarfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
@@ -18,7 +18,6 @@ from tempfile import TemporaryDirectory
 from xml.parsers.expat import ExpatError
 
 from filelock import FileLock, Timeout
-from mitmproxy_rs.local import LocalRedirector
 
 if sys.platform == "win32":
     pwd = None
@@ -141,11 +140,14 @@ def _require_owned_directory(path: Path) -> None:
         )
 
 
-def require_local_backend() -> None:
+def require_local_backend(*, installation_is_current: Callable[[], bool]) -> None:
     """Validate prerequisites without installing or activating a Network Extension.
 
     The actual mitmproxy startup owns app installation and macOS authorization.
     Passing this check does not establish that the user has approved the extension.
+
+    Args:
+        installation_is_current: Native installer's read-only bundle identity check.
 
     Raises:
         RuntimeError: The platform, packaged app, or installation permissions prevent startup.
@@ -166,7 +168,7 @@ def require_local_backend() -> None:
             "its packaged redirector."
         )
     _verify_packaged_app(archive)
-    _require_install_access()
+    _require_install_access(installation_is_current)
 
 
 def _packaged_archive() -> Path:
@@ -328,14 +330,14 @@ def _verify_bundle_signature(app: Path) -> None:
             )
 
 
-def _require_install_access() -> None:
+def _require_install_access(installation_is_current: Callable[[], bool]) -> None:
     """Use the native installer's content comparison before requesting replacement access."""
     if sys.platform != "darwin":
         raise RuntimeError("System Capture currently supports macOS only.")
     app = _APPLICATIONS / _APP_NAME
     executable = app / "Contents/MacOS/Mitmproxy Redirector"
     try:
-        if LocalRedirector.installation_is_current():
+        if installation_is_current():
             if executable.is_file() and os.access(executable, os.X_OK):
                 _verify_bundle_signature(app)
                 return

@@ -8,11 +8,13 @@ import hashlib
 import os
 import socket
 import subprocess
+import sys
 from collections.abc import Sequence
 from importlib.metadata import version
 from pathlib import Path
 from uuid import uuid4
 
+from mitmproxy_rs.local import LocalRedirector
 from rich.console import Console
 
 from exp.cli.capture.approval import open_pending_approval_settings
@@ -53,7 +55,7 @@ def _capture(
 ) -> None:
     """Prepare normal authentication and certificates, then own one foreground run."""
     with console.status("Checking Capture…"):
-        require_local_backend()
+        require_local_backend(installation_is_current=_installed_bundle_matches)
     with capture_instance():
         credentials = capture_credentials(console=console, environment=os.environ, root=root)
         asyncio.run(
@@ -61,6 +63,13 @@ def _capture(
                 console, domains=domains, credentials=credentials, verbose=verbose
             )
         )
+
+
+def _installed_bundle_matches() -> bool:
+    """Query the native installer's app identity only on its supported platform."""
+    if sys.platform != "darwin":
+        raise RuntimeError("System Capture currently supports macOS only.")
+    return LocalRedirector.installation_is_current()
 
 
 async def _capture_authenticated(

@@ -13,7 +13,6 @@ import tarfile
 from importlib.metadata import Distribution, PackageNotFoundError
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
 from unittest.mock import Mock
 
 import pytest
@@ -60,8 +59,6 @@ def backend_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, codesig
     monkeypatch.delenv("MITMPROXY_KEEP_REDIRECTOR", raising=False)
     package = Distribution.at(tmp_path / "mitmproxy_macos-0.12.11.dist-info")
     monkeypatch.setattr(local_backend, "distribution", lambda name: package)
-    monkeypatch.setattr(local_backend, "LocalRedirector", Mock())
-    cast(Mock, local_backend.LocalRedirector).installation_is_current.return_value = False
     return applications
 
 
@@ -69,7 +66,7 @@ def test_preflight_does_not_install_or_activate(backend_environment: Path, tmp_p
     """A valid packaged dependency passes without extracting an app or changing any file."""
     _archive(tmp_path)
     before = {path: path.stat().st_mtime_ns for path in tmp_path.rglob("*")}
-    local_backend.require_local_backend()
+    local_backend.require_local_backend(installation_is_current=lambda: False)
     assert before == {path: path.stat().st_mtime_ns for path in tmp_path.rglob("*")}
     assert list(backend_environment.iterdir()) == []
 
@@ -80,14 +77,14 @@ def test_preflight_rejects_other_platform_before_package_lookup(
     """Unsupported systems receive the product boundary, not a missing dependency error."""
     monkeypatch.setattr(local_backend.sys, "platform", "linux")
     with pytest.raises(RuntimeError, match="macOS only"):
-        local_backend.require_local_backend()
+        local_backend.require_local_backend(installation_is_current=lambda: False)
 
 
 def test_preflight_rejects_root(backend_environment: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Credential-bearing Capture must remain in the normal user's process."""
     monkeypatch.setattr(local_backend.os, "geteuid", lambda: 0)
     with pytest.raises(RuntimeError, match="normal user, not with sudo"):
-        local_backend.require_local_backend()
+        local_backend.require_local_backend(installation_is_current=lambda: False)
 
 
 def test_missing_dependency_explains_reinstallation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -105,7 +102,7 @@ def test_missing_dependency_explains_reinstallation(monkeypatch: pytest.MonkeyPa
 def test_missing_archive_explains_reinstallation(backend_environment: Path) -> None:
     """Installed metadata without the packaged app does not count as readiness."""
     with pytest.raises(RuntimeError, match="redirector package is missing or invalid"):
-        local_backend.require_local_backend()
+        local_backend.require_local_backend(installation_is_current=lambda: False)
 
 
 @pytest.mark.parametrize("content", [b"invalid tar", b"\0" * 10240])
@@ -144,7 +141,7 @@ def test_extension_minimum_is_enforced(
     _archive(tmp_path, app_version="12.0", extension_version="13.1")
     monkeypatch.setattr(local_backend.platform, "mac_ver", lambda: ("13.0", ("", "", ""), ""))
     with pytest.raises(RuntimeError, match="macOS 13.1 or newer"):
-        local_backend.require_local_backend()
+        local_backend.require_local_backend(installation_is_current=lambda: False)
 
 
 def test_minimum_os_boundary_passes(
@@ -153,7 +150,7 @@ def test_minimum_os_boundary_passes(
     """The exact packaged deployment target is accepted."""
     _archive(tmp_path)
     monkeypatch.setattr(local_backend.platform, "mac_ver", lambda: ("12.0", ("", "", ""), ""))
-    local_backend.require_local_backend()
+    local_backend.require_local_backend(installation_is_current=lambda: False)
 
 
 def test_unmanaged_redirector_override_is_explicit(
@@ -163,7 +160,7 @@ def test_unmanaged_redirector_override_is_explicit(
     _archive(tmp_path)
     monkeypatch.setenv("MITMPROXY_KEEP_REDIRECTOR", "1")
     with pytest.raises(RuntimeError, match="Unset MITMPROXY_KEEP_REDIRECTOR"):
-        local_backend.require_local_backend()
+        local_backend.require_local_backend(installation_is_current=lambda: False)
 
 
 def test_install_permission_denied_is_actionable(
@@ -173,13 +170,12 @@ def test_install_permission_denied_is_actionable(
     _archive(tmp_path)
     monkeypatch.setattr(local_backend, "_writable_directory", lambda path: False)
     with pytest.raises(RuntimeError, match="Ask your administrator.*normal user"):
-        local_backend.require_local_backend()
+        local_backend.require_local_backend(installation_is_current=lambda: False)
     assert list(backend_environment.iterdir()) == []
 
 
 def _installed_app(applications: Path, archive: Path, *, current: bool) -> Path:
-    """Create a fake bundle and configure the native installer's content comparison."""
-    cast(Mock, local_backend.LocalRedirector).installation_is_current.return_value = current
+    """Create a fake bundle with a chosen installation timestamp."""
     app = applications / local_backend._APP_NAME
     contents = app / "Contents"
     (contents / "MacOS").mkdir(parents=True)
@@ -201,7 +197,7 @@ def test_current_install_with_different_timestamp_does_not_require_update_permis
     app = _installed_app(backend_environment, archive, current=True)
     os.utime(app / "Contents/Info.plist", ns=(1, 1))
     monkeypatch.setattr(local_backend, "_writable_directory", lambda path: False)
-    local_backend.require_local_backend()
+    local_backend.require_local_backend(installation_is_current=lambda: True)
 
 
 def test_outdated_install_requires_app_replacement_access(
@@ -214,7 +210,7 @@ def test_outdated_install_requires_app_replacement_access(
         local_backend, "_writable_directory", lambda path: path == backend_environment
     )
     with pytest.raises(RuntimeError, match="permission to install or update"):
-        local_backend.require_local_backend()
+        local_backend.require_local_backend(installation_is_current=lambda: False)
 
 
 def test_current_install_without_executable_fails(
@@ -225,7 +221,7 @@ def test_current_install_without_executable_fails(
     app = _installed_app(backend_environment, archive, current=True)
     (app / "Contents/MacOS/Mitmproxy Redirector").unlink()
     with pytest.raises(RuntimeError, match="installed Mitmproxy Redirector app is incomplete"):
-        local_backend.require_local_backend()
+        local_backend.require_local_backend(installation_is_current=lambda: True)
 
 
 def test_signature_verification_requires_exact_developer_and_bundles(
@@ -270,7 +266,7 @@ def test_tampered_or_wrong_identity_bundle_stops_preflight(
     _archive(tmp_path)
     codesign.return_value = subprocess.CompletedProcess(["codesign"], exit_code, "", "invalid")
     with pytest.raises(RuntimeError, match="rejected.*signature"):
-        local_backend.require_local_backend()
+        local_backend.require_local_backend(installation_is_current=lambda: False)
     assert codesign.call_count == 1
     assert list(backend_environment.iterdir()) == []
     assert not Path(codesign.call_args.args[0][-1]).exists()
@@ -302,7 +298,7 @@ def test_fresh_install_verifies_private_archive_copy(
 ) -> None:
     """Verification precedes the native installer without publishing an app ourselves."""
     _archive(tmp_path)
-    local_backend.require_local_backend()
+    local_backend.require_local_backend(installation_is_current=lambda: False)
     assert codesign.call_count == 2
     staged = Path(codesign.call_args_list[0].args[0][-1])
     assert staged.name == local_backend._APP_NAME
@@ -323,7 +319,7 @@ def test_reused_install_still_requires_valid_signature(
         subprocess.CompletedProcess(["codesign"], 1, "", "modified executable"),
     ]
     with pytest.raises(RuntimeError, match="rejected.*signature"):
-        local_backend.require_local_backend()
+        local_backend.require_local_backend(installation_is_current=lambda: True)
     assert codesign.call_count == 3
     assert codesign.call_args.args[0][-1] == str(app)
     assert app.exists()

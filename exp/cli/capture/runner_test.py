@@ -57,7 +57,7 @@ def test_runner_reports_startup_failure(
 def test_preflight_runs_before_login_or_cloud_requests(monkeypatch: pytest.MonkeyPatch) -> None:
     """Missing backend prerequisites cannot open login or create a cloud run."""
 
-    def unavailable() -> None:
+    def unavailable(*, installation_is_current: Callable[[], bool]) -> None:
         """Reject backend setup before authentication is allowed."""
         raise RuntimeError("Synthetic missing redirector")
 
@@ -104,7 +104,9 @@ def test_session_ownership_covers_login_and_shutdown(
         if fail_session:
             raise RuntimeError("Synthetic shutdown failure")
 
-    monkeypatch.setattr(runner, "require_local_backend", lambda: events.append("preflight"))
+    monkeypatch.setattr(
+        runner, "require_local_backend", lambda installation_is_current: events.append("preflight")
+    )
     monkeypatch.setattr(runner, "capture_instance", ownership)
     monkeypatch.setattr(runner, "capture_credentials", authenticate)
     monkeypatch.setattr(runner, "_capture_authenticated", session)
