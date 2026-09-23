@@ -739,6 +739,7 @@ def _discover_models(
         provider=runtime_provider,
         api_key=endpoint.api_key,
         base_url=endpoint.connection.base_url,
+        catalog="experiential" if provider == HOSTED_SETUP_PICKER else None,
     )
     aliases = set(taken_aliases)
     while True:
@@ -768,6 +769,7 @@ def _discover_models(
                         provider=runtime_provider,
                         api_key=api_key,
                         base_url=endpoint.connection.base_url,
+                        catalog="experiential" if provider == HOSTED_SETUP_PICKER else None,
                     )
                 continue
             return _ProviderDiscoveryResult(endpoint, ()) if recovery == _RECOVERY_SKIP else None

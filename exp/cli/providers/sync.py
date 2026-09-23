@@ -53,6 +53,7 @@ def sync_account_models(
             provider=connection.provider,
             api_key=api_key,
             base_url=connection.base_url,
+            catalog="experiential",
         )
     )
     if not discovered:

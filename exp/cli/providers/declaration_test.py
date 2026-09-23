@@ -128,8 +128,8 @@ def test_router_declaration_requires_limits_and_does_not_invent_cache_from_neigh
     assert serves_role(declared.capabilities, SetupRole.ROUTER_CANDIDATE)
 
 
-def test_published_prices_are_confirmed_instead_of_retyped() -> None:
-    """Provider-published prices are confirmed and never replaced by an inferred value."""
+def test_published_metadata_needs_no_capability_or_price_question() -> None:
+    """Known metadata is reused directly without redundant prompts or price changes."""
     published = DiscoveredModel(
         provider="openai-compatible",
         model="hosted-chat",
@@ -139,7 +139,7 @@ def test_published_prices_are_confirmed_instead_of_retyped() -> None:
         cached_input_cost_per_million_tokens_usd=0.1,
         cache_write_cost_per_million_tokens_usd=0.2,
     )
-    console = ScriptedConsole("\n\n\n\n\n")
+    console = ScriptedConsole("")
 
     declared = declare_role_metadata(
         _identity(published=published),
@@ -153,7 +153,51 @@ def test_published_prices_are_confirmed_instead_of_retyped() -> None:
     assert declared.capabilities.output_cost_per_million_tokens_usd == 2.0
     assert declared.capabilities.cached_input_cost_per_million_tokens_usd == 0.1
     assert declared.capabilities.cache_write_cost_per_million_tokens_usd == 0.2
-    assert "Use published input cost" in console.output
+    assert "Supports chat completions?" not in console.output
+    assert "Use published" not in console.output
+
+
+def test_partial_catalog_metadata_only_asks_for_missing_prices() -> None:
+    """A missing price does not cause known chat, tools, reasoning, or limits to be lost."""
+    published = DiscoveredModel(
+        provider="openai-compatible",
+        model="hosted-chat",
+        supports_completions=True,
+        supports_tools=True,
+        supports_reasoning=True,
+        reasoning_effort="high",
+        context_window_tokens=128000,
+        maximum_output_tokens=16000,
+        input_cost_per_million_tokens_usd=1.0,
+        output_cost_per_million_tokens_usd=2.0,
+    )
+    console = ScriptedConsole("0.1\n0.2\n")
+
+    declared = declare_role_metadata(
+        _identity(published=published), SetupRole.ROUTER_CANDIDATE, console=console
+    )
+
+    assert declared is not None and declared.capabilities is not None
+    assert declared.capabilities.supports_tools is True
+    assert declared.capabilities.reasoning_effort == "high"
+    assert declared.capabilities.context_window_tokens == 128000
+    assert declared.capabilities.cached_input_cost_per_million_tokens_usd == 0.1
+    assert "Supports chat completions?" not in console.output
+    assert "Context window tokens" not in console.output
+
+
+def test_catalog_denial_is_not_overridden_by_a_default_yes_prompt() -> None:
+    """Selecting an embedding-only model cannot invent chat support with Enter."""
+    console = ScriptedConsole("")
+    item = _identity(
+        published=DiscoveredModel(
+            provider="openai-compatible", model="hosted-embed", supports_completions=False
+        )
+    )
+
+    assert declare_role_metadata(item, SetupRole.WORLD_MODEL, console=console) is None
+    assert "does not support chat completions" in console.output
+    assert "[y/n]" not in console.output
 
 
 def test_declining_a_required_capability_keeps_the_model_unassigned() -> None:

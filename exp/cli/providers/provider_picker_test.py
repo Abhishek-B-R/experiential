@@ -1410,6 +1410,7 @@ def test_experiential_cloud_lists_through_the_openai_compatible_family() -> None
             provider="openai-compatible",
             api_key="xpl_test_key",
             base_url=HOSTED_GATEWAY_DEFAULT_BASE_URL,
+            catalog="experiential",
         )
     ]
     assert [model.model for model in models] == ["deepseek-v4-flash"]
