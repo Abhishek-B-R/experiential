@@ -65,7 +65,7 @@ from exp.runtime.gateway.recovery import (
 from exp.runtime.gateway.recovery_test import Clock, eligible
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.routing import GatewayRoute
-from exp.runtime.gateway.rung_admission import RungShed
+from exp.runtime.gateway.rung_admission import RungLoadKey, RungLoadRegistry, RungShed
 from exp.runtime.openai_protocol.errors import (
     THROTTLED_RETRY_AFTER_SECONDS,
     public_failure_error,
@@ -436,6 +436,212 @@ def test_disconnect_usage_evidence_survives_every_settlement_path(
         assert terminal.usage.output_tokens == 3
     assert registry.entry(entry.authorization.request_id) is None
     assert len(ledger.finished) == 1
+
+
+@pytest.mark.parametrize("retry", ["direct", "sweep"])
+def test_opened_disconnect_estimates_cache_reads_from_the_organizations_settled_share(
+    retry: str,
+) -> None:
+    """The org's settled cached fraction fills the cache-read leg, frozen for an exact replay."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    registry._loads.record_settle(  # noqa: SLF001 - seeding the EWMA the settle path reads
+        rung_load_key(entry.route.deployments[0]),
+        entry.authorization.organization_id,
+        cached_tokens=900,
+        input_tokens=1_000,
+    )
+    encoded = json.dumps(
+        {
+            "request_id": entry.authorization.request_id,
+            "attempt_id": started["attempt_id"],
+            "outcome": "failed",
+            "usage": None,
+            "failure": {"failure_class": "cancelled", "safe_message": "caller disconnected"},
+            "finalize": True,
+            "opened": True,
+            "dispatched": True,
+            "usage_incomplete_due_to_disconnect": True,
+            "streamed_output": {"text": "partial", "reasoning": "", "images": 0},
+        }
+    )
+    if retry == "sweep":
+        ledger.fail_finishes = 1
+        with pytest.raises(NativeBridgeError):
+            registry.settle(encoded)
+        # The live signal moves before the sweep lands the retained payload.
+        registry._loads.record_settle(  # noqa: SLF001 - moving the EWMA the replay must ignore
+            rung_load_key(entry.route.deployments[0]),
+            entry.authorization.organization_id,
+            cached_tokens=0,
+            input_tokens=1_000_000,
+        )
+        registry.sweep_expired()
+    else:
+        registry.settle(encoded)
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None and terminal.usage is not None
+    assert terminal.usage_estimated is True
+    counted = counted_input_tokens(entry.request)
+    assert terminal.usage.input_tokens == counted
+    assert terminal.usage.cached_input_tokens == int(counted * 0.9)
+    assert len(ledger.finished) == 1
+
+
+@pytest.mark.parametrize("first_fraction", [0.0, 0.9])
+def test_concurrent_disconnect_estimates_share_one_frozen_fraction(
+    monkeypatch: pytest.MonkeyPatch, first_fraction: float
+) -> None:
+    """A delayed duplicate cannot replace the first frozen sample, including an explicit zero."""
+    registry, _ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    payload: JsonObject = {
+        "attempt_id": started["attempt_id"],
+        "outcome": "failed",
+        "failure": {"failure_class": "cancelled", "safe_message": "caller disconnected"},
+        "usage": None,
+        "opened": True,
+        "dispatched": True,
+        "usage_incomplete_due_to_disconnect": True,
+        "streamed_output": {"text": "partial"},
+    }
+    reading, release = threading.Event(), threading.Event()
+    results: list[GatewayEvent] = []
+    errors: list[BaseException] = []
+    owner = threading.current_thread()
+
+    def racing_fraction(
+        loads: RungLoadRegistry | None, current: InflightRequest, attempt_id: object
+    ) -> float:
+        """Pause the older sample until the competing settlement freezes its sample."""
+        assert current is entry and attempt_id == started["attempt_id"]
+        if threading.current_thread() is owner:
+            return first_fraction
+        reading.set()
+        assert release.wait(5)
+        return 0.3
+
+    def estimate() -> None:
+        """Retain the delayed caller's actual terminal or surface its thread failure."""
+        try:
+            results.append(disconnect_estimate.settled_terminal(payload, entry)[0])
+        except BaseException as error:  # noqa: BLE001 - thread failures must reach the assertion.
+            errors.append(error)
+
+    monkeypatch.setattr(disconnect_estimate, "_recent_cached_fraction", racing_fraction)
+    worker = threading.Thread(target=estimate)
+    worker.start()
+    try:
+        assert reading.wait(5)
+        first = disconnect_estimate.settled_terminal(payload, entry)[0]
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive() and not errors
+    assert results == [first]
+    assert entry.estimated_cache_fractions[str(started["attempt_id"])] == first_fraction
+
+
+@pytest.mark.parametrize("retry", ["direct", "sweep"])
+@pytest.mark.parametrize("observed_write", [False, True])
+def test_estimated_cache_pricing_uses_actual_child_without_creating_observed_evidence(
+    monkeypatch: pytest.MonkeyPatch, retry: str, observed_write: bool
+) -> None:
+    """Child pricing reads only its org/rung sample and never feeds estimates back into evidence."""
+    registry, ledger, entry = _registry()
+    registry.recovery_host = RecoveryHostFake()
+    entry.route = entry.route.model_copy(
+        update={
+            "snapshot": entry.route.snapshot.model_copy(
+                update={
+                    "model_stages": tuple(
+                        ModelExecutionStage(
+                            stage_index=depth,
+                            exact_model_id="child-model"
+                            if depth
+                            else entry.route.snapshot.exact_model_id,
+                            pool_id="child-pool" if depth else entry.route.snapshot.pool_id,
+                            deployment_ids=(deployment.deployment_id,),
+                        )
+                        for depth, deployment in enumerate(entry.route.deployments)
+                    )
+                }
+            )
+        }
+    )
+    first = _start(registry, ordinal=0)
+    failure: JsonObject = {
+        "failure_class": "provider_internal",
+        "safe_message": "provider unavailable",
+        "retryable_same_deployment": False,
+        "failover_eligible": True,
+    }
+    _settle(
+        registry,
+        attempt_id=str(first["attempt_id"]),
+        outcome="failed",
+        finalize=False,
+        failure=failure,
+    )
+    started = _start(registry, ordinal=1, current_depth=0, failure=failure)
+    assert started["route_depth"] == 1
+    for depth, cached in ((0, 100), (1, 900)):
+        registry.loads.record_settle(
+            rung_load_key(entry.route.deployments[depth]),
+            entry.authorization.organization_id,
+            cached_tokens=cached,
+            input_tokens=1_000,
+        )
+    registry.loads.record_settle(
+        rung_load_key(entry.route.deployments[1]),
+        "other-organization",
+        cached_tokens=200,
+        input_tokens=1_000,
+    )
+    recorded = set(entry.recovery_recorded_attempts)
+    sessions = dict(registry.recovery._sessions)
+
+    def reject_estimated_sample(
+        key: RungLoadKey, organization_id: str, *, cached_tokens: int, input_tokens: int
+    ) -> None:
+        """An estimated terminal must never reach the observed fairness/EWMA writer."""
+        pytest.fail("estimated cache pricing fed the observed cache registry")
+
+    monkeypatch.setattr(registry.loads, "record_settle", reject_estimated_sample)
+    payload = json.dumps(
+        {
+            "request_id": entry.authorization.request_id,
+            "attempt_id": started["attempt_id"],
+            "outcome": "failed",
+            "usage": {"input_tokens": 1_000, "output_tokens": 1, "cache_creation_input_tokens": 800}
+            if observed_write
+            else None,
+            "failure": {"failure_class": "cancelled", "safe_message": "caller disconnected"},
+            "finalize": True,
+            "opened": True,
+            "dispatched": True,
+            "usage_incomplete_due_to_disconnect": True,
+            "streamed_output": {"text": "partial"},
+        }
+    )
+    if retry == "sweep":
+        ledger.fail_finishes = 1
+        with pytest.raises(NativeBridgeError):
+            registry.settle(payload)
+        registry.sweep_expired()
+    else:
+        registry.settle(payload)
+    registry.settle(payload)
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None and terminal.usage is not None and terminal.usage_estimated
+    expected_read = 200 if observed_write else int(counted_input_tokens(entry.request) * 0.9)
+    assert terminal.usage.cached_input_tokens == expected_read
+    assert terminal.usage.cache_creation_input_tokens == (800 if observed_write else None)
+    assert terminal.usage.cache_creation_1h_input_tokens is None
+    assert entry.recovery_recorded_attempts == recorded
+    assert registry.recovery._sessions == sessions
+    assert not entry.cache_recorded_attempts
+    assert len(ledger.finished) == 2
 
 
 @pytest.mark.parametrize("retry", ["direct", "sweep"])

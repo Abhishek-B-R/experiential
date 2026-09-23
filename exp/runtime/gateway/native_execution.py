@@ -148,7 +148,10 @@ class InflightRequest:
             retries never renew cache residency or failure cooldowns.
         recovery_observation_lock: Serializes recovery observation timestamps and effects
             for this request only, never held across ledger I/O or host callbacks.
-        execution_lock: Serializes reservation and abandonment for this request only.
+        estimated_cache_fractions: First cached-fraction sample used to price each attempt's
+            disconnect estimate; retained retries reuse it without creating observed warmth.
+        execution_lock: Serializes reservation, abandonment and estimated-fraction retention
+            for this request only; fraction reads and tokenization run outside it.
         pending_abandon: Terminal failure retained while a reservation is in flight.
         ordinary_attempt_counts: Per-route failure-retry counts, initialized from physical
             counts; semantic tool turns and reasoning-repair successors do not increment them.
@@ -173,6 +176,7 @@ class InflightRequest:
     active_attempt_id: str | None = None
     # Every reserved attempt's route depth, for health recording at settle.
     attempt_depths: dict[str, int] = field(default_factory=dict)
+    estimated_cache_fractions: dict[str, float] = field(default_factory=dict)
     # The exact settlement the data plane could not land; the sweep replays it
     # verbatim so a completed outcome and its usage are never downgraded.
     pending_settlement: JsonObject | None = None

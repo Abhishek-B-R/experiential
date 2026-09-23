@@ -680,7 +680,7 @@ class NativeAttemptAccounting:
         opened = bool(data.get("opened", False))
         parsed = terminal_from_settlement(data, surface=entry.authorization.surface)
         retain_recovery_observation_time(self.recovery, entry, attempt_id)
-        terminal, failure = settled_terminal(data, entry, parsed=parsed)
+        terminal, failure = settled_terminal(data, entry, parsed=parsed, loads=self._loads)
         try:
             self._finish_attempt(
                 attempt_id=attempt_id,
@@ -906,7 +906,7 @@ class NativeAttemptAccounting:
             settlement = entry.pending_settlement
             if settlement is None:
                 continue
-            terminal, failure = settled_terminal(settlement, entry)
+            terminal, failure = settled_terminal(settlement, entry, loads=self._loads)
             if self._settle_swept(
                 request_id,
                 entry,

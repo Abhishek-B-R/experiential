@@ -121,6 +121,99 @@ def test_cache_legs_are_dropped_without_a_reported_input_total() -> None:
     assert usage.output_tokens == 3
 
 
+@pytest.mark.parametrize(
+    ("observed", "fraction", "expected_cached"),
+    [
+        (None, 0.9, "estimate"),
+        (None, 0.0, None),
+        (None, 1.7, "all"),
+        (GatewayUsage(input_tokens=1_000, output_tokens=1), 0.9, 900),
+        (GatewayUsage(input_tokens=1_000, output_tokens=1, cached_input_tokens=0), 0.9, 0),
+        (GatewayUsage(input_tokens=1_000, output_tokens=1, cached_input_tokens=250), 0.9, 250),
+    ],
+)
+def test_unreported_cache_reads_take_the_recent_cached_fraction(
+    observed: GatewayUsage | None, fraction: float, expected_cached: object
+) -> None:
+    """A missing cache-read leg is estimated at the organization's share; a reported one is kept."""
+    request = _request()
+    usage = estimate_disconnect_usage(
+        _disconnect(observed),
+        request=request,
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        opened=True,
+        streamed=StreamedOutput(text="partial"),
+        cached_fraction=fraction,
+    ).usage
+    assert usage is not None
+    assert usage.input_tokens is not None
+    if expected_cached == "estimate":
+        assert usage.cached_input_tokens == int(usage.input_tokens * fraction) > 0
+    elif expected_cached == "all":
+        assert usage.cached_input_tokens == usage.input_tokens
+    else:
+        assert usage.cached_input_tokens == expected_cached
+    assert usage.cache_creation_input_tokens is None
+
+
+@pytest.mark.parametrize("hour_tokens", [None, 0, 800])
+@pytest.mark.parametrize("fraction", [0.1, 0.9, 1.0])
+@pytest.mark.parametrize("writes", [800, 1_200])
+@pytest.mark.parametrize("reported_read", [None, 0, 100])
+def test_estimated_reads_cannot_displace_provider_observed_writes(
+    hour_tokens: int | None, fraction: float, writes: int, reported_read: int | None
+) -> None:
+    """Only imputed reads use remaining input; provider read/write and TTL facts stay exact."""
+    observed = GatewayUsage(
+        input_tokens=1_000,
+        output_tokens=1,
+        cached_input_tokens=reported_read,
+        cache_creation_input_tokens=writes,
+        cache_creation_1h_input_tokens=hour_tokens,
+    )
+    terminal = estimate_disconnect_usage(
+        _disconnect(observed),
+        request=_request(),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        opened=True,
+        streamed=StreamedOutput(text="partial"),
+        cached_fraction=fraction,
+    )
+    assert terminal.usage_estimated and terminal.usage is not None
+    usage = terminal.usage
+    expected_read = (
+        reported_read
+        if reported_read is not None
+        else min(max(0, 1_000 - writes), int(1_000 * fraction))
+    )
+    assert usage.cached_input_tokens == expected_read
+    assert usage.cache_creation_input_tokens == writes
+    assert usage.cache_creation_1h_input_tokens == hour_tokens
+
+
+def test_unbound_cache_subsets_do_not_override_a_missing_input_estimate() -> None:
+    """Without a reported input total, prior cache subsets remain unknown rather than invented."""
+    terminal = estimate_disconnect_usage(
+        _disconnect(
+            GatewayUsage(
+                output_tokens=1,
+                cached_input_tokens=7,
+                cache_creation_input_tokens=800,
+                cache_creation_1h_input_tokens=0,
+            )
+        ),
+        request=_request(),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        opened=True,
+        streamed=StreamedOutput(text="partial"),
+        cached_fraction=1.0,
+    )
+    assert terminal.usage is not None
+    assert terminal.usage.cached_input_tokens == terminal.usage.input_tokens
+    assert terminal.usage.cache_creation_input_tokens is None
+    assert terminal.usage.cache_creation_1h_input_tokens is None
+
+
 def test_overflow_extrapolates_from_the_retained_ratio_or_the_fallback_density() -> None:
     """Text past the data plane's bound is counted, never forgotten."""
     retained = "alpha beta gamma delta " * 8

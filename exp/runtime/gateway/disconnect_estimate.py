@@ -18,6 +18,7 @@ from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.attempt_tokens import counted_input_tokens
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayFailure, GatewayRequest
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
+from exp.runtime.gateway.native_execution import rung_load_key
 from exp.runtime.gateway.native_settlement import (
     StreamedOutput,
     streamed_output_from_settlement,
@@ -26,6 +27,7 @@ from exp.runtime.gateway.native_settlement import (
     web_search_requests_from_settlement,
 )
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
+from exp.runtime.gateway.rung_admission import RungLoadRegistry
 from exp.runtime.gateway.stream_contracts import GatewayEvent, GatewayUsage
 
 if TYPE_CHECKING:
@@ -40,16 +42,22 @@ def settled_terminal(
     entry: InflightRequest,
     *,
     parsed: tuple[GatewayEvent, GatewayFailure | None] | None = None,
+    loads: RungLoadRegistry | None = None,
 ) -> tuple[GatewayEvent, GatewayFailure | None]:
     """Build one in-flight request's terminal from its settlement, disconnect estimate applied.
 
-    Deterministic over the retained payload, so the direct settle and the
-    sweep's replay of the same settlement produce the same meter.
+    Deterministic over the retained payload: the cache fraction read from the
+    registry is frozen on the in-flight entry at first use, so the sweep's
+    replay of a retained settlement reproduces the original meter even after
+    later settlements moved the organization's live signal.
 
     Args:
         data: Parsed native settlement payload.
         entry: The owning in-flight request (its prompt and frozen surface).
         parsed: Already validated terminal used to stamp receipt time before tokenization.
+        loads: The rung load registry whose per-organization cached-fraction
+            EWMA (fed by this organization's observed settled meters on the rung)
+            fills an unreported cache leg; None prices the prompt fresh.
 
     Returns:
         The normalized terminal event and optional failure.
@@ -63,6 +71,7 @@ def settled_terminal(
         surface=entry.authorization.surface,
         opened=data.get("opened") is True,
         streamed=streamed_output_from_settlement(data),
+        cached_fraction=_frozen_cached_fraction(data, loads, entry),
     )
     if terminal.usage_estimated and terminal.usage is not None:
         terminal = terminal.model_copy(
@@ -78,6 +87,34 @@ def settled_terminal(
     return terminal, failure
 
 
+def _frozen_cached_fraction(
+    data: JsonObject, loads: RungLoadRegistry | None, entry: InflightRequest
+) -> float:
+    """The fraction frozen on the entry for this attempt, freezing the live signal at first use."""
+    attempt_id = data.get("attempt_id")
+    if not isinstance(attempt_id, str):
+        return 0.0
+    with entry.execution_lock:
+        frozen = entry.estimated_cache_fractions.get(attempt_id)
+    if frozen is not None:
+        return frozen
+    observed = _recent_cached_fraction(loads, entry, attempt_id)
+    with entry.execution_lock:
+        return entry.estimated_cache_fractions.setdefault(attempt_id, observed)
+
+
+def _recent_cached_fraction(
+    loads: RungLoadRegistry | None, entry: InflightRequest, attempt_id: object
+) -> float:
+    """The organization's live cached fraction on the rung that served the attempt, else 0."""
+    depth = None if not isinstance(attempt_id, str) else entry.attempt_depths.get(attempt_id)
+    if loads is None or depth is None or depth >= len(entry.route.deployments):
+        return 0.0
+    return loads.cached_fraction(
+        rung_load_key(entry.route.deployments[depth]), entry.authorization.organization_id
+    )
+
+
 def estimate_disconnect_usage(
     terminal: GatewayEvent,
     *,
@@ -85,6 +122,7 @@ def estimate_disconnect_usage(
     surface: GatewayApiSurface | None,
     opened: bool,
     streamed: StreamedOutput | None,
+    cached_fraction: float = 0.0,
 ) -> GatewayEvent:
     """Fill a cancelled disconnect's unreported meter legs from gateway evidence.
 
@@ -104,6 +142,11 @@ def estimate_disconnect_usage(
         surface: The frozen request surface.
         opened: Whether the provider's response headers arrived.
         streamed: Generated text the data plane observed before the cut.
+        cached_fraction: The organization's recent cached share of input on
+            this rung (its own settled meters' EWMA). An unreported cache leg
+            is estimated at that share, so a caller whose conversation runs
+            hot in the provider cache is not billed the whole prompt fresh
+            (OpenAI-shaped wires report cache only in the final frame).
 
     Returns:
         The terminal with an ``estimated`` usage, or the terminal unchanged.
@@ -138,13 +181,22 @@ def estimate_disconnect_usage(
     )
     if reasoning_tokens is not None and reasoning_tokens > output_tokens:
         output_tokens = reasoning_tokens
-    # Cache legs are subsets of a REPORTED input total; without one they
-    # cannot be squared with the estimated prompt count and stay unknown.
+    # Cache-write legs are subsets of a REPORTED input total; without one they
+    # cannot be squared with the estimated prompt count and stay unknown. A
+    # missing cache-READ leg is estimated at the organization's recent cached
+    # share on this rung; a reported one (Anthropic's message start, zero
+    # included) is kept as reported.
     reported_input = observed is not None and observed.input_tokens is not None
+    cached_input_tokens = observed.cached_input_tokens if reported_input else None
+    if cached_input_tokens is None and cached_fraction > 0 and input_tokens > 0:
+        observed_writes = (observed.cache_creation_input_tokens or 0) if reported_input else 0
+        # Estimated reads cannot displace reported writes or erase unknown write-TTL cost.
+        available_input = max(0, input_tokens - observed_writes)
+        cached_input_tokens = min(available_input, int(input_tokens * min(cached_fraction, 1.0)))
     usage = GatewayUsage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
-        cached_input_tokens=observed.cached_input_tokens if reported_input else None,
+        cached_input_tokens=cached_input_tokens,
         cache_creation_input_tokens=(
             observed.cache_creation_input_tokens if reported_input else None
         ),

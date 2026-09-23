@@ -153,8 +153,12 @@ with an overflow character count). Each repaired generation owns a separate rese
 settlement; its fresh meter cannot erase the prior attempt's observed or unresolved cost. When the
 provider had accepted the request (`opened`), the accounting registry completes the meter with the gateway's own tokenizer: the counted prompt fills
 a missing input total, the observed deltas fill a missing output total (reasoning folded in as an
-output subset), an observed leg is kept when it is at least the estimate, and cache legs stay
-unknown unless the provider reported an input total. The terminal then carries the internal
+output subset), an observed leg is kept when it is at least the estimate, an unreported cache-read leg is
+estimated at the organization's recent cached share of input on the actual attempt's rung (the
+same observed-meter EWMA the cache-priority term reads; zero without a live sample). That fraction
+is frozen per attempt for concurrent or retained settlement retries. Imputed reads cannot overlap
+provider-reported cache writes or erase their unknown TTL cost. Cache-write legs stay unknown
+unless the provider reported an input total. The terminal then carries the internal
 `usage_estimated` marker and settles at the estimated cost with `usage_source = estimated`,
 releasing the rest of the reserved bound; the local gateway's monthly allocation charges the same
 figure. Known gateway web/tool-search counts survive an absent provider meter and remain
