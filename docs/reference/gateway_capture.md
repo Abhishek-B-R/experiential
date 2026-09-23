@@ -85,6 +85,22 @@ storage retries do not decode the response or serialize the record again. Native
 the structure directly. Request admission still crosses the Python/Rust boundary
 as JSON; exceptional lossless sidecars and raw tool-call strings also use JSON.
 
+Hosted destinations can opt into `CaptureCollector.batched(config_json, write_batch)`.
+The callback receives a tuple of prepared JSON strings and must return a list of
+booleans in the same order: `True` acknowledges durable storage or an intentional
+privacy exclusion, and `False` retains that record for retry. Exceptions or an
+incorrect receipt count acknowledge nothing. Failed members retain the exact same
+prepared string object; acknowledged members are released independently.
+
+Batches gather only already queued work, with no fill delay, up to 64 records.
+Gathering stops after reaching a soft 1 MiB encoded-byte target; its final record
+may cross that target, so the hard bound is 1 MiB plus the configured record limit.
+The batch destination reserves five times that combined bound plus 256 bytes per
+batch slot before queue admission. Rust rejects configurations without room for
+this reservation and one queued record. Persistent failures can fill the bounded
+batch or queue and backpressure new requests; batching does not promise unbounded
+progress around failed records or process-crash durability.
+
 Delivery limits bound record count, each final encoded payload and retained record
 memory, including a record currently held by a slow destination. One destination
 worker also reserves space for its prepared payload before any queue admission.
@@ -114,7 +130,7 @@ destination write succeeds. A destination error retains the current record and
 its queue slot, and retries with exponential backoff from 25 milliseconds to one
 second. There is no retry-count expiry: a persistent outage backpressures capture
 instead of discarding accepted data. A malformed or oversized payload that cannot
-be prepared still fails explicitly; raising a storage exception is never a way
+be prepared remains pending with a visible failure counter; raising a storage exception is never a way
 to skip a record. Destinations must be idempotent because a write may commit before
 its acknowledgement is lost. Returning normally also acknowledges an intentional
 exclusion by the destination's current consent or retention policy.
