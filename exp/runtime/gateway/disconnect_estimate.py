@@ -31,9 +31,6 @@ from exp.runtime.gateway.stream_contracts import GatewayEvent, GatewayUsage
 if TYPE_CHECKING:
     from exp.runtime.gateway.native_execution import InflightRequest
 
-FROZEN_CACHED_FRACTION_KEY = "estimated_cached_fraction"
-"""Settlement payload key holding the cache fraction the first estimate used, so a replay is exact."""
-
 FALLBACK_CHARACTERS_PER_TOKEN = 4
 """Characters per token assumed for overflow text when nothing was retained to calibrate on."""
 
@@ -47,9 +44,9 @@ def settled_terminal(
     """Build one in-flight request's terminal from its settlement, disconnect estimate applied.
 
     Deterministic over the retained payload: the cache fraction read from the
-    registry is frozen INTO the payload on first use, so the sweep's replay of
-    a retained settlement reproduces the original meter even after later
-    settlements moved the organization's live signal.
+    registry is frozen on the in-flight entry at first use, so the sweep's
+    replay of a retained settlement reproduces the original meter even after
+    later settlements moved the organization's live signal.
 
     Args:
         data: Parsed native settlement payload.
@@ -76,13 +73,15 @@ def settled_terminal(
 def _frozen_cached_fraction(
     data: JsonObject, loads: RungLoadRegistry | None, entry: InflightRequest
 ) -> float:
-    """Read the cache fraction frozen on the payload, freezing the live signal on first use."""
-    frozen = data.get(FROZEN_CACHED_FRACTION_KEY)
-    if isinstance(frozen, (int, float)) and not isinstance(frozen, bool):
-        return float(frozen)
-    fraction = _recent_cached_fraction(loads, entry, data.get("attempt_id"))
-    data[FROZEN_CACHED_FRACTION_KEY] = fraction
-    return fraction
+    """The fraction frozen on the entry for this attempt, freezing the live signal at first use."""
+    attempt_id = data.get("attempt_id")
+    if not isinstance(attempt_id, str):
+        return 0.0
+    frozen = entry.estimated_cache_fractions.get(attempt_id)
+    if frozen is None:
+        frozen = _recent_cached_fraction(loads, entry, attempt_id)
+        entry.estimated_cache_fractions[attempt_id] = frozen
+    return frozen
 
 
 def _recent_cached_fraction(
