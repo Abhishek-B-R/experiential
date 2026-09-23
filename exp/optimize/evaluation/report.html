@@ -22,7 +22,7 @@
     }
     small,
     .muted {
-      color: #666;
+      color: #0a0a0a;
     }
     button,
     select {
@@ -54,7 +54,7 @@
     pre {
       white-space: pre-wrap;
       overflow-wrap: anywhere;
-      background: #fafafa;
+      background: white;
       border: 1px solid #ececec;
       padding: 16px;
       max-height: 75vh;
@@ -77,6 +77,7 @@
     svg {
       width: 100%;
       height: auto;
+      fill: #0a0a0a;
     }
     #detail {
       display: none;
@@ -196,12 +197,12 @@
       svg("line", { x1: 75, y1: y(v), x2: 1010, y2: y(v), stroke: "#ececec" });
       svg(
         "text",
-        { x: 30, y: y(v) + 5, fill: "#666", "font-size": 13 },
+        { x: 30, y: y(v) + 5, fill: "#0a0a0a", "font-size": 13 },
         (v * 100).toFixed(0),
       );
       svg(
         "text",
-        { x: x(v * max), y: 386, fill: "#666", "font-size": 13 },
+        { x: x(v * max), y: 386, fill: "#0a0a0a", "font-size": 13 },
         "$" + cost(v * max),
       );
     }
