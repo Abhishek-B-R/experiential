@@ -1,6 +1,6 @@
 //! SQLite transaction and retention mechanics, called only by native delivery.
 use super::local::{CaptureConfiguration, Policy};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -71,6 +71,17 @@ pub(super) fn validate(config: &CaptureConfiguration) -> Result<(), String> {
 }
 
 pub(super) fn open_database(path: &Path) -> Result<Connection, String> {
+    // The operator controls the parent directory. Resolve directory aliases
+    // (including macOS /var) without resolving away the final file's symlink.
+    let parent = path
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .ok_or("cannot resolve local capture storage directory")?;
+    let filename = path
+        .file_name()
+        .ok_or("invalid local capture storage filename")?;
+    let canonical = parent.join(filename);
+    let path = canonical.as_path();
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -83,7 +94,21 @@ pub(super) fn open_database(path: &Path) -> Result<Connection, String> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(_) => return Err("cannot create local gateway capture database".into()),
     }
-    let connection = Connection::open(path).map_err(safe_error)?;
+    require_private_file(path, false)?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        require_private_file(Path::new(&sidecar), true)?;
+    }
+    // Creation above establishes private permissions. Never let SQLite recreate
+    // a disappeared file with default permissions or follow a final symlink.
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(safe_error)?;
     let foreign_tables: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table'
@@ -116,6 +141,25 @@ pub(super) fn open_database(path: &Path) -> Result<Connection, String> {
         )
         .map_err(safe_error)?;
     Ok(connection)
+}
+
+fn require_private_file(path: &Path, optional: bool) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("cannot inspect local capture storage permissions".into()),
+    };
+    if !metadata.file_type().is_file() {
+        return Err("local capture storage must be a regular file, not a symlink".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err("local capture storage requires owner-only file permissions".into());
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn persist(connection: &mut Connection, item: &Pending) -> rusqlite::Result<Persisted> {

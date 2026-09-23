@@ -101,10 +101,106 @@ fn another_database_schema_is_rejected_without_modifying_evidence() {
         )
         .unwrap();
     drop(existing);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let before = std::fs::read(&path).unwrap();
     let error = open_database(&path).unwrap_err();
     assert!(error.contains("use a fresh traffic database"));
     assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn permissive_existing_database_is_rejected_without_modifying_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::temp_dir().join(format!(
+        "capture-permissions-{}-{}.db",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let connection = open_database(&path).unwrap();
+    drop(connection);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert!(open_database(&path).unwrap_err().contains("owner-only"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_database_symlink_is_rejected_without_modifying_target() {
+    use std::os::unix::fs::symlink;
+    let path = std::env::temp_dir().join(format!(
+        "capture-symlink-{}-{}.db",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let link = path.with_extension("link");
+    let connection = open_database(&path).unwrap();
+    drop(connection);
+    let before = std::fs::read(&path).unwrap();
+    symlink(&path, &link).unwrap();
+    assert!(open_database(&link).unwrap_err().contains("regular file"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(link).unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_sqlite_sidecars_must_also_be_private_before_any_database_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::temp_dir().join(format!(
+        "capture-sidecars-{}-{}.db",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let connection = open_database(&path).unwrap();
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        assert_eq!(
+            std::fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    drop(connection);
+    let before = std::fs::read(&path).unwrap();
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        std::fs::write(&sidecar, b"untouched sidecar fixture").unwrap();
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(open_database(&path).unwrap_err().contains("owner-only"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read(&sidecar).unwrap(),
+            b"untouched sidecar fixture"
+        );
+        std::fs::remove_file(&sidecar).unwrap();
+    }
     std::fs::remove_file(path).unwrap();
 }
 

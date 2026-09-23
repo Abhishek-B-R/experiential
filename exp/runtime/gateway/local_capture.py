@@ -51,7 +51,7 @@ def open_local_capture(configuration: CaptureConfiguration | None) -> CaptureCon
 
 def local_capture_path(root: Path) -> Path:
     """Return the separate content database, never the accounting database."""
-    return (root / "gateway" / "traffic.db").resolve()
+    return root.resolve() / "gateway" / "traffic.db"
 
 
 def local_capture_configuration(root: Path, *, ghost: bool = False) -> CaptureConfiguration | None:

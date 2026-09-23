@@ -26,6 +26,18 @@ from exp.simulation.ingest.gateway import load_gateway_capture
 exp_gateway_native = pytest.importorskip("exp_gateway_native")
 
 
+def test_default_capture_path_does_not_resolve_away_a_database_symlink(tmp_path: Path) -> None:
+    """Keep the final path visible to the native storage boundary's symlink rejection."""
+    directory = tmp_path / "gateway"
+    directory.mkdir()
+    target = tmp_path / "another.db"
+    target.touch()
+    link = directory / "traffic.db"
+    link.symlink_to(target)
+    assert local_capture_path(tmp_path) == link
+    assert local_capture_path(tmp_path) != target
+
+
 def test_local_capture_defaults_on_for_own_provider_keys_and_ghost_disables(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

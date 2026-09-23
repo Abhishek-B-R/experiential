@@ -41,6 +41,20 @@ than silently hiding their records or modifying their contents.
 
 ## Privacy and retention
 
+Capture is intended for a trusted local OS account whose gateway directory is not
+writable by other users. It is not a shared-host tenant isolation boundary. The
+full conversation is stored in plaintext for local replay and mining, including
+any sensitive information inside prompts or tool output. No redaction, encryption,
+or protection from another process running as the same account is implied. Use a
+private account directory and appropriate disk/backup protection. On Windows, the
+operator must restrict that directory with account ACLs.
+
+On Unix, new content files use mode `0600`. Startup refuses group/other-accessible
+existing databases or SQLite sidecars, and refuses symlink/non-regular content
+files before writing. It does not silently change permissions or alter those files;
+the operator must secure them first. This keeps the requested default-on collection
+without weakening the stored evidence or claiming encrypted storage.
+
 `exp run --ghost` disables content collection while retaining content-free
 accounting. The startup receipt reports `traffic_capture` and `traffic_database`.
 The human-readable banner discloses capture before requests are served.
