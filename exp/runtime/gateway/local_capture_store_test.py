@@ -134,3 +134,45 @@ def test_reader_refuses_a_dangling_symlink_rather_than_reading_it_as_absent(
 
     with pytest.raises(ValueError, match="regular file"):
         store.read_after()
+
+
+def test_reader_fails_closed_when_the_entry_is_swapped_around_the_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The check-to-use race: validated, then replaced before SQLite resolves the name.
+
+    The guard cannot hand SQLite its descriptor, so the two opens resolve the
+    pathname separately. This drives the window directly by swapping the entry
+    for a link to another database at the moment of connect, and asserts the
+    reader refuses rather than serving the substitute's rows.
+    """
+    scope = LocalCaptureScope(user_id="user", application_id="app")
+    path = tmp_path / "capture.db"
+    _seed_capture(path, scope, "ours")
+    elsewhere = tmp_path / "elsewhere.db"
+    _seed_capture(elsewhere, scope, "not-ours")
+    store = LocalCaptureStore(path, scope)
+    real_connect = sqlite3.connect
+
+    def swap_then_connect(database: str, **kwargs: object) -> sqlite3.Connection:
+        path.unlink()
+        path.symlink_to(elsewhere)
+        return real_connect(database, uri=bool(kwargs.get("uri")), timeout=1.0)
+
+    monkeypatch.setattr(sqlite3, "connect", swap_then_connect)
+
+    with pytest.raises(ValueError, match="changed identity"):
+        store.read_after()
+
+
+def test_reader_serves_an_unswapped_database_normally(tmp_path: Path) -> None:
+    """The identity check must not refuse the ordinary case it guards."""
+    scope = LocalCaptureScope(user_id="user", application_id="app")
+    path = tmp_path / "capture.db"
+    _seed_capture(path, scope, "ours")
+
+    store = LocalCaptureStore(path, scope)
+
+    assert [row.experience.experience_id for row in store.read_after()] == ["ours"]
+    assert [row.experience.experience_id for row in store.read_snapshot()] == ["ours"]
+    assert [row.experience.experience_id for row in store.iter_snapshot()] == ["ours"]

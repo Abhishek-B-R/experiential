@@ -1,5 +1,7 @@
 """Read-only identity-scoped consumption of the native gateway capture database."""
 
+import errno
+import os
 import sqlite3
 import stat
 from collections.abc import Generator
@@ -8,39 +10,83 @@ from pathlib import Path
 
 from exp.runtime.gateway.local_capture_contracts import CapturedExchange, LocalCaptureScope
 
+_NOT_A_REGULAR_FILE = (
+    "capture database must be a regular file; use a database path without a file symlink"
+)
 
-def _require_regular_file(path: Path) -> None:
-    """Reject a final path entry that is not a regular file, without following it.
 
-    A symlink at the database filename redirects the reader to content the
+def _pin_regular_file(path: Path) -> int | None:
+    """Open the final path entry without following it, and keep it pinned.
+
+    ``O_NOFOLLOW`` refuses a final-entry symlink in the open itself, so there is
+    no window between deciding the entry is a regular file and holding it. The
+    descriptor stays open for the whole read: it pins the inode, so the identity
+    the caller checks against cannot be recycled underneath it.
+
+    A symlink at the database filename would redirect the reader to content the
     operator never named, and every scope check downstream then inspects the
-    wrong file and finds nothing wrong. File mode is deliberately not checked
-    here: native capture owns this database and its permissions, so a read-only
+    wrong file and finds nothing wrong. File mode is deliberately not checked:
+    native capture owns this database and its permissions, so a read-only
     consumer is not the component that gets to refuse them.
-
-    An absent path is left to the connection, which already reports it as the
-    actionable "collect fresh traffic" error a caller matches on. Absence is not
-    the substitution this guards against, and answering it here first would
-    replace that guidance with a bare metadata error.
 
     Args:
         path: Capture database whose final entry has not been resolved.
 
+    Returns:
+        A descriptor on the validated entry, or ``None`` when the path is
+        absent. Absence is left to the connection, which reports it as the
+        actionable "collect fresh traffic" error a caller matches on; it is not
+        the substitution this guards against.
+
     Raises:
-        OSError: The path's metadata cannot be read for a reason other than
-            absence.
+        OSError: The entry cannot be opened for a reason other than absence.
         ValueError: The final entry is a symlink or another non-regular file.
     """
     try:
-        # lstat, not stat: stat answers about the TARGET, which is the question
-        # that lets a symlink through. A DANGLING link still answers here, so it
-        # is refused rather than mistaken for an absent file.
-        mode = path.lstat().st_mode
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except FileNotFoundError:
-        return
-    if not stat.S_ISREG(mode):
+        return None
+    except OSError as error:
+        # ELOOP is how O_NOFOLLOW reports "the final entry is a symlink",
+        # including a dangling one, which must not read as an absent file.
+        if error.errno not in {errno.ELOOP, errno.EMLINK}:
+            raise
+        raise ValueError(_NOT_A_REGULAR_FILE) from error
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(_NOT_A_REGULAR_FILE)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _require_pinned_identity(path: Path, descriptor: int) -> None:
+    """Fail closed unless ``path`` still names the pinned entry.
+
+    SQLite is handed a pathname, not this descriptor, so it resolves the name a
+    second time and could open a different file than the one validated. Only the
+    caller can tell: comparing the name's CURRENT target against the pinned
+    inode answers whether the two opens agree, and a mismatch means the entry
+    was replaced around the database open. That is refused rather than read.
+
+    ``stat`` here, not ``lstat``, precisely because it must answer the question
+    SQLite's own open asked: what does this name resolve to.
+
+    Args:
+        path: The database pathname handed to SQLite.
+        descriptor: The pinned entry from :func:`_pin_regular_file`.
+
+    Raises:
+        OSError: The path's metadata cannot be read.
+        ValueError: The name no longer resolves to the validated entry.
+    """
+    pinned = os.fstat(descriptor)
+    current = path.stat()
+    if (current.st_dev, current.st_ino) != (pinned.st_dev, pinned.st_ino):
         raise ValueError(
-            "capture database must be a regular file; use a database path without a file symlink"
+            "capture database changed identity while it was being opened; "
+            "retry the read once the path is stable"
         )
 
 
@@ -104,12 +150,21 @@ class LocalCaptureStore:
 
     def _iter_read(self, *, sequence: int, limit: int | None) -> Generator[CaptureRow]:
         """Own one snapshot and validate every payload against its durable partition."""
-        # Checked per read rather than once at construction: a store outlives the
-        # call that built it, so the entry can be replaced with a link in between.
-        # Both read paths land here, so neither can be left behind.
-        _require_regular_file(self._path)
-        connection = sqlite3.connect(f"{self._path.as_uri()}?mode=ro", uri=True, timeout=1.0)
+        # Validated per read rather than once at construction: a store outlives
+        # the call that built it, so the entry can be replaced in between. Both
+        # read paths land here, so neither can be left behind.
+        descriptor = _pin_regular_file(self._path)
         try:
+            connection = sqlite3.connect(f"{self._path.as_uri()}?mode=ro", uri=True, timeout=1.0)
+        except BaseException:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise
+        try:
+            if descriptor is not None:
+                # Before any query: SQLite resolved the pathname itself, so this
+                # is what proves it opened the entry that was validated.
+                _require_pinned_identity(self._path, descriptor)
             connection.execute("BEGIN")
             cursor = connection.execute(
                 "SELECT sequence, payload FROM gateway_captures "
@@ -129,3 +184,7 @@ class LocalCaptureStore:
                 yield CaptureRow(sequence=row[0], experience=experience)
         finally:
             connection.close()
+            if descriptor is not None:
+                # Held until the read is done: while it is open the inode cannot
+                # be recycled, so the identity checked above stays meaningful.
+                os.close(descriptor)
