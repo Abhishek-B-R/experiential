@@ -1430,3 +1430,63 @@ def test_udp_and_quic_bypass_decryption_and_preserve_datagrams(port: int, payloa
         assert forwarded[0].data == payload
     assert not captured
     assert not proxy._captures
+
+
+@pytest.mark.parametrize("ending", ["error", "response", "shutdown"])
+def test_abandoned_websocket_upgrade_is_not_a_model_request(ending: str) -> None:
+    """An empty GET upgrade must not inflate capture or drop counts before response.create."""
+    captured: list[CapturedExchange] = []
+    proxy = CaptureProxy(
+        sink=lambda exchange: captured.append(exchange) is None, domains=("chatgpt.com",)
+    )
+    flow = http.HTTPFlow(
+        connection.Client(peername=("127.0.0.1", 1), sockname=("127.0.0.1", 2), sni="chatgpt.com"),
+        connection.Server(address=("chatgpt.com", 443)),
+    )
+    flow.request = http.Request.make(
+        "GET",
+        "https://chatgpt.com/backend-api/codex/responses",
+        headers={"Host": "chatgpt.com", "Upgrade": "websocket"},
+    )
+    asyncio.run(proxy.requestheaders(flow))
+    proxy.request(flow)
+    if ending == "error":
+        proxy.error(flow)
+    elif ending == "response":
+        flow.response = http.Response.make(403)
+        proxy.responseheaders(flow)
+        proxy.response(flow)
+    else:
+        proxy._finish_pending()
+    assert not captured
+    assert not proxy._captures
+    assert proxy.dropped_exchanges == 0
+
+
+@pytest.mark.parametrize("port", [53, 443])
+def test_dns_diagnostics_report_lifecycle_without_destinations_or_queries(port: int) -> None:
+    """Verbose DNS diagnostics reveal forwarding progress without recording unrelated traffic."""
+    diagnostics: list[str] = []
+    proxy = CaptureProxy(
+        sink=lambda exchange: True, domains=("chatgpt.com",), on_diagnostic=diagnostics.append
+    )
+    manager = Proxyserver()
+    master = Mock(spec=DumpMaster, addons=Mock())
+    master.addons.get.return_value = manager
+    proxy._master = master
+    client = connection.Client(
+        peername=("127.0.0.1", 1), sockname=("127.0.0.1", 2), transport_protocol="udp"
+    )
+    ctx = context.Context(client, options.Options())
+    ctx.server.address = ("private-resolver.example", port)
+    manager.connections[client.id] = Mock(
+        spec=ProxyConnectionHandler, client=client, layer=layer.NextLayer(ctx), transports={}
+    )
+    proxy.client_connected(client)
+    proxy.client_disconnected(client)
+    if port == 53:
+        assert len(diagnostics) == 2
+        assert all("DNS forwarding" in event for event in diagnostics)
+        assert not any("private-resolver" in event for event in diagnostics)
+    else:
+        assert not diagnostics

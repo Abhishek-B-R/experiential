@@ -236,11 +236,17 @@ class CaptureProxy:
 
     def client_connected(self, client: connection.Client) -> None:
         """Contain native client write failures within their own connection."""
+        self._diagnostic("connection_opened", client)
         self._guard_transport(client, client)
 
     def server_connected(self, data: server_hooks.ServerConnectionHookData) -> None:
         """Apply the same connection lifetime to native upstream UDP writers."""
+        self._diagnostic("upstream_connected", data.client)
         self._guard_transport(data.client, data.server)
+
+    def server_connect_error(self, data: server_hooks.ServerConnectionHookData) -> None:
+        """Expose forwarding failure without printing upstream error contents."""
+        self._diagnostic("upstream_connection_failed", data.client)
 
     def _guard_transport(self, client: connection.Client, target: connection.Connection) -> None:
         """Install the native writer guard only in this Capture master's transports."""
@@ -360,8 +366,19 @@ class CaptureProxy:
         No raw errors, URLs, headers, process arguments, or message bodies are emitted.
         """
         host = (client.sni or "").lower().rstrip(".")
-        if self._on_diagnostic is None or host not in self._domains:
+        if self._on_diagnostic is None:
             return
+        if host not in self._domains:
+            # DNS has no TLS name. Observe only forwarding lifecycle, never queries.
+            if client.transport_protocol != "udp" or self._master is None:
+                return
+            proxyserver = self._master.addons.get("proxyserver")
+            assert isinstance(proxyserver, Proxyserver)
+            handler = proxyserver.connections.get(client.id)
+            address = handler.layer.context.server.address if handler is not None else None
+            if address is None or address[1] != 53:
+                return
+            host = "DNS forwarding"
         try:
             self._on_diagnostic(f"{event} · {host} · connection {client.id[:8]}")
         except Exception:  # noqa: BLE001
@@ -423,6 +440,7 @@ class CaptureProxy:
             request=_Body(self._max_body_bytes),
             response=_Body(self._max_body_bytes),
             request_encoding=flow.request.headers.get("content-encoding", ""),
+            websocket=flow.request.method.upper() == "GET",
         )
         self._captures[flow.id] = capture
         flow.request.stream = capture.request.tee
@@ -441,6 +459,10 @@ class CaptureProxy:
         flow.response.stream = True
         capture = self._captures.get(flow.id)
         if capture is not None:
+            if capture.websocket and flow.response.status_code != 101:
+                self._captures.pop(flow.id, None)
+                self._diagnostic("websocket_upgrade_failed", flow.client_conn)
+                return
             capture.status = flow.response.status_code
             capture.response_encoding = flow.response.headers.get("content-encoding", "")
             capture.response_content_type = flow.response.headers.get("content-type", "")
@@ -460,6 +482,10 @@ class CaptureProxy:
         """Capture available response evidence without copying transport error secrets."""
         capture = self._captures.get(flow.id)
         if capture is not None:
+            if capture.websocket and capture.status != 101:
+                self._captures.pop(flow.id, None)
+                self._diagnostic("websocket_upgrade_failed", flow.client_conn)
+                return
             capture.failed = True
             capture.request_done = True
             capture.response_done = True
