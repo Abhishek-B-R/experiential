@@ -39,8 +39,8 @@ from exp.common.models import (
 )
 from exp.common.project import ArtifactCorruptionError, ProjectStore, ProjectStoreError
 from exp.common.traces import load_trace_dataset
+from exp.common.traces.ingest.dataset import read_trace_model_identity_evidence
 from exp.runtime.models import CatalogRoleName, ResolvedModel
-from exp.simulation.ingest.dataset import read_trace_model_identity_evidence
 from exp.simulation.retrieval import load_rag_index
 from exp.simulation.world_model import GroundedWorldModelArtifact
 
@@ -443,7 +443,7 @@ def test_first_build_configures_providers_and_models_through_the_picker(
     result = _RUNNER.invoke(
         app,
         ["build", "support", "--traces", str(source), "--root", str(root)],
-        input="1\n\n1\n\n1\n\n2\n\ny\n",
+        input="/openai\n1\n\n1\n\n1\n\n2\n\ny\n",
     )
 
     assert result.exit_code == 0, result.output

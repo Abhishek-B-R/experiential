@@ -51,6 +51,7 @@ from exp.common.rollouts import (
 )
 from exp.common.routing import KnnGuard, KnnRouterPolicy
 from exp.common.routing.bank import KnnBankManifest
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.router.activation import load_project_router
 from exp.optimize.router.errors import RouterCompositionError
 from exp.optimize.router.evaluation.build import (
@@ -78,7 +79,6 @@ from exp.simulation.engines.text.resume import (
     MAXIMUM_CELL_ATTEMPTS,
     reexecutable_dispatch_failure,
 )
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 from exp.simulation.orchestration import Simulator
 from exp.simulation.specs import SimulationSpec, WorldModelSettings, simulation_spec_digest
 

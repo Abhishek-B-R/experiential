@@ -307,3 +307,144 @@ fn expired_content_is_removed_from_database_and_wal_after_readers_release() {
     drop(writer);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn import_namespace_survives_native_retention_and_reopen() {
+    let path = std::env::temp_dir().join(format!(
+        "capture-import-{}-{}.db",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let existing = private_import_database(&path);
+    for (_, sql) in TRACE_TABLE_SQL {
+        existing.execute_batch(sql).unwrap();
+    }
+    existing
+        .execute_batch(
+            "INSERT INTO trace_store_schema VALUES(1);
+         INSERT INTO trace_records VALUES(printf('%064d',0),'source-trace','saved import');",
+        )
+        .unwrap();
+    drop(existing);
+    let mut writer = open_database(&path).unwrap();
+    persist(&mut writer, &pending("expired", policy())).unwrap();
+    prune(&writer, &policy(), now() + 61).unwrap();
+    assert_eq!(
+        writer
+            .query_row("SELECT payload FROM trace_records", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "saved import"
+    );
+    assert_eq!(
+        writer
+            .query_row("SELECT COUNT(*) FROM gateway_captures", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    drop(writer);
+    let mut reopened = open_database(&path).unwrap();
+    persist(&mut reopened, &pending("new", policy())).unwrap();
+    drop(reopened);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn incomplete_or_unsupported_import_schema_is_not_modified() {
+    for complete in [false, true] {
+        let path = std::env::temp_dir().join(format!(
+            "capture-import-schema-{}-{}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let existing = private_import_database(&path);
+        existing.execute_batch("CREATE TABLE trace_store_schema(version INTEGER); INSERT INTO trace_store_schema VALUES(2);").unwrap();
+        if complete {
+            existing.execute_batch("CREATE TABLE trace_records(id TEXT); CREATE TABLE trace_imports(id TEXT);
+                CREATE TABLE trace_import_records(id TEXT); CREATE TABLE trace_project_imports(id TEXT);").unwrap();
+        }
+        drop(existing);
+        let before = std::fs::read(&path).unwrap();
+        assert!(open_database(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn native_writer_retries_a_short_import_transaction_without_duplicate_records() {
+    let path = std::env::temp_dir().join(format!(
+        "capture-import-lock-{}-{}.db",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut writer = open_database(&path).unwrap();
+    let importer = Connection::open(&path).unwrap();
+    importer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let record = pending("concurrent", policy());
+    assert!(matches!(
+        persist(&mut writer, &record),
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if error.code == rusqlite::ErrorCode::DatabaseBusy
+    ));
+    importer.execute_batch("COMMIT").unwrap();
+    persist(&mut writer, &record).unwrap();
+    persist(&mut writer, &record).unwrap();
+    assert_eq!(
+        importer
+            .query_row("SELECT COUNT(*) FROM gateway_captures", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    drop(importer);
+    drop(writer);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn complete_import_names_cannot_hide_changed_columns_or_constraints() {
+    for mutation in [
+        "ALTER TABLE trace_records ADD COLUMN injected TEXT",
+        "DROP TABLE trace_project_imports; CREATE TABLE trace_project_imports (sequence INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, import_id TEXT NOT NULL)",
+        "DROP TABLE trace_records; CREATE TABLE trace_records (record_sha256 TEXT PRIMARY KEY, trace_id TEXT NOT NULL, payload TEXT NOT NULL) STRICT",
+    ] {
+        let path = std::env::temp_dir().join(format!(
+            "capture-import-definition-{}-{}.db", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let existing = private_import_database(&path);
+        for (_, sql) in TRACE_TABLE_SQL {
+            existing.execute_batch(sql).unwrap();
+        }
+        existing.execute_batch("INSERT INTO trace_store_schema VALUES(1)").unwrap();
+        existing.execute_batch(mutation).unwrap();
+        drop(existing);
+        let before = std::fs::read(&path).unwrap();
+        assert!(open_database(&path).unwrap_err().contains("incompatible trace table"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+fn private_import_database(path: &Path) -> Connection {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    drop(options.open(path).unwrap());
+    Connection::open(path).unwrap()
+}

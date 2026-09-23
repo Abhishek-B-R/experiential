@@ -43,6 +43,9 @@ from exp.common.project import (
     artifact_input,
 )
 from exp.common.release_revision import installed_release_revision
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
+from exp.common.traces.ingest.sources import CANONICAL_TRACE_SOURCES, load_trace_source
+from exp.runtime.gateway.ingest import load_gateway_capture
 from exp.runtime.gateway.local_capture import local_capture_path
 from exp.runtime.models import (
     CapabilityRequirement,
@@ -55,8 +58,6 @@ from exp.runtime.models.preflight import preflight_capabilities
 from exp.runtime.models.providers.transport import ProviderTransportError, RetryPolicy
 from exp.simulation.build import ProjectBuild, TaskSetBuild, build_project, select_completed_build
 from exp.simulation.engines.text.errors import SimulationContentionError
-from exp.simulation.ingest.otlp import TraceNormalizationResult
-from exp.simulation.ingest.sources import CANONICAL_TRACE_SOURCES, load_trace_source
 from exp.simulation.retrieval import (
     RAGEmbedderBinding,
     RAGLineageBinding,
@@ -109,7 +110,7 @@ def build(
     source: str = typer.Option(
         "otlp",
         "--source",
-        help=f"Trace source format: {', '.join(CANONICAL_TRACE_SOURCES)}.",
+        help=f"Trace source format: {', '.join(sorted((*CANONICAL_TRACE_SOURCES, 'gateway')))}.",
     ),
     root: Path = ROOT_OPTION,
     identity: str | None = typer.Option(
@@ -262,7 +263,7 @@ def build(
         with progress_display(_console) as progress:
             report(progress, "normalization")
             normalized = (
-                load_trace_source(source, path, identity_id=identity)
+                load_gateway_capture(path, identity_id=identity)
                 if identity is not None
                 else _load_canonical_traces(path, source)
             )

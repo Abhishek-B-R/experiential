@@ -5,6 +5,46 @@ use std::fs::OpenOptions;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+// Complete import definitions are also verified by Python before shared writes.
+const TRACE_TABLE_SQL: &[(&str, &str)] = &[
+    (
+        "trace_store_schema",
+        "CREATE TABLE trace_store_schema (version INTEGER PRIMARY KEY CHECK(version=1)) STRICT",
+    ),
+    (
+        "trace_records",
+        "CREATE TABLE trace_records (
+        record_sha256 TEXT PRIMARY KEY CHECK(length(record_sha256)=64),
+        trace_id TEXT NOT NULL, payload TEXT NOT NULL
+    ) STRICT",
+    ),
+    (
+        "trace_imports",
+        "CREATE TABLE trace_imports (
+        import_id TEXT PRIMARY KEY, source_format TEXT NOT NULL,
+        source TEXT NOT NULL, metadata TEXT NOT NULL, created_at TEXT NOT NULL
+    ) STRICT",
+    ),
+    (
+        "trace_import_records",
+        "CREATE TABLE trace_import_records (
+        import_id TEXT NOT NULL REFERENCES trace_imports(import_id),
+        ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+        record_sha256 TEXT NOT NULL REFERENCES trace_records(record_sha256),
+        source TEXT NOT NULL,
+        PRIMARY KEY(import_id,ordinal)
+    ) STRICT",
+    ),
+    (
+        "trace_project_imports",
+        "CREATE TABLE trace_project_imports (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL, import_id TEXT NOT NULL REFERENCES trace_imports(import_id),
+        UNIQUE(project_id,import_id)
+    ) STRICT",
+    ),
+];
+
 pub(crate) struct Pending {
     pub policy: Policy,
     pub payload: String,
@@ -113,7 +153,9 @@ pub(super) fn open_database(path: &Path) -> Result<Connection, String> {
     let foreign_tables: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table'
-             AND name NOT LIKE 'sqlite_%' AND name != 'gateway_captures')",
+             AND name NOT LIKE 'sqlite_%' AND name NOT IN (
+               'gateway_captures', 'trace_store_schema', 'trace_records',
+               'trace_imports', 'trace_import_records', 'trace_project_imports'))",
             [],
             |row| row.get(0),
         )
@@ -127,6 +169,52 @@ pub(super) fn open_database(path: &Path) -> Result<Connection, String> {
     connection
         .busy_timeout(Duration::from_millis(100))
         .map_err(safe_error)?;
+    let trace_tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN (
+               'trace_store_schema', 'trace_records', 'trace_imports',
+               'trace_import_records', 'trace_project_imports')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(safe_error)?;
+    if trace_tables != 0 {
+        if trace_tables != 5 {
+            return Err("incomplete trace import schema; preserve this traffic database".into());
+        }
+        for (table, expected) in TRACE_TABLE_SQL {
+            let saved: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .map_err(safe_error)?;
+            let normalize = |sql: &str| {
+                sql.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase()
+            };
+            if normalize(&saved) != normalize(expected) {
+                return Err(
+                    "incompatible trace table definition; preserve this traffic database".into(),
+                );
+            }
+        }
+        let supported: bool = connection
+            .query_row(
+                "SELECT COUNT(*)=1 AND MIN(version)=1 FROM trace_store_schema",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(safe_error)?;
+        if !supported {
+            return Err(
+                "unsupported trace import schema; use a matching Experiential release".into(),
+            );
+        }
+    }
     connection
         .execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;

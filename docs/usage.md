@@ -10,6 +10,7 @@ The root surface is deliberately small:
 | `exp` | Open the branded home screen. `Run Gateway` is the first option and runs setup when needed. | Interactive gateway menu, or the default gateway in a non-interactive terminal. |
 | `exp login [--root ROOT]` | Sign in to Experiential Cloud through the Platform browser approval flow, save the returned organization key, and synchronize the authenticated account's model identities. | User-local credential plus secret-free hosted provider/model records in `.exp/models.toml`. |
 | `exp run [PROJECT] [--root ROOT] [--check]` | Start the local gateway directly, optionally with one project-backed alias. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
+| `exp ingest PROJECT --traces PATH --source chat-json` | Import canonical file or gateway traces. | Immutable imports and project associations in `gateway/traffic.db`. |
 | `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Launch the guided end-to-end build when traces are omitted, or use one explicit local source for automation. | Simulation, serving RAG, fit RAG, syllabus, evaluation evidence, and a runnable automatic router. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
 | `exp optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
@@ -171,7 +172,33 @@ of OpenAI user or tool messages, and `terminal`. Tool observations are nontermin
 consume them before producing its final answer. World-model artifacts pin the v2 prompt; rebuild
 projects created with a different prompt before running them.
 
+### Ingest a trace export
+
+```bash
+exp ingest powerset --traces rollouts.jsonl --source chat-json --root .exp
+exp ingest powerset --source gateway --identity default --root .exp
+```
+
+Ingest stores canonical traces in `.exp/gateway/traffic.db`, alongside native gateway captures.
+It preserves initial system/developer instructions, declared tool schemas, paired tool results,
+source provenance, normalization exclusions and model identity evidence. The receipt identifies
+an immutable import associated with the project. Repeating an unchanged import reuses its records
+and association; changed source content produces a new import without overwriting earlier evidence.
+
+No model setup, embedding, simulation or judging runs. No project folder is created.
+`--dry-run` validates the source and reports accepted/excluded records without writing anything.
+A terminal can prompt for the source file and format; automation supplies `--traces` explicitly.
+OTel sources (`otlp`, `otel-genai`) and completed exported chat captures (`experiential`) use the
+same persistence path. See [trace input and storage](reference/ingest.md) for the Python API.
+
+Native capture exports must contain completed JSON Chat Completions responses. Export stream
+captures as reconstructed `chat-json`, or use `--source gateway` to consume the native database's
+JSON/SSE captures. Incomplete or refused exports appear as explicit exclusions. Chat exports
+without timestamps retain synthetic ordering markers and do not imply measured latency.
+There is no minimum or maximum import count.
+
 ### Local gateway traffic
 
 See [local traffic capture](reference/local_gateway_traffic.md) for default-on,
-identity-scoped collection and `exp build --source gateway --identity ID`.
+identity-scoped collection. `--source gateway` reads every retained record for the required
+identity from one consistent snapshot, including corpora larger than one page.

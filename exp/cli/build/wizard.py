@@ -48,6 +48,7 @@ from exp.common.project import (
 from exp.common.release_revision import installed_release_revision
 from exp.common.tasks import load_task_set
 from exp.common.traces import load_trace_dataset
+from exp.common.traces.ingest.dataset import read_trace_model_identity_evidence
 from exp.optimize.router.automatic.attribution import resolve_router_observed_attributions
 from exp.optimize.router.automatic.preflight import preflight_automatic_router
 from exp.optimize.router.automatic.replay import (
@@ -74,7 +75,6 @@ from exp.optimize.router.judging.service import (
 )
 from exp.runtime.models import RuntimeModelCatalog
 from exp.simulation.build import build_project
-from exp.simulation.ingest.dataset import read_trace_model_identity_evidence
 from exp.simulation.world_model import load_grounded_world_model_artifact
 
 

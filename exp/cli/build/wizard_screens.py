@@ -16,8 +16,8 @@ from rich.prompt import Prompt
 from exp.common.models import ModelCatalog
 from exp.common.project import ProjectModelConfiguration
 from exp.common.tasks import TaskCase
+from exp.common.traces.ingest.sources import CANONICAL_TRACE_SOURCES
 from exp.simulation.build import ProjectBuild
-from exp.simulation.ingest.sources import CANONICAL_TRACE_SOURCES
 
 
 @dataclass(frozen=True)
@@ -109,10 +109,10 @@ def select_trace(initial_source: str, *, console: Console) -> tuple[str, Path]:
         Canonical source name and validated local path.
     """
     source = initial_source.strip().casefold()
-    if source not in CANONICAL_TRACE_SOURCES:
+    if source not in (*CANONICAL_TRACE_SOURCES, "gateway"):
         source = Prompt.ask(
             "Trace source",
-            choices=list(CANONICAL_TRACE_SOURCES),
+            choices=sorted((*CANONICAL_TRACE_SOURCES, "gateway")),
             default="otlp",
             console=console,
         )
