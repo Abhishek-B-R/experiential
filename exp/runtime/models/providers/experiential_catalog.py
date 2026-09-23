@@ -71,8 +71,10 @@ def model_metadata(entry: JsonObject) -> tuple[str, JsonObject] | None:
         return None
     metadata = dict(_object(route.get("capabilities")))
     output_modalities = model.get("output_modalities")
-    if isinstance(output_modalities, list):
-        metadata["supports_completions"] = "text" in output_modalities
+    if "supports_completions" not in metadata and isinstance(output_modalities, list):
+        metadata["supports_completions"] = (
+            "text" in output_modalities and metadata.get("supports_embeddings") is not True
+        )
     metadata["context_window_tokens"] = model.get("context_window")
     limits = [
         value

@@ -76,3 +76,22 @@ def test_metadata_uses_the_default_route_not_provider_display_order() -> None:
     }
     entry["default_provider_ids"] = ["missing"]
     assert model_metadata(entry) is None
+
+
+@pytest.mark.parametrize(
+    "capabilities", [{"supports_completions": False}, {"supports_embeddings": True}]
+)
+def test_text_modalities_cannot_override_an_explicit_protocol_declaration(
+    capabilities: JsonObject,
+) -> None:
+    """An embedding route can advertise text without becoming a chat model."""
+    result = model_metadata(
+        {
+            "model": {"slug": "embed", "output_modalities": ["text"]},
+            "providers": [{"id": "primary", "status": "active", "capabilities": capabilities}],
+            "default_provider_ids": ["primary"],
+        }
+    )
+
+    assert result is not None
+    assert result[1]["supports_completions"] is False
