@@ -13,14 +13,33 @@ use super::record::{Record, Request};
 struct PythonSink(Py<PyAny>);
 
 impl Sink for PythonSink {
-    fn write(&mut self, record: &Record, maximum_bytes: usize) -> Result<(), ()> {
+    type Prepared = Py<PyAny>;
+
+    fn preparation_bytes(maximum_record_bytes: usize) -> usize {
+        // CPython may use four bytes per character even in mostly-ASCII JSON
+        // when one supplementary Unicode character occurs. Include the UTF-8
+        // encoding that overlaps construction, plus object header/slack.
+        maximum_record_bytes.saturating_mul(5).saturating_add(256)
+    }
+
+    fn prepare(&self, record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
         let encoded = record.encode(maximum_bytes).ok_or(())?;
+        Python::try_attach(|py| {
+            encoded
+                .into_pyobject(py)
+                .map(|value| value.into_any().unbind())
+        })
+        .ok_or(())?
+        .map_err(|_| ())
+    }
+
+    fn write(&mut self, prepared: &Self::Prepared) -> Result<(), ()> {
         // This is the dedicated delivery worker, never a serving or bridge thread.
         // Exception text can contain SQL parameters or content, so only count failure.
         Python::try_attach(|py| {
             self.0
                 .bind(py)
-                .call1((encoded,))
+                .call1((prepared.bind(py),))
                 .map(|_| ())
                 .map_err(|_| ())
         })
@@ -36,6 +55,37 @@ pub struct CaptureCollector {
 
 #[pymethods]
 impl CaptureCollector {
+    /// Use the same collector and delivery worker with a native local SQLite sink.
+    #[staticmethod]
+    fn sqlite(py: Python<'_>, config_json: &str, local_json: &str) -> PyResult<Option<Self>> {
+        let config: Configuration = serde_json::from_str(config_json)
+            .map_err(|_| PyValueError::new_err("invalid capture configuration"))?;
+        config.validate().map_err(PyValueError::new_err)?;
+        if config.settlement_required {
+            return Err(PyValueError::new_err(
+                "local capture cannot require hosted settlement",
+            ));
+        }
+        let local: super::local::CaptureConfiguration = serde_json::from_str(local_json)
+            .map_err(|_| PyValueError::new_err("invalid local capture configuration"))?;
+        if config.delivery.maximum_records != local.queue_capacity {
+            return Err(PyValueError::new_err("local delivery bounds must match"));
+        }
+        py.detach(|| {
+            let Some(sink) = super::local::SqliteSink::open(local)? else {
+                return Ok(None);
+            };
+            Collector::new(config, sink)
+                .map(|collector| {
+                    Some(Self {
+                        inner: Arc::new(collector),
+                    })
+                })
+                .map_err(str::to_owned)
+        })
+        .map_err(PyValueError::new_err)
+    }
+
     /// Configure bounded native capture with an off-path synchronous destination.
     #[new]
     fn new(py: Python<'_>, config_json: &str, sink: Py<PyAny>) -> PyResult<Self> {
@@ -92,5 +142,10 @@ impl CaptureCollector {
     fn counts(&self) -> (u64, u64, u64, u64, u64, u64) {
         let [pending, bytes, persisted, failed, dropped, skipped] = self.inner.counts();
         (pending, bytes, persisted, failed, dropped, skipped)
+    }
+
+    /// Retention or WAL cleanup failures, separate from durable-write failures.
+    fn maintenance_failures(&self) -> u64 {
+        self.inner.maintenance_failures()
     }
 }

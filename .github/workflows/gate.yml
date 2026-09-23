@@ -30,15 +30,48 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          # Published wheels are immutable per version, so any change under the
-          # crate must move the crate version. GitHub's merge-base file list is
-          # authoritative and needs no local history (the checkout is shallow).
+          # Published wheels are immutable. An explicit unreleased stack may
+          # defer its bump, but cannot publish until the deferral is removed.
+          # GitHub's merge-base file list needs no local checkout history.
+          marker=.github/deferred-native-release.toml
+          if [ -f "$marker" ]; then
+            uv run python - <<'PY'
+          import tomllib
+          from pathlib import Path
+          marker = tomllib.loads(Path(".github/deferred-native-release.toml").read_text())
+          for name, path in (("experiential", "pyproject.toml"),
+                             ("exp-gateway-native", "exp/runtime/gateway/native/pyproject.toml")):
+              version = tomllib.loads(Path(path).read_text())["project"]["version"]
+              assert version == marker[name], "remove release deferral before bumping versions"
+          PY
+            for path in pyproject.toml exp/runtime/gateway/native/Cargo.toml; do
+              head_version="$(grep -m1 '^version = ' "$path")"
+              base_version="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${path}?ref=${GITHUB_BASE_REF}" \
+                -q .content | base64 -d | grep -m1 '^version = ')"
+              test "$head_version" = "$base_version" || {
+                echo "release deferral must preserve both base versions" >&2
+                exit 1
+              }
+            done
+            echo "unreleased native changes: package publication is blocked"
+            exit 0
+          fi
           files="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
             --paginate -q '.[].filename')" || {
             echo "could not list the pull request's files; failing closed" >&2
             exit 1
           }
           changed="$(printf '%s\n' "${files}" | grep -c '^exp/runtime/gateway/native/' || true)"
+          if printf '%s\n' "${files}" | grep -qx '.github/deferred-native-release.toml'; then
+            changed=1
+            head_project="$(grep -m1 '^version = ' pyproject.toml)"
+            base_project="$(gh api "repos/${GITHUB_REPOSITORY}/contents/pyproject.toml?ref=${GITHUB_BASE_REF}" \
+              -q .content | base64 -d | grep -m1 '^version = ')"
+            test "$head_project" != "$base_project" || {
+              echo "ending a release deferral requires a new flagship version" >&2
+              exit 1
+            }
+          fi
           if [ "${changed}" = "0" ]; then
             echo "crate untouched"
             exit 0

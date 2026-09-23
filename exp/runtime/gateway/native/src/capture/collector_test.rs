@@ -6,10 +6,19 @@ use std::sync::{mpsc, Arc};
 struct MemorySink(mpsc::Sender<Record>);
 
 impl Sink for MemorySink {
-    fn write(&mut self, record: &Record, maximum_bytes: usize) -> Result<(), ()> {
-        let encoded = record.encode(maximum_bytes).ok_or(())?;
+    type Prepared = String;
+
+    fn preparation_bytes(maximum_record_bytes: usize) -> usize {
+        maximum_record_bytes
+    }
+
+    fn prepare(&self, record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
+        record.encode(maximum_bytes).ok_or(())
+    }
+
+    fn write(&mut self, record: &Self::Prepared) -> Result<(), ()> {
         self.0
-            .send(serde_json::from_str(&encoded).map_err(|_| ())?)
+            .send(serde_json::from_str(record).map_err(|_| ())?)
             .map_err(|_| ())
     }
 }
@@ -251,6 +260,32 @@ fn routing_provenance_is_optional_until_selected_and_then_immutable() {
 }
 
 #[test]
+fn collector_forwards_destination_cleanup_failure_without_losing_write_success() {
+    struct CleanupFailure;
+    impl Sink for CleanupFailure {
+        type Prepared = ();
+        fn preparation_bytes(_: usize) -> usize {
+            0
+        }
+        fn prepare(&self, _: &Record, _: usize) -> Result<(), ()> {
+            Ok(())
+        }
+        fn write(&mut self, _: &()) -> Result<(), ()> {
+            Ok(())
+        }
+        fn take_maintenance_failures(&mut self) -> u64 {
+            1
+        }
+    }
+    let collector = Collector::new(config(), CleanupFailure).unwrap();
+    assert!(collector.begin(request("saved")));
+    collector.settle("saved", true, false);
+    assert!(collector.close_until(Instant::now() + Duration::from_secs(1)));
+    assert_eq!(collector.counts(), [0, 0, 1, 0, 0, 0]);
+    assert_eq!(collector.maintenance_failures(), 1);
+}
+
+#[test]
 fn selected_model_uses_cached_request_size_including_json_escapes() {
     let mut configuration = config();
     configuration.maximum_request_bytes = 1024;
@@ -466,7 +501,17 @@ fn blocked_handoff_keeps_source_count_and_bytes_until_delivery_owns_record() {
                 fail: bool,
             }
             impl Sink for PausedSink {
-                fn write(&mut self, record: &Record, _limit: usize) -> Result<(), ()> {
+                type Prepared = String;
+
+                fn preparation_bytes(maximum: usize) -> usize {
+                    maximum
+                }
+
+                fn prepare(&self, record: &Record, _maximum: usize) -> Result<String, ()> {
+                    Ok(record.request.request_id.clone())
+                }
+
+                fn write(&mut self, record: &Self::Prepared) -> Result<(), ()> {
                     self.entered.send(()).unwrap();
                     let (lock, signal) = &*self.release;
                     let ready = lock.lock().unwrap();
@@ -474,12 +519,10 @@ fn blocked_handoff_keeps_source_count_and_bytes_until_delivery_owns_record() {
                         .wait_timeout_while(ready, Duration::from_secs(5), |ready| !*ready)
                         .unwrap();
                     assert!(*ready && !timeout.timed_out());
-                    self.records
-                        .send(record.request.request_id.clone())
-                        .unwrap();
-                    if self.fail {
+                    if std::mem::take(&mut self.fail) {
                         Err(())
                     } else {
+                        self.records.send(record.clone()).unwrap();
                         Ok(())
                     }
                 }
@@ -555,6 +598,9 @@ fn blocked_handoff_keeps_source_count_and_bytes_until_delivery_owns_record() {
             ids.sort();
             assert_eq!(ids, ["first", "second"]);
             assert_eq!(collector.counts()[0..2], [0, 0]);
+            assert_eq!(collector.counts()[2], 2);
+            assert_eq!(collector.counts()[3], u64::from(fail_sink));
+            assert_eq!(collector.counts()[4], 0);
             assert_eq!(collector.pending.lock().unwrap().bytes, 0);
             if let Err(error) = outcome {
                 std::panic::resume_unwind(error);

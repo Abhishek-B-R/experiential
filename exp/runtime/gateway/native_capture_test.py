@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +19,12 @@ from exp.common.models.gateway_chains import (
 )
 from exp.runtime.gateway.contracts import AuthorizationSnapshot
 from exp.runtime.gateway.lifecycle import load_gateway_components
+from exp.runtime.gateway.local_capture_config import CaptureBinding
+from exp.runtime.gateway.local_capture_config import (
+    CaptureConfiguration as LocalCaptureConfiguration,
+)
+from exp.runtime.gateway.local_capture_contracts import CapturePolicy, LocalCaptureScope
+from exp.runtime.gateway.local_capture_store import LocalCaptureStore
 from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
 from exp.runtime.gateway.native_bridge_test import _configured_pool_gateway
 from exp.runtime.gateway.native_capture import (
@@ -43,15 +50,21 @@ from exp.runtime.gateway.tests.launch_test import (
 )
 from exp.runtime.gateway.tests.native_chat_images_test import _PNG_BASE64
 from exp.runtime.gateway.tests.native_waterfall_test import _content_chunk, _terminal_frames
+from exp.simulation.ingest.gateway import load_gateway_capture
 
 native = pytest.importorskip("exp_gateway_native")
 
 
 @pytest.mark.parametrize("winner", ["child", "root_suffix"])
-@pytest.mark.parametrize("policy", ["keep", "off", "byok", "prompt_only", "cancel"])
+@pytest.mark.parametrize(
+    ("destination", "policy"),
+    [("hosted", policy) for policy in ("keep", "off", "byok", "prompt_only", "cancel")]
+    + [("sqlite", "keep"), ("sqlite", "cancel")],
+)
 def test_nested_capture_separates_root_from_winner_and_does_not_recapture_replay(
     tmp_path: Path,
     winner: str,
+    destination: str,
     policy: str,
 ) -> None:
     """Actual HTTP traversal keeps root input identity and permission-gated winning provenance."""
@@ -134,9 +147,26 @@ def test_nested_capture_separates_root_from_winner_and_does_not_recapture_replay
     publish_authored_chain_fixture(tmp_path, revision_id="capture-chain", pool_id="alpha")
     components = chain_components(tmp_path, environment={"TEST_PROVIDER_KEY": "test-only"})
     records: list[str] = []
-    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), records.append)
+    scope = LocalCaptureScope(user_id=manager.grants()[0].identity_id, application_id="gateway")
+    traffic_path = tmp_path / "nested-traffic.db"
+    if destination == "sqlite":
+        local = LocalCaptureConfiguration(
+            database_path=traffic_path,
+            bindings=(
+                CaptureBinding(alias="coding", policy=CapturePolicy(scope=scope, enabled=True)),
+            ),
+        )
+        collector = native.CaptureCollector.sqlite(
+            CaptureConfiguration(settlement_required=False).model_dump_json(),
+            local.model_dump_json(),
+        )
+        assert collector is not None
+    else:
+        collector = native.CaptureCollector(
+            CaptureConfiguration().model_dump_json(), records.append
+        )
     capture = CaptureController(
-        collector, application_for=lambda _auth: None if policy == "off" else "app"
+        collector, application_for=lambda _auth: None if policy == "off" else scope.application_id
     )
     port, shutdown = _unused_port(), native.shutdown_handle()
     errors: list[BaseException] = []
@@ -207,7 +237,32 @@ def test_nested_capture_separates_root_from_winner_and_does_not_recapture_replay
         thread.join(5)
     assert not errors and not worker.is_alive()
     assert collector.close(1)
-    if policy in {"off", "byok"}:
+    if destination == "sqlite":
+        rows = LocalCaptureStore(traffic_path, scope).read_after()
+        assert records == []
+        if policy == "cancel":
+            assert rows == ()
+            assert load_gateway_capture(traffic_path, identity_id=scope.user_id).traces == ()
+        else:
+            assert len(rows) == 1
+            experience = rows[0].experience
+            assert experience.schema_version == 1
+            assert experience.provenance.model_id == "model-revision-exact"
+            output = experience.request["exp_capture_output"]
+            assert isinstance(output, dict)
+            assert output["canonical_model_id"] == expected
+            assert output["gemini_thought_parts_truncated"] is None
+            ingested = load_gateway_capture(traffic_path, identity_id=scope.user_id)
+            assert not ingested.issues and len(ingested.traces) == 1
+            assert ingested.traces[0].initial_context["model_id"] == "model-revision-exact"
+            assert ingested.traces[0].initial_context["canonical_model_id"] == expected
+        assert (
+            LocalCaptureStore(
+                traffic_path, LocalCaptureScope(user_id="other", application_id="gateway")
+            ).read_after()
+            == ()
+        )
+    elif policy in {"off", "byok"}:
         assert records == []
     else:
         assert len(records) == 1
@@ -223,11 +278,11 @@ def test_nested_capture_separates_root_from_winner_and_does_not_recapture_replay
             assert record["metrics"]["terminal_at"] is None
 
 
-@pytest.mark.parametrize("capture_enabled", [False, True])
+@pytest.mark.parametrize("destination", ["off", "hosted", "sqlite"])
 @pytest.mark.parametrize("shape", ["large", "fragments", "signed_text", "signed_image", "oversize"])
 def test_gemini_capture_only_evidence_never_retries_or_fails_visible_inference(
     tmp_path: Path,
-    capture_enabled: bool,
+    destination: str,
     shape: str,
 ) -> None:
     """Optional telemetry limits never consume the refusal or semantic output budgets."""
@@ -304,13 +359,27 @@ def test_gemini_capture_only_evidence_never_retries_or_fails_visible_inference(
     components = chain_components(tmp_path, environment={"TEST_PROVIDER_KEY": "test-only"})
     records: list[str] = []
     configuration = CaptureConfiguration(maximum_response_bytes=100_000, settlement_required=False)
-    collector = (
-        native.CaptureCollector(configuration.model_dump_json(), records.append)
-        if capture_enabled
-        else None
-    )
+    scope = LocalCaptureScope(user_id=manager.grants()[0].identity_id, application_id="gateway")
+    traffic_path = tmp_path / "gemini-traffic.db"
+    if destination == "sqlite":
+        local = LocalCaptureConfiguration(
+            database_path=traffic_path,
+            bindings=(
+                CaptureBinding(alias="coding", policy=CapturePolicy(scope=scope, enabled=True)),
+            ),
+        )
+        collector = native.CaptureCollector.sqlite(
+            configuration.model_dump_json(), local.model_dump_json()
+        )
+        assert collector is not None
+    elif destination == "hosted":
+        collector = native.CaptureCollector(configuration.model_dump_json(), records.append)
+    else:
+        collector = None
     capture = (
-        CaptureController(collector, application_for=lambda _auth: "app") if collector else None
+        CaptureController(collector, application_for=lambda _auth: scope.application_id)
+        if collector
+        else None
     )
 
     class Plane(NativeControlPlane):
@@ -372,13 +441,27 @@ def test_gemini_capture_only_evidence_never_retries_or_fails_visible_inference(
             "SELECT deployment_id,state FROM gateway_attempts"
         ).fetchall() == [("alpha", "completed")]
     if collector:
-        assert collector.close(1) and len(records) == 1
-        record = CaptureRecord.model_validate_json(records[0])
-        assert record.response is not None and record.metrics is not None
-        assert record.gemini_thought_parts_truncated is (shape == "oversize")
-        assert len(record.gemini_thought_parts) == (
-            0 if shape == "oversize" else 257 if shape == "fragments" else 1
-        )
+        assert collector.close(1)
+        if destination == "sqlite":
+            assert records == []
+            rows = LocalCaptureStore(traffic_path, scope).read_after()
+            assert len(rows) == 1
+            output = rows[0].experience.request["exp_capture_output"]
+            assert isinstance(output, dict)
+            assert output["canonical_model_id"] == "model-revision-exact"
+            assert output["gemini_thought_parts_truncated"] is (shape == "oversize")
+            parts = output["gemini_thought_parts"]
+            assert isinstance(parts, list)
+            ingested = load_gateway_capture(traffic_path, identity_id=scope.user_id)
+            assert not ingested.issues and len(ingested.traces) == 1
+            assert ingested.traces[0].initial_context["capture_output"] == output
+        else:
+            assert len(records) == 1
+            record = CaptureRecord.model_validate_json(records[0])
+            assert record.response is not None and record.metrics is not None
+            assert record.gemini_thought_parts_truncated is (shape == "oversize")
+            parts = record.gemini_thought_parts
+        assert len(parts) == (0 if shape == "oversize" else 257 if shape == "fragments" else 1)
     else:
         assert records == []
 
@@ -451,6 +534,7 @@ def test_python_sink_runs_off_caller_thread_and_close_releases_gil() -> None:
     assert threads and threads[0] != threading.get_ident()
     assert CaptureRecord.model_validate_json(records[0]).request.scope.identity_id == "identity"
     assert collector.counts() == (0, 0, 1, 0, 0, 0)
+    assert collector.maintenance_failures() == 0
 
 
 def test_close_timeout_preserves_accepted_content_for_later_host_settlement() -> None:
@@ -467,21 +551,69 @@ def test_close_timeout_preserves_accepted_content_for_later_host_settlement() ->
     assert collector.counts() == (0, 0, 1, 0, 0, 0)
 
 
-def test_python_sink_failure_never_logs_exception_content(
+def test_python_sink_retries_without_losing_content_or_acknowledging_failure(
     capfd: pytest.CaptureFixture[str],
 ) -> None:
-    """Database exception strings may carry private parameters and must be discarded."""
+    """A failed destination retains its exact record until recovery, even during close."""
+    attempted = threading.Event()
+    recovering = threading.Event()
+    attempts: list[str] = []
+    persisted: list[str] = []
 
-    def fail(_record: str) -> None:
-        """Simulate a storage rejection containing sensitive context."""
-        raise RuntimeError("private SQL parameter that must not be logged")
+    def write(record: str) -> None:
+        """Simulate an outage whose exception contains private SQL parameters."""
+        attempts.append(record)
+        attempted.set()
+        if not recovering.is_set():
+            raise RuntimeError("private SQL parameter that must not be logged")
+        persisted.append(record)
 
-    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), fail)
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), write)
+    assert collector.begin(_request_json())
+    settlement = threading.Thread(target=collector.settle, args=("request", True, False))
+    settlement.start()
+    try:
+        assert attempted.wait(1)
+        assert not collector.close(0.05)
+        pending, retained, successes, failures, drops, skips = collector.counts()
+        assert pending == 1 and retained > 0
+        assert successes == drops == skips == 0
+        assert failures >= 1
+        assert settlement.is_alive()
+    finally:
+        recovering.set()
+        settlement.join(3)
+    assert not settlement.is_alive()
+    assert collector.close(1)
+    assert len(attempts) >= 2 and len(set(attempts)) == 1
+    assert all(record is attempts[0] for record in attempts)
+    assert persisted == attempts[:1]
+    assert collector.counts()[0:3] == (0, 0, 1)
+    assert collector.counts()[4:] == (0, 0)
+    assert "private SQL" not in "".join(capfd.readouterr())
+
+
+def test_python_sink_rechecks_policy_after_an_uncertain_commit() -> None:
+    """Retry is idempotent and may acknowledge revocation without retaining content."""
+    rows: dict[str, str] = {}
+    attempts = 0
+
+    def write(encoded: str) -> None:
+        """Lose the first acknowledgement, then simulate consent revocation on retry."""
+        nonlocal attempts
+        attempts += 1
+        record = CaptureRecord.model_validate_json(encoded)
+        if attempts == 1:
+            rows[record.request.request_id] = encoded
+            raise ConnectionError("lost acknowledgement")
+        rows.pop(record.request.request_id, None)
+
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), write)
     assert collector.begin(_request_json())
     collector.settle("request", True, False)
     assert collector.close(1)
-    assert collector.counts() == (0, 0, 0, 1, 0, 0)
-    assert "private SQL" not in "".join(capfd.readouterr())
+    assert attempts == 2 and not rows
+    assert collector.counts() == (0, 0, 1, 1, 0, 0)
 
 
 def test_python_and_rust_configuration_fail_closed() -> None:
@@ -492,6 +624,79 @@ def test_python_and_rust_configuration_fail_closed() -> None:
         CaptureConfiguration(maximum_pending_bytes=1)
     with pytest.raises(ValueError):
         native.CaptureCollector('{"unknown": true}', lambda _: None)
+    with pytest.raises(ValueError, match="preparation"):
+        CaptureDeliveryLimits(maximum_record_bytes=1024, maximum_bytes=5 * 1024 + 256)
+    invalid = CaptureConfiguration().model_dump(mode="json")
+    invalid["delivery"] = {
+        "maximum_records": 1,
+        "maximum_record_bytes": 1024,
+        "maximum_bytes": 5 * 1024 + 256,
+    }
+    with pytest.raises(ValueError, match="preparation"):
+        native.CaptureCollector(json.dumps(invalid), lambda _: None)
+
+
+@pytest.mark.parametrize("maximum_bytes", [5 * 1024 + 257, 6 * 1024 + 255])
+def test_preparation_must_leave_a_full_record_budget(maximum_bytes: int) -> None:
+    """Do not accept a configuration whose preparation crowds out its queue."""
+    with pytest.raises(ValueError, match="preparation"):
+        CaptureDeliveryLimits(maximum_record_bytes=1024, maximum_bytes=maximum_bytes)
+    invalid = CaptureConfiguration().model_dump(mode="json")
+    invalid["delivery"] = {
+        "maximum_records": 1,
+        "maximum_record_bytes": 1024,
+        "maximum_bytes": maximum_bytes,
+    }
+    with pytest.raises(ValueError, match="preparation"):
+        native.CaptureCollector(json.dumps(invalid), lambda _: None)
+
+
+def test_exact_preparation_and_record_budget_boundary_is_valid() -> None:
+    """The exact queue-plus-preparation boundary admits and persists a record."""
+    delivery = CaptureDeliveryLimits(maximum_record_bytes=8192, maximum_bytes=6 * 8192 + 256)
+    records: list[str] = []
+    collector = native.CaptureCollector(
+        CaptureConfiguration(delivery=delivery).model_dump_json(), records.append
+    )
+    assert collector.begin(_request_json())
+    collector.settle("request", True, False)
+    assert collector.close(1)
+    assert len(records) == 1
+    assert collector.counts() == (0, 0, 1, 0, 0, 0)
+
+
+def test_prepared_python_unicode_payload_is_inside_delivery_memory_budget() -> None:
+    """A wide Unicode string remains charged while a paused destination retains it."""
+    entered, resume = threading.Event(), threading.Event()
+    payload_bytes: list[int] = []
+
+    def write(encoded: str) -> None:
+        """Hold one four-byte Python string without retaining an additional copy."""
+        payload_bytes.append(sys.getsizeof(encoded))
+        entered.set()
+        assert resume.wait(3)
+
+    limits = CaptureDeliveryLimits(maximum_bytes=65_536, maximum_record_bytes=8192)
+    configuration = CaptureConfiguration(delivery=limits)
+    collector = native.CaptureCollector(configuration.model_dump_json(), write)
+    request = json.loads(_request_json())
+    request["context"]["request"]["messages"] = [{"role": "user", "content": "x" * 2000 + "🌍"}]
+    assert collector.begin(json.dumps(request))
+    settlement = threading.Thread(target=collector.settle, args=("request", True, False))
+    settlement.start()
+    try:
+        assert entered.wait(1)
+        pending, retained, *_ = collector.counts()
+        assert pending == 1
+        assert retained > 5 * limits.maximum_record_bytes + 256
+        assert payload_bytes[0] < retained <= limits.maximum_bytes
+        assert not collector.close(0)
+    finally:
+        resume.set()
+        settlement.join(3)
+    assert not settlement.is_alive()
+    assert collector.close(1)
+    assert collector.counts() == (0, 0, 1, 0, 0, 0)
 
 
 def test_accepted_routing_failure_keeps_effective_prompt_without_inventing_model(
