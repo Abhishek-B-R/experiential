@@ -11,7 +11,7 @@ from exp.common.tasks import TaskCase
 from exp.runtime.agents.interface import AgentEpisode
 from exp.runtime.environments import EnvironmentSession, Observation
 
-_DEFAULT_MAXIMUM_MODEL_CALLS = 50
+_DEFAULT_MAXIMUM_MODEL_CALLS = 100
 _MAXIMUM_SYSTEM_PROMPT_CHARACTERS = 20_000
 
 
@@ -33,8 +33,8 @@ class ChatAgentRuntime:
         Raises:
             ValueError: The ceiling or optional system prompt is invalid.
         """
-        if not 1 <= maximum_model_calls <= 64:
-            raise ValueError("maximum_model_calls must be between 1 and 64")
+        if maximum_model_calls < 1:
+            raise ValueError("maximum_model_calls must be positive")
         self._maximum_model_calls = maximum_model_calls
         self._system_prompt = normalize_chat_system_prompt(system_prompt)
 

@@ -729,14 +729,20 @@ def test_builtin_chat_system_contract_matches_platform_shape_and_bounds() -> Non
     assert system.model_dump(mode="json") == {
         "kind": "builtin_chat",
         "system_prompt": "Follow policy.",
-        "maximum_model_calls": 8,
+        "maximum_model_calls": 100,
     }
     with pytest.raises(ValueError, match="blank"):
         ProjectSystemConfiguration(system_prompt="   ")
     with pytest.raises(ValueError):
         ProjectSystemConfiguration(system_prompt="x" * 20_001)
+    assert (
+        ProjectSystemConfiguration(
+            system_prompt="valid", maximum_model_calls=1000
+        ).maximum_model_calls
+        == 1000
+    )
     with pytest.raises(ValueError):
-        ProjectSystemConfiguration(system_prompt="valid", maximum_model_calls=65)
+        ProjectSystemConfiguration(system_prompt="valid", maximum_model_calls=0)
     with pytest.raises(ValueError):
         ProjectSystemConfiguration.model_validate({"system_prompt": "valid", "unsupported": True})
 

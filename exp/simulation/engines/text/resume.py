@@ -144,6 +144,7 @@ def validate_resume_rollout(
         binding.grounded_world_model_input,
         binding.simulation_spec_input,
         pins.resolution_input,
+        *((rollout.continuation_of,) if rollout.continuation_of is not None else ()),
     )
     if (
         rollout.cell_id != cell.cell_id
