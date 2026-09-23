@@ -17,6 +17,10 @@ _RECORD_PREFIXES = frozenset(
     }
 )
 _CHAT_ROLES = frozenset({"system", "developer", "user", "human", "assistant", "tool"})
+_SPAN_PREFIXES = _RECORD_PREFIXES | {
+    "resourceSpans.item.scopeSpans.item.spans.item",
+    "item.resourceSpans.item.scopeSpans.item.spans.item",
+}
 _SIGNATURE_FIELDS = frozenset(
     {
         "messages",
@@ -51,10 +55,15 @@ def detect_trace_source(path: Path) -> str | None:
         OSError: The selected file cannot be read.
     """
     matches: set[str] = set()
+    conventions: set[str] = set()
     records: dict[str, dict[str, str]] = {}
     try:
         with path.open("rb") as stream:
             for prefix, event, value in ijson.parse(stream, multiple_values=True):
+                if isinstance(value, str):
+                    convention = _attribute_convention(prefix, event, value)
+                    if convention is not None:
+                        conventions.add(convention)
                 if prefix in _RECORD_PREFIXES:
                     if event == "start_map":
                         records[prefix] = {}
@@ -76,7 +85,32 @@ def detect_trace_source(path: Path) -> str | None:
                             records[record]["capture_protocol"] = "string"
     except (ijson.JSONError, UnicodeDecodeError):
         return None
+    if matches & {"otlp", "otel-genai"} and conventions != {"gen_ai"}:
+        return None
     return next(iter(matches)) if len(matches) == 1 else None
+
+
+def _attribute_convention(prefix: str, event: str, key: str) -> str | None:
+    """Distinguish GenAI from OpenInference only at supported span-attribute locations."""
+    if event == "string":
+        suffix = "attributes.item.key"
+    elif event == "map_key":
+        suffix = "attributes"
+    else:
+        return None
+    if prefix == suffix:
+        span = ""
+    elif prefix.endswith("." + suffix):
+        span = prefix[: -len(suffix) - 1]
+    else:
+        return None
+    if span not in _SPAN_PREFIXES:
+        return None
+    if key == "gen_ai" or key.startswith("gen_ai."):
+        return "gen_ai"
+    if key in {"openinference", "llm"} or key.startswith(("openinference.", "llm.")):
+        return "openinference"
+    return None
 
 
 def _record_sources(prefix: str, fields: dict[str, str]) -> set[str]:

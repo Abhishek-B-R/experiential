@@ -7,6 +7,7 @@ import pytest
 
 from exp.cli.build.app import _build_grounded_artifacts
 from exp.common.models import ModelCatalog
+from exp.common.progress import ProgressEvent
 from exp.common.project import ProjectStore
 from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.evaluation.export import export_report, load_report_evidence
@@ -121,8 +122,6 @@ def test_underfilled_project_never_dispatches_or_creates_a_run(tmp_path: Path) -
 
 def test_interrupted_parallel_run_resumes_without_repeating_paid_cells(tmp_path: Path) -> None:
     """Stopping at a progress boundary drains active cells and resumes only missing work."""
-    from exp.common.progress import ProgressEvent
-
     project, catalog, state = _twenty_scenarios(tmp_path)
     run = prepare_run(
         project,
