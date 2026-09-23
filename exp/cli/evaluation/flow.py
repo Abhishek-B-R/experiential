@@ -194,7 +194,7 @@ def _results(project: ProjectStore, run: EvaluationRun, *, interactive: bool) ->
 
 
 def _project_screen(project: ProjectStore) -> str | None:
-    """Keep starting work separate from browsing saved results and provider setup."""
+    """Keep starting an evaluation separate from browsing saved results."""
     tasks = evaluation_tasks(project)
     while True:
         heading(_console, project.paths.project_id, f"{len(tasks)} scenarios")
@@ -202,9 +202,7 @@ def _project_screen(project: ProjectStore) -> str | None:
         runs = list_runs(project)
         if runs:
             choices.append(PickerOption("saved", "Saved evaluations"))
-        choices.extend(
-            (PickerOption("providers", "Configure providers"), PickerOption("exit", "Back"))
-        )
+        choices.append(PickerOption("exit", "Back"))
         choice = choose_one(_console, title="Evaluations", options=choices)
         if not choice.values or choice.values[0] == "exit":
             return "exit"
