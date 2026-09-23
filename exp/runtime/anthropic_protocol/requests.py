@@ -74,6 +74,7 @@ from exp.runtime.gateway.contracts import (
     RedactedThinkingBlock,
     ThinkingBlock,
 )
+from exp.runtime.gateway.request_policy import GatewayRequestPolicy
 from exp.runtime.models.providers.cache_policy import (
     multimodal_text_cache_blocks,
     retain_multimodal_cache_boundaries,
@@ -289,6 +290,7 @@ class _MessagesRequest(AnthropicWireModel):
     cost, not semantics."""
     inference_geo: str | None = Field(default=None, min_length=1, max_length=64)
     provider: ProviderRoutingPreferences | None = None
+    gateway: GatewayRequestPolicy | None = None
     """The gateway's cross-surface ZDR demand / OpenRouter routing preferences."""
     """Inference-region selector, forwarded verbatim (accepted live without
     a beta, 2026-08-30). Bounded but deliberately not enumerated: the
@@ -358,6 +360,8 @@ def decode_messages_count_tokens(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
+    if "gateway" in payload:
+        raise unsupported_field("gateway")
     try:
         return _decode(payload, _CountTokensRequest, anthropic_beta=anthropic_beta)
     except ProviderParameterError as error:
@@ -456,6 +460,7 @@ def _decode(
             inference_geo=request.inference_geo,
             provider_beta_tokens=forwarded_betas,
             ignored_parameters=(*dropped_beta_disclosures, *channels.disclosures),
+            gateway=request.gateway,
             zdr_requested=request.provider is not None and request.provider.demands_zdr,
             provider_preferences=(
                 cast(JsonObject, payload["provider"]) if request.provider is not None else None

@@ -135,14 +135,21 @@ by transcript contents.
 
 Some providers supply usage only at the end. A dispatched request canceled before a provider
 terminal is observed carries the internal `usage_incomplete_due_to_disconnect` accounting signal
-even when partial counts are known. Hosted monetary accounting retains unresolved authorization
-separately from settled spend for later resolution. The local gateway's monthly allocation uses
-its existing conservative policy instead: the full reserved bound consumes budget, the provider
-cost stays unknown, and observed partial counts remain available. That local allocation is shown
-under settled budget and is not automatically reconciled; it is not a provider bill or a hosted
-customer-account debit. An observed terminal with missing usage retains the host's unknown-terminal
-policy; this marker does not broaden that policy. Stopping generation is not evidence that its
-unreported usage was free.
+even when partial counts are known, together with the generated text observed so far
+(`streamed_output`: visible text and tool arguments in one leg, reasoning in the other, bounded
+with an overflow character count). When the provider had accepted the request (`opened`), the
+accounting registry completes the meter with the gateway's own tokenizer: the counted prompt fills
+a missing input total, the observed deltas fill a missing output total (reasoning folded in as an
+output subset), an observed leg is kept when it is at least the estimate, and cache legs stay
+unknown unless the provider reported an input total. The terminal then carries the internal
+`usage_estimated` marker and settles at the estimated cost with `usage_source = estimated`,
+releasing the rest of the reserved bound; the local gateway's monthly allocation charges the same
+figure. A disconnect the provider never answered (not opened), or one on a DECISIONS request,
+keeps the conservative policy: the full reserved bound consumes local budget, the provider cost
+stays unknown, observed partial counts remain available, and hosted accounting retains unresolved
+authorization separately from settled spend. An observed terminal with missing usage retains the
+host's unknown-terminal policy; neither marker broadens it. Stopping generation is not evidence
+that its unreported usage was free, and an estimate is never reported as observed.
 
 Meter parsing follows the provider's wire contract. Missing primary counts on partial
 OpenAI, Anthropic, or Bedrock reports remain unknown. Gemini's present `usageMetadata` uses

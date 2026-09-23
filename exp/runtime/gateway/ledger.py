@@ -37,7 +37,7 @@ from exp.runtime.gateway.ledger_usage import (
     billing_source_usage_rows,
     identity_usage_rows,
 )
-from exp.runtime.gateway.ledger_valuation import frozen_usage_cost, optional_int
+from exp.runtime.gateway.ledger_valuation import frozen_usage_cost, optional_int, settle_pricing
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
 from exp.runtime.gateway.sqlite.store import SystemGatewayClock
 
@@ -606,12 +606,8 @@ class SQLiteAttemptLedger:
             and usage.input_tokens >= threshold
         )
         prefix = "long_context_" if long_context else ""
-        # Partial disconnect usage remains evidence, not a final provider cost.
-        # Preserve its counts while consuming the conservative budget bound.
-        partial = terminal_event is not None and terminal_event.usage_incomplete_due_to_disconnect
-        cost = None if partial else frozen_usage_cost(row, usage, prefix=prefix)
-        budget_settlement = (
-            cost if cost is not None else optional_int(row["budget_reserved_nano_usd"])
+        cost, budget_settlement, usage_source = settle_pricing(
+            row, usage, terminal_event, prefix=prefix
         )
         if row["api_surface"] == GatewayApiSurface.DECISIONS.value and cost is None:
             # An unmetered decision can still have executed upstream. Keep the
@@ -662,7 +658,7 @@ class SQLiteAttemptLedger:
                 None if usage is None else usage.cache_creation_1h_input_tokens,
                 None if usage is None else usage.output_tokens,
                 None if usage is None else usage.reasoning_tokens,
-                "unknown" if usage is None else "observed",
+                usage_source,
                 cost,
                 counterfactual_cost,
                 budget_settlement,

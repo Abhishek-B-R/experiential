@@ -17,6 +17,7 @@ from exp.common.core.artifacts import (
     FailureCode,
     JsonObject,
     StructuredFailure,
+    redact_secret_json,
 )
 from exp.common.models import (
     AssistantAction,
@@ -42,17 +43,20 @@ from exp.common.rollouts import (
     RolloutSpan,
     StopReason,
 )
+from exp.common.rollouts.checkpoint import TextRolloutCheckpoint
 from exp.common.tasks import TaskCase
 from exp.runtime.environments import Observation
 from exp.runtime.models import ResolvedModel
 from exp.runtime.models.providers.transport import classify_retry
 from exp.simulation.engines.clock import timestamp
 from exp.simulation.engines.text.environment import SimulatedToolUseError
+from exp.simulation.engines.text.grounding import estimate_retrieval_economics
 from exp.simulation.engines.text.prompt import (
     SimulatedToolResult,
     TextWorldModelProtocolError,
     TextWorldModelTransition,
     candidate_rag_actions,
+    parse_world_model_transition,
     text_prompt_sha256,
 )
 from exp.simulation.engines.text.redaction import redact_json
@@ -79,14 +83,7 @@ class TokenCounter(Protocol):
     """Counts the full serialized request before a model client can send it."""
 
     def count(self, request: ModelRequest) -> int:
-        """Return a conservative number of context tokens required by one request.
-
-        Args:
-            request: Complete provider-neutral request before provider conversion.
-
-        Returns:
-            A nonnegative count that includes all visible request content.
-        """
+        """Return a nonnegative context-token bound for the complete visible request."""
         ...
 
 
@@ -94,14 +91,7 @@ class Utf8UpperBoundTokenCounter:
     """Provider-neutral byte upper bound used when no exact tokenizer is supplied."""
 
     def count(self, request: ModelRequest) -> int:
-        """Count UTF-8 request bytes plus per-message framing as a conservative token bound.
-
-        Args:
-            request: Complete provider-neutral request to preflight.
-
-        Returns:
-            A conservative nonnegative bound that never silently shortens request content.
-        """
+        """Bound complete request tokens by UTF-8 bytes plus per-message framing."""
         rendered = request.model_dump_json(exclude_none=False)
         return len(rendered.encode("utf-8")) + 4 * len(request.messages)
 
@@ -136,6 +126,7 @@ class RecordingCandidateClient:
         maximum_cost_usd: float,
         stop_on_overspend: bool,
         maximum_steps: int,
+        maximum_rollout_output_tokens: int = 1_000_000,
         maximum_output_tokens: int,
         redacted_field_names: frozenset[str],
         clock: Callable[[], datetime],
@@ -172,6 +163,7 @@ class RecordingCandidateClient:
         self._maximum_cost_usd = maximum_cost_usd
         self._stop_on_overspend = stop_on_overspend
         self._maximum_steps = maximum_steps
+        self._maximum_rollout_output_tokens = maximum_rollout_output_tokens
         self._maximum_output_tokens = maximum_output_tokens
         self._redacted_field_names = redacted_field_names
         self._clock = clock
@@ -368,7 +360,11 @@ class RecordingCandidateClient:
         candidate_request = _bounded_candidate_request(
             request,
             visible_transcript=self._visible_transcript,
-            maximum_output_tokens=self._maximum_output_tokens,
+            maximum_output_tokens=min(
+                self._maximum_output_tokens,
+                self._remaining_output_tokens(),
+                self._candidate.capabilities.maximum_output_tokens or self._maximum_output_tokens,
+            ),
         )
         _preflight_context(
             self._candidate.alias,
@@ -446,29 +442,23 @@ class RecordingCandidateClient:
             )
             for action in candidate_rag_actions(candidate_response.output)
         )
-        query_bytes = max(
+        if any(
             len(
                 render_rag_key(
                     task=query.task, initial_context=query.initial_context, action=query.action
                 ).encode("utf-8")
             )
+            > self._query_embedding.maximum_input_tokens
             for query in queries
-        )
-        if query_bytes > self._query_embedding.maximum_input_tokens:
+        ):
             raise _text_failure(
                 StopReason.MAXIMUM_COST,
                 FailureCode.BUDGET,
                 "grounding query exceeds its reserved input-token ceiling",
                 phase="query_embedding_budget",
             )
-        query_economics = combine_economics(
-            tuple(
-                self._grounded_world_model.retriever.estimate_query_economics(
-                    query, self._query_embedding
-                )
-                for query in queries
-            ),
-            require_complete_usage=False,
+        query_economics = estimate_retrieval_economics(
+            queries, self._grounded_world_model.retriever, self._query_embedding
         )
         self._check_spend_ceiling(role="query embedding")
         self._retrieval_economics.append(query_economics)
@@ -479,7 +469,11 @@ class RecordingCandidateClient:
                 candidate_response=candidate_response.output,
                 excluded_lineage_ids=(self._task.lineage_group_id,),
                 state=self._environment_state,
-                maximum_output_tokens=self._maximum_output_tokens,
+                maximum_output_tokens=min(
+                    self._maximum_output_tokens,
+                    self._world_model.capabilities.maximum_output_tokens
+                    or self._maximum_output_tokens,
+                ),
             ),
             # The retained retrieval estimate above already covers this dispatch's worst case
             # in every reconciliation path, so the window's incremental reservation is zero.
@@ -571,6 +565,60 @@ class RecordingCandidateClient:
         }
         self._terminal = transition.terminal
         return candidate_response
+
+    def _remaining_output_tokens(self) -> int:
+        """Admit generated tokens, including reasoning, without treating missing usage as zero."""
+        usages = [response.economics.usage for response in self._candidate_responses]
+        if any(usage is None for usage in usages):
+            raise _text_failure(
+                StopReason.MAXIMUM_OUTPUT_TOKENS,
+                FailureCode.BUDGET,
+                "candidate usage is missing; cannot safely admit more output tokens",
+                phase="candidate_token_budget",
+            )
+        used = sum(usage.output_tokens for usage in usages if usage is not None)
+        remaining = self._maximum_rollout_output_tokens - used
+        if remaining <= 0:
+            raise _text_failure(
+                StopReason.MAXIMUM_OUTPUT_TOKENS,
+                FailureCode.BUDGET,
+                "rollout output-token budget exhausted; increase it to continue",
+                phase="candidate_token_budget",
+            )
+        return remaining
+
+    def checkpoint(self) -> TextRolloutCheckpoint | None:
+        """Return safe resumable state only at a complete, unredacted world-turn boundary."""
+        if self._pending_tools or not (
+            len(self._candidate_responses)
+            == len(self._world_model_responses)
+            == len(self._transitions)
+        ):
+            return None
+        checkpoint = TextRolloutCheckpoint(
+            visible_transcript=self._visible_transcript,
+            candidate_responses=tuple(self._candidate_responses),
+            world_model_responses=tuple(self._world_model_responses),
+            retrieval_economics=tuple(self._retrieval_economics),
+        )
+        raw = checkpoint.model_dump(mode="json")
+        safe, _ = redact_secret_json(redact_json(raw, self._redacted_field_names))
+        return checkpoint if safe == raw else None
+
+    def restore(self, checkpoint: TextRolloutCheckpoint, spans: tuple[RolloutSpan, ...]) -> None:
+        """Restore a validated built-in chat prefix without dispatching any prior call."""
+        self._visible_transcript = checkpoint.visible_transcript
+        self._candidate_responses = list(checkpoint.candidate_responses)
+        self._world_model_responses = list(checkpoint.world_model_responses)
+        self._transitions = [
+            parse_world_model_transition(item.output) for item in checkpoint.world_model_responses
+        ]
+        self._environment_state = self._transitions[-1].state if self._transitions else {}
+        self._retrieval_economics = list(checkpoint.retrieval_economics)
+        self._candidate_spans = [s for s in spans if s.kind == RolloutEventKind.AGENT_MODEL_CALL]
+        self._world_model_spans = [
+            s for s in spans if s.kind == RolloutEventKind.SIMULATOR_WORLD_MODEL_CALL
+        ]
 
     def _check_spend_ceiling(self, *, role: str) -> None:
         """Apply the episode's overspend policy before one paid dispatch.
@@ -754,17 +802,12 @@ def _bounded_candidate_request(
 ) -> ModelRequest:
     """Inject the visible transcript and enforce a caller-visible output budget."""
     requested_budget = request.maximum_output_tokens
-    if requested_budget is not None and requested_budget > maximum_output_tokens:
-        raise _text_failure(
-            StopReason.FAILURE,
-            FailureCode.VALIDATION,
-            "candidate requested more output tokens than the frozen text simulation budget",
-            phase="candidate_output_budget",
-        )
     return request.model_copy(
         update={
             "messages": _messages_with_visible_transcript(request.messages, visible_transcript),
-            "maximum_output_tokens": requested_budget or maximum_output_tokens,
+            "maximum_output_tokens": min(
+                requested_budget or maximum_output_tokens, maximum_output_tokens
+            ),
             "tool_choice": request.tool_choice,
         }
     )
