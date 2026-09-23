@@ -29,7 +29,7 @@ impl Configuration {
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         self.delivery.validate()?;
         if !(1..=4096).contains(&self.maximum_pending_records)
-            || !(1..=1024 * 1024).contains(&self.maximum_request_bytes)
+            || !(1..=4 * 1024 * 1024).contains(&self.maximum_request_bytes)
             || !(1..=4 * 1024 * 1024).contains(&self.maximum_response_bytes)
             || self.maximum_pending_bytes < self.maximum_request_bytes
             || self.maximum_pending_bytes < self.maximum_response_bytes
@@ -77,6 +77,7 @@ struct Entry {
     bytes: usize,
     attached: bool,
     output_finished: bool,
+    checkpointing: bool,
     response_allowed: bool,
     response_discarded: Arc<AtomicBool>,
 }
@@ -140,7 +141,7 @@ impl<S: Sink> Sink for MaintainedSink<S> {
 fn expire_pending(pending: &mut Pending, skipped: &AtomicU64) {
     let now = Instant::now();
     pending.entries.retain(|_, entry| {
-        if entry.expires <= now {
+        if entry.expires <= now && !entry.checkpointing {
             pending.bytes -= entry.bytes;
             skipped.fetch_add(1, Ordering::Relaxed);
             false
@@ -238,6 +239,7 @@ impl Collector {
                 bytes,
                 attached: false,
                 output_finished: false,
+                checkpointing: false,
                 response_allowed: !self.config.settlement_required,
                 response_discarded: Arc::new(AtomicBool::new(false)),
             },
@@ -302,8 +304,52 @@ impl Collector {
         }
     }
 
-    /// Hosted terminal eligibility precedes durable content, so a dropped BYOK
-    /// discard can never leave a previously queued prompt behind.
+    /// Checkpoint a hosted prompt after the winning host-funded lane is frozen.
+    /// The destination must recheck consent and merge this idempotent update
+    /// without replacing a later response. Keep the shared request tree live
+    /// until terminal settlement; no provider response belongs in this write.
+    pub(crate) fn checkpoint(&self, request_id: &str) -> bool {
+        // The local experience sink projects completed exchanges, not prompt
+        // records. It must never acknowledge a checkpoint it cannot persist.
+        if !self.config.settlement_required {
+            return true;
+        }
+        let record = {
+            let Ok(mut pending) = self.pending.lock() else {
+                return false;
+            };
+            let Some(entry) = pending.entries.get_mut(request_id) else {
+                // Capture-off, ZDR and declined identities have no admission.
+                return true;
+            };
+            entry.checkpointing = true;
+            Record {
+                schema_version: SCHEMA_VERSION,
+                request: entry.record.request.clone(),
+                response: None,
+                provider_reasoning: None,
+                provider_reasoning_source_json: None,
+                provider_tool_calls_json: None,
+                deployment_id: None,
+                metrics: None,
+                gemini_thought_parts: Vec::new(),
+                gemini_thought_parts_source_json: None,
+                captured_at: entry.record.captured_at,
+            }
+        };
+        let persisted = self.emit(record, None);
+        if let Ok(mut pending) = self.pending.lock() {
+            if let Some(entry) = pending.entries.get_mut(request_id) {
+                entry.checkpointing = false;
+                // Destination backpressure is not abandoned-request idle time.
+                entry.expires = Instant::now() + Duration::from_secs(self.config.ttl_seconds);
+            }
+        }
+        persisted
+    }
+
+    /// Terminal policy controls response retention; the winning lane was frozen
+    /// before any hosted prompt checkpoint. The sink rechecks live consent.
     pub(crate) fn settle(&self, request_id: &str, keep_prompt: bool, keep_response: bool) {
         let Ok(mut pending) = self.pending.lock() else {
             return;
@@ -331,8 +377,7 @@ impl Collector {
         }
         entry.response_allowed = true;
         if !entry.output_finished {
-            // Emit once at response completion. A preliminary prompt write could
-            // otherwise overtake the response after releasing the pending lock.
+            // The terminal update supplies output to the earlier prompt checkpoint.
             pending.bytes += entry.bytes;
             pending.entries.insert(request_id.to_owned(), entry);
         } else {
@@ -343,6 +388,7 @@ impl Collector {
     }
 
     /// Output may arrive before or after settlement; unpermitted output stays bounded.
+    #[cfg(test)]
     pub(crate) fn finish(
         &self,
         request_id: &str,
