@@ -39,7 +39,7 @@ fn repeated_close_meters_each_drained_delta_once() {
         Dialect::OpenAiCompatible,
         deadline,
     );
-    let observed = Observation::default().next_dial();
+    let observed = Observation::default();
     relay.set_observation(observed.clone());
     relay.ready.push_back(Event::TextDelta("once".into()));
     relay.close_transport();
@@ -56,7 +56,7 @@ fn private_gemini_meter_is_separate_from_visible_signatures_and_terminal() {
         Dialect::GeminiGenerateContent,
         deadline,
     );
-    let observed = Observation::default().next_dial();
+    let observed = Observation::default();
     relay.set_observation(observed.clone());
     let events = relay.normalizer.feed(&crate::sse::SseEvent {
         event: None,
@@ -139,7 +139,7 @@ async fn effective_stop_terminal_wins_raw_incomplete_on_disconnect() {
 }
 
 #[tokio::test]
-async fn across_dial_unknown_leg_cannot_reuse_known_prior_subtotal() {
+async fn a_missing_input_leg_stays_unknown() {
     let wire = concat!(
         "data: {\"choices\":[],\"usage\":{\"completion_tokens\":2}}\n\n",
         "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n",
@@ -150,11 +150,6 @@ async fn across_dial_unknown_leg_cannot_reuse_known_prior_subtotal() {
     let mut relay = UpstreamRelay::from_stream(source.boxed(), Dialect::OpenAiCompatible, deadline);
     let observed = Observation::default();
     relay.set_observation(observed.clone());
-    relay.set_carried_usage(Some(Usage {
-        input_tokens: Some(13),
-        output_tokens: Some(7),
-        ..Usage::default()
-    }));
     relay
         .next_event(deadline, Duration::from_secs(5), Instant::now())
         .await
@@ -162,25 +157,18 @@ async fn across_dial_unknown_leg_cannot_reuse_known_prior_subtotal() {
     relay.close_transport();
     let usage = observed.snapshot().usage.unwrap();
     assert_eq!(usage.input_tokens, None);
-    assert_eq!(usage.output_tokens, Some(9));
+    assert_eq!(usage.output_tokens, Some(2));
 }
 
 #[tokio::test]
-async fn abnormal_end_does_not_promote_an_earlier_dial_subtotal() {
+async fn abnormal_end_keeps_unreported_usage_unknown() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut relay = UpstreamRelay::from_stream(
         futures_util::stream::empty().boxed(),
         Dialect::OpenAiCompatible,
         deadline,
     );
-    relay.set_carried_usage(Some(Usage {
-        input_tokens: Some(13),
-        output_tokens: Some(7),
-        ..Usage::default()
-    }));
-    let unknown = relay.usage_before_failure(None).unwrap();
-    assert_eq!(unknown.input_tokens, None);
-    assert_eq!(unknown.output_tokens, None);
+    assert!(relay.usage_before_failure(None).is_none());
 
     let events = relay
         .normalizer
@@ -192,11 +180,11 @@ async fn abnormal_end_does_not_promote_an_earlier_dial_subtotal() {
     relay.queue_events(events);
     let partial = relay.usage_before_failure(None).unwrap();
     assert_eq!(partial.input_tokens, None);
-    assert_eq!(partial.output_tokens, Some(9));
+    assert_eq!(partial.output_tokens, Some(2));
 }
 
 #[test]
-fn close_does_not_merge_raw_current_usage_into_an_across_dial_total() {
+fn close_preserves_latest_cumulative_usage() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut relay = UpstreamRelay::from_stream(
         futures_util::stream::pending().boxed(),
@@ -205,11 +193,6 @@ fn close_does_not_merge_raw_current_usage_into_an_across_dial_total() {
     );
     let observed = Observation::default();
     relay.set_observation(observed.clone());
-    relay.set_carried_usage(Some(Usage {
-        input_tokens: None,
-        output_tokens: Some(7),
-        ..Usage::default()
-    }));
     for data in [
         r#"{"type":"message_start","message":{"usage":{"input_tokens":13,"output_tokens":2}}}"#,
         r#"{"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":4}}"#,
@@ -224,12 +207,12 @@ fn close_does_not_merge_raw_current_usage_into_an_across_dial_total() {
         relay.queue_events(events);
     }
     let before = observed.snapshot().usage.unwrap();
-    assert_eq!(before.input_tokens, None);
-    assert_eq!(before.output_tokens, Some(11));
+    assert_eq!(before.input_tokens, Some(13));
+    assert_eq!(before.output_tokens, Some(4));
     relay.close_transport();
     let after = observed.snapshot().usage.unwrap();
-    assert_eq!(after.input_tokens, None);
-    assert_eq!(after.output_tokens, Some(11));
+    assert_eq!(after.input_tokens, Some(13));
+    assert_eq!(after.output_tokens, Some(4));
 }
 
 #[tokio::test]
@@ -311,7 +294,7 @@ async fn close_drains_custom_input_without_inventing_provider_terminality() {
             guard.rebind(format!("attempt-{valid}-{completed}"));
             guard.mark_dispatched();
             guard.mark_opened();
-            let observation = guard.begin_dial_observation();
+            let observation = guard.capture_observation();
             relay.set_observation(observation.clone());
             relay.set_native_tool_translation(NativeToolTranslation::from([(
                 "patch".into(),

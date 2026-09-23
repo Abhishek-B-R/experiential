@@ -10,7 +10,6 @@ from collections.abc import Mapping
 from concurrent.futures import Future, wait
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import Protocol
 
 from exp.common.core.artifacts import ContractModel
@@ -19,9 +18,7 @@ from exp.common.models.gateway_catalog import (
     ExactModelDeployment,
     ExactModelPool,
     NormalizedGatewayCatalog,
-    is_foreign_snapshot,
 )
-from exp.common.models.gateway_chains import GatewayModelChain
 from exp.common.routing.policy import RoutingDecision
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -34,6 +31,8 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.discovery import PublishedAliasMetadata, published_alias_metadata
 from exp.runtime.gateway.interfaces import ProjectTargetResolver
 from exp.runtime.gateway.model_plan import (
+    _CatalogView,
+    _index_catalogs,
     model_execution_snapshot,
     project_stage_selection,
     stage_start_authorized,
@@ -41,6 +40,7 @@ from exp.runtime.gateway.model_plan import (
 from exp.runtime.gateway.project_episode_identity import (
     project_episode_identity as project_episode_identity,
 )
+from exp.runtime.gateway.request_policy import RequestedRouteId
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded, RequestDeadline
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 from exp.runtime.router.runtime import RouterRuntime
@@ -68,13 +68,18 @@ so the ledger shows the request ran without its thinking continuity.
 
 
 class GatewayRoute(ContractModel):
-    """One immutable ordered exact-model route ready for provider execution."""
+    """One immutable ordered exact-model route ready for provider execution.
+
+    Attributes:
+        resolved_route_id: Optional host attestation that the requested public handle leads.
+    """
 
     snapshot: ExecutionSnapshot
     deployment: ExactModelDeployment
     fallback_deployments: tuple[ExactModelDeployment, ...] = ()
     route_reason: str
     fallback_reason: str | None = None
+    resolved_route_id: RequestedRouteId | None = None
     reasoning_pinned_deployment_id: str | None = None
     """The deployment whose credential sealed the request's active reasoning.
 
@@ -156,16 +161,6 @@ class RouteResolver(Protocol):
     ) -> GatewayRoute:
         """Resolve one project target from a caller thread without an event loop."""
         ...
-
-
-@dataclass(frozen=True)
-class _CatalogView:
-    """One revision-scoped catalog with immutable chain, pool, and deployment indexes."""
-
-    catalog: NormalizedGatewayCatalog
-    chains: Mapping[str, GatewayModelChain]
-    pools: Mapping[str, ExactModelPool]
-    deployments: Mapping[str, ExactModelDeployment]
 
 
 class CatalogRouteResolver:
@@ -594,57 +589,6 @@ class CatalogRouteResolver:
             route_reason=route_reason,
             fallback_reason=fallback_reason,
         )
-
-
-def _index_catalogs(
-    catalogs: Mapping[tuple[str, str], NormalizedGatewayCatalog],
-) -> dict[tuple[str, str], _CatalogView]:
-    """Index digest-verified catalogs by alias revision and catalog digest.
-
-    The pinned ``catalog_sha256`` stays the identity/attribution key for every
-    revision. A same-version catalog must reproduce it exactly, so a mismatch is
-    corruption and still raises. A cross-version snapshot (served through the
-    hydration reader's tolerant path during a rolling deploy) is expected not to
-    reproduce it; that catalog is indexed under its pinned digest without the
-    byte-exact check, so a roll never hard-fails route resolution.
-
-    Args:
-        catalogs: Alias-revision and digest pairs mapped to normalized snapshots.
-
-    Returns:
-        Fully built revision-scoped catalog views.
-
-    Raises:
-        ValueError: A same-version catalog does not match its declared digest.
-    """
-    indexed: dict[tuple[str, str], _CatalogView] = {}
-    # Hundreds of alias revisions can share one immutable catalog. Hash and index
-    # each distinct object once, but verify every key's digest independently.
-    # ``catalogs`` keeps object IDs stable by retaining them for the whole loop.
-    identity_by_object: dict[int, str] = {}
-    view_by_object: dict[int, _CatalogView] = {}
-    for key, catalog in catalogs.items():
-        revision_id, catalog_sha256 = key
-        if not is_foreign_snapshot(catalog):
-            identity = identity_by_object.get(id(catalog))
-            if identity is None:
-                identity = catalog.identity_sha256()
-                identity_by_object[id(catalog)] = identity
-            if identity != catalog_sha256:
-                raise ValueError(f"catalog for alias revision {revision_id!r} has the wrong digest")
-        view = view_by_object.get(id(catalog))
-        if view is None:
-            view = _CatalogView(
-                catalog=catalog,
-                chains=MappingProxyType(catalog.chains_by_model() if catalog.model_chains else {}),
-                pools=MappingProxyType({pool.pool_id: pool for pool in catalog.pools}),
-                deployments=MappingProxyType(
-                    {deployment.deployment_id: deployment for deployment in catalog.deployments}
-                ),
-            )
-            view_by_object[id(catalog)] = view
-        indexed[key] = view
-    return indexed
 
 
 @dataclass(frozen=True)

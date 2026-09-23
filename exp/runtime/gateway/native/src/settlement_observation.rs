@@ -27,8 +27,6 @@ pub(crate) struct StreamedOutput {
     /// Generated images, billed per image rather than per token: any at all
     /// leaves the meter unestimable from text.
     pub images: u64,
-    /// Only the first dial can certify a complete attempt's estimate evidence.
-    pub single_dial: bool,
 }
 
 impl StreamedOutput {
@@ -89,7 +87,6 @@ pub(crate) struct Observed {
     pub terminal: Option<Event>,
     pub first_token_at: Option<SystemTime>,
     pub streamed_output: StreamedOutput,
-    dial_count: u32,
 }
 
 impl Default for Observed {
@@ -104,31 +101,11 @@ impl Default for Observed {
             terminal: None,
             first_token_at: None,
             streamed_output: StreamedOutput::default(),
-            dial_count: 0,
         }
     }
 }
 
 impl Observation {
-    /// A repaired dial resets its meter but retains the physical attempt's start.
-    pub(crate) fn next_dial(&self) -> Self {
-        let previous = self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let dial_count = previous.dial_count.saturating_add(1);
-        Self(Arc::new(Mutex::new(Observed {
-            started_at: previous.started_at,
-            started: previous.started,
-            dial_count,
-            streamed_output: StreamedOutput {
-                single_dial: dial_count == 1,
-                ..StreamedOutput::default()
-            },
-            ..Observed::default()
-        })))
-    }
-
     /// Meter private Gemini thought text without retaining capture parts or emitting events.
     pub(crate) fn record_gemini_reasoning(&self, text: &str) {
         let mut observed = self.0.lock().unwrap_or_else(|error| error.into_inner());
@@ -176,18 +153,6 @@ impl Observation {
             observed.terminal = Some(event.clone());
             observed.terminal_at = Some(SystemTime::now());
             observed.duration = Some(observed.started.elapsed());
-        }
-    }
-
-    /// Replace an across-dial aggregate, where a newly unknown leg must not
-    /// inherit the earlier dial's known subtotal through cumulative merging.
-    pub(crate) fn record_dial_total(&self, usage: Usage) {
-        let mut observed = self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if observed.terminal.is_none() {
-            observed.usage = Some(usage);
         }
     }
 

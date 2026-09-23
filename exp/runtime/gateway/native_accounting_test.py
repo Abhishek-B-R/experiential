@@ -471,7 +471,7 @@ def test_estimated_disconnect_preserves_search_charges_and_receipt_time_without_
             "opened": True,
             "finalize": True,
             "usage_incomplete_due_to_disconnect": True,
-            "streamed_output": {"single_dial": True, "text": "visible output"},
+            "streamed_output": {"text": "visible output"},
             "web_search_requests": 2,
             "tool_search_requests": 3,
         }
@@ -523,7 +523,6 @@ def test_opened_disconnect_settles_an_estimated_meter_on_every_path(
         "dispatched": True,
         "usage_incomplete_due_to_disconnect": True,
         "streamed_output": {
-            "single_dial": True,
             "text": "The sky is blue because",
             "reasoning": "",
             "text_overflow_chars": 0,
@@ -653,6 +652,46 @@ def _retryable_failure() -> JsonObject:
         "retryable_same_deployment": True,
         "failover_eligible": True,
     }
+
+
+@pytest.mark.parametrize("reject_successor", [False, True])
+def test_repair_successor_owns_fresh_reservation_without_erasing_prior_unknown(
+    reject_successor: bool,
+) -> None:
+    """A settled unknown first attempt survives both successful and refused repair reservations."""
+    registry, ledger, entry = _registry()
+    first = _start(registry, ordinal=0)
+    _settle(
+        registry,
+        attempt_id=str(first["attempt_id"]),
+        outcome="failed",
+        finalize=False,
+        failure={"failure_class": "invalid_request", "safe_message": "encrypted item refused"},
+    )
+    assert ledger.terminal_events[-1] is not None and ledger.terminal_events[-1].usage is None
+    assert entry.active_attempt_id is None
+    payload = json.dumps(
+        {
+            "request_id": entry.authorization.request_id,
+            "attempt_ordinal": 1,
+            "current_depth": 0,
+            "reasoning_repair": True,
+        }
+    )
+    if reject_successor:
+        ledger.budget_rejections[entry.route.deployment.deployment_id] = BudgetScopeKind.TEAM
+        with pytest.raises(NativeBridgeError):
+            registry.start_attempt(payload)
+        assert len(ledger.started) == 1 and len(ledger.finished) == 1
+        assert registry.entry(entry.authorization.request_id) is None
+    else:
+        second = json.loads(registry.start_attempt(payload))
+        assert second["attempt_id"] != first["attempt_id"]
+        assert len(ledger.started) == 2 and entry.total_attempts == 2
+        assert entry.attempt_counts[0] == 2 and entry.ordinary_attempt_counts[0] == 1
+        registry.abandon(json.dumps({"request_id": entry.authorization.request_id}))
+        assert len(ledger.finished) == 2
+    assert ledger.terminal_events[0] is not None and ledger.terminal_events[0].usage is None
 
 
 def test_waterfall_reservations_count_every_physical_dispatch() -> None:
@@ -1429,6 +1468,84 @@ class TestLaneSaturation:
         assert refused["exhausted"] is True
         assert cast("JsonObject", refused["failure"])["failure_class"] == "throttled"
         assert registry.rung_admission_counters() == (1, 0, 1)
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        None,
+        GatewayRungDispatchPolicy(concurrency_bound=1),
+        GatewayRungDispatchPolicy(concurrency_bound=1, saturation="refuse"),
+        GatewayRungDispatchPolicy(requests_per_minute=1),
+    ],
+)
+@pytest.mark.parametrize("reasoning_pinned", [False, True])
+def test_selected_first_route_refuses_load_shed_without_spill_or_overflow(
+    dispatch: GatewayRungDispatchPolicy | None, reasoning_pinned: bool
+) -> None:
+    """A caller selector neither moves sideways nor overrides any lane load ceiling."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+    deployments = (
+        _deployment("deployment-a", connection_sha256="b" * 64, dispatch=dispatch),
+        _deployment("deployment-b", connection_sha256="c" * 64),
+    )
+    _admit(registry, deployments, request_id="occupied")
+    selected = _admit(
+        registry,
+        deployments,
+        request_id="selected",
+        reasoning_pinned_deployment_id="deployment-a" if reasoning_pinned else None,
+    )
+    selected.route = selected.route.model_copy(update={"resolved_route_id": "route_" + "a" * 64})
+    assert _start(registry, ordinal=0, request_id="occupied")["route_depth"] == 0
+    if dispatch is not None and dispatch.requests_per_minute is not None:
+        # Release concurrency so this arm exercises only the retained rate window.
+        _settle(
+            registry,
+            attempt_id=str(ledger.started[0]["attempt_id"]),
+            outcome="completed",
+            finalize=True,
+            request_id="occupied",
+        )
+    refused = _start(registry, ordinal=0, request_id="selected")
+    assert refused["exhausted"] is True
+    failure = refused["failure"]
+    assert isinstance(failure, dict)
+    assert failure["failure_class"] == "throttled"
+    assert failure["retry_after_seconds"] == THROTTLED_RETRY_AFTER_SECONDS
+    assert len(ledger.started) == 1
+    assert registry.rung_admission_counters() == (1, 0, 1)
+    assert registry.entry("selected") is None
+
+
+@pytest.mark.parametrize("probe_occupied", [False, True])
+def test_selected_first_route_does_not_force_an_open_health_circuit(
+    probe_occupied: bool,
+) -> None:
+    """Selecting a suppressed lead never converts a healthy sibling into circuit override."""
+    registry, ledger, selected = _registry()
+    selected.route = selected.route.model_copy(update={"resolved_route_id": "route_" + "a" * 64})
+    key = deployment_health_key(selected.authorization, selected.route.deployment)
+    registry.health.failed(
+        key,
+        GatewayFailure(
+            failure_class=GatewayFailureClass.PROVIDER_AUTHENTICATION,
+            safe_message="provider rejected its credential",
+        ),
+    )
+    if probe_occupied:
+        assert registry.health.claim_last_resort(key)
+    refused = _start(registry, ordinal=0)
+    assert refused["exhausted"] is True
+    failure = refused["failure"]
+    assert isinstance(failure, dict)
+    assert failure["failure_class"] == "provider_internal"
+    assert not ledger.started
+    assert registry.entry(selected.authorization.request_id) is None
+    ordinary = _admit(registry, selected.route.deployments, request_id="ordinary")
+    assert _start(registry, ordinal=0, request_id="ordinary")["route_depth"] == 1
+    assert ordinary.total_attempts == 1
 
 
 class TestRungDispatchPolicy:

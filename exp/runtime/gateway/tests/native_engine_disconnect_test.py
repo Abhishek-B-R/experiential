@@ -888,7 +888,6 @@ def test_responses_websocket_close_stops_quiet_provider(
             "" if phase == "precommit" else "usable partial answer"
         )
     assert row["usage_source"] == "estimated"
-    assert own[0]["streamed_output"]["single_dial"] is True
     assert own[0]["usage_incomplete_due_to_disconnect"] is True
     assert _PROVIDER_CALLS[prompt] == 1
 

@@ -59,6 +59,7 @@ from exp.runtime.gateway.native_recovery import (
 from exp.runtime.gateway.native_rung_policy import (
     bind_sticky_dispatch,
     failed_dispatch_candidate,
+    record_cache_fraction,
     reserve_rung_slot,
     shed_keeps_rung,
 )
@@ -370,15 +371,15 @@ class NativeAttemptAccounting:
             raise NativeBridgeError(public_failure_error(failure))
         failure = failure_from_boundary_payload(data.get("failure"))
         current_depth = data.get("current_depth")
-        ladder = eligible_ladder(route, failure)  # The depths this walk may claim at all.
-        # Rung dispatch policies shed a claimed rung SIDEWAYS to the next
-        # claimable one instead of queueing on it. Each shed is remembered so
-        # the dispatched attempt can disclose the bypassed rung, and so a ladder
-        # exhausted only by sheds applies the selected rung's saturation policy.
+        selected_first = route.resolved_route_id is not None and entry.total_attempts == 0
+        ladder = (0,) if selected_first else eligible_ladder(route, failure)
+        # A caller-selected first dial cannot spill or override health and load gates.
+        # Other ladders may spill sideways or use their operator-authored overflow.
         policy_sheds: list[tuple[int, str]] = []
         disposition: ThrottleDisposition | None = None
         redial_depth: int | None = None  # The rung a post-backoff redial re-dials.
         tool_search_round = False
+        reasoning_repair = data.get("reasoning_repair") is True and isinstance(current_depth, int)
         if failure is not None and isinstance(current_depth, int):
             candidate, disposition = failed_dispatch_candidate(
                 health=self._health,
@@ -402,15 +403,21 @@ class NativeAttemptAccounting:
                 policy_sheds.append((current_depth, THROTTLE_FAILOVER_COLD))
             last_failure: GatewayFailure | None = failure
         else:
-            # A gateway tool-search round re-dials the rung that just served
-            # the withheld search call (its conversation now extended); the
-            # claim starts there and only moves on if that rung went unhealthy.
+            # Semantic tool turns prefer the preceding rung; repairs stay on that rung.
             tool_search_round = data.get("tool_search_round") is True and isinstance(
                 current_depth, int
             )
-            candidate = claim_route_from(
-                self._health, keys, current_depth if tool_search_round else 0, ladder
-            )
+            if selected_first:
+                candidate = 0 if self._health.claim(keys[0]) else None
+            else:
+                candidate = claim_route_from(
+                    self._health,
+                    keys,
+                    current_depth if tool_search_round or reasoning_repair else 0,
+                    (current_depth,) if reasoning_repair else ladder,
+                )
+            if reasoning_repair:
+                ladder = (current_depth,)
             last_failure = None
         forced_overflow = False
         shed_records: dict[int, RungShed] = {}
@@ -434,7 +441,11 @@ class NativeAttemptAccounting:
                 break
             if candidate is None:
                 if policy_sheds and last_failure is None and not forced_overflow:
-                    candidate = overflow_target(route, policy_sheds, shed_records)
+                    candidate = (
+                        None
+                        if selected_first
+                        else overflow_target(route, policy_sheds, shed_records)
+                    )
                     forced_overflow = candidate is not None
                     if candidate is None:
                         last_failure = lane_saturated_failure()
@@ -447,6 +458,19 @@ class NativeAttemptAccounting:
                 self._health.release_probe(keys[candidate])
                 candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
                 continue
+            if not entry.attempt_policy.permits(
+                entry.total_attempts, entry.attempt_counts[candidate]
+            ):
+                last_failure = last_failure or GatewayFailure(
+                    failure_class=GatewayFailureClass.INVALID_REQUEST,
+                    safe_message=(
+                        "The request exhausted gateway.retry attempt limits before "
+                        "producing an answer. Increase the requested limits and resend."
+                    ),
+                    rejected_parameter="gateway.retry",
+                )
+                self._health.release_probe(keys[candidate])
+                break
             deployment = deployment_priced_for_service_tier(
                 route.deployments[candidate],
                 getattr(entry.request, "service_tier", None),
@@ -476,7 +500,7 @@ class NativeAttemptAccounting:
                 policy_sheds.append((candidate, ticket.reason))
                 shed_records[candidate] = ticket
                 self._health.release_probe(keys[candidate])
-                forced_overflow = shed_keeps_rung(
+                forced_overflow = not selected_first and shed_keeps_rung(
                     route, candidate, redial_depth, last_failure, ticket.reason
                 )
                 if (
@@ -593,6 +617,8 @@ class NativeAttemptAccounting:
                 elif forced_overflow:
                     self._throttle_backoff_forced += 1
                 entry.attempt_counts[candidate] += 1
+                if not tool_search_round and not reasoning_repair:
+                    entry.ordinary_attempt_counts[candidate] += 1
                 if throttle_backoff:
                     entry.throttle_redials[candidate] += 1
                 entry.total_attempts += 1
@@ -830,50 +856,16 @@ class NativeAttemptAccounting:
             self._health.succeeded(key)
 
     def _record_cache_fraction(
-        self,
-        entry: InflightRequest,
-        attempt_id: str,
-        terminal: GatewayEvent,
+        self, entry: InflightRequest, attempt_id: str, terminal: GatewayEvent
     ) -> None:
-        """Fold one settled attempt's cached-token fraction into the registry.
-
-        Feeds the congestion-dependent cache-priority term (a per-(organization,
-        rung) EWMA of the settled cached fraction, so fairness favors traffic
-        that reuses warm provider cache). Attempts without an observed input
-        count record nothing: an estimated disconnect meter has no cache legs.
-        One attempt folds at most once, whichever of the direct path and the
-        retained-settlement sweep lands it, so a duplicate cannot skew the EWMA.
-
-        Args:
-            entry: The owning in-flight request.
-            attempt_id: The settled attempt.
-            terminal: The settled terminal event.
-        """
-        usage = terminal.usage
-        if usage is None or usage.input_tokens is None or terminal.usage_estimated:
-            return
-        depth = entry.attempt_depths.get(attempt_id)
-        if depth is None:
-            return
-        if self._cache_sample_gate is not None:
-            # Promo-funded (or otherwise excluded) attempts must not buy
-            # fair-share weight; an erroring gate skips the sample rather
-            # than admit one the host meant to exclude.
-            try:
-                if not self._cache_sample_gate(attempt_id):
-                    return
-            except Exception:  # noqa: BLE001 - the sample is telemetry, never worth failing settle.
-                return
-        with self._lock:
-            if attempt_id in entry.cache_recorded_attempts:
-                return
-            entry.cache_recorded_attempts.add(attempt_id)
-        cached = usage.cached_input_tokens
-        self._loads.record_settle(
-            rung_load_key(entry.route.deployments[depth]),
-            entry.authorization.organization_id,
-            cached_tokens=0 if cached is None else cached,
-            input_tokens=usage.input_tokens,
+        """Apply the observed-only cache sample once through the existing rung-policy owner."""
+        record_cache_fraction(
+            self._loads,
+            entry,
+            attempt_id,
+            terminal,
+            lock=self._lock,
+            sample_gate=self._cache_sample_gate,
         )
 
     def _sweep_loop(self) -> None:

@@ -94,8 +94,8 @@ def estimate_disconnect_usage(
     provider never answered has no billed work to estimate, a data plane that
     predates the evidence (or sent it malformed) leaves the meter unknown, and
     generated images are billed per image, so any image keeps the meter
-    unknown too. Explicit single-dial proof is required: a repaired dial's
-    retained prefix cannot price earlier work or release its unresolved hold.
+    unknown too. Each repair owns a separate reserved physical attempt, so
+    the estimate never includes or releases another attempt's liability.
     Decisions, embeddings, and image requests keep their own contracts untouched.
 
     Args:
@@ -114,7 +114,6 @@ def estimate_disconnect_usage(
         or surface is GatewayApiSurface.DECISIONS
         or not isinstance(request, GatewayRequest)
         or streamed is None
-        or not streamed.single_dial
         or streamed.images > 0
     ):
         return terminal

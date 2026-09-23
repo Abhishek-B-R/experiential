@@ -94,6 +94,8 @@ fn policy(refusal_failover: bool) -> RoutePolicy {
         maximum_same_deployment_attempts: 2,
         refusal_failover,
         throttle_redial: None,
+        physical_route_cap: None,
+        backoff: None,
     }
 }
 

@@ -292,6 +292,16 @@ async fn handle_frame(
     // with an empty completed response and perform no model work.
     if let Some(generate) = body.remove("generate") {
         if generate == Value::Bool(false) {
+            if body.contains_key("gateway") {
+                let mut error = PublicError::new(
+                    400,
+                    "unsupported_parameter",
+                    "gateway requires generate=true. Remove gateway for a prewarm request.",
+                    "invalid_request_error",
+                );
+                error.param = Some("gateway".to_string());
+                return send_public_error(socket, deadline, &error).await;
+            }
             let probability_include =
                 body.get("include")
                     .and_then(Value::as_array)

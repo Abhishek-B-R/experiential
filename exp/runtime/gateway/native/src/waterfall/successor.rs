@@ -60,6 +60,22 @@ pub(super) fn throttle_backoff_delay(
     {
         return None;
     }
+    if throttle_redials_at_depth >= schedule.max_attempts.min(wire.throttle_redial_budget) {
+        return None;
+    }
+    if let Some(backoff) = ctx.policy.backoff {
+        return backoff.delay(
+            throttle_redials_at_depth,
+            failure.retry_after_seconds,
+            remaining(ctx.deadline).saturating_sub(first_byte_allowance(
+                wire,
+                ctx.time_to_first_byte,
+                ctx.time_to_first_byte_slope_seconds_per_million_input_tokens,
+                ctx.approximate_input_tokens,
+            )),
+            ctx.request_id,
+        );
+    }
     BackoffQuery {
         // The rung's per-request budget never exceeds the schedule's cap.
         schedule: ThrottleRedial {

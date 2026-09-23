@@ -239,12 +239,10 @@ class StreamedOutput(BaseModel):
         text_overflow_chars: Visible characters beyond the retained bound, default zero.
         reasoning_overflow_chars: Reasoning characters beyond the bound, default zero.
         images: Observed generated image count, default zero; any image disables estimation.
-        single_dial: Native proof that evidence covers the sole dial, false when absent.
     """
 
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
-    single_dial: bool = False
     text: str = ""
     reasoning: str = ""
     text_overflow_chars: int = Field(default=0, ge=0)

@@ -149,10 +149,9 @@ Some providers supply usage only at the end. A dispatched request canceled befor
 terminal is observed carries the internal `usage_incomplete_due_to_disconnect` accounting signal
 even when partial counts are known, together with the generated text observed so far
 (`streamed_output`: visible text and tool arguments in one leg, reasoning in the other, bounded
-with an overflow character count). Only explicit native `single_dial=true` evidence may be
-estimated. A repaired second dial resets its retained content but cannot erase the first dial's
-unresolved cost; missing or false single-dial proof retains the conservative hold. When that proof
-is present and the provider had accepted the request (`opened`), the accounting registry completes the meter with the gateway's own tokenizer: the counted prompt fills
+with an overflow character count). Each repaired generation owns a separate reservation and
+settlement; its fresh meter cannot erase the prior attempt's observed or unresolved cost. When the
+provider had accepted the request (`opened`), the accounting registry completes the meter with the gateway's own tokenizer: the counted prompt fills
 a missing input total, the observed deltas fill a missing output total (reasoning folded in as an
 output subset), an observed leg is kept when it is at least the estimate, and cache legs stay
 unknown unless the provider reported an input total. The terminal then carries the internal
@@ -163,7 +162,7 @@ request-level charges on the finalizing settlement only. Estimated usage cannot 
 warmth or recovery success. Private Gemini thought text reaches the bounded attempt meter even
 with capture disabled; signatures are not tokens and no private metering event enters public output
 or refusal buffers. A disconnect the provider never answered (not opened), malformed or missing
-evidence, image output, a multi-dial attempt, or a DECISIONS request keeps the conservative policy: the full reserved bound consumes local budget, the provider cost
+evidence, image output, or a DECISIONS request keeps the conservative policy: the full reserved bound consumes local budget, the provider cost
 stays unknown, observed partial counts remain available, and hosted accounting retains unresolved
 authorization separately from settled spend. An observed terminal with missing usage retains the
 host's unknown-terminal policy; neither marker broadens it. Stopping generation is not evidence

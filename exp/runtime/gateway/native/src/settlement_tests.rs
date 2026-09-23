@@ -18,11 +18,11 @@ async fn parsed_usage_wins_stale_consumer_usage_on_local_failure() {
         );
         guard.rebind(format!("attempt-{ordinal}"));
         guard.mark_opened();
-        guard.begin_dial_observation().record_dial_total(Usage {
+        guard.capture_observation().record(&Event::Usage(Usage {
             input_tokens: Some(13),
             output_tokens: fresh,
             ..Usage::default()
-        });
+        }));
         let stale = Usage {
             input_tokens: Some(13),
             output_tokens: Some(0),
@@ -67,7 +67,7 @@ async fn observed_terminal_wins_disconnect_once_and_rebind_clears_facts() {
     );
     guard.rebind("attempt".into());
     guard.mark_dispatched();
-    let observation = guard.begin_dial_observation();
+    let observation = guard.capture_observation();
     observation.record(&Event::Usage(Usage {
         input_tokens: Some(19),
         output_tokens: Some(7),
@@ -108,13 +108,11 @@ async fn observed_terminal_wins_disconnect_once_and_rebind_clears_facts() {
         if opened {
             cancelled.mark_opened();
         }
-        cancelled
-            .begin_dial_observation()
-            .record(&Event::Usage(Usage {
-                input_tokens: Some(19),
-                output_tokens: Some(0),
-                ..Usage::default()
-            }));
+        cancelled.capture_observation().record(&Event::Usage(Usage {
+            input_tokens: Some(19),
+            output_tokens: Some(0),
+            ..Usage::default()
+        }));
         assert!(cancelled.settle_cancelled(None, &[]).await);
         let latest: String = Python::attach(|py| {
             py.import("json")
@@ -145,10 +143,14 @@ async fn observed_terminal_wins_disconnect_once_and_rebind_clears_facts() {
         Instant::now(),
     );
     guard.rebind("one".into());
-    let old = guard.begin_dial_observation();
+    let old = guard.capture_observation();
+    old.record(&Event::TextDelta("first physical attempt".into()));
     old.record(&Event::Completed);
     guard.rebind("two".into());
     assert!(guard.observation.snapshot().terminal.is_none());
+    assert!(guard.observation.snapshot().streamed_output.text.is_empty());
+    old.record(&Event::TextDelta("late first attempt".into()));
+    assert!(guard.observation.snapshot().streamed_output.text.is_empty());
     guard.disarm_finalized("completed");
 }
 
@@ -170,7 +172,7 @@ async fn dispatched_cancellation_carries_streamed_output_only_without_a_terminal
         guard.rebind(name.into());
         guard.mark_dispatched();
         guard.mark_opened();
-        let observation = guard.begin_dial_observation();
+        let observation = guard.capture_observation();
         observation.record(&Event::ReasoningContentDelta {
             route_sha256: "route".into(),
             delta: "let me think".into(),
@@ -203,83 +205,10 @@ async fn dispatched_cancellation_carries_streamed_output_only_without_a_terminal
     assert_eq!(writes[0]["streamed_output"]["text_overflow_chars"], 0);
     assert_eq!(writes[0]["streamed_output"]["reasoning_overflow_chars"], 0);
     assert_eq!(writes[0]["streamed_output"]["images"], 0);
-    assert_eq!(writes[0]["streamed_output"]["single_dial"], true);
     // An observed provider terminal is the final meter: nothing to estimate.
     assert_eq!(writes[1]["outcome"], "completed");
     assert_eq!(writes[1]["usage_incomplete_due_to_disconnect"], false);
     assert!(writes[1].get("streamed_output").is_none());
-}
-
-#[tokio::test]
-async fn repaired_unknown_dials_cannot_authorize_a_single_dial_estimate() {
-    Python::initialize();
-    let plane = Python::attach(|py| {
-        pyo3::types::PyModule::from_code(py, c"import json\nclass Plane:\n def __init__(self): self.writes = []\n def settle(self, argument):\n  self.writes.append(json.loads(argument))\n  return '{}'\n def close_thread_resources(self, argument): return '{}'\n", c"repair_meter.py", c"repair_meter")
-            .unwrap().getattr("Plane").unwrap().call0().unwrap().unbind()
-    });
-    let bridge = Arc::new(Bridge::new(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
-    for opened_second in [false, true] {
-        let mut guard = AttemptGuard::new(
-            bridge.clone(),
-            Arc::new(AtomicUsize::new(0)),
-            "request".into(),
-            Instant::now(),
-        );
-        guard.rebind("attempt".into());
-        let first = guard.begin_dial_observation();
-        assert!(first.snapshot().streamed_output.single_dial);
-        guard.mark_dispatched();
-        guard.mark_opened();
-        first.record(&Event::Usage(Usage {
-            input_tokens: Some(13),
-            output_tokens: Some(7),
-            ..Usage::default()
-        }));
-        first.record_gemini_reasoning("first billed reasoning");
-        let second = guard.begin_dial_observation();
-        second.record_dial_total(Usage::default());
-        if opened_second {
-            guard.mark_opened();
-            second.record_gemini_reasoning("second reasoning");
-        }
-        // The old relay retains its own immutable observation, not the new dial's.
-        first.record_gemini_reasoning("late first dial");
-        assert_eq!(
-            second.snapshot().streamed_output.reasoning,
-            if opened_second {
-                "second reasoning"
-            } else {
-                ""
-            }
-        );
-        assert!(guard.settle_cancelled(None, &[]).await);
-        guard.rebind("fresh-attempt".into());
-        assert!(
-            guard
-                .begin_dial_observation()
-                .snapshot()
-                .streamed_output
-                .single_dial
-        );
-        guard.disarm_finalized("failed");
-    }
-    let writes: String = Python::attach(|py| {
-        py.import("json")
-            .unwrap()
-            .call_method1("dumps", (plane.bind(py).getattr("writes").unwrap(),))
-            .unwrap()
-            .extract()
-            .unwrap()
-    });
-    let writes: Value = serde_json::from_str(&writes).unwrap();
-    assert_eq!(writes.as_array().unwrap().len(), 2);
-    for row in writes.as_array().unwrap() {
-        assert_eq!(row["opened"], true);
-        assert_eq!(row["streamed_output"]["single_dial"], false);
-        assert!(row["usage"]["input_tokens"].is_null());
-        assert!(row["usage"]["output_tokens"].is_null());
-        assert_eq!(row["usage_incomplete_due_to_disconnect"], true);
-    }
 }
 
 #[test]

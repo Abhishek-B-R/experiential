@@ -241,6 +241,7 @@ def decode_chat(
             "thinking_budget",
             "max_output_tokens",
             "provider",
+            "gateway",
             "plugins",
         },
     )
@@ -286,6 +287,7 @@ def decode_chat(
             ),
             zdr_requested=request.provider is not None and request.provider.demands_zdr,
             provider_preferences=_provider_preferences(payload, request.provider),
+            gateway=request.gateway,
             web_search=chat_web_search(
                 options=request.web_search_options,
                 plugins=request.plugins,
@@ -397,7 +399,7 @@ def decode_responses(
     _validate_official(
         _RESPONSES_OFFICIAL,
         official_probe,
-        extension_fields={"top_k", "reasoning", "client_metadata", "provider"},
+        extension_fields={"top_k", "reasoning", "client_metadata", "provider", "gateway"},
     )
     include_encrypted_reasoning, include_output_text_logprobs = _responses_include_options(
         request.include
@@ -459,6 +461,7 @@ def decode_responses(
             ),
             zdr_requested=request.provider is not None and request.provider.demands_zdr,
             provider_preferences=_provider_preferences(payload, request.provider),
+            gateway=request.gateway,
             maximum_output_tokens=request.max_output_tokens,
             maximum_output_tokens_parameter=(
                 "max_output_tokens" if request.max_output_tokens is not None else None

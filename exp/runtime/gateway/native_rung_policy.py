@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import threading
 import time
+from collections.abc import Callable
 
 from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.gateway.contracts import GatewayEvent, GatewayFailure, GatewayFailureClass
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.native_execution import (
     THROTTLE_BACKOFF,
@@ -202,7 +204,7 @@ def failed_dispatch_candidate(
         keys=keys,
         failure=failure,
         current_depth=current_depth,
-        attempt_counts=entry.attempt_counts,
+        attempt_counts=entry.ordinary_attempt_counts,
         total_attempts=entry.total_attempts,
         refusal_failover=entry.authorization.refusal_failover,
         failover_mode=stage.failover_mode,
@@ -214,6 +216,10 @@ def failed_dispatch_candidate(
             entry.throttle_redial_budgets[current_depth] - entry.throttle_redials[current_depth]
         ),
         fallback_rules=route_fallback_rules(route),
+        maximum_total_attempts=entry.attempt_policy.maximum_total_attempts,
+        maximum_same_deployment_attempts=entry.attempt_policy.maximum_same_deployment_attempts,
+        physical_route_cap=entry.attempt_policy.physical_route_cap,
+        physical_attempt_counts=entry.attempt_counts,
     )
     disposition = throttle_disposition(
         failure,
@@ -395,3 +401,50 @@ def throttle_redial_budgets(
         share = min(1.0, fraction / threshold)
         budgets.append(int(schedule.max_attempts * share))
     return tuple(budgets)
+
+
+def record_cache_fraction(
+    loads: RungLoadRegistry,
+    entry: InflightRequest,
+    attempt_id: str,
+    terminal: GatewayEvent,
+    *,
+    lock: threading.Lock,
+    sample_gate: Callable[[str], bool] | None,
+) -> None:
+    """Fold only actual provider cache evidence into the rung fairness sample once.
+
+    Args:
+        loads: Existing worker admission registry receiving the observed sample.
+        entry: Request-local attempt ownership and completed-sample membership.
+        attempt_id: Durable physical attempt being settled.
+        terminal: Final event; estimated disconnect usage never establishes cache warmth.
+        lock: Accounting lock protecting the existing membership test and mark.
+        sample_gate: Optional hosted funding eligibility check, run outside the lock.
+    """
+    usage = terminal.usage
+    if usage is None or usage.input_tokens is None or terminal.usage_estimated:
+        return
+    depth = entry.attempt_depths.get(attempt_id)
+    if depth is None:
+        return
+    if sample_gate is not None:
+        # Promo-funded (or otherwise excluded) attempts must not buy
+        # fair-share weight; an erroring gate skips the sample rather
+        # than admit one the host meant to exclude.
+        try:
+            if not sample_gate(attempt_id):
+                return
+        except Exception:  # noqa: BLE001 - the sample is telemetry, never worth failing settle.
+            return
+    with lock:
+        if attempt_id in entry.cache_recorded_attempts:
+            return
+        entry.cache_recorded_attempts.add(attempt_id)
+    cached = usage.cached_input_tokens
+    loads.record_settle(
+        rung_load_key(entry.route.deployments[depth]),
+        entry.authorization.organization_id,
+        cached_tokens=0 if cached is None else cached,
+        input_tokens=usage.input_tokens,
+    )

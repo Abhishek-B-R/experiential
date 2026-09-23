@@ -81,6 +81,8 @@ def stage_affinity_ordered_rungs(
         ),
     )
     placement = AffinityPlacement(fingerprint=fingerprint, recovery_scoped=True)
+    if route.resolved_route_id is not None:
+        return route, wires, placement
     if route.reasoning_pinned_deployment_id is not None and any(
         deployment.deployment_id == route.reasoning_pinned_deployment_id
         for deployment in route.deployments

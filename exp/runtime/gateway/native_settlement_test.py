@@ -87,9 +87,6 @@ def test_cancelled_disconnect_marker_retains_unknown_final_meter(usage: JsonObje
         ({"images": 2}, StreamedOutput(images=2)),
         ({"images": "2"}, None),
         ({"unexpected": "text"}, None),
-        ({"single_dial": "true"}, None),
-        ({"single_dial": 1}, None),
-        ({"single_dial": True}, StreamedOutput(single_dial=True)),
     ],
 )
 def test_streamed_output_parses_only_the_typed_shape(

@@ -46,6 +46,10 @@ pub(crate) struct Admission {
     pub maximum_total_attempts: u32,
     pub maximum_same_deployment_attempts: u32,
     #[serde(default)]
+    pub physical_route_cap: Option<u32>,
+    #[serde(default)]
+    pub backoff: Option<crate::request_policy::Backoff>,
+    #[serde(default)]
     pub refusal_failover: bool,
     /// The pool's backoff-and-redial schedule for throttled rungs; absent on
     /// pools that keep throttles failover-only, so their waterfall is
@@ -145,10 +149,12 @@ impl Admission {
 
     pub(crate) fn policy(&self) -> RoutePolicy {
         RoutePolicy {
-            maximum_total_attempts: self.maximum_total_attempts.max(1),
-            maximum_same_deployment_attempts: self.maximum_same_deployment_attempts.max(1),
+            maximum_total_attempts: self.maximum_total_attempts,
+            maximum_same_deployment_attempts: self.maximum_same_deployment_attempts,
             refusal_failover: self.refusal_failover,
             throttle_redial: self.throttle_redial,
+            physical_route_cap: self.physical_route_cap,
+            backoff: self.backoff,
         }
     }
 

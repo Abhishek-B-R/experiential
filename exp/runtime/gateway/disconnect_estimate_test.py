@@ -54,9 +54,7 @@ def _tokens(text: str) -> int:
 def test_opened_disconnect_without_any_report_is_priced_from_prompt_and_streamed_text() -> None:
     """The counted prompt and the tokenized deltas replace the meter the provider never sent."""
     request = _request()
-    streamed = StreamedOutput(
-        single_dial=True, text="Sunlight scatters off air molecules.", reasoning="short waves"
-    )
+    streamed = StreamedOutput(text="Sunlight scatters off air molecules.", reasoning="short waves")
     estimated = estimate_disconnect_usage(
         _disconnect(),
         request=request,
@@ -81,7 +79,7 @@ def test_observed_legs_win_unless_the_streamed_text_already_exceeds_them() -> No
     observed = GatewayUsage(
         input_tokens=1_200, output_tokens=1, cached_input_tokens=1_000, reasoning_tokens=None
     )
-    streamed = StreamedOutput(single_dial=True, text="word " * 40)
+    streamed = StreamedOutput(text="word " * 40)
     estimated = estimate_disconnect_usage(
         _disconnect(observed),
         request=request,
@@ -116,7 +114,7 @@ def test_cache_legs_are_dropped_without_a_reported_input_total() -> None:
         request=_request(),
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
         opened=True,
-        streamed=StreamedOutput(single_dial=True),
+        streamed=StreamedOutput(),
     ).usage
     assert usage is not None
     assert usage.cached_input_tokens is None
@@ -131,7 +129,7 @@ def test_overflow_extrapolates_from_the_retained_ratio_or_the_fallback_density()
         request=_request(),
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
         opened=True,
-        streamed=StreamedOutput(single_dial=True, text=retained, text_overflow_chars=len(retained)),
+        streamed=StreamedOutput(text=retained, text_overflow_chars=len(retained)),
     ).usage
     assert usage is not None
     assert usage.output_tokens == 2 * _tokens(retained)
@@ -140,14 +138,14 @@ def test_overflow_extrapolates_from_the_retained_ratio_or_the_fallback_density()
         request=_request(),
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
         opened=True,
-        streamed=StreamedOutput(single_dial=True, reasoning_overflow_chars=41),
+        streamed=StreamedOutput(reasoning_overflow_chars=41),
     ).usage
     assert bare is not None
     assert bare.reasoning_tokens == -(-41 // FALLBACK_CHARACTERS_PER_TOKEN)
     assert bare.output_tokens == bare.reasoning_tokens
 
 
-_PARTIAL = StreamedOutput(single_dial=True, text="partial answer")
+_PARTIAL = StreamedOutput(text="partial answer")
 
 
 @pytest.mark.parametrize(
@@ -163,7 +161,7 @@ _PARTIAL = StreamedOutput(single_dial=True, text="partial answer")
             True,
             GatewayApiSurface.CHAT_COMPLETIONS,
             True,
-            StreamedOutput(single_dial=True, text="ok", images=1),
+            StreamedOutput(text="ok", images=1),
         ),
     ],
 )
@@ -201,30 +199,10 @@ def test_non_completion_requests_are_left_alone() -> None:
         request=EmbeddingsRequest(inputs=("one",)),
         surface=GatewayApiSurface.EMBEDDINGS,
         opened=True,
-        streamed=StreamedOutput(single_dial=True),
+        streamed=StreamedOutput(),
     )
     assert unchanged.usage is None
     assert unchanged.usage_estimated is False
-
-
-@pytest.mark.parametrize("opened", [False, True])
-def test_repaired_dial_cannot_replace_unknown_aggregate_with_one_prompt(
-    opened: bool,
-) -> None:
-    """An earlier billed 13/7 dial plus unknown work is not a single-dial estimate."""
-    # The native repaired-dial aggregator deliberately clears incomplete totals.
-    terminal = _disconnect()
-    evidence = StreamedOutput.model_validate({"text": "second dial", "single_dial": False})
-    unchanged = estimate_disconnect_usage(
-        terminal,
-        request=_request(),
-        surface=GatewayApiSurface.CHAT_COMPLETIONS,
-        opened=opened,
-        streamed=evidence,
-    )
-    assert unchanged is terminal
-    assert unchanged.usage is None
-    assert not unchanged.usage_estimated
 
 
 def test_estimated_marker_requires_a_disconnect_with_both_totals() -> None:

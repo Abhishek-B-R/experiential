@@ -206,10 +206,6 @@ pub struct UpstreamRelay {
     /// carrying only role/lifecycle scaffolding, so time-to-first-token is
     /// stamped on the first event that carries visible model output.
     first_token_at: Option<SystemTime>,
-    /// Tokens an earlier, refused dial of the same attempt was billed for,
-    /// folded once into each cumulative usage snapshot this relay yields so
-    /// the reservation settles both dials' tokens as one.
-    carried_usage: Option<Usage>,
     observation: Option<crate::settlement::Observation>,
     capture_reasoning: Option<crate::capture::reasoning::Observer>,
 }
@@ -282,7 +278,6 @@ impl UpstreamRelay {
             first_token_at: None,
             native_tool_inverter: NativeToolInverter::default(),
             tool_search: ToolSearchWithholder::default(),
-            carried_usage: None,
             observation: None,
             capture_reasoning: None,
         }
@@ -353,29 +348,12 @@ impl UpstreamRelay {
             // Several dialects retain a parsed meter until terminal encoding.
             // Accounting observes it now, even when this frame yields no event.
             if let Some(usage) = self.normalizer.observed_usage() {
-                let usage = match self.carried_usage.as_ref() {
-                    Some(carried) => fold_usage(carried, usage.clone()),
-                    None => usage.clone(),
-                };
-                if self.carried_usage.is_some() {
-                    observation.record_dial_total(usage);
-                } else {
-                    observation.record(&Event::Usage(usage));
-                }
-            }
-            if self.normalizer.observed_usage().is_none()
-                && self.carried_usage.is_some()
-                && events.iter().any(Event::is_terminal)
-            {
-                observation.record_dial_total(Usage::default());
+                observation.record(&Event::Usage(usage.clone()));
             }
             for event in &events {
-                match (event, self.carried_usage.as_ref()) {
-                    (Event::Usage(usage), Some(carried)) => {
-                        observation.record_dial_total(fold_usage(carried, usage.clone()));
-                    }
-                    (Event::Usage(_), _) => observation.record(event),
-                    (Event::Failed(failure), _) => {
+                match event {
+                    Event::Usage(_) => observation.record(event),
+                    Event::Failed(failure) => {
                         let failure = match self.customer_managed_provider.as_deref() {
                             Some(provider) => crate::stream_errors::customer_credential_failure(
                                 failure.clone(),
@@ -434,19 +412,9 @@ impl UpstreamRelay {
     }
 
     /// Prefer the normalizer's latest cumulative report on an abnormal end.
-    /// Add the earlier dial exactly once, never to an already folded report.
     /// Dialects that yield usage directly keep their last yielded report.
     pub fn usage_before_failure(&self, reported: Option<Usage>) -> Option<Usage> {
-        self.normalizer
-            .observed_usage()
-            .map(|observed| match self.carried_usage.as_ref() {
-                Some(carried) => fold_usage(carried, observed.clone()),
-                None => observed.clone(),
-            })
-            .or(reported)
-            // The current dial was dispatched too. Without its report, the
-            // earlier dial is only a subtotal, never the attempt's full meter.
-            .or_else(|| self.carried_usage.as_ref().map(|_| Usage::default()))
+        self.normalizer.observed_usage().cloned().or(reported)
     }
 
     /// The wall-clock time this relay yielded its first output token, or
@@ -519,15 +487,6 @@ impl UpstreamRelay {
     /// `parallel_tool_calls: false` to a wire without that control).
     pub fn set_serialize_tool_calls(&mut self, serialize: bool) {
         self.tool_serializer = serialize.then(ToolCallSerializer::new);
-    }
-
-    /// Carry the tokens a refused earlier dial of this attempt was billed
-    /// for; they join each cumulative usage report once.
-    pub fn set_carried_usage(&mut self, carried: Option<Usage>) {
-        if let (Some(observation), Some(_)) = (&self.observation, &carried) {
-            observation.record_dial_total(Usage::default());
-        }
-        self.carried_usage = carried;
     }
 
     /// Enable the probability output requested in the frozen provider payload.
@@ -626,7 +585,7 @@ impl UpstreamRelay {
             *last += yielded.elapsed();
         }
         loop {
-            if let Some(mut event) = self.ready.pop_front() {
+            if let Some(event) = self.ready.pop_front() {
                 // Every yielded event exits here, so this is the one place that
                 // stamps time-to-first-token: the first event carrying visible
                 // model output. Prefix events peeked during commit also passed
@@ -637,11 +596,6 @@ impl UpstreamRelay {
                     if let Some(observation) = &self.observation {
                         observation.record_first_token(self.first_token_at);
                     }
-                }
-                if let (Event::Usage(usage), Some(carried)) =
-                    (&mut event, self.carried_usage.as_ref())
-                {
-                    *usage = fold_usage(carried, usage.clone());
                 }
                 if let Some(observation) = &self.observation {
                     observation.record(&event);
@@ -954,40 +908,6 @@ mod h2_abort_tests {
         );
         assert_eq!(failure.failure_class, FailureClass::Transport);
         assert!(failure.failover_eligible);
-    }
-}
-
-/// The tokens of two physical dials of one attempt, summed leg by leg; a leg
-/// neither reported stays absent.
-fn fold_usage(carried: &Usage, current: Usage) -> Usage {
-    let add = |a: Option<u64>, b: Option<u64>| match (a, b) {
-        (Some(a), Some(b)) => Some(a + b),
-        (Some(a), None) | (None, Some(a)) => Some(a),
-        (None, None) => None,
-    };
-    // Across physical dials, an absent leg means the total is unknown, not
-    // that this dial contributed zero. Cumulative reports within one dial use
-    // Usage::merge_observed instead of this sum.
-    let total = |a: Option<u64>, b: Option<u64>| a.zip(b).map(|(a, b)| a + b);
-    Usage {
-        input_tokens: total(carried.input_tokens, current.input_tokens),
-        output_tokens: total(carried.output_tokens, current.output_tokens),
-        cached_input_tokens: add(carried.cached_input_tokens, current.cached_input_tokens),
-        cache_creation_input_tokens: add(
-            carried.cache_creation_input_tokens,
-            current.cache_creation_input_tokens,
-        ),
-        cache_creation_1h_input_tokens: match (
-            carried.cache_creation_input_tokens.unwrap_or(0),
-            carried.cache_creation_1h_input_tokens,
-            current.cache_creation_input_tokens.unwrap_or(0),
-            current.cache_creation_1h_input_tokens,
-        ) {
-            (a, None, _, _) if a > 0 => None,
-            (_, _, b, None) if b > 0 => None,
-            (_, a, _, b) => add(a, b),
-        },
-        reasoning_tokens: add(carried.reasoning_tokens, current.reasoning_tokens),
     }
 }
 

@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
 
-from exp.common.models.gateway_catalog import ExactModelPool, NormalizedGatewayCatalog
+from exp.common.models.gateway_catalog import (
+    ExactModelDeployment,
+    ExactModelPool,
+    NormalizedGatewayCatalog,
+    is_foreign_snapshot,
+)
 from exp.common.models.gateway_chains import (
     GatewayModelChain,
     ModelExecutionStage,
@@ -143,3 +150,64 @@ def project_stage_selection(
             "model_stages": tuple(stages),
         }
     )
+
+
+@dataclass(frozen=True)
+class _CatalogView:
+    """One revision-scoped catalog with immutable chain, pool, and deployment indexes."""
+
+    catalog: NormalizedGatewayCatalog
+    chains: Mapping[str, GatewayModelChain]
+    pools: Mapping[str, ExactModelPool]
+    deployments: Mapping[str, ExactModelDeployment]
+
+
+def _index_catalogs(
+    catalogs: Mapping[tuple[str, str], NormalizedGatewayCatalog],
+) -> dict[tuple[str, str], _CatalogView]:
+    """Index digest-verified catalogs by alias revision and catalog digest.
+
+    The pinned ``catalog_sha256`` stays the identity/attribution key for every
+    revision. A same-version catalog must reproduce it exactly, so a mismatch is
+    corruption and still raises. A cross-version snapshot (served through the
+    hydration reader's tolerant path during a rolling deploy) is expected not to
+    reproduce it; that catalog is indexed under its pinned digest without the
+    byte-exact check, so a roll never hard-fails route resolution.
+
+    Args:
+        catalogs: Alias-revision and digest pairs mapped to normalized snapshots.
+
+    Returns:
+        Fully built revision-scoped catalog views.
+
+    Raises:
+        ValueError: A same-version catalog does not match its declared digest.
+    """
+    indexed: dict[tuple[str, str], _CatalogView] = {}
+    # Hundreds of alias revisions can share one immutable catalog. Hash and index
+    # each distinct object once, but verify every key's digest independently.
+    # ``catalogs`` keeps object IDs stable by retaining them for the whole loop.
+    identity_by_object: dict[int, str] = {}
+    view_by_object: dict[int, _CatalogView] = {}
+    for key, catalog in catalogs.items():
+        revision_id, catalog_sha256 = key
+        if not is_foreign_snapshot(catalog):
+            identity = identity_by_object.get(id(catalog))
+            if identity is None:
+                identity = catalog.identity_sha256()
+                identity_by_object[id(catalog)] = identity
+            if identity != catalog_sha256:
+                raise ValueError(f"catalog for alias revision {revision_id!r} has the wrong digest")
+        view = view_by_object.get(id(catalog))
+        if view is None:
+            view = _CatalogView(
+                catalog=catalog,
+                chains=MappingProxyType(catalog.chains_by_model() if catalog.model_chains else {}),
+                pools=MappingProxyType({pool.pool_id: pool for pool in catalog.pools}),
+                deployments=MappingProxyType(
+                    {deployment.deployment_id: deployment for deployment in catalog.deployments}
+                ),
+            )
+            view_by_object[id(catalog)] = view
+        indexed[key] = view
+    return indexed

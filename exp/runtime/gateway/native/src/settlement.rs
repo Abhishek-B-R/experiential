@@ -302,11 +302,6 @@ impl AttemptGuard {
         }
     }
 
-    pub(crate) fn begin_dial_observation(&mut self) -> Observation {
-        self.observation = self.observation.next_dial();
-        self.observation.clone()
-    }
-
     /// Share the selected attempt's meter without another JSON boundary or token count.
     pub(crate) fn capture_observation(&self) -> Observation {
         self.observation.clone()
@@ -570,7 +565,6 @@ fn disconnect_provenance(
             "text_overflow_chars": streamed.text_overflow_chars,
             "reasoning_overflow_chars": streamed.reasoning_overflow_chars,
             "images": streamed.images,
-            "single_dial": streamed.single_dial,
         });
     }
     compact_json(&payload)

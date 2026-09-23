@@ -26,6 +26,7 @@ from exp.runtime.gateway.native_admission import (
     _affinity_ordered_rungs,
     _prefer_cache_capable_rungs,
     admitted_route_requests,
+    select_single_route_before_search,
 )
 from exp.runtime.gateway.native_admission_test import _affinity_fixture, _marked_request
 from exp.runtime.gateway.native_execution import (
@@ -52,6 +53,7 @@ from exp.runtime.gateway.recovery import (
 )
 from exp.runtime.gateway.recovery_test import Clock
 from exp.runtime.gateway.replay_identity import canonical_request_sha256
+from exp.runtime.gateway.request_policy import GatewayRequestPolicy, GatewayRoutingPolicy
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.sticky_affinity import AffinityPlacement
 from exp.runtime.models.credentials import DispatchCredentialReceipt
@@ -191,6 +193,84 @@ def stage_affinity_ordered_rungs(
         authorization=authorization,
         continuation=continuation,
     )
+
+
+def test_exact_selected_staged_route_cannot_be_reordered_or_recovered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exact opaque selector precedes every stage-affinity or recovery preference."""
+    route, wires = _affinity_fixture()
+    route = route.model_copy(update={"resolved_route_id": "route_" + "b" * 64})
+    accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=Host())
+
+    def unexpected(*_args: object, **_kwargs: object) -> None:
+        """Neither rendezvous nor recovery may reinterpret the explicitly chosen first route."""
+        raise AssertionError("selected route entered elective scheduling")
+
+    monkeypatch.setattr(native_stage_admission, "rendezvous_order", unexpected)
+    monkeypatch.setattr(accounting.recovery, "choose", unexpected)
+    selected, selected_wires, _ = _stage_order(
+        route,
+        wires,
+        _marked_request(),
+        accounting=accounting,
+        authorization=route.snapshot.authorization,
+        continuation=None,
+    )
+    assert selected is route and selected_wires is wires
+
+
+@pytest.mark.parametrize("root_available", [False, True])
+def test_no_fallback_stage_preselection_never_enters_child(
+    monkeypatch: pytest.MonkeyPatch, root_available: bool
+) -> None:
+    """No-fallback narrows only current root providers, even with descendant-start authority."""
+    normalized = catalog()
+    auth = _route().snapshot.authorization.model_copy(update={"descendant_start_authorized": True})
+    snapshot = model_execution_snapshot(normalized, auth, normalized.pools[0])
+    by_id = {deployment.deployment_id: deployment for deployment in normalized.deployments}
+    deployments = tuple(by_id[name] for name in snapshot.deployment_ids)
+    route = GatewayRoute(
+        snapshot=snapshot,
+        deployment=deployments[0],
+        fallback_deployments=deployments[1:],
+        route_reason="direct",
+    )
+    _, fixture_wires = _affinity_fixture()
+    wires = tuple(fixture_wires[0] for _ in deployments)
+    request = _marked_request().model_copy(
+        update={
+            "gateway": GatewayRequestPolicy(routing=GatewayRoutingPolicy(allow_fallbacks=False))
+        }
+    )
+    accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=Host())
+
+    def prepare(candidate: GatewayRoute, resolved: tuple, incoming: GatewayRequest) -> tuple:
+        """Observe the stage boundary before capability filtering or effectful search."""
+        assert all(item.exact_model_id == snapshot.exact_model_id for item in candidate.deployments)
+        if not root_available:
+            raise GatewayRoutingError("root cannot serve request")
+        return candidate, resolved, incoming, incoming, ()
+
+    monkeypatch.setattr("exp.runtime.gateway.native_admission.prepare_route_requests", prepare)
+    if not root_available:
+        with pytest.raises(GatewayRoutingError, match="root cannot serve"):
+            select_single_route_before_search(
+                route, wires, request, accounting=accounting, authorization=auth, continuation=None
+            )
+    else:
+        selected, selected_wires, _ = select_single_route_before_search(
+            route, wires, request, accounting=accounting, authorization=auth, continuation=None
+        )
+        assert len(selected.deployments) == len(selected_wires) == 1
+        assert selected.deployment.exact_model_id == snapshot.exact_model_id
+        assert selected.snapshot.model_stages[0].deployment_ids == (
+            selected.deployment.deployment_id,
+        )
+        assert all(
+            stage.exact_model_id == snapshot.exact_model_id
+            for stage in selected.snapshot.model_stages
+        )
 
 
 @pytest.mark.parametrize("mode", ["maximize_cache", "maximize_cache_affinity"])

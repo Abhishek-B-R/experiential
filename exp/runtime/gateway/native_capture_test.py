@@ -628,7 +628,6 @@ def test_gemini_disconnect_meter_is_independent_of_optional_capture(
         streamed = raw["streamed_output"]
         assert isinstance(streamed, dict)
         assert streamed["reasoning"] == expected_reasoning and streamed["text"] == "visible"
-        assert streamed["single_dial"] is True
     if collector:
         assert collector.close(1)
     else:

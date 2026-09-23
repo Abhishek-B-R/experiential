@@ -73,10 +73,12 @@ class Plane:
                     if self.first_depth is not None
                     else next(i for i, rules in enumerate(self.rules) if rules is None)
                 )
+            elif data.get("reasoning_repair"):
+                candidate = depth
             elif (
                 data.get("throttle_backoff")
                 and failure["failure_class"] == "throttled"
-                and self.counts[depth] <= self.max_redials
+                and sum(1 for start in self.starts if start.get("throttle_backoff") and start.get("current_depth") == depth) <= self.max_redials
             ):
                 candidate = depth
             elif depth + 1 < len(self.counts) and self.admits(depth + 1, failure):
@@ -421,6 +423,31 @@ impl Harness {
         throttle_redial: Option<ThrottleRedial>,
         deadline: Duration,
     ) -> (Won, AttemptGuard) {
+        self.run_with_policy(
+            raw_key,
+            caller_scope,
+            route,
+            RoutePolicy {
+                maximum_total_attempts: 8,
+                maximum_same_deployment_attempts: 2,
+                refusal_failover: false,
+                throttle_redial,
+                physical_route_cap: None,
+                backoff: None,
+            },
+            deadline,
+        )
+        .await
+    }
+
+    pub(super) async fn run_with_policy(
+        &self,
+        raw_key: &str,
+        caller_scope: Option<&str>,
+        route: &[DeploymentWire],
+        policy: RoutePolicy,
+        deadline: Duration,
+    ) -> (Won, AttemptGuard) {
         let mut guard = AttemptGuard::new(
             self.bridge.clone(),
             Arc::new(AtomicUsize::new(0)),
@@ -435,12 +462,7 @@ impl Harness {
             raw_key,
             caller_scope,
             route,
-            policy: RoutePolicy {
-                maximum_total_attempts: 8,
-                maximum_same_deployment_attempts: 2,
-                refusal_failover: false,
-                throttle_redial,
-            },
+            policy,
             deadline: Instant::now() + deadline,
             time_to_first_byte: Duration::from_secs(5),
             time_to_first_byte_slope_seconds_per_million_input_tokens: 0.0,
