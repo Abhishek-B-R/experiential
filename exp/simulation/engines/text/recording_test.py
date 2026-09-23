@@ -1,5 +1,6 @@
 """Tests for text-only candidate recording and preflight boundaries."""
 
+import json
 import logging
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -369,6 +370,44 @@ def test_recorder_keeps_candidate_and_world_calls_separate_and_tool_free() -> No
     assert recorder.recorded.world_model_economics.cost_usd == NumericMeasurement(
         value=0.10,
         provenance="observed",
+    )
+
+
+@pytest.mark.parametrize("stop_on_overspend", [False, True])
+def test_empty_candidate_response_is_preserved_without_retrieval_cost(
+    stop_on_overspend: bool,
+) -> None:
+    """A completed blank reply is world-model evidence, not an embedding/provider failure."""
+    candidate = _ScriptedClient([_response("", model=_snapshot("candidate-a"))])
+    world = _ScriptedClient(
+        [
+            _response(
+                '{"message":"No answer received.","terminal":true}',
+                model=_snapshot("world-model-a"),
+            )
+        ]
+    )
+    recorder = _recorder(candidate, world, stop_on_overspend=stop_on_overspend)
+
+    response = recorder.complete(
+        ModelRequest(messages=(ModelMessage(role="user", content="Help."),))
+    )
+
+    assert response.output == AssistantAction(content="")
+    assert len(candidate.requests) == len(world.requests) == 1
+    evidence = json.loads(world.requests[0].messages[1].content or "")
+    assert evidence["candidate_response"] == {"content": "", "tool_calls": []}
+    assert recorder.terminal_error is None
+    assert recorder.world_model_terminal
+    assert recorder.recorded.retrieved_transition_ids == ((),)
+    assert recorder.recorded.retrieval_economics.cost_usd == NumericMeasurement(
+        value=0, provenance="estimated"
+    )
+    assert recorder.recorded.candidate_economics.cost_usd == NumericMeasurement(
+        value=0.1, provenance="observed"
+    )
+    assert recorder.recorded.world_model_economics.cost_usd == NumericMeasurement(
+        value=0.1, provenance="observed"
     )
 
 

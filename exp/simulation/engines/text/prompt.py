@@ -216,12 +216,14 @@ def validate_transition_action(
 
 
 def candidate_rag_actions(action: AssistantAction) -> tuple[RAGAction, ...]:
-    """Use the real corpus's tool-call shape for every parallel invocation."""
+    """Use corpus-shaped actions; an empty reply has no visible action to retrieve."""
     if action.tool_calls:
         return tuple(
             RAGAction(kind="tool_call", tool_name=call.name, tool_arguments=call.arguments)
             for call in action.tool_calls
         )
+    if not action.content:
+        return ()
     return (RAGAction(kind="message", content=action.content),)
 
 
