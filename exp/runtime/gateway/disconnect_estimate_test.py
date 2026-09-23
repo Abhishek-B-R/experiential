@@ -17,6 +17,7 @@ from exp.runtime.gateway.disconnect_estimate import (
     FALLBACK_CHARACTERS_PER_TOKEN,
     estimate_disconnect_usage,
 )
+from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.native_settlement import StreamedOutput
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.stream_contracts import GatewayEvent, GatewayEventKind
@@ -110,7 +111,7 @@ def test_cache_legs_are_dropped_without_a_reported_input_total() -> None:
         request=_request(),
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
         opened=True,
-        streamed=None,
+        streamed=StreamedOutput(),
     ).usage
     assert usage is not None
     assert usage.cached_input_tokens is None
@@ -141,18 +142,25 @@ def test_overflow_extrapolates_from_the_retained_ratio_or_the_fallback_density()
     assert bare.output_tokens == bare.reasoning_tokens
 
 
+_PARTIAL = StreamedOutput(text="partial answer")
+
+
 @pytest.mark.parametrize(
-    ("opened", "surface", "marker"),
+    ("opened", "surface", "marker", "streamed"),
     [
-        (False, GatewayApiSurface.CHAT_COMPLETIONS, True),
-        (True, GatewayApiSurface.DECISIONS, True),
-        (True, GatewayApiSurface.CHAT_COMPLETIONS, False),
+        (False, GatewayApiSurface.CHAT_COMPLETIONS, True, _PARTIAL),
+        (True, GatewayApiSurface.DECISIONS, True, _PARTIAL),
+        (True, GatewayApiSurface.CHAT_COMPLETIONS, False, _PARTIAL),
+        # A data plane predating (or mis-sending) the evidence keeps unknown.
+        (True, GatewayApiSurface.CHAT_COMPLETIONS, True, None),
+        # Generated images are billed per image, never estimable from text.
+        (True, GatewayApiSurface.CHAT_COMPLETIONS, True, StreamedOutput(text="ok", images=1)),
     ],
 )
-def test_unopened_decision_and_ordinary_settlements_are_left_alone(
-    opened: bool, surface: GatewayApiSurface, marker: bool
+def test_unopened_decision_image_and_ordinary_settlements_are_left_alone(
+    opened: bool, surface: GatewayApiSurface, marker: bool, streamed: StreamedOutput | None
 ) -> None:
-    """Only an opened, dispatched disconnect on a generation surface is estimated."""
+    """Only an opened, dispatched text disconnect with data-plane evidence is estimated."""
     terminal = (
         _disconnect()
         if marker
@@ -169,9 +177,22 @@ def test_unopened_decision_and_ordinary_settlements_are_left_alone(
         request=_request(),
         surface=surface,
         opened=opened,
-        streamed=StreamedOutput(text="partial answer"),
+        streamed=streamed,
     )
     assert unchanged is terminal
+    assert unchanged.usage is None
+    assert unchanged.usage_estimated is False
+
+
+def test_non_completion_requests_are_left_alone() -> None:
+    """Embeddings and image requests have their own billing shapes; nothing is estimated."""
+    unchanged = estimate_disconnect_usage(
+        _disconnect(),
+        request=EmbeddingsRequest(inputs=("one",)),
+        surface=GatewayApiSurface.EMBEDDINGS,
+        opened=True,
+        streamed=StreamedOutput(),
+    )
     assert unchanged.usage is None
     assert unchanged.usage_estimated is False
 

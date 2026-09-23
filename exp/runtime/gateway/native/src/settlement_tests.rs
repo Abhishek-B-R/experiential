@@ -202,6 +202,7 @@ async fn dispatched_cancellation_carries_streamed_output_only_without_a_terminal
     assert_eq!(writes[0]["streamed_output"]["reasoning"], "let me think");
     assert_eq!(writes[0]["streamed_output"]["text_overflow_chars"], 0);
     assert_eq!(writes[0]["streamed_output"]["reasoning_overflow_chars"], 0);
+    assert_eq!(writes[0]["streamed_output"]["images"], 0);
     // An observed provider terminal is the final meter: nothing to estimate.
     assert_eq!(writes[1]["outcome"], "completed");
     assert_eq!(writes[1]["usage_incomplete_due_to_disconnect"], false);

@@ -26,16 +26,12 @@ pub(crate) struct StreamedOutput {
     pub text_overflow_chars: u64,
     /// Characters of reasoning past the retained bound.
     pub reasoning_overflow_chars: u64,
+    /// Generated images, billed per image rather than per token: any at all
+    /// leaves the meter unestimable from text.
+    pub images: u64,
 }
 
 impl StreamedOutput {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.text.is_empty()
-            && self.reasoning.is_empty()
-            && self.text_overflow_chars == 0
-            && self.reasoning_overflow_chars == 0
-    }
-
     fn append(retained: &mut String, overflow: &mut u64, delta: &str) {
         if retained.len() + delta.len() <= STREAMED_OUTPUT_RETAINED_BYTES {
             retained.push_str(delta);
@@ -72,6 +68,7 @@ impl StreamedOutput {
                     );
                 }
             }
+            Event::Image(_) => self.images += 1,
             _ => {}
         }
     }
@@ -245,6 +242,7 @@ mod tests {
         assert_eq!(streamed.text, "Hello{\"q\":1}");
         assert_eq!(streamed.reasoning, "think");
         assert_eq!(streamed.text_overflow_chars, 0);
+        assert_eq!(streamed.images, 1);
 
         let mut bounded = StreamedOutput::default();
         bounded.record(&Event::TextDelta(
@@ -253,8 +251,7 @@ mod tests {
         bounded.record(&Event::TextDelta("ééé".into()));
         assert_eq!(bounded.text.len(), STREAMED_OUTPUT_RETAINED_BYTES);
         assert_eq!(bounded.text_overflow_chars, 3);
-        assert!(!bounded.is_empty());
-        assert!(StreamedOutput::default().is_empty());
+        assert_eq!(bounded.images, 0);
     }
 
     #[test]

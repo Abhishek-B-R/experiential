@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.attempt_tokens import counted_input_tokens
-from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayFailure
+from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayFailure, GatewayRequest
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
 from exp.runtime.gateway.native_settlement import (
     StreamedOutput,
@@ -70,9 +70,13 @@ def estimate_disconnect_usage(
     """Fill a cancelled disconnect's unreported meter legs from gateway evidence.
 
     Applies only to the trusted ``usage_incomplete_due_to_disconnect`` marker on
-    an attempt whose provider had accepted the request (``opened``): a dispatch
-    the provider never answered has no billed work to estimate. Decisions keep
-    their own hold contract untouched.
+    a completion attempt whose provider had accepted the request (``opened``)
+    and whose data plane sent its generated-output evidence: a dispatch the
+    provider never answered has no billed work to estimate, a data plane that
+    predates the evidence (or sent it malformed) leaves the meter unknown, and
+    generated images are billed per image, so any image keeps the meter
+    unknown too. Decisions, embeddings, and image requests keep their own
+    contracts untouched.
 
     Args:
         terminal: The normalized cancelled terminal from the settlement.
@@ -88,10 +92,12 @@ def estimate_disconnect_usage(
         not terminal.usage_incomplete_due_to_disconnect
         or not opened
         or surface is GatewayApiSurface.DECISIONS
+        or not isinstance(request, GatewayRequest)
+        or streamed is None
+        or streamed.images > 0
     ):
         return terminal
     observed = terminal.usage
-    streamed = streamed or StreamedOutput()
     reasoning_estimate = _text_tokens(streamed.reasoning, streamed.reasoning_overflow_chars)
     visible_estimate = _text_tokens(streamed.text, streamed.text_overflow_chars)
     input_tokens = (

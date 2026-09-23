@@ -547,9 +547,12 @@ impl AttemptGuard {
 
 /// Stamp trusted dispatch evidence without changing the base settlement vocabulary.
 ///
-/// An incomplete meter also carries the generated text observed so far, so
-/// the control plane can estimate the output the provider billed for with
-/// its own tokenizer instead of settling a caller's disconnect as unknown.
+/// An incomplete meter also carries the generated output observed so far
+/// (always present, empty when nothing was generated) so the control plane
+/// can estimate the output the provider billed for with its own tokenizer
+/// instead of settling a caller's disconnect as unknown. Its absence means
+/// the data plane predates the field, and the control plane keeps the
+/// unknown policy.
 fn disconnect_provenance(
     argument: String,
     dispatched: bool,
@@ -560,12 +563,13 @@ fn disconnect_provenance(
         serde_json::from_str(&argument).expect("settlement JSON was encoded locally");
     payload["dispatched"] = json!(dispatched);
     payload["usage_incomplete_due_to_disconnect"] = json!(incomplete);
-    if incomplete && !streamed.is_empty() {
+    if incomplete {
         payload["streamed_output"] = json!({
             "text": streamed.text,
             "reasoning": streamed.reasoning,
             "text_overflow_chars": streamed.text_overflow_chars,
             "reasoning_overflow_chars": streamed.reasoning_overflow_chars,
+            "images": streamed.images,
         });
     }
     compact_json(&payload)

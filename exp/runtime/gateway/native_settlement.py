@@ -220,14 +220,17 @@ class StreamedOutput(BaseModel):
     reasoning: str = ""
     text_overflow_chars: int = Field(default=0, ge=0)
     reasoning_overflow_chars: int = Field(default=0, ge=0)
+    images: int = Field(default=0, ge=0)
 
 
 def streamed_output_from_settlement(data: JsonObject | None) -> StreamedOutput | None:
-    """Parse the settlement's optional generated-text evidence.
+    """Parse the settlement's optional generated-output evidence.
 
-    Only a dispatched cancellation without a provider terminal carries it. A
-    malformed object is dropped rather than estimated from: the settlement
-    then keeps its unknown meter exactly as an engine predating the field.
+    Only a dispatched cancellation without a provider terminal carries it,
+    and the data plane always sends it then (an empty object when nothing was
+    generated). A malformed object is dropped rather than estimated from, and
+    an absent one means a data plane predating the field: either way the
+    settlement keeps its unknown meter.
 
     Args:
         data: Parsed native settlement payload.
