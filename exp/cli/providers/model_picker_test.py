@@ -13,6 +13,7 @@ from exp.cli.providers.model_picker import (
     build_result,
     configured_models,
     declare_model,
+    model_selection,
     render_summary,
     select_gateway_model,
     select_models,
@@ -625,6 +626,24 @@ def test_a_connection_only_used_by_unselected_models_is_not_written() -> None:
     )
 
     assert [connection.name for connection in result.setup.connections] == ["openai"]
+
+
+def test_selected_models_keep_published_denials_in_the_catalog_record() -> None:
+    """Saving a selected model retains explicit false flags for the next setup session."""
+    item = replace(
+        _CHAT,
+        published=DiscoveredModel(
+            provider=_CHAT.provider,
+            model=_CHAT.model,
+            supports_structured_output=False,
+        ),
+    )
+
+    record = model_selection(item).catalog_record()
+
+    assert record.discovery == item.published
+    with pytest.raises(ValueError, match="same provider model"):
+        ModelRecord.model_validate({**record.model_dump(), "model": "different-model"})
 
 
 def test_duplicate_provider_model_names_receive_distinct_aliases() -> None:

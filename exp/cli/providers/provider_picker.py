@@ -811,9 +811,7 @@ def _discover_models(
         if not fresh_verified and not fresh_unknown:
             console.print(f"  [green]\u2713[/green] {label}: models already configured")
             return _ProviderDiscoveryResult(endpoint, ())
-        console.print(
-            _discovery_status(label, verified=len(fresh_verified), unknown=len(fresh_unknown))
-        )
+        console.print(_discovery_status(label, verified=len(verified), unknown=len(unknown)))
         models = []
         for model in (*fresh_verified, *fresh_unknown):
             alias = derive_model_alias(runtime_provider, model.model, frozenset(aliases))
@@ -872,15 +870,15 @@ def _discovery_status(label: str, *, verified: int, unknown: int) -> str:
 
     Args:
         label: Readable provider name.
-        verified: Newly listed models with role-proven metadata.
-        unknown: Newly listed identities that still need operator declaration.
+        verified: Listed models with role-proven metadata, including configured aliases.
+        unknown: Listed identities that still need operator declaration.
 
     Returns:
         One compact status line for the discovery transcript.
     """
     if verified and unknown:
         return (
-            f"  [green]\u2713[/green] {label}: {verified} models, "
+            f"  [green]\u2713[/green] {label}: {verified + unknown} models, "
             f"{unknown} with {UNKNOWN_METADATA_LABEL}"
         )
     if unknown:

@@ -47,6 +47,7 @@ from exp.common.models.catalog_prices import (
     NanoUsdRatePerMillionTokens as NanoUsdRatePerMillionTokens,
 )
 from exp.common.models.catalog_roles import ModelRoles
+from exp.common.models.discovery import DiscoveredModel
 from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
 from exp.common.models.failover_tokens import FailoverToken
 from exp.common.models.gateway_pools import GatewayPoolRecord
@@ -664,6 +665,9 @@ class ModelRecord(ContractModel):
 
     ``supported_reasoning_efforts`` preserves discovery choices for setup without changing
     the identity-bearing capability snapshot. ``None`` means the listing did not declare them.
+
+    ``discovery`` retains published tri-state flags so an explicit denial survives reload
+    and remains distinguishable from an undeclared capability's default value.
     """
 
     connection: str = Field(min_length=1, max_length=128)
@@ -673,12 +677,15 @@ class ModelRecord(ContractModel):
     billing_source: BillingSource
     capabilities: ModelCapabilities | None = None
     supported_reasoning_efforts: tuple[ReasoningEffort, ...] | None = None
+    discovery: DiscoveredModel | None = None
     gateway: GatewayDeploymentMetadata | None = None
     sft_provenance: SFTModelProvenance | None = None
 
     @model_validator(mode="after")
     def _require_secret_free_model_identity(self) -> ModelRecord:
         """Reject contradictory reasoning metadata and credential-bearing identity fields."""
+        if self.discovery is not None and self.discovery.model != self.model:
+            raise ValueError("discovery metadata must describe the same provider model")
         if (
             self.gateway is not None
             and self.gateway.capabilities.declares_reasoning_contract
@@ -708,6 +715,11 @@ class ModelRecord(ContractModel):
                     ),
                     "gateway": (
                         self.gateway.model_dump(mode="json") if self.gateway is not None else None
+                    ),
+                    "discovery": (
+                        self.discovery.model_dump(mode="json")
+                        if self.discovery is not None
+                        else None
                     ),
                     "sft_provenance": (
                         self.sft_provenance.model_dump(mode="json")

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from exp.cli.providers.declaration import (
     can_declare_role,
     declare_role_metadata,
@@ -198,6 +200,52 @@ def test_catalog_denial_is_not_overridden_by_a_default_yes_prompt() -> None:
     assert declare_role_metadata(item, SetupRole.WORLD_MODEL, console=console) is None
     assert "does not support chat completions" in console.output
     assert "[y/n]" not in console.output
+    assert not eligible_for_role(item, SetupRole.WORLD_MODEL)
+
+
+def test_explicit_judge_denial_overrides_stale_capabilities_and_retained_roles() -> None:
+    """A Cloud denial excludes a model before selection even if older state allowed it."""
+    item = _identity(
+        published=DiscoveredModel(
+            provider="openai-compatible",
+            model="hosted-chat",
+            supports_completions=True,
+            supports_structured_output=False,
+        ),
+        capabilities=ModelCapabilities(
+            supports_completions=True,
+            supports_structured_output=True,
+            input_cost_per_million_tokens_usd=1.0,
+            output_cost_per_million_tokens_usd=2.0,
+        ),
+    )
+    item = replace(item, retainable_roles=frozenset({SetupRole.JUDGE}))
+
+    assert eligible_for_role(item, SetupRole.WORLD_MODEL)
+    assert not eligible_for_role(item, SetupRole.JUDGE)
+    assert not can_declare_role(item, SetupRole.JUDGE)
+    console = ScriptedConsole("")
+    assert declare_role_metadata(item, SetupRole.JUDGE, console=console) is None
+    assert "[y/n]" not in console.output
+
+
+def test_missing_structured_output_is_distinct_from_an_explicit_denial() -> None:
+    """Private endpoints can still declare missing metadata rather than an API denial."""
+    item = _identity(
+        published=DiscoveredModel(
+            provider="openai-compatible",
+            model="hosted-chat",
+            supports_completions=True,
+        ),
+        capabilities=ModelCapabilities(
+            supports_completions=True,
+            input_cost_per_million_tokens_usd=1.0,
+            output_cost_per_million_tokens_usd=2.0,
+        ),
+    )
+
+    assert eligible_for_role(item, SetupRole.JUDGE)
+    assert can_declare_role(item, SetupRole.JUDGE)
 
 
 def test_declining_a_required_capability_keeps_the_model_unassigned() -> None:

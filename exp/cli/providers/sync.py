@@ -90,6 +90,7 @@ def sync_account_models(
             billing_source=BillingSource.HOST_MANAGED,
             capabilities=resolved.capabilities,
             supported_reasoning_efforts=item.supported_reasoning_efforts,
+            discovery=item,
         )
 
     sync_provider_models(

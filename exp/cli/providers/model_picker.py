@@ -829,6 +829,7 @@ def model_selection(item: AvailableModel) -> ProviderModelSelection:
         model=item.model,
         capabilities=capabilities,
         supported_reasoning_efforts=item.supported_reasoning_efforts,
+        discovery=item.published,
     )
 
 
@@ -865,6 +866,7 @@ def configured_models(
                 pricing_source=PricingSource.CONFIGURED,
                 configured=True,
                 retainable_roles=roles,
+                published=model.discovery,
                 supported_reasoning_efforts=(
                     model.supported_reasoning_efforts
                     if model.supported_reasoning_efforts is not None

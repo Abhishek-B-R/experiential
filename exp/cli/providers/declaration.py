@@ -66,7 +66,7 @@ def can_declare_role(item: AvailableModel, role: SetupRole) -> bool:
     Returns:
         ``True`` only for OpenAI-compatible identities that do not already prove the role.
     """
-    if item.provider != "openai-compatible":
+    if item.provider != "openai-compatible" or _role_denied(item, role):
         return False
     return item.capabilities is None or not serves_role(item.capabilities, role)
 
@@ -82,11 +82,23 @@ def eligible_for_role(item: AvailableModel, role: SetupRole) -> bool:
         ``True`` when verified metadata serves the role, the exact prior binding retains it,
         or the operator can declare the missing fields.
     """
-    return (
+    return not _role_denied(item, role) and (
         (item.capabilities is not None and serves_role(item.capabilities, role))
         or role in item.retainable_roles
         or can_declare_role(item, role)
     )
+
+
+def _role_denied(item: AvailableModel, role: SetupRole) -> bool:
+    """Reject roles whose required protocol is explicitly denied by published metadata."""
+    required = (
+        ("supports_embeddings",)
+        if role is SetupRole.EMBEDDER
+        else ("supports_completions", "supports_structured_output")
+        if role is SetupRole.JUDGE
+        else ("supports_completions",)
+    )
+    return any(_known_bool(item, field) is False for field in required)
 
 
 def merge_declared_models(

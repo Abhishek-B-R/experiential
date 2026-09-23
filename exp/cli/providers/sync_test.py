@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from exp.cli.providers.declaration import eligible_for_role
 from exp.cli.providers.experiential_cloud import hosted_connection
+from exp.cli.providers.model_picker import configured_models
 from exp.cli.providers.sync import sync_account_models
 from exp.cli.shared.picker_test import ScriptedConsole
 from exp.common.models import (
@@ -21,8 +25,10 @@ from exp.runtime.models.providers import HttpProviderModelLister
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 
 
+@pytest.mark.parametrize("structured_output", [False, True])
 def test_login_refreshes_unknown_models_from_the_cloud_catalog_without_new_aliases(
     tmp_path: Path,
+    structured_output: bool,
 ) -> None:
     """A login repairs cached identity-only metadata without calls to inference endpoints."""
     connection = hosted_connection({})
@@ -56,7 +62,7 @@ def test_login_refreshes_unknown_models_from_the_cloud_catalog_without_new_alias
                                     "input_nano_usd_per_million": 200000000,
                                     "output_nano_usd_per_million": 1200000000,
                                     "capabilities": {
-                                        "supports_structured_output": True,
+                                        "supports_structured_output": structured_output,
                                         "supports_reasoning": True,
                                         "reasoning_default_effort": "high",
                                         "supported_reasoning_efforts": ["low", "high", "max"],
@@ -85,7 +91,13 @@ def test_login_refreshes_unknown_models_from_the_cloud_catalog_without_new_alias
     saved = load_model_catalog(tmp_path / "models.toml")
     capabilities = saved.models["my-model"].capabilities
     assert capabilities is not None
-    assert serves_role(capabilities, SetupRole.JUDGE)
+    assert serves_role(capabilities, SetupRole.JUDGE) is structured_output
+    assert saved.models["my-model"].discovery is not None
+    assert saved.models["my-model"].discovery.supports_structured_output is structured_output
+    available = configured_models(
+        saved.models, connection_providers={connection.name: connection.provider}
+    )
+    assert eligible_for_role(available[0], SetupRole.JUDGE) is structured_output
     assert capabilities.input_cost_per_million_tokens_usd == 0.2
     assert capabilities.output_cost_per_million_tokens_usd == 1.2
     assert saved.models["my-model"].supported_reasoning_efforts == ("low", "high", "max")
