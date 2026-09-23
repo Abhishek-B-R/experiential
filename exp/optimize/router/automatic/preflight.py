@@ -31,6 +31,11 @@ from exp.common.project import (
 from exp.common.routing import RouterEmbeddingReservation
 from exp.common.tasks import TaskCase, load_task_set
 from exp.common.traces import Trace, load_trace_dataset
+from exp.common.traces.ingest.dataset import (
+    read_trace_model_identity_evidence,
+    verify_current_trace_dataset,
+)
+from exp.common.traces.ingest.model_identity import TraceModelIdentityEvidenceSet
 from exp.optimize.router.automatic.attribution import (
     RouterAttributionError,
     RouterObservedAttribution,
@@ -61,11 +66,6 @@ from exp.optimize.router.judging.contracts import (
 )
 from exp.runtime.agents import agent_factory_sha256
 from exp.runtime.models import RuntimeModelCatalog
-from exp.simulation.ingest.dataset import (
-    read_trace_model_identity_evidence,
-    verify_current_trace_dataset,
-)
-from exp.simulation.ingest.model_identity import TraceModelIdentityEvidenceSet
 from exp.simulation.specs import CandidateCompletionReservation
 from exp.simulation.world_model import load_grounded_world_model_artifact
 

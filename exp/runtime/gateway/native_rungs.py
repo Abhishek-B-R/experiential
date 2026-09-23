@@ -19,10 +19,11 @@ from dataclasses import dataclass
 
 from exp.common.core.artifacts import JsonObject, sha256_bytes
 from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
+from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayApiSurface, GatewayRequest
 from exp.runtime.gateway.native_admission import shape_parallel_tool_calls
 from exp.runtime.gateway.native_dispatch import frozen_dispatch
 from exp.runtime.gateway.native_execution import FrozenDispatchBinding, deployment_wire_entry
+from exp.runtime.gateway.native_image_output import image_aware_stream_payload
 from exp.runtime.gateway.reasoning_carrier import (
     ReasoningCarrierAuthority,
     reasoning_carrier_authority,
@@ -37,6 +38,8 @@ from exp.runtime.models.providers import (
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.generation_parameter_validation import bounded_output_request
+from exp.runtime.models.providers.logprobs import require_chat_logprobs, require_responses_logprobs
 from exp.runtime.models.providers.openrouter_routing import (
     OPENROUTER_PROVIDER_ID,
     constrain_openrouter_zero_data_retention,
@@ -44,7 +47,6 @@ from exp.runtime.models.providers.openrouter_routing import (
     openrouter_metadata_headers,
 )
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
-from exp.runtime.models.providers.streaming_requests import dialect_stream_payload
 from exp.runtime.models.providers.wire_messages import anthropic_request_headers
 
 ZDR_CONSTRAINT_CAPABILITY = "zero_data_retention_constraint"
@@ -60,6 +62,8 @@ class RungDispatch:
     binding: FrozenDispatchBinding | None
     carrier_authority: ReasoningCarrierAuthority | None
     parallel_disclosure: str | None
+    output_disclosure: str | None
+    reserved_output_tokens: int
 
 
 def build_rung_dispatch(
@@ -93,7 +97,29 @@ def build_rung_dispatch(
     rung_request, parallel_disclosure = shape_parallel_tool_calls(
         provider_request, deployment.gateway.capabilities
     )
-    upstream_payload = dialect_stream_payload(profile, rung_request)
+    capabilities = deployment.capabilities
+    rung_request, output_bound = bounded_output_request(
+        profile,
+        rung_request,
+        model_maximum_output_tokens=(
+            capabilities.maximum_output_tokens if capabilities is not None else None
+        ),
+        context_window_tokens=(
+            capabilities.context_window_tokens if capabilities is not None else None
+        ),
+    )
+    output_disclosure = (
+        f"max_tokens->default({output_bound};{profile.dialect};declared_bound)"
+        if provider_request.maximum_output_tokens is None
+        and rung_request.maximum_output_tokens is not None
+        else None
+    )
+    if rung_request.surface == GatewayApiSurface.CHAT_COMPLETIONS:
+        require_chat_logprobs((profile,), rung_request)
+    require_responses_logprobs((profile,), rung_request)
+    upstream_payload = image_aware_stream_payload(
+        profile, rung_request, capabilities, deployment.provider
+    )
     if rung_request.provider_preferences is not None and _openrouter_wire(deployment, profile):
         # The caller's routing preferences reach the one wire that defines
         # them; every other dialect's builder never emits the field.
@@ -151,6 +177,8 @@ def build_rung_dispatch(
         binding=binding,
         carrier_authority=carrier_authority,
         parallel_disclosure=parallel_disclosure,
+        output_disclosure=output_disclosure,
+        reserved_output_tokens=output_bound,
     )
 
 

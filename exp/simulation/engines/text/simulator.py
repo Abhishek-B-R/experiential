@@ -33,6 +33,7 @@ from exp.common.rollouts import (
     StopReason,
 )
 from exp.runtime.agents import AgentRuntime
+from exp.runtime.agents.factory import is_builtin_chat_factory
 from exp.runtime.models import ResolvedModel
 from exp.simulation.engines.clock import timestamp, utc_now
 from exp.simulation.engines.text.artifact_set import persist_artifact_set
@@ -45,6 +46,11 @@ from exp.simulation.engines.text.bindings import (
     rollout_id_for_binding,
 )
 from exp.simulation.engines.text.cell_progress import cell_progress_reporter
+from exp.simulation.engines.text.continuation import (
+    load_continuations,
+    rebind_completed,
+    retain_lineage,
+)
 from exp.simulation.engines.text.episode_loop import execute_text_episode_loop
 from exp.simulation.engines.text.errors import (
     SimulationConfigurationError,
@@ -66,6 +72,7 @@ from exp.simulation.engines.text.leases import (
     TextCellLeaseState,
     TextCellLeaseStore,
 )
+from exp.simulation.engines.text.lineage_spend import lineage_spend, prefix_retry_credit
 from exp.simulation.engines.text.prompt import WORLD_MODEL_TEXT_PROMPT_VERSION
 from exp.simulation.engines.text.recording import (
     RecordingCandidateClient,
@@ -89,7 +96,6 @@ from exp.simulation.engines.text.rollout_support import (
     elapsed_seconds,
     failure_span,
     internal_failure,
-    known_total_spend,
     normalize_text_tool_failure,
     orchestration_economics,
 )
@@ -106,7 +112,7 @@ class WorldModelSimulator:
     """Execute a text-only customer agent against a remote world-model provider.
 
     The simulator deliberately owns only one concrete mode. It invokes independently resolved
-    candidate and world-model clients, gives the agent an execute-only no-tools environment,
+    candidate and world-model clients, gives the agent a simulated tool environment,
     persists one immutable rollout per selected cell, never exposes a mutable world-model session,
     sends no tools to the world model, and records candidate economics apart from simulator cost.
 
@@ -221,11 +227,6 @@ class WorldModelSimulator:
     def run(self, spec: SimulationSpec) -> SimulationArtifactSet:
         """Run or resume exactly the sparse simulated cells selected by ``spec``.
 
-        A finite spend ceiling serializes new episode admission so later cells can be marked as
-        structured budget failures after observed provider spend reaches the ceiling. Provider
-        pricing is observed after a call in the v1 model contract, so the first episode that
-        crosses a ceiling is retained honestly rather than fabricated as a zero-cost estimate.
-
         Args:
             spec: Frozen world-model recipe selecting exact evaluation-plan cells.
 
@@ -237,6 +238,8 @@ class WorldModelSimulator:
             SimulationResumeError: Existing immutable artifacts do not match this simulation.
         """
         require_implemented_mode(spec, SimulationMode.WORLD_MODEL)
+        if spec.continuation_of is not None and not is_builtin_chat_factory(self._agent_factory):
+            raise SimulationResumeError("continuation requires the built-in chat runtime")
         cells, world_model, grounded_world_model = self._validate_spec_and_bindings(spec)
         spec, spec_input = persist_canonical_specification(self._store, spec)
         resolution, resolution_input, bindings = self._persist_resolution(
@@ -246,6 +249,7 @@ class WorldModelSimulator:
             world_model,
             grounded_world_model,
         )
+        load_continuations(self._store, spec, tuple(cells), bindings)
         completed = self._load_completed_rollouts(cells, bindings, resolution_input)
         pending = tuple(cell for cell in cells if cell.cell_id not in completed)
         pending = self._stale_recovery_first(pending, resolution, resolution_input, bindings)
@@ -634,7 +638,7 @@ class WorldModelSimulator:
         for cell_id, binding in bindings.items():
             cell = next(item for item in self._plan.cells if item.cell_id == cell_id)
             rollouts.extend(persisted_cell_attempts(self._store, cell, binding, pins))
-        return known_total_spend(rollouts)
+        return lineage_spend(self._store, rollouts)
 
     def _execute_cell(
         self,
@@ -648,7 +652,7 @@ class WorldModelSimulator:
         maximum_cell_cost_usd: float,
         attempt: int = 0,
     ) -> RolloutArtifact:
-        """Execute one grounded no-tools episode or retain its structured failure.
+        """Execute one grounded simulated episode or retain its structured failure.
 
         Args:
             spec: Validated finite-cost simulation specification.
@@ -666,29 +670,16 @@ class WorldModelSimulator:
         Raises:
             SimulationConfigurationError: Required world-model or retrieval settings are absent.
         """
+        parent = load_continuations(self._store, spec, (cell,), {cell.cell_id: binding}).get(
+            cell.cell_id
+        )
+        if parent is not None and parent.stop_reason == StopReason.COMPLETED:
+            return rebind_completed(self._store, parent, spec, cell, binding, resolution_input)
+        maximum_cell_cost_usd += prefix_retry_credit(parent, attempt)
         task = self._tasks[cell.task_id]
         candidate = self._candidate_models[cell.candidate_alias]
         started_at = timestamp(self._clock)
         started_monotonic = self._monotonic()
-        if task.tools:
-            return self._failure_rollout(
-                spec,
-                cell,
-                candidate,
-                world_model,
-                binding,
-                resolution_input,
-                started_at,
-                StopReason.FAILURE,
-                StructuredFailure(
-                    code=FailureCode.UNSUPPORTED,
-                    message="text world-model simulation cannot run a task that declares tools",
-                    attribution=FailureAttribution.TOOL,
-                    details={"phase": "task_tools", "tool_count": len(task.tools)},
-                ),
-                duration_seconds=elapsed_seconds(started_monotonic, self._monotonic()),
-                attempt=attempt,
-            )
         settings = spec.world_model
         if settings is None:  # pragma: no cover - validated before this execution path
             raise SimulationConfigurationError("world-model simulation settings are missing")
@@ -736,11 +727,14 @@ class WorldModelSimulator:
             maximum_cost_usd=maximum_cell_cost_usd,
             stop_on_overspend=spec.stop_on_overspend,
             maximum_steps=spec.maximum_steps,
+            maximum_rollout_output_tokens=spec.maximum_rollout_output_tokens,
             maximum_output_tokens=settings.maximum_output_tokens,
             redacted_field_names=self._redacted_field_names,
             clock=self._clock,
             token_counter=self._token_counter,
         )
+        if parent is not None and parent.text_checkpoint is not None:
+            recorder.restore(parent.text_checkpoint, parent.spans)
         try:
             outcome = execute_text_episode_loop(
                 agent_factory=self._agent_factory,
@@ -748,7 +742,7 @@ class WorldModelSimulator:
                 recorder=recorder,
             )
         except Exception as exc:  # noqa: BLE001 - construction faults remain cell evidence
-            return self._failure_rollout(
+            failed = self._failure_rollout(
                 spec,
                 cell,
                 candidate,
@@ -762,10 +756,11 @@ class WorldModelSimulator:
                 recorder=recorder,
                 attempt=attempt,
             )
+            return retain_lineage(self._store, failed, parent)
         failure = outcome.failure
         if outcome.episodes and failure == outcome.episodes[-1].failure:
             failure = normalize_text_tool_failure(outcome.episodes[-1])
-        return self._rollout_builder.make(
+        rollout = self._rollout_builder.make(
             spec=spec,
             cell=cell,
             candidate=candidate,
@@ -789,6 +784,9 @@ class WorldModelSimulator:
             ),
             attempt=attempt,
         )
+
+        rollout = rollout.model_copy(update={"text_checkpoint": recorder.checkpoint()})
+        return retain_lineage(self._store, rollout, parent)
 
     def _failure_rollout(
         self,

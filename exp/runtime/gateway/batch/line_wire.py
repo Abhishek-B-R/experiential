@@ -177,8 +177,16 @@ def _decoded_request(line: BatchLine) -> GatewayRequest:
     # The synchronous lane refuses these before dispatch because the Messages
     # wire cannot honor them; the batch lane refuses them per line at submit
     # for the same reason instead of letting the payload builder drop them.
-    if request.logprobs is True or request.top_logprobs is not None:
-        path = "top_logprobs" if request.top_logprobs is not None else "logprobs"
+    if (
+        request.logprobs is True
+        or request.top_logprobs is not None
+        or request.include_output_text_logprobs
+    ):
+        path = (
+            "include"
+            if request.include_output_text_logprobs
+            else ("top_logprobs" if request.top_logprobs is not None else "logprobs")
+        )
         raise BatchSubmitError(
             f"line {line.custom_id!r} sets {path}, which this gateway response contract "
             "does not carry; remove the field"

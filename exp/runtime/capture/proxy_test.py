@@ -26,12 +26,12 @@ from mitmproxy.tools.dump import DumpMaster
 from wsproto.frame_protocol import Opcode
 
 from exp.common.core.artifacts import SourceIdentity
+from exp.common.traces.ingest.otlp import normalize_otlp_payload
 from exp.runtime.capture import proxy as capture_module
 from exp.runtime.capture.certificates import prepare_certificate
 from exp.runtime.capture.normalization import CapturedExchange
 from exp.runtime.capture.proxy import CaptureProxy, _Body, _CaptureTlsConfig
 from exp.runtime.capture.upload import CaptureUploader
-from exp.simulation.ingest.otlp import normalize_otlp_payload
 
 
 @pytest.fixture

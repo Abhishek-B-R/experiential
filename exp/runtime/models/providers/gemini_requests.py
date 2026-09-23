@@ -60,6 +60,7 @@ def gemini_generate_request(
     stop_sequences: tuple[str, ...] = (),
     response_json_schema: JsonObject | None = None,
     json_object_output: bool = False,
+    default_maximum_output_tokens: int | None = DEFAULT_MAXIMUM_OUTPUT_TOKENS,
 ) -> JsonObject:
     """Convert a EXP request into Gemini's native generateContent payload.
 
@@ -78,6 +79,8 @@ def gemini_generate_request(
         response_json_schema: Strict JSON schema admitted for structured output.
         json_object_output: Whether to request schema-free JSON output
             (``responseMimeType`` only, no ``responseJsonSchema``).
+        default_maximum_output_tokens: Model-client default when the request
+            omits a ceiling. Gateway callers pass ``None`` to preserve omission.
 
     Returns:
         A native payload for the generateContent and streamGenerateContent
@@ -145,8 +148,8 @@ def gemini_generate_request(
     del supports_logprobs
     if request.maximum_output_tokens is not None:
         generation["maxOutputTokens"] = request.maximum_output_tokens
-    else:
-        generation["maxOutputTokens"] = DEFAULT_MAXIMUM_OUTPUT_TOKENS
+    elif default_maximum_output_tokens is not None:
+        generation["maxOutputTokens"] = default_maximum_output_tokens
     payload["generationConfig"] = generation
     return payload
 
@@ -204,7 +207,19 @@ def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonOb
     action = message.assistant_action
     text = message.content if message.content is not None else action.content if action else None
     parts: list[JsonObject] = []
-    if text is not None:
+    if message.content_parts:
+        for part in message.content_parts:
+            if part.kind == "text":
+                parts.append({"text": part.text})
+            elif part.kind == "image":
+                parts.append(gemini_image_part(part))
+            else:
+                raise ValueError("Gemini assistant history supports text and image parts")
+        # Chat history carries caller-owned content rather than Gemini's opaque
+        # signatures, as with replayed function calls below.
+        for part in parts:
+            part["thoughtSignature"] = GEMINI_THOUGHT_SIGNATURE_BYPASS
+    elif text is not None:
         parts.append({"text": text})
     if action is not None:
         for call in action.tool_calls:

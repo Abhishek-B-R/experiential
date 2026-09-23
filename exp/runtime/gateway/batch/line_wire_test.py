@@ -158,6 +158,7 @@ def test_untranslatable_chat_lines_are_submit_rejections(body: JsonObject, match
         # The shared decoder already refuses this one; it must still surface as
         # the same per-line submit rejection.
         ("/v1/responses", {"input": "hi", "top_logprobs": 2}, "top_logprobs"),
+        ("/v1/responses", {"input": "hi", "include": ["message.output_text.logprobs"]}, "include"),
         (
             "/v1/responses",
             {"input": "hi", "tools": [{"type": "web_search"}]},

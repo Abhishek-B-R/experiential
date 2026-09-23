@@ -1,11 +1,5 @@
-//! Provider wire dialects: SSE normalizers mirroring the event mappers in
-//! `exp.runtime.models.providers.streaming`. Upstream payloads are built by
-//! the python control plane with the shared `streaming_requests` builders and
-//! arrive fully formed in the admission response.
-//!
-//! This module owns the dialect registry, the dialect-selected frame decoder,
-//! and the shared `Normalizer` state machine; each provider's frame mapping
-//! lives in its own submodule as `Normalizer` methods.
+//! Wire registry, frame decoding, and normalization of Python-built upstream payloads.
+//! Provider frame mappings live in submodules as `Normalizer` methods.
 
 mod anthropic;
 mod bedrock;
@@ -17,6 +11,8 @@ pub(in crate::dialects) use relay_finish::{
 };
 mod gemini;
 mod openai;
+mod responses_logprobs;
+pub(crate) use responses_logprobs::records_retained_bytes;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -339,7 +335,7 @@ fn complete_streamed_tool(
 /// Complete one streamed tool call the provider itself marked truncated.
 ///
 /// A call whose accumulated arguments still parse as a JSON object completes
-/// normally; one left mid-fragment by the output budget is DROPPED (marked
+/// normally; one left empty or mid-fragment by the output budget is DROPPED (marked
 /// completed without a `ToolCallCompleted`), because the provider never
 /// finished it and the caller's remedy is a larger budget, not a retry of a
 /// "malformed" provider. Only a provider-declared truncation (a Chat
@@ -351,9 +347,7 @@ fn complete_streamed_tool_truncated(
     tool: &mut ToolAccumulator,
     events: &mut Vec<Event>,
 ) -> Result<(), Failure> {
-    let parses = tool.custom
-        || tool.raw_arguments.is_empty()
-        || require_json_object_text(&tool.raw_arguments).is_ok();
+    let parses = tool.custom || require_json_object_text(&tool.raw_arguments).is_ok();
     if parses {
         complete_streamed_tool(index, tool, events)
     } else {
@@ -406,20 +400,22 @@ pub struct Normalizer {
     // terminal frame can then finish normally instead of failing malformed.
     emitted_output: bool,
     accumulated_tool_bytes: usize,
+    accumulated_image_bytes: usize,
     accumulated_summary_bytes: usize,
     reasoning_summaries: BTreeMap<(u32, u32), String>,
     openai_output_items: BTreeMap<u32, (ProviderOutputItemKind, Option<String>)>,
     openai_hosted_items: BTreeMap<u32, OpenAiHostedItem>,
     openai_completed_output_items: BTreeSet<u32>,
     // Anthropic accumulation.
-    input_tokens: u64,
-    output_tokens: u64,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
     cache_read: u64,
     cache_write: u64,
     cache_write_1h: Option<u64>,
     stop_reason: Option<String>,
     // OpenAI-compatible and Gemini accumulation.
     usage: Option<Usage>,
+    openai_usage: crate::events::OpenAiUsageAccumulator,
     finish_reason: Option<String>,
     // Gemini accumulation: whole function calls arrive in one part, so the
     // provider supplies no tool index; assignment order mirrors the python
@@ -435,6 +431,10 @@ pub struct Normalizer {
     // `messageStop` both follow the block): a budget truncation drops the
     // call and ends Incomplete; any other ending surfaces this failure.
     deferred_tool_failure: Option<Failure>,
+    // Bedrock removes finished blocks from `tools`; only empty stopped blocks
+    // stay pending until the final reason authorizes completion or truncation.
+    bedrock_empty_stopped_tools: BTreeSet<u32>,
+    anthropic_stopped_tools: BTreeSet<u32>,
     // A call the provider cut mid-fragment was dropped under an ending that
     // did not declare truncation; the terminal then settles Incomplete.
     dropped_cut_call: bool,
@@ -443,6 +443,8 @@ pub struct Normalizer {
     // opted into its response metadata. First non-empty value wins; a label
     // only (bounded, printable ASCII), never content.
     upstream_provider: Option<String>,
+    chat_logprobs: bool,
+    responses_logprobs: bool,
 }
 
 /// Longest upstream label kept from a stream (mirrors the python settlement bound).
@@ -464,31 +466,52 @@ impl Normalizer {
             terminal: false,
             emitted_output: false,
             accumulated_tool_bytes: 0,
+            accumulated_image_bytes: 0,
             accumulated_summary_bytes: 0,
             reasoning_summaries: BTreeMap::new(),
             openai_output_items: BTreeMap::new(),
             openai_hosted_items: BTreeMap::new(),
             openai_completed_output_items: BTreeSet::new(),
-            input_tokens: 0,
-            output_tokens: 0,
+            input_tokens: None,
+            output_tokens: None,
             cache_read: 0,
             cache_write: 0,
             cache_write_1h: None,
             stop_reason: None,
             usage: None,
+            openai_usage: crate::events::OpenAiUsageAccumulator::default(),
             finish_reason: None,
             gemini_tool_index: 0,
             reasoning_content_route_sha256,
             request_words: Vec::new(),
             deferred_tool_failure: None,
+            bedrock_empty_stopped_tools: BTreeSet::new(),
+            anthropic_stopped_tools: BTreeSet::new(),
             dropped_cut_call: false,
             upstream_provider: None,
+            chat_logprobs: false,
+            responses_logprobs: false,
         }
+    }
+
+    pub fn enable_responses_logprobs(&mut self, enabled: bool) {
+        self.responses_logprobs = enabled;
+    }
+
+    pub fn enable_chat_logprobs(&mut self, enabled: bool) {
+        self.chat_logprobs = enabled;
     }
 
     /// The upstream an aggregator named as serving this stream, if any chunk said.
     pub fn upstream_provider(&self) -> Option<&str> {
         self.upstream_provider.as_deref()
+    }
+
+    /// Latest decoded provider meters, including reports held until terminal.
+    /// The relay snapshots these before waiting for another provider frame so
+    /// cancellation retains usage that has not yet become an outward event.
+    pub(crate) fn observed_usage(&self) -> Option<&Usage> {
+        self.usage.as_ref()
     }
 
     /// Keep the first upstream label a chunk names; garbage (empty, over-long,
@@ -507,12 +530,19 @@ impl Normalizer {
         self.upstream_provider = Some(trimmed.to_string());
     }
 
+    /// Bound aggregate image output even when images are delivered incrementally.
+    fn reserve_image_bytes(&mut self, additional: usize) -> Result<(), Failure> {
+        self.accumulated_image_bytes = self.accumulated_image_bytes.saturating_add(additional);
+        self.reserve_tool_bytes(0)
+    }
+
     /// Reserve retained-output budget for accumulated tool-argument text.
     fn reserve_tool_bytes(&mut self, additional: usize) -> Result<(), Failure> {
         self.accumulated_tool_bytes = self.accumulated_tool_bytes.saturating_add(additional);
         if self
             .accumulated_tool_bytes
             .saturating_add(self.accumulated_summary_bytes)
+            .saturating_add(self.accumulated_image_bytes)
             > MAXIMUM_RETAINED_OUTPUT_BYTES
         {
             return Err(Failure::new(
@@ -529,6 +559,7 @@ impl Normalizer {
         if self
             .accumulated_tool_bytes
             .saturating_add(self.accumulated_summary_bytes)
+            .saturating_add(self.accumulated_image_bytes)
             > MAXIMUM_RETAINED_OUTPUT_BYTES
         {
             return Err(Failure::new(
@@ -611,12 +642,9 @@ impl Normalizer {
         ))
     }
 
-    /// Recover a Gemini stream that emitted content and then terminated
-    /// *abnormally* — a broken transport read, a malformed frame, or a decoder
-    /// error — rather than closing cleanly. `on_stream_end` covers the clean
-    /// end (last content frame, then EOF, no terminal frame); this covers the
-    /// abnormal end, where the underlying failure would otherwise discard a
-    /// real partial answer.
+    /// Recover Gemini content after a transport, frame, or decoder failure.
+    /// `on_stream_end` covers a clean EOF without a terminal frame; this covers
+    /// abnormal ends where the failure would otherwise discard a partial answer.
     ///
     /// Scoped to Gemini: Gemini uniquely ends legitimate turns without a
     /// terminal frame, so a break after content is far more likely a
@@ -630,12 +658,14 @@ impl Normalizer {
     /// malformed reject. Any non-Gemini dialect, or a stream already terminated,
     /// keeps the original failure unchanged.
     ///
-    /// A retained-output overflow is never recovered: it is a deliberate gateway
-    /// limit (`provider_output_too_large`), not a provider abnormality, so
-    /// converting it to `Incomplete` would deliver and bill an over-limit partial
-    /// instead of surfacing the overflow — regardless of dialect or content.
+    /// Deliberate output limits and nonretryable validation failures remain errors:
+    /// recovery must not regenerate a rejected image or disguise it as partial output.
     pub fn recover_abnormal_end(&mut self, failure: Failure) -> Result<Vec<Event>, Failure> {
-        if failure.safe_message == OUTPUT_OVERFLOW_MESSAGE {
+        if failure.safe_message == OUTPUT_OVERFLOW_MESSAGE
+            || (failure.failure_class == FailureClass::MalformedResponse
+                && !failure.retryable_same_deployment
+                && !failure.failover_eligible)
+        {
             return Err(failure);
         }
         if self.terminal || self.dialect != Dialect::GeminiGenerateContent {
@@ -663,7 +693,8 @@ impl Normalizer {
         if self.terminal {
             return Ok(Vec::new());
         }
-        let events = match self.dialect {
+        let previous_usage = self.usage.clone();
+        let result = match self.dialect {
             Dialect::OpenAiResponses => self.feed_openai_responses(frame),
             Dialect::AnthropicMessages => self.feed_anthropic(frame),
             Dialect::OpenAiCompatible => self.feed_openai_compatible(frame),
@@ -672,7 +703,25 @@ impl Normalizer {
             Dialect::TypesafeSystemone => {
                 Err(malformed("decision models do not serve chat streams"))
             }
-        }?;
+        };
+        let mut observed = previous_usage;
+        for usage in self.usage.iter() {
+            observed
+                .get_or_insert_with(Usage::default)
+                .merge_observed(usage);
+        }
+        // A later malformed field must not discard meters already decoded in
+        // this frame or an earlier one. Preserve them before propagating error.
+        self.usage = observed.clone();
+        let mut events = result?;
+        for event in &mut events {
+            if let Event::Usage(usage) = event {
+                let merged = observed.get_or_insert_with(Usage::default);
+                merged.merge_observed(usage);
+                *usage = merged.clone();
+            }
+        }
+        self.usage = observed;
         if events.iter().any(Event::is_output_token) {
             self.emitted_output = true;
         }

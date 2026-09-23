@@ -34,12 +34,12 @@ from exp.common.project.project import require_durable_source_id
 from exp.common.release_revision import installed_release_revision
 from exp.common.tasks import TaskSet
 from exp.common.traces import load_trace_dataset
-from exp.simulation.ingest.dataset import (
+from exp.common.traces.ingest.dataset import (
     PersistedTraceDataset,
     persist_trace_dataset,
 )
-from exp.simulation.ingest.otlp import TraceNormalizationResult
-from exp.simulation.ingest.sources import load_trace_source
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
+from exp.common.traces.ingest.sources import load_trace_source
 from exp.simulation.mining.bindings import (
     bindings_for_mining,
     task_set_content_id,

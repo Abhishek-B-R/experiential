@@ -130,6 +130,7 @@ pub(crate) async fn responses(
         "idempotency_key": idempotency_key,
         "client_request_id": client_request_id,
         "client_ip": client_ip(&headers),
+        "capture_session_id": crate::capture::session_id(&headers),
     }));
     let admission_text = match state.bridge.call("admit", admit_argument).await {
         Ok(text) => text,
@@ -217,6 +218,7 @@ pub(crate) async fn responses(
         // Bytes over four approximates input tokens; a timeout heuristic
         // only, never a billing quantity.
         approximate_input_tokens: (body_text.len() as f64) / 4.0,
+        chat_logprobs: false,
         // A turn that ends before any semantic output is still a response
         // the caller can continue from; the waterfall retains it in flight.
         output_less_retention: Some(remember_argument(
@@ -229,13 +231,16 @@ pub(crate) async fn responses(
     };
     let mut won = acquire_attempt(&context, &mut guard).await;
     adopt_outcome(&mut admission, &mut won);
+    crate::capture::reasoning::observe_winner(state.capture.clone(), &admission, &guard, &mut won);
 
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or(0);
 
-    match won {
+    let capture = state.capture.clone();
+    let capture_request_id = admission.request_id.clone();
+    let response = match won {
         Won::Failed(error) => {
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;
@@ -291,7 +296,8 @@ pub(crate) async fn responses(
                 .await
             }
         }
-    }
+    };
+    crate::capture::response::capture_response(capture, &capture_request_id, response)
 }
 
 /// Answer one Responses attempt that the waterfall already settled: a
@@ -803,15 +809,22 @@ async fn stream_responses(
                 {
                     Ok(Some(event)) => event,
                     Ok(None) => {
+                        usage = committed.relay.usage_before_failure(usage.take());
                         fail_stream!(Failure::new(
                             FailureClass::MalformedResponse,
                             "provider stream ended without a terminal event",
                         ))
                     }
-                    Err(failure) => fail_stream!(failure),
+                    Err(failure) => {
+                        usage = committed.relay.usage_before_failure(usage.take());
+                        fail_stream!(failure)
+                    }
                 }
             };
             track_event(&event, &mut usage, &mut tool_names);
+            if matches!(event, Event::Failed(_)) {
+                usage = committed.relay.usage_before_failure(usage.take());
+            }
             if redactor.is_none() {
                 // A guarded stream retains what the caller actually saw, so
                 // a continuation replays the redacted text, never the raw

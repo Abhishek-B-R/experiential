@@ -338,6 +338,11 @@ async fn collect_response(
     }
     let bytes = read_bounded_body(response, deadline, phase_timeout).await?;
     let payload = strict_json(&bytes)?;
+    // Billing evidence is independent of decision validity. Keep it on the
+    // attempt guard before any error or cancellation can discard the answer.
+    if let Ok(usage) = decision_usage(&payload) {
+        guard.record_decision_usage(usage);
+    }
     let served = public_decisions(payload, admission)?;
     if remaining(deadline).is_zero() {
         return Err(timeout_failure());
@@ -544,6 +549,17 @@ fn public_decisions(
         };
         public_answers.insert(id.clone(), public);
     }
+    let usage = decision_usage(&payload)?;
+    Ok((
+        json!({"id": stable_public_id("decision", &admission.request_id),
+        "model": admission.alias, "answers": public_answers,
+        "usage": {"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens}}),
+        usage,
+    ))
+}
+
+/// Validate the provider's billing evidence without trusting the decision answers.
+fn decision_usage(payload: &Value) -> Result<Usage, Failure> {
     let input_tokens = token_count(&payload["usage"]["input_tokens"])?;
     let output_tokens = token_count(&payload["usage"]["output_tokens"])?;
     if input_tokens == 0 && output_tokens == 0 {
@@ -551,20 +567,14 @@ fn public_decisions(
             "decision response reported no billable token usage",
         ));
     }
-    let usage = Usage {
+    Ok(Usage {
         input_tokens: Some(input_tokens),
         output_tokens: Some(output_tokens),
         cached_input_tokens: None,
         cache_creation_input_tokens: None,
         cache_creation_1h_input_tokens: None,
         reasoning_tokens: None,
-    };
-    Ok((
-        json!({"id": stable_public_id("decision", &admission.request_id),
-        "model": admission.alias, "answers": public_answers,
-        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}}),
-        usage,
-    ))
+    })
 }
 
 fn probability(value: &Value) -> Result<f64, Failure> {

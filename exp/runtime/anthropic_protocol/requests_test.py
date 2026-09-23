@@ -19,6 +19,8 @@ from exp.runtime.gateway.contracts import (
     ThinkingBlock,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.errors import ProviderParameterError
+from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 from exp.runtime.models.providers.wire_messages import anthropic_blocks
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
@@ -1176,18 +1178,16 @@ def test_caller_beta_tokens_partition_into_allowlist_and_disclosures() -> None:
     assert raised.value.detail.param == "anthropic-beta"
 
 
-def test_a_real_toolset_tool_description_over_8k_decodes() -> None:
-    """Tool descriptions bound generously: a real Claude Code toolset
-    carried a description past the earlier 8k cap and 400ed with
-    "Invalid value for 'tools.1.description'" while the provider accepts
-    40k-character descriptions live (verified 2026-08-30)."""
+@pytest.mark.parametrize("length", [65_537, 119_825, 262_145, 1_048_576])
+def test_tool_descriptions_are_preserved_without_a_per_field_limit(length: int) -> None:
+    """Messages preserves large descriptions, including their final Unicode character."""
+    description = "y" * (length - 1) + "界"
     tools = [
         {"name": "small", "description": "x", "input_schema": {"type": "object"}},
-        {"name": "large", "description": "y" * 40_000, "input_schema": {"type": "object"}},
+        {"name": "large", "description": description, "input_schema": {"type": "object"}},
     ]
     decoded = decode_messages(_body(tools=tools))
-    description = decoded.request.tools[1].description
-    assert description is not None and len(description) == 40_000
+    assert decoded.request.tools[1].description == description
 
 
 def test_decode_accepts_the_live_eager_input_streaming_tool_shape() -> None:
@@ -1664,8 +1664,8 @@ def _openai_reasoning_profile() -> GatewayWireProfile:
     )
 
 
-def test_a_claude_code_thinking_request_serves_on_an_openai_route() -> None:
-    """The Messages thinking channel translates end to end, disclosed.
+def test_a_bare_claude_code_thinking_request_serves_on_an_openai_route() -> None:
+    """The budgetless Messages thinking channel translates end to end, disclosed.
 
     Driven through the real /v1/messages decode surface and the admission
     sequence: route shaping still rejects the config by name, the coercion
@@ -1685,7 +1685,7 @@ def test_a_claude_code_thinking_request_serves_on_an_openai_route() -> None:
         _body(
             max_tokens=16000,
             messages=[{"role": "user", "content": "hi"}],
-            thinking={"type": "enabled", "budget_tokens": 8192},
+            thinking={"type": "enabled"},
         )
     )
     profile = _openai_reasoning_profile()
@@ -1694,7 +1694,7 @@ def test_a_claude_code_thinking_request_serves_on_an_openai_route() -> None:
 
     coercion = coerce_generation_parameters((profile,), decoded.request)
     assert coercion is not None
-    assert coercion.disclosures == ("thinking->reasoning_effort:medium(budget_tokens)",)
+    assert coercion.disclosures == ("thinking->reasoning_effort:medium(gateway_default)",)
     _public, provider = route_generation_parameter_requests((profile,), coercion.request)
     payload = dialect_stream_payload(profile, provider)
     assert payload["reasoning"] == {"effort": "medium"}
@@ -1766,20 +1766,15 @@ def test_a_failed_tool_result_serves_on_an_openai_route() -> None:
     ]
 
 
-def test_the_claude_code_model_probe_serves_on_an_openai_route() -> None:
-    """The exact post-/model probe (max_tokens: 1) rides the provider floor."""
-    from exp.runtime.models.providers.streaming_requests import (
-        dialect_stream_payload,
-        route_generation_parameter_requests,
-    )
-
+def test_the_claude_code_model_probe_refuses_an_incompatible_provider_floor() -> None:
+    """A one-token probe is refused rather than secretly raised to sixteen."""
     decoded = decode_messages(_body(max_tokens=1, messages=[{"role": "user", "content": "hi"}]))
     profile = _openai_reasoning_profile()
-    public, provider = route_generation_parameter_requests((profile,), decoded.request)
-
-    assert "max_tokens->16" in public.ignored_parameters
-    payload = dialect_stream_payload(profile, provider)
-    assert payload["max_output_tokens"] == 16
+    with pytest.raises(ProviderParameterError) as rejected:
+        route_generation_parameter_requests((profile,), decoded.request)
+    assert rejected.value.param == "max_tokens"
+    assert rejected.value.code == "invalid_parameter"
+    assert decoded.request.maximum_output_tokens == 1
 
 
 def test_decode_names_a_duplicate_tool_use_id_instead_of_crashing() -> None:
@@ -1858,17 +1853,17 @@ def test_openrouter_reasoning_effort_rides_the_canonical_effort_channel() -> Non
 
 
 def test_openrouter_reasoning_enabled_and_budget_forms_translate() -> None:
-    """``enabled: true`` is OpenRouter's default depth; a token budget maps by tier."""
+    """A bare enable names default depth; a numeric budget remains an exact bound."""
     enabled = decode_messages(_body(reasoning={"enabled": True}))
     assert enabled.request.reasoning_effort == "medium"
     disabled = decode_messages(_body(reasoning={"enabled": False}))
     assert disabled.request.reasoning_effort is None
     assert disabled.request.provider_thinking_config == {"type": "disabled"}
-    # A budget becomes the budgeted thinking config Anthropic rungs forward and
-    # non-Anthropic rungs translate by tier (<=4096 low, <=16384 medium, else high).
+    # A budget stays numerical for budget-capable rungs. Other wires refuse
+    # rather than approximating this hard bound with an advisory effort.
     budget = decode_messages(_body(max_tokens=64000, reasoning={"max_tokens": 32000}))
     assert budget.request.provider_thinking_config == {"type": "enabled", "budget_tokens": 32000}
-    assert budget.request.reasoning_effort == "high"
+    assert budget.request.reasoning_effort is None
     # exclude only hides reasoning from the reply, which this gateway does not
     # render for non-Anthropic rungs anyway; it is dropped with disclosure.
     excluded = decode_messages(_body(reasoning={"effort": "high", "exclude": True}))
@@ -1907,7 +1902,7 @@ def test_openrouter_reasoning_wins_over_thinking_and_output_config_with_disclosu
         _body(
             max_tokens=4096,
             reasoning={"effort": "high"},
-            thinking={"type": "enabled", "budget_tokens": 2048},
+            thinking={"type": "enabled"},
             output_config={"effort": "low", "format": {"type": "text"}},
         )
     )
@@ -2147,31 +2142,19 @@ def test_a_thinking_budget_at_or_above_max_tokens_is_refused_at_the_boundary() -
     assert counted.request.provider_thinking_config == {"type": "enabled", "budget_tokens": 4096}
 
 
-def test_a_superseded_thinking_budget_is_never_refused() -> None:
-    """The refusal reads the RESOLVED channel: an explicit ``reasoning.effort``
-    discards the thinking config beside it, so its budget cannot starve the
-    reply and the request decodes at that effort with the supersession
-    disclosed. A ``reasoning.max_tokens`` budget is its own channel's check."""
-    decoded = decode_messages(
-        _body(
-            max_tokens=2048,
-            thinking={"type": "enabled", "budget_tokens": 4096},
-            reasoning={"effort": "high"},
+@pytest.mark.parametrize("reasoning", ({"effort": "high"}, {"enabled": False}))
+def test_a_numeric_thinking_budget_cannot_be_superseded(reasoning: JsonObject) -> None:
+    """Conflicting channels are refused instead of erasing a numerical bound."""
+    with pytest.raises(OpenAIProtocolError) as rejected:
+        decode_messages(
+            _body(
+                max_tokens=2048,
+                thinking={"type": "enabled", "budget_tokens": 4096},
+                reasoning=reasoning,
+            )
         )
-    )
-    assert decoded.request.reasoning_effort == "high"
-    assert decoded.request.provider_thinking_config is None
-    assert "thinking->dropped(superseded_by_reasoning)" in decoded.request.ignored_parameters
-
-    # reasoning: {enabled: false} resolves to a disabled config with no budget.
-    off = decode_messages(
-        _body(
-            max_tokens=2048,
-            thinking={"type": "enabled", "budget_tokens": 4096},
-            reasoning={"enabled": False},
-        )
-    )
-    assert off.request.provider_thinking_config == {"type": "disabled"}
+    assert rejected.value.status_code == 400
+    assert rejected.value.detail.param == "thinking.budget_tokens"
 
 
 def test_provider_zdr_demand_decodes_on_the_messages_surface() -> None:

@@ -9,8 +9,8 @@ import pytest
 import zstandard
 
 from exp.common.core.artifacts import JsonObject, JsonValue, SourceIdentity
+from exp.common.traces.ingest.otlp import normalize_otlp_payload
 from exp.runtime.capture.normalization import CapturedExchange, capture_protocol, normalize_exchange
-from exp.simulation.ingest.otlp import normalize_otlp_payload
 
 
 def _exchange(**changes: str | bytes | int | bool) -> CapturedExchange:

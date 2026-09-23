@@ -78,6 +78,7 @@ _GEMINI_RAW_ARGUMENTS = '{"city":"Zürich","count":2}'
 
 GEMINI_GOLDEN_EVENTS: tuple[JsonObject, ...] = (
     {"kind": "text_delta", "text": "Hel"},
+    {"kind": "gemini_thought_part", "part": {"thought": True, "text": "hidden reasoning"}},
     {"kind": "text_delta", "text": "lo"},
     {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "lookup"},
     {"kind": "tool_arguments_delta", "index": 0, "text": _GEMINI_RAW_ARGUMENTS},
@@ -123,6 +124,7 @@ GEMINI_PROMPT_BLOCK_EVENTS: tuple[JsonObject, ...] = (
     {
         "kind": "usage",
         "input_tokens": 42,
+        # Gemini's present usageMetadata follows proto3 scalar-zero omission.
         "output_tokens": 0,
         "cached_input_tokens": 0,
         "reasoning_tokens": None,
@@ -620,7 +622,9 @@ ANTHROPIC_THINKING_EVENTS: tuple[JsonObject, ...] = (
 )
 
 
-def _anthropic_start_usage(input_tokens: int, output_tokens: int, cached: int) -> dict[str, object]:
+def _anthropic_start_usage(
+    input_tokens: int, output_tokens: int | None, cached: int
+) -> dict[str, object]:
     """The usage event an Anthropic ``message_start`` now surfaces before content.
 
     The start-frame meters reach the Messages encoder's own ``message_start``
@@ -640,7 +644,8 @@ def test_native_anthropic_normalizer_emits_thinking_events() -> None:
     """Extended-thinking frames normalize to dedicated events, never silence."""
     result = _native_normalized("anthropic_messages", ANTHROPIC_THINKING_CHUNKS)
     assert result["failure"] is None
-    assert result["events"] == [_anthropic_start_usage(8, 0, 2), *ANTHROPIC_THINKING_EVENTS]
+    # message_start omits output_tokens; only message_delta reports its total.
+    assert result["events"] == [_anthropic_start_usage(8, None, 2), *ANTHROPIC_THINKING_EVENTS]
 
 
 # Captured from a live api.anthropic.com tool_use stream (2026-08-28,

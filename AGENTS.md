@@ -30,8 +30,9 @@ uv run pytest -q
   may not import optimize or cli; optimize may not import cli. Optimize owns application
   orchestration and may depend inward on common, runtime, and simulation. The AST gate rejects
   every current forbidden edge directly and proves that the package graph is acyclic.
-- The root CLI command set is exact: `build`, `capture`, `config`, `login`, `optimize`, and `run`. An invocation without a
-  subcommand opens the default gateway home screen. `exp/cli/app_test.py` and the release tests
+- The root CLI command set is exact: `build`, `capture`, `config`, `login`, `optimize`, and `run`.
+  An invocation without a subcommand opens the default gateway home screen.
+  `exp/cli/app_test.py` and the release tests
   enforce the current command and distribution shape.
 
 ## CLI package ownership
@@ -50,17 +51,27 @@ uv run pytest -q
 
 ## Evidence, simulation, and routing lifecycle
 
-- `exp/simulation/` owns trace ingestion, representative-task mining, typed simulation specs,
-  current engines, orchestration, artifact construction, and comparisons. New modules for those
-  responsibilities go inside `exp/simulation/`, never at the flat `exp/` root.
-- `exp build PROJECT --traces TRACE_FILE --source SOURCE --root ROOT` is the only CLI path
-  from local traces to immutable task evidence. It accepts 100 through 1000 normalized traces,
-  writes manifest-bound fit and held-out tasks plus `proposals_pending` review state, builds both
-  RAG indexes under a strict embedding-cost ceiling, and binds the grounded world model without a
-  completion or judge call. Route each corpus through an explicit canonical source loader.
-- New trace sources belong in `exp/simulation/ingest/`, normalize into the `Trace` and `TraceSpan`
-  contracts in `exp/common/traces/`, support file ingestion, and register from
-  `exp/simulation/ingest/__init__.py`.
+- `exp/common/traces/ingest/` owns reusable source parsing, trace normalization, provenance,
+  streaming and import persistence. Gateway-specific capture/protocol adapters live under
+  `exp/runtime/gateway/ingest/` and supply canonical evidence to the shared ingestion layer.
+- `exp/simulation/` owns representative-task mining, typed simulation specs, current engines,
+  orchestration, artifact construction, and comparisons. New modules for those responsibilities
+  go inside `exp/simulation/`, never at the flat `exp/` root.
+- `exp build PROJECT --traces TRACE_FILE --source SOURCE --root ROOT` imports canonical traces
+  into shared `<root>/gateway/traffic.db` SQLite storage, then mines scenarios from that exact
+  saved evidence. `--source gateway --identity ID` selects retained captures for one explicit
+  identity. Imports preserve source provenance, prompts, tools, results, normalization exclusions
+  and model identity; immutable import IDs and project associations are transactional and
+  idempotent. Ingestion remains a common Python operation, not a separate CLI command.
+  Build writes manifest-bound fit and held-out tasks plus
+  `proposals_pending` review state, builds both RAG indexes under a strict embedding-cost ceiling,
+  and binds the grounded world model without a completion or judge call. Route each corpus
+  through an explicit canonical source loader. The interactive wizard defaults to provider
+  configuration and build preparation; router optimization requires an explicit selection.
+- New file trace sources belong in `exp/common/traces/ingest/`, normalize into the `Trace` and
+  `TraceSpan` contracts in `exp/common/traces/`, and register with the explicit shared source table.
+  Runtime-specific source adapters stay with their runtime owner. Common ingestion never imports
+  runtime or simulation code; source selection is composed by the consuming command.
 - Python applications use `exp.compose_router` to complete review, plan-bound simulation,
   judgment, fitting, held-out verification, reporting, and runtime loading. Callers inject the
   approved review and setup suppliers, simulator factory, judge, runtime catalog, and finite
@@ -161,6 +172,10 @@ uv run pytest -q
 - Every class, function, and method uses a Google-style docstring, including private helpers,
   nested functions, and test helpers, so each callable states its contract locally. An absolutely
   trivial callable may use one clear summary line.
+- Document dataclass and Pydantic model fields in a Google-style `Attributes:` section of the
+  class docstring. Do not use standalone string literals after field declarations as inline
+  attribute docstrings. Keep field declarations together below the class docstring; field
+  descriptions belong in `Attributes:`, including defaults, constraints, and behavioral caveats.
 - **Never `print`.** All diagnostic/progress output goes through a module logger
   (`logging.getLogger(__name__)`), never the `print` builtin — enforced by ruff's `T20` rules.
   The one exception is deliberate user-facing CLI presentation, which goes through a local rich

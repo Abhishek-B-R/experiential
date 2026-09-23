@@ -1,5 +1,6 @@
 """Tests for text-only candidate recording and preflight boundaries."""
 
+import json
 import logging
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -28,7 +29,7 @@ from exp.common.models import (
     completion_cost_reservation,
 )
 from exp.common.rollouts import StopReason
-from exp.common.tasks import TaskCase
+from exp.common.tasks import TaskCase, ToolSchema
 from exp.runtime.models import ResolvedModel
 from exp.runtime.models.providers.openai import openai_responses_response
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
@@ -230,6 +231,8 @@ def _recorder(
     active_input_price: float | None = 1.0,
     maximum_cost_usd: float = 10.0,
     stop_on_overspend: bool = False,
+    maximum_steps: int = 2,
+    maximum_rollout_output_tokens: int = 1_000_000,
 ) -> RecordingCandidateClient:
     """Build a recorder with explicit fake candidate, world model, and retriever.
 
@@ -298,7 +301,8 @@ def _recorder(
         completion_maximum_attempts=1,
         maximum_cost_usd=maximum_cost_usd,
         stop_on_overspend=stop_on_overspend,
-        maximum_steps=2,
+        maximum_steps=maximum_steps,
+        maximum_rollout_output_tokens=maximum_rollout_output_tokens,
         maximum_output_tokens=16_000,
         redacted_field_names=frozenset(),
         clock=lambda: _TIME,
@@ -366,6 +370,44 @@ def test_recorder_keeps_candidate_and_world_calls_separate_and_tool_free() -> No
     assert recorder.recorded.world_model_economics.cost_usd == NumericMeasurement(
         value=0.10,
         provenance="observed",
+    )
+
+
+@pytest.mark.parametrize("stop_on_overspend", [False, True])
+def test_empty_candidate_response_is_preserved_without_retrieval_cost(
+    stop_on_overspend: bool,
+) -> None:
+    """A completed blank reply is world-model evidence, not an embedding/provider failure."""
+    candidate = _ScriptedClient([_response("", model=_snapshot("candidate-a"))])
+    world = _ScriptedClient(
+        [
+            _response(
+                '{"message":"No answer received.","terminal":true}',
+                model=_snapshot("world-model-a"),
+            )
+        ]
+    )
+    recorder = _recorder(candidate, world, stop_on_overspend=stop_on_overspend)
+
+    response = recorder.complete(
+        ModelRequest(messages=(ModelMessage(role="user", content="Help."),))
+    )
+
+    assert response.output == AssistantAction(content="")
+    assert len(candidate.requests) == len(world.requests) == 1
+    evidence = json.loads(world.requests[0].messages[1].content or "")
+    assert evidence["candidate_response"] == {"content": "", "tool_calls": []}
+    assert recorder.terminal_error is None
+    assert recorder.world_model_terminal
+    assert recorder.recorded.retrieved_transition_ids == ((),)
+    assert recorder.recorded.retrieval_economics.cost_usd == NumericMeasurement(
+        value=0, provenance="estimated"
+    )
+    assert recorder.recorded.candidate_economics.cost_usd == NumericMeasurement(
+        value=0.1, provenance="observed"
+    )
+    assert recorder.recorded.world_model_economics.cost_usd == NumericMeasurement(
+        value=0.1, provenance="observed"
     )
 
 
@@ -514,11 +556,11 @@ def test_recorder_rejects_tool_requests_before_any_provider_call() -> None:
     world_client = _ScriptedClient([])
     recorder = _recorder(candidate_client, world_client)
 
-    with pytest.raises(TextSimulationError, match="tool-free") as error:
+    with pytest.raises(TextSimulationError, match="declared tool schemas") as error:
         recorder.complete(
             ModelRequest(
                 messages=(ModelMessage(role="user", content="Use the system."),),
-                tool_choice="auto",
+                tools=(ToolSchema(name="unknown", description="Unknown", input_schema={}),),
             )
         )
 
@@ -728,3 +770,49 @@ def test_stop_mode_recorder_blocks_the_next_dispatch_after_spend_reaches_the_cei
 
     assert error.value.stop_reason == StopReason.MAXIMUM_COST
     assert len(candidate_client.requests) == 1
+
+
+def test_rollout_token_budget_bounds_the_next_request_and_preserves_usage() -> None:
+    """Only remaining total generated tokens are admitted on later candidate requests."""
+    candidate = _ScriptedClient(
+        [
+            _response("first", model=_snapshot("candidate-a")),
+            _response("second", model=_snapshot("candidate-a")),
+        ]
+    )
+    world = _ScriptedClient(
+        [
+            _response('{"message":"continue","terminal":false}', model=_snapshot("world-model-a")),
+            _response('{"message":"continue","terminal":false}', model=_snapshot("world-model-a")),
+        ]
+    )
+    recorder = _recorder(candidate, world, maximum_steps=100, maximum_rollout_output_tokens=6)
+    request = ModelRequest(messages=(ModelMessage(role="user", content="start"),))
+    recorder.complete(request)
+    recorder.complete(request)
+    assert [item.maximum_output_tokens for item in candidate.requests] == [6, 3]
+    with pytest.raises(TextSimulationError) as caught:
+        recorder.complete(request)
+    assert caught.value.stop_reason == StopReason.MAXIMUM_OUTPUT_TOKENS
+    assert len(candidate.requests) == 2
+    assert recorder.checkpoint() is not None
+
+
+def test_missing_token_usage_blocks_further_dispatch() -> None:
+    """Missing usage never silently replenishes a rollout's output budget."""
+    response = _response("answer", model=_snapshot("candidate-a"))
+    response = response.model_copy(
+        update={"economics": response.economics.model_copy(update={"usage": None})}
+    )
+    candidate = _ScriptedClient([response])
+    world = _ScriptedClient(
+        [
+            _response('{"message":"continue","terminal":false}', model=_snapshot("world-model-a")),
+        ]
+    )
+    recorder = _recorder(candidate, world, maximum_steps=100)
+    request = ModelRequest(messages=(ModelMessage(role="user", content="start"),))
+    recorder.complete(request)
+    with pytest.raises(TextSimulationError, match="usage is missing"):
+        recorder.complete(request)
+    assert len(candidate.requests) == 1

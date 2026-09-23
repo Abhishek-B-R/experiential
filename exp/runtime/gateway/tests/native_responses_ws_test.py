@@ -120,6 +120,19 @@ def test_websocket_transport_mirrors_the_http_event_stream(
         with connect(
             ws_url, additional_headers={**headers, "Idempotency-Key": "connection-op"}
         ) as socket:
+            # Probability output cannot be requested on a non-generating prewarm.
+            provider_calls = _LoopbackProvider.calls
+            for probability_fields in (
+                {"include": ["message.output_text.logprobs"]},
+                {"top_logprobs": 0},
+                {"logprobs": True},
+            ):
+                socket.send(_request_frame(generate=False, input=[], **probability_fields))
+                probability_prewarm = _collect_stream(socket)
+                assert probability_prewarm[0]["type"] == "error"
+                assert probability_prewarm[0]["status"] == 400
+                assert _LoopbackProvider.calls == provider_calls
+
             # Prewarm completes an empty response without touching the provider.
             provider_calls = _LoopbackProvider.calls
             socket.send(_request_frame(generate=False, input=[]))

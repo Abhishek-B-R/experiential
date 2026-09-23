@@ -96,6 +96,11 @@ class GatewayWireProfile:
     The native (Rust) data plane builds provider payloads and parses provider
     streams itself; this profile carries the connection-specific wire facts
     that only the resolved Python client knows.
+
+    Attributes:
+        supports_logprobs: Verified Chat probability support on this exact model.
+        supports_responses_logprobs: Native Responses probability support, opt-in.
+        logprobs_reasoning_efforts: Qualified efforts; empty means unknown support.
     """
 
     dialect: str
@@ -192,10 +197,10 @@ class GatewayWireProfile:
     """Largest top-k value accepted by the provider wire, when known."""
 
     supports_logprobs: bool = False
-    """Provider metadata for logprob support.
 
-    Dispatch stays disabled until normalized output projection exists.
-    """
+    supports_responses_logprobs: bool = False
+
+    logprobs_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
 
     supports_frequency_penalty: bool = False
     """Whether this exact route accepts the ``frequency_penalty`` sampling control.
@@ -284,11 +289,9 @@ class GatewayWireProfile:
     minimum_output_tokens: int | None = None
     """Smallest output-token ceiling this rung's provider accepts, when declared.
 
-    Catalog-declared (``GatewayDeploymentCapabilities.minimum_output_tokens``),
-    never derived from the dialect: a caller ceiling below it is floored with
-    disclosure on every surface instead of dispatching a value the provider
-    400s (Perplexity sonar and Sakana fugu via OpenRouter, grok-4.6 on
-    Bedrock all refuse ``max_tokens < 16`` on the Chat wire)."""
+    Catalog-declared (``GatewayDeploymentCapabilities.minimum_output_tokens``).
+    A smaller explicit caller ceiling is refused before dispatch, never raised.
+    Route selection may keep another rung that accepts the caller's ceiling."""
 
     signs_request_body: bool = False
     """Whether dispatch headers are computed per request over the exact

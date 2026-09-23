@@ -48,13 +48,58 @@ def test_thinking_adaptive_defers_to_the_model_default() -> None:
     assert request.ignored_parameters == ("thinking->translated(reasoning_effort)",)
 
 
-def test_thinking_adaptive_budget_tokens_is_disclosed_not_carried() -> None:
-    request = _decode(thinking={"type": "adaptive", "budget_tokens": 4096})
-    assert request.thinking_default_enable is True
-    assert request.ignored_parameters == (
-        "budget_tokens->dropped(not_carried)",
-        "thinking->translated(reasoning_effort)",
-    )
+def test_numeric_thinking_budget_is_preserved_for_route_admission() -> None:
+    """Chat retains the exact numeric budget instead of selecting an effort."""
+    request = _decode(thinking={"type": "enabled", "budget_tokens": 4096}, max_tokens=8192)
+    assert request.provider_thinking_config == {"type": "enabled", "budget_tokens": 4096}
+    assert request.reasoning_effort is None
+    assert request.thinking_default_enable is False
+    assert request.ignored_parameters == ()
+
+
+@pytest.mark.parametrize("budget", (0, 1023, True, 4096.5, "4096"))
+def test_nested_budget_requires_an_anthropic_integer_budget(budget: object) -> None:
+    """Malformed or too-small budgets fail at the caller field."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        _decode(thinking={"type": "enabled", "budget_tokens": budget})
+    assert error.value.detail.param == "thinking.budget_tokens"
+
+
+@pytest.mark.parametrize("mode", ("adaptive", "disabled"))
+def test_nested_budget_requires_enabled_mode(mode: str) -> None:
+    """A numeric budget cannot be combined with an adaptive or off mode."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        _decode(thinking={"type": mode, "budget_tokens": 4096})
+    assert error.value.detail.param == "thinking.budget_tokens"
+
+
+@pytest.mark.parametrize(
+    "limit_field", ("max_tokens", "max_completion_tokens", "max_output_tokens")
+)
+@pytest.mark.parametrize("limit", (2048, 4096))
+def test_nested_budget_leaves_room_below_any_output_limit(limit_field: str, limit: int) -> None:
+    """All output-limit spellings apply the same numeric budget constraint."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        _decode(thinking={"type": "enabled", "budget_tokens": 4096}, **{limit_field: limit})
+    assert error.value.detail.param == "thinking.budget_tokens"
+
+
+@pytest.mark.parametrize(
+    "controls",
+    [
+        {"thinking_budget": 4096},
+        {"reasoning_effort": "high"},
+        {"reasoning": {"effort": "high"}},
+        {"reasoning": {"enabled": False}},
+        {"enable_thinking": False},
+        {"chat_template_kwargs": {"enable_thinking": False}},
+    ],
+)
+def test_nested_budget_rejects_conflicting_controls(controls: dict[str, object]) -> None:
+    """Neither effort nor an off switch may erase the requested budget."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        _decode(thinking={"type": "enabled", "budget_tokens": 4096}, **controls)
+    assert error.value.detail.param == "thinking.budget_tokens"
 
 
 def test_thinking_unknown_type_names_the_members_not_the_json_type() -> None:
@@ -68,15 +113,6 @@ def test_thinking_unknown_type_names_the_members_not_the_json_type() -> None:
     assert error.value.detail.param == "thinking.type"
     assert error.value.detail.message == (
         "Invalid value for 'thinking.type': expected one of 'enabled', 'disabled' or 'adaptive'."
-    )
-
-
-def test_thinking_enabled_budget_tokens_is_disclosed_not_carried() -> None:
-    request = _decode(thinking={"type": "enabled", "budget_tokens": 4096})
-    assert request.thinking_default_enable is True
-    assert request.ignored_parameters == (
-        "budget_tokens->dropped(not_carried)",
-        "thinking->translated(reasoning_effort)",
     )
 
 
@@ -115,6 +151,22 @@ def test_explicit_flat_reasoning_effort_wins_over_translate_fields() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "off_fields",
+    (
+        {"thinking": {"type": "disabled"}},
+        {"reasoning": {"enabled": False}},
+        {"chat_template_kwargs": {"enable_thinking": False}},
+        {"enable_thinking": False},
+    ),
+)
+def test_flat_effort_cannot_override_an_explicit_off_setting(off_fields: JsonObject) -> None:
+    """An active flat effort conflicts with any caller's explicit off switch."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        _decode(reasoning_effort="high", **off_fields)
+    assert error.value.detail.param == "reasoning_effort"
+
+
 def test_conflicting_enable_and_disable_fields_are_rejected() -> None:
     with pytest.raises(OpenAIProtocolError):
         _decode(thinking={"type": "enabled"}, chat_template_kwargs={"enable_thinking": False})
@@ -148,18 +200,13 @@ def test_openrouter_reasoning_enabled_translates_to_the_canonical_control() -> N
     assert disabled.thinking_default_enable is False
 
 
-@pytest.mark.parametrize(
-    ("budget", "effort"), [(1024, "low"), (4096, "low"), (8192, "medium"), (32768, "high")]
-)
-def test_openrouter_reasoning_budget_snaps_to_the_nearest_tier(budget: int, effort: str) -> None:
-    """A ``max_tokens`` budget maps through the Messages surface's budget table."""
-    request = _decode(reasoning={"max_tokens": budget})
-    assert request.reasoning_effort == effort
-    assert request.thinking_default_enable is False
-    assert request.ignored_parameters == (
-        "reasoning.max_tokens->translated(reasoning_effort)",
-        "reasoning->translated(reasoning_effort)",
-    )
+@pytest.mark.parametrize("budget", (1024, 4096, 8192, 32768))
+def test_openrouter_reasoning_budget_is_not_replaced_by_effort(budget: int) -> None:
+    """A hard token budget cannot become an advisory effort level."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        _decode(reasoning={"max_tokens": budget})
+    assert error.value.detail.param == "reasoning.max_tokens"
+    assert error.value.detail.code == "unsupported_parameter"
 
 
 def test_openrouter_reasoning_exclude_is_disclosed_not_carried() -> None:
@@ -196,15 +243,14 @@ def test_explicit_flat_effort_reports_every_present_alternate_spelling() -> None
     )
 
 
-def test_explicit_flat_effort_ignores_alternate_objects_whole() -> None:
-    """When the flat effort wins, an alternate object's inner fields are not
-    separately reported as translated or dropped."""
-    request = _decode(
-        reasoning_effort="low",
-        reasoning={"max_tokens": 2048, "exclude": True},
-        thinking={"type": "enabled", "budget_tokens": 4096},
+@pytest.mark.parametrize("field", ("thinking", "reasoning"))
+def test_explicit_flat_effort_cannot_discard_a_numeric_budget(field: str) -> None:
+    """A second effort channel cannot erase the caller's numerical bound."""
+    value = (
+        {"type": "enabled", "budget_tokens": 4096} if field == "thinking" else {"max_tokens": 2048}
     )
-    assert request.ignored_parameters == (
-        "reasoning->ignored(explicit_reasoning_effort)",
-        "thinking->ignored(explicit_reasoning_effort)",
+    with pytest.raises(OpenAIProtocolError) as error:
+        _decode(reasoning_effort="low", **{field: value})
+    assert error.value.detail.param == (
+        "thinking.budget_tokens" if field == "thinking" else "reasoning.max_tokens"
     )

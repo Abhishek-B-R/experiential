@@ -52,6 +52,7 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
         "google-auth",
         "google-re2",
         "httpx",
+        "ijson",
         "numpy",
         "openai",
         "posthog",
@@ -1482,7 +1483,7 @@ def _installed_release_driver() -> None:
         raise AssertionError(f"exp gateway did not listen on port {port}")
 
     def start_gateway(root: Path) -> tuple[subprocess.Popen[str], int, str]:
-        """Start one installed gateway subprocess on an unused loopback port.
+        """Start the accounting-only privacy canary with explicit content opt-out.
 
         Args:
             root: Configured gateway root.
@@ -1494,6 +1495,7 @@ def _installed_release_driver() -> None:
         process = subprocess.Popen(
             [
                 str(executable),
+                "--ghost",
                 "--root",
                 str(root),
                 "--port",
@@ -2319,7 +2321,7 @@ def _installed_release_driver() -> None:
             provider_model=provider_model,
             exact_model_id="project-exact-model",
             revision=None,
-            capabilities=ModelCapabilities(),
+            capabilities=ModelCapabilities(maximum_output_tokens=32_000),
             gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
             prices=GatewayTokenPrices(
                 # $1 / $2 per million tokens, in nano-USD.
@@ -2692,7 +2694,7 @@ def _installed_release_driver() -> None:
             session.id,
             {"role": "assistant", "content": "What account email is associated?"},
         )
-        assert observation.message == {
+        assert observation.messages[0] == {
             "role": "user",
             "content": "P17 generated world observation",
         }

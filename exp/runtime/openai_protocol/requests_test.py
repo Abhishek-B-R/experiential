@@ -24,7 +24,15 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.reasoning_carrier import FIREWORKS_REASONING_CONTENT_PREFIX
-from exp.runtime.models.providers.streaming_requests import openai_responses_stream_payload
+from exp.runtime.gateway.replay_identity import canonical_request_sha256
+from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.generation_route_compat import (
+    compatible_generation_parameter_profile_indexes,
+)
+from exp.runtime.models.providers.streaming_requests import (
+    dialect_stream_payload,
+    openai_responses_stream_payload,
+)
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.model_adapter import model_request
 from exp.runtime.openai_protocol.requests import (
@@ -834,19 +842,33 @@ def test_responses_decoder_preserves_top_p() -> None:
     assert decoded.request.top_p == 1
 
 
-def test_chat_decoder_rejects_unprojectable_top_logprobs() -> None:
-    """Alternate-token probability output is rejected at the public boundary."""
-    with pytest.raises(OpenAIProtocolError) as raised:
+@pytest.mark.parametrize("count", [0, 1, 20])
+def test_chat_decoder_preserves_top_logprobs(count: int) -> None:
+    """Standard probability controls survive decoding for route admission."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hello"}],
+            "logprobs": True,
+            "top_logprobs": count,
+        }
+    )
+    assert decoded.request.logprobs is True
+    assert decoded.request.top_logprobs == count
+
+
+@pytest.mark.parametrize("count", [True, False, 1.0, "1", -1, 21])
+def test_chat_decoder_rejects_invalid_top_logprobs(count: int | float | str) -> None:
+    """The probability count is strictly an integer in the documented range."""
+    with pytest.raises(OpenAIProtocolError):
         decode_chat(
             {
                 "model": "coding",
                 "messages": [{"role": "user", "content": "hello"}],
                 "logprobs": True,
-                "top_logprobs": 5,
+                "top_logprobs": count,
             }
         )
-    assert raised.value.detail.code == "unsupported_parameter"
-    assert raised.value.detail.param == "top_logprobs"
 
 
 def test_chat_decoder_accepts_store_false_opt_out() -> None:
@@ -1535,12 +1557,12 @@ def test_responses_decoder_keeps_orphaned_reasoning_as_its_own_turn() -> None:
 
 
 def test_responses_decoder_rejects_unknown_include_paths() -> None:
-    """Only the encrypted reasoning include selector is honored."""
+    """Unknown include selectors remain rejected by name."""
     with pytest.raises(OpenAIProtocolError) as raised:
         decode_responses(
             {
                 "model": "coding",
-                "include": ["message.output_text.logprobs"],
+                "include": ["web_search_call.results"],
                 "input": "hi",
             }
         )
@@ -2156,20 +2178,14 @@ def test_chat_decoder_accepts_image_parts_inside_a_tool_message() -> None:
     assert decoded.request.images == tool_message.images
 
 
-def test_chat_decoder_still_rejects_image_parts_on_an_assistant_message() -> None:
-    """No wire carries an image inside an assistant turn; the 400 names the tool exception."""
+def test_chat_decoder_preserves_generated_assistant_image_parts() -> None:
+    """A generated image can be replayed in a following chat turn."""
     part: JsonObject = {
         "type": "image_url",
         "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
     }
-
-    with pytest.raises(OpenAIProtocolError) as captured:
-        decode_chat(_copilot_tool_screenshot_body("assistant", part))
-
-    assert captured.value.detail.code == "invalid_parameter"
-    assert captured.value.detail.param == "messages.2"
-    assert "valid only for user messages" in captured.value.detail.message
-    assert "tool message may carry image parts" in captured.value.detail.message
+    decoded = decode_chat(_copilot_tool_screenshot_body("assistant", part))
+    assert decoded.request.messages[2].images[0].data == _PNG_BASE64
 
 
 @pytest.mark.parametrize(
@@ -2366,25 +2382,25 @@ def test_malformed_chat_image_url_is_rejected_with_its_field() -> None:
     assert error.value.detail.param == "messages.0.content.0.image_url"
 
 
-def test_assistant_image_parts_are_rejected() -> None:
-    """Only a caller message may carry an image."""
-    with pytest.raises(OpenAIProtocolError):
-        decode_chat(
-            {
-                "model": "coding",
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
-                            }
-                        ],
-                    }
-                ],
-            }
-        )
+def test_assistant_image_only_history_is_preserved() -> None:
+    """Image-only assistant content remains available to the next turn."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    assert decoded.request.messages[0].images[0].data == _PNG_BASE64
 
 
 _PDF_BASE64 = "JVBERi0xLjQKJSBtaW5pbWFsIHBkZgo="
@@ -4068,95 +4084,42 @@ def test_forced_tool_choice_decodes_canonically_on_both_openai_surfaces() -> Non
     assert responses_named.request.tool_choice == GatewayNamedToolChoice(name="lookup")
 
 
-def test_tool_description_bounds_are_uniform_and_named_on_both_surfaces() -> None:
-    """65,536-char descriptions serve; 65,537 is a self-explanatory named 400.
-
-    Prod report: an 8,292-char tool description 400d every agentic turn at
-    the old 8,192 bound while the provider itself serves 66,000+ (probed
-    live 2026-09-05). The bound now matches the Messages surface and the
-    canonical GatewayToolDefinition, and the over-limit rejection states the
-    limit and the arriving length instead of forcing the caller to bisect.
-    """
-    reporter_sized = "x" * 8_292
-    at_bound = "x" * 65_536
-    over_bound = "x" * 65_537
-
-    for description in (reporter_sized, at_bound):
-        decoded = decode_chat(
-            {
-                "model": "coding",
-                "messages": [{"role": "user", "content": "hi"}],
-                "tools": [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "t",
-                            "description": description,
-                            "parameters": {"type": "object"},
-                        },
-                    }
-                ],
-            }
-        )
-        assert decoded.request.tools[0].description == description
-
-    with pytest.raises(OpenAIProtocolError) as chat_over:
-        decode_chat(
-            {
-                "model": "coding",
-                "messages": [{"role": "user", "content": "hi"}],
-                "tools": [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "t",
-                            "description": over_bound,
-                            "parameters": {"type": "object"},
-                        },
-                    }
-                ],
-            }
-        )
-    assert chat_over.value.detail.param == "tools.0.function.description"
-    assert "at most 65,536 characters" in str(chat_over.value.detail.message)
-    assert "65,537" in str(chat_over.value.detail.message)
-
-    decoded = decode_responses(
+@pytest.mark.parametrize("length", [65_537, 119_825, 262_145, 1_048_576])
+def test_tool_descriptions_are_preserved_without_a_per_field_limit(length: int) -> None:
+    """Both OpenAI surfaces preserve descriptions beyond diagnostic preview sizes."""
+    description = "x" * (length - 1) + "界"
+    function: JsonObject = {
+        "name": "t",
+        "description": description,
+        "parameters": {"type": "object"},
+    }
+    chat = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": function}],
+        }
+    )
+    responses = decode_responses(
         {
             "model": "coding",
             "input": "hi",
-            "tools": [
-                {
-                    "type": "function",
-                    "name": "t",
-                    "description": at_bound,
-                    "parameters": {"type": "object"},
-                }
-            ],
+            "tools": [{"type": "function", **function}],
         }
     )
-    assert decoded.request.tools[0].description == at_bound
-    with pytest.raises(OpenAIProtocolError) as responses_over:
-        decode_responses(
-            {
-                "model": "coding",
-                "input": "hi",
-                "tools": [
-                    {
-                        "type": "function",
-                        "name": "t",
-                        "description": over_bound,
-                        "parameters": {"type": "object"},
-                    }
-                ],
-            }
+    for decoded in (chat, responses):
+        assert decoded.request.tools[0].description == description
+        changed_tool = decoded.request.tools[0].model_copy(
+            update={"description": description[:-1] + "語"}
         )
-    assert responses_over.value.detail.param == "tools.0.description"
-    assert "at most 65,536 characters" in str(responses_over.value.detail.message)
+        changed_request = decoded.request.model_copy(update={"tools": (changed_tool,)})
+        assert canonical_request_sha256(decoded.request) != canonical_request_sha256(
+            changed_request
+        )
 
 
 def test_structured_format_description_bounds_are_uniform_and_named() -> None:
-    """The response_format and text.format description bounds match the tools'."""
+    """Structured-format descriptions retain their own bound on both surfaces."""
     at_bound = "x" * 65_536
     over_bound = "x" * 65_537
 
@@ -4854,3 +4817,122 @@ def test_responses_decoder_normalizes_tool_search_and_deferred_tools() -> None:
     assert decoded.request.tool_search is not None
     assert decoded.request.tool_search.declared_as == "responses_tool"
     assert decoded.request.tool_search.tool_type == "tool_search"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"model": "coding", "input": "hi", "include": ["message.output_text.logprobs"]},
+        {"model": "coding", "input": "hi", "top_logprobs": 0},
+        {
+            "model": "coding",
+            "input": "hi",
+            "include": ["message.output_text.logprobs"],
+            "top_logprobs": 2,
+        },
+    ],
+)
+def test_responses_logprobs_preserves_independent_intent(payload: JsonObject) -> None:
+    """Responses selector and count remain independent canonical controls."""
+    request = decode_responses(payload).request
+    assert request.surface == GatewayApiSurface.RESPONSES
+    assert request.logprobs is None
+    assert request.include_output_text_logprobs == ("include" in payload)
+    assert request.top_logprobs == payload.get("top_logprobs")
+
+
+@pytest.mark.parametrize("value", ["true", 1, 0])
+def test_chat_logprobs_requires_strict_boolean(value: int | str) -> None:
+    """Reject non-boolean logprobs values at the public boundary."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "logprobs": value,
+            }
+        )
+
+
+def test_chat_logprobs_narrows_to_capable_compatible_rungs_and_forwards_zero() -> None:
+    """Filter incapable rungs while preserving an explicitly requested zero."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": True,
+            "top_logprobs": 0,
+        }
+    )
+    incapable = GatewayWireProfile(dialect="openai_compatible", url="https://a.test")
+    capable = GatewayWireProfile(
+        dialect="openai_compatible", url="https://b.test", supports_logprobs=True
+    )
+    assert compatible_generation_parameter_profile_indexes(
+        (incapable, capable), decoded.request
+    ) == (1,)
+    shaped = decoded.request.model_copy(update={"stream": True})
+    payload = dialect_stream_payload(capable, shaped)
+    assert payload["logprobs"] is True
+    assert payload["top_logprobs"] == 0
+
+
+@pytest.mark.parametrize("count", [True, False, 1.0, "1", -1, 21])
+def test_responses_probability_count_is_strict(count: int | float | str) -> None:
+    """Responses counts use the same strict bounded integer contract as Chat."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_responses({"model": "coding", "input": "hi", "top_logprobs": count})
+
+
+def test_responses_accepts_returned_probability_content_in_stateless_history() -> None:
+    """Resending returned output retains text but strips observation-only probabilities."""
+    request = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "A",
+                            "annotations": [],
+                            "logprobs": [
+                                {"token": "A", "logprob": -0.1, "bytes": [65], "top_logprobs": []}
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+    ).request
+    assert request.messages[0].content == "A"
+
+
+@pytest.mark.parametrize("limit", (1, 128, 8192))
+def test_chat_accepts_max_output_tokens_without_losing_the_ceiling(limit: int) -> None:
+    """Clients using the Responses spelling retain an exact Chat output ceiling."""
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_output_tokens": limit,
+        }
+    ).request
+    assert request.maximum_output_tokens == limit
+    assert request.maximum_output_tokens_parameter == "max_output_tokens"
+
+
+@pytest.mark.parametrize("other", ("max_tokens", "max_completion_tokens"))
+def test_chat_output_limit_spellings_cannot_override_each_other(other: str) -> None:
+    """Reject ambiguous ceilings rather than increasing a caller's bound."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_output_tokens": 128,
+                other: 256,
+            }
+        )

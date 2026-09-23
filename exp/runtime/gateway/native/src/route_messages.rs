@@ -31,6 +31,7 @@ use crate::respond::{
     latin1_header_list, outward_event, read_body, send_bounded, settle_stream_end,
     sse_body_response,
 };
+use crate::respond::{log_stream_exit, stream_delivery::Delivery};
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
@@ -170,6 +171,7 @@ pub(crate) async fn messages(
         "surface": "messages",
         "anthropic_beta": anthropic_beta,
         "client_ip": client_ip(&headers),
+        "capture_session_id": crate::capture::session_id(&headers),
     }));
     let admission_text = match state.bridge.call("admit", admit_argument).await {
         Ok(text) => text,
@@ -218,14 +220,18 @@ pub(crate) async fn messages(
         // Bytes over four approximates input tokens; a timeout heuristic
         // only, never a billing quantity.
         approximate_input_tokens: (body_text.len() as f64) / 4.0,
+        chat_logprobs: false,
         output_less_retention: None,
         output_token_cap: admission.maximum_output_tokens,
         tool_search: admission.tool_search.as_ref(),
     };
     let mut won = acquire_attempt(&context, &mut guard).await;
     adopt_outcome(&mut admission, &mut won);
+    crate::capture::reasoning::observe_winner(state.capture.clone(), &admission, &guard, &mut won);
 
-    match won {
+    let capture = state.capture.clone();
+    let capture_request_id = admission.request_id.clone();
+    let response = match won {
         Won::Failed(error) => messages_error_response(&error),
         Won::Settled(settled) => settled_messages_response(&admission, settled).await,
         Won::Committed(committed) => {
@@ -239,7 +245,8 @@ pub(crate) async fn messages(
                 completed_messages(admission, guard, committed, deadline, permit).await
             }
         }
-    }
+    };
+    crate::capture::response::capture_response(capture, &capture_request_id, response)
 }
 
 /// Abandon a durably accepted request whose admission reply failed to parse,
@@ -621,6 +628,7 @@ async fn stream_messages(
         let _permit = permit;
         let mut guard = guard;
         let mut committed = committed;
+        let mut delivery = Delivery::new(sender.clone(), false);
         let mut encoder =
             MessagesSseEncoder::new_with_ignored(&request_id, &alias, ignored_parameters);
         configure_messages_encoder_for(&mut encoder, &admission);
@@ -636,11 +644,13 @@ async fn stream_messages(
 
         macro_rules! fail_stream {
             ($failure:expr) => {{
+                committed.relay.close_transport();
+                log_stream_exit(&request_id, "provider_or_encoding_failure");
                 let failure = $failure.boundary();
-                emit_messages_failure(&sender, deadline, &mut encoder, &failure).await;
                 guard
                     .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
                     .await;
+                emit_messages_failure(&sender, deadline, &mut encoder, &failure).await;
                 return;
             }};
         }
@@ -662,7 +672,9 @@ async fn stream_messages(
             }
         };
         for frame in start_frames {
-            if !send_bounded(&sender, deadline, Bytes::from(frame)).await {
+            if !delivery.send(deadline, Bytes::from(frame)).await {
+                committed.relay.close_transport();
+                log_stream_exit(&request_id, "subscriber_closed_or_delivery_deadline");
                 guard.settle_cancelled(usage.as_ref(), &tool_names).await;
                 return;
             }
@@ -670,25 +682,47 @@ async fn stream_messages(
 
         let mut prefix: std::collections::VecDeque<Event> = committed.prefix.drain(..).collect();
         loop {
+            if crate::relay::remaining(deadline).is_zero() {
+                committed.relay.close_transport();
+                log_stream_exit(&request_id, "delivery_deadline");
+                guard.settle_cancelled(usage.as_ref(), &tool_names).await;
+                return;
+            }
             let event = if let Some(event) = prefix.pop_front() {
                 event
             } else {
-                match committed
-                    .relay
-                    .next_event(deadline, phase_timeout, guard.started)
+                match delivery
+                    .next(
+                        committed
+                            .relay
+                            .next_event(deadline, phase_timeout, guard.started),
+                    )
                     .await
                 {
-                    Ok(Some(event)) => event,
-                    Ok(None) => {
+                    None => {
+                        committed.relay.close_transport();
+                        log_stream_exit(&request_id, "subscriber_closed");
+                        guard.settle_cancelled(usage.as_ref(), &tool_names).await;
+                        return;
+                    }
+                    Some(Ok(Some(event))) => event,
+                    Some(Ok(None)) => {
+                        usage = committed.relay.usage_before_failure(usage.take());
                         fail_stream!(Failure::new(
                             FailureClass::MalformedResponse,
                             "provider stream ended without a terminal event",
                         ))
                     }
-                    Err(failure) => fail_stream!(failure),
+                    Some(Err(failure)) => {
+                        usage = committed.relay.usage_before_failure(usage.take());
+                        fail_stream!(failure)
+                    }
                 }
             };
             track_event(&event, &mut usage, &mut tool_names);
+            if matches!(event, Event::Failed(_)) {
+                usage = committed.relay.usage_before_failure(usage.take());
+            }
             // Mirror the relay's first-token time onto the guard as tokens stream.
             guard.record_first_token(committed.relay.first_token_at());
             let outward = outward_event(&event, &mut visible_refusal);
@@ -706,6 +740,7 @@ async fn stream_messages(
                 Err(failure) => fail_stream!(failure),
             };
             if event.is_terminal() {
+                committed.relay.close_transport();
                 if matches!(event, Event::Completed | Event::StoppedAtSequence(_)) {
                     // Mirrors the Chat stream: a tool turn with hidden
                     // reasoning is sealed before its terminal frames on both
@@ -763,6 +798,7 @@ async fn stream_messages(
                         .await
                 };
                 if !settled {
+                    log_stream_exit(&request_id, "settlement_unavailable");
                     return;
                 }
             }
@@ -773,6 +809,7 @@ async fn stream_messages(
                         if terminal.is_some() {
                             // The attempt already settled by its provider
                             // terminal; the stream simply ends short.
+                            log_stream_exit(&request_id, "terminal_encoding_failed");
                             return;
                         }
                         fail_stream!(Failure::new(
@@ -782,7 +819,9 @@ async fn stream_messages(
                     }
                 };
                 for data in encoded {
-                    if !send_bounded(&sender, deadline, Bytes::from(data)).await {
+                    if !delivery.send(deadline, Bytes::from(data)).await {
+                        committed.relay.close_transport();
+                        log_stream_exit(&request_id, "subscriber_closed_or_delivery_deadline");
                         settle_stream_end(
                             &mut guard,
                             terminal.as_ref(),

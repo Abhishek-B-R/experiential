@@ -6,10 +6,9 @@ alias points at a local OpenAI-compatible SSE mock upstream. The tests drive
 ``POST /v1/messages`` with Anthropic-shaped requests through the real Rust
 data plane and shared python control plane.
 
-The Anthropic passthrough upstream dialect is deliberately not driven here:
-``anthropic`` is a fixed-origin provider whose connection config rejects a
-custom ``base_url``, so it cannot be pointed at a loopback mock without
-weakening that production invariant.
+Budget tests redirect only an already-admitted fixed-origin destination to
+loopback. Decoding, route validation, frozen payloads, dispatch and settlement
+remain real; provider configuration still enforces its production origin.
 """
 
 from __future__ import annotations
@@ -31,6 +30,8 @@ from typing import cast
 
 import httpx
 import pytest
+from openai import OpenAI
+from websockets.sync.client import connect
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelCapabilities
@@ -72,7 +73,21 @@ _DRIVER_SOURCE = textwrap.dedent(
             Path(config["root"]),
             environment=environment,
         )
-        control_plane = NativeControlPlane(
+        control_plane_type = NativeControlPlane
+        if "mock_destination" in config:
+            class LoopbackControlPlane(NativeControlPlane):
+                """Redirect only the admitted network destination to the local mock."""
+
+                def admit(self, argument: str) -> str:
+                    """Keep real decoding, admission and frozen payloads; replace the URL."""
+                    admitted = json.loads(super().admit(argument))
+                    for rung in admitted["route"]:
+                        assert rung["url"] == config["expected_destination"]
+                        rung["url"] = config["mock_destination"]
+                    return json.dumps(admitted)
+
+            control_plane_type = LoopbackControlPlane
+        control_plane = control_plane_type(
             components,
             request_timeout_seconds=config["request_timeout_seconds"],
         )
@@ -242,6 +257,40 @@ def _zero_output_terminal_frames(finish_reason: str) -> bytes:
     )
 
 
+def _anthropic_budget_frames() -> bytes:
+    """Return a complete Anthropic text stream with terminal usage."""
+    events = (
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg-budget",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [],
+                "stop_reason": None,
+                "usage": {"input_tokens": 9, "output_tokens": 0},
+            },
+        },
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "hello world"},
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": 4},
+        },
+        {"type": "message_stop"},
+    )
+    return b"".join(
+        b"event: " + str(event["type"]).encode() + b"\n" + _sse_frame(event) for event in events
+    )
+
+
 class _SseUpstream(BaseHTTPRequestHandler):
     """OpenAI-compatible SSE mock whose shape is selected by the prompt."""
 
@@ -254,6 +303,38 @@ class _SseUpstream(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length))
         with self.payloads_lock:
             self.payloads.append(payload)
+        if self.path == "/v1/gemini":
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(
+                _sse_frame(
+                    {
+                        "candidates": [
+                            {
+                                "content": {"role": "model", "parts": [{"text": "hello world"}]},
+                                "finishReason": "STOP",
+                                "index": 0,
+                            }
+                        ],
+                        "usageMetadata": {
+                            "promptTokenCount": 9,
+                            "candidatesTokenCount": 4,
+                            "thoughtsTokenCount": 2,
+                            "totalTokenCount": 15,
+                        },
+                    }
+                )
+            )
+            self.wfile.flush()
+            return
+        if self.path == "/v1/messages":
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(_anthropic_budget_frames())
+            self.wfile.flush()
+            return
         prompt = payload["messages"][-1]["content"]
         if prompt in {"reject-param-token", "reject-dump-token"}:
             # A client error the caller can act on, and one whose message is a
@@ -400,6 +481,207 @@ class _ResponsesUpstream(BaseHTTPRequestHandler):
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
         try:
+            if "count-only" in json.dumps(payload):
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_text.delta",
+                            "output_index": 0,
+                            "item_id": "msg_count",
+                            "content_index": 0,
+                            "delta": "count",
+                            "logprobs": [],
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_text.done",
+                            "output_index": 0,
+                            "item_id": "msg_count",
+                            "content_index": 0,
+                            "text": "count",
+                            "logprobs": [],
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "status": "completed",
+                                "output": [
+                                    {
+                                        "id": "msg_count",
+                                        "type": "message",
+                                        "status": "completed",
+                                        "content": [
+                                            {
+                                                "type": "output_text",
+                                                "text": "count",
+                                                "logprobs": [],
+                                            }
+                                        ],
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
+            include = payload.get("include", [])
+            if "probability-regression" in json.dumps(payload) or (
+                isinstance(include, list) and "message.output_text.logprobs" in include
+            ):
+                terminal_status = (
+                    "incomplete" if "probability-incomplete" in json.dumps(payload) else "completed"
+                )
+                terminal_event = f"response.{terminal_status}"
+                records = [{"token": "OK", "logprob": -0.125, "bytes": [79, 75]}]
+                text_done_records = [{"token": "OK", "logprob": -0.1250001, "bytes": [79, 75]}]
+                item_done_records = [{"token": "OK", "logprob": -0.1250002, "bytes": [79, 75]}]
+                terminal_records = [{"token": "OK", "logprob": -0.125000123, "bytes": [79, 75]}]
+                if "probability-empty-first" in json.dumps(payload):
+                    self.wfile.write(
+                        _sse_frame(
+                            {
+                                "type": "response.output_text.delta",
+                                "output_index": 0,
+                                "item_id": "msg_probability",
+                                "content_index": 0,
+                                "delta": "",
+                                "logprobs": [],
+                            }
+                        )
+                    )
+                if "probability-done-first" in json.dumps(payload):
+                    self.wfile.write(
+                        _sse_frame(
+                            {
+                                "type": "response.output_text.done",
+                                "output_index": 0,
+                                "item_id": "msg_probability",
+                                "content_index": 0,
+                                "text": "",
+                                "logprobs": records,
+                            }
+                        )
+                    )
+                if "probability-first" in json.dumps(payload):
+                    self.wfile.write(
+                        _sse_frame(
+                            {
+                                "type": "response.output_text.delta",
+                                "output_index": 0,
+                                "item_id": "msg_probability",
+                                "content_index": 0,
+                                "delta": "",
+                                "logprobs": records,
+                            }
+                        )
+                    )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_text.delta",
+                            "output_index": 0,
+                            "item_id": "msg_probability",
+                            "content_index": 0,
+                            "delta": "OK",
+                            "logprobs": []
+                            if "probability-first" in json.dumps(payload)
+                            else records,
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_text.done",
+                            "output_index": 0,
+                            "item_id": "msg_probability",
+                            "content_index": 0,
+                            "text": "OK",
+                            "logprobs": text_done_records,
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.content_part.done",
+                            "output_index": 0,
+                            "item_id": "msg_probability",
+                            "content_index": 0,
+                            "part": {
+                                "type": "output_text",
+                                "text": "OK",
+                                "logprobs": None
+                                if "probability-null" in json.dumps(payload)
+                                else [],
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": 0,
+                            "item": {
+                                "id": "msg_probability",
+                                "type": "message",
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "OK",
+                                        "logprobs": None
+                                        if "probability-null" in json.dumps(payload)
+                                        else item_done_records,
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": terminal_event,
+                            "response": {
+                                "status": terminal_status,
+                                "incomplete_details": {"reason": "max_output_tokens"},
+                                "output": [
+                                    {
+                                        "id": "msg_probability",
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "status": "completed",
+                                        "content": [
+                                            {
+                                                "type": "output_text",
+                                                "text": "OK",
+                                                "logprobs": None
+                                                if "probability-null" in json.dumps(payload)
+                                                else terminal_records,
+                                            }
+                                        ],
+                                    }
+                                ],
+                                "usage": {"input_tokens": 1, "output_tokens": 1},
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
             if hosted_echoed:
                 # Turn 2 of the hosted lane: the continuation replayed the
                 # verbatim web_search_call item, so answer with plain text.
@@ -729,25 +1011,52 @@ def _messages_body(prompt: str, *, stream: bool = False, tools: bool = False) ->
 
 
 @pytest.fixture(scope="module", name="engine")
-def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine]:
+def _engine(
+    tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest
+) -> Iterator[_ServingEngine]:
     """Serve one shared native engine subprocess over a seeded root.
 
     Yields:
         The live serving facts as a :class:`_ServingEngine`.
     """
+    variant = str(getattr(request, "param", ""))
+    qwen_budget = variant.startswith("qwen-budget")
+    qwen_model = variant.partition(":")[2] or "qwen3.8-max"
+    gemini_budget = variant == "gemini-budget"
+    anthropic_budget = getattr(request, "param", None) == "anthropic-budget"
     root = tmp_path_factory.mktemp("native-messages-root")
     with _SseUpstream.payloads_lock:
         _SseUpstream.payloads.clear()
     upstream = ThreadingHTTPServer((_HOST, 0), _SseUpstream)
     upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
     upstream_thread.start()
+    mock_url = f"http://{_HOST}:{upstream.server_address[1]}/v1"
     _manager, raw_key = _configured_gateway(
         root,
-        base_url=f"http://{_HOST}:{upstream.server_address[1]}/v1",
+        base_url=(
+            "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+            if qwen_budget
+            else mock_url
+        ),
+        provider="anthropic"
+        if anthropic_budget
+        else "gemini"
+        if gemini_budget
+        else "openai-compatible",
+        provider_model=(
+            "claude-sonnet-4-6"
+            if anthropic_budget
+            else "gemini-2.5-flash"
+            if gemini_budget
+            else qwen_model
+            if qwen_budget
+            else "provider-model-exact"
+        ),
         capabilities=ModelCapabilities(
             chat_max_tokens_field="max_completion_tokens",
-            maximum_output_tokens=128,
+            maximum_output_tokens=8192 if anthropic_budget or qwen_budget or gemini_budget else 128,
             maximum_temperature=1.0,
+            supports_reasoning=qwen_budget or anthropic_budget or gemini_budget,
         ),
     )
     driver = root / "native_messages_driver.py"
@@ -756,6 +1065,30 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         {
             "root": str(root),
             "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS,
+            **(
+                {
+                    "mock_destination": f"{mock_url}/chat/completions",
+                    "expected_destination": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
+                }
+                if qwen_budget
+                else {}
+            ),
+            **(
+                {
+                    "mock_destination": f"{mock_url}/gemini",
+                    "expected_destination": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+                }
+                if gemini_budget
+                else {}
+            ),
+            **(
+                {
+                    "mock_destination": f"{mock_url}/messages",
+                    "expected_destination": "https://api.anthropic.com/v1/messages",
+                }
+                if anthropic_budget
+                else {}
+            ),
         }
     )
     stderr_log = root / "driver-stderr.log"
@@ -851,10 +1184,13 @@ def _responses_engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Ser
             supports_reasoning=True,
             supports_tools=True,
             supports_temperature=False,
+            maximum_output_tokens=128_000,
+            supports_logprobs=True,
         ),
         gateway_capabilities=GatewayDeploymentCapabilities(
             supports_streaming=True,
             supports_streaming_tool_arguments=True,
+            supports_responses_logprobs=True,
         ),
         prices=GatewayTokenPrices(),
         pricing_source=None,
@@ -1566,6 +1902,184 @@ def test_responses_stream_zero_output_keeps_terminal_usage(
     assert usage["output_tokens"] == 0
 
 
+def test_responses_sdk_stream_preserves_probability_phases_and_final_json(
+    responses_engine: _ServingEngine,
+) -> None:
+    """The served native SSE path retains rich phase observations and final records."""
+    client = OpenAI(
+        base_url=f"{responses_engine.base}/v1",
+        api_key=responses_engine.raw_key,
+    )
+    with client.responses.stream(
+        model="responses",
+        input="probability-regression",
+        include=["message.output_text.logprobs"],
+        top_logprobs=0,
+        store=False,
+    ) as stream:
+        events = list(stream)
+        final = stream.get_final_response()
+    event_types = [event.type for event in events]
+    assert "response.output_text.delta" in event_types
+    assert "response.output_text.done" in event_types
+    assert "response.output_item.done" in event_types
+    delta_event = next(
+        event.model_dump() for event in events if event.type == "response.output_text.delta"
+    )
+    assert delta_event["logprobs"][0]["bytes"] == [79, 75]
+    text_done = next(
+        event.model_dump() for event in events if event.type == "response.output_text.done"
+    )
+    assert text_done["logprobs"][0]["token"] == "OK"
+    item_done = next(
+        event.model_dump() for event in events if event.type == "response.output_item.done"
+    )
+    assert item_done["item"]["content"][0]["logprobs"][0]["token"] == "OK"
+    assert item_done["item"]["content"][0]["logprobs"][0]["logprob"] == -0.1250002
+    body = final.model_dump()
+    assert body["output"][0]["content"][0]["text"] == "OK"
+    assert body["output"][0]["content"][0]["logprobs"]
+    assert body["output"][0]["content"][0]["logprobs"][0]["token"] == "OK"
+    assert body["output"][0]["content"][0]["logprobs"][0]["bytes"] == [79, 75]
+    assert body["output"][0]["content"][0]["logprobs"][0]["logprob"] == -0.125000123
+
+
+def test_responses_count_only_does_not_add_include_or_records(
+    responses_engine: _ServingEngine,
+) -> None:
+    """A count alone forwards no selector and returns no probability records."""
+    with _ResponsesUpstream.payloads_lock:
+        _ResponsesUpstream.payloads.clear()
+    response = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={"model": "responses", "input": "count-only", "top_logprobs": 2},
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["output"][0]["content"][0]["logprobs"] == []
+    with _ResponsesUpstream.payloads_lock:
+        dispatched = tuple(_ResponsesUpstream.payloads)
+    assert dispatched
+    include = dispatched[-1].get("include", [])
+    assert isinstance(include, list)
+    assert "message.output_text.logprobs" not in include
+    assert dispatched[-1]["top_logprobs"] == 2
+
+
+def test_responses_ws_probability_generation_preserves_phases(
+    responses_engine: _ServingEngine,
+) -> None:
+    """Generating Responses WebSocket retains delta and terminal probabilities."""
+    with connect(
+        f"ws://{responses_engine.base.removeprefix('http://')}/v1/responses",
+        additional_headers={"Authorization": f"Bearer {responses_engine.raw_key}"},
+    ) as socket:
+        socket.send(
+            json.dumps(
+                {
+                    "type": "response.create",
+                    "model": "responses",
+                    "input": "probability-regression",
+                    "include": ["message.output_text.logprobs"],
+                    "top_logprobs": 0,
+                }
+            )
+        )
+        events: list[JsonObject] = []
+        while True:
+            event = json.loads(socket.recv(timeout=30))
+            assert isinstance(event, dict)
+            events.append(event)
+            if event["type"] in {"response.completed", "response.incomplete"}:
+                break
+    delta = next(event for event in events if event["type"] == "response.output_text.delta")
+    delta_records = delta.get("logprobs")
+    assert isinstance(delta_records, list) and isinstance(delta_records[0], dict)
+    assert delta_records[0].get("bytes") == [79, 75]
+    done = next(event for event in events if event["type"] == "response.output_text.done")
+    done_records = done.get("logprobs")
+    assert isinstance(done_records, list) and isinstance(done_records[0], dict)
+    assert done_records[0].get("logprob") == -0.1250001
+    terminal = events[-1]
+    response = terminal.get("response")
+    assert isinstance(response, dict)
+    output = response.get("output")
+    assert isinstance(output, list) and isinstance(output[0], dict)
+    content = output[0].get("content")
+    assert isinstance(content, list) and isinstance(content[0], dict)
+    terminal_records = content[0].get("logprobs")
+    assert isinstance(terminal_records, list) and isinstance(terminal_records[0], dict)
+    record = terminal_records[0]
+    assert record["logprob"] == -0.125000123
+    assert record["bytes"] == [79, 75]
+
+
+def test_responses_probability_incomplete_nonstream_preserves_terminal_records(
+    responses_engine: _ServingEngine,
+) -> None:
+    """A nonstream incomplete terminal still carries provider probabilities."""
+    response = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={
+            "model": "responses",
+            "input": "probability-incomplete",
+            "include": ["message.output_text.logprobs"],
+            "top_logprobs": 0,
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "incomplete", body
+    record = body["output"][0]["content"][0]["logprobs"][0]
+    assert record == {"token": "OK", "logprob": -0.125000123, "bytes": [79, 75]}
+
+
+def test_responses_probability_continuation_replays_history_without_logprobs(
+    responses_engine: _ServingEngine,
+) -> None:
+    """Continuation history keeps text and bytes while omitting provider metadata."""
+    with _ResponsesUpstream.payloads_lock:
+        _ResponsesUpstream.payloads.clear()
+    headers = {"authorization": f"Bearer {responses_engine.raw_key}"}
+    first = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers=headers,
+        json={
+            "model": "responses",
+            "input": "probability-regression",
+            "include": ["message.output_text.logprobs"],
+            "top_logprobs": 0,
+        },
+        timeout=30.0,
+    )
+    assert first.status_code == 200
+    first_body = first.json()
+    second = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers=headers,
+        json={
+            "model": "responses",
+            "previous_response_id": first_body["id"],
+            "input": "probability-regression-continue",
+            "include": ["message.output_text.logprobs"],
+            "top_logprobs": 0,
+        },
+        timeout=30.0,
+    )
+    assert second.status_code == 200
+    second_body = second.json()
+    assert second_body["output"][0]["content"][0]["logprobs"][0]["bytes"] == [79, 75]
+    with _ResponsesUpstream.payloads_lock:
+        dispatched = tuple(_ResponsesUpstream.payloads)
+    assert len(dispatched) == 2
+    replayed = cast(list[JsonObject], dispatched[1]["input"])
+    assert all("logprobs" not in json.dumps(item) for item in replayed), replayed
+
+
 @pytest.mark.parametrize(("prompt", "stop_reason"), _ZERO_OUTPUT_MESSAGES_CASES)
 def test_messages_non_stream_zero_output_keeps_real_input_tokens(
     engine: _ServingEngine,
@@ -1867,7 +2381,7 @@ def test_responses_capped_silent_stop_is_incomplete_max_output_tokens(
     )
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["status"] == "incomplete"
+    assert body["status"] == "incomplete", body
     assert body["incomplete_details"] == {"reason": "max_output_tokens"}
     assert body["output"] == []
 
@@ -1890,12 +2404,11 @@ def test_messages_silent_stop_is_a_max_tokens_stop(engine: _ServingEngine) -> No
 def test_replayed_thinking_history_serves_with_disclosure_on_a_foreign_route(
     engine: _ServingEngine,
 ) -> None:
-    """Replayed Anthropic thinking HISTORY serves on a non-Anthropic route with
-    the drop disclosed and the blocks omitted upstream (Claude Code carries
-    Claude's signed blocks into every later turn of a session, so the old
-    pre-dispatch 400 killed every session that switched models); a live
-    thinking CONFIG likewise serves through the admission coercion (dropped
-    with disclosure on this non-reasoning OpenAI-compatible route)."""
+    """Preserve replayable history while refusing an unenforceable numeric budget.
+
+    Thinking history is disclosed and omitted on a non-Anthropic wire. A live
+    numeric thinking budget is a constraint, not permission to drop the field.
+    """
     with _SseUpstream.payloads_lock:
         dispatched_before = len(_SseUpstream.payloads)
 
@@ -1904,19 +2417,16 @@ def test_replayed_thinking_history_serves_with_disclosure_on_a_foreign_route(
         headers={"x-api-key": engine.raw_key},
         json={
             **_messages_body("thinking-config-serves"),
-            # Below the 64-token ceiling: a budget at or above max_tokens is
-            # refused at the boundary (Anthropic's own rule), while one under
-            # Anthropic's 1024 minimum is only a depth hint on this route.
+            # This wire cannot enforce a numeric thinking budget, even one
+            # below the caller's total output ceiling.
             "thinking": {"type": "enabled", "budget_tokens": 32},
         },
         timeout=10.0,
     )
-    assert config.status_code == 200
+    assert config.status_code == 400
+    assert "thinking" in config.json()["error"]["message"]
     with _SseUpstream.payloads_lock:
-        dispatched_config = _SseUpstream.payloads[dispatched_before:]
-        dispatched_before = len(_SseUpstream.payloads)
-    assert len(dispatched_config) == 1
-    assert "thinking" not in dispatched_config[0]
+        assert len(_SseUpstream.payloads) == dispatched_before
 
     history = httpx.post(
         f"{engine.base}/v1/messages",
@@ -2456,3 +2966,437 @@ def test_invalid_chat_verbosity_is_rejected_before_provider_dispatch(
     assert response.json()["error"]["code"] == "invalid_parameter"
     with _SseUpstream.payloads_lock:
         assert len(_SseUpstream.payloads) == before
+
+
+@pytest.mark.parametrize("surface", ["chat/completions", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_ordinary_responses_rung_ignores_unrequested_probability_fields(
+    responses_engine: _ServingEngine, surface: str, stream: bool
+) -> None:
+    """Standard empty upstream probability arrays never break cross-surface output."""
+    response = httpx.post(
+        f"{responses_engine.base}/v1/{surface}",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={
+            "model": "responses",
+            "messages": [{"role": "user", "content": "count-only"}],
+            "max_tokens": 64,
+            "stream": stream,
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    assert "count" in response.text
+    assert "invalid_provider_stream" not in response.text
+    assert "server_error" not in response.text
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "first", ["probability-first", "probability-empty-first", "probability-done-first"]
+)
+def test_probability_only_delta_binds_identity_for_later_text_and_completion(
+    responses_engine: _ServingEngine, stream: bool, first: str
+) -> None:
+    """A populated probability-only first frame does not double-start its message."""
+    response = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={
+            "model": "responses",
+            "input": first,
+            "include": ["message.output_text.logprobs"],
+            "stream": stream,
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "response.completed" in response.text
+        assert "response.failed" not in response.text
+    else:
+        assert response.json()["output"][0]["content"][0]["text"] == "OK"
+        assert response.json()["output"][0]["content"][0]["logprobs"][0]["token"] == "OK"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_nullable_completed_probability_phases_are_preserved(
+    responses_engine: _ServingEngine, stream: bool
+) -> None:
+    """Optional final-part arrays remain null without erasing distinct delta observations."""
+    response = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={
+            "model": "responses",
+            "input": "probability-null",
+            "include": ["message.output_text.logprobs"],
+            "stream": stream,
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "response.completed" in response.text
+        assert "response.failed" not in response.text
+        assert '"logprobs":null' in response.text
+    else:
+        assert response.json()["output"][0]["content"][0]["logprobs"] is None
+
+
+@pytest.mark.parametrize("surface", ["chat/completions", "responses", "messages"])
+@pytest.mark.parametrize("length", [119_825, 262_145])
+def test_large_tool_description_reaches_provider_unchanged(
+    engine: _ServingEngine, surface: str, length: int
+) -> None:
+    """The served endpoints forward full descriptions without writing them to diagnostics."""
+    marker = f"tool-description-canary-{surface}-{length}"
+    description = marker + "x" * (length - len(marker) - 1) + "界"
+    function: JsonObject = {
+        "name": "lookup",
+        "description": description,
+        "parameters": {"type": "object"},
+    }
+    body: JsonObject = {"model": "coding"}
+    if surface == "responses":
+        body.update(input=marker, tools=[{"type": "function", **function}])
+    else:
+        body["messages"] = [{"role": "user", "content": marker}]
+        if surface == "messages":
+            body.update(
+                max_tokens=64,
+                tools=[
+                    {
+                        "name": "lookup",
+                        "description": description,
+                        "input_schema": {"type": "object"},
+                    }
+                ],
+            )
+        else:
+            body["tools"] = [{"type": "function", "function": function}]
+    response = httpx.post(
+        f"{engine.base}/v1/{surface}",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json=body,
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    with _SseUpstream.payloads_lock:
+        matching = [
+            payload
+            for payload in _SseUpstream.payloads
+            if marker in json.dumps(payload["messages"])
+        ]
+    assert len(matching) == 1
+    tools = cast(list[JsonObject], matching[0]["tools"])
+    forwarded = cast(JsonObject, tools[0]["function"])
+    assert forwarded["description"] == description
+    assert marker not in (engine.root / "driver-stderr.log").read_text()
+
+
+@pytest.mark.parametrize("stream", (False, True))
+def test_chat_responses_spelling_of_output_limit_serves(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """The Chat endpoint accepts max_output_tokens and retains length-stop semantics."""
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "silent-stop-token"}],
+            "max_output_tokens": 40,
+            "stream": stream,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        chunks = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert any(
+            choice.get("finish_reason") == "length"
+            for chunk in chunks
+            for choice in chunk.get("choices", [])
+        )
+    else:
+        assert response.json()["choices"][0]["finish_reason"] == "length"
+
+
+@pytest.mark.parametrize("engine", ("qwen-budget",), indirect=True)
+@pytest.mark.parametrize("stream", (False, True))
+def test_chat_thinking_budget_survives_native_http_dispatch(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """Both client modes deliver the exact budget and total cap to the mock Qwen server."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking_budget": 32,
+            "enable_thinking": True,
+            "max_output_tokens": 64,
+            "stream": stream,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "data: [DONE]" in response.text
+    else:
+        assert response.json()["choices"][0]["message"]["content"] == "hello world"
+    with _SseUpstream.payloads_lock:
+        captured = list(_SseUpstream.payloads)
+    assert len(captured) == 1
+    assert captured[0]["model"] == "qwen3.8-max"
+    assert captured[0]["thinking_budget"] == 32
+    assert captured[0]["enable_thinking"] is True
+    assert captured[0]["max_completion_tokens"] == 64
+    assert "max_tokens" not in captured[0]
+    assert "max_output_tokens" not in captured[0]
+    assert "reasoning_effort" not in captured[0]
+    assert "reasoning" not in captured[0]
+
+
+@pytest.mark.parametrize("engine", ("anthropic-budget",), indirect=True)
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("output_limit", (None, 8192))
+def test_chat_nested_budget_survives_native_http_dispatch(
+    engine: _ServingEngine,
+    stream: bool,
+    output_limit: int | None,
+) -> None:
+    """The served Chat endpoint delivers the exact budget on the Anthropic wire."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    body: JsonObject = {
+        "model": "coding",
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "enabled", "budget_tokens": 4096},
+        "stream": stream,
+    }
+    if output_limit is not None:
+        body["max_tokens"] = output_limit
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json=body,
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "data: [DONE]" in response.text
+        assert "hello world" in response.text
+    else:
+        assert response.json()["choices"][0]["message"]["content"] == "hello world"
+    with _SseUpstream.payloads_lock:
+        captured = list(_SseUpstream.payloads)
+    assert len(captured) == 1
+    assert captured[0]["model"] == "claude-sonnet-4-6"
+    assert captured[0]["thinking"] == {"type": "enabled", "budget_tokens": 4096}
+    assert captured[0]["max_tokens"] == 8192
+    assert "reasoning_effort" not in captured[0]
+    assert "thinking_budget" not in captured[0]
+
+
+@pytest.mark.parametrize("engine", ("anthropic-budget",), indirect=True)
+def test_chat_nested_budget_above_rung_default_never_dispatches(engine: _ServingEngine) -> None:
+    """An omitted caller cap cannot bypass the selected rung's output bound."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 8192},
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["param"] == "thinking.budget_tokens"
+    with _SseUpstream.payloads_lock:
+        assert _SseUpstream.payloads == []
+
+
+@pytest.mark.parametrize(
+    "engine",
+    (
+        "anthropic-budget",
+        "gemini-budget",
+        "qwen-budget",
+        "qwen-budget:qwen3.8-27b",
+        "qwen-budget:glm-5.2",
+        "qwen-budget:kimi-k2.5",
+    ),
+    indirect=True,
+)
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("control", ("thinking_budget", "thinking"))
+def test_numeric_budget_cross_provider_http_dispatch(
+    engine: _ServingEngine,
+    stream: bool,
+    control: str,
+) -> None:
+    """The same client budget is frozen into each provider's exact native control."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    body: JsonObject = {
+        "model": "coding",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 8192,
+        "stream": stream,
+    }
+    body[control] = (
+        2048 if control == "thinking_budget" else {"type": "enabled", "budget_tokens": 2048}
+    )
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json=body,
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "data: [DONE]" in response.text
+        chunks = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert (
+            "".join(
+                choice.get("delta", {}).get("content", "")
+                for chunk in chunks
+                for choice in chunk.get("choices", [])
+            )
+            == "hello world"
+        )
+    else:
+        assert response.json()["choices"][0]["message"]["content"] == "hello world"
+    with _SseUpstream.payloads_lock:
+        captured = list(_SseUpstream.payloads)
+    assert len(captured) == 1
+    payload = captured[0]
+    if "generationConfig" in payload:
+        assert payload["generationConfig"] == {
+            "thinkingConfig": {"thinkingBudget": 2048},
+            "maxOutputTokens": 8192,
+        }
+    elif "thinking" in payload:
+        assert payload["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+        assert payload["max_tokens"] == 8192
+    else:
+        assert payload["thinking_budget"] == 2048
+        if payload["model"] == "qwen3.8-max":
+            assert payload["max_completion_tokens"] == 8192
+            assert "max_tokens" not in payload
+        else:
+            assert payload["max_tokens"] == 6144
+            assert "max_completion_tokens" not in payload
+    assert "reasoning_effort" not in payload
+    assert "reasoning" not in payload
+
+
+@pytest.mark.parametrize("engine", ("gemini-budget",), indirect=True)
+@pytest.mark.parametrize("budget", (0, -1, 24576))
+def test_gemini_sentinels_survive_native_http(engine: _ServingEngine, budget: int) -> None:
+    """Zero and dynamic thinking remain explicit controls rather than omissions."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking_budget": budget,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    with _SseUpstream.payloads_lock:
+        payload = _SseUpstream.payloads[-1]
+    assert payload["generationConfig"] == {
+        "thinkingConfig": {"thinkingBudget": budget},
+        "maxOutputTokens": 8192,
+    }
+
+
+@pytest.mark.parametrize("engine", ("gemini-budget", "qwen-budget:kimi-k2.5"), indirect=True)
+@pytest.mark.parametrize("stream", (False, True))
+def test_messages_budget_crosses_native_non_anthropic_routes(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """Messages clients preserve nested budgets when the selected native wire supports them."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key, "anthropic-version": "2023-06-01"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8192,
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            "stream": stream,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        events = [
+            json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")
+        ]
+        assert "".join(event.get("delta", {}).get("text", "") for event in events) == "hello world"
+        assert events[-1]["type"] == "message_stop"
+    else:
+        assert response.json()["content"][0]["text"] == "hello world"
+    with _SseUpstream.payloads_lock:
+        payload = _SseUpstream.payloads[-1]
+    if "generationConfig" in payload:
+        assert payload["generationConfig"] == {
+            "thinkingConfig": {"thinkingBudget": 2048},
+            "maxOutputTokens": 8192,
+        }
+    else:
+        assert payload["thinking_budget"] == 2048
+        assert payload["max_tokens"] == 6144
+    assert "thinking" not in payload
+
+
+@pytest.mark.parametrize(
+    "engine,budget",
+    (("gemini-budget", 24577), ("qwen-budget:kimi-k3", 2048), ("qwen-budget:glm-5.3", 2048)),
+    indirect=("engine",),
+)
+def test_incapable_numeric_budget_never_reaches_upstream(
+    engine: _ServingEngine, budget: int
+) -> None:
+    """An invalid range or a model that ignores budgets fails before network dispatch."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking_budget": budget,
+            "max_tokens": 8192,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["param"] == "thinking_budget"
+    with _SseUpstream.payloads_lock:
+        assert _SseUpstream.payloads == []

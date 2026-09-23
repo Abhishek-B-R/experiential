@@ -66,6 +66,7 @@ from exp.runtime.models.providers.generation_parameter_validation import (
     require_route_numeric_parameter as _require_route_numeric_parameter,
 )
 from exp.runtime.models.providers.instruction_turns import disclose_system_fold
+from exp.runtime.models.providers.logprobs import require_chat_logprobs, require_responses_logprobs
 from exp.runtime.models.providers.messages_payloads import (
     anthropic_messages_stream_payload as anthropic_messages_stream_payload,
 )
@@ -91,11 +92,16 @@ from exp.runtime.models.providers.server_tools import (
     anthropic_server_tools_present,
     disclose_dropped_server_tools,
 )
+from exp.runtime.models.providers.thinking_budget import (
+    qwen_uses_total_budget_cap,
+    require_thinking_budget_support,
+    thinking_budget_parameter,
+    thinking_budget_value,
+    thinking_budget_wire_field,
+)
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
-
-_ANTHROPIC_REQUIRED_MAX_TOKENS_DEFAULT = 4096
 
 TOOL_ERROR_FOLD_DISCLOSURE = "messages.content.is_error->content"
 """Disclosure recorded when a tool-result error flag folds into result text.
@@ -108,11 +114,9 @@ silent drop would misstate that the invocation failed.
 """
 
 OPENAI_MINIMUM_OUTPUT_TOKENS = 16
-"""Smallest ``max_output_tokens`` the OpenAI wires accept.
+"""Smallest ``max_output_tokens`` the OpenAI Responses wire accepts.
 
-The provider rejects lower values by name ("Expected a value >= 16"), while
-the Anthropic surface legally carries ``max_tokens`` down to 1, so
-Messages-surface requests below the floor are raised to it with disclosure.
+A smaller explicit caller ceiling is refused, never increased during translation.
 """
 
 _STRICT_STRUCTURED_OUTPUT_DIALECTS = frozenset(
@@ -161,11 +165,28 @@ def route_generation_parameter_requests(
     """
     if not profiles:
         raise ValueError("generation parameter shaping requires at least one wire profile")
+    if request.surface == GatewayApiSurface.CHAT_COMPLETIONS:
+        require_chat_logprobs(profiles, request)
+    require_responses_logprobs(profiles, request)
     for profile in profiles:
+        require_thinking_budget_support(profile, request)
         if fireworks_continuation_required(profile, request):
             require_responses_continuation_channel(request)
 
     ignored = list(request.ignored_parameters)
+    budget = thinking_budget_value(request)
+    if budget is not None:
+        source = thinking_budget_parameter(request)
+        for profile in profiles:
+            target = thinking_budget_wire_field(profile)
+            if target != source:
+                disclosure = f"{source}->translated({target})"
+                if disclosure not in ignored:
+                    ignored.append(disclosure)
+            if profile.dialect == "openai_compatible" and not qwen_uses_total_budget_cap(profile):
+                disclosure = "max_tokens->translated(total_output_minus_thinking_budget)"
+                if disclosure not in ignored:
+                    ignored.append(disclosure)
     provider_updates: dict[str, object] = {}
 
     def ignore(field: str, public_path: str | None = None) -> None:
@@ -192,74 +213,27 @@ def route_generation_parameter_requests(
                 param=param,
                 code="invalid_parameter",
             )
-        # Two floors, one rewrite. The OpenAI wire floor is a TRANSLATION
-        # fact: Anthropic and Chat Completions accept output ceilings down to
-        # 1 (Claude Code probes with exactly that after a /model switch) while
-        # OpenAI rejects max_output_tokens below 16, so a Messages or Chat
-        # value translated onto an OpenAI Responses rung rides the provider
-        # floor with disclosure instead of surfacing a provider 400 the
-        # caller cannot act on (2026-09-05 stragglers). A Chat value keeps
-        # native semantics on a chat wire (some compatible providers accept
-        # an output ceiling of 1); only the TRANSLATED Responses wire imposes
-        # OpenAI's minimum. A native Responses caller keeps the named
-        # admission rejection below: sub-16 is invalid on its own surface.
-        translated_onto_openai_wire = (
-            request.surface == GatewayApiSurface.MESSAGES
-            and any(
-                profile.dialect in {"openai_responses", "openai_compatible"} for profile in profiles
-            )
-        ) or (
-            request.surface == GatewayApiSurface.CHAT_COMPLETIONS
-            and any(profile.dialect == "openai_responses" for profile in profiles)
-        )
-        # The declared floor is a LANE fact the catalog stamps per rung
-        # (``GatewayWireProfile.minimum_output_tokens``): a provider that
-        # refuses small ceilings on a wire that natively carries them
-        # (Perplexity sonar and Sakana fugu via OpenRouter, grok-4.6 on
-        # Bedrock: "max_tokens must be at least 16"). It floors on EVERY
-        # surface, because the refusal is the provider's, not the wire's.
-        # The route floors to the LARGEST minimum any rung declares, so no
-        # rung of the waterfall dispatches a value it would refuse. A native
-        # Responses request on an all-Responses route is the one exception:
-        # sub-16 is invalid on its own surface and keeps the named admission
-        # rejection below, whatever a rung declares.
-        native_responses_route = request.surface == GatewayApiSurface.RESPONSES and all(
-            profile.dialect == "openai_responses" for profile in profiles
-        )
+        # A ceiling is caller authority, not a sampling preference. A rung
+        # that cannot accept it narrows out instead of increasing the budget.
         output_floor = max(
-            (
-                OPENAI_MINIMUM_OUTPUT_TOKENS if translated_onto_openai_wire else 0,
-                *(
-                    profile.minimum_output_tokens
-                    for profile in profiles
-                    if profile.minimum_output_tokens is not None and not native_responses_route
-                ),
+            max(
+                profile.minimum_output_tokens or 0,
+                OPENAI_MINIMUM_OUTPUT_TOKENS if profile.dialect == "openai_responses" else 0,
             )
-        )
-        if (
-            request.maximum_output_tokens < output_floor
-            # The floored value must stay within every rung's declared output
-            # ceiling; a route capped below the floor keeps the caller value
-            # and the provider's own rejection.
-            and (not route_limits or min(route_limits) >= output_floor)
-        ):
-            provider_updates["maximum_output_tokens"] = output_floor
-            parameter = request.maximum_output_tokens_parameter or "max_tokens"
-            path = f"{parameter}->{output_floor}"
-            if path not in ignored:
-                ignored.append(path)
-    elif any(profile.dialect == "anthropic_messages" for profile in profiles):
-        # Anthropic requires max_tokens even when the public surface does not.
-        # Pin one route-wide default so every waterfall rung sees the same
-        # output budget, bounded by the smallest known model ceiling.
-        route_limits = tuple(
-            profile.maximum_output_tokens
             for profile in profiles
-            if profile.maximum_output_tokens is not None
         )
-        provider_updates["maximum_output_tokens"] = min(
-            (_ANTHROPIC_REQUIRED_MAX_TOKENS_DEFAULT, *route_limits)
-        )
+        if request.maximum_output_tokens < output_floor:
+            parameter = request.maximum_output_tokens_parameter or "max_tokens"
+            raise ProviderParameterError(
+                message=(
+                    f"The parameter {parameter!r} must be at least {output_floor} on this "
+                    "model route. Raise the value or choose a model that accepts this ceiling."
+                ),
+                param=parameter,
+                code="invalid_parameter",
+            )
+    # Omission stays on the shared request. A required wire derives its own
+    # ceiling at payload build, never from the tightest fallback's limit.
     # The rejection names the field the CALLER sent (the request knows which
     # of its surface's effort fields carried the value; see the property).
     effort_path = request.caller_effort_parameter
@@ -395,7 +369,7 @@ def route_generation_parameter_requests(
                 ),
                 param=effort_path,
             )
-    else:
+    elif budget is None:
         # An omitted caller value remains omitted on the shared request. Each
         # dialect payload injects only its own provider-required default, so a
         # fallback never forces that default onto a wire where it is optional.
@@ -742,7 +716,7 @@ def route_generation_parameter_requests(
         # serves and discloses the drop: foreign wires omit them at encoding.
         if THINKING_HISTORY_DROP_DISCLOSURE not in ignored:
             ignored.append(THINKING_HISTORY_DROP_DISCLOSURE)
-    if request.provider_thinking_config is not None and non_anthropic_route:
+    if request.provider_thinking_config is not None and non_anthropic_route and budget is None:
         # A thinking CONFIG (unlike replayed thinking blocks) has a serviceable
         # cross-wire reading. The named rejection here is what lets the admit
         # loop offer the disclosed thinking->reasoning_effort translation (or
@@ -784,30 +758,6 @@ def route_generation_parameter_requests(
         provider_updates["provider_server_tools"] = ()
         if clear_tool_choice:
             provider_updates["tool_choice"] = None
-    outbound_maximum_output_tokens = provider_updates.get(
-        "maximum_output_tokens", request.maximum_output_tokens
-    )
-    if (
-        isinstance(outbound_maximum_output_tokens, int)
-        and outbound_maximum_output_tokens < OPENAI_MINIMUM_OUTPUT_TOKENS
-        and all(profile.dialect == "openai_responses" for profile in profiles)
-    ):
-        # The provider's own 400 for this is post-dispatch and opaque on some
-        # relays; the documented Responses minimum is a request fact, so it is
-        # rejected at admission with the bound named. The value judged is the
-        # one that would dispatch: a Messages-surface probe already floored
-        # with disclosure above never reaches this rejection, while a route
-        # whose declared ceiling sits below the floor cannot ride it and gets
-        # the named minimum instead of the provider's opaque 400.
-        parameter = request.maximum_output_tokens_parameter or "max_output_tokens"
-        raise ProviderParameterError(
-            message=(
-                f"The parameter {parameter!r} must be at least 16 on this model route "
-                "(the OpenAI Responses minimum). Raise the value and resend the request."
-            ),
-            param=parameter,
-            code="invalid_parameter",
-        )
     # Codex native Responses tool declarations/history serve verbatim only on a
     # native Responses rung; a foreign wire gets them translated to function
     # tools (namespaces hoisted, custom tools as one ``input`` function; hosted
@@ -965,33 +915,8 @@ def route_generation_parameter_requests(
             )
             provider_updates["serialize_tool_calls"] = True
 
-    # A true logprob request changes the requested result. Until the normalized
-    # response can return those arrays, reject it rather than pretending it ran.
-    if request.logprobs is True:
-        path = (
-            "top_logprobs"
-            if request.surface.value == "responses" and request.top_logprobs is not None
-            else "logprobs"
-        )
-        raise ProviderParameterError(
-            message=(
-                f"The parameter {path!r} is not supported by this gateway response contract. "
-                "Remove the field and resend the request."
-            ),
-            param=path,
-            code="unsupported_parameter",
-        )
     if request.logprobs is False:
         ignore("logprobs")
-    if request.top_logprobs is not None:
-        raise ProviderParameterError(
-            message=(
-                "The parameter 'top_logprobs' is not supported by this gateway response "
-                "contract. Remove the field and resend the request."
-            ),
-            param="top_logprobs",
-            code="unsupported_parameter",
-        )
 
     ignored_parameters = tuple(ignored)
     public_request = request.model_copy(update={"ignored_parameters": ignored_parameters})
