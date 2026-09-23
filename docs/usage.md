@@ -52,7 +52,9 @@ Rust for the first source build. The first run installs the bundled, signed
 Mitmproxy Redirector app at `/Applications/Mitmproxy Redirector.app`. Approve its Network Extension
 when macOS asks. Before login, Capture verifies the packaged app and extension signatures against
 mitmproxy's expected signing identity, verifies any installed copy it will reuse, and checks the
-supported macOS version and installation access. If your account cannot install or update the app
+supported macOS version and installation access. Identical installed app contents are reused
+across Python environments without replacing the app or requesting new setup approval.
+If your account cannot install or update the app
 in `/Applications`, ask your administrator for installation access, then retry as your normal user.
 
 Advanced users can repeat `--domain HOST` to replace the defaults with an exact set, for example

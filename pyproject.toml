@@ -123,5 +123,5 @@ python-version = "3.12"
 exp-gateway-native = { path = "exp/runtime/gateway/native" }
 
 # Immutable development pins for Capture's reviewed forks; release metadata uses PyPI names.
-exp-mitmproxy = { git = "https://github.com/experientiallabs/mitmproxy", rev = "fb8fe17a7922fd2863f6ecf5504234305b8ffb99" }
-exp-mitmproxy-rs = { git = "https://github.com/experientiallabs/mitmproxy_rs", rev = "20411534322a2d91d548d18b6f350968c5e489d0", subdirectory = "mitmproxy-rs" }
+exp-mitmproxy = { git = "https://github.com/experientiallabs/mitmproxy", rev = "86bc8ae59c1a9ee53bce353ff87a469d379cf720" }
+exp-mitmproxy-rs = { git = "https://github.com/experientiallabs/mitmproxy_rs", rev = "c9c55057cb58fe13a22f6a420629df13c65bd365", subdirectory = "mitmproxy-rs" }

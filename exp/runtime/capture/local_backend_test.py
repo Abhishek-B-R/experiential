@@ -13,6 +13,7 @@ import tarfile
 from importlib.metadata import Distribution, PackageNotFoundError
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import Mock
 
 import pytest
@@ -59,6 +60,8 @@ def backend_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, codesig
     monkeypatch.delenv("MITMPROXY_KEEP_REDIRECTOR", raising=False)
     package = Distribution.at(tmp_path / "mitmproxy_macos-0.12.11.dist-info")
     monkeypatch.setattr(local_backend, "distribution", lambda name: package)
+    monkeypatch.setattr(local_backend, "LocalRedirector", Mock())
+    cast(Mock, local_backend.LocalRedirector).installation_is_current.return_value = False
     return applications
 
 
@@ -175,7 +178,8 @@ def test_install_permission_denied_is_actionable(
 
 
 def _installed_app(applications: Path, archive: Path, *, current: bool) -> Path:
-    """Create a fake installed bundle whose timestamp controls mitmproxy's update decision."""
+    """Create a fake bundle and configure the native installer's content comparison."""
+    cast(Mock, local_backend.LocalRedirector).installation_is_current.return_value = current
     app = applications / local_backend._APP_NAME
     contents = app / "Contents"
     (contents / "MacOS").mkdir(parents=True)
@@ -189,12 +193,13 @@ def _installed_app(applications: Path, archive: Path, *, current: bool) -> Path:
     return app
 
 
-def test_current_install_does_not_require_update_permission(
+def test_current_install_with_different_timestamp_does_not_require_update_permission(
     backend_environment: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An exact reusable app can run even when the user cannot replace /Applications apps."""
     archive = _archive(tmp_path)
-    _installed_app(backend_environment, archive, current=True)
+    app = _installed_app(backend_environment, archive, current=True)
+    os.utime(app / "Contents/Info.plist", ns=(1, 1))
     monkeypatch.setattr(local_backend, "_writable_directory", lambda path: False)
     local_backend.require_local_backend()
 
@@ -212,10 +217,10 @@ def test_outdated_install_requires_app_replacement_access(
         local_backend.require_local_backend()
 
 
-def test_matching_timestamp_without_executable_fails(
+def test_current_install_without_executable_fails(
     backend_environment: Path, tmp_path: Path
 ) -> None:
-    """A partial installation cannot pass merely because the plist timestamp matches."""
+    """The installed app must be executable before its signed contents can be reused."""
     archive = _archive(tmp_path)
     app = _installed_app(backend_environment, archive, current=True)
     (app / "Contents/MacOS/Mitmproxy Redirector").unlink()
@@ -306,10 +311,10 @@ def test_fresh_install_verifies_private_archive_copy(
     assert list(backend_environment.iterdir()) == []
 
 
-def test_reused_install_is_verified_even_with_matching_timestamp(
+def test_reused_install_still_requires_valid_signature(
     backend_environment: Path, tmp_path: Path, codesign: Mock
 ) -> None:
-    """A correct timestamp is only an upstream reuse hint, never proof of authenticity."""
+    """Matching packaged contents do not replace checking the installed app's signature."""
     archive = _archive(tmp_path)
     app = _installed_app(backend_environment, archive, current=True)
     codesign.side_effect = [

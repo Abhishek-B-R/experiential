@@ -18,6 +18,7 @@ from tempfile import TemporaryDirectory
 from xml.parsers.expat import ExpatError
 
 from filelock import FileLock, Timeout
+from mitmproxy_rs.local import LocalRedirector
 
 if sys.platform == "win32":
     pwd = None
@@ -165,7 +166,7 @@ def require_local_backend() -> None:
             "its packaged redirector."
         )
     _verify_packaged_app(archive)
-    _require_install_access(archive)
+    _require_install_access()
 
 
 def _packaged_archive() -> Path:
@@ -225,10 +226,8 @@ def _minimum_macos(archive: Path) -> tuple[int, int, int]:
 def _verify_packaged_app(archive: Path) -> None:
     """Verify a bounded private copy before mitmproxy can install or execute this archive.
 
-    The native installer only copies the packaged archive and sets a plist
-    timestamp; it has no install-only or pre-execution hook. Validating its source
-    bundle covers fresh installs without replacing that installer or patching native
-    methods. The separate installed-bundle check covers its timestamp-based reuse path.
+    Validating the source bundle covers fresh installs before the native installer
+    runs. The separate installed-bundle check covers reuse of identical app contents.
     """
     try:
         if archive.stat().st_size > _ARCHIVE_MAX_BYTES:
@@ -329,13 +328,14 @@ def _verify_bundle_signature(app: Path) -> None:
             )
 
 
-def _require_install_access(archive: Path) -> None:
-    """Match mitmproxy's mtime reuse rule before requiring app replacement permissions."""
+def _require_install_access() -> None:
+    """Use the native installer's content comparison before requesting replacement access."""
+    if sys.platform != "darwin":
+        raise RuntimeError("System Capture currently supports macOS only.")
     app = _APPLICATIONS / _APP_NAME
-    plist = app / "Contents/Info.plist"
     executable = app / "Contents/MacOS/Mitmproxy Redirector"
     try:
-        if plist.is_file() and plist.stat().st_mtime_ns == archive.stat().st_mtime_ns:
+        if LocalRedirector.installation_is_current():
             if executable.is_file() and os.access(executable, os.X_OK):
                 _verify_bundle_signature(app)
                 return
