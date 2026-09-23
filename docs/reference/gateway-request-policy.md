@@ -78,7 +78,13 @@ HTTP client does not run an independent retry policy underneath accounting.
 
 `allow_fallbacks` is a strict boolean, default true. False keeps the first eligible
 route after ordinary capability and governance filtering, and prevents runtime
-fallback or saturation spill onto another route.
+fallback or saturation spill onto another route. This choice is frozen against the
+caller's request before gateway-run search performs work. Injected search results
+and later tool context are revalidated against that same route: if they no longer
+fit, the gateway returns a field-specific context-window error without a model dispatch, even
+if another route has a larger context window. Allow fallbacks or select a larger
+eligible route when that flexibility is needed. Search preparation is not repeated
+on another route after the no-fallback choice.
 
 An optional `route_id` is an opaque public handle of the form `route_` followed by
 64 lowercase hexadecimal characters. It is not a provider or deployment id. A host

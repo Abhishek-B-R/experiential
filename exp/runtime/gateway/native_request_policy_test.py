@@ -2,6 +2,7 @@
 
 import dataclasses
 import json
+import sqlite3
 from collections.abc import Sequence
 from pathlib import Path
 from unittest.mock import patch
@@ -24,6 +25,7 @@ from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.sticky_affinity import sticky_first_order
 from exp.runtime.gateway.web_search.backend import StaticWebSearchBackend, WebSearchBackend
+from exp.runtime.gateway.web_search.contracts import GatewayWebSearchResult
 from exp.runtime.gateway.web_search.plan import WebSearchPlan, plan_web_search
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
@@ -295,3 +297,66 @@ def test_selected_conditional_route_fails_even_with_an_ordinary_fallback(tmp_pat
     )
     with pytest.raises(ProviderParameterError, match="requested route"):
         require_route_authority(authorization, request, selected)
+    with (
+        patch("exp.runtime.gateway.native_bridge.resolve_admission_route", return_value=selected),
+        patch("exp.runtime.gateway.native_bridge.plan_web_search") as search,
+    ):
+        with pytest.raises(NativeBridgeError) as caught:
+            plane.admit(
+                json.dumps(
+                    {
+                        "raw_key": key,
+                        "body": _body(
+                            {
+                                "routing": {
+                                    "route_id": authorization.requested_route_id,
+                                    "allow_fallbacks": False,
+                                }
+                            }
+                        ),
+                    }
+                )
+            )
+    assert json.loads(caught.value.public_error_json)["param"] == "gateway.routing.route_id"
+    assert search.call_count == 0
+
+
+@pytest.mark.parametrize("allow_fallbacks", [False, True])
+def test_no_fallback_freezes_route_before_effectful_search_growth(
+    tmp_path: Path, allow_fallbacks: bool
+) -> None:
+    """A searched prompt cannot silently change a caller's already frozen sole route."""
+    small = ModelCapabilities(context_window_tokens=100, maximum_output_tokens=32)
+    large = ModelCapabilities(context_window_tokens=10000, maximum_output_tokens=32)
+    manager, key = _configured_pool_gateway(tmp_path, model_capabilities=(small, large))
+    components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "synthetic"})
+    backend = StaticWebSearchBackend(
+        (
+            GatewayWebSearchResult(
+                url="https://example.com/result", title="Search result", snippet="Evidence " * 400
+            ),
+        )
+    )
+    plane = NativeControlPlane(components, web_search=backend)
+    body: JsonObject = {
+        "model": "coding",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 16,
+        "web_search_options": {},
+        "gateway": {"routing": {"allow_fallbacks": allow_fallbacks}},
+    }
+    argument = json.dumps({"raw_key": key, "body": json.dumps(body)})
+    if allow_fallbacks:
+        admitted = json.loads(plane.admit(argument))
+        assert [wire["deployment_id"] for wire in admitted["route"]] == ["beta"]
+        plane.abandon(json.dumps({"request_id": admitted["request_id"]}))
+    else:
+        with pytest.raises(NativeBridgeError) as caught:
+            plane.admit(argument)
+        error = json.loads(caught.value.public_error_json)
+        assert error["status_code"] == 400
+        assert error["code"] == "invalid_request"
+        assert "context" in error["message"].lower()
+    assert backend.queries == ["hi"]
+    with sqlite3.connect(manager.database_path) as connection:
+        assert connection.execute("select count(*) from gateway_attempts").fetchone() == (0,)
