@@ -25,9 +25,10 @@ def render_report(console: Console, project: ProjectStore, run: EvaluationRun) -
     evidence = load_report_evidence(project, run)
     report = evidence.report
     heading(console, project.paths.project_id, "Saved results")
+    repeats = run.prepared.setup.repeats
     console.print(
         f"{len(evidence.tasks)} scenarios · {len(report.models)} models · "
-        f"{run.prepared.setup.repeats} runs per scenario\n"
+        f"{repeats} {'run' if repeats == 1 else 'runs'} per scenario\n"
     )
     table = Table(box=None, padding=(0, 2), expand=False)
     table.add_column("Model", overflow="fold")

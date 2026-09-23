@@ -232,7 +232,8 @@ def _preflight(project: ProjectStore, run: EvaluationRun) -> None:
     heading(_console, project.paths.project_id, "Review evaluation")
     _console.print(
         f"{cost.scenario_count} scenarios × {cost.worker_count} models × "
-        f"{setup.repeats} runs = {cost.judgment_count} rollouts\n"
+        f"{setup.repeats} {'run' if setup.repeats == 1 else 'runs'} = "
+        f"{cost.judgment_count} rollouts\n"
     )
     _console.print(Text("Models: " + ", ".join(candidate.alias for candidate in setup.candidates)))
     _console.print(Text(f"World model: {setup.world_model_settings.world_model_alias}"))

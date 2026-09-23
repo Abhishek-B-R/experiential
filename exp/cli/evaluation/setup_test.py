@@ -27,6 +27,14 @@ def test_models_runs_and_judge_preserve_project_and_rollout_budgets(
             )
         }
     )
+    assert models["candidate-a"].capabilities is not None
+    models["candidate-a"] = models["candidate-a"].model_copy(
+        update={
+            "capabilities": models["candidate-a"].capabilities.model_copy(
+                update={"supports_structured_output": False}
+            )
+        }
+    )
     catalog = catalog.model_copy(update={"models": models})
     before = len(state.completion_calls), len(state.embedding_calls)
     before_project = project.load_project()
@@ -52,9 +60,11 @@ def test_models_runs_and_judge_preserve_project_and_rollout_budgets(
         console: Console, *, title: str, options: Sequence[PickerOption], default: str | None = None
     ) -> PickerResult:
         """Select a new judge, then accept the displayed execution defaults."""
-        del console, options
+        del console
         screens.append(title)
         if title == "Judge":
+            assert "candidate-a" not in {option.value for option in options}
+            assert "candidate-b" in {option.value for option in options}
             assert default == "judge"
             return PickerResult(values=("candidate-b",))
         return PickerResult(values=("review",))

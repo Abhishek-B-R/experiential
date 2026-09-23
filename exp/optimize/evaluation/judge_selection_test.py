@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from exp.common.judging import verify_persisted_calibration
 from exp.optimize.evaluation.prepare import ModelEvaluationOptions, read_evaluation_judge
 from exp.optimize.evaluation.runs import EvaluationDefaults, prepare_run
@@ -44,4 +46,34 @@ def test_changing_judge_preserves_syllabus_and_project_defaults(tmp_path: Path) 
         code_revision=_REVISION,
     )
     assert replay.prepared.judge_setup == changed.prepared.judge_setup
+    assert before == (len(state.completion_calls), len(state.embedding_calls))
+
+
+def test_judge_override_requires_structured_output(tmp_path: Path) -> None:
+    """Unsupported judge choices fail before a run or provider call can be created."""
+    project, catalog, state = _twenty_scenarios(tmp_path)
+    model = catalog.models["candidate-b"]
+    assert model.capabilities is not None
+    incompatible = model.model_copy(
+        update={
+            "capabilities": model.capabilities.model_copy(
+                update={"supports_structured_output": False}
+            )
+        }
+    )
+    catalog = catalog.model_copy(
+        update={"models": {**catalog.models, "unsupported-judge": incompatible}}
+    )
+    before = len(state.completion_calls), len(state.embedding_calls)
+    with pytest.raises(ValueError, match="structured output"):
+        prepare_run(
+            project,
+            catalog,
+            EvaluationDefaults(
+                models=("candidate-a", "candidate-b"),
+                judge="unsupported-judge",
+            ),
+            code_revision=_REVISION,
+        )
+    assert not list((project.paths.runtime_directory / "evaluations").glob("*/run.json"))
     assert before == (len(state.completion_calls), len(state.embedding_calls))

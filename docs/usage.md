@@ -301,7 +301,8 @@ Without an authored judge, the task-success judge is explicitly provisional.
 screen: select models, runs per scenario, and judge; review the estimate; then choose Start
 evaluation. Provider connections, traces, scenarios, and world-model grounding come from build.
 Advanced rollout budgets are optional. Saved results show score, assistant cost, and latency;
-Open report opens plots and side-by-side traces. Details exposes paths and accounting. The default minimum is 20 distinct scenarios,
+Open report opens plots and side-by-side traces. Details exposes paths and accounting.
+The default minimum is 20 distinct scenarios,
 with one repeat, eight parallel workers, 100 steps, and 1,000,000 generated tokens per rollout.
 Retries are separate from repeats. New evaluations collect fresh evidence; resume reuses the
 exact saved run. Settings are saved in the project's `evaluation.json`.

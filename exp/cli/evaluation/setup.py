@@ -5,7 +5,7 @@ from rich.prompt import IntPrompt
 
 from exp.cli.evaluation.view import heading
 from exp.cli.shared.picker import PickerOption, choose_many, choose_one
-from exp.common.models import ModelCatalog
+from exp.common.models import ModelCatalog, SetupRole, serves_role
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.prepare import ModelEvaluationOptions, read_evaluation_judge
 from exp.optimize.evaluation.runs import EvaluationDefaults
@@ -59,6 +59,7 @@ def configure_evaluation(
                 alias, alias, "project judge" if alias == project_judge else model.connection
             )
             for alias, model in sorted(candidates.items())
+            if model.capabilities is not None and serves_role(model.capabilities, SetupRole.JUDGE)
         ),
     )
     if not judge.values:
@@ -71,7 +72,8 @@ def configure_evaluation(
     while True:
         heading(console, name, "New evaluation · settings")
         console.print(
-            f"{options.repeats} runs per scenario · {options.maximum_concurrency} parallel rollouts"
+            f"Runs per scenario: {options.repeats} · "
+            f"Parallel rollouts: {options.maximum_concurrency}"
         )
         console.print(
             f"[dim]{options.maximum_steps} steps · "

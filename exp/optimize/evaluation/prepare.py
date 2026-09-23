@@ -21,7 +21,9 @@ from exp.common.models import (
     CompletionCostReservation,
     ModelCatalog,
     RoutedCandidateSnapshot,
+    SetupRole,
     persist_pricing_snapshot,
+    serves_role,
 )
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.traces import load_trace_dataset
@@ -207,8 +209,10 @@ def prepare_model_evaluation(
     ):
         raise ValueError("judge setup or calibration differs from the completed evaluation project")
     static = RuntimeModelCatalog(catalog, environment={})
+    judge_model, judge_caps = static.snapshot(judge_alias or selected.judge_alias)
+    if not serves_role(judge_caps, SetupRole.JUDGE):
+        raise ValueError("judge requires structured output and pricing; choose another judge model")
     if judge_alias is not None and judge_alias != selected.judge_alias:
-        judge_model, _ = static.snapshot(judge_alias)
         judge_setup, calibration_id = select_judge_model(
             project,
             selected,
