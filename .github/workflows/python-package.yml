@@ -170,6 +170,9 @@ jobs:
           assert callable(exp_gateway_native.serve)
           PY
           /tmp/exp-wheel-smoke/bin/exp --help
+      - name: Block publishing unreleased native changes
+        if: github.event_name == 'release' || inputs.publish == true
+        run: test ! -e .github/deferred-native-release.toml
       - name: Installed-wheel no-spend release evidence
         env:
           PYTHONNOUSERSITE: "1"
