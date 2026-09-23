@@ -129,7 +129,12 @@ class CoverageReason(ContractModel):
 
 
 class HeldOutCoverage(ContractModel):
-    """All planned held-out row statuses retained without denominator collapse."""
+    """All planned held-out row statuses retained without denominator collapse.
+
+    Attributes:
+        incomplete_row_count: Nonnegative count of budget- or length-limited rows, default 0.
+            These retain incurred spend but have no judgment or fabricated zero score.
+    """
 
     planned_row_count: int = Field(ge=0)
     observed_row_count: int = Field(ge=0)
