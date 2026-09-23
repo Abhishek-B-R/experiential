@@ -82,6 +82,12 @@ pub(super) fn open_database(path: &Path) -> Result<Connection, String> {
         .ok_or("invalid local capture storage filename")?;
     let canonical = parent.join(filename);
     let path = canonical.as_path();
+    // Reject unsafe orphaned sidecars before even creating an empty database.
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        require_private_file(Path::new(&sidecar), true)?;
+    }
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -95,11 +101,6 @@ pub(super) fn open_database(path: &Path) -> Result<Connection, String> {
         Err(_) => return Err("cannot create local gateway capture database".into()),
     }
     require_private_file(path, false)?;
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let mut sidecar = path.as_os_str().to_owned();
-        sidecar.push(suffix);
-        require_private_file(Path::new(&sidecar), true)?;
-    }
     // Creation above establishes private permissions. Never let SQLite recreate
     // a disappeared file with default permissions or follow a final symlink.
     let connection = Connection::open_with_flags(

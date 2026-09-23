@@ -167,6 +167,33 @@ fn capture_database_symlink_is_rejected_without_modifying_target() {
 
 #[cfg(unix)]
 #[test]
+fn unsafe_orphaned_sidecar_is_rejected_before_creating_database() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::temp_dir().join(format!(
+        "capture-orphan-{}-{}.db",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        std::fs::write(&sidecar, b"untouched orphan fixture").unwrap();
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(open_database(&path).unwrap_err().contains("owner-only"));
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read(&sidecar).unwrap(),
+            b"untouched orphan fixture"
+        );
+        std::fs::remove_file(&sidecar).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn existing_sqlite_sidecars_must_also_be_private_before_any_database_write() {
     use std::os::unix::fs::PermissionsExt;
     let path = std::env::temp_dir().join(format!(
