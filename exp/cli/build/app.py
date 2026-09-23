@@ -106,8 +106,8 @@ def build(
     project: str = _PROJECT_ARGUMENT,
     legacy_trace_file: Path | None = _LEGACY_TRACE_ARGUMENT,
     trace_file: Path | None = _TRACE_FILE_OPTION,
-    source: str = typer.Option(
-        "otlp",
+    source: str | None = typer.Option(
+        None,
         "--source",
         help=f"Trace source format: {', '.join(sorted((*CANONICAL_TRACE_SOURCES, 'gateway')))}.",
     ),
@@ -164,7 +164,7 @@ def build(
         project: Safe local project identifier below ``<root>/projects``.
         legacy_trace_file: Active positional trace-path compatibility for packaged examples.
         trace_file: Explicit local canonical trace export, or ``None`` for the interactive wizard.
-        source: Declared local-export format.
+        source: Declared format; guided builds detect it, explicit file builds default to OTLP.
         root: Local ``.exp`` artifact root.
         identity: Required local identity when using ``--source gateway``.
         world_model: Optional configured alias override for this project.
@@ -185,7 +185,7 @@ def build(
         if trace_file is not None:
             raise typer.BadParameter("provide traces once, using -t/--traces or the trace path")
         trace_file = legacy_trace_file
-    if source.strip().casefold() == "gateway":
+    if source is not None and source.strip().casefold() == "gateway":
         if identity is None:
             raise typer.BadParameter("--source gateway requires --identity ID")
         trace_file = trace_file or local_capture_path(root)
@@ -230,6 +230,7 @@ def build(
             )
             raise typer.Exit(code=1) from exc
         return
+    source = source or "otlp"
     started = time.monotonic()
     with usage_error(
         ArtifactStoreError,

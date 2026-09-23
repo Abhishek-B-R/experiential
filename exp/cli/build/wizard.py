@@ -82,7 +82,7 @@ from exp.simulation.world_model import load_grounded_world_model_artifact
 def run_build_wizard(
     project: str,
     *,
-    source: str,
+    source: str | None,
     root: Path,
     world_model: str | None,
     judge: str | None,
@@ -97,7 +97,7 @@ def run_build_wizard(
 
     Args:
         project: Safe local project identifier.
-        source: Initial trace-source choice.
+        source: Explicit trace-source choice, or None to recognize the selected export.
         root: Local EXP artifact root.
         world_model: Optional world-model alias override.
         judge: Optional judge alias override.

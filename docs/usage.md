@@ -270,7 +270,9 @@ world-model grounding. Model roles belong to the project; embedding work uses th
 preflight. An unchanged completed build reuses its scenarios and indexes without new provider calls.
 `--dry-run` uses temporary SQLite for source ingestion and may checkpoint deterministic project
 evidence, but makes no provider calls, durable trace imports, or completed-build selection.
-The interactive build prompts for an explicit source file; automation supplies `--traces`.
+The interactive build prompts for an explicit source file and detects chat JSON, native capture,
+and recognizable OpenTelemetry exports. Unknown or ambiguous files get a format question in the
+TUI. An explicit `--source` is always respected; automation supplies `--traces` and `--source`.
 OTel sources (`otlp`, `otel-genai`) and completed exported chat captures (`experiential`) use the
 same persistence path. See [trace input and storage](reference/ingest.md) for the Python API.
 

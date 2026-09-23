@@ -36,6 +36,7 @@ from exp.common.models import (
 from exp.common.project import ProjectModelConfiguration
 from exp.common.routing import KnnRouterPolicy
 from exp.common.tasks import TaskCase, load_task_set
+from exp.common.traces.ingest.persistence_test import _source as _chat_export
 from exp.common.traces.sqlite import SQLiteTraceStore
 from exp.common.traces.sqlite_schema import trace_database_path
 from exp.optimize.router.activation import load_project_router
@@ -368,6 +369,35 @@ def test_default_build_prepares_saved_scenarios_without_rollouts(
     assert "router-policy" not in artifact_types
 
 
+def test_bare_build_chat_export_completes_with_saved_provider_roles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The three-command UX accepts a chat JSONL file with no source or root flags."""
+    _chat_export(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path / ".exp"
+    write_model_catalog(root / "models.toml", _catalog())
+    state = _ProviderState()
+    _install_integrated_runtime(monkeypatch, state)
+
+    result = _RUNNER.invoke(
+        app,
+        ["build", "powerset"],
+        input="\nresearch.jsonl\ny\n",
+        env={"OPENAI_API_KEY": "fixture-secret", "EXP_RELEASE_REVISION": _REVISION},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Format: chat-json" in unstyle(result.output)
+    store = wizard.ProjectStore(root, "powerset")
+    assert store.load_project().trace_source == "chat-json"
+    assert store.load_project().build is not None
+    traces = SQLiteTraceStore(trace_database_path(root))
+    imports = traces.list_imports("powerset")
+    assert len(imports) == 1 and len(traces.read_import(imports[0]).traces) == 20
+    assert state.embedding_calls and not state.completion_calls
+
+
 def test_explicit_router_selection_builds_and_composes_provisional_router(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -398,7 +428,8 @@ def test_explicit_router_selection_builds_and_composes_provisional_router(
     assert "Select the providers you want to use" not in printed
     assert printed.count("Workflow") == 1
     assert printed.index("judge rubric") < printed.index("Trace path")
-    assert printed.count("Trace path (otlp export)") == 1
+    assert printed.count("Trace path") == 1
+    assert "Format: otlp" in printed
     assert printed.count("Use these recommended models?") == 1
     assert printed.count("Authorize exp build support") == 1
     assert "Judge syllabus" in printed
@@ -1042,6 +1073,7 @@ def test_bare_build_dispatches_wizard_without_required_trace_option(
 
     assert result.exit_code == 0, result.output
     assert calls and calls[0][0] == ("support",)
+    assert calls[0][1]["source"] is None
     help_result = _RUNNER.invoke(app, ["build", "--help"])
     assert help_result.exit_code == 0
     assert "-t" in unstyle(help_result.output)

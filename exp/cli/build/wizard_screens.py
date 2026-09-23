@@ -16,6 +16,7 @@ from rich.prompt import Prompt
 from exp.common.models import ModelCatalog
 from exp.common.project import ProjectModelConfiguration
 from exp.common.tasks import TaskCase
+from exp.common.traces.ingest.detection import detect_trace_source
 from exp.common.traces.ingest.sources import CANONICAL_TRACE_SOURCES
 from exp.simulation.build import ProjectBuild
 
@@ -95,29 +96,25 @@ def select_workflow(*, console: Console) -> WizardWorkflowSelection:
         console.print(f"[red]error[/red] enter step numbers between 1 and {len(_WORKFLOW_STEPS)}")
 
 
-def select_trace(initial_source: str, *, console: Console) -> tuple[str, Path]:
+def select_trace(initial_source: str | None, *, console: Console) -> tuple[str, Path]:
     """Select one supported trace source and require an explicit local trace path.
 
     The wizard never infers a trace file from the working directory; when -t/--traces
     was not given, the operator always names the exact export to use.
 
     Args:
-        initial_source: CLI-provided initial source choice.
+        initial_source: Explicit CLI source, or None to recognize the selected export.
         console: Interactive terminal.
 
     Returns:
         Canonical source name and validated local path.
     """
-    source = initial_source.strip().casefold()
-    if source not in (*CANONICAL_TRACE_SOURCES, "gateway"):
-        source = Prompt.ask(
-            "Trace source",
-            choices=sorted((*CANONICAL_TRACE_SOURCES, "gateway")),
-            default="otlp",
-            console=console,
-        )
+    source = initial_source.strip().casefold() if initial_source is not None else None
+    if source is not None and source not in (*CANONICAL_TRACE_SOURCES, "gateway"):
+        raise ValueError(f"unsupported trace source {source!r}; choose a supported --source")
     while True:
-        answer = Prompt.ask(f"Trace path ({source} export)", console=console)
+        prompt = f"Trace path ({source} export)" if source else "Trace path"
+        answer = Prompt.ask(prompt, console=console)
         selected = (answer or "").strip()
         if not selected:
             console.print("[red]error[/red] a local trace path is required")
@@ -129,6 +126,20 @@ def select_trace(initial_source: str, *, console: Console) -> tuple[str, Path]:
         if not path.is_file():
             console.print(f"[red]error[/red] the trace path must name a file: {path}")
             continue
+        if source is None:
+            try:
+                source = detect_trace_source(path)
+            except OSError:
+                console.print(
+                    "[red]error[/red] cannot read this file; choose a readable trace export"
+                )
+                continue
+            if source is None:
+                source = Prompt.ask(
+                    "Trace format", choices=list(CANONICAL_TRACE_SOURCES), console=console
+                )
+            else:
+                console.print(f"[dim]Format: {source}[/dim]")
         return source, path
 
 
