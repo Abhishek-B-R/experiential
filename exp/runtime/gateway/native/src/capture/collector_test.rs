@@ -6,10 +6,19 @@ use std::sync::{mpsc, Arc};
 struct MemorySink(mpsc::Sender<Record>);
 
 impl Sink for MemorySink {
-    fn write(&mut self, record: &Record, maximum_bytes: usize) -> Result<(), ()> {
-        let encoded = record.encode(maximum_bytes).ok_or(())?;
+    type Prepared = String;
+
+    fn preparation_bytes(maximum_record_bytes: usize) -> usize {
+        maximum_record_bytes
+    }
+
+    fn prepare(&self, record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
+        record.encode(maximum_bytes).ok_or(())
+    }
+
+    fn write(&mut self, record: &Self::Prepared) -> Result<(), ()> {
         self.0
-            .send(serde_json::from_str(&encoded).map_err(|_| ())?)
+            .send(serde_json::from_str(record).map_err(|_| ())?)
             .map_err(|_| ())
     }
 }
@@ -156,7 +165,14 @@ fn routing_provenance_is_optional_until_selected_and_then_immutable() {
 fn collector_forwards_destination_cleanup_failure_without_losing_write_success() {
     struct CleanupFailure;
     impl Sink for CleanupFailure {
-        fn write(&mut self, _: &Record, _: usize) -> Result<(), ()> {
+        type Prepared = ();
+        fn preparation_bytes(_: usize) -> usize {
+            0
+        }
+        fn prepare(&self, _: &Record, _: usize) -> Result<(), ()> {
+            Ok(())
+        }
+        fn write(&mut self, _: &()) -> Result<(), ()> {
             Ok(())
         }
         fn take_maintenance_failures(&mut self) -> u64 {

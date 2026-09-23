@@ -53,9 +53,11 @@ per-record ceiling. SQLite indexes/journals add disk overhead. Oversize,
 interrupted and non-successful responses are not reproducible completed records.
 When storage is slower than incoming traffic, response completion waits for the
 SQLite transaction rather than discarding queued captures. Admission that cannot
-register required capture returns 503 before making a provider call. A write
-failure terminates the HTTP body with an error; already-streamed bytes cannot be
-withdrawn. Graceful shutdown reports an incomplete drain without purging accepted
+register required capture returns 503 before making a provider call. A storage
+failure retains the same prepared SQLite payload and retries with bounded backoff;
+it does not re-encode the conversation or discard it after a retry limit. A payload
+that cannot be prepared within its explicit bounds fails the HTTP body; bytes
+already streamed cannot be withdrawn. Graceful shutdown reports an incomplete drain without purging accepted
 delivery records, and the process must stay alive until that drain completes.
 The collector's content-free counters report delivery and collection failures.
 `maintenance_failures()` reports retention/WAL cleanup failures separately: a busy

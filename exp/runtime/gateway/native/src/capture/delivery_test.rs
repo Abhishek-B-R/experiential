@@ -7,14 +7,23 @@ struct PausedSink {
 }
 
 impl Sink for PausedSink {
-    fn write(&mut self, record: &Record, _maximum_bytes: usize) -> Result<(), ()> {
-        self.entered
-            .send(record.request.request_id.clone())
-            .map_err(|_| ())?;
+    type Prepared = String;
+
+    fn preparation_bytes(_maximum_record_bytes: usize) -> usize {
+        512
+    }
+
+    fn prepare(&self, record: &Record, _maximum_bytes: usize) -> Result<Self::Prepared, ()> {
+        Ok(record.request.request_id.clone())
+    }
+
+    fn write(&mut self, record: &Self::Prepared) -> Result<(), ()> {
+        self.entered.send(record.clone()).map_err(|_| ())?;
         self.resume
             .recv_timeout(Duration::from_secs(5))
             .map_err(|_| ())?;
         if self.fail {
+            self.fail = false;
             Err(())
         } else {
             Ok(())
@@ -40,7 +49,7 @@ fn paused(limits: Limits, fail: bool) -> (Delivery, mpsc::Receiver<String>, mpsc
 fn limits() -> Limits {
     Limits {
         maximum_records: 2,
-        maximum_bytes: record("12345678").heap_bytes() * 2,
+        maximum_bytes: record("12345678").heap_bytes() * 2 + 512,
         maximum_record_bytes: 1024,
     }
 }
@@ -106,7 +115,7 @@ fn record_count_is_bounded_even_for_tiny_records() {
     assert!(result.recv_timeout(Duration::from_millis(30)).is_err());
     assert_eq!(
         delivery.counts(),
-        [2, (record("a").heap_bytes() * 2) as u64, 0, 0, 0]
+        [2, (record("a").heap_bytes() * 2 + 512) as u64, 0, 0, 0]
     );
     resume.send(()).unwrap();
     assert!(result.recv_timeout(Duration::from_secs(1)).unwrap());
@@ -131,20 +140,37 @@ fn allocated_capacity_not_just_json_length_is_charged() {
 }
 
 #[test]
-fn failed_destination_releases_budget_and_records_no_sensitive_error() {
+fn failed_destination_retains_budget_and_retries_the_same_record_after_close_timeout() {
     let (delivery, entered, resume) = paused(limits(), true);
     assert!(delivery.submit(record("private")));
     entered.recv_timeout(Duration::from_secs(1)).unwrap();
     resume.send(()).unwrap();
+    assert_eq!(
+        entered.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "private"
+    );
+    assert!(!delivery.close_until(Instant::now()));
+    assert_eq!(
+        delivery.counts(),
+        [1, (record("private").heap_bytes() + 512) as u64, 0, 1, 0]
+    );
+    resume.send(()).unwrap();
     assert!(delivery.close_until(Instant::now() + Duration::from_secs(1)));
-    assert_eq!(delivery.counts(), [0, 0, 0, 1, 0]);
+    assert_eq!(delivery.counts(), [0, 0, 1, 1, 0]);
 }
 
 #[test]
 fn committed_write_and_cleanup_failures_have_separate_counters() {
     struct CleanupFailure;
     impl Sink for CleanupFailure {
-        fn write(&mut self, _: &Record, _: usize) -> Result<(), ()> {
+        type Prepared = ();
+        fn preparation_bytes(_: usize) -> usize {
+            0
+        }
+        fn prepare(&self, _: &Record, _: usize) -> Result<(), ()> {
+            Ok(())
+        }
+        fn write(&mut self, _: &()) -> Result<(), ()> {
             Ok(())
         }
         fn take_maintenance_failures(&mut self) -> u64 {
@@ -198,7 +224,7 @@ fn shutdown_timeout_reports_incomplete_drain_without_purging_accepted_records() 
 }
 
 #[test]
-fn synchronous_completion_waits_for_durable_success_and_reports_writer_failure() {
+fn synchronous_completion_waits_for_acknowledgement_including_retries() {
     for fail in [false, true] {
         let (delivery, entered, resume) = paused(limits(), fail);
         let delivery = Arc::new(delivery);
@@ -212,7 +238,12 @@ fn synchronous_completion_waits_for_durable_success_and_reports_writer_failure()
         entered.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(result.recv_timeout(Duration::from_millis(30)).is_err());
         resume.send(()).unwrap();
-        assert_eq!(result.recv_timeout(Duration::from_secs(1)).unwrap(), !fail);
+        if fail {
+            assert_eq!(entered.recv_timeout(Duration::from_secs(1)).unwrap(), "ack");
+            assert!(result.recv_timeout(Duration::from_millis(30)).is_err());
+            resume.send(()).unwrap();
+        }
+        assert!(result.recv_timeout(Duration::from_secs(1)).unwrap());
         waiting.join().unwrap();
         assert!(delivery.close_until(Instant::now() + Duration::from_secs(1)));
         assert_eq!(delivery.counts()[4], 0);

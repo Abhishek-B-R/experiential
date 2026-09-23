@@ -40,13 +40,13 @@ fn sqlite_retention_deduplication_and_scope_are_independent() {
     ));
     let mut connection = open_database(&path).unwrap();
     let app = policy();
-    persist(&mut connection, pending("one", app.clone())).unwrap();
-    persist(&mut connection, pending("one", app.clone())).unwrap();
-    persist(&mut connection, pending("two", app.clone())).unwrap();
+    persist(&mut connection, &pending("one", app.clone())).unwrap();
+    persist(&mut connection, &pending("one", app.clone())).unwrap();
+    persist(&mut connection, &pending("two", app.clone())).unwrap();
     let mut other = app.clone();
     other.scope.application_id = "other".into();
-    persist(&mut connection, pending("other", other)).unwrap();
-    persist(&mut connection, pending("three", app.clone())).unwrap();
+    persist(&mut connection, &pending("other", other)).unwrap();
+    persist(&mut connection, &pending("three", app.clone())).unwrap();
     let ids: Vec<String> = connection
         .prepare("SELECT experience_id FROM gateway_captures ORDER BY sequence")
         .unwrap()
@@ -147,7 +147,7 @@ fn expired_content_is_removed_from_database_and_wal_after_readers_release() {
     let marker = "synthetic-expiring-tool-output-unique-marker";
     let mut item = pending("expired", policy());
     item.payload = marker.into();
-    persist(&mut writer, item).unwrap();
+    persist(&mut writer, &item).unwrap();
     let reader = Connection::open(&path).unwrap();
     reader.execute_batch("BEGIN").unwrap();
     let _: String = reader
@@ -158,8 +158,8 @@ fn expired_content_is_removed_from_database_and_wal_after_readers_release() {
     // report WAL cleanup separately from the successful database insertion.
     let mut single = policy();
     single.maximum_experiences = 1;
-    persist(&mut writer, pending("fresh-one", single.clone())).unwrap();
-    let outcome = persist(&mut writer, pending("fresh-two", single)).unwrap();
+    persist(&mut writer, &pending("fresh-one", single.clone())).unwrap();
+    let outcome = persist(&mut writer, &pending("fresh-two", single)).unwrap();
     assert!(outcome.maintenance_failed);
     let count: i64 = writer
         .query_row(

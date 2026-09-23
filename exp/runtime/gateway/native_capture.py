@@ -24,7 +24,9 @@ class CaptureDeliveryLimits(ContractModel):
 
     Attributes:
         maximum_records: Queued and actively written records, defaulting to 256.
-        maximum_bytes: Retained delivery memory, defaulting to 64 MiB.
+        maximum_bytes: Queue and prepared-payload budget, defaulting to 64 MiB.
+            One worker reserves 5 times maximum_record_bytes plus 256 bytes for
+            UTF-8 encoding and the widest Python string. Queued records use the remainder.
         maximum_record_bytes: Final encoded payload ceiling, defaulting to 8 MiB.
     """
 
@@ -36,9 +38,9 @@ class CaptureDeliveryLimits(ContractModel):
 
     @model_validator(mode="after")
     def _validate_budget(self) -> CaptureDeliveryLimits:
-        """Require room for one maximum-size record."""
-        if self.maximum_bytes < self.maximum_record_bytes:
-            raise ValueError("capture byte budget must fit one record")
+        """Reserve one worker's preparation allocation outside queued content."""
+        if self.maximum_bytes < 6 * self.maximum_record_bytes + 256:
+            raise ValueError("capture byte budget must fit destination preparation and one record")
         return self
 
 

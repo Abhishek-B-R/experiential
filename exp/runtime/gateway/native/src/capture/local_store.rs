@@ -5,7 +5,7 @@ use std::fs::OpenOptions;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub(super) struct Pending {
+pub(crate) struct Pending {
     pub policy: Policy,
     pub payload: String,
     pub experience_id: String,
@@ -118,7 +118,7 @@ pub(super) fn open_database(path: &Path) -> Result<Connection, String> {
     Ok(connection)
 }
 
-pub(super) fn persist(connection: &mut Connection, item: Pending) -> rusqlite::Result<Persisted> {
+pub(super) fn persist(connection: &mut Connection, item: &Pending) -> rusqlite::Result<Persisted> {
     let transaction = connection.transaction()?;
     transaction.execute(
         "INSERT INTO gateway_captures

@@ -71,7 +71,16 @@ impl SqliteSink {
 }
 
 impl Sink for SqliteSink {
-    fn write(&mut self, record: &Record, maximum_bytes: usize) -> Result<(), ()> {
+    type Prepared = Option<local_store::Pending>;
+
+    fn preparation_bytes(maximum_record_bytes: usize) -> usize {
+        // Encoded payload plus its response-id copy, two bounded scope strings,
+        // the fixed-size experience id, and the owning struct. SQLite's own
+        // transaction workspace is separate from the delivery queue budget.
+        2 * maximum_record_bytes + 1024 + 256 + std::mem::size_of::<local_store::Pending>()
+    }
+
+    fn prepare(&self, record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
         let scope = &record.request.scope;
         let policy = self
             .policies
@@ -82,7 +91,7 @@ impl Sink for SqliteSink {
             })
             .ok_or(())?;
         let Some(response) = projection::completed_response(record) else {
-            return Ok(());
+            return Ok(None);
         };
         let response_id = response
             .get("id")
@@ -108,17 +117,20 @@ impl Sink for SqliteSink {
             maximum_bytes.min(policy.maximum_experience_bytes),
         )
         .ok_or(())?;
-        let persisted = local_store::persist(
-            &mut self.connection,
-            local_store::Pending {
-                policy: policy.clone(),
-                payload,
-                experience_id,
-                response_id: response_id.to_owned(),
-                captured_at: record.captured_at as u64,
-            },
-        )
-        .map_err(|_| ())?;
+        Ok(Some(local_store::Pending {
+            policy: policy.clone(),
+            payload,
+            experience_id,
+            response_id: response_id.to_owned(),
+            captured_at: record.captured_at as u64,
+        }))
+    }
+
+    fn write(&mut self, prepared: &Self::Prepared) -> Result<(), ()> {
+        let Some(prepared) = prepared else {
+            return Ok(());
+        };
+        let persisted = local_store::persist(&mut self.connection, prepared).map_err(|_| ())?;
         self.maintenance_failed += u64::from(persisted.maintenance_failed);
         Ok(())
     }
@@ -134,3 +146,7 @@ impl Sink for SqliteSink {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "local_test.rs"]
+mod tests;

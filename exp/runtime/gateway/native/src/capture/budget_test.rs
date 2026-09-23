@@ -47,3 +47,15 @@ fn small_ordered_maps_include_minimum_entry_and_index_allocations() {
     let minimum_allocation = 3 * entry + 4 * std::mem::size_of::<usize>() + 16;
     assert!(heap_bytes(&value) >= minimum_allocation);
 }
+
+#[test]
+fn final_encoding_capacity_stays_inside_its_payload_reservation() {
+    for size in [31, 257, 1025, 8193] {
+        let value = json!({"content": "x".repeat(size), "last": "🌍"});
+        let limit = json_bytes(&value);
+        let encoded = encode(&value, limit).unwrap();
+        assert_eq!(encoded.len(), limit);
+        assert!(encoded.capacity() <= limit);
+        assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap(), value);
+    }
+}
