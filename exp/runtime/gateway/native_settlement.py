@@ -207,6 +207,45 @@ class NativeSettlementPayload(BaseModel):
         return self.usage_incomplete_due_to_disconnect
 
 
+class StreamedOutput(BaseModel):
+    """Generated text the data plane observed before a caller disconnected.
+
+    Verbatim text by output leg plus the characters past the data plane's
+    retained bound, so an estimate can extrapolate what it could not keep.
+    """
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    text: str = ""
+    reasoning: str = ""
+    text_overflow_chars: int = Field(default=0, ge=0)
+    reasoning_overflow_chars: int = Field(default=0, ge=0)
+
+
+def streamed_output_from_settlement(data: JsonObject | None) -> StreamedOutput | None:
+    """Parse the settlement's optional generated-text evidence.
+
+    Only a dispatched cancellation without a provider terminal carries it. A
+    malformed object is dropped rather than estimated from: the settlement
+    then keeps its unknown meter exactly as an engine predating the field.
+
+    Args:
+        data: Parsed native settlement payload.
+
+    Returns:
+        The typed streamed output, or None when absent or malformed.
+    """
+    if data is None:
+        return None
+    payload = data.get("streamed_output")
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return StreamedOutput.model_validate(payload)
+    except ValueError:
+        return None
+
+
 def terminal_from_settlement(
     data: JsonObject,
     *,

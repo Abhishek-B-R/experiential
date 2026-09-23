@@ -35,6 +35,7 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayUsage,
 )
+from exp.runtime.gateway.disconnect_estimate import estimate_disconnect_usage
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.lane_saturation import lane_saturated_failure, overflow_target
 from exp.runtime.gateway.native_accounting_errors import (
@@ -70,6 +71,7 @@ from exp.runtime.gateway.native_settlement import (
     first_token_at_from_settlement,
     ledger_failure,
     settlement_rate_limit,
+    streamed_output_from_settlement,
     terminal_from_settlement,
     tool_search_requests_from_terminal,
     tool_search_requests_kwarg,
@@ -655,6 +657,7 @@ class NativeAttemptAccounting:
         finalize = bool(data.get("finalize", True))
         opened = bool(data.get("opened", False))
         terminal, failure = terminal_from_settlement(data, surface=entry.authorization.surface)
+        terminal = self._estimate_disconnect(entry, terminal, data)
         first_token_at = first_token_at_from_settlement(data)
         rate_limit = settlement_rate_limit(data)
         upstream = upstream_provider_from_settlement(data)
@@ -686,7 +689,9 @@ class NativeAttemptAccounting:
                 entry.pending_settlement = data
             raise authority_error(exc) from exc
         self._record_health(entry, attempt_id, opened=opened, failure=failure)
-        self._record_cache_fraction(entry, attempt_id, terminal.usage)
+        self._record_cache_fraction(
+            entry, attempt_id, terminal.usage, usage_estimated=terminal.usage_estimated
+        )
         with self._lock:
             if finalize:
                 self._inflight.pop(request_id, None)
@@ -815,11 +820,30 @@ class NativeAttemptAccounting:
         else:
             self._health.succeeded(key)
 
+    @staticmethod
+    def _estimate_disconnect(
+        entry: InflightRequest, terminal: GatewayEvent, data: JsonObject
+    ) -> GatewayEvent:
+        """Price a caller's disconnect from the gateway's own evidence when the provider could not.
+
+        Deterministic over the retained payload, so the direct path and the
+        sweep's replay of the same settlement produce the same estimate.
+        """
+        return estimate_disconnect_usage(
+            terminal,
+            request=entry.request,
+            surface=entry.authorization.surface,
+            opened=data.get("opened") is True,
+            streamed=streamed_output_from_settlement(data),
+        )
+
     def _record_cache_fraction(
         self,
         entry: InflightRequest,
         attempt_id: str,
         usage: GatewayUsage | None,
+        *,
+        usage_estimated: bool = False,
     ) -> None:
         """Fold one settled attempt's cached-token fraction into the registry.
 
@@ -835,8 +859,10 @@ class NativeAttemptAccounting:
             entry: The owning in-flight request.
             attempt_id: The settled attempt.
             usage: The terminal event's usage, if any.
+            usage_estimated: The usage is the gateway's disconnect estimate, whose
+                cache legs are unreported; it says nothing about cache reuse.
         """
-        if usage is None or usage.input_tokens is None:
+        if usage is None or usage.input_tokens is None or usage_estimated:
             return
         depth = entry.attempt_depths.get(attempt_id)
         if depth is None:
@@ -900,6 +926,7 @@ class NativeAttemptAccounting:
             terminal, failure = terminal_from_settlement(
                 settlement, surface=entry.authorization.surface
             )
+            terminal = self._estimate_disconnect(entry, terminal, settlement)
             if self._settle_swept(
                 request_id,
                 entry,
@@ -990,7 +1017,9 @@ class NativeAttemptAccounting:
         # A retained settlement that finally lands through the sweep carries
         # the same observed usage as the direct path, so the cache-priority
         # EWMA must not depend on WHICH recovery path succeeded.
-        self._record_cache_fraction(entry, attempt_id, terminal.usage)
+        self._record_cache_fraction(
+            entry, attempt_id, terminal.usage, usage_estimated=terminal.usage_estimated
+        )
         with self._lock:
             if finalize:
                 self._inflight.pop(request_id, None)

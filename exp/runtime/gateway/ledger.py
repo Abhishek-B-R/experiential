@@ -37,7 +37,11 @@ from exp.runtime.gateway.ledger_usage import (
     billing_source_usage_rows,
     identity_usage_rows,
 )
-from exp.runtime.gateway.ledger_valuation import frozen_usage_cost, optional_int
+from exp.runtime.gateway.ledger_valuation import (
+    frozen_usage_cost,
+    optional_int,
+    usage_source_label,
+)
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
 from exp.runtime.gateway.sqlite.store import SystemGatewayClock
 
@@ -607,8 +611,16 @@ class SQLiteAttemptLedger:
         )
         prefix = "long_context_" if long_context else ""
         # Partial disconnect usage remains evidence, not a final provider cost.
-        # Preserve its counts while consuming the conservative budget bound.
-        partial = terminal_event is not None and terminal_event.usage_incomplete_due_to_disconnect
+        # Preserve its counts while consuming the conservative budget bound,
+        # unless the registry completed the meter with the gateway's own
+        # tokenizer estimate: that prices the work the provider billed and
+        # releases the rest of the bound, labelled estimated.
+        estimated = terminal_event is not None and terminal_event.usage_estimated
+        partial = (
+            terminal_event is not None
+            and terminal_event.usage_incomplete_due_to_disconnect
+            and not estimated
+        )
         cost = None if partial else frozen_usage_cost(row, usage, prefix=prefix)
         budget_settlement = (
             cost if cost is not None else optional_int(row["budget_reserved_nano_usd"])
@@ -662,7 +674,7 @@ class SQLiteAttemptLedger:
                 None if usage is None else usage.cache_creation_1h_input_tokens,
                 None if usage is None else usage.output_tokens,
                 None if usage is None else usage.reasoning_tokens,
-                "unknown" if usage is None else "observed",
+                usage_source_label(usage, estimated=estimated),
                 cost,
                 counterfactual_cost,
                 budget_settlement,

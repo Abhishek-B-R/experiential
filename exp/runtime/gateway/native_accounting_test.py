@@ -19,6 +19,7 @@ from exp.common.models.catalog import (
 )
 from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
+from exp.runtime.gateway.attempt_tokens import counted_input_tokens
 from exp.runtime.gateway.budgets import (
     BudgetReservationRejected,
     BudgetScopeKind,
@@ -42,6 +43,7 @@ from exp.runtime.gateway.native_accounting import (
 from exp.runtime.gateway.native_components import SyncWriteLedger
 from exp.runtime.gateway.native_execution import InflightRequest, deployment_health_key
 from exp.runtime.gateway.native_settlement import failure_from_boundary_payload, ledger_failure
+from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.openai_protocol.errors import (
     THROTTLED_RETRY_AFTER_SECONDS,
@@ -382,6 +384,61 @@ def test_disconnect_usage_evidence_survives_every_settlement_path(
     if terminal.usage is not None:
         assert terminal.usage.input_tokens == 7
         assert terminal.usage.output_tokens == 3
+    assert registry.entry(entry.authorization.request_id) is None
+    assert len(ledger.finished) == 1
+
+
+@pytest.mark.parametrize("retry", ["direct", "sweep"])
+@pytest.mark.parametrize(
+    "surface", [GatewayApiSurface.CHAT_COMPLETIONS, GatewayApiSurface.DECISIONS]
+)
+@pytest.mark.parametrize("opened", [False, True])
+def test_opened_disconnect_settles_an_estimated_meter_on_every_path(
+    opened: bool, surface: GatewayApiSurface, retry: str
+) -> None:
+    """An accepted request the caller abandoned prices its prompt and streamed text once."""
+    registry, ledger, entry = _registry()
+    entry.authorization = entry.authorization.model_copy(update={"surface": surface})
+    started = _start(registry, ordinal=0)
+    payload: JsonObject = {
+        "request_id": entry.authorization.request_id,
+        "attempt_id": started["attempt_id"],
+        "outcome": "failed",
+        "usage": None,
+        "failure": {"failure_class": "cancelled", "safe_message": "caller disconnected"},
+        "finalize": True,
+        "opened": opened,
+        "dispatched": True,
+        "usage_incomplete_due_to_disconnect": True,
+        "streamed_output": {
+            "text": "The sky is blue because",
+            "reasoning": "",
+            "text_overflow_chars": 0,
+            "reasoning_overflow_chars": 0,
+        },
+    }
+    encoded = json.dumps(payload)
+    if retry == "sweep":
+        ledger.fail_finishes = 1
+        with pytest.raises(NativeBridgeError):
+            registry.settle(encoded)
+        registry.sweep_expired()
+    else:
+        registry.settle(encoded)
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None
+    assert terminal.usage_incomplete_due_to_disconnect is True
+    estimated = opened and surface is not GatewayApiSurface.DECISIONS
+    assert terminal.usage_estimated is estimated
+    if estimated:
+        assert terminal.usage is not None
+        assert terminal.usage.input_tokens == counted_input_tokens(entry.request) > 0
+        assert terminal.usage.output_tokens == len(
+            reservation_encoder().encode_ordinary("The sky is blue because")
+        )
+        assert terminal.usage.reasoning_tokens == 0
+    else:
+        assert terminal.usage is None
     assert registry.entry(entry.authorization.request_id) is None
     assert len(ledger.finished) == 1
 

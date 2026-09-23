@@ -110,6 +110,24 @@ def estimated_cost_nano_usd(
     return require_representable_nano_usd((numerator + 500_000) // 1_000_000, what="attempt cost")
 
 
+def usage_source_label(usage: GatewayUsage | None, *, estimated: bool) -> str:
+    """The ledger's usage provenance for one settlement.
+
+    ``unknown`` without usage, ``estimated`` when the registry completed a
+    disconnect's meter with the gateway tokenizer, ``observed`` otherwise.
+
+    Args:
+        usage: The usage the settlement carries, if any.
+        estimated: Whether that usage is the gateway's disconnect estimate.
+
+    Returns:
+        One of the three ``usage_source`` labels every ledger schema accepts.
+    """
+    if usage is None:
+        return "unknown"
+    return "estimated" if estimated else "observed"
+
+
 def optional_int(value: int | None) -> int | None:
     """Convert one nullable SQLite integer value to its precise type."""
     return None if value is None else int(value)
