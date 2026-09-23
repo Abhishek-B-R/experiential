@@ -28,15 +28,15 @@ class WizardWorkflowSelection:
     build: bool = True
     judge_rubric: bool = False
     judge_calibration: bool = False
-    router: bool = True
+    router: bool = False
 
 
 _WORKFLOW_STEPS: tuple[tuple[str, str, bool], ...] = (
     ("providers", "connect providers and assign model roles", True),
-    ("build", "ingest traces and build the world model", True),
+    ("build", "import traces, mine scenarios and prepare the world model", True),
     ("judge rubric", "edit the judge rubric; off keeps the task-success default", False),
     ("judge calibration", "review and approve judge examples by hand", False),
-    ("router optimization", "simulate, judge, and fit the router", True),
+    ("router optimization", "simulate, judge, and fit the router", False),
 )
 
 

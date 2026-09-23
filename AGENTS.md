@@ -30,7 +30,7 @@ uv run pytest -q
   may not import optimize or cli; optimize may not import cli. Optimize owns application
   orchestration and may depend inward on common, runtime, and simulation. The AST gate rejects
   every current forbidden edge directly and proves that the package graph is acyclic.
-- The root CLI command set is exact: `build`, `config`, `ingest`, `login`, `optimize`, and `run`.
+- The root CLI command set is exact: `build`, `config`, `login`, `optimize`, and `run`.
   An invocation without a subcommand opens the default gateway home screen.
   `exp/cli/app_test.py` and the release tests
   enforce the current command and distribution shape.
@@ -38,7 +38,7 @@ uv run pytest -q
 ## CLI package ownership
 
 - `exp/cli/app.py` owns root command composition only. Command implementations live in the
-  `build/`, `config/`, `ingest/`, `judge/`, `optimize/`, and `gateway/` packages. Gateway serving and the
+  `build/`, `config/`, `judge/`, `optimize/`, and `gateway/` packages. Gateway serving and the
   default home screen live under `gateway/`.
 - `exp/cli/providers/` owns provider discovery, model selection, and catalog setup shared by
   commands. Command-specific orchestration stays with its command package. In particular,
@@ -57,17 +57,17 @@ uv run pytest -q
 - `exp/simulation/` owns representative-task mining, typed simulation specs, current engines,
   orchestration, artifact construction, and comparisons. New modules for those responsibilities
   go inside `exp/simulation/`, never at the flat `exp/` root.
-- `exp ingest PROJECT --traces TRACE_FILE --source SOURCE --root ROOT` normalizes local traces
-  into the shared `<root>/gateway/traffic.db` SQLite database. `--source gateway --identity ID`
-  selects retained captures for one explicit gateway identity. Imports preserve canonical traces,
-  exact source provenance, tool definitions/results, normalization exclusions and model identity
-  evidence. Immutable import IDs and project membership are transactional and idempotent. Ingest
-  does not create project folders, mine tasks, configure providers, embed, simulate or judge.
-- `exp build PROJECT --traces TRACE_FILE --source SOURCE --root ROOT` creates immutable task
-  evidence from an explicit corpus. It writes manifest-bound fit and held-out tasks plus
+- `exp build PROJECT --traces TRACE_FILE --source SOURCE --root ROOT` imports canonical traces
+  into shared `<root>/gateway/traffic.db` SQLite storage, then mines scenarios from that exact
+  saved evidence. `--source gateway --identity ID` selects retained captures for one explicit
+  identity. Imports preserve source provenance, prompts, tools, results, normalization exclusions
+  and model identity; immutable import IDs and project associations are transactional and
+  idempotent. Ingestion remains a common Python operation, not a separate CLI command.
+  Build writes manifest-bound fit and held-out tasks plus
   `proposals_pending` review state, builds both RAG indexes under a strict embedding-cost ceiling,
   and binds the grounded world model without a completion or judge call. Route each corpus
-  through an explicit canonical source loader.
+  through an explicit canonical source loader. The interactive wizard defaults to provider
+  configuration and build preparation; router optimization requires an explicit selection.
 - New file trace sources belong in `exp/common/traces/ingest/`, normalize into the `Trace` and
   `TraceSpan` contracts in `exp/common/traces/`, and register with the explicit shared source table.
   Runtime-specific source adapters stay with their runtime owner. Common ingestion never imports
@@ -140,7 +140,7 @@ uv run pytest -q
   orchestration lives in `automatic/`, manual judge calibration in `judging/`, offline policy work
   in `fit/`, and evaluation preparation in `evaluation/`. The durable judgment ledger remains at
   `judgment_budget.py`.
-- The root CLI is locked to `build`, `config`, `ingest`, `login`, `optimize`, and `run`.
+- The root CLI is locked to `build`, `config`, `login`, `optimize`, and `run`.
   The optimize group is locked to `router` and `model`; the config group is locked to
   `budget`, `gateway`, `judge`, `providers`,
   and `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag, is a

@@ -11,6 +11,7 @@ import typer
 from rich.console import Console
 
 from exp.cli.build.cost import over_ceiling_message
+from exp.cli.build.traces import load_build_traces
 from exp.cli.providers.provider_picker import resolve_setup_providers
 from exp.cli.providers.setup import (
     ProviderSetupOptions,
@@ -43,9 +44,7 @@ from exp.common.project import (
     artifact_input,
 )
 from exp.common.release_revision import installed_release_revision
-from exp.common.traces.ingest.otlp import TraceNormalizationResult
-from exp.common.traces.ingest.sources import CANONICAL_TRACE_SOURCES, load_trace_source
-from exp.runtime.gateway.ingest import load_gateway_capture
+from exp.common.traces.ingest.sources import CANONICAL_TRACE_SOURCES
 from exp.runtime.gateway.local_capture import local_capture_path
 from exp.runtime.models import (
     CapabilityRequirement,
@@ -258,20 +257,13 @@ def build(
             runtime_catalog,
             selected,
         )
-        _console.print("[dim]loading[/dim] Normalize trace evidence")
+        _console.print("[dim]loading[/dim] Import trace evidence and mine scenarios")
         path = _resolve_trace_file(trace_file)
         with progress_display(_console) as progress:
             report(progress, "normalization")
-            normalized = (
-                load_gateway_capture(path, identity_id=identity)
-                if identity is not None
-                else _load_canonical_traces(path, source)
+            normalized = load_build_traces(
+                project, root=root, path=path, source=source, identity=identity, dry_run=dry_run
             )
-            if not normalized.traces:
-                raise ValueError(
-                    "no valid canonical traces were produced; inspect the input and provide at "
-                    f"least one valid {source.strip().casefold()} trace"
-                )
             record_count = len(normalized.traces) + len(normalized.issues)
             report(
                 progress,
@@ -844,23 +836,6 @@ def _resolve_trace_file(trace_file: Path) -> Path:
             f"--traces must name a trace export, not a directory: {trace_file}"
         )
     return trace_file
-
-
-def _load_canonical_traces(path: Path, source: str) -> TraceNormalizationResult:
-    """Read a raw source once through its explicit canonical loader.
-
-    Args:
-        path: Validated local trace export.
-        source: Explicit supported source format.
-
-    Returns:
-        Canonical normalized trace result.
-
-    Raises:
-        TraceSourceError: The format is unsupported or normalization fails; the command's
-            `usage_error` boundary converts it (a `ValueError`) into `typer.BadParameter`.
-    """
-    return load_trace_source(source, path)
 
 
 def _capture_local_build_telemetry(

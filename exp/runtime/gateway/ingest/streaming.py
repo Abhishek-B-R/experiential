@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 from collections.abc import Iterator, Mapping
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 from exp.common.core.artifacts import SourceIdentity, canonical_json_bytes
@@ -45,8 +45,7 @@ def ingest_gateway_capture(
     Returns:
         Normalization counts and exclusions, plus a receipt unless dry_run.
     """
-    with normalization_workspace("chat-json") as normalized:
-        _stage_gateway(normalized, path, identity_id)
+    with normalized_gateway_capture(path, identity_id=identity_id) as normalized:
         return persist_normalized_import(
             project_id,
             root=root,
@@ -54,6 +53,22 @@ def ingest_gateway_capture(
             normalized=normalized,
             dry_run=dry_run,
         )
+
+
+@contextmanager
+def normalized_gateway_capture(path: Path, *, identity_id: str) -> Iterator[NormalizedSource]:
+    """Own one identity's frozen, normalized capture snapshot before shared writes.
+
+    Args:
+        path: Existing native capture database.
+        identity_id: Explicit identity whose retained evidence is selected.
+
+    Yields:
+        Private normalized evidence for validation, publication, and scenario building.
+    """
+    with normalization_workspace("chat-json") as normalized:
+        _stage_gateway(normalized, path, identity_id)
+        yield normalized
 
 
 def _stage_gateway(normalized: NormalizedSource, path: Path, identity_id: str) -> None:

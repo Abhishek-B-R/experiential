@@ -1,7 +1,8 @@
 # Local trace input
 
-`exp ingest PROJECT --traces PATH --source SOURCE` normalizes a local corpus and commits it to
-`<root>/gateway/traffic.db` (default root: `.exp`). Each source is declared, never guessed:
+`exp build PROJECT --traces PATH --source SOURCE` normalizes a local corpus, commits it to
+`<root>/gateway/traffic.db` (default root: `.exp`), then mines scenarios and prepares world-model
+grounding from that saved evidence. Each source is declared, never guessed:
 
 | `--source` | Local input |
 |---|---|
@@ -44,10 +45,11 @@ do not import runtime or simulation code. Gateway capture and protocol adapters 
 
 ## Stored evidence
 
-Ingest writes canonical traces and source provenance into the same SQLite content database as
+The ingestion stage writes canonical traces and provenance into the same SQLite content database as
 local gateway capture. Source files stay at the caller's path. The database owns normalized trace
 records, immutable imports, ordered import membership and project associations. It does not yet
-own the other project-folder artifacts. Import does not require an existing project configuration.
+own the other project-folder artifacts. The lower-level Python import API does not require an
+existing project configuration; the build command also prepares project state and scenarios.
 
 Canonical content is hashed independently of per-import source provenance, so overlapping exports
 can share identical normalized records. An import ID binds the source format, source digest,
@@ -62,6 +64,8 @@ the largest source record or trace, not the total archive. Compact exclusion and
 metadata is collected separately and still grows with record count. Temporary disk space is needed
 for the source snapshot, indexed records and normalized output; it is removed on ordinary completion
 or exception. An abruptly killed process can leave temporary files for operating-system cleanup.
+These memory bounds apply to source ingestion. Scenario mining and RAG preparation currently
+materialize the canonical corpus, so a complete build can use memory proportional to its size.
 
 Canonical records and import membership are written in short transactions targeting at most
 64 records or 1 MiB of serialized records per batch. These are buffer targets, not input limits:
@@ -74,8 +78,11 @@ see staging, so consumers must use the store's read methods.
 Gateway collection can acquire the writer lock between batches. Reads use their own SQLite
 snapshot. Unsupported database schemas fail before any settings or table changes.
 
-`--dry-run` validates without creating a database or project directory. Ingest has no trace-count
-minimum or total-count ceiling, and it performs no model setup, embedding, simulation or judging.
+`exp build --dry-run` uses temporary SQLite for ingestion. It may checkpoint deterministic project
+artifacts, but writes no shared trace import, makes no provider calls, and selects no completed
+build. The lower-level Python import API's `dry_run=True` writes no persistent storage. Ingestion
+has no trace-count minimum or total-count ceiling and performs no model calls; build requires at
+least one valid trace and uses the configured embedder after its cost preflight.
 `--source gateway --identity ID` defaults to this root's traffic database and reads all retained
 records for that identity, copying one row at a time from one snapshot to private disk. `--traces PATH` can select
 another explicit capture database. Identity is never inferred from the project name.
@@ -113,10 +120,12 @@ summary, receipt = ingest_gateway_capture(
 )
 ```
 
-`exp build` remains a separate workflow: it mines representative tasks, selects project model
-roles, estimates embedding cost, builds serving and fit-only RAG indexes, and binds the grounded
-world model under the configured spend ceiling. Its current CLI reads an explicit source corpus.
-Ingest alone does not run or select a build, and does not produce an evaluation or HTML report.
+Ingestion is the first stage of `exp build`. The command then mines representative tasks,
+selects project model roles, estimates embedding cost, builds serving and fit-only RAG indexes,
+and binds the grounded world model under the configured spend ceiling. Exact repeated builds
+reuse their saved evidence and completed indexes. Source imports and scenario artifacts remain
+immutable, preserving the evidence pinned by earlier evaluations. Preparation alone produces no
+evaluation or HTML report; those are outputs of running and judging candidate rollouts.
 
 ## Authorized PostHog HogQL pull
 

@@ -17,7 +17,6 @@ from exp.cli.gateway.serve import (
     DEFAULT_MAX_ACTIVE_REQUESTS,
     run,
 )
-from exp.cli.ingest.app import ingest
 from exp.cli.shared.defer import add_deferred_typer
 from exp.cli.shared.options import ROOT_OPTION
 from exp.common.config import load_env_file
@@ -35,8 +34,7 @@ add_deferred_typer(
     help="Optimize supported frozen project artifacts.",
     known_names=("router", "model"),
 )
-app.command("ingest", help="Store file or gateway traces in local SQLite.")(ingest)
-app.command("build", help="Build a reusable grounded world model from local trace evidence.")(build)
+app.command("build", help="Import traces, mine scenarios, and build a grounded world model.")(build)
 app.command("run", help="Run the local gateway, optionally with one project-backed alias.")(run)
 app.command(
     "login",

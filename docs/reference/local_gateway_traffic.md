@@ -20,15 +20,15 @@ router project is required. Traffic using your own provider keys is included.
 exp run --root .exp
 # Send ordinary requests with an issued gateway key.
 # Stop the gateway; the bounded writer drains during graceful shutdown.
-exp ingest support --source gateway --identity default --root .exp
+exp build support --source gateway --identity default --root .exp
 ```
 
-Ingest reads and writes `.exp/gateway/traffic.db`, separate from content-free accounting.
+Build reads and writes `.exp/gateway/traffic.db`, separate from content-free accounting.
 Use `--traces /absolute/path/traffic.db` to read another explicit capture file.
-The identity is mandatory; omitting it never means all identities. Ingest preserves an immutable
-normalized snapshot and project association without provider calls or a project directory.
-`exp build --source gateway --identity ID` separately runs the grounded-build workflow
-with its normal cost estimate and consent.
+The identity is mandatory; omitting it never means all identities. Build first preserves an
+immutable normalized snapshot and project association, then mines scenarios and prepares their
+world-model grounding. Source ingestion makes no provider calls; embedding work follows the
+normal build cost estimate and consent.
 
 Capture configuration, record contracts and the read-only store live under
 `exp/runtime/gateway/`; trace normalization remains in `exp/common/traces/ingest/`.

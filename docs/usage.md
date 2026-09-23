@@ -10,8 +10,7 @@ The root surface is deliberately small:
 | `exp` | Open the branded home screen. `Run Gateway` is the first option and runs setup when needed. | Interactive gateway menu, or the default gateway in a non-interactive terminal. |
 | `exp login [--root ROOT]` | Sign in to Experiential Cloud through the Platform browser approval flow, save the returned organization key, and synchronize the authenticated account's model identities. | User-local credential plus secret-free hosted provider/model records in `.exp/models.toml`. |
 | `exp run [PROJECT] [--root ROOT] [--check]` | Start the local gateway directly, optionally with one project-backed alias. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
-| `exp ingest PROJECT --traces PATH --source chat-json` | Import canonical file or gateway traces. | Immutable imports and project associations in `gateway/traffic.db`. |
-| `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Launch the guided end-to-end build when traces are omitted, or use one explicit local source for automation. | Simulation, serving RAG, fit RAG, syllabus, evaluation evidence, and a runnable automatic router. |
+| `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Import file or gateway traces, mine scenarios, and prepare world-model grounding; omitting traces opens the guided build. | Canonical imports in `gateway/traffic.db`, versioned scenarios, serving RAG, fit RAG and a grounded world model. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
 | `exp optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
 | `exp --root ROOT [--check]` | Validate or start the initialized authenticated default gateway on loopback; the native data plane serves every route, including Chat Completions, Responses, and Anthropic Messages. | OpenAI-compatible and Anthropic Messages endpoints, readiness routes, and content-free usage view. |
@@ -146,12 +145,13 @@ Completions plus Responses, and stream plus non-stream calls. Provider protocol 
 deterministic. Hosted-provider runs require credentials and are reported separately in
 [`release-scope.md`](release-scope.md); fixture success is not presented as a live-provider result.
 
-The guided build uses one bounded consent to create simulation evidence, separate serving and fit
-RAG indexes, a judge syllabus, closed-loop candidate evaluations, and a runnable router. Human
-judge calibration is recommended but optional: provisional judgment provenance remains visible,
-and later approval plus another build creates an immutable human-calibrated successor. Running the
-endpoint records traffic by default so a later optimization can use newly attributed outcomes.
-Explicit trace automation can still stop after the grounded build, then use
+The guided build defaults to importing traces, mining scenarios, and creating separate serving
+and fit RAG indexes with world-model grounding. Judge editing, calibration, and router optimization
+are explicit optional steps. Selecting router optimization uses one bounded consent for the
+combined build and evaluation schedule. Human judge calibration is recommended but optional:
+provisional judgment provenance remains visible, and later approval creates an immutable
+human-calibrated successor. Running the endpoint records traffic by default so a later optimization
+can use newly attributed outcomes. Completed grounded projects can use
 [`router-optimization.json`](reference/router_optimization_config.md) with `exp optimize router`.
 Router fitting never invokes world-model fidelity testing. Applications that need a world-model
 quality measurement can call the separate `build_fidelity_evaluation_plan` and
@@ -172,22 +172,25 @@ of OpenAI user or tool messages, and `terminal`. Tool observations are nontermin
 consume them before producing its final answer. World-model artifacts pin the v2 prompt; rebuild
 projects created with a different prompt before running them.
 
-### Ingest a trace export
+### Build scenarios from traces
 
 ```bash
-exp ingest powerset --traces rollouts.jsonl --source chat-json --root .exp
-exp ingest powerset --source gateway --identity default --root .exp
+exp build powerset --traces rollouts.jsonl --source chat-json --root .exp
+exp build powerset --source gateway --identity default --root .exp
 ```
 
-Ingest stores canonical traces in `.exp/gateway/traffic.db`, alongside native gateway captures.
+Build first stores canonical traces in `.exp/gateway/traffic.db`, alongside native gateway captures.
 It preserves initial system/developer instructions, declared tool schemas, paired tool results,
 source provenance, normalization exclusions and model identity evidence. The receipt identifies
 an immutable import associated with the project. Repeating an unchanged import reuses its records
 and association; changed source content produces a new import without overwriting earlier evidence.
 
-No model setup, embedding, simulation or judging runs. No project folder is created.
-`--dry-run` validates the source and reports accepted/excluded records without writing anything.
-A terminal can prompt for the source file and format; automation supplies `--traces` explicitly.
+It then mines scenarios from that saved evidence, writes immutable task sets and prepares
+world-model grounding. Model roles belong to the project; embedding work uses the normal cost
+preflight. An unchanged completed build reuses its scenarios and indexes without new provider calls.
+`--dry-run` uses temporary SQLite for source ingestion and may checkpoint deterministic project
+evidence, but makes no provider calls, durable trace imports, or completed-build selection.
+The interactive build prompts for an explicit source file; automation supplies `--traces`.
 OTel sources (`otlp`, `otel-genai`) and completed exported chat captures (`experiential`) use the
 same persistence path. See [trace input and storage](reference/ingest.md) for the Python API.
 
@@ -195,7 +198,9 @@ Native capture exports must contain completed JSON Chat Completions responses. E
 captures as reconstructed `chat-json`, or use `--source gateway` to consume the native database's
 JSON/SSE captures. Incomplete or refused exports appear as explicit exclusions. Chat exports
 without timestamps retain synthetic ordering markers and do not imply measured latency.
-There is no minimum or maximum import count.
+There is no minimum or maximum import count; a build requires at least one valid trace.
+Source ingestion streams through disk-backed staging. Scenario mining and RAG preparation
+currently materialize the canonical corpus, so the whole build's memory grows with that corpus.
 
 ### Local gateway traffic
 

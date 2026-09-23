@@ -16,6 +16,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 
+from exp.cli.build.traces import load_build_traces
 from exp.cli.build.wizard_screens import (
     WizardBuildPlan,
 )
@@ -262,8 +263,7 @@ def run_build_wizard(
                 return
 
     if not selection.router:
-        console.print("[green]Done[/green] Router optimization was not selected.")
-        console.print(f"  next  rerun exp build {project} and include router optimization")
+        console.print("[green]Complete[/green] Scenarios and world-model grounding are ready.")
         return
     assert cost_plan is not None
     options = replace(
@@ -552,7 +552,6 @@ def _prepare_new_build(
     """
     from exp.cli.build.app import (
         _embedding_cost_ceiling,
-        _load_canonical_traces,
         _missing_build_configuration,
         _project_store,
         _reuse_completed_grounded_artifacts,
@@ -561,9 +560,7 @@ def _prepare_new_build(
     )
     from exp.cli.providers.setup import ProviderSetupOptions, run_provider_setup
 
-    normalized = _load_canonical_traces(trace_path, source)
-    if not normalized.traces:
-        raise ValueError("selected trace source produced no valid canonical traces")
+    normalized = load_build_traces(project, root=root, path=trace_path, source=source)
     catalog_path = root / "models.toml"
     existing_catalog = load_model_catalog(catalog_path) if catalog_path.exists() else None
     if _missing_build_configuration(existing_catalog):
