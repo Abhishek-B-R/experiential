@@ -33,8 +33,8 @@ from exp.runtime.gateway.contracts import (
     GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
-    GatewayUsage,
 )
+from exp.runtime.gateway.disconnect_estimate import settled_terminal
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.lane_saturation import lane_saturated_failure, overflow_target
 from exp.runtime.gateway.native_accounting_errors import (
@@ -70,7 +70,6 @@ from exp.runtime.gateway.native_settlement import (
     first_token_at_from_settlement,
     ledger_failure,
     settlement_rate_limit,
-    terminal_from_settlement,
     tool_search_requests_from_terminal,
     tool_search_requests_kwarg,
     upstream_provider_from_settlement,
@@ -654,7 +653,7 @@ class NativeAttemptAccounting:
         attempt_id = str(data["attempt_id"])
         finalize = bool(data.get("finalize", True))
         opened = bool(data.get("opened", False))
-        terminal, failure = terminal_from_settlement(data, surface=entry.authorization.surface)
+        terminal, failure = settled_terminal(data, entry)
         first_token_at = first_token_at_from_settlement(data)
         rate_limit = settlement_rate_limit(data)
         upstream = upstream_provider_from_settlement(data)
@@ -686,7 +685,7 @@ class NativeAttemptAccounting:
                 entry.pending_settlement = data
             raise authority_error(exc) from exc
         self._record_health(entry, attempt_id, opened=opened, failure=failure)
-        self._record_cache_fraction(entry, attempt_id, terminal.usage)
+        self._record_cache_fraction(entry, attempt_id, terminal)
         with self._lock:
             if finalize:
                 self._inflight.pop(request_id, None)
@@ -819,24 +818,24 @@ class NativeAttemptAccounting:
         self,
         entry: InflightRequest,
         attempt_id: str,
-        usage: GatewayUsage | None,
+        terminal: GatewayEvent,
     ) -> None:
         """Fold one settled attempt's cached-token fraction into the registry.
 
-        Feeds the congestion-dependent cache-priority term: the registry keeps
-        a per-(organization, rung) EWMA of the settled cached fraction, so
-        fairness can favor the organization whose traffic actually reuses warm
-        provider cache. Attempts without observed token usage record nothing,
-        and one attempt folds at most once: a settlement can reach the ledger
-        through both the direct path and the retained-settlement sweep (each
-        idempotent there), and a duplicate fold would skew the estimate.
+        Feeds the congestion-dependent cache-priority term (a per-(organization,
+        rung) EWMA of the settled cached fraction, so fairness favors traffic
+        that reuses warm provider cache). Attempts without an observed input
+        count record nothing: an estimated disconnect meter has no cache legs.
+        One attempt folds at most once, whichever of the direct path and the
+        retained-settlement sweep lands it, so a duplicate cannot skew the EWMA.
 
         Args:
             entry: The owning in-flight request.
             attempt_id: The settled attempt.
-            usage: The terminal event's usage, if any.
+            terminal: The settled terminal event.
         """
-        if usage is None or usage.input_tokens is None:
+        usage = terminal.usage
+        if usage is None or usage.input_tokens is None or terminal.usage_estimated:
             return
         depth = entry.attempt_depths.get(attempt_id)
         if depth is None:
@@ -897,9 +896,7 @@ class NativeAttemptAccounting:
             settlement = entry.pending_settlement
             if settlement is None:
                 continue
-            terminal, failure = terminal_from_settlement(
-                settlement, surface=entry.authorization.surface
-            )
+            terminal, failure = settled_terminal(settlement, entry)
             if self._settle_swept(
                 request_id,
                 entry,
@@ -990,7 +987,7 @@ class NativeAttemptAccounting:
         # A retained settlement that finally lands through the sweep carries
         # the same observed usage as the direct path, so the cache-priority
         # EWMA must not depend on WHICH recovery path succeeded.
-        self._record_cache_fraction(entry, attempt_id, terminal.usage)
+        self._record_cache_fraction(entry, attempt_id, terminal)
         with self._lock:
             if finalize:
                 self._inflight.pop(request_id, None)
