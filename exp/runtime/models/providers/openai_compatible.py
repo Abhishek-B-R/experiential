@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import ClassVar, Literal, cast
@@ -48,6 +49,7 @@ from exp.runtime.models.providers.errors import (
     ProviderRefusalSignal,
     ProviderResponseError,
     ProviderRetryableResponseError,
+    ProviderTruncatedResponseError,
     require_array,
     require_integer,
     require_object,
@@ -295,7 +297,10 @@ def openai_compatible_response(
     content = content_value if isinstance(content_value, str) else None
     tool_call_values = _array_or_empty(message)
     tool_calls = tuple(
-        parse_openai_wire_tool_call(value, index) for index, value in enumerate(tool_call_values)
+        parse_openai_wire_tool_call(
+            value, index, hit_length_limit=choice.get("finish_reason") == "length"
+        )
+        for index, value in enumerate(tool_call_values)
     )
     try:
         output = AssistantAction(content=content, tool_calls=tool_calls)
@@ -707,12 +712,15 @@ def _openai_message(
     return payload
 
 
-def parse_openai_wire_tool_call(value: object, index: int) -> ToolCall:
+def parse_openai_wire_tool_call(
+    value: object, index: int, *, hit_length_limit: bool = False
+) -> ToolCall:
     """Parse one OpenAI-wire tool call without accepting malformed JSON arguments.
 
     Args:
         value: One decoded ``tool_calls`` array element.
         index: Zero-based array position used in error messages.
+        hit_length_limit: Retained termination flag permits only EOF truncation classification.
 
     Returns:
         The typed tool call with its arguments decoded as a JSON object.
@@ -731,6 +739,11 @@ def parse_openai_wire_tool_call(value: object, index: int) -> ToolCall:
     try:
         arguments = json.loads(raw_arguments)
     except json.JSONDecodeError as exc:
+        if hit_length_limit and _incomplete_json_object_prefix(raw_arguments):
+            raise ProviderTruncatedResponseError(
+                f"tool_calls[{index}].function.arguments ended inside JSON "
+                "at the response length boundary"
+            ) from exc
         raise OpenAICompatibleResponseError(
             f"tool_calls[{index}].function.arguments is not JSON"
         ) from exc
@@ -744,6 +757,87 @@ def parse_openai_wire_tool_call(value: object, index: int) -> ToolCall:
         arguments=arguments,
         raw_arguments=raw_arguments,
     )
+
+
+_JSON_STRING_CHAR = r'(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))'
+_JSON_NUMBER = r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"
+_JSON_SCALAR = re.compile(rf'"{_JSON_STRING_CHAR}*"|true|false|null|{_JSON_NUMBER}')
+_JSON_INCOMPLETE_SCALAR = re.compile(
+    rf'"{_JSON_STRING_CHAR}*(?:\\(?:u[0-9a-fA-F]{{0,3}})?)?'
+    r"|t|tr|tru|f|fa|fal|fals|n|nu|nul|-"
+    r"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?[eE][+-]?"
+    r"|-?(?:0|[1-9][0-9]*)\."
+)
+
+
+def _incomplete_json_object_prefix(value: str) -> bool:
+    """Whether appending bytes could complete an unfinished JSON object.
+
+    Track container grammar as well as tokens: EOF inside a literal, exponent
+    or escape is recoverable only when all preceding structure is valid. This
+    neither repairs arguments nor accepts a complete non-object value.
+
+    Args:
+        value: Exact decoded tool-argument string rejected by the JSON parser.
+
+    Returns:
+        True only when appending characters could complete the started JSON object
+        without changing its existing tokens or container grammar.
+    """
+    if not value.lstrip(" \t\r\n").startswith("{"):
+        return False
+    position = 0
+    states = ["end", "value"]
+    while states:
+        state = states.pop()
+        while position < len(value) and value[position] in " \t\r\n":
+            position += 1
+        if position == len(value):
+            return state != "end"
+        char = value[position]
+        if state == "end":
+            return False
+        if state == "object_first":
+            if char == "}":
+                position += 1
+                continue
+            state = "key"
+        if state == "array_first":
+            if char == "]":
+                position += 1
+            else:
+                states.extend(("array_next", "value"))
+            continue
+        if state in ("object_next", "array_next"):
+            if char == ("}" if state == "object_next" else "]"):
+                position += 1
+                continue
+            if char != ",":
+                return False
+            states.extend(("key",) if state == "object_next" else ("array_next", "value"))
+            position += 1
+            continue
+        if state == "colon":
+            if char != ":":
+                return False
+            states.extend(("object_next", "value"))
+            position += 1
+            continue
+        if state == "key":
+            if char != '"':
+                return False
+            states.append("colon")
+        elif char in "{[":
+            states.append("object_first" if char == "{" else "array_first")
+            position += 1
+            continue
+        if _JSON_INCOMPLETE_SCALAR.fullmatch(value, position):
+            return True
+        scalar = _JSON_SCALAR.match(value, position)
+        if scalar is None:
+            return False
+        position = scalar.end()
+    return False
 
 
 def _array_or_empty(message: JsonObject) -> list[JsonValue]:
