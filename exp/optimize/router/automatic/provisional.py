@@ -22,6 +22,7 @@ from exp.common.models import (
     ModelSnapshot,
     completion_cost_reservation,
 )
+from exp.common.models.catalog_prices import GatewayTokenPrices
 from exp.common.project import (
     ProjectHostedJudgeEvidence,
     ProjectStore,
@@ -111,6 +112,7 @@ def prepare_hosted_provisional_judge(
             request_reservation=_judge_request_reservation(
                 capabilities,
                 judge_model=judge_model,
+                token_prices=catalog.models[models.judge].token_prices,
                 maximum_input_tokens=maximum_input_tokens,
                 maximum_output_tokens=maximum_output_tokens,
                 maximum_attempts=maximum_attempts,
@@ -178,6 +180,7 @@ def prepare_hosted_provisional_judge(
     request = _judge_request_reservation(
         capabilities,
         judge_model=judge_model,
+        token_prices=catalog.models[models.judge].token_prices,
         maximum_input_tokens=maximum_input_tokens,
         maximum_output_tokens=maximum_output_tokens,
         maximum_attempts=maximum_attempts,
@@ -429,6 +432,7 @@ def _judge_request_reservation(
     maximum_input_tokens: int | None,
     maximum_output_tokens: int,
     maximum_attempts: int,
+    token_prices: GatewayTokenPrices | None,
 ) -> CompletionCostReservation:
     """Build one complete judge request reservation from static catalog declarations.
 
@@ -438,6 +442,7 @@ def _judge_request_reservation(
         maximum_input_tokens: Input ceiling, or None to use model capacity minus output.
         maximum_output_tokens: Per-call output ceiling.
         maximum_attempts: Per-call retry ceiling.
+        token_prices: Exact authored judge schedule, or explicit None for four-rate pricing.
 
     Returns:
         Conservative retry-inclusive completion reservation.
@@ -468,6 +473,7 @@ def _judge_request_reservation(
     assert cached_price is not None and cache_write_price is not None
     return completion_cost_reservation(
         model=judge_model,
+        token_prices=token_prices,
         input_usd_per_million_tokens=input_price,
         output_usd_per_million_tokens=output_price,
         cached_input_usd_per_million_tokens=cached_price,

@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.runtime.gateway.contracts import (
     ChoiceLogprobs,
     GatewayEvent,
@@ -837,40 +836,6 @@ class ResponsesSseEncoder:
         )
 
 
-def encode_chat_events(encoder: ChatSseEncoder, events: Iterable[GatewayEvent]) -> tuple[str, ...]:
-    """Encode one complete deterministic Chat event fixture.
-
-    Args:
-        encoder: Fresh Chat encoder.
-        events: Ordered provider events ending in one terminal.
-
-    Returns:
-        Complete SSE frame sequence.
-    """
-    frames = list(encoder.start())
-    for event in events:
-        frames.extend(encoder.feed(event))
-    return tuple(frames)
-
-
-def encode_responses_events(
-    encoder: ResponsesSseEncoder, events: Iterable[GatewayEvent]
-) -> tuple[str, ...]:
-    """Encode one complete deterministic Responses event fixture.
-
-    Args:
-        encoder: Fresh Responses encoder.
-        events: Ordered provider events ending in one terminal.
-
-    Returns:
-        Complete named SSE lifecycle.
-    """
-    frames = list(encoder.start())
-    for event in events:
-        frames.extend(encoder.feed(event))
-    return tuple(frames)
-
-
 def _required_index(event: GatewayEvent) -> int:
     """Return one required tool-call index or reject malformed provider state."""
     if event.tool_call_index is None:
@@ -916,8 +881,14 @@ def _chat_usage(usage: GatewayUsage) -> JsonObject:
                 if usage.cache_creation_input_tokens is not None
                 else {}
             ),
+            **(
+                {"cache_write_1h_tokens": usage.cache_creation_1h_input_tokens}
+                if usage.cache_creation_1h_input_tokens is not None
+                else {}
+            ),
         },
         "completion_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},
+        **_unreported_usage_details(usage),
     }
 
 
@@ -934,11 +905,31 @@ def _responses_usage(usage: GatewayUsage | None) -> JsonObject | None:
         "input_tokens_details": {
             "cached_tokens": usage.cached_input_tokens or 0,
             "cache_write_tokens": usage.cache_creation_input_tokens or 0,
+            **(
+                {"cache_write_1h_tokens": usage.cache_creation_1h_input_tokens}
+                if usage.cache_creation_1h_input_tokens is not None
+                else {}
+            ),
         },
         "output_tokens": usage.output_tokens,
         "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},
         "total_tokens": usage.input_tokens + usage.output_tokens,
+        **_unreported_usage_details(usage),
     }
+
+
+def _unreported_usage_details(usage: GatewayUsage) -> JsonObject:
+    """Disclose missing meters without violating required integer wire shapes."""
+    fields: list[JsonValue] = [
+        name
+        for name, count in (
+            ("cached_tokens", usage.cached_input_tokens),
+            ("cache_write_tokens", usage.cache_creation_input_tokens),
+            ("reasoning_tokens", usage.reasoning_tokens),
+        )
+        if count is None
+    ]
+    return {"unreported_token_details": fields} if fields else {}
 
 
 def _reasoning_envelope(request: GatewayRequest) -> JsonObject:

@@ -310,12 +310,12 @@ cache-marker reordering never demotes it while dispatchable, and a dispatch-poli
 authored per-worker `requests_per_minute`, `tokens_per_minute` or `concurrency_bound`) force-admits
 it as `saturated_overflow` instead of spilling to a stripped fallback. A continuation whose sealed
 carriers all precede the latest user message carries no active reasoning and routes as a plain
-request; a single-rung pool has no fallback. A carrier that authenticates but arrives on an EDITED
-turn (a changed tool-call id, name or argument, visible text, or conversation prefix; OpenCode echoes
-a schema-invalid tool call as a call to its `invalid` tool) is dropped unrevealed, never refused,
-and disclosed as `messages.reasoning_content->dropped(assistant_turn_changed)`; a later carrier
-sealed over it fails its prefix binding and drops too, while an earlier intact one still pins.
-Authentication or authority failures (tamper, retagging, credential rotation) are still refused.
+request; a single-rung pool has no fallback. An authentic carrier on an EDITED turn (changed tool
+call, visible text or prefix; OpenCode echoes a schema-invalid call as its `invalid` tool) drops
+unrevealed, disclosed as `messages.reasoning_content->dropped(assistant_turn_changed)`, as does one
+whose issuing rung left the route (a lane closed on exhausted credit): `issuing_route_unavailable`.
+A later carrier sealed over a dropped turn fails its prefix binding and drops too; an earlier intact
+one still pins. Authentication or authority failures (tamper, rotation) are still refused.
 
 First-party CLI compatibility is capture-driven: the fields real Claude Code and Codex send by
 default are accepted and preserved. On the Messages surface, `output_config` forwards verbatim on
@@ -644,7 +644,11 @@ payload to the sealed carrier that admission authenticates and pins to its issui
 dropping the unsigned display duplicate beside it. On the Responses surface over Anthropic routes,
 thinking text is projected onto the reasoning-summary channel (signatures deliberately dropped)
 so callers receive the reasoning they pay for, while the Chat surface has no reasoning
-representation and drops it like summary deltas. Streaming emits the Anthropic
+representation and drops it like summary deltas. The same channel carries an exposure-gated
+rung's plaintext on the Responses surface: the route reasoning item streams it as one
+`summary_text` part and still carries the sealed carrier as `encrypted_content` on tool turns,
+so the replay contract is unchanged (the decoder reads the carrier and ignores the summary).
+Streaming emits the Anthropic
 lifecycle (`message_start`, `ping`, content blocks, `message_delta` with the mapped stop reason
 and usage, `message_stop`, or one terminal `error` event); the non-streaming body is the
 Anthropic message object. Completed streams stop with `end_turn` (`tool_use` when tool calls are
@@ -767,7 +771,7 @@ reasoning. Missing or null values remain absent. Plaintext is bounded to 8,388,6
 values exceeding that limit receive a named error with the limit and a retry instruction.
 Route narrowing prefers exposing rungs and discloses
 `messages.reasoning_content->dropped(unsupported_by_provider)` when a rung cannot replay it,
-including routes with no exposing rung.
+including routes with no exposing rung. Reasoning display, which every rung does by default and which never changes replay, is described in [gateway-reasoning-display.md](gateway-reasoning-display.md).
 
 A rung whose chat template accepts a system message only as the very first message declares
 `system_messages_leading_only` (the official Qwen3.6+ `chat_template.jinja` raises
@@ -843,8 +847,7 @@ narrows to a strict-capable rung when the route has one and otherwise drops only
 a schema keyword. The same validator requires `additionalProperties: false` on every object, so
 strict tool schemas reaching an Anthropic rung have their objects closed with the
 `tools.parameters.additionalProperties->false` disclosure, exactly like structured-output schemas.
-The `capability_parity` row reports the per-release forced-choice fact as
-`supports_forced_tool_choice`. On the OpenAI-compatible Chat Completions wire a canonical
+On the OpenAI-compatible Chat Completions wire a canonical
 `developer` message is emitted as `system` without disclosure: OpenAI defines the two roles
 identically (developer-provided instructions the model follows regardless of user messages),
 while the third-party servers behind that dialect enumerate only the classic roles and reject
@@ -867,10 +870,10 @@ Gemini uses `responseMimeType: "application/json"` without a schema. Anthropic/B
 best-effort system instruction, disclosed as `response_format->instruction(json_object)`.
 Every wire receives a counted JSON-object instruction; native format fields are retained.
 No empty schema is synthesized. Use `json_schema` when a supported route must enforce a shape.
-A caller `service_tier` on the OpenAI-family surfaces forwards verbatim
-only on rungs dispatching tenant-owned (BYOK) credentials, where the caller pays the provider
-directly; host-funded rungs never emit it (the tier changes provider pricing while the gateway
-bills catalog rates) and a route with no eligible rung drops it with disclosure. Anthropic's own
+Chat and Responses normalize `service_tier: "fast"` to `priority`; BYOK forwarding and auto/default behavior stay unchanged.
+Host tiers require enabled cards; priority selects eligible rungs, never a standard-only lead. Admission freezes standard and requested schedules, including long-context/cache writes, and reserves the larger bound.
+Hosts persist `GatewayServiceTierAdmission` and validate `GatewayServiceTierSettlement` against it, never against live catalog or provider-authored prices.
+Settlement prices the served tier (Responses terminal evidence, not its created echo); missing, unknown or conflicting evidence holds the reservation without charging or releasing it. Anthropic's own
 `service_tier` stays a recorded Messages-surface rejection. A caller top-level `provider` object (OpenRouter's routing-preference shape) is accepted on all three surfaces, Messages included (Anthropic SDKs send it through `extra_body`); exactly one key changes gateway behavior: `provider: {"zdr": true}` DEMANDS zero-data-retention routing for that request, carried as `GatewayRequest.zdr_requested` and `AuthorizationSnapshot.zdr_requested`. A host that publishes provider data-retention postures applies the same posture filter as its organization-level `require_zdr` (natively ZDR rungs first, then an OpenRouter rung dispatched under `provider: {"zdr": true, "data_collection": "deny"}` plus `X-OpenRouter-Metadata: enabled`, flagged through `ExecutionSnapshot.zdr_constrained_deployment_ids`), answers `x-gateway-zdr: true`, and refuses with a 403 naming the excluded providers when no rung qualifies; the demand only tightens and never loosens an organization policy, and the local gateway (no postures) refuses it with a 403 on `provider.zdr`.
 The rest of the object (`data_collection`, `order`, `only`, ...) forwards to OpenRouter rungs verbatim (tightened when the rung is constrained) and is dropped on every other wire (`openai_responses`, `anthropic_messages`, `gemini_generate_content`, `bedrock_converse_stream`, and non-OpenRouter `openai_compatible` rungs), which have no such field. On `maximize_cache` pools, a cache-marked request dispatches
 marker-honoring (Anthropic Messages) rungs before marker-dropping wires, stably within each
@@ -929,9 +932,6 @@ SDK accumulators (Python and TypeScript) copy every usage field present on `mess
 their final message shows the true counts. The estimate is display-only: the encoder keeps it
 apart from the usage it settles from, so it never reaches `message_delta` or the ledger, which
 bill the provider's report.
-The per-deployment `capability_parity` export joins catalog declarations with provider-family ground truth so catalogs can warn about gaps and route around them.
-Schema version 7 additionally projects `supports_prompt_cache_boundaries`, `supports_custom_tools`, `supports_grammar_tools`, `supports_tool_call_limit`, `reports_model_status`, and the existing `reports_reasoning_tokens` declaration.
-These declarations default false and never enable a request feature. Cache boundaries mean explicit breakpoints and retention, not implicit prefix caching. Read tool flags with the row's `dialect` and public API surface: Chat still refuses custom and grammar tools; Responses still refuses `max_tool_calls`.
 Gemini `modelStatus` is not preserved; catalogs must leave `reports_model_status` false until the response contract carries it.
 
 Commit-independent headers are available before streaming begins. Route-dependent headers are
@@ -959,6 +959,7 @@ alias-revision-scoped stores. A `store: false` request skips continuation retent
 OpenAI Responses routes, whose opaque payloads replay verbatim from the caller's input; the
 replayed reasoning item's `id` is never forwarded upstream because the provider binds the
 encrypted payload to its original item id and callers echo this gateway's own minted public ids.
+On a route whose every rung is one gateway reasoning-carrier scheme (Fireworks, or Hunyuan, which also covers a rung declaring `reasoning_content_native`), the same include returns the sealed tool-turn carrier as the reasoning item's `encrypted_content` and the decoder recognizes a replayed carrier by its scheme prefix, so a Codex-style `store: false` loop keeps the thinking across tool calls (the replayed summary text is kept for trace capture only); rungs that cannot carry that scheme are narrowed out, and a route left with none refuses the include.
 The provider also binds the payload to the organization (Azure: the tenant) that sealed it, so a replayed item another lane, account, or tool produced is refused with `invalid_encrypted_content` whatever rung dials; the data plane treats that refusal as a repair, not a verdict, whether the refusal arrives before the stream (OpenAI's 4xx) or inside it (OpenRouter's Responses relay answers 200 and fails the stream on its first frame under `invalid_prompt`): the waterfall re-dials the SAME rung once through a new reservation when the [request attempt budgets](gateway-request-policy.md) permit it, with every replayed reasoning item carrying `encrypted_content` stripped (message, tool-call, and tool-result items keep their positions; the calls and assistant message of a stripped turn lose their provider `id`, which the provider would tie back to the missing reasoning item), remembers that stripped payload for every later dial of the rung in the same request (a throttle redial never earns the refusal twice; another rung starts from the original, since its account may decrypt it), and remembers per worker, for 30 minutes after their last replay and up to 100,000 entries, the digests of the refused payloads (the one the provider quoted, else every one present; salted by the caller's organization and identity ids as admission names them, never by the request's bearer, which in a hosted worker is the front's ephemeral exchanged token, so one caller's memory never touches another's) so a LATER request that replays them is stripped of exactly those items before its first dial (`encrypted_reasoning_stripped_proactive`), with the reactive repair still behind it, and discloses a served repair through the `x-gateway-replay-repair: encrypted_reasoning_stripped` header (HTTP responses only), the `encrypted_reasoning_stripped` data-plane counter, and one content-free operator line, each written only once the re-dial opened.
 The verdict is read through the shared OpenAI-family envelope reader: OpenAI's and Azure's `error.code`, OpenAI's fixed sentence when a relay such as Novita re-envelopes the refusal without the code, and the document OpenRouter relays under `error.metadata.raw`; hidden reasoning continuity is lost for the stripped items only; without the memory the repair would RECUR on every later turn (the stateless caller keeps the foreign items and a `previous_response_id` continuation retains the turn as replayed; production 2026-09-15: about 74 refused dials a minute, 82% of one tenant's agent turns), so a conversation now pays the refused dial once per worker that serves it; a refusal of the stripped payload itself, or a payload with nothing to strip, surfaces the provider's 400 unchanged. Replay is opt-in through the standard `Idempotency-Key` header only;
 `X-Client-Request-Id` is caller correlation identity (Codex sends its session id there on

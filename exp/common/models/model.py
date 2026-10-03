@@ -84,12 +84,28 @@ class Usage(ContractModel):
     replace the total input count and must not be added a second time by callers.
     ``output_tokens`` is total generated usage, including provider-reported reasoning tokens;
     reasoning is a subset and must not be added again.
+
+    Attributes:
+        input_tokens: Total observed input, including cache-read and cache-write subsets.
+        output_tokens: Total observed generated tokens, including reasoning.
+        cached_input_tokens: Observed read subset, or None when unreported.
+        cache_write_input_tokens: Observed write subset, or None when unreported.
+        cache_write_1h_input_tokens: Observed one-hour portion of writes; zero and None differ.
+        reasoning_tokens: Observed reasoning portion of output, or None when unreported.
+        service_tier: Explicitly returned processing tier; None uses the ordinary request basis.
     """
 
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     cached_input_tokens: int | None = Field(default=None, ge=0)
     cache_write_input_tokens: int | None = Field(default=None, ge=0)
+    cache_write_1h_input_tokens: int | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
+    reasoning_tokens: int | None = Field(default=None, ge=0, exclude_if=lambda value: value is None)
+    service_tier: str | None = Field(
+        default=None, min_length=1, max_length=64, exclude_if=lambda value: value is None
+    )
 
 
 class NumericMeasurement(ContractModel):
@@ -111,15 +127,27 @@ class OperationEconomics(ContractModel):
 
     Attributes:
         provider_attempts: Observed dispatch attempts, or None when not reported.
+        unbilled_attempts: Trusted pre-dispatch refusals included in provider_attempts. Zero is
+            omitted from serialized evidence to preserve artifacts without admission retries.
         usage: Successful-response token accounting, when available.
         cost_usd: Observed or conservatively estimated provider charge.
         latency_seconds: Observed or estimated operation duration.
     """
 
     provider_attempts: int | None = Field(default=None, ge=1)
+    unbilled_attempts: int = Field(default=0, ge=0, exclude_if=lambda value: value == 0)
     usage: Usage | None = None
     cost_usd: NumericMeasurement | None = None
     latency_seconds: NumericMeasurement | None = None
+
+    @model_validator(mode="after")
+    def validate_unbilled_attempts(self) -> OperationEconomics:
+        """Require a complete observed attempt count before releasing known unpaid retries."""
+        if self.unbilled_attempts and (
+            self.provider_attempts is None or self.unbilled_attempts > self.provider_attempts
+        ):
+            raise ValueError("unbilled attempts require a matching observed total attempt count")
+        return self
 
 
 def combine_economics(
@@ -176,6 +204,24 @@ def _sum_usage(values: Sequence[Usage]) -> Usage:
         output_tokens=sum(value.output_tokens for value in values),
         cached_input_tokens=cached_total,
         cache_write_input_tokens=written_total,
+        cache_write_1h_input_tokens=_sum_optional_counts(
+            tuple(value.cache_write_1h_input_tokens for value in values)
+        ),
+        reasoning_tokens=_sum_optional_counts(tuple(value.reasoning_tokens for value in values)),
+        service_tier=(
+            values[0].service_tier
+            if all(value.service_tier == values[0].service_tier for value in values)
+            else None
+        ),
+    )
+
+
+def _sum_optional_counts(values: Sequence[int | None]) -> int | None:
+    """Sum one observed subset only when every constituent reports it."""
+    return (
+        sum(value for value in values if value is not None)
+        if all(value is not None for value in values)
+        else None
     )
 
 
@@ -504,6 +550,14 @@ class ModelCapabilities(ContractModel):
     wire on a carrier-route identity, so an absent capability fails closed and
     reasoning stays stripped even on an otherwise-exposable endpoint.
     """
+    reasoning_output_hidden: bool = False
+    """Whether this rung withholds its model's reasoning text from the caller.
+
+    Off by default: every rung returns the readable reasoning its provider
+    streams (plaintext reasoning, thinking, and reasoning summaries) as display
+    copy beside the content. Display never changes replay or the sealed
+    carrier. Stamping it is the per-rung operator opt-out.
+    """
     reasoning_content_native: bool = False
     """Whether this OpenAI-compatible rung speaks the native ``reasoning_content`` contract.
 
@@ -622,6 +676,7 @@ class ModelCapabilities(ContractModel):
             "reasoning_effort",
             "sampling_requires_reasoning_none",
             "reasoning_output_exposed",
+            "reasoning_output_hidden",
             "reasoning_content_native",
             "system_messages_leading_only",
             "chat_max_tokens_field",

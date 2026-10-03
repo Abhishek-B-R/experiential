@@ -22,7 +22,8 @@ from exp.common.core.artifacts import (
     canonical_json_bytes,
 )
 from exp.common.evaluations import EvaluationCell, EvaluationPlan
-from exp.common.evaluations.build_test import _snapshot, _store
+from exp.common.evaluations.build_test import _snapshot as _base_snapshot
+from exp.common.evaluations.build_test import _store
 from exp.common.models import (
     AssistantAction,
     CompletionCostReservation,
@@ -54,6 +55,7 @@ from exp.common.tasks import TaskCase, TaskSet, ToolSchema
 from exp.runtime.agents import AgentEpisode, AgentRuntime
 from exp.runtime.environments import EnvironmentSession
 from exp.runtime.models import ResolvedModel
+from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.providers.errors import ProviderRefusalError, ProviderRefusalSignal
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.simulation.engines.text.bindings import (
@@ -403,6 +405,20 @@ def _grounded_world_model_input() -> ArtifactInput:
     return ArtifactInput(artifact_id="grounded-world-model", sha256="e" * 64)
 
 
+def _snapshot(alias: str) -> ModelSnapshot:
+    """Pin the grounded fixture world model to its actual declared capacities."""
+    snapshot = _base_snapshot(alias)
+    if alias == "world-model-a":
+        return snapshot.model_copy(
+            update={
+                "capabilities_sha256": ModelCapabilities(
+                    context_window_tokens=100_000, maximum_output_tokens=16_000
+                ).identity_sha256()
+            }
+        )
+    return snapshot
+
+
 def _grounded_world_model(
     world_client: ModelClient,
     retriever: TraceRAGRetriever,
@@ -437,6 +453,7 @@ def _grounded_world_model(
         ),
         retriever=retriever,
         client=world_client,
+        capabilities=ModelCapabilities(context_window_tokens=100_000, maximum_output_tokens=16_000),
     )
 
 
@@ -596,7 +613,7 @@ def _spec(
         "world_model": WorldModelSettings(
             world_model_alias="world-model-a",
             grounded_world_model_input=grounded_input,
-            prompt_version="text-world-model-v2",
+            prompt_version="text-world-model-v3",
             query_embedding=query_embedding or _query_embedding(),
         ),
         "seed": 11,
@@ -620,6 +637,7 @@ def _simulator(
     fit_retriever: TraceRAGRetriever | _FitRetriever | None = None,
     fit_rag_input: ArtifactInput | None = None,
     completion_contract_input: ArtifactInput | None = None,
+    request_budget: RequestBudget | None = None,
 ) -> WorldModelSimulator:
     """Bind deterministic clients and an exact fit retriever to the simulator.
 
@@ -635,6 +653,7 @@ def _simulator(
         fit_retriever: Optional exact read-only fit retriever.
         fit_rag_input: Optional explicit fit-only RAG pointer.
         completion_contract_input: Optional exact completion reservation artifact.
+        request_budget: Optional shared request ledger with explicit aggregate authorization.
 
     Returns:
         Fully bound text-world-model simulator.
@@ -662,6 +681,7 @@ def _simulator(
         },
         agent_factory=agent_factory,
         completion_contract_input=completion_contract_input,
+        request_budget=request_budget,
         clock=lambda: _TIME,
         monotonic=lambda: 1.0,
     )
@@ -1042,7 +1062,7 @@ def test_worst_case_query_reservation_never_blocks_an_episode_with_spend_remaini
     settings = WorldModelSettings(
         world_model_alias="world-model-a",
         grounded_world_model_input=_grounded_world_model_input(),
-        prompt_version="text-world-model-v2",
+        prompt_version="text-world-model-v3",
         query_embedding=_query_embedding(price=100.0),
     )
 
@@ -1115,7 +1135,7 @@ def test_expensive_episode_estimate_dispatches_until_actual_spend_reaches_the_ce
     settings = WorldModelSettings(
         world_model_alias="world-model-a",
         grounded_world_model_input=_grounded_world_model_input(),
-        prompt_version="text-world-model-v2",
+        prompt_version="text-world-model-v3",
         query_embedding=_query_embedding(),
     )
 
@@ -1181,7 +1201,7 @@ def test_query_embedding_catalog_drift_blocks_every_dispatch(
     settings = WorldModelSettings(
         world_model_alias="world-model-a",
         grounded_world_model_input=_grounded_world_model_input(),
-        prompt_version="text-world-model-v2",
+        prompt_version="text-world-model-v3",
         query_embedding=_query_embedding(
             price=price,
             maximum_attempts=maximum_attempts,

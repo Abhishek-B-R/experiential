@@ -135,6 +135,9 @@ pub(crate) fn error_response(error: &PublicError) -> Response {
     if let Some(wait) = error.retry_after_seconds {
         builder = builder.header(header::RETRY_AFTER, wait.to_string());
     }
+    if error.status_code == 429 && error.known_unbilled {
+        builder = builder.header("x-gateway-admission-refused", "true");
+    }
     builder
         .body(Body::from(compact_json(&error.json_body())))
         .unwrap_or_else(|_| Response::new(Body::empty()))
@@ -242,8 +245,7 @@ pub(crate) fn latin1_bytes(value: &str) -> Vec<u8> {
         .collect()
 }
 
-/// Build one exact HTTP response from a stored keyed result, mirroring the
-/// python engine's `_cached_response`.
+/// Build one exact HTTP response from a stored keyed result.
 pub(crate) fn cached_response(cached: &CachedResponse) -> Response {
     let mut builder = Response::builder()
         .status(
@@ -263,8 +265,7 @@ pub(crate) fn cached_response(cached: &CachedResponse) -> Response {
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
-/// Append one frame while it remains within the replay capture ceiling,
-/// mirroring the python engine's `capture_frame`.
+/// Append one frame while it remains within the replay capture ceiling.
 pub(crate) fn capture_frame(buffer: &mut Vec<u8>, data: &[u8], replayable: bool) -> bool {
     capture_frame_bounded(buffer, data, replayable, STREAM_REPLAY_CAPTURE_BYTES)
 }
@@ -383,8 +384,7 @@ pub(crate) async fn settle_stream_end(
 /// Close one stream that reached a terminal outcome: publish the keyed
 /// capture (or abandon it), then flush the withheld terminal frames.
 ///
-/// Mirrors the python engine's `_stream_body` tail: a keyed stream that
-/// cannot be retained (capture overflow or a rejected publication) ends
+/// A keyed stream that cannot be retained (capture overflow or a rejected publication) ends
 /// without its terminal frames, so the caller observes a truncated stream
 /// rather than an unreplayable success, and every waiting duplicate fails
 /// closed instead of hanging.
@@ -436,6 +436,30 @@ pub(crate) async fn finish_stream_terminal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_certified_429_responses_publish_the_admission_marker() {
+        for (status, certified, expected) in [
+            (429, true, Some("true")),
+            (429, false, None),
+            (409, true, None),
+            (502, true, None),
+        ] {
+            let mut error = PublicError::new(status, "unavailable_route", "busy", "api_error");
+            error.retry_after_seconds = Some(5);
+            error.known_unbilled = certified;
+            let response = error_response(&error);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-gateway-admission-refused")
+                    .map(|v| v.to_str().unwrap()),
+                expected
+            );
+            assert_eq!(response.headers().get("retry-after").unwrap(), "5");
+            assert!(error.json_body()["error"].get("known_unbilled").is_none());
+        }
+    }
 
     #[test]
     fn repeated_list_header_lines_join_in_arrival_order() {

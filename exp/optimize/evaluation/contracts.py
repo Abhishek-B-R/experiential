@@ -13,6 +13,7 @@ from exp.common.evaluations import EvaluationProtocol, ObservedProductionCell
 from exp.common.judging import Judge
 from exp.common.models import ModelSnapshot, RoutedCandidateSnapshot
 from exp.optimize.evaluation.simulation import SimulatorFactory
+from exp.runtime.models.budget import RequestBudget
 from exp.simulation.specs import WorldModelSettings
 
 
@@ -35,7 +36,7 @@ class EvaluationSetup(ContractModel):
         maximum_steps: Positive candidate-turn ceiling.
         continuation_of: Optional parent evaluation retained during budget continuation.
         maximum_rollout_output_tokens: Positive cumulative generation ceiling, default one million.
-        maximum_concurrency: Positive maximum number of simultaneous rollouts.
+        maximum_concurrency: Positive phase-wide allowance for simultaneous rollouts or judgments.
         repeats: Independent runs per scenario/model pair, default one and separate from retries.
     """
 
@@ -59,14 +60,16 @@ class EvaluationSetup(ContractModel):
 
 
 class EvaluationBudget(ContractModel):
-    """Finite ceilings for simulation plus judging; execution never opts out of enforcement.
+    """Judgment-count authority and an optional aggregate provider-spend limit.
 
     Attributes:
-        maximum_cost_usd: Positive finite provider-spend ceiling.
+        maximum_cost_usd: Optional positive finite provider-spend ceiling. None removes only
+            the aggregate cap for catalog-backed execution; per-request reservations remain
+            enforced. Direct evaluate_models callers supply a finite simulation envelope.
         maximum_judgments: Positive ceiling on durable cell judgments.
     """
 
-    maximum_cost_usd: float = Field(gt=0, allow_inf_nan=False)
+    maximum_cost_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     maximum_judgments: int = Field(gt=0)
 
 
@@ -76,7 +79,7 @@ class EvaluationExecutionContract(ArtifactEnvelope):
     Attributes:
         contract_id: Content-derived execution identity.
         setup: Frozen model, environment and judge inputs.
-        budget: Frozen finite execution ceilings. Catalog-backed execution also enforces
+        budget: Frozen execution ceilings. Catalog-backed execution also enforces
             the separately approved request allowance in its durable spending ledger.
     """
 
@@ -116,12 +119,16 @@ class EvaluationServices:
 
     Attributes:
         simulator_factory: Builds the selected simulation engine for one frozen plan.
-        judge: Provider-bound, reservation-enforcing judge.
+        judge: Provider-bound, reservation-enforcing judge. Parallel execution requires an
+            explicit true ``supports_concurrent_request_admission`` capability; undeclared
+            injected judges retain serial spend checks and callback behavior.
         plan_inputs: Additional immutable execution inputs, empty by default.
         judging_protocol: Optional explicit fresh judging pass over saved rollouts.
         judging_input: Immutable reviewed judging revision, independent of simulation identity.
-        spending_limit_usd: Optional request-ledger allowance, independent of plan identity.
+        spending_limit_usd: Request-ledger allowance, independent of plan identity. Omitted
+            uses the execution budget; explicit None removes the aggregate cap.
         judge_spend: Optional authoritative request-ledger reconciliation for saved rollouts.
+        request_budget: Current shared ledger authorizing interrupted-cell recovery, if supplied.
     """
 
     simulator_factory: SimulatorFactory
@@ -129,8 +136,9 @@ class EvaluationServices:
     plan_inputs: tuple[ArtifactInput, ...] = ()
     judging_protocol: EvaluationProtocol | None = None
     judging_input: ArtifactInput | None = None
-    spending_limit_usd: float | None = None
+    spending_limit_usd: float | None | Literal["execution_budget"] = "execution_budget"
     judge_spend: Callable[[tuple[str, ...]], float] | None = None
+    request_budget: RequestBudget | None = None
 
 
 class EvaluationRuntimeJudge(Judge, Protocol):

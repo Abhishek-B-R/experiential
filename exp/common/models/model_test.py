@@ -32,6 +32,24 @@ from exp.common.tasks import ToolSchema
 _CAPABILITIES_DIGEST = "a" * 64
 
 
+def test_absent_unbilled_counter_preserves_existing_economics_serialization() -> None:
+    """Adding admission evidence does not change the canonical bytes of existing receipts."""
+    legacy = {"provider_attempts": 1, "usage": None, "cost_usd": None, "latency_seconds": None}
+    economics = OperationEconomics.model_validate(legacy)
+    assert economics.unbilled_attempts == 0
+    assert economics.model_dump(mode="json") == legacy
+    assert sha256_json(economics) == sha256_json(legacy)
+
+
+@pytest.mark.parametrize("attempts,unbilled", [(None, 1), (1, 2), (2, -1)])
+def test_unbilled_attempts_require_a_complete_consistent_wire_count(
+    attempts: int | None, unbilled: int
+) -> None:
+    """Incomplete or contradictory counters cannot release retry reservations."""
+    with pytest.raises(ValidationError):
+        OperationEconomics(provider_attempts=attempts, unbilled_attempts=unbilled)
+
+
 def test_actions_need_payload_and_measurements_are_finite() -> None:
     """Invalid empty actions and non-finite economics fail at the shared boundary."""
     with pytest.raises(ValidationError, match="content or at least one tool"):
@@ -120,6 +138,7 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
         "reasoning_effort": None,
         "sampling_requires_reasoning_none": False,
         "reasoning_output_exposed": False,
+        "reasoning_output_hidden": False,
         "reasoning_content_native": False,
         "system_messages_leading_only": False,
         "chat_max_tokens_field": None,
@@ -477,6 +496,15 @@ def test_reasoning_content_native_is_a_gateway_flag_outside_the_frozen_identity(
     assert ModelCapabilities().reasoning_content_native is False
     assert (
         ModelCapabilities(reasoning_content_native=True).identity_sha256()
+        == ModelCapabilities().identity_sha256()
+    )
+
+
+def test_reasoning_output_hidden_is_a_gateway_flag_outside_the_frozen_identity() -> None:
+    """The reasoning display opt-out defaults off and never re-digests a catalog."""
+    assert ModelCapabilities().reasoning_output_hidden is False
+    assert (
+        ModelCapabilities(reasoning_output_hidden=True).identity_sha256()
         == ModelCapabilities().identity_sha256()
     )
 

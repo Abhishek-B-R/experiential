@@ -8,17 +8,18 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
-from rich.prompt import FloatPrompt
+from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
 
 from exp.cli.evaluation.setup import configure_evaluation
 from exp.cli.evaluation.view import heading, inspect_report, render_report
-from exp.cli.shared.consent import can_prompt, require_spend_consent
+from exp.cli.shared.consent import SpendBudget, can_prompt, require_spend_consent, spend_warnings
 from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.cli.shared.picker import PickerOption, choose_one
 from exp.cli.shared.progress import progress_display
 from exp.cli.shared.theme import EXP_THEME
+from exp.common.config import resolve_command_budget_usd
 from exp.common.models import load_model_catalog
 from exp.common.progress import ProgressEvent, ProgressHook
 from exp.common.project import ProjectStore
@@ -170,24 +171,32 @@ def run_evaluation(
                     progress=progress,
                 )
                 save_defaults(store, selected_defaults)
-        _preflight(store, run)
+        _preflight(store, run, reviewing=interactive and not yes)
         if dry_run:
             _console.print("Prepared without provider calls. Resume with:")
             _console.print(f"exp eval {project} --root {root} --resume {run.run_id}", markup=False)
             return
         while True:
+            reviewed = False
             if interactive and not yes:
                 selected_run = _review(store, run)
                 if selected_run is None:
                     return
                 run = selected_run
+                reviewed = True
             if not require_spend_consent(
                 _console,
                 root=root,
                 yes=yes,
-                estimated_cost_usd=run.spending_limit_usd,
+                estimated_cost_usd=(
+                    run.prepared.cost.estimated_cost_usd
+                    if run.spending_limit_usd is None
+                    else run.spending_limit_usd
+                ),
                 command=f"exp eval {project} --resume {run.run_id}",
                 non_interactive=not interactive,
+                previously_confirmed=reviewed and run.spending_limit_usd is None,
+                cost_is_upper_bound=run.spending_limit_usd is not None,
             ):
                 return
             save_run(store, run)
@@ -214,7 +223,7 @@ def run_evaluation(
                     )
                     return
                 yes = False
-                _console.print("Increase the spending limit to continue this evaluation.")
+                _console.print("Increase or remove the spending limit to continue.")
             except SimulationContentionError:
                 _console.print("Paused: rollout state is busy. Completed work saved.")
                 _console.print(
@@ -293,12 +302,13 @@ def _project_screen(project: ProjectStore) -> str | None:
             return selected.values[0]
 
 
-def _preflight(project: ProjectStore, run: EvaluationRun) -> None:
+def _preflight(project: ProjectStore, run: EvaluationRun, *, reviewing: bool = False) -> None:
     """Show the model matrix and costs in one short launch review.
 
     Args:
         project: Project supplying the display name.
         run: Prepared evaluation supplying frozen models, repeats, and cost estimates.
+        reviewing: Whether an interactive launch choice follows this displayed estimate.
     """
     cost = run.prepared.cost
     setup = run.prepared.setup
@@ -315,9 +325,32 @@ def _preflight(project: ProjectStore, run: EvaluationRun) -> None:
     )
     if run.judging_revision is not None:
         _console.print("Retry judging with full model context. Saved rollouts are reused.")
-    _console.print(
-        f"\nEstimated ${cost.estimated_cost_usd:,.2f} · "
-        f"Spending limit ${run.spending_limit_usd:,.2f}"
+    limit = (
+        "Spending limit off"
+        if run.spending_limit_usd is None
+        else f"Spending limit ${run.spending_limit_usd:,.2f}"
+    )
+    _console.print(f"\nEstimated ${cost.estimated_cost_usd:,.2f} · {limit}")
+    if not cost.maximum_is_upper_bound:
+        _console.print("Some tariff dimensions are unknown; estimates are not spending bounds.")
+    if reviewing:
+        for warning in _uncapped_spend_warnings(project, run):
+            _console.print(warning)
+
+
+def _uncapped_spend_warnings(project: ProjectStore, run: EvaluationRun) -> tuple[str, ...]:
+    """Resolve warning copy for an uncapped review without granting launch authority."""
+    if run.spending_limit_usd is not None:
+        return ()
+    return spend_warnings(
+        (
+            SpendBudget(
+                "command",
+                run.prepared.cost.estimated_cost_usd,
+                resolve_command_budget_usd(project.paths.root, None),
+            ),
+        ),
+        cost_is_upper_bound=False,
     )
 
 
@@ -336,6 +369,7 @@ def _review(project: ProjectStore, run: EvaluationRun) -> EvaluationRun | None:
         choice = choose_one(
             _console,
             title="Ready",
+            default="back" if _uncapped_spend_warnings(project, run) else None,
             options=(
                 PickerOption(
                     "start", "Resume evaluation" if run.status != "prepared" else "Start evaluation"
@@ -348,25 +382,34 @@ def _review(project: ProjectStore, run: EvaluationRun) -> EvaluationRun | None:
         if not choice.values or choice.values[0] == "back":
             return None
         if choice.values[0] == "start":
-            if (
-                run.required_spending_limit_usd
-                and run.spending_limit_usd < run.required_spending_limit_usd
-            ):
-                _console.print("Increase the spending limit before resuming.")
-                continue
+            # A prior reservation hint can outlive other calls settling. The request
+            # ledger decides whether this explicitly reviewed cap admits new work.
             return run
         if choice.values[0] == "limit":
-            suggested = max(run.spending_limit_usd, run.required_spending_limit_usd or 0)
-            limit = FloatPrompt.ask(
-                "Total spending limit ($)",
+            value = Prompt.ask(
+                "Total spending limit ($, or none)",
                 console=_console,
-                default=math.ceil(suggested * 100) / 100,
-            )
-            if not math.isfinite(limit) or limit <= 0:
-                _console.print("Enter a positive dollar amount.")
+                default=(
+                    "none"
+                    if run.spending_limit_usd is None
+                    else str(
+                        math.ceil(
+                            max(run.spending_limit_usd, run.required_spending_limit_usd or 0) * 100
+                        )
+                        / 100
+                    )
+                ),
+            ).strip()
+            try:
+                limit = None if value.lower() == "none" else float(value)
+            except ValueError:
+                _console.print("Enter a positive dollar amount or none.")
+                continue
+            if limit is not None and (not math.isfinite(limit) or limit <= 0):
+                _console.print("Enter a positive dollar amount or none.")
                 continue
             run = run.model_copy(update={"spending_limit_usd": limit})
-            _preflight(project, run)
+            _preflight(project, run, reviewing=True)
             continue
         heading(_console, project.paths.project_id, "Cost details")
         table = Table("Stage", "Estimate", box=None)
@@ -384,7 +427,8 @@ def _review(project: ProjectStore, run: EvaluationRun) -> EvaluationRun | None:
         _console.print(Text(run.prepared.cost.estimate_basis), style="dim")
         _console.print(
             f"Captured turns with measured tokens: {run.prepared.cost.measured_turns:g} / "
-            f"{run.prepared.cost.captured_turns:g}. Pauses before exceeding the spending limit.",
+            f"{run.prepared.cost.captured_turns:g}. "
+            "An enabled spending limit pauses before the next unaffordable request.",
             style="dim",
         )
 

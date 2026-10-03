@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import math
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -75,8 +74,11 @@ class EvaluationRun(ContractModel):
         prepared: Frozen model, task, judge, and cost bindings.
         judging_revision: Optional explicit retry pass over unchanged saved rollouts.
         status: Current execution lifecycle state.
-        spending_limit_usd: Planned total allowance, authorized only by explicit launch consent.
-        required_spending_limit_usd: Minimum total allowance requested by a paused call.
+        spending_limit_usd: Optional total allowance, authorized by explicit launch consent.
+            Explicit None keeps accounting without an aggregate spending cap. The field
+            must be present in persisted records.
+        required_spending_limit_usd: Advisory allowance from the last blocked request.
+            Cleared on resume; only the live request ledger decides new admission.
         stage: Most recent engine progress stage.
         completed: Completed units in that stage, when available.
         total: Planned units in that stage, when available.
@@ -96,7 +98,7 @@ class EvaluationRun(ContractModel):
     status: Literal["prepared", "running", "interrupted", "paused", "failed", "completed"] = (
         "prepared"
     )
-    spending_limit_usd: float = Field(gt=0, allow_inf_nan=False)
+    spending_limit_usd: float | None = Field(gt=0, allow_inf_nan=False)
     required_spending_limit_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     stage: str = "prepared"
     completed: int | None = None
@@ -235,7 +237,7 @@ def prepare_run(
         created_at=created_at,
         code_revision=code_revision,
         prepared=prepared,
-        spending_limit_usd=max(5.0, math.ceil(prepared.cost.estimated_cost_usd * 200) / 100),
+        spending_limit_usd=None,
     )
     report(progress, "Saving evaluation")
     save_run(project, run)
@@ -362,7 +364,9 @@ def execute_run(
             raise ValueError("supplied run differs from its frozen database snapshot")
         frozen_project = project.snapshot(saved.project_config_sha256)
         active = (
-            saved if saved.status == "completed" else saved.model_copy(update={"status": "running"})
+            saved
+            if saved.status == "completed"
+            else saved.model_copy(update={"status": "running", "required_spending_limit_usd": None})
         )
         save_run(project, active)
 

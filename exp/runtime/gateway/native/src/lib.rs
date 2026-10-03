@@ -2,8 +2,9 @@
 //!
 //! `serve` blocks the calling Python thread (with the GIL released) while the
 //! tokio server owns the socket; the Python control plane is reached through
-//! bounded callbacks. The fixture functions expose the Rust SSE encoder and
-//! failure taxonomy for byte-level parity tests against the Python engine.
+//! bounded callbacks. The fixture functions expose the Rust SSE encoder, stream
+//! normalizer and failure taxonomy to the Python SDK-conformance and taxonomy
+//! tests.
 
 mod admission;
 mod bridge;
@@ -27,6 +28,7 @@ mod memory;
 mod metrics;
 mod param_attribution;
 mod rate_limit_headers;
+mod reasoning_display;
 mod rejection_shapes;
 mod relay;
 mod replay;
@@ -43,6 +45,7 @@ mod route_messages;
 mod route_responses;
 mod route_responses_ws;
 mod server;
+mod service_tier;
 mod settlement;
 mod sse;
 mod stop_sequences;
@@ -302,7 +305,7 @@ fn encode_responses_fixture(
 }
 
 /// Build one non-streaming Responses body fixture through the Rust
-/// aggregation for byte parity tests against the python `completed_body`.
+/// aggregation for the SDK-conformance tests.
 #[pyfunction]
 fn completed_responses_fixture(
     request_id: &str,
@@ -321,63 +324,8 @@ fn completed_responses_fixture(
     Ok(serde_json::to_string(&aggregated.body).unwrap_or_else(|_| "null".to_string()))
 }
 
-/// Encode one normalized event fixture through the Rust Anthropic Messages
-/// SSE encoder for byte parity tests. `events_json` is a list of simplified
-/// event objects.
-#[pyfunction]
-fn encode_messages_fixture(
-    request_id: &str,
-    model: &str,
-    events_json: &str,
-) -> PyResult<Vec<String>> {
-    let events = parse_fixture_events(events_json).map_err(PyValueError::new_err)?;
-    let mut encoder = encode_messages::MessagesSseEncoder::new(request_id, model);
-    let mut frames = encoder
-        .start()
-        .map_err(|error| PyValueError::new_err(error_payload(&error)))?;
-    for event in &events {
-        frames.extend(
-            encoder
-                .feed(event)
-                .map_err(|error| PyValueError::new_err(error_payload(&error)))?,
-        );
-    }
-    Ok(frames)
-}
-
-/// Build one non-streaming Anthropic message body fixture through the Rust
-/// aggregation for byte parity tests against `completed_messages_body`.
-#[pyfunction]
-fn completed_messages_fixture(
-    request_id: &str,
-    model: &str,
-    events_json: &str,
-) -> PyResult<String> {
-    let events = parse_fixture_events(events_json).map_err(PyValueError::new_err)?;
-    let aggregated = encode_messages::completed_messages_body(request_id, model, &events)
-        .map_err(|error| PyValueError::new_err(error_payload(&error)))?;
-    if let Some(failure) = aggregated.failure {
-        return Err(PyValueError::new_err(error_payload(
-            &failure.public_error(),
-        )));
-    }
-    Ok(serde_json::to_string(&aggregated.body).unwrap_or_else(|_| "null".to_string()))
-}
-
-/// Render one OpenAI-shaped public error as the Anthropic error envelope for
-/// translation parity tests against `anthropic_error_body`.
-#[pyfunction]
-fn anthropic_error_fixture(public_error_json: &str) -> PyResult<String> {
-    let error: errors::PublicError = serde_json::from_str(public_error_json)
-        .map_err(|error| PyValueError::new_err(format!("invalid public error: {error}")))?;
-    Ok(
-        serde_json::to_string(&encode_messages::anthropic_error_body(&error))
-            .unwrap_or_else(|_| "null".to_string()),
-    )
-}
-
 /// Normalize one raw provider stream fixture through the Rust frame decoder
-/// and dialect normalizer for parity tests against the python event mappers.
+/// and dialect normalizer for the SDK-conformance and normalizer tests.
 ///
 /// `chunks_json` is a JSON array of latin-1 encoded chunk strings (one
 /// character per raw byte, so binary framings round-trip losslessly). The
@@ -468,35 +416,11 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
             None => Err("provider output item requires item_type".to_string()),
         };
         let event = match kind {
-            "image" => events::Event::Image(
-                object
-                    .get("url")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("image requires url")?
-                    .to_string(),
-            ),
             "text_delta" => events::Event::TextDelta(text),
             "refusal_delta" => events::Event::RefusalDelta(text),
-            "choice_logprobs_delta" => {
-                let choice_index = object
-                    .get("choice_index")
-                    .and_then(serde_json::Value::as_u64)
-                    .filter(|index| *index == 0)
-                    .ok_or("choice logprobs requires choice_index 0")?;
-                events::Event::ChoiceLogprobsDelta(
-                    crate::logprobs::parse(object.get("logprobs"), choice_index as u32)
-                        .map_err(|failure| failure.safe_message)?
-                        .ok_or("choice logprobs requires logprobs")?,
-                )
-            }
             "provider_text_delta" => events::Event::ProviderTextDelta {
                 output_index,
                 item_id: item_id.ok_or("provider text delta requires item_id")?,
-                delta: text,
-            },
-            "provider_refusal_delta" => events::Event::ProviderRefusalDelta {
-                output_index,
-                item_id: item_id.ok_or("provider refusal delta requires item_id")?,
                 delta: text,
             },
             "provider_output_item_started" => events::Event::ProviderOutputItemStarted {
@@ -513,6 +437,7 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                 status,
                 phase,
             },
+            "reasoning_text_delta" => events::Event::ReasoningTextDelta(text),
             "reasoning_summary_delta" => events::Event::ReasoningSummaryDelta {
                 output_index: object
                     .get("output_index")
@@ -528,23 +453,6 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .unwrap_or("")
                     .to_string(),
                 delta: text,
-            },
-            "thinking_delta" => events::Event::ThinkingDelta { index, delta: text },
-            "thinking_signature" => events::Event::ThinkingSignature {
-                index,
-                signature: object
-                    .get("signature")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-            },
-            "redacted_thinking" => events::Event::RedactedThinking {
-                index,
-                data: object
-                    .get("data")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
             },
             "encrypted_reasoning" => events::Event::EncryptedReasoning {
                 output_index: object
@@ -642,55 +550,6 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .get("reasoning_tokens")
                     .and_then(serde_json::Value::as_u64),
             }),
-            "server_tool_use_started" => events::Event::ServerToolUseStarted {
-                index,
-                call_id: object
-                    .get("call_id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                name: object
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-            },
-            "server_tool_arguments_delta" => {
-                events::Event::ServerToolArgumentsDelta { index, delta: text }
-            }
-            "server_tool_use_completed" => events::Event::ServerToolUseCompleted {
-                index,
-                call: events::CompletedToolCall {
-                    call_id: object
-                        .get("call_id")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    namespace: None,
-                    caller: None,
-                    name: object
-                        .get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    provider_item_id: None,
-                    provider_status: None,
-                    raw_arguments: object
-                        .get("raw_arguments")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    custom: false,
-                },
-            },
-            "server_tool_result" => events::Event::ServerToolResult {
-                index,
-                block: object
-                    .get("block")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-            },
             "hosted_tool_item_started" => events::Event::HostedToolItemStarted {
                 output_index: object
                     .get("output_index")
@@ -770,18 +629,8 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .unwrap_or("")
                     .to_string(),
             },
-            "text_block_started" => events::Event::TextBlockStarted { index },
-            "citation_delta" => events::Event::CitationDelta {
-                index,
-                citation: object
-                    .get("citation")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-            },
             "completed" => events::Event::Completed,
             "incomplete" => events::Event::Incomplete,
-            "paused_turn" => events::Event::PausedTurn,
             "failed" => events::Event::Failed(errors::Failure::new(
                 errors::FailureClass::ProviderInternal,
                 if text.is_empty() {
@@ -817,14 +666,12 @@ fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(serve, module)?)?;
     module.add_function(wrap_pyfunction!(metrics_snapshot_json, module)?)?;
     module.add_function(wrap_pyfunction!(encode_chat_fixture, module)?)?;
-    module.add_function(wrap_pyfunction!(encode_messages_fixture, module)?)?;
     module.add_function(wrap_pyfunction!(encode_responses_fixture, module)?)?;
-    module.add_function(wrap_pyfunction!(completed_messages_fixture, module)?)?;
     module.add_function(wrap_pyfunction!(completed_responses_fixture, module)?)?;
-    module.add_function(wrap_pyfunction!(anthropic_error_fixture, module)?)?;
     module.add_function(wrap_pyfunction!(normalize_stream_fixture, module)?)?;
     module.add_function(wrap_pyfunction!(failure_public_error_fixture, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    module.add("AUTOMATIC_VERTEX_CACHE_CONTRACT_VERSION", 1)?;
     module.add("MODEL_STAGE_CONTRACT_VERSION", MODEL_STAGE_CONTRACT_VERSION)?;
     Ok(())
 }

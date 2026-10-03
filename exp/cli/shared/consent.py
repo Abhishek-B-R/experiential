@@ -66,6 +66,7 @@ def require_spend_consent(
     non_interactive: bool = False,
     previously_confirmed: bool = False,
     additional_budgets: Sequence[SpendBudget] = (),
+    cost_is_upper_bound: bool = True,
 ) -> bool:
     """Enforce the configured authorization policy for one conservative cost estimate.
 
@@ -74,6 +75,8 @@ def require_spend_consent(
     answer. An estimate above any budget warns and offers the same explicit confirmation,
     defaulting to no. ``--yes`` or a recorded confirmation authorizes the displayed estimate
     even above the configured budget; it does not change the saved budget for future commands.
+    Uncapped execution always requires ``--yes`` or explicit confirmation, even when its
+    estimate is below the automatic threshold.
 
     An undefined estimate (``None``) means the catalog carries no pricing for a selected model,
     so no ceiling comparison is possible. EXP reports the cost as undefined honestly instead of
@@ -89,8 +92,11 @@ def require_spend_consent(
             models carry no catalog pricing and the cost cannot be estimated.
         command: Complete command identity shown to the operator.
         non_interactive: Whether this invocation forbids terminal questions.
-        previously_confirmed: Whether immutable command state records an earlier confirmation.
+        previously_confirmed: Whether the estimate and its warnings were reviewed and
+            explicitly confirmed. Uncapped reviews do not repeat warnings after confirmation.
         additional_budgets: Component budgets to review together with the command total.
+        cost_is_upper_bound: Whether the displayed estimate is an enforced allowance. False
+            labels uncapped execution honestly and always requires explicit confirmation.
 
     Returns:
         True when execution is authorized, or False after an interactive decline.
@@ -113,20 +119,12 @@ def require_spend_consent(
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
     budget = _cost_decimal(configured, label="configured command budget")
-    warnings: list[str] = []
-    for component in (
-        SpendBudget("command", estimated_cost_usd, configured),
-        *additional_budgets,
-    ):
-        limit = _cost_decimal(component.maximum_cost_usd, label=f"{component.name} budget")
-        if component.estimated_cost_usd is None:
-            continue
-        cost = _cost_decimal(component.estimated_cost_usd, label=f"{component.name} estimate")
-        if cost > limit:
-            warnings.append(
-                f"[yellow]warning[/yellow] {escape(component.name)} estimate "
-                f"{_format_usd(cost)} exceeds the {_format_usd(limit)} budget."
-            )
+    warnings = spend_warnings(
+        (SpendBudget("command", estimated_cost_usd, configured), *additional_budgets),
+        cost_is_upper_bound=cost_is_upper_bound,
+    )
+    if previously_confirmed and not cost_is_upper_bound:
+        return True
     if warnings:
         return _confirm_over_budget(
             console,
@@ -135,16 +133,61 @@ def require_spend_consent(
             warnings=warnings,
             yes=yes or previously_confirmed,
             non_interactive=non_interactive,
+            cost_is_upper_bound=cost_is_upper_bound,
         )
-    if estimate <= budget / Decimal(2) or yes or previously_confirmed:
+    if yes or previously_confirmed or (cost_is_upper_bound and estimate <= budget / Decimal(2)):
         return True
     if non_interactive or not can_prompt(console):
-        _refuse_noninteractive(console, command=command, estimate=estimate, budget=budget)
-    prompt = f"Authorize {command} to spend up to {_format_usd(estimate)}?"
+        _refuse_noninteractive(
+            console,
+            command=command,
+            estimate=estimate,
+            budget=budget,
+            cost_is_upper_bound=cost_is_upper_bound,
+        )
+    prompt = (
+        f"Authorize {command} to spend up to {_format_usd(estimate)}?"
+        if cost_is_upper_bound
+        else f"Authorize {command} (estimated {_format_usd(estimate)}, no spending limit)?"
+    )
     try:
         return Confirm.ask(prompt, default=False, console=console)
     except EOFError:
         _refuse_unanswered(console, command=command, estimate=estimate, budget=budget)
+
+
+def spend_warnings(
+    budgets: Sequence[SpendBudget], *, cost_is_upper_bound: bool = True
+) -> tuple[str, ...]:
+    """Format cost warnings without prompting, authorizing, or changing settings.
+
+    Args:
+        budgets: Named estimates and configured warning thresholds.
+        cost_is_upper_bound: Whether amounts are enforced allowances or uncapped estimates.
+
+    Returns:
+        Markup-safe warnings for estimates above their configured thresholds.
+
+    Raises:
+        typer.BadParameter: A cost or threshold is negative or non-finite.
+    """
+    warnings: list[str] = []
+    for component in budgets:
+        limit = _cost_decimal(component.maximum_cost_usd, label=f"{component.name} budget")
+        if component.estimated_cost_usd is None:
+            continue
+        cost = _cost_decimal(component.estimated_cost_usd, label=f"{component.name} estimate")
+        if cost > limit:
+            threshold = (
+                f"{_format_usd(limit)} budget"
+                if cost_is_upper_bound
+                else f"configured {_format_usd(limit)} warning threshold"
+            )
+            warnings.append(
+                f"[yellow]warning[/yellow] {escape(component.name)} estimate "
+                f"{_format_usd(cost)} exceeds the {threshold}."
+            )
+    return tuple(warnings)
 
 
 def _confirm_undefined_cost(
@@ -207,6 +250,7 @@ def _confirm_over_budget(
     warnings: Sequence[str],
     yes: bool,
     non_interactive: bool,
+    cost_is_upper_bound: bool,
 ) -> bool:
     """Warn about exceeded budgets and offer one explicit override for this invocation.
 
@@ -217,6 +261,7 @@ def _confirm_over_budget(
         warnings: Named budget overruns to display before confirmation.
         yes: Whether the invocation already has explicit confirmation.
         non_interactive: Whether this invocation forbids terminal questions.
+        cost_is_upper_bound: Whether the amount is an enforced allowance or an uncapped estimate.
 
     Returns:
         True only after explicit confirmation; a blank answer or decline authorizes nothing.
@@ -228,13 +273,18 @@ def _confirm_over_budget(
         console.print(warning)
     if yes:
         return True
+    amount = (
+        f"up to {_format_usd(estimate)}"
+        if cost_is_upper_bound
+        else f"estimated {_format_usd(estimate)}, no spending limit"
+    )
     if non_interactive or not can_prompt(console):
         console.print(
             "No spend was authorized. Re-run in an interactive terminal to proceed, or use "
-            f"--yes after reviewing {escape(command)} (up to {_format_usd(estimate)})."
+            f"--yes after reviewing {escape(command)} ({amount})."
         )
         raise typer.Exit(NO_CONSENT_EXIT_CODE)
-    prompt = f"Proceed anyway (up to {_format_usd(estimate)})?"
+    prompt = f"Proceed anyway ({amount})?"
     try:
         confirmed = Confirm.ask(prompt, default=False, console=console)
     except EOFError:
@@ -286,15 +336,24 @@ def _refuse_noninteractive(
     command: str,
     estimate: Decimal,
     budget: Decimal,
+    cost_is_upper_bound: bool,
 ) -> NoReturn:
-    """Exit when an above-half estimate has no deterministic confirmation.
+    """Exit when the invocation requires confirmation and no terminal is available.
 
     Args:
         console: Command-owned output console.
         command: Complete command identity.
         estimate: Conservative invocation estimate.
         budget: Configured per-command ceiling.
+        cost_is_upper_bound: Whether the displayed cost is an enforced allowance.
     """
+    if not cost_is_upper_bound:
+        console.print(
+            "authorization: execution has no spending limit and requires explicit confirmation. "
+            "This session cannot prompt; re-run with --yes after reviewing "
+            f"{escape(command)} (estimated {_format_usd(estimate)}, no spending limit)."
+        )
+        raise typer.Exit(NO_CONSENT_EXIT_CODE)
     console.print(
         "authorization: this estimate requires explicit confirmation because it exceeds 50% "
         "of the configured budget. This session cannot prompt; re-run with --yes after "

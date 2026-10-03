@@ -48,6 +48,10 @@ def test_valid_thinking_off_reaches_native_payload(
     model_id: str, effort: ReasoningEffort | None
 ) -> None:
     """A valid off switch survives route shaping and actual dialect encoding."""
+    _assert_thinking_off_reaches_payload(model_id, effort)
+
+
+def _assert_thinking_off_reaches_payload(model_id: str, effort: ReasoningEffort | None) -> None:
     profile = _anthropic_profile(model_id)
     output_config: JsonObject | None = None if effort is None else {"effort": effort}
     request = GatewayRequest(
@@ -85,6 +89,10 @@ def test_unsupported_thinking_off_is_never_coerced(
     model_id: str, effort: ReasoningEffort | None
 ) -> None:
     """Unsupported off requests retain their typed pre-dispatch refusal."""
+    _assert_thinking_off_refused(model_id, effort)
+
+
+def _assert_thinking_off_refused(model_id: str, effort: ReasoningEffort | None) -> None:
     profile = _anthropic_profile(model_id)
     request = GatewayRequest(
         surface=GatewayApiSurface.MESSAGES,
@@ -117,13 +125,13 @@ def test_unsupported_thinking_off_is_never_coerced(
 @pytest.mark.parametrize("effort", (None, "low", "medium", "high", "xhigh", "max"))
 def test_opus_55_never_disables_thinking(model_id: str, effort: ReasoningEffort | None) -> None:
     """The always-adaptive point release refuses off without changing the request."""
-    test_unsupported_thinking_off_is_never_coerced(model_id, effort)
+    _assert_thinking_off_refused(model_id, effort)
 
 
 @pytest.mark.parametrize("model_id", ("claude-opus-5-50", "claude-opus-5-5-1"))
 def test_opus_55_thinking_rule_does_not_claim_unknown_releases(model_id: str) -> None:
     """An unverified point release never inherits the exact 5.5 off prohibition."""
-    test_valid_thinking_off_reaches_native_payload(model_id, "low")
+    _assert_thinking_off_reaches_payload(model_id, "low")
 
 
 @pytest.mark.parametrize(
@@ -136,8 +144,16 @@ def test_opus_55_thinking_rule_does_not_claim_unknown_releases(model_id: str) ->
         "claude-fable-5-1",
     ),
 )
-def test_omitted_thinking_and_effort_stay_omitted_on_wire(model_id: str) -> None:
-    """A catalog default does not opt an unspecified request into reasoning."""
+def test_omitted_thinking_stays_adaptive_with_a_summarized_display_and_no_effort(
+    model_id: str,
+) -> None:
+    """An unspecified request on a default-thinking generation asks to see its reasoning.
+
+    These generations already think adaptively when the request omits
+    ``thinking``, so the payload states that mode with a ``summarized``
+    display. The catalog default still does not opt the request into an
+    effort, so no ``output_config`` is sent.
+    """
     profile = _anthropic_profile(model_id)
     request = GatewayRequest(
         surface=GatewayApiSurface.MESSAGES,
@@ -146,7 +162,7 @@ def test_omitted_thinking_and_effort_stay_omitted_on_wire(model_id: str) -> None
     )
     _, provider = route_generation_parameter_requests((profile,), request)
     payload = dialect_stream_payload(profile, provider)
-    assert "thinking" not in payload
+    assert payload["thinking"] == {"type": "adaptive", "display": "summarized"}
     assert "output_config" not in payload
 
 
@@ -232,7 +248,7 @@ _SONNET_55_IDS = (
 @pytest.mark.parametrize("effort", (None, "low", "medium", "high", "xhigh", "max"))
 def test_sonnet_55_rejects_disabled_thinking(model_id: str, effort: ReasoningEffort | None) -> None:
     """Every spelling refuses the unsupported off switch without coercion."""
-    test_unsupported_thinking_off_is_never_coerced(model_id, effort)
+    _assert_thinking_off_refused(model_id, effort)
 
 
 @pytest.mark.parametrize("model_id", _SONNET_55_IDS)
@@ -256,7 +272,7 @@ def test_sonnet_55_efforts_and_default_are_exact(model_id: str) -> None:
 )
 def test_sonnet_55_rules_never_claim_other_releases(model_id: str) -> None:
     """Generation support does not inherit the exact release's off rule or default."""
-    test_valid_thinking_off_reaches_native_payload(model_id, "low")
+    _assert_thinking_off_reaches_payload(model_id, "low")
     assert default_reasoning_effort(model_id, "anthropic_adaptive") == "medium"
 
 

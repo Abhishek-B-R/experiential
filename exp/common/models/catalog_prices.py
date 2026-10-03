@@ -48,7 +48,8 @@ class GatewayServiceTierPrices(ContractModel):
     OpenAI's ``service_tier`` reprices the WHOLE request (``flex`` discounted,
     ``priority`` premium): these rates replace the base schedule for every
     dimension at cost, no markup. ``None`` on a dimension is unknown exactly as
-    on the base schedule (never the base rate). v1 bills the REQUESTED tier.
+    on the base schedule (never the base rate). Its own long-context schedule
+    applies independently of the standard processing schedule.
     """
 
     input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
@@ -57,6 +58,7 @@ class GatewayServiceTierPrices(ContractModel):
     cache_creation_1h_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    long_context: GatewayLongContextTier | None = None
 
 
 class GatewayTokenPrices(ContractModel):
@@ -65,10 +67,12 @@ class GatewayTokenPrices(ContractModel):
     Values are integer nano-USD per million provider-reported tokens (one nano-USD is a
     billionth of a dollar: $1.25 per million is ``1_250_000_000``), bounded above by
     ``MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS``. ``None`` means the rate is unknown; it must
-    never be interpreted as zero. Existing optimizer float pricing remains unchanged.
-    Cache-creation rates price disjoint 5-minute and 1-hour write tokens. The
+    never be interpreted as zero. Evaluation snapshots may freeze this complete card separately
+    from provider invoice charges. Explicit four-rate snapshots remain a distinct price contract.
+    Cache-creation rates price disjoint non-one-hour and one-hour write tokens. The
     unqualified rate prices the remainder after observed 1-hour writes; missing
-    TTL evidence leaves write cost unknown, never inferred from requested TTL.
+    TTL evidence leaves write cost unknown unless both authored write rates are equal, never
+    inferred from requested TTL or provider name.
     """
 
     input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
@@ -113,7 +117,7 @@ class GatewayTokenPrices(ContractModel):
             tier: Requested provider processing tier.
 
         Returns:
-            The tier card as a whole-request schedule without long-context pricing,
+            The tier card as a complete schedule with its own long-context pricing,
             or this schedule when no configured tier card applies.
         """
         card = self.service_tier(tier)
@@ -126,5 +130,5 @@ class GatewayTokenPrices(ContractModel):
             cache_creation_1h_input_nano_usd_per_million_tokens=card.cache_creation_1h_input_nano_usd_per_million_tokens,
             output_nano_usd_per_million_tokens=card.output_nano_usd_per_million_tokens,
             reasoning_nano_usd_per_million_tokens=card.reasoning_nano_usd_per_million_tokens,
-            long_context=None,
+            long_context=card.long_context,
         )

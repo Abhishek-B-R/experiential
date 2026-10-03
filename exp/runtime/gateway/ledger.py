@@ -26,6 +26,8 @@ from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayEvent,
     GatewayFailure,
+    GatewayServiceTierAdmission,
+    GatewayServiceTierSettlement,
 )
 from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.ledger_errors import (
@@ -39,6 +41,14 @@ from exp.runtime.gateway.ledger_errors import (
 )
 from exp.runtime.gateway.ledger_errors import (
     IdempotencyReplayUnavailableError as IdempotencyReplayUnavailableError,
+)
+from exp.runtime.gateway.ledger_requests import finish_request
+from exp.runtime.gateway.ledger_service_tiers import (
+    long_context_values,
+    reconcile_tier_receipt,
+    record_tier_admission,
+    settle_tier,
+    tier_usage_cost,
 )
 from exp.runtime.gateway.ledger_usage import (
     BillingSourceUsage,
@@ -187,12 +197,14 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         if authorization.caller_operation_sha256 is not None:
             prior = connection.execute(
                 """
-                SELECT canonical_request_sha256, terminal_state
+                SELECT canonical_request_sha256, terminal_state, failed_without_effects,
+                  NOT EXISTS (SELECT 1 FROM gateway_attempts AS a
+                    WHERE a.request_id = gateway_requests.request_id) AS no_dispatch
                 FROM gateway_requests
                 WHERE organization_id = ? AND identity_id = ?
                   AND alias_revision_id = ? AND api_surface = ?
                   AND caller_operation_sha256 = ?
-                ORDER BY accepted_at DESC LIMIT 1
+                ORDER BY rowid DESC LIMIT 1
                 """,
                 (
                     authorization.organization_id,
@@ -206,18 +218,19 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 if str(prior["canonical_request_sha256"]) != (
                     authorization.canonical_request_sha256
                 ):
-                    # Deliberately fail closed even when the prior attempt
-                    # failed: after an ambiguous failure the provider may
-                    # have executed, so different content under one
-                    # operation identity is a client bug the key exists to
-                    # surface. Retrying different content needs a new key.
+                    # A failed request never authorizes different content under the same key.
                     raise IdempotencyConflictError(
                         "caller operation key was reused with different request content"
                     )
-                if str(prior["terminal_state"]) not in {
-                    "expired_before_dispatch",
-                    "unknown_after_crash",
-                }:
+                if not (
+                    str(prior["terminal_state"])
+                    in {"expired_before_dispatch", "unknown_after_crash"}
+                    or (
+                        prior["terminal_state"] == "failed"
+                        and prior["failed_without_effects"]
+                        and prior["no_dispatch"]
+                    )
+                ):
                     raise IdempotencyReplayUnavailableError(
                         "matching keyed request exists but durable content replay is unavailable"
                     )
@@ -270,6 +283,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         fallback_reason: str | None = None,
         dispatch_reason: str | None = None,
         preferred_deployment: ExactModelDeployment | None = None,
+        service_tier: GatewayServiceTierAdmission | None = None,
     ) -> AttemptId:
         """Durably mark a provider dispatch before starting network work.
 
@@ -310,6 +324,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 fallback_reason=fallback_reason,
                 dispatch_reason=dispatch_reason,
                 preferred_deployment=preferred_deployment,
+                service_tier=service_tier,
             )
 
     def apply_start_attempt(
@@ -328,6 +343,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         fallback_reason: str | None = None,
         dispatch_reason: str | None = None,
         preferred_deployment: ExactModelDeployment | None = None,
+        service_tier: GatewayServiceTierAdmission | None = None,
     ) -> AttemptId:
         """Run the dispatch reservation inside the caller's open write transaction.
 
@@ -456,41 +472,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 prices.cache_creation_1h_input_nano_usd_per_million_tokens,
                 prices.output_nano_usd_per_million_tokens,
                 prices.reasoning_nano_usd_per_million_tokens,
-                (
-                    None
-                    if prices.long_context is None
-                    else prices.long_context.input_threshold_tokens
-                ),
-                (
-                    None
-                    if prices.long_context is None
-                    else prices.long_context.input_nano_usd_per_million_tokens
-                ),
-                (
-                    None
-                    if prices.long_context is None
-                    else prices.long_context.cached_input_nano_usd_per_million_tokens
-                ),
-                (
-                    None
-                    if prices.long_context is None
-                    else prices.long_context.cache_creation_input_nano_usd_per_million_tokens
-                ),
-                (
-                    None
-                    if prices.long_context is None
-                    else prices.long_context.cache_creation_1h_input_nano_usd_per_million_tokens
-                ),
-                (
-                    None
-                    if prices.long_context is None
-                    else prices.long_context.output_nano_usd_per_million_tokens
-                ),
-                (
-                    None
-                    if prices.long_context is None
-                    else prices.long_context.reasoning_nano_usd_per_million_tokens
-                ),
+                *long_context_values(prices),
                 route_reason,
                 fallback_reason,
                 dispatch_reason,
@@ -518,6 +500,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 maximum_cost_nano_usd,
             ),
         )
+        record_tier_admission(connection, attempt_id, service_tier)
         require_attempt_budget(
             connection,
             organization_id=snapshot.authorization.organization_id,
@@ -550,6 +533,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         upstream_provider: str | None = None,
         web_search_requests: int = 0,
         tool_search_requests: int = 0,
+        service_tier: GatewayServiceTierSettlement | None = None,
     ) -> None:
         """Idempotently settle one attempt with normalized content-free fields.
 
@@ -585,6 +569,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 upstream_provider=upstream_provider,
                 web_search_requests=web_search_requests,
                 tool_search_requests=tool_search_requests,
+                service_tier=service_tier,
             )
 
     def apply_finish_attempt(
@@ -604,6 +589,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         upstream_provider: str | None = None,
         web_search_requests: int = 0,
         tool_search_requests: int = 0,
+        service_tier: GatewayServiceTierSettlement | None = None,
     ) -> None:
         """Run the attempt settlement inside the caller's open write transaction.
 
@@ -650,11 +636,21 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
             raise GatewayLedgerError("attempt does not exist")
         current_state = str(row["state"])
         if current_state != "dispatched":
-            if current_state == state:
+            if current_state == state or (
+                current_state == "unknown_after_crash" and service_tier is not None
+            ):
+                reconcile_tier_receipt(connection, attempt_id, service_tier, terminal_event, usage)
                 return
             raise GatewayLedgerError("attempt is already settled with another terminal state")
-        cost = observed_usage_cost(row, usage, terminal_event)
-        budget_settlement = budget_settlement_nano_usd(row, cost, usage, terminal_event)
+        tier = settle_tier(connection, attempt_id, service_tier)
+        cost = (
+            observed_usage_cost(row, usage, terminal_event)
+            if tier is None
+            else tier_usage_cost(tier, usage, terminal_event)
+        )
+        budget_settlement = (
+            budget_settlement_nano_usd(row, cost, usage, terminal_event) if tier is None else cost
+        )
         usage_source = usage_source_label(
             usage, estimated=terminal_event is not None and terminal_event.usage_estimated
         )
@@ -775,15 +771,22 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
-    ) -> None:
-        """Idempotently terminalize accepted work that never reached dispatch.
+        certify_no_effects: bool = False,
+    ) -> bool:
+        """Terminalize accepted work and return its committed no-effects certificate.
 
         Args:
             authorization: Frozen authority identifying the accepted request.
             failure: Sanitized pre-dispatch terminal failure.
+            certify_no_effects: Trusted proof that admission could not perform paid prework.
         """
         with self._transaction() as connection:
-            self.apply_finish_request(connection, authorization=authorization, failure=failure)
+            return self.apply_finish_request(
+                connection,
+                authorization=authorization,
+                failure=failure,
+                certify_no_effects=certify_no_effects,
+            )
 
     def apply_finish_request(
         self,
@@ -791,38 +794,22 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
-    ) -> None:
-        """Run the pre-dispatch settlement inside the caller's open write transaction.
+        certify_no_effects: bool = False,
+    ) -> bool:
+        """Persist a no-effects certificate under the write fence; expose after commit.
 
         Args:
             connection: Open write transaction owned by the caller.
             authorization: Frozen authority identifying the accepted request.
             failure: Sanitized pre-dispatch terminal failure.
+            certify_no_effects: Trusted proof that admission could not perform paid prework.
         """
-        state, normalized_failure, _failure_message, _ = _terminal_values(None, failure)
-        del normalized_failure, _failure_message
-        row = connection.execute(
-            """
-            SELECT organization_id, terminal_state FROM gateway_requests
-            WHERE request_id = ?
-            """,
-            (authorization.request_id,),
-        ).fetchone()
-        if row is None:
-            raise GatewayLedgerError("request was not durably accepted")
-        if str(row["organization_id"]) != authorization.organization_id:
-            raise GatewayLedgerError("request authority differs from accepted request")
-        current = row["terminal_state"]
-        if current is not None:
-            if str(current) == state:
-                return
-            raise GatewayLedgerError("request is already settled with another terminal state")
-        connection.execute(
-            """
-            UPDATE gateway_requests SET terminal_state = ?, terminal_at = ?
-            WHERE request_id = ? AND terminal_state IS NULL
-            """,
-            (state, utc_text(self._clock.now()), authorization.request_id),
+        return finish_request(
+            connection,
+            authorization=authorization,
+            failure=failure,
+            terminal_at=self._clock.now(),
+            certify_no_effects=certify_no_effects,
         )
 
     def reconcile_crashed_requests(self, *, cleanup_grace: timedelta) -> tuple[int, int]:

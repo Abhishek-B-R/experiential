@@ -28,6 +28,7 @@ from exp.runtime.gateway.contracts import (
     GatewayFailure,
     GatewayFailureClass,
     GatewayRequest,
+    GatewayServiceTierAdmission,
 )
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
 from exp.runtime.gateway.execution_resolution import (
@@ -42,6 +43,7 @@ from exp.runtime.gateway.native_fallback_rules import FallbackRules, eligible_de
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_settlement import deployment_operation_key
 from exp.runtime.gateway.reasoning_carrier import ReasoningCarrierAuthority
+from exp.runtime.gateway.reasoning_display import reasoning_output_hidden
 from exp.runtime.gateway.recovery import FrozenRecoveryBinding
 from exp.runtime.gateway.request_policy import RequestAttemptPolicy, attempt_policy
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
@@ -52,6 +54,10 @@ from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.cache_policy import cache_markers
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
+from exp.runtime.models.providers.openrouter_routing import (
+    openrouter_cache_writes_within_reads,
+    openrouter_chat_wire,
+)
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 
 if TYPE_CHECKING:
@@ -145,6 +151,8 @@ class InflightRequest:
     facts the terminal settlement consumes.
 
     Attributes:
+        attempt_service_tiers: Frozen pricing authority keyed by physical attempt, initially
+            empty; untiered and customer-managed attempts have no entry.
         recovery_observed_at: First validated terminal receipt epoch per reserved attempt;
             retries never renew cache residency or failure cooldowns.
         recovery_observation_lock: Serializes recovery observation timestamps and effects
@@ -164,6 +172,7 @@ class InflightRequest:
         recovery_recorded_attempts: Attempts whose recovery effects already ran, initially empty.
         recovery_reason: Optional content-free reason for the admitted recovery placement.
         denied_destination_pools: Exactly bound destination-only budget refusals in this request.
+        no_paid_prework: Trusted admission without possible paid prework, default false.
         explicit_cache_state: Private marked-prefix plans and durable operation bindings,
             absent unless a host provides explicit cache spending authority.
     """
@@ -172,6 +181,7 @@ class InflightRequest:
     route: GatewayRoute
     request: ServingRequest
     deadline_monotonic: float
+    no_paid_prework: bool = field(default=False, kw_only=True)
     attempt_counts: list[int] = field(default_factory=list)
     ordinary_attempt_counts: list[int] = field(default_factory=list)
     attempt_policy: RequestAttemptPolicy = field(default_factory=RequestAttemptPolicy)
@@ -186,6 +196,7 @@ class InflightRequest:
     active_attempt_id: str | None = None
     # Every reserved attempt's route depth, for health recording at settle.
     attempt_depths: dict[str, int] = field(default_factory=dict)
+    attempt_service_tiers: dict[str, GatewayServiceTierAdmission] = field(default_factory=dict)
     estimated_cache_fractions: dict[str, float] = field(default_factory=dict)
     # The exact settlement the data plane could not land; the sweep replays it
     # verbatim so a completed outcome and its usage are never downgraded.
@@ -282,17 +293,10 @@ def deployment_priced_for_service_tier(
 ) -> ExactModelDeployment:
     """Reprice one deployment for a requested flex/priority processing tier.
 
-    v1 bills the REQUESTED tier: when the SELECTED candidate actually FORWARDS
-    the tier to its provider and carries a pass-through card for it, the card's
-    rates replace the base schedule on a copy used only for THIS reservation, so
-    the ceiling, the stored per-token rates, and settlement all bill the tier
-    transparently. ``forwards_tier`` is the admission-time forwarding decision
-    for this exact depth (``GatewayWireProfile.forwards_tier``); gating on it
-    keeps FORWARD and BILL consistent even if a card ever sits on a lane whose
-    wire would strip the tier (non-tier dialect, tier disabled): such a depth
-    runs the provider's base schedule, so it must bill the base schedule too. No
-    tier, no forwarding, or no card returns the deployment unchanged. The copy
-    stays Python-side and never crosses the native boundary.
+    The admitted card is frozen beside the standard card; settlement selects
+    between them from upstream evidence rather than assuming the requested tier.
+    No tier, no forwarding, or no card returns the deployment unchanged. The
+    copy stays Python-side and never crosses the native boundary.
     """
     if not forwards_tier:
         return deployment
@@ -918,11 +922,19 @@ def deployment_wire_entry(
         "fireworks_reasoning_route_sha256": profile.fireworks_reasoning_route_sha256,
         "hunyuan_reasoning_route_sha256": profile.hunyuan_reasoning_route_sha256,
         "reasoning_output_exposed": profile.reasoning_output_exposed,
+        "reasoning_output_hidden": reasoning_output_hidden(deployment.capabilities),
         # Gateway-emulated stop sequences: the stream is cut at the first
         # match and terminates with a stop-sequence reason. Empty for rungs
         # whose payload already carries the caller's stop field.
         "stop_sequences": list(stop_sequences),
         "serialize_tool_calls": serialize_tool_calls,
+        # OpenRouter's Gemini rungs report cache writes as a subset of cache
+        # reads (the creating call reads the written prefix back); the data
+        # plane separates the two legs before settlement.
+        "cache_writes_within_reads": (
+            openrouter_chat_wire(deployment.provider, profile.dialect)
+            and openrouter_cache_writes_within_reads(profile.model_id)
+        ),
         # Codex native tools translated to function tools on a foreign wire;
         # the data plane inverts the tool-call responses back to the native
         # (namespaced / custom) shape the caller declared. Empty on native

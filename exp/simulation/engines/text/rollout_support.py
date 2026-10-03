@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
-from typing import cast
 
 from exp.common.core.artifacts import (
     FailureAttribution,
@@ -16,6 +15,7 @@ from exp.common.rollouts import (
     RolloutArtifact,
     RolloutEventKind,
     RolloutSpan,
+    unknown_dispatch_reservation_is_upper_bound,
     unknown_dispatch_reserved_cost_usd,
     unknown_spend_failure,
 )
@@ -101,32 +101,13 @@ def normalize_text_tool_failure(episode: AgentEpisode) -> StructuredFailure | No
     )
 
 
-def known_total_spend(
-    rollouts: Sequence[RolloutArtifact],
-) -> float | None:
-    """Return total conservative provider spend, or ``None`` if any episode is unpriced.
-
-    Args:
-        rollouts: Completed text-simulation rollout artifacts to total.
-
-    Returns:
-        The known conservative provider spend, or ``None`` when any billed call is not priced
-        and has no persisted worst-case reservation.
-    """
-    values = tuple(rollout_spend(rollout) for rollout in rollouts)
-    if any(value is None for value in values):
-        return None
-    return sum(cast(float, value) for value in values)
-
-
 def rollout_spend(
     rollout: RolloutArtifact,
 ) -> float | None:
     """Return reconciled provider cost without treating unknown dispatches as free.
 
-    An unknown-spend failure is charged its persisted worst-case reservation instead of
-    poisoning the whole total, so one ambiguous dispatch stays conservatively inside the
-    ceiling while every other completed cell remains priced exactly.
+    A proven reservation bounds a failed dispatch conservatively. A numeric planning estimate
+    cannot replace missing pricing or metering evidence and leaves the total unknown.
 
     Args:
         rollout: Completed text-simulation rollout whose recorded calls are inspected.
@@ -136,10 +117,12 @@ def rollout_spend(
         charges, or ``None`` when any dispatched operation has unpriceable spend.
     """
     reserved: float | None = None
+    unknown = False
     if unknown_spend_failure(rollout.failure):
         reserved = unknown_dispatch_reserved_cost_usd(rollout.failure)
-        if reserved is None:
-            return None
+        if reserved is None or not unknown_dispatch_reservation_is_upper_bound(rollout.failure):
+            reserved = None
+            unknown = True
     roles = (
         (rollout.candidate_economics, RolloutEventKind.AGENT_MODEL_CALL),
         (rollout.world_model_economics, RolloutEventKind.SIMULATOR_WORLD_MODEL_CALL),
@@ -150,12 +133,13 @@ def rollout_spend(
         if not made_call:
             continue
         if economics is None or economics.cost_usd is None:
-            return None
-        total += economics.cost_usd.value
+            unknown = True
+        else:
+            total += economics.cost_usd.value
     retrieval = rollout.retrieval_economics
     if retrieval is not None and retrieval.cost_usd is not None:
         total += retrieval.cost_usd.value
-    return total
+    return None if unknown else total
 
 
 def elapsed_seconds(started_at: float, ended_at: float) -> float:

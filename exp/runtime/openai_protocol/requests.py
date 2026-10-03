@@ -13,10 +13,6 @@ from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError, 
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.common.models.model import ToolCall
-from exp.runtime.gateway.compatibility import (
-    CompatibilityDisposition,
-    CompatibilityManifest,
-)
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
     ExposedReasoningContentBlock,
@@ -34,7 +30,6 @@ from exp.runtime.gateway.embeddings_contracts import (
     EmbeddingTokenIds,
 )
 from exp.runtime.gateway.reasoning_carrier import (
-    FIREWORKS_REASONING_CONTENT_PREFIX,
     parse_reasoning_content_carrier,
     scheme_for_carrier,
 )
@@ -49,7 +44,7 @@ from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
     EMBEDDINGS_MANIFEST,
     RESPONSES_MANIFEST,
-    disposition_map,
+    validate_manifest,
 )
 from exp.runtime.openai_protocol.media_parts import message_content
 from exp.runtime.openai_protocol.prompt_cache_key_alias import fold_prompt_cache_key_alias
@@ -255,7 +250,7 @@ def decode_chat(
     payload, alias_disclosures = fold_prompt_cache_key_alias(payload)
     cache_payload = payload
     payload = drop_opencode_cache_control(payload)
-    _validate_manifest(payload, CHAT_MANIFEST)
+    validate_manifest(payload, CHAT_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
     _validate_official(
@@ -376,7 +371,7 @@ def decode_embeddings(payload: JsonObject) -> DecodedEmbeddingsRequest:
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
-    _validate_manifest(payload, EMBEDDINGS_MANIFEST)
+    validate_manifest(payload, EMBEDDINGS_MANIFEST)
     if payload.get("stream") is True:
         raise unsupported_field("stream")
     _validate_official(_EMBEDDINGS_OFFICIAL, payload, extension_fields={"stream"})
@@ -413,7 +408,7 @@ def decode_responses(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
     payload, alias_disclosures = fold_prompt_cache_key_alias(payload)
-    _validate_manifest(payload, RESPONSES_MANIFEST)
+    validate_manifest(payload, RESPONSES_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
     request = _validate_wire(_ResponsesRequest, payload)
@@ -576,15 +571,6 @@ def _provider_preferences(
         return None
     raw = payload.get("provider")
     return dict(raw) if isinstance(raw, dict) else None
-
-
-def _validate_manifest(payload: JsonObject, manifest: CompatibilityManifest) -> None:
-    """Reject unsupported and unknown top-level fields before responder work."""
-    decisions = disposition_map(manifest)
-    for field in payload:
-        disposition = decisions.get(field)
-        if disposition is None or disposition == CompatibilityDisposition.UNSUPPORTED:
-            raise unsupported_field(field)
 
 
 def _validate_official(
@@ -888,10 +874,15 @@ def _response_input_messages(
                     ReplayedNativeItem(index=index, role="assistant", item=raw_items[index])
                 )
                 continue
-            if item.encrypted_content.startswith(FIREWORKS_REASONING_CONTENT_PREFIX):
+            # The carrier's own prefix names the scheme it was sealed under
+            # (Fireworks or Hunyuan, the latter including every declared
+            # ``reasoning_content_native`` origin); any other value is a native
+            # provider's encrypted reasoning.
+            scheme = scheme_for_carrier(item.encrypted_content)
+            if scheme is not None:
                 try:
                     block: EncryptedReasoningBlock | SealedReasoningContentBlock = (
-                        parse_reasoning_content_carrier(item.encrypted_content)
+                        parse_reasoning_content_carrier(item.encrypted_content, scheme=scheme)
                     )
                 except ValueError as exc:
                     raise invalid_field(
@@ -905,7 +896,22 @@ def _response_input_messages(
                     output_index=index,
                     status=item.status,
                 )
-            replayed.append(ReplayedReasoning(index=index, block=block))
+            try:
+                visible = (
+                    tuple(
+                        ExposedReasoningContentBlock(content=part.text)
+                        for part in item.summary
+                        if part.text
+                    )
+                    if scheme is not None
+                    else ()
+                )
+            except ValidationError as exc:
+                raise invalid_field(
+                    f"input.{index}.summary",
+                    "Replayed reasoning summary exceeds 8,388,608 characters.",
+                ) from exc
+            replayed.append(ReplayedReasoning(index=index, block=block, visible=visible))
         elif isinstance(item, _ResponseMessage):
             converted = _messages((item,), f"input.{index}")
             if converted and item.role == "assistant":

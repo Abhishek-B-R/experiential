@@ -22,6 +22,7 @@ import textwrap
 import threading
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import cast
@@ -39,12 +40,12 @@ from exp.common.models import (
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind, SQLiteBudgetStore
 from exp.runtime.gateway.catalog_authority import (
-    upsert_certified_pool,
     upsert_connection,
     upsert_singleton_deployment,
 )
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.tests.certified_pool_fixture_test import upsert_certified_pool
 from exp.runtime.gateway.tests.native_messages_test import _DRIVER_SOURCE, _HOST, _ServingEngine
 
 pytest.importorskip("exp_gateway_native")
@@ -150,6 +151,46 @@ def _rounded_answer(selector: str) -> JsonObject:
     }
 
 
+# Choice answers from bounded synthetic jev-1.13.0 calls: hundredth bins totalling
+# 0.99, and a unit total whose winner sits one hundredth below another bin.
+_ROUNDED_CHOICES: dict[str, JsonObject] = {
+    "rounded-choice-total": {
+        "type": "choice",
+        "choice": "white",
+        "confidence": 0.27,
+        "probabilities": {
+            "brown": 0.01,
+            "red": 0.34,
+            "blue": 0.1,
+            "yellow": 0.04,
+            "orange": 0.01,
+            "black": 0.08,
+            "white": 0.34,
+            "purple": 0.02,
+            "green": 0.04,
+            "pink": 0.01,
+        },
+    },
+    "rounded-choice-rank": {
+        "type": "choice",
+        "choice": "white",
+        "confidence": 0.24,
+        "probabilities": {
+            "green": 0.05,
+            "white": 0.3,
+            "black": 0.1,
+            "orange": 0.01,
+            "brown": 0.01,
+            "red": 0.31,
+            "yellow": 0.04,
+            "blue": 0.14,
+            "pink": 0.01,
+            "purple": 0.03,
+        },
+    },
+}
+
+
 class _DecisionsUpstream(BaseHTTPRequestHandler):
     """Serve bounded synthetic answers, recording only loopback test traffic."""
 
@@ -196,6 +237,18 @@ class _DecisionsUpstream(BaseHTTPRequestHandler):
             quantity = cast(JsonObject, answers["quantity"])
             quantity["score"] = 1.74
             quantity["probabilities"] = {"0": 0.05 + 1e-12, "1": 0.15 - 1e-12, "2": 0.8}
+        elif selector == "infeasible-choice-total":
+            cast(JsonObject, answers["department"])["probabilities"] = {
+                "billing": 0.33,
+                "technical": 0.33,
+                "sales": 0.32,
+            }
+        elif selector == "infeasible-choice-rank":
+            department = cast(JsonObject, answers["department"])
+            department["choice"] = "technical"
+            department["probabilities"] = {"billing": 0.5, "technical": 0.49, "sales": 0.0}
+        elif selector in _ROUNDED_CHOICES:
+            answers["department"] = _ROUNDED_CHOICES[selector]
         elif selector in {"rounded-low", "rounded-high"}:
             answers["quantity"] = _rounded_answer(selector)
             body["usage"] = {
@@ -223,7 +276,9 @@ class _DecisionsUpstream(BaseHTTPRequestHandler):
 
 
 @pytest.fixture(scope="module", name="engine")
-def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine]:
+def _engine(
+    tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest
+) -> Iterator[_ServingEngine]:
     """Serve the shared native driver with separately granted chat/decision aliases.
 
     Yields:
@@ -369,6 +424,7 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         {
             "root": str(root),
             "request_timeout_seconds": _TIMEOUT_SECONDS,
+            "default_lane_bound": request.param if hasattr(request, "param") else None,
             "typesafe_loopback_url": f"http://{_HOST}:{upstream_port}/v1/systemone",
         }
     )
@@ -613,6 +669,34 @@ def test_rounded_provider_score_is_preserved_and_settled_once(
     _assert_budget_accounted(engine)
 
 
+@pytest.mark.parametrize("selector", sorted(_ROUNDED_CHOICES))
+def test_rounded_provider_choice_is_preserved_and_settled_once(
+    engine: _ServingEngine, selector: str
+) -> None:
+    """Real synthetic choice numbers cross Rust unchanged with one exact charge."""
+    before = _request_ids(engine)
+    calls_before = _provider_calls()
+    body = _body(selector)
+    answer = _ROUNDED_CHOICES[selector]
+    questions = cast(JsonObject, body["questions"])
+    cast(JsonObject, questions["department"])["criteria"] = dict.fromkeys(
+        cast(JsonObject, answer["probabilities"])
+    )
+    response = _post(engine, body)
+    assert response.status_code == 200, response.text
+    assert response.json()["answers"]["department"] == answer
+    assert response.json()["usage"] == {"input_tokens": 451, "output_tokens": 68}
+    assert _provider_calls() == calls_before + 1
+    [(request, attempts)] = _settled(engine, before)
+    assert request["terminal_state"] == "completed"
+    [attempt] = attempts
+    assert attempt["state"] == "completed"
+    assert attempt["failure_class"] is None
+    assert attempt["usage_source"] == "observed"
+    assert attempt["budget_settled_nano_usd"] == _COST_NANO_USD
+    _assert_budget_accounted(engine)
+
+
 def test_missing_usage_and_invalid_typed_answers_fail_closed(engine: _ServingEngine) -> None:
     """Unbillable answers and mismatched types/probabilities/legends never escape."""
     cases = (
@@ -623,6 +707,8 @@ def test_missing_usage_and_invalid_typed_answers_fail_closed(engine: _ServingEng
         ("inconsistent-score", "decision-failover"),
         ("precise-score", "decision-failover"),
         ("precise-probabilities", "decision-failover"),
+        ("infeasible-choice-total", "decision-failover"),
+        ("infeasible-choice-rank", "decision-failover"),
         ("wrong-type", "decision-failover"),
     )
     for selector, alias in cases:
@@ -809,6 +895,36 @@ def test_disconnect_settles_before_deadline_and_holds_unknown_liability(
     assert attempt["state"] == "cancelled"
     assert _provider_calls() == calls_before + 1
     _assert_unknown_liability(engine, attempt)
+
+
+@pytest.mark.parametrize("engine", [1], indirect=True)
+def test_systemone_capacity_refusal_preserves_committed_unbilled_proof(
+    engine: _ServingEngine,
+) -> None:
+    """Real SystemOne capacity refusal forwards the certificate without a provider call."""
+    _DecisionsUpstream.stall_started.clear()
+    _DecisionsUpstream.release_stalls.clear()
+    before = _request_ids(engine)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        occupied = pool.submit(_post, engine, _body("disconnect"))
+        try:
+            assert _DecisionsUpstream.stall_started.wait(5)
+            refused = _post(engine, _body("capacity-retry"))
+            assert refused.status_code == 429, refused.text
+            assert refused.headers["retry-after"] == "5"
+            assert refused.headers["x-gateway-admission-refused"] == "true"
+        finally:
+            _DecisionsUpstream.release_stalls.set()
+        assert occupied.result(timeout=5).status_code == 200
+    retried = _post(engine, _body("capacity-retry"))
+    assert retried.status_code == 200, retried.text
+    requests = _settled(engine, before, expected=3)
+    assert sorted(len(attempts) for _request, attempts in requests) == [0, 1, 1]
+    with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+        certified = connection.execute(
+            "SELECT request_id FROM gateway_requests WHERE failed_without_effects = 1"
+        ).fetchall()
+    assert len(certified) == 1
 
 
 def test_timeout_retains_unknown_liability_and_exhausts_budget(engine: _ServingEngine) -> None:

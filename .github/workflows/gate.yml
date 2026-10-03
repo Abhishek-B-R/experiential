@@ -10,6 +10,12 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same pull request supersedes the running gate; main
+# pushes and manual runs each keep their own run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   gate:
     runs-on: ubuntu-latest
@@ -18,7 +24,17 @@ jobs:
       UV_PYTHON: "3.13"
     steps:
       - uses: actions/checkout@v4
+      - name: Key the uv cache on the git-pinned source builds
+        # What the uv cache holds across runs is the wheels uv built from
+        # source (pruned for CI), above all the git-pinned exp-mitmproxy-rs
+        # (~3 min). Keying on all of uv.lock went cold on every release bump.
+        run: grep -E 'source = \{ git' uv.lock > .uv-cache-key || true
       - uses: astral-sh/setup-uv@v6
+        with:
+          # Python 3.13 jobs only: a key shared with the 3.12 job is saved once
+          # by whichever finishes first, holding the wrong interpreter's builds.
+          cache-dependency-glob: .uv-cache-key
+          cache-suffix: py313-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -126,14 +142,56 @@ jobs:
         run: >-
           uv run pytest -q -k "not live"
           exp/optimize/model/sft/tinker_test.py
+
+  gate-shards:
+    # Standard runners are free on this public repository, so running the
+    # non-live suite as parallel shards beside the lint/cargo gate job cuts
+    # the critical path at no cost.
+    name: gate tests (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Balanced on measured test time; each shard is ~2-3 minutes of tests on
+        # four workers. A path a shard ignores must be another shard's path, or
+        # run by a dedicated step (Tinker in gate, the evidence suites on macOS).
+        include:
+          - name: rest
+            paths: exp --ignore=exp/optimize/router --ignore=exp/runtime/gateway --ignore=exp/optimize/evaluation --ignore=exp/optimize/model/sft/tinker_test.py --ignore=exp/simulation/tests/comparison_evidence_test.py --deselect=exp/tests/release_test.py::test_installed_wheel_no_spend_release_evidence
+          - name: router-hosted
+            paths: exp/optimize/router/hosted_test.py exp/optimize/router/automatic
+          - name: router
+            paths: exp/optimize/router --ignore=exp/optimize/router/hosted_test.py --ignore=exp/optimize/router/automatic
+          - name: gateway
+            paths: exp/runtime/gateway
+          - name: evaluation
+            paths: exp/optimize/evaluation
+    env:
+      UV_PYTHON: "3.13"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Key the uv cache on the git-pinned source builds
+        # What the uv cache holds across runs is the wheels uv built from
+        # source (pruned for CI), above all the git-pinned exp-mitmproxy-rs
+        # (~3 min). Keying on all of uv.lock went cold on every release bump.
+        run: grep -E 'source = \{ git' uv.lock > .uv-cache-key || true
+      - uses: astral-sh/setup-uv@v6
+        with:
+          # Python 3.13 jobs only: a key shared with the 3.12 job is saved once
+          # by whichever finishes first, holding the wrong interpreter's builds.
+          cache-dependency-glob: .uv-cache-key
+          cache-suffix: py313-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: exp/runtime/gateway/native
+      - name: Install the project and its dev extras
+        run: uv sync --extra dev
       - name: non-live tests
         run: >-
           uv run pytest -n 4 --dist worksteal -q -k "not live"
-          exp
-          --ignore=exp/optimize/model/sft/tinker_test.py
+          ${{ matrix.paths }}
           --ignore=exp/optimize/router/tests/composition_evidence_test.py
-          --ignore=exp/simulation/tests/comparison_evidence_test.py
-          --deselect=exp/tests/release_test.py::test_installed_wheel_no_spend_release_evidence
 
   sdk-python312:
     runs-on: ubuntu-latest
@@ -154,6 +212,74 @@ jobs:
           uv run exp capture --help
           uv run pytest -q exp/cli/app_test.py exp/cli/capture exp/runtime/capture \
             exp/tests/release_test.py -k "not installed_wheel"
+
+  darwin-scope:
+    # The macOS evidence job is the most expensive check here (macOS bills 10x)
+    # while few pull requests touch what it covers. The Linux gate still runs
+    # the Capture suites on every PR, and main pushes always run the macOS job.
+    runs-on: ubuntu-latest
+    outputs:
+      required: ${{ steps.scope.outputs.required }}
+    steps:
+      - name: Does this pull request touch the Darwin evidence scope
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" != pull_request ]; then
+            echo "required=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate \
+            -q '.[] | {filename, previous_filename, patch}' > files.jsonl || {
+            echo "could not list the pull request's files; running the macOS job" >&2
+            echo "required=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          SCOPE = re.compile(
+              r"^(exp/runtime/capture/|exp/cli/capture/|exp/runtime/environments/"
+              r"|exp/runtime/router/|exp/optimize/router/|exp/simulation/"
+              # Shared files the evidence suites load directly. exp/common/ is
+              # deliberately out (a quarter of all merges); main pushes cover it.
+              r"|conftest\.py$|exp/__init__\.py$|exp/conftest\.py$"
+              r"|exp/tests/release_revision_test\.py$"
+              r"|\.github/workflows/gate\.yml$)"
+          )
+          MANIFESTS = {"pyproject.toml", "uv.lock"}
+          # Every release bumps both manifests; only a dependency change matters here.
+          VERSION_ONLY = re.compile(
+              r'^[+-](version = "[0-9][0-9a-z.+-]*"'
+              r'|\s*"exp-gateway-native>=[0-9][0-9.]*,<[0-9][0-9.]*",(\s*#.*)?)$'
+          )
+
+          def needs_macos(changed: dict) -> bool:
+              name = changed["filename"]
+              # A rename out of the scope still removes a file the job covers.
+              if SCOPE.match(name) or SCOPE.match(changed.get("previous_filename") or ""):
+                  return True
+              if name not in MANIFESTS:
+                  return False
+              patch = changed.get("patch")
+              if not patch:  # GitHub omits very large patches
+                  return True
+              lines = [
+                  line
+                  for line in patch.splitlines()
+                  if line[:1] in "+-" and not line.startswith(("+++", "---"))
+              ]
+              return not all(VERSION_ONLY.match(line) for line in lines)
+
+          with open("files.jsonl") as handle:
+              required = any(needs_macos(json.loads(line)) for line in handle if line.strip())
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"required={str(required).lower()}\n")
+          PY
 
   windows-snapshot-authority:
     name: Windows snapshot authority
@@ -214,6 +340,8 @@ jobs:
           path: windows-snapshot-authority.xml
 
   w16-darwin-evidence:
+    needs: darwin-scope
+    if: needs.darwin-scope.outputs.required == 'true'
     runs-on: macos-latest
     env:
       UV_PYTHON: "3.13"

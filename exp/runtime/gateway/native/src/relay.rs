@@ -46,7 +46,9 @@ pub fn event_retained_bytes(event: &Event) -> usize {
         Event::EncryptedReasoning {
             encrypted_content, ..
         } => encrypted_content.len(),
-        Event::ReasoningContentDelta { delta, .. } => delta.len(),
+        Event::ReasoningContentDelta { delta, .. } | Event::ReasoningTextDelta(delta) => {
+            delta.len()
+        }
         Event::ToolArgumentsDelta { delta, .. } | Event::ServerToolArgumentsDelta { delta, .. } => {
             delta.len()
         }
@@ -331,10 +333,15 @@ impl UpstreamRelay {
 
     fn queue_events(&mut self, events: Vec<Event>) {
         if let Some(observation) = &self.observation {
+            observation.record_service_tier(&self.normalizer.service_tier);
             // Several dialects retain a parsed meter until terminal encoding.
             // Accounting observes it now, even when this frame yields no event.
             if let Some(usage) = self.normalizer.observed_usage() {
-                observation.record(&Event::Usage(usage.clone()));
+                if self.normalizer.meter_replaces_earlier() {
+                    observation.replace_usage(usage);
+                } else {
+                    observation.record(&Event::Usage(usage.clone()));
+                }
             }
             for event in &events {
                 match event {
@@ -424,6 +431,17 @@ impl UpstreamRelay {
         S: Into<String>,
     {
         self.normalizer.set_request_words(words);
+    }
+
+    /// Carry the rung's cache-write accounting into usage normalization.
+    pub fn set_cache_writes_within_reads(&mut self, writes_within_reads: bool) {
+        self.normalizer
+            .set_cache_writes_within_reads(writes_within_reads);
+    }
+
+    /// Carry the tokens this attempt's own automatic cache create wrote.
+    pub fn set_gemini_cache_writes(&mut self, written: Option<u64>) {
+        self.normalizer.set_gemini_cache_writes(written);
     }
 
     /// Carry the Codex native-tool inversion map (see

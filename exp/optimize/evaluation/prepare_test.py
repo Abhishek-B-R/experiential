@@ -6,22 +6,39 @@ import pytest
 
 from exp.common.models import ModelCatalog
 from exp.common.progress import ProgressEvent
-from exp.common.project import ProjectStore
+from exp.common.project import ProjectStore, artifact_input
+from exp.common.traces import load_trace_dataset
+from exp.common.traces.sqlite import SQLiteTraceStore
+from exp.common.traces.sqlite_schema import trace_database_path
 from exp.optimize.evaluation.prepare import (
     ModelEvaluationOptions,
     PreparedModelEvaluation,
     prepare_model_evaluation,
 )
+from exp.optimize.evaluation.spending import BudgetedEmbedding
 from exp.optimize.router.automatic.provisional import prepare_hosted_provisional_judge
 from exp.optimize.router.automatic.service_test import (
     _REVISION,
     _TIME,
     _completed_project,
+    _EmbeddingClient,
     _ProviderState,
 )
 from exp.runtime.agents import ChatAgentRuntime, agent_factory_sha256
+from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.providers.transport import RetryPolicy
+from exp.simulation.build import BuildReviewReadiness, select_completed_build
+from exp.simulation.retrieval import RAGAction, RAGEmbedderBinding, RAGQuery, load_fit_rag_retriever
+from exp.simulation.retrieval.embedding_inputs import plan_rag_embedding_inputs
+from exp.simulation.retrieval.retriever import RAGQueryInputLimitError
+from exp.simulation.retrieval.transitions import render_rag_key
 from exp.simulation.specs import load_simulation_completion_contract
+from exp.simulation.world_model import artifact as world_artifact
+from exp.simulation.world_model.artifact import (
+    WORLD_MODEL_ARTIFACT_PATH,
+    GroundedWorldModelArtifact,
+    persist_grounded_world_model,
+)
 
 
 def _prepare(
@@ -65,6 +82,14 @@ def test_prepare_freezes_replayable_catalog_selection_without_provider_access(
     project, catalog, _, prepared = _prepare(tmp_path)
     assert ModelEvaluationOptions().maximum_output_tokens is None
     assert ModelEvaluationOptions().maximum_judge_input_tokens is None
+    assert ModelEvaluationOptions().maximum_retrieval_query_tokens is None
+    world_caps = catalog.models["world"].capabilities
+    assert world_caps is not None and world_caps.context_window_tokens is not None
+    retrieval = prepared.setup.world_model_settings.query_embedding
+    assert retrieval is not None
+    assert retrieval.maximum_input_tokens == (
+        world_caps.context_window_tokens - prepared.setup.world_model_settings.maximum_output_tokens
+    )
     judge_caps = catalog.models["judge"].capabilities
     assert judge_caps is not None and judge_caps.context_window_tokens is not None
     assert prepared.judge_request.maximum_input_tokens == (
@@ -91,6 +116,180 @@ def test_prepare_freezes_replayable_catalog_selection_without_provider_access(
     assert replay == prepared
     assert project.artifacts.list_ids() == before
     assert PreparedModelEvaluation.model_validate_json(prepared.model_dump_json()) == prepared
+
+
+def test_new_prompt_preparation_reuses_immutable_build_evidence_without_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refresh a plain evaluation project without altering its immutable input evidence."""
+    with monkeypatch.context() as producer:
+        producer.setattr(
+            world_artifact, "GROUNDED_WORLD_MODEL_PROMPT_VERSION", "text-world-model-v2"
+        )
+        project, catalog, state = _completed_project(tmp_path)
+    build = project.load_project().build
+    assert build is not None
+    traces = load_trace_dataset(project.artifacts, build.trace_dataset.artifact_id)
+    assert traces.dataset.source is not None
+    imports = SQLiteTraceStore(trace_database_path(project.paths.root))
+    receipt = imports.write_import(
+        project.load_project().project_id,
+        source_format="fixture",
+        source=traces.dataset.source,
+        traces=traces.traces,
+        metadata={"schema_version": 1, "issues": [], "identity_evidence": None},
+    )
+    project.bind_completed_build(build, trace_import_id=receipt.import_id)
+    original_config = project.load_project()
+    assert original_config.system is None
+    assert original_config.build_spend_ledger is None
+    assert original_config.hosted_judge is None
+    assert original_config.router_policy is None
+    assert original_config.router_report is None
+    old_bytes = project.artifacts.read_bytes(
+        build.world_model.artifact_id, WORLD_MODEL_ARTIFACT_PATH
+    )
+    old_world = GroundedWorldModelArtifact.model_validate_json(old_bytes)
+    assert old_world.prompt_version == "text-world-model-v2"
+    calls = (len(state.embedding_calls), len(state.completion_calls), state.credential_resolutions)
+    judge = prepare_hosted_provisional_judge(
+        project,
+        catalog,
+        maximum_input_tokens=32_768,
+        maximum_output_tokens=8_192,
+        maximum_attempts=RetryPolicy().maximum_attempts,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+
+    def prepare() -> PreparedModelEvaluation:
+        """Freeze a fresh comparison without constructing any provider client."""
+        return prepare_model_evaluation(
+            project,
+            catalog,
+            ("candidate-a", "candidate-b"),
+            judge_setup=judge.setup_input,
+            calibration_id=judge.calibration_id,
+            embedder_alias="embedder",
+            options=ModelEvaluationOptions(maximum_steps=1),
+            created_at=_TIME,
+            code_revision=_REVISION,
+        )
+
+    with pytest.raises(ValueError, match="persist a new world model.*new evaluation"):
+        prepare()
+    stable_files = {
+        (pointer.artifact_id, name): project.artifacts.read_bytes(pointer.artifact_id, name)
+        for pointer, name in (
+            (build.trace_dataset, "traces.jsonl"),
+            (build.task_set, "tasks.jsonl"),
+            (build.fit_rag, "transitions.jsonl"),
+            (build.fit_rag, "vectors.jsonl"),
+            (build.serving_rag, "transitions.jsonl"),
+            (build.serving_rag, "vectors.jsonl"),
+        )
+    }
+    current = persist_grounded_world_model(
+        project.artifacts,
+        build.serving_rag,
+        model_alias=old_world.model_alias,
+        model=old_world.model,
+        created_at=_TIME,
+        code_revision=_REVISION,
+        top_k=old_world.top_k,
+    )
+    new_build = build.model_copy(update={"world_model": artifact_input(current.manifest)})
+    review = project.read_review()
+    assert isinstance(review, dict)
+    select_completed_build(
+        project,
+        new_build,
+        BuildReviewReadiness.model_validate(review["build_review"]),
+        trace_import_id=original_config.trace_import_id,
+    )
+    assert project.load_project().trace_import_id == original_config.trace_import_id
+    assert imports.read_import(receipt.import_id).traces == traces.traces
+    prepared = prepare()
+    assert current.artifact.prompt_version == "text-world-model-v3"
+    assert current.artifact.world_model_id != old_world.world_model_id
+    assert current.artifact.prompt_sha256 != old_world.prompt_sha256
+    assert prepared.setup.world_model_settings.prompt_version == "text-world-model-v3"
+    assert prepared.setup.world_model_settings.grounded_world_model_input == new_build.world_model
+    assert new_build.model_dump(exclude={"world_model"}) == build.model_dump(
+        exclude={"world_model"}
+    )
+    assert (
+        project.artifacts.read_bytes(build.world_model.artifact_id, WORLD_MODEL_ARTIFACT_PATH)
+        == old_bytes
+    )
+    for (artifact_id, name), data in stable_files.items():
+        assert project.artifacts.read_bytes(artifact_id, name) == data
+    assert calls == (
+        len(state.embedding_calls),
+        len(state.completion_calls),
+        state.credential_resolutions,
+    )
+
+
+def test_large_chunked_query_uses_derived_capacity_and_accounts_exact_paid_inputs(
+    tmp_path: Path,
+) -> None:
+    """A 50KB query fits lossless chunks, charges their bytes, and exactly replays saved vectors."""
+    project, _, state, prepared = _prepare(tmp_path)
+    reservation = prepared.setup.world_model_settings.query_embedding
+    assert reservation is not None
+    query = RAGQuery(
+        task="Inspect records",
+        initial_context={
+            "records": "".join(f"record-{index:05d}: preserved value\n" for index in range(1600))
+        },
+        action=RAGAction(kind="message", content="Check the evidence"),
+    )
+    plan = plan_rag_embedding_inputs(
+        (
+            render_rag_key(
+                task=query.task, initial_context=query.initial_context, action=query.action
+            ),
+        )
+    )
+    assert 40_000 < plan.maximum_input_tokens < 60_000
+    assert max(len(text.encode("utf-8")) for text in plan.texts) <= 2_048
+    budget = RequestBudget(project, identity="large-query", maximum_cost_usd=None)
+    embedder = RAGEmbedderBinding(
+        client=BudgetedEmbedding(_EmbeddingClient(state), budget, reservation),
+        snapshot=reservation.model,
+        maximum_attempts=reservation.maximum_attempts,
+        input_usd_per_million_tokens=reservation.input_usd_per_million_tokens,
+        maximum_input_tokens=2_048,
+    )
+    retriever = load_fit_rag_retriever(
+        project.artifacts, prepared.setup.fit_rag_input, embedder=embedder
+    )
+    with pytest.raises(RAGQueryInputLimitError):
+        retriever.estimate_query_economics(
+            query, reservation.model_copy(update={"maximum_input_tokens": 32_768})
+        )
+    estimate = retriever.estimate_query_economics(query, reservation)
+    before = len(state.embedding_calls)
+    with budget.scope("query"):
+        matches = retriever.retrieve(query)
+    paid = state.embedding_calls[before:]
+    expected = (
+        plan.maximum_input_tokens
+        * reservation.maximum_attempts
+        * reservation.input_usd_per_million_tokens
+        / 1_000_000
+    )
+    assert tuple(text for batch in paid for text in batch) == plan.texts
+    assert estimate.cost_usd is not None
+    assert estimate.cost_usd.value == pytest.approx(expected)
+    assert budget.accounted_usd == pytest.approx(expected)
+    with budget.scope("query"):
+        assert retriever.retrieve(query) == matches
+    assert len(state.embedding_calls) == before + len(paid)
+    assert budget.accounted_usd == pytest.approx(expected)
+    assert ModelEvaluationOptions().maximum_steps == 100
+    assert ModelEvaluationOptions().maximum_rollout_output_tokens == 1_000_000
 
 
 def test_prepare_rejects_duplicate_workers_before_writes(tmp_path: Path) -> None:
@@ -214,7 +413,12 @@ def test_heterogeneous_capacities_use_model_specific_input_estimates(
         judge_setup=initial.judge_setup,
         calibration_id=initial.setup.simulation_protocol.judge_calibration_id,
         embedder_alias="embedder",
-        options=ModelEvaluationOptions(maximum_steps=1, maximum_output_tokens=output_ceiling),
+        options=ModelEvaluationOptions(
+            maximum_steps=1,
+            maximum_output_tokens=output_ceiling,
+            # Isolate output sizing from the separately tested derived query capacity.
+            maximum_retrieval_query_tokens=32_768,
+        ),
         created_at=_TIME,
         code_revision=_REVISION,
     )

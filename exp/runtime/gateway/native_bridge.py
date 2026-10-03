@@ -30,7 +30,7 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayRequest,
 )
-from exp.runtime.gateway.explicit_cache import ExplicitCacheHost
+from exp.runtime.gateway.explicit_cache import AutomaticCacheHost, ExplicitCacheHost
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
 from exp.runtime.gateway.guardrails import deterministic
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
@@ -91,6 +91,7 @@ from exp.runtime.gateway.native_count_tokens import NativeCountTokensMixin
 from exp.runtime.gateway.native_decisions import NativeDecisionsMixin
 from exp.runtime.gateway.native_decode_boundary import NativeDecodeMixin
 from exp.runtime.gateway.native_dispatch_signing import NativeDispatchSigningMixin
+from exp.runtime.gateway.native_effects import admission_without_effects
 from exp.runtime.gateway.native_embeddings import NativeEmbeddingsMixin
 from exp.runtime.gateway.native_execution import (
     FrozenDispatchBinding,
@@ -103,7 +104,7 @@ from exp.runtime.gateway.native_execution import (
 from exp.runtime.gateway.native_explicit_cache import (
     NativeExplicitCacheMixin,
     bind_explicit_cache,
-    validate_explicit_cache_host,
+    validate_cache_hosts,
 )
 from exp.runtime.gateway.native_images import NativeImagesMixin
 from exp.runtime.gateway.native_observability import NativeObservabilityMixin
@@ -200,6 +201,7 @@ class NativeControlPlane(
         web_search: WebSearchBackend | None = None,
         default_lane_bound: int | None = None,
         explicit_cache: ExplicitCacheHost | None = None,
+        automatic_cache: AutomaticCacheHost | None = None,
     ) -> None:
         """Bind loaded gateway components for serving.
 
@@ -227,13 +229,16 @@ class NativeControlPlane(
                 no ``concurrency_bound`` (``lane_saturation.default_lane_bound``
                 of the data plane's ``max_active_requests``); ``None`` leaves
                 unauthored rungs unbounded, the historical behavior.
+            automatic_cache: Opt-in Vertex prefix selection and durable host accounting.
+                No client markers are required; content never enters host callbacks.
             explicit_cache: Durable host policy and resource accounting for marked Google
                 prefixes. None disables explicit cache operations; generation is unchanged.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
-        self._explicit_cache = validate_explicit_cache_host(explicit_cache)
+        self._automatic_cache = automatic_cache
+        self._explicit_cache = validate_cache_hosts(explicit_cache, automatic_cache)
         self._capture = capture
         # The optional batch lane: hosts without it leave every batch route
         # answering the uniform not-enabled error below.
@@ -641,6 +646,7 @@ class NativeControlPlane(
                 provider_request,
                 public_request,
                 wire_route,
+                automatic=self._automatic_cache is not None,
             )
         except NativeBridgeError:
             # The enriched fail-closed capability rejection above already
@@ -716,6 +722,7 @@ class NativeControlPlane(
                 request=provider_request,
                 deadline_monotonic=deadline,
                 continuation=continuation_context,
+                no_paid_prework=admission_without_effects(authorization, captured_request, policy),
                 policy=policy,
                 signers=tuple(signers),
                 dispatch_bindings=tuple(dispatch_bindings),
@@ -767,7 +774,7 @@ class NativeControlPlane(
                 self._guardrails,
                 policy,
                 public_request,
-                image_output=any(wire.get("image_output") is True for wire in wire_route),
+                wire_route=wire_route,
             ).value,
             "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
         }

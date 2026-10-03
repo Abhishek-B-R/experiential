@@ -1,5 +1,6 @@
 """Judging recovery preserves completed rollouts, scores, and prior spend."""
 
+import threading
 from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
@@ -11,14 +12,18 @@ from pydantic import BaseModel, JsonValue
 from exp.common.core.artifacts import ArtifactEnvelope
 from exp.common.judging import Judgment, Rubric
 from exp.common.models import AssistantAction, ModelCatalog, ModelRequest, ModelResponse, Usage
+from exp.common.models.catalog import GatewayDeploymentMetadata
+from exp.common.models.catalog_prices import GatewayTokenPrices
 from exp.common.project import ArtifactManifest
 from exp.common.project.records import ProjectRecords
 from exp.common.rollouts import RolloutArtifact
+from exp.optimize.evaluation.contracts import EvaluationBudget
 from exp.optimize.evaluation.judging_resume import (
     prepare_judging_revision,
     read_judging_revision,
 )
 from exp.optimize.evaluation.prepare import ModelEvaluationOptions
+from exp.optimize.evaluation.prepare_test import _prepare
 from exp.optimize.evaluation.runs import (
     EvaluationDefaults,
     EvaluationRun,
@@ -27,9 +32,13 @@ from exp.optimize.evaluation.runs import (
     prepare_run,
     save_run,
 )
+from exp.optimize.evaluation.runtime import run_prepared_model_evaluation
+from exp.optimize.evaluation.runtime_test import _ScheduledRuntimeCatalog
+from exp.optimize.evaluation.service import ModelEvaluationResult
 from exp.optimize.router.automatic import service_test as automatic_fixtures
 from exp.optimize.router.automatic.service_test import (
     _REVISION,
+    _TIME,
     _completed_project,
     _CompletionClient,
     _RuntimeCatalog,
@@ -40,23 +49,115 @@ from exp.optimize.router.judgment_budget import JudgmentExclusionRecord
 from exp.runtime.models import RuntimeModelCatalog
 
 
-def test_judging_retry_preserves_rollouts_valid_scores_and_all_attempt_costs(
+def test_parallel_judge_write_failure_drains_and_reuses_every_paid_response(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent successful receipts survive one failed artifact write and exact resume."""
+    project, catalog, state, prepared = _prepare(tmp_path)
+    runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
+    original_write = project.artifacts.write_json
+    lock = threading.Lock()
+    barrier = threading.Barrier(2)
+    probes = 0
+
+    def write_probe(
+        *,
+        artifact_id: str,
+        artifact_type: str,
+        envelope: ArtifactEnvelope,
+        files: Mapping[str, BaseModel | JsonValue],
+    ) -> ArtifactManifest:
+        """Fail one completed response only after a sibling is also ready to persist."""
+        nonlocal probes
+        if artifact_type == "manual-judge-probe":
+            with lock:
+                probes += 1
+                ordinal = probes
+            if ordinal <= 2:
+                barrier.wait(timeout=5)
+            if ordinal == 1:
+                raise OSError("interrupted concurrent probe write")
+        return original_write(
+            artifact_id=artifact_id, artifact_type=artifact_type, envelope=envelope, files=files
+        )
+
+    def run() -> ModelEvaluationResult:
+        """Use the exact same evaluation identity and shared request ledger on every attempt."""
+        return run_prepared_model_evaluation(
+            project,
+            prepared,
+            runtime,
+            budget=EvaluationBudget(maximum_cost_usd=100, maximum_judgments=100),
+            provider_spend_consented=True,
+            created_at=_TIME,
+            code_revision=_REVISION,
+        )
+
+    monkeypatch.setattr(project.artifacts, "write_json", write_probe)
+    with pytest.raises(OSError, match="interrupted concurrent probe write"):
+        run()
+    before = Counter(alias for alias, _ in state.completion_calls)
+    saved_judgments = {
+        key
+        for key in project.artifacts.list_ids()
+        if project.artifacts.read(key).manifest.artifact_type == "judgment"
+    }
+    assert 2 <= before["judge"] <= 6
+    assert saved_judgments
+    monkeypatch.setattr(project.artifacts, "write_json", original_write)
+    result = run()
+    after = Counter(alias for alias, _ in state.completion_calls)
+    assert after["judge"] == 6
+    assert after["candidate-a"] == after["candidate-b"] == 3
+    assert result.report.compared_cells == 3
+    assert saved_judgments.issubset(project.artifacts.list_ids())
+    assert not any(
+        project.artifacts.read(key).manifest.artifact_type == "judgment-exclusion"
+        for key in project.artifacts.list_ids()
+    )
+    assert run() == result
+    assert after == Counter(alias for alias, _ in state.completion_calls)
+
+
+@pytest.mark.parametrize("scheduled", [False, True])
+def test_judging_retry_preserves_rollouts_valid_scores_and_all_attempt_costs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scheduled: bool
 ) -> None:
     """Recover two kinds of judge failure without another worker or world-model dispatch."""
     project, catalog, state = _completed_project(tmp_path)
+    if scheduled:
+        card = GatewayTokenPrices(
+            input_nano_usd_per_million_tokens=1_000_000_000,
+            cached_input_nano_usd_per_million_tokens=500_000_000,
+            cache_creation_input_nano_usd_per_million_tokens=1_500_000_000,
+            cache_creation_1h_input_nano_usd_per_million_tokens=2_500_000_000,
+            output_nano_usd_per_million_tokens=2_000_000_000,
+            reasoning_nano_usd_per_million_tokens=3_000_000_000,
+        )
+        catalog = catalog.model_copy(
+            update={
+                "models": {
+                    **catalog.models,
+                    "judge": catalog.models["judge"].model_copy(
+                        update={"gateway": GatewayDeploymentMetadata(prices=card)}
+                    ),
+                }
+            }
+        )
     run = prepare_run(
         project,
         catalog,
         EvaluationDefaults(
             models=("candidate-a", "candidate-b"),
             minimum_scenarios=3,
-            options=ModelEvaluationOptions(maximum_steps=1, maximum_judge_input_tokens=32_768),
+            options=ModelEvaluationOptions(
+                maximum_steps=1, maximum_judge_input_tokens=32_768, maximum_concurrency=1
+            ),
         ),
         code_revision=_REVISION,
     ).model_copy(update={"spending_limit_usd": 100.0})
     save_run(project, run)
-    runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
+    runtime = cast(RuntimeModelCatalog, _ScheduledRuntimeCatalog(catalog, state))
     original_complete = _CompletionClient.complete
     original_render = protocol._bounded_judge_request
     render_count = [0]
@@ -88,6 +189,23 @@ def test_judging_retry_preserves_rollouts_valid_scores_and_all_attempt_costs(
         """Make the first judge response malformed; remaining responses are usable."""
         response = original_complete(client, request)
         if client._alias == "judge":
+            if scheduled:
+                assert response.economics.usage is not None
+                response = response.model_copy(
+                    update={
+                        "economics": response.economics.model_copy(
+                            update={
+                                "usage": response.economics.usage.model_copy(
+                                    update={
+                                        "cache_write_input_tokens": 0,
+                                        "reasoning_tokens": 0,
+                                    }
+                                ),
+                                "provider_attempts": 1,
+                            }
+                        )
+                    }
+                )
             judge_count[0] += 1
             if judge_count[0] == 1:
                 return response.model_copy(update={"output": AssistantAction(content="invalid")})
@@ -123,6 +241,33 @@ def test_judging_retry_preserves_rollouts_valid_scores_and_all_attempt_costs(
     assert before == Counter(alias for alias, _ in state.completion_calls)
     revision = read_judging_revision(project, failed.prepared, pointer)
     assert revision.request.maximum_input_tokens > 32_768
+    assert revision.request.token_prices == catalog.models["judge"].token_prices
+    assert revision.request.token_prices == failed.prepared.judge_request.token_prices
+    if scheduled:
+        assert revision.request.token_prices is not None
+        changed_card = revision.request.token_prices.model_copy(
+            update={"reasoning_nano_usd_per_million_tokens": 4_000_000_000}
+        )
+        changed_catalog = catalog.model_copy(
+            update={
+                "models": {
+                    **catalog.models,
+                    "judge": catalog.models["judge"].model_copy(
+                        update={"gateway": GatewayDeploymentMetadata(prices=changed_card)}
+                    ),
+                }
+            }
+        )
+        before_drift = (project.artifacts.list_ids(), len(state.completion_calls))
+        with pytest.raises(ValueError, match="judge prices or output settings changed"):
+            prepare_judging_revision(
+                project,
+                failed.prepared,
+                changed_catalog,
+                created_at=failed.created_at,
+                code_revision=failed.code_revision,
+            )
+        assert before_drift == (project.artifacts.list_ids(), len(state.completion_calls))
     resumed = failed.model_copy(update={"judging_revision": pointer})
     save_run(project, resumed)
     monkeypatch.setattr(protocol, "_bounded_judge_request", original_render)
@@ -196,7 +341,7 @@ def test_recovery_counts_paid_response_when_probe_write_failed(
         EvaluationDefaults(
             models=("candidate-a", "candidate-b"),
             minimum_scenarios=3,
-            options=ModelEvaluationOptions(maximum_steps=1),
+            options=ModelEvaluationOptions(maximum_steps=1, maximum_concurrency=1),
         ),
         code_revision=_REVISION,
     ).model_copy(update={"spending_limit_usd": 100.0})
@@ -345,6 +490,7 @@ def test_judging_recovery_can_exceed_original_quote_under_approved_allowance(
     assert Counter(alias for alias, _ in state.completion_calls) - before == {"judge": 6}
     assert result.report.compared_cells == 3
     assert result.judge_cost_usd > run.prepared.cost.maximum_cost_usd
+    assert resumed.spending_limit_usd is not None
     assert result.judge_cost_usd < resumed.spending_limit_usd
     history = tuple(
         EvaluationRun.model_validate_json(payload)

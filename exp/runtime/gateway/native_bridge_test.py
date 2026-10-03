@@ -67,7 +67,10 @@ from exp.runtime.gateway.native_bridge import (
 )
 from exp.runtime.gateway.native_bridge_errors import capability_param as _public_capability_param
 from exp.runtime.gateway.native_components import NativeGatewayComponents
-from exp.runtime.gateway.native_reasoning import CHANGED_TURN_CARRIER_DROPPED
+from exp.runtime.gateway.native_reasoning import (
+    CHANGED_TURN_CARRIER_DROPPED,
+    UNAVAILABLE_ISSUER_CARRIER_DROPPED,
+)
 from exp.runtime.gateway.native_recovery import session_cache_key
 from exp.runtime.gateway.native_stage_admission_test import Host
 from exp.runtime.gateway.replay_identity import canonical_request_sha256
@@ -1535,6 +1538,80 @@ def _reasoning_failover_pool(
     return control, raw_key, body, cast("list[JsonObject]", initial["route"])
 
 
+def test_carrier_whose_issuing_rung_left_the_route_drops_instead_of_refusing(
+    tmp_path: Path,
+) -> None:
+    """A lane closed under an open conversation serves the next turn without its thinking.
+
+    Production 2026-09-30 01:49Z: the house Tencent account ran out, the catalog
+    closed its lane and republished glm-5.3 without the issuing rung, and the
+    OpenCode session's next turn was refused as an inauthentic continuation. The
+    carrier is untouched and no client retry could repair that, so admission now
+    drops it unrevealed, routes on the current pool, and discloses the drop.
+    """
+    from datetime import UTC, datetime
+
+    from exp.common.models import GatewayEquivalenceCertification
+    from exp.runtime.gateway.catalog_authority import (
+        upsert_singleton_deployment,
+    )
+    from exp.runtime.gateway.tests.certified_pool_fixture_test import upsert_certified_pool
+
+    _control, raw_key, body, _initial_route = _reasoning_failover_pool(tmp_path)
+    # Re-certify the pool without the issuing rung (beta plus a new gamma), the
+    # shape a closed house lane publishes: the carrier's deployment is gone.
+    upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="gamma",
+        connection_name="beta-provider",
+        provider_model="gamma-model-exact",
+        exact_model_id="model-revision-exact",
+        revision=None,
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    _catalog, normalized, _snapshot = snapshot_current_catalog(tmp_path)
+    normalized, snapshot, _changed = upsert_certified_pool(
+        tmp_path,
+        pool_id="coding",
+        exact_model_id="model-revision-exact",
+        deployment_aliases=("beta", "gamma"),
+        certification=GatewayEquivalenceCertification(
+            certification_id="certification-pool-without-issuer",
+            provenance="operator-reviewed deployment manifests",
+            evidence_sha256="b" * 64,
+            certified_at=datetime(2026, 9, 30, tzinfo=UTC),
+        ),
+        expected_catalog_sha256=normalized.identity_sha256(),
+        replace=True,
+    )
+    GatewayManagement(tmp_path).activate_direct_alias(
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="revision-pool-issuer-closed",
+        pool_id="coding",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path, environment={"TEST_PROVIDER_KEY": "shared-hunyuan-secret"}
+        )
+    )
+
+    served = _admit(control, raw_key, body)
+
+    route = cast("list[JsonObject]", served["route"])
+    assert [wire["deployment_id"] for wire in route] == ["beta", "gamma"]
+    assert served["route_reason"] == "direct"
+    assert served["ignored_parameters"] == [UNAVAILABLE_ISSUER_CARRIER_DROPPED]
+    assert "private reasoning only the issuing rung can unseal" not in json.dumps(route)
+    assert "reasoning_content" not in json.dumps(route[0]["upstream_payload"])
+
+
 def _attempt_route_reasons(control: NativeControlPlane, request_id: str) -> list[tuple[int, str]]:
     """Return each reserved attempt's ``(route_depth, route_reason)`` for one request."""
     ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
@@ -2542,10 +2619,10 @@ def _configured_pool_gateway(
     from exp.common.models import GatewayEquivalenceCertification
     from exp.runtime.gateway.catalog_authority import (
         ConnectionConfig,
-        upsert_certified_pool,
         upsert_connection,
         upsert_singleton_deployment,
     )
+    from exp.runtime.gateway.tests.certified_pool_fixture_test import upsert_certified_pool
 
     manager = GatewayManagement(root)
     manager.initialize()
@@ -3242,7 +3319,7 @@ def test_encrypted_reasoning_pins_winning_fallback_and_rejects_credential_drift(
     recorded: list[GatewayFailure] = []
     original_finish = control._accounting.finish_request_quietly  # noqa: SLF001
 
-    def _capture_finish(authorization: AuthorizationSnapshot, failure: GatewayFailure) -> None:
+    def _capture_finish(authorization: AuthorizationSnapshot, failure: GatewayFailure) -> bool:
         recorded.append(failure)
         return original_finish(authorization, failure)
 
@@ -3278,7 +3355,7 @@ def test_admission_maps_a_route_build_failure_to_a_retryable_unavailable(
     recorded: list[GatewayFailure] = []
     original_finish = control._accounting.finish_request_quietly  # noqa: SLF001
 
-    def _capture(authorization: AuthorizationSnapshot, failure: GatewayFailure) -> None:
+    def _capture(authorization: AuthorizationSnapshot, failure: GatewayFailure) -> bool:
         recorded.append(failure)
         return original_finish(authorization, failure)
 
@@ -5210,199 +5287,6 @@ def test_hosted_components_without_group_commit_writer_settle(
     assert report["totals"]["terminal_counts"] == [{"state": "completed", "attempts": 1}]
 
 
-def _messages_fixture_json() -> str:
-    """Return the Rust fixture-event JSON for the shared Messages stream."""
-    return json.dumps(
-        [
-            {"kind": "text_delta", "text": "Hel"},
-            {"kind": "text_delta", "text": "lo é"},
-            {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
-            {"kind": "tool_arguments_delta", "index": 0, "text": '{"q": '},
-            {"kind": "tool_arguments_delta", "index": 0, "text": '"x"}'},
-            {
-                "kind": "tool_call_completed",
-                "index": 0,
-                "call_id": "call-1",
-                "name": "search",
-                "raw_arguments": '{"q": "x"}',
-            },
-            {"kind": "usage", "input_tokens": 10, "output_tokens": 4, "cached_input_tokens": 3},
-            {"kind": "completed"},
-        ]
-    )
-
-
-def test_rust_messages_sse_frames_match_the_committed_golden() -> None:
-    """Rust Messages SSE frames equal the committed golden fixture."""
-    native = pytest.importorskip("exp_gateway_native")
-
-    actual = native.encode_messages_fixture("request-abc", "coding", _messages_fixture_json())
-    assert list(actual) == _parity_golden("messages_tool_stream_frames")
-
-
-def test_rust_messages_drop_reasoning_summary_deltas_without_changing_the_golden() -> None:
-    """The Messages surface has no reasoning-summary shape, so deltas emit nothing.
-
-    A stream carrying a reasoning summary produces exactly the committed golden
-    frames of the same stream without one.
-    """
-    native = pytest.importorskip("exp_gateway_native")
-
-    events = json.loads(_messages_fixture_json())
-    events.insert(
-        0,
-        {
-            "kind": "reasoning_summary_delta",
-            "output_index": 0,
-            "summary_index": 0,
-            "text": "Checked the plan.",
-        },
-    )
-    actual = native.encode_messages_fixture("request-abc", "coding", json.dumps(events))
-    assert list(actual) == _parity_golden("messages_tool_stream_frames")
-
-
-def test_rust_messages_failure_frames_match_the_committed_golden() -> None:
-    """A failed Messages terminal equals the committed golden error event."""
-    native = pytest.importorskip("exp_gateway_native")
-
-    fixture = json.dumps(
-        [
-            {"kind": "text_delta", "text": "oops"},
-            {"kind": "failed", "text": "provider stream failed"},
-        ]
-    )
-    actual = native.encode_messages_fixture("request-abc", "coding", fixture)
-    assert list(actual) == _parity_golden("messages_failure_frames")
-
-
-def test_rust_messages_completed_body_matches_the_committed_golden() -> None:
-    """The Rust non-streaming Anthropic message equals the committed golden body."""
-    native = pytest.importorskip("exp_gateway_native")
-
-    actual = native.completed_messages_fixture("request-abc", "coding", _messages_fixture_json())
-    assert actual == _parity_golden("messages_tool_stream_body")
-
-
-def test_rust_anthropic_error_translation_matches_the_committed_goldens() -> None:
-    """The Rust Anthropic error envelope equals the committed translations.
-
-    Every failure class is exercised through one committed OpenAI-shaped
-    input and its committed Anthropic envelope, plus one param-carrying
-    protocol error to prove the param folding. The committed inputs also pin
-    the OpenAI-side taxonomy for classes whose live rendering is wall-clock
-    dependent (quota reset boundaries).
-    """
-    native = pytest.importorskip("exp_gateway_native")
-
-    inputs = cast("dict[str, JsonObject]", _parity_golden("anthropic_error_inputs"))
-    envelopes = cast("dict[str, JsonObject]", _parity_golden("anthropic_error_envelopes"))
-    assert set(inputs) == {failure_class.value for failure_class in GatewayFailureClass}
-    assert set(envelopes) == set(inputs)
-
-    for failure_class in GatewayFailureClass:
-        payload = inputs[failure_class.value]
-        translated = json.loads(native.anthropic_error_fixture(json.dumps(payload)))
-        assert translated == envelopes[failure_class.value], failure_class
-    with_param = cast("JsonObject", _parity_golden("anthropic_error_with_param_input"))
-    translated = json.loads(native.anthropic_error_fixture(json.dumps(with_param)))
-    assert translated == _parity_golden("anthropic_error_with_param")
-
-
-def test_rust_messages_body_preserves_interleaved_block_order() -> None:
-    """The native body keeps provider block order in the non-streaming shape."""
-    native = pytest.importorskip("exp_gateway_native")
-
-    fixture = json.dumps(
-        [
-            {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
-            {
-                "kind": "tool_call_completed",
-                "index": 0,
-                "call_id": "call-1",
-                "name": "search",
-                "raw_arguments": "{}",
-            },
-            {"kind": "text_delta", "text": "after"},
-            {"kind": "completed"},
-        ]
-    )
-    actual = native.completed_messages_fixture("request-abc", "coding", fixture)
-    assert actual == _parity_golden("messages_block_order_body")
-    assert json.loads(actual)["content"][0]["type"] == "tool_use"
-    assert json.loads(actual)["content"][1] == {"type": "text", "text": "after"}
-
-
-def test_rust_messages_deferred_tool_completion_matches_the_committed_goldens() -> None:
-    """Deferred completions (OpenAI-compatible [DONE] ordering) hold parity.
-
-    Text arriving between a tool's arguments and its completion must stream
-    and aggregate exactly as the committed goldens recorded, with the tool
-    block anchored at its start position.
-    """
-    native = pytest.importorskip("exp_gateway_native")
-
-    fixture = json.dumps(
-        [
-            {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
-            {"kind": "tool_arguments_delta", "index": 0, "text": "{}"},
-            {"kind": "text_delta", "text": "after"},
-            {
-                "kind": "tool_call_completed",
-                "index": 0,
-                "call_id": "call-1",
-                "name": "search",
-                "raw_arguments": "{}",
-            },
-            {"kind": "completed"},
-        ]
-    )
-    actual_frames = native.encode_messages_fixture("request-abc", "coding", fixture)
-    assert list(actual_frames) == _parity_golden("messages_deferred_frames")
-    actual_body = native.completed_messages_fixture("request-abc", "coding", fixture)
-    assert actual_body == _parity_golden("messages_deferred_body")
-
-
-def test_rust_messages_interleaved_parallel_tools_match_the_goldens() -> None:
-    """Interleaved parallel tool calls stay in byte parity with the goldens.
-
-    The canonical stream may legally interleave tool A arguments, tool B
-    start, and more tool A arguments; the encoder must schedule blocks in
-    start order, streaming the open block live and buffering the rest.
-    """
-    native = pytest.importorskip("exp_gateway_native")
-
-    fixture = json.dumps(
-        [
-            {"kind": "tool_call_started", "index": 0, "call_id": "call-a", "name": "alpha"},
-            {"kind": "tool_arguments_delta", "index": 0, "text": '{"a": '},
-            {"kind": "tool_call_started", "index": 1, "call_id": "call-b", "name": "beta"},
-            {"kind": "tool_arguments_delta", "index": 1, "text": '{"b": 2}'},
-            {"kind": "tool_arguments_delta", "index": 0, "text": "1}"},
-            {
-                "kind": "tool_call_completed",
-                "index": 0,
-                "call_id": "call-a",
-                "name": "alpha",
-                "raw_arguments": '{"a": 1}',
-            },
-            {
-                "kind": "tool_call_completed",
-                "index": 1,
-                "call_id": "call-b",
-                "name": "beta",
-                "raw_arguments": '{"b": 2}',
-            },
-            {"kind": "usage", "input_tokens": 6, "output_tokens": 3},
-            {"kind": "completed"},
-        ]
-    )
-    actual_frames = native.encode_messages_fixture("request-abc", "coding", fixture)
-    assert list(actual_frames) == _parity_golden("messages_interleaved_frames")
-    actual_body = native.completed_messages_fixture("request-abc", "coding", fixture)
-    assert actual_body == _parity_golden("messages_interleaved_body")
-
-
 def test_store_false_skips_continuation_retention(tmp_path: Path) -> None:
     """A store:false response is never remembered, so continuing from it fails
     closed with the shared previous_response_not_found error."""
@@ -5453,38 +5337,6 @@ def test_store_false_skips_continuation_retention(tmp_path: Path) -> None:
     ]
 
 
-def _thinking_fixture_json() -> str:
-    """Return the Rust fixture-event JSON for the thinking Messages stream."""
-    return json.dumps(
-        [
-            {"kind": "thinking_delta", "index": 0, "text": "Let me "},
-            {"kind": "thinking_delta", "index": 0, "text": "check."},
-            {"kind": "thinking_signature", "index": 0, "signature": "c2lnbmF0dXJl"},
-            {"kind": "redacted_thinking", "index": 1, "data": "b3BhcXVl"},
-            {"kind": "text_delta", "text": "Hello"},
-            {"kind": "usage", "input_tokens": 12, "output_tokens": 7, "cached_input_tokens": 2},
-            {"kind": "completed"},
-        ]
-    )
-
-
-def test_rust_messages_thinking_stream_matches_the_hand_authored_goldens() -> None:
-    """Thinking blocks stream and aggregate exactly as the Anthropic spec fixes.
-
-    The golden frames were hand-authored against the public Messages
-    streaming contract: the thinking block opens with empty fields, streams
-    thinking_delta fragments, closes with one signature_delta, redacted
-    thinking travels whole in its start frame, and the non-streaming body
-    carries the same blocks in order with the byte-exact signature.
-    """
-    native = pytest.importorskip("exp_gateway_native")
-
-    frames = native.encode_messages_fixture("request-abc", "coding", _thinking_fixture_json())
-    assert list(frames) == _parity_golden("messages_thinking_frames")
-    body = native.completed_messages_fixture("request-abc", "coding", _thinking_fixture_json())
-    assert body == _parity_golden("messages_thinking_body")
-
-
 def test_rust_responses_encrypted_reasoning_matches_the_hand_authored_golden() -> None:
     """Requested encrypted reasoning lands verbatim on the reasoning item."""
     native = pytest.importorskip("exp_gateway_native")
@@ -5523,108 +5375,6 @@ def test_rust_responses_encrypted_reasoning_matches_the_hand_authored_golden() -
         fixture,
     )
     assert body == _parity_golden("responses_encrypted_reasoning_body")
-
-
-def test_thinking_bytes_round_trip_the_native_pipeline_exactly() -> None:
-    """Non-ASCII thinking text and a multi-kilobyte signature survive the full
-    provider-frames-to-public-frames pipeline byte-identically.
-
-    The signature is an opaque cryptographic value the provider verifies on
-    replay, so any re-encoding drift (Unicode escaping, truncation, split
-    handling) would break every continued Claude Code conversation.
-    """
-    native = pytest.importorskip("exp_gateway_native")
-
-    thinking_one = "Grüß 事實 مرحبا  "
-    thinking_two = "🤔🧠 σκέψη ⇒ done"
-    signature = "Eq" + "A0b/+=" * 700  # ~4.2 KB, base64-shaped.
-    redacted = "R3" * 1500
-    provider_chunks = [
-        json.dumps({"type": "message_start", "message": {"usage": {"input_tokens": 3}}}),
-        json.dumps(
-            {
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
-            }
-        ),
-        json.dumps(
-            {
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "thinking_delta", "thinking": thinking_one},
-            },
-            ensure_ascii=False,
-        ),
-        json.dumps(
-            {
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "thinking_delta", "thinking": thinking_two},
-            },
-            ensure_ascii=False,
-        ),
-        json.dumps(
-            {
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "signature_delta", "signature": signature},
-            }
-        ),
-        json.dumps({"type": "content_block_stop", "index": 0}),
-        json.dumps(
-            {
-                "type": "content_block_start",
-                "index": 1,
-                "content_block": {"type": "redacted_thinking", "data": redacted},
-            }
-        ),
-        json.dumps({"type": "content_block_stop", "index": 1}),
-        json.dumps(
-            {
-                "type": "message_delta",
-                "delta": {"stop_reason": "end_turn"},
-                "usage": {"output_tokens": 9},
-            }
-        ),
-        json.dumps({"type": "message_stop"}),
-    ]
-    # The fixture boundary carries raw stream bytes as latin-1 code points.
-    frames_json = json.dumps(
-        [f"data: {chunk}\n\n".encode().decode("latin-1") for chunk in provider_chunks]
-    )
-    normalized = json.loads(native.normalize_stream_fixture("anthropic_messages", frames_json))
-    assert normalized["failure"] is None
-    events = normalized["events"]
-    streamed_thinking = "".join(
-        event["text"] for event in events if event["kind"] == "thinking_delta"
-    )
-    assert streamed_thinking.encode() == (thinking_one + thinking_two).encode()
-    assert [event["signature"] for event in events if event["kind"] == "thinking_signature"] == [
-        signature
-    ]
-
-    fixture = json.dumps(events, ensure_ascii=False)
-    public_frames = native.encode_messages_fixture("request-abc", "coding", fixture)
-    payloads = [json.loads(frame.split("data: ", 1)[1].strip()) for frame in public_frames if frame]
-    out_thinking = "".join(
-        payload["delta"]["thinking"]
-        for payload in payloads
-        if payload["type"] == "content_block_delta" and payload["delta"]["type"] == "thinking_delta"
-    )
-    out_signature = "".join(
-        payload["delta"]["signature"]
-        for payload in payloads
-        if payload["type"] == "content_block_delta"
-        and payload["delta"]["type"] == "signature_delta"
-    )
-    assert out_thinking.encode() == (thinking_one + thinking_two).encode()
-    assert out_signature.encode() == signature.encode()
-
-    body = json.loads(native.completed_messages_fixture("request-abc", "coding", fixture))
-    assert body["content"][0]["thinking"].encode() == (thinking_one + thinking_two).encode()
-    assert body["content"][0]["signature"].encode() == signature.encode()
-    assert body["content"][1]["data"].encode() == redacted.encode()
 
 
 def test_encrypted_content_bytes_survive_the_responses_encoder_exactly() -> None:
@@ -5806,7 +5556,7 @@ def test_capability_rejection_names_the_public_request_field(
     recorded: list[GatewayFailure] = []
     original_finish = control._accounting.finish_request_quietly  # noqa: SLF001
 
-    def _capture_finish(authorization: AuthorizationSnapshot, failure: GatewayFailure) -> None:
+    def _capture_finish(authorization: AuthorizationSnapshot, failure: GatewayFailure) -> bool:
         recorded.append(failure)
         return original_finish(authorization, failure)
 
@@ -5887,37 +5637,16 @@ def _zero_argument_tool_fixture_json() -> str:
     )
 
 
-def test_zero_argument_tool_calls_encode_on_every_public_lane() -> None:
-    """The zero-argument completion sequence serves both lanes, both modes.
+def test_zero_argument_tool_calls_encode_on_the_chat_and_responses_lanes() -> None:
+    """The zero-argument completion sequence serves the Chat and Responses lanes.
 
     Production incident (2026-08-28): every zero-argument tool failed as
     malformed_response. The normalizer fix seeds `{}` at completion; these
-    assertions pin that the seeded sequence encodes as a valid Anthropic
-    tool_use block and a valid Chat tool call, streaming and non-streaming.
+    assertions pin that the seeded sequence encodes as a valid Chat tool call
+    and Responses function call (the Messages lane is pinned in Rust).
     """
     native = pytest.importorskip("exp_gateway_native")
     fixture = _zero_argument_tool_fixture_json()
-
-    frames = native.encode_messages_fixture("request-abc", "coding", fixture)
-    assert any('"type":"tool_use"' in frame for frame in frames)
-    assert frames[-1].startswith("event: message_stop")
-    streamed_input = "".join(
-        payload["delta"]["partial_json"]
-        for payload in (
-            json.loads(frame.split("data: ", 1)[1].strip()) for frame in frames if frame
-        )
-        if payload["type"] == "content_block_delta"
-        and payload["delta"]["type"] == "input_json_delta"
-    )
-    assert streamed_input == "{}"
-    messages_body = json.loads(native.completed_messages_fixture("request-abc", "coding", fixture))
-    assert messages_body["content"][0] == {
-        "type": "tool_use",
-        "id": "call-1",
-        "name": "get_time",
-        "input": {},
-    }
-    assert messages_body["stop_reason"] == "tool_use"
 
     chat_frames = native.encode_chat_fixture("request-abc", "coding", 1_700_000_000, True, fixture)
     assert chat_frames[-1] == "data: [DONE]\n\n"
@@ -6185,87 +5914,6 @@ def test_open_response_format_schema_closes_on_an_anthropic_rung(tmp_path: Path)
     geo = cast("JsonObject", properties["geo"])
     assert geo["additionalProperties"] is False
     assert schema["required"] == ["city", "geo"]
-
-
-def _web_search_fixture_json() -> str:
-    """One WebSearch event stream in the fixture-event vocabulary."""
-    result_block = (
-        '{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1",'
-        '"content":[{"type":"web_search_result","encrypted_content":"Et8Q"}],'
-        '"caller":{"type":"direct"}}'
-    )
-    citation = '{"type":"web_search_result_location","cited_text":"3.14.7"}'
-    return json.dumps(
-        [
-            {
-                "kind": "server_tool_use_started",
-                "index": 0,
-                "call_id": "srvtoolu_1",
-                "name": "web_search",
-            },
-            {"kind": "server_tool_arguments_delta", "index": 0, "text": '{"query": "python"}'},
-            {
-                "kind": "server_tool_use_completed",
-                "index": 0,
-                "call_id": "srvtoolu_1",
-                "name": "web_search",
-                "raw_arguments": '{"query": "python"}',
-            },
-            {"kind": "server_tool_result", "index": 1, "block": result_block},
-            {"kind": "text_block_started", "index": 2},
-            {"kind": "citation_delta", "index": 2, "citation": citation},
-            {"kind": "text_delta", "text": "It is 3.14.7."},
-            {"kind": "usage", "input_tokens": 12284, "output_tokens": 103},
-            {"kind": "completed"},
-        ]
-    )
-
-
-def test_rust_messages_streams_server_tool_blocks_intact() -> None:
-    """Server tool events stream back as their native Anthropic blocks."""
-    native = pytest.importorskip("exp_gateway_native")
-
-    frames = list(
-        native.encode_messages_fixture("request-abc", "coding", _web_search_fixture_json())
-    )
-    joined = "".join(frames)
-    assert '"type":"server_tool_use","id":"srvtoolu_1","name":"web_search"' in joined
-    assert '"type":"web_search_tool_result"' in joined
-    assert '"caller":{"type":"direct"}' in joined
-    assert '"type":"citations_delta"' in joined
-    # Provider-executed tool use never becomes the tool_use stop reason.
-    assert '"stop_reason":"end_turn"' in joined
-
-
-def test_rust_messages_completed_body_carries_server_tool_blocks() -> None:
-    """The non-streaming aggregation keeps every server-tool block in order."""
-    native = pytest.importorskip("exp_gateway_native")
-
-    body = json.loads(
-        native.completed_messages_fixture("request-abc", "coding", _web_search_fixture_json())
-    )
-    kinds = [block["type"] for block in body["content"]]
-    assert kinds == ["server_tool_use", "web_search_tool_result", "text"]
-    assert body["content"][2]["citations"] == [
-        {"type": "web_search_result_location", "cited_text": "3.14.7"}
-    ]
-    assert body["stop_reason"] == "end_turn"
-
-
-def test_rust_messages_paused_turn_keeps_its_stop_reason() -> None:
-    """A pause_turn terminal survives to the caller instead of end_turn."""
-    native = pytest.importorskip("exp_gateway_native")
-
-    fixture = json.dumps(
-        [
-            {"kind": "text_delta", "text": "searching"},
-            {"kind": "paused_turn"},
-        ]
-    )
-    frames = "".join(native.encode_messages_fixture("request-abc", "coding", fixture))
-    assert '"stop_reason":"pause_turn"' in frames
-    body = json.loads(native.completed_messages_fixture("request-abc", "coding", fixture))
-    assert body["stop_reason"] == "pause_turn"
 
 
 def test_internal_admission_failures_log_the_real_exception(
@@ -6706,6 +6354,121 @@ def test_reasoning_content_native_rung_round_trips_preserved_thinking_off_the_te
     plain_messages = cast("list[JsonObject]", plain_payload["messages"])
     assert plain_messages[1]["reasoning_content"] == "ls lists the directory."
     assert plain.get("ignored_parameters", []) == []
+
+
+def test_reasoning_content_native_rung_round_trips_a_codex_responses_tool_turn(
+    tmp_path: Path,
+) -> None:
+    """A Codex-shaped Responses loop keeps a native rung's thinking across a tool call.
+
+    Codex sends ``store: false`` with ``include: ["reasoning.encrypted_content"]``
+    on every turn. On a declared ``reasoning_content_native`` rung (the
+    Experiential Cloud GLM vLLM origins) the include was refused because only a
+    native Responses or Fireworks route counted as a carrier channel; the
+    Hunyuan-scheme route is one too. The replayed reasoning item carries the
+    exposed summary text beside the sealed carrier, and the decoder must take
+    the carrier by its own scheme prefix, not only the Fireworks one.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://glm.example.test/v1",
+        capabilities=ModelCapabilities(
+            maximum_output_tokens=128_000,
+            supports_tools=True,
+            reasoning_output_exposed=True,
+            reasoning_content_native=True,
+        ),
+    )
+    tools: list[JsonObject] = [
+        {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
+    ]
+    codex: JsonObject = {
+        "model": "coding",
+        "store": False,
+        "include": ["reasoning.encrypted_content"],
+        "tools": tools,
+    }
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "shared-secret"})
+    )
+    admission = _admit(
+        control,
+        raw_key,
+        json.dumps({**codex, "input": [{"role": "user", "content": "hi"}]}),
+        surface="responses",
+    )
+    assert "error" not in admission, admission
+    initial = _flatten_started(control, admission)
+    route_sha256 = initial["hunyuan_reasoning_route_sha256"]
+    assert isinstance(route_sha256, str)
+
+    hidden = "reason privately about the lookup"
+    sealed = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "route_depth": initial["route_depth"],
+                    "route_sha256": route_sha256,
+                    "content": hidden,
+                    "assistant_content": None,
+                    "tool_calls": [
+                        {"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}
+                    ],
+                }
+            )
+        )
+    )["carrier"]
+    assert sealed.startswith("x-experiential-hunyuan-reasoning-v1:")
+    control.settle(
+        json.dumps(
+            {
+                "request_id": initial["request_id"],
+                "attempt_id": initial["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": ["lookup"],
+                "failure": None,
+            }
+        )
+    )
+
+    replica = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "shared-secret"})
+    )
+    continued = _admit(
+        replica,
+        raw_key,
+        json.dumps(
+            {
+                **codex,
+                "input": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "type": "reasoning",
+                        "id": "rs_glm",
+                        "summary": [{"type": "summary_text", "text": hidden}],
+                        "encrypted_content": sealed,
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call-one",
+                        "name": "lookup",
+                        "arguments": "{}",
+                    },
+                    {"type": "function_call_output", "call_id": "call-one", "output": "done"},
+                ],
+            }
+        ),
+        surface="responses",
+    )
+    assert "error" not in continued, continued
+    route = cast("list[JsonObject]", continued["route"])
+    payload = cast("JsonObject", route[0]["upstream_payload"])
+    messages = cast("list[JsonObject]", payload["messages"])
+    assistant = next(message for message in messages if message.get("tool_calls"))
+    assert continued["route_reason"] == "reasoning_continuation"
+    assert assistant["reasoning_content"] == hidden
 
 
 def test_an_unflagged_self_hosted_rung_stays_stripped_with_no_carrier_route(

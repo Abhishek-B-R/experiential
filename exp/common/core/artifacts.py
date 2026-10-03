@@ -55,8 +55,7 @@ _SECRET_ENVIRONMENT_NAME_PATTERN = re.compile(
     r"\b(?:[A-Z][A-Z0-9]*_)*(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|REFRESH_TOKEN|SECRET|"
     r"CREDENTIAL)(?:_[A-Z0-9]+)*\b"
 )
-_SECRET_REFERENCE_PATTERN = re.compile(
-    r"\b(?:"
+_SECRET_REFERENCE_NAME = (
     r"access[_ -]?token|"
     r"api[_ -]?key(?:[_ -]?env)?|"
     r"authorization|"
@@ -65,8 +64,14 @@ _SECRET_REFERENCE_PATTERN = re.compile(
     r"refresh[_ -]?token|"
     r"secret(?:[_ -]?(?:env|ref))?|"
     r"token[_ -]?env"
-    r")\b",
+)
+_SECRET_REFERENCE_PATTERN = re.compile(rf"\b(?:{_SECRET_REFERENCE_NAME})\b", re.IGNORECASE)
+_SECRET_KEY_FIELD_PATTERN = re.compile(
+    rf"(?:^|[._:/ -])(?:{_SECRET_REFERENCE_NAME}|auth[_ -]?token)$",
     re.IGNORECASE,
+)
+_SECRET_ASSIGNMENT_SUFFIX_PATTERN = re.compile(
+    r"(?:[\s\"'`]*[:=]|\s+(?:is|was|equals|set\s+to)\b)", re.IGNORECASE
 )
 SECRET_REDACTION_PLACEHOLDER = "[REDACTED]"
 _SECRET_REDACTION_PATTERNS = (
@@ -366,6 +371,45 @@ def assert_text_secret_free(value: str) -> None:
         raise SecretBoundaryError("immutable artifacts cannot contain credential references")
     if _has_secret_value(value):
         raise SecretBoundaryError("immutable artifacts cannot contain secret-like values")
+
+
+def assert_prose_secret_free(value: str) -> None:
+    """Allow credential terminology in prose while rejecting assignments and secret values.
+
+    Credential terms followed by assignment punctuation or verbs remain prohibited, including
+    ambiguous prose, because the assigned value may lack a recognizable token prefix.
+
+    Args:
+        value: Decoded prose about to enter an immutable artifact.
+
+    Raises:
+        SecretBoundaryError: The prose assigns a credential or includes a secret-like value.
+    """
+    for pattern in (_SECRET_REFERENCE_PATTERN, _SECRET_ENVIRONMENT_NAME_PATTERN):
+        for match in pattern.finditer(value):
+            if _SECRET_ASSIGNMENT_SUFFIX_PATTERN.match(value, match.end()):
+                raise SecretBoundaryError(
+                    "immutable artifacts cannot contain credential assignments"
+                )
+    if _has_secret_value(value):
+        raise SecretBoundaryError("immutable artifacts cannot contain secret-like values")
+
+
+def assert_key_secret_free(value: str) -> None:
+    """Reject credential fields and secret values while allowing descriptive JSON keys.
+
+    A provider or namespace prefix does not make a terminal credential field safe.
+
+    Args:
+        value: A decoded JSON object key, without its value.
+
+    Raises:
+        SecretBoundaryError: The key names a credential field or contains credential-like content.
+    """
+    name = value.strip()
+    if _SECRET_KEY_FIELD_PATTERN.search(name) or _SECRET_ENVIRONMENT_NAME_PATTERN.fullmatch(name):
+        raise SecretBoundaryError("immutable artifacts cannot contain credential fields")
+    assert_prose_secret_free(value)
 
 
 def redact_secret_text(value: str) -> tuple[str, int]:

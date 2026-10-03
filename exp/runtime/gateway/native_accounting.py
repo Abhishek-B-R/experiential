@@ -16,7 +16,6 @@ from exp.runtime.gateway.budget_continuation import denied_destination_pool
 from exp.runtime.gateway.budgets import (
     BudgetReservationRejected,
     BudgetScopeKind,
-    maximum_attempt_cost_nano_usd,
 )
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -63,6 +62,7 @@ from exp.runtime.gateway.native_rung_policy import (
     reserve_rung_slot,
     shed_keeps_rung,
 )
+from exp.runtime.gateway.native_service_tiers import admission_kwarg, tier_ceiling
 from exp.runtime.gateway.native_settlement import (
     all_routes_throttled_failure,
     all_routes_unavailable_failure,
@@ -82,6 +82,7 @@ from exp.runtime.gateway.native_settlement import (
 )
 from exp.runtime.gateway.recovery import RecoveryHost, SessionRecoveryRegistry
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
+from exp.runtime.gateway.service_tiers import tier_admission
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 from exp.runtime.openai_protocol.errors import public_failure_error
 
@@ -98,11 +99,8 @@ TOOL_SEARCH_ROUND: Final = "tool_search_round"
 class NativeAttemptAccounting:
     """Registry of admitted requests and their durable attempt settlements.
 
-    Methods are called from multiple Rust worker threads; the registry is
-    guarded by one lock and swept both opportunistically and on a timer so an
-    abandoned reservation cannot outlive its request deadline by more than
-    the sweep grace. A lost durable terminal write latches the registry
-    unhealthy so readiness fails until the next startup reconciliation.
+    A lock protects Rust callbacks; timed and opportunistic sweeps bound abandoned
+    reservations. Failed terminal writes block readiness until startup reconciliation.
     """
 
     def __init__(
@@ -118,17 +116,11 @@ class NativeAttemptAccounting:
 
         Args:
             write_ledger: Blocking durable request and attempt ledger.
-            budget_error_factory: Optional hosted mapping for a rejected
-                reservation.
+            budget_error_factory: Optional mapping for a rejected reservation.
             default_lane_bound: Per-worker cap for rungs authoring no bound (lane_saturation).
-            cache_sample_gate: Optional hosted predicate deciding whether one
-                settled attempt (by attempt id) may feed the cache-priority
-                EWMA. The hosted store knows which attempts are promo-funded;
-                admitting those samples would let free-tier replay traffic
-                (whose cached prefixes are costless under a promotion) buy
-                fair-share weight with the very replay the promotion already
-                subsidizes. ``None`` admits every sample; a raising gate
-                skips the sample (fails closed).
+            cache_sample_gate: Predicate admitting a settled attempt to the cache-priority
+                EWMA. Hosts exclude promo-funded samples so subsidized replay cannot buy
+                fair-share weight. ``None`` admits every sample; exceptions skip it.
         """
         self._write_ledger = write_ledger
         self._finish_attempt: Callable[..., None] = write_ledger.finish_attempt
@@ -422,9 +414,9 @@ class NativeAttemptAccounting:
                 ladder = (current_depth,)
             last_failure = None
         forced_overflow = False
+        capacity_refused = False
         shed_records: dict[int, RungShed] = {}
-        # The input half of the reservation tokenizes the whole prompt, so it
-        # is computed once per ladder walk and shared with every candidate.
+        # Tokenize the input reservation once per ladder walk for all candidates.
         reserved_input_tokens = worst_case_input_tokens(entry.request)
         while True:
             with self._lock:
@@ -451,6 +443,7 @@ class NativeAttemptAccounting:
                     forced_overflow = candidate is not None
                     if candidate is None:
                         last_failure = lane_saturated_failure()
+                        capacity_refused = True
                         with self._lock:
                             self._rung_saturation_refusals += 1
                         break
@@ -473,6 +466,13 @@ class NativeAttemptAccounting:
                 )
                 self._health.release_probe(keys[candidate])
                 break
+            tier = tier_admission(
+                route.deployments[candidate].gateway.prices,
+                getattr(entry.request, "service_tier", None),
+                forwards_tier=candidate < len(entry.tier_forwarded_by_depth)
+                and entry.tier_forwarded_by_depth[candidate],
+                customer_managed=route.deployments[candidate].billing_source == "customer_managed",
+            )
             deployment = deployment_priced_for_service_tier(
                 route.deployments[candidate],
                 getattr(entry.request, "service_tier", None),
@@ -512,6 +512,7 @@ class NativeAttemptAccounting:
                     is None
                 ):
                     last_failure = lane_saturated_failure()
+                    capacity_refused = True
                     with self._lock:
                         self._rung_saturation_refusals += 1
                     break
@@ -535,9 +536,10 @@ class NativeAttemptAccounting:
                     deployment=deployment,
                     attempt_ordinal=entry.total_attempts,
                     route_depth=candidate,
-                    maximum_cost_nano_usd=maximum_attempt_cost_nano_usd(
-                        reservation_request, deployment, input_tokens=reserved_input_tokens
+                    maximum_cost_nano_usd=tier_ceiling(
+                        reservation_request, deployment, tier, input_tokens=reserved_input_tokens
                     ),
+                    **admission_kwarg(tier),
                     reserved_input_tokens=reserved_input_tokens,
                     reserved_output_tokens=reserved_output_tokens,
                     route_reason=route.attempt_route_reason(route.deployments[candidate]),
@@ -626,15 +628,16 @@ class NativeAttemptAccounting:
                 entry.total_attempts += 1
                 entry.active_attempt_id = attempt_id
                 entry.attempt_depths[attempt_id] = candidate
+                if tier is not None:
+                    entry.attempt_service_tiers[attempt_id] = tier
             return json.dumps(
                 {"attempt_id": attempt_id, "route_depth": candidate},
                 separators=(",", ":"),
             )
         exhaustion = last_failure
         if exhaustion is None:
-            # Nothing dispatched and nothing classified: forced claims admit
-            # any non-throttled circuit, so an empty first claim means every
-            # deployment sits inside a provider throttle window.
+            # An empty forced claim means every deployment is provider-throttled.
+            # Otherwise report unavailable without a free-capacity certificate.
             throttled_remaining = self._health.throttled_remaining_seconds(keys)
             pinned = pins_native_responses_route(entry.request)
             exhaustion = (
@@ -642,35 +645,31 @@ class NativeAttemptAccounting:
                 if throttled_remaining is not None
                 else all_routes_unavailable_failure()
             )
-        if active:
-            self.finish_request_quietly(entry.authorization, ledger_failure(exhaustion))
+        certified = active and self.finish_request_quietly(
+            entry.authorization,
+            ledger_failure(exhaustion),
+            certify_no_effects=capacity_refused and entry.no_paid_prework,
+        )
         with self._lock:
             if entry.pending_abandon is None:
                 self._inflight.pop(request_id, None)
-        return exhausted_attempt_payload(exhaustion)
+        return exhausted_attempt_payload(exhaustion, known_unbilled=capacity_refused and certified)
 
     def settle(self, argument: str) -> str:
         """Durably settle one previously reserved attempt exactly once.
 
-        A finalizing settlement also terminalizes the request and removes the
-        in-flight entry; a non-finalizing one (a failed precommit dispatch
-        with a successor still possible) closes only the attempt so the
-        waterfall can reserve its next dispatch. Deployment-health circuits
-        record every settled outcome, restoring admission first when the
-        dispatch had opened.
+        Finalization closes the request; otherwise the waterfall continues. Health records both.
 
         Args:
-            argument: JSON object with ``request_id``, ``attempt_id``,
-                ``outcome``, optional ``usage``, ``tool_names``, ``failure``,
-                ``finalize`` (default true), and ``opened`` (default false).
+            argument: JSON request/attempt identity, outcome, optional usage/failure,
+                finalization flag, and witnessed provider metadata.
 
         Returns:
             An empty JSON object; repeated settlement is a no-op.
 
         Raises:
-            NativeBridgeError: The durable terminal write failed; the
-                in-flight entry is kept so a retried settlement (from the
-                data plane or the deadline sweep) can still reach the ledger.
+            NativeBridgeError: The terminal write failed; the retained entry lets either
+                the data plane or the deadline sweep retry the original settlement.
         """
         data = json.loads(argument)
         request_id = str(data["request_id"])
@@ -690,7 +689,11 @@ class NativeAttemptAccounting:
                 terminal_event=terminal,
                 failure=failure,
                 finalize_request=finalize,
-                **settlement_metadata(data, self._finish_attempt),
+                **settlement_metadata(
+                    data,
+                    self._finish_attempt,
+                    service_tier=entry.attempt_service_tiers.get(attempt_id),
+                ),
                 **web_search_requests_kwarg(
                     self._finish_attempt, web_search_requests_from_terminal(terminal)
                 ),
@@ -699,9 +702,7 @@ class NativeAttemptAccounting:
                 ),
             )
         except Exception as exc:  # noqa: BLE001 - the data plane retries.
-            # The exact settlement is retained so a retry (from the data
-            # plane or the timer sweep) lands the ORIGINAL outcome and usage,
-            # never a downgraded cancellation.
+            # Both retry paths retain the original outcome, usage and tier evidence.
             with self._lock:
                 entry.pending_settlement = data
             raise authority_error(exc) from exc
@@ -795,15 +796,20 @@ class NativeAttemptAccounting:
         self,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
-    ) -> None:
-        """Finalize accepted pre-dispatch work without masking the primary failure."""
+        *,
+        certify_no_effects: bool = False,
+    ) -> bool:
+        """Return committed no-effects proof; failed writes never certify free work."""
         try:
-            self._write_ledger.finish_request(
+            committed = self._write_ledger.finish_request(
                 authorization=authorization,
                 failure=failure,
+                certify_no_effects=certify_no_effects,
             )
+            return committed is True
         except Exception:  # noqa: BLE001 - primary admission failure stays authoritative.
             self._accounting_healthy = False
+            return False
 
     def _record_health(
         self,
@@ -950,7 +956,7 @@ class NativeAttemptAccounting:
         finalize: bool,
         settlement: JsonObject | None = None,
     ) -> bool:
-        """Land one swept settlement from its retained payload; keep the entry to retry on failure.
+        """Replay the retained settlement, keeping it for another retry on failure.
 
         Returns:
             Whether the swept terminal write reached the ledger.
@@ -961,7 +967,11 @@ class NativeAttemptAccounting:
                 terminal_event=terminal,
                 failure=failure,
                 finalize_request=finalize,
-                **settlement_metadata(settlement, self._finish_attempt),
+                **settlement_metadata(
+                    settlement,
+                    self._finish_attempt,
+                    service_tier=entry.attempt_service_tiers.get(attempt_id),
+                ),
                 **web_search_requests_kwarg(
                     self._finish_attempt, web_search_requests_from_terminal(terminal)
                 ),
@@ -973,9 +983,7 @@ class NativeAttemptAccounting:
             self._accounting_healthy = False
             return False
         self._record_health(entry, attempt_id, opened=False, failure=failure, settlement=settlement)
-        # A retained settlement that finally lands through the sweep carries
-        # the same observed usage as the direct path, so the cache-priority
-        # EWMA must not depend on WHICH recovery path succeeded.
+        # Cache-priority observations must not depend on which settlement path succeeds.
         self._record_cache_fraction(entry, attempt_id, terminal)
         record_session_outcome(
             self.recovery,

@@ -38,6 +38,8 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayMessage,
     GatewayRequest,
+    GatewayServiceTierAdmission,
+    GatewayServiceTierSettlement,
     GatewayUsage,
 )
 from exp.runtime.gateway.ledger import AttemptRejectedError
@@ -179,8 +181,10 @@ class _RecordingLedger:
     def __init__(self) -> None:
         """Start with empty write logs and no scripted rejections."""
         self.started: list[JsonObject] = []
+        self.started_request_ids: set[str] = set()
         self.finished: list[JsonObject] = []
         self.terminal_events: list[GatewayEvent | None] = []
+        self.service_tiers: list[GatewayServiceTierSettlement | None] = []
         self.upstream_providers: list[str | None] = []
         self.first_token_times: list[datetime | None] = []
         self.web_search_requests: list[int | None] = []
@@ -189,6 +193,7 @@ class _RecordingLedger:
         self.finished_requests: list[GatewayFailure] = []
         self.budget_rejections: dict[str, BudgetScopeKind] = {}
         self.fail_finishes = 0
+        self.fail_request_finishes = 0
         self.typed_rejection: GatewayFailure | None = None
         self._counter = 0
 
@@ -199,7 +204,7 @@ class _RecordingLedger:
     def start_attempt(
         self,
         *,
-        snapshot: object,
+        snapshot: ExecutionSnapshot,
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
@@ -210,15 +215,17 @@ class _RecordingLedger:
         fallback_reason: str | None = None,
         dispatch_reason: str | None = None,
         preferred_deployment: ExactModelDeployment | None = None,
+        service_tier: GatewayServiceTierAdmission | None = None,
     ) -> str:
         """Reserve one recorded attempt row, honoring scripted rejections."""
-        del snapshot, fallback_reason
+        del fallback_reason
         if self.typed_rejection is not None:
             raise AttemptRejectedError("root preflight required", failure=self.typed_rejection)
         scope = self.budget_rejections.get(deployment.deployment_id)
         if scope is not None:
             raise BudgetReservationRejected(scope_kind=scope, reason="scripted")
         self._counter += 1
+        self.started_request_ids.add(snapshot.authorization.request_id)
         attempt_id = f"attempt-{self._counter}"
         self.started.append(
             {
@@ -254,6 +261,7 @@ class _RecordingLedger:
         upstream_provider: str | None = None,
         web_search_requests: int | None = None,
         tool_search_requests: int | None = None,
+        service_tier: GatewayServiceTierSettlement | None = None,
     ) -> None:
         """Record one settled attempt, tracking harvested rate-limit values apart.
 
@@ -266,6 +274,7 @@ class _RecordingLedger:
         self.web_search_requests.append(web_search_requests)
         self.tool_search_requests.append(tool_search_requests)
         self.terminal_events.append(terminal_event)
+        self.service_tiers.append(service_tier)
         if self.fail_finishes > 0:
             self.fail_finishes -= 1
             raise RuntimeError("scripted terminal-write failure")
@@ -302,10 +311,14 @@ class _RecordingLedger:
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
-    ) -> None:
-        """Record one request-only terminalization."""
-        del authorization
+        certify_no_effects: bool = False,
+    ) -> bool:
+        """Record terminalization and report the fake's exact prior-attempt history."""
+        if self.fail_request_finishes:
+            self.fail_request_finishes -= 1
+            raise RuntimeError("scripted request terminal-write failure")
         self.finished_requests.append(failure)
+        return certify_no_effects and authorization.request_id not in self.started_request_ids
 
 
 def _registry() -> tuple[NativeAttemptAccounting, _RecordingLedger, InflightRequest]:
@@ -394,6 +407,57 @@ def test_attempt_token_and_money_reservations_use_the_frozen_payload_bound(
     assert row["maximum_cost_nano_usd"] == maximum_attempt_cost_nano_usd(
         entry.request.model_copy(update={"maximum_output_tokens": frozen_bound}), deployment
     )
+
+
+@pytest.mark.parametrize("served", ("priority", "default", None))
+@pytest.mark.parametrize("retry", ("direct", "explicit", "sweep"))
+def test_service_tier_evidence_survives_every_settlement_path(
+    served: Literal["priority", "default"] | None, retry: str
+) -> None:
+    """Recovery binds the original observation to the same immutable attempt cards."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    attempt_id = str(started["attempt_id"])
+    admission = GatewayServiceTierAdmission(
+        requested="priority",
+        standard_prices=GatewayTokenPrices(
+            input_nano_usd_per_million_tokens=1_000_000,
+            output_nano_usd_per_million_tokens=2_000_000,
+        ),
+        requested_prices=GatewayTokenPrices(
+            input_nano_usd_per_million_tokens=2_000_000,
+            output_nano_usd_per_million_tokens=4_000_000,
+        ),
+    )
+    entry.attempt_service_tiers[attempt_id] = admission
+    payload: JsonObject = {
+        "request_id": entry.authorization.request_id,
+        "attempt_id": attempt_id,
+        "outcome": "completed",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+        "finalize": True,
+        "service_tier": {
+            "served": served,
+            "resolution": "missing" if served is None else "confirmed",
+        },
+    }
+    encoded = json.dumps(payload)
+    if retry != "direct":
+        ledger.fail_finishes = 1
+        with pytest.raises(NativeBridgeError):
+            registry.settle(encoded)
+        assert entry.pending_settlement == payload
+    if retry == "sweep":
+        registry.sweep_expired()
+    else:
+        registry.settle(encoded)
+    expected = admission.settlement(
+        served=served, resolution="missing" if served is None else "confirmed"
+    )
+    assert ledger.service_tiers[-1] == expected
+    assert registry.entry(entry.authorization.request_id) is None
+    registry.settle(encoded)
+    assert len(ledger.finished) == 1
 
 
 @pytest.mark.parametrize("partial_usage", (False, True))
@@ -1245,6 +1309,7 @@ def _admit(
     sticky_preferred: bool = False,
     reasoning_pinned_deployment_id: str | None = None,
     catalog_sha256: str = _DIGEST,
+    no_paid_prework: bool = True,
 ) -> InflightRequest:
     """Register one admitted request over the given rung ladder.
 
@@ -1284,6 +1349,7 @@ def _admit(
         route=route,
         request=_request(),
         deadline_monotonic=time.monotonic() + 30,
+        no_paid_prework=no_paid_prework,
         affinity_fingerprint=affinity_fingerprint,
         sticky_preferred=sticky_preferred,
     )
@@ -1337,6 +1403,7 @@ class TestLaneSaturation:
         assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
         refused = _start(registry, ordinal=0, request_id="request-2")
         assert refused["exhausted"] is True
+        assert refused["known_unbilled"] is True
         failure = cast("JsonObject", refused["failure"])
         assert failure["failure_class"] == "throttled"
         assert failure["retry_after_seconds"] == 5
@@ -1355,6 +1422,31 @@ class TestLaneSaturation:
         )
         _admit(registry, only, request_id="request-3")
         assert _start(registry, ordinal=0, request_id="request-3")["route_depth"] == 0
+
+    @pytest.mark.parametrize("no_paid_prework", [False, True])
+    @pytest.mark.parametrize("prior_attempt", [False, True])
+    @pytest.mark.parametrize("write_fails", [False, True])
+    def test_capacity_certificate_requires_durable_zero_attempt_proof(
+        self, prior_attempt: bool, write_fails: bool, no_paid_prework: bool
+    ) -> None:
+        """In-memory counters and a swallowed terminal error cannot certify free work."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+        only = (_deployment("deployment-a", connection_sha256="b" * 64),)
+        _admit(registry, only, request_id="occupied")
+        _admit(registry, only, request_id="refused", no_paid_prework=no_paid_prework)
+        _start(registry, ordinal=0, request_id="occupied")
+        if prior_attempt:
+            ledger.started_request_ids.add("refused")
+        ledger.fail_request_finishes = int(write_fails)
+
+        response = _start(registry, ordinal=0, request_id="refused")
+
+        assert response.get("known_unbilled", False) is (
+            no_paid_prework and not prior_attempt and not write_fails
+        )
+        assert registry.accounting_healthy is (not write_fails)
+        assert len(ledger.started) == 1
 
     @pytest.mark.parametrize("authored", [False, True])
     @pytest.mark.parametrize("staged", [False, True])
@@ -2065,7 +2157,7 @@ def test_start_attempt_reprices_only_when_the_selected_depth_forwards_the_tier()
         def start_attempt(
             self,
             *,
-            snapshot: object,
+            snapshot: ExecutionSnapshot,
             deployment: ExactModelDeployment,
             attempt_ordinal: int,
             route_depth: int,
@@ -2076,6 +2168,7 @@ def test_start_attempt_reprices_only_when_the_selected_depth_forwards_the_tier()
             fallback_reason: str | None = None,
             dispatch_reason: str | None = None,
             preferred_deployment: ExactModelDeployment | None = None,
+            service_tier: GatewayServiceTierAdmission | None = None,
         ) -> str:
             """Record the reserved input rate, then reserve as the base fake does."""
             self.reserved_input_micro.append(
@@ -3844,6 +3937,7 @@ def test_abandon_during_committed_reservation_retains_and_closes_late_attempt(
         fallback_reason: str | None = None,
         dispatch_reason: str | None = None,
         preferred_deployment: ExactModelDeployment | None = None,
+        service_tier: GatewayServiceTierAdmission | None = None,
     ) -> str:
         """Delay the existing typed ledger method without changing reservation semantics."""
         result = original(

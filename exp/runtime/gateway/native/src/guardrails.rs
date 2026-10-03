@@ -96,7 +96,12 @@ pub fn apply_text_replacement(events: &[Event], replacement: &str) -> Vec<Event>
             | Event::ThinkingDelta { .. }
             | Event::ThinkingSignature { .. }
             | Event::RedactedThinking { .. }
-            | Event::EncryptedReasoning { .. } => {}
+            | Event::EncryptedReasoning { .. }
+            // Route reasoning too: an exposed rung would return it as plaintext
+            // beside the rewrite, and the turn loses only its thinking carrier,
+            // exactly like the Anthropic and Codex carriers above.
+            | Event::ReasoningContentDelta { .. }
+            | Event::ReasoningTextDelta(_) => {}
             // Server-tool activity and citations carry the fetched content
             // (queries, result payloads, cited text) that a rewrite must not
             // leak, so they drop with the reasoning channel. Hosted Responses
@@ -280,6 +285,10 @@ fn classify(event: &Event) -> StreamAdmission {
         | Event::StoppedAtSequence(_)
         | Event::PausedTurn
         | Event::GeminiThoughtPart(_)
+        // Display-only reasoning never renders on a guardrailed request
+        // (display is off whenever an output chain runs), so it carries no
+        // caller-visible text to judge.
+        | Event::ReasoningTextDelta(_)
         | Event::Failed(_) => StreamAdmission::Passthrough,
     }
 }
@@ -548,6 +557,23 @@ mod tests {
         assert!(rewritten
             .iter()
             .any(|event| matches!(event, Event::ToolCallCompleted { .. })));
+    }
+
+    #[test]
+    fn replacement_drops_route_reasoning() {
+        let events = vec![
+            Event::ReasoningContentDelta {
+                route_sha256: "a".repeat(64),
+                delta: "the secret plan".to_string(),
+            },
+            Event::TextDelta("secret".to_string()),
+            Event::Completed,
+        ];
+        let rewritten = apply_text_replacement(&events, "safe");
+        assert!(!rewritten
+            .iter()
+            .any(|event| matches!(event, Event::ReasoningContentDelta { .. })));
+        assert!(matches!(rewritten[0], Event::TextDelta(ref text) if text == "safe"));
     }
 
     #[test]

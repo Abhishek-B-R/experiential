@@ -9,29 +9,287 @@ from typing import cast
 
 import pytest
 
-import exp
-from exp.common.models import AssistantAction, ModelRequest, ModelResponse
+from exp.common.core.artifacts import FailureCode, StructuredFailure
+from exp.common.evaluations.evidence import read_rollout
+from exp.common.models import AssistantAction, ModelRequest, ModelResponse, Usage
+from exp.common.models.catalog import GatewayDeploymentMetadata
+from exp.common.models.catalog_prices import (
+    GatewayLongContextTier,
+    GatewayServiceTierPrices,
+    GatewayTokenPrices,
+)
 from exp.common.progress import ProgressEvent
 from exp.optimize.evaluation.contracts import EvaluationBudget
+from exp.optimize.evaluation.prepare import ModelEvaluationOptions, prepare_model_evaluation
 from exp.optimize.evaluation.prepare_test import _prepare
 from exp.optimize.evaluation.runtime import run_prepared_model_evaluation
 from exp.optimize.evaluation.spending import BudgetedCompletion
+from exp.optimize.router.automatic.provisional import prepare_hosted_provisional_judge
 from exp.optimize.router.automatic.service_test import (
     _REVISION,
     _TIME,
+    _completed_project,
     _CompletionClient,
     _RuntimeCatalog,
 )
+from exp.optimize.router.errors import RouterCompositionError
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.budget import SpendLimitReached
 from exp.simulation.engines.text import simulator
+from exp.simulation.engines.text.errors import stale_cell_failure
+
+
+class _ScheduledRuntimeCatalog(_RuntimeCatalog):
+    """Keep real runtime schedule bindings around deterministic provider clients."""
+
+    def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
+        """Match the public resolver's immutable complete-price metadata handoff."""
+        return replace(
+            super().resolve(alias, role=role),
+            token_prices=self._catalog_value.models[alias].token_prices,
+        )
+
+
+def test_finite_preflight_rejects_incomplete_judge_before_any_runtime_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A priceable simulation cannot run first when the later judge lacks a finite bound."""
+    project, catalog, state = _completed_project(tmp_path)
+    card = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=1_000_000_000,
+        cached_input_nano_usd_per_million_tokens=500_000_000,
+        cache_creation_input_nano_usd_per_million_tokens=1_500_000_000,
+        output_nano_usd_per_million_tokens=2_000_000_000,
+    )
+    catalog = catalog.model_copy(
+        update={
+            "models": {
+                **catalog.models,
+                "judge": catalog.models["judge"].model_copy(
+                    update={"gateway": GatewayDeploymentMetadata(prices=card)}
+                ),
+            }
+        }
+    )
+    judge = prepare_hosted_provisional_judge(
+        project,
+        catalog,
+        maximum_input_tokens=32_768,
+        maximum_output_tokens=8_192,
+        maximum_attempts=3,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    prepared = prepare_model_evaluation(
+        project,
+        catalog,
+        ("candidate-a", "candidate-b"),
+        judge_setup=judge.setup_input,
+        calibration_id=judge.calibration_id,
+        embedder_alias="embedder",
+        options=ModelEvaluationOptions(maximum_steps=1),
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    assert prepared.cost.workers.maximum_is_upper_bound
+    assert not prepared.cost.judge.maximum_is_upper_bound
+    before = (
+        project.artifacts.list_ids(),
+        len(state.completion_calls),
+        len(state.embedding_calls),
+        state.credential_resolutions,
+    )
+    with pytest.raises(ValueError, match="finite spending limit requires complete"):
+        run_prepared_model_evaluation(
+            project,
+            prepared,
+            cast(RuntimeModelCatalog, _ScheduledRuntimeCatalog(catalog, state)),
+            budget=EvaluationBudget(maximum_cost_usd=100, maximum_judgments=100),
+            provider_spend_consented=True,
+            created_at=_TIME,
+            code_revision=_REVISION,
+        )
+    assert before == (
+        project.artifacts.list_ids(),
+        len(state.completion_calls),
+        len(state.embedding_calls),
+        state.credential_resolutions,
+    )
+    original_complete = _CompletionClient.complete
+
+    def complete(client: _CompletionClient, request: ModelRequest) -> ModelResponse:
+        """Give uncapped execution actual zero subset meters, without filling unknown prices."""
+        response = original_complete(client, request)
+        assert response.economics.usage is not None
+        return response.model_copy(
+            update={
+                "economics": response.economics.model_copy(
+                    update={
+                        "provider_attempts": 1,
+                        "usage": response.economics.usage.model_copy(
+                            update={
+                                "cached_input_tokens": 0,
+                                "cache_write_input_tokens": 0,
+                                "reasoning_tokens": 0,
+                            }
+                        ),
+                    }
+                )
+            }
+        )
+
+    monkeypatch.setattr(_CompletionClient, "complete", complete)
+    runtime = cast(RuntimeModelCatalog, _ScheduledRuntimeCatalog(catalog, state))
+    budget = EvaluationBudget(maximum_cost_usd=None, maximum_judgments=100)
+    result = run_prepared_model_evaluation(
+        project,
+        prepared,
+        runtime,
+        budget=budget,
+        provider_spend_consented=True,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    calls = (len(state.completion_calls), len(state.embedding_calls))
+    replay = run_prepared_model_evaluation(
+        project,
+        prepared,
+        runtime,
+        budget=budget,
+        provider_spend_consented=True,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    assert replay == result
+    assert calls == (len(state.completion_calls), len(state.embedding_calls))
+
+
+def test_full_schedule_preparation_execution_report_and_lower_cap_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The actual engine carries whole-request rates and disjoint usage through every role."""
+    project, catalog, state = _completed_project(tmp_path)
+    build = project.load_project().build
+    assert build is not None
+    original_world = project.artifacts.read_bytes(build.world_model.artifact_id, "world-model.json")
+    card = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=1_000_000_000,
+        cached_input_nano_usd_per_million_tokens=500_000_000,
+        cache_creation_input_nano_usd_per_million_tokens=1_500_000_000,
+        cache_creation_1h_input_nano_usd_per_million_tokens=2_500_000_000,
+        output_nano_usd_per_million_tokens=2_000_000_000,
+        reasoning_nano_usd_per_million_tokens=3_000_000_000,
+        flex=GatewayServiceTierPrices(input_nano_usd_per_million_tokens=90_000_000_000),
+        priority=GatewayServiceTierPrices(output_nano_usd_per_million_tokens=90_000_000_000),
+        long_context=GatewayLongContextTier(
+            input_threshold_tokens=8,
+            input_nano_usd_per_million_tokens=2_000_000_000,
+            cached_input_nano_usd_per_million_tokens=1_000_000_000,
+            cache_creation_input_nano_usd_per_million_tokens=3_000_000_000,
+            cache_creation_1h_input_nano_usd_per_million_tokens=5_000_000_000,
+            output_nano_usd_per_million_tokens=4_000_000_000,
+            reasoning_nano_usd_per_million_tokens=6_000_000_000,
+        ),
+    )
+    catalog = catalog.model_copy(
+        update={
+            "models": {
+                alias: record.model_copy(update={"gateway": GatewayDeploymentMetadata(prices=card)})
+                if alias != "embedder"
+                else record
+                for alias, record in catalog.models.items()
+            }
+        }
+    )
+    judge = prepare_hosted_provisional_judge(
+        project,
+        catalog,
+        maximum_input_tokens=32_768,
+        maximum_output_tokens=8_192,
+        maximum_attempts=3,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    prepared = prepare_model_evaluation(
+        project,
+        catalog,
+        ("candidate-a", "candidate-b"),
+        judge_setup=judge.setup_input,
+        calibration_id=judge.calibration_id,
+        embedder_alias="embedder",
+        options=ModelEvaluationOptions(maximum_steps=1),
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    assert prepared.judge_request.token_prices == card
+    assert prepared.cost.maximum_is_upper_bound
+    real_complete = _CompletionClient.complete
+
+    def complete(client: _CompletionClient, request: ModelRequest) -> ModelResponse:
+        """Supply one successful provider-shaped meter with all six token dimensions."""
+        response = real_complete(client, request)
+        return response.model_copy(
+            update={
+                "economics": response.economics.model_copy(
+                    update={
+                        "usage": Usage(
+                            input_tokens=8,
+                            output_tokens=4,
+                            cached_input_tokens=2,
+                            cache_write_input_tokens=2,
+                            cache_write_1h_input_tokens=1,
+                            reasoning_tokens=1,
+                        ),
+                        "provider_attempts": 1,
+                    }
+                )
+            }
+        )
+
+    monkeypatch.setattr(_CompletionClient, "complete", complete)
+    runtime = cast(RuntimeModelCatalog, _ScheduledRuntimeCatalog(catalog, state))
+    result = run_prepared_model_evaluation(
+        project,
+        prepared,
+        runtime,
+        budget=EvaluationBudget(maximum_cost_usd=100, maximum_judgments=100),
+        provider_spend_consented=True,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    assert result.report.compared_cells == 3
+    assert all(row.operating_cost_usd == pytest.approx(0.000036) for row in result.report.models)
+    assert {alias for alias, _ in state.completion_calls} == {
+        "candidate-a",
+        "candidate-b",
+        "world",
+        "judge",
+    }
+    calls = (len(state.completion_calls), len(state.embedding_calls))
+    replay = run_prepared_model_evaluation(
+        project,
+        prepared,
+        runtime,
+        budget=EvaluationBudget(maximum_cost_usd=0.0000001, maximum_judgments=100),
+        provider_spend_consented=True,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    assert replay == result
+    assert calls == (len(state.completion_calls), len(state.embedding_calls))
+    assert (
+        project.artifacts.read_bytes(build.world_model.artifact_id, "world-model.json")
+        == original_world
+    )
 
 
 @pytest.mark.parametrize("blank_worker", [False, True])
+@pytest.mark.parametrize("uncapped", [False, True])
 def test_prepared_evaluation_runs_real_lm_judge_and_replays_without_model_calls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     blank_worker: bool,
+    uncapped: bool,
 ) -> None:
     """Only provider transport is deterministic; all evaluation execution is production code."""
     project, catalog, state, prepared = _prepare(tmp_path)
@@ -64,7 +322,7 @@ def test_prepared_evaluation_runs_real_lm_judge_and_replays_without_model_calls(
     embeddings_before = len(state.embedding_calls)
     runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
     budget = EvaluationBudget(
-        maximum_cost_usd=prepared.cost.maximum_cost_usd,
+        maximum_cost_usd=None if uncapped else prepared.cost.maximum_cost_usd,
         maximum_judgments=prepared.cost.judgment_count,
     )
     result = run_prepared_model_evaluation(
@@ -209,7 +467,143 @@ def test_request_ledger_retries_without_scanning_rollouts_under_cell_locks(
     assert before == (len(state.completion_calls), len(state.embedding_calls))
 
 
-def test_budget_pause_resumes_partial_turn_without_repeating_paid_calls(tmp_path: Path) -> None:
+def test_catalog_runtime_supersedes_legacy_interrupted_cells_with_its_actual_uncapped_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catalog-backed execution carries current ledger authority past saved legacy finals.
+
+    Args:
+        tmp_path: Isolated project root for catalog, rollout, judgment, and receipt artifacts.
+        monkeypatch: Fixture that installs deterministic completion interruptions.
+    """
+    project, catalog, state, prepared = _prepare(tmp_path)
+    original_complete = BudgetedCompletion.complete
+    paused = False
+    pause_before_judge = True
+    lock = threading.Lock()
+
+    class Paused(BaseException):
+        """Stop after one durably saved paid response, before its rollout is complete."""
+
+    def complete(client: BudgetedCompletion, request: ModelRequest) -> ModelResponse:
+        """Interrupt exactly one paid candidate call while retaining its actual ledger response.
+
+        Args:
+            client: Catalog-backed completion wrapper with the shared request ledger.
+            request: Exact model request passed to the original completion implementation.
+
+        Returns:
+            The original completion result when no configured interruption applies.
+
+        Raises:
+            Paused: Before the held judge call, or after the first assistant response is durable.
+        """
+        nonlocal paused
+        if client._role == "judge" and pause_before_judge:
+            raise Paused
+        response = original_complete(client, request)
+        with lock:
+            if client._role.startswith("assistant:") and not paused:
+                paused = True
+                raise Paused
+        return response
+
+    def legacy_failure(
+        lease_id: str, reserved_cost_usd: float | None, *, retry_uncapped: bool
+    ) -> StructuredFailure:
+        """Produce the exact historical stale outcome without altering any saved artifact."""
+        assert retry_uncapped
+        return stale_cell_failure(lease_id, reserved_cost_usd, retry_uncapped=False)
+
+    monkeypatch.setattr(BudgetedCompletion, "complete", complete)
+    runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
+    budget = EvaluationBudget(maximum_cost_usd=None, maximum_judgments=100)
+    with pytest.raises(Paused):
+        run_prepared_model_evaluation(
+            project,
+            prepared,
+            runtime,
+            budget=budget,
+            provider_spend_consented=True,
+            created_at=_TIME,
+            code_revision=_REVISION,
+        )
+    monkeypatch.setattr(simulator, "stale_cell_failure", legacy_failure)
+    with pytest.raises(Paused):
+        run_prepared_model_evaluation(
+            project,
+            prepared,
+            runtime,
+            budget=budget,
+            provider_spend_consented=True,
+            created_at=_TIME,
+            code_revision=_REVISION,
+        )
+    before_partial = (project.artifacts.list_ids(), len(state.completion_calls))
+    with pytest.raises(RouterCompositionError, match="before new judgment dispatch"):
+        run_prepared_model_evaluation(
+            project,
+            prepared,
+            runtime,
+            budget=EvaluationBudget(maximum_cost_usd=0.01, maximum_judgments=100),
+            provider_spend_consented=True,
+            created_at=_TIME,
+            code_revision=_REVISION,
+        )
+    assert before_partial == (project.artifacts.list_ids(), len(state.completion_calls))
+    pause_before_judge = False
+    result = run_prepared_model_evaluation(
+        project,
+        prepared,
+        runtime,
+        budget=budget,
+        provider_spend_consented=True,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    rollouts = [
+        read_rollout(project.artifacts, artifact_id)[0]
+        for artifact_id in project.artifacts.list_ids()
+        if project.artifacts.read(artifact_id).manifest.artifact_type == "rollout"
+    ]
+    legacy = [
+        rollout
+        for rollout in rollouts
+        if rollout.failure is not None
+        and rollout.failure.details.get("phase") == "paid_cell_stale_lease"
+    ]
+    assert len(legacy) == 1
+    assert legacy[0].failure is not None and legacy[0].failure.code == FailureCode.BUDGET
+    successors = [
+        rollout
+        for rollout in rollouts
+        if rollout.cell_id == legacy[0].cell_id and rollout.retry_attempt == 1
+    ]
+    assert len(successors) == 1 and successors[0].failure is None
+    assert result.simulation_cost_usd is None and result.cost_usd is None
+    assert successors[0].simulation_binding == legacy[0].simulation_binding
+    assert all(row.quality == 1 for row in result.report.models)
+    assert result.report.compared_cells == prepared.cost.scenario_count
+    before = len(state.completion_calls)
+    assert (
+        run_prepared_model_evaluation(
+            project,
+            prepared,
+            runtime,
+            budget=EvaluationBudget(maximum_cost_usd=0.01, maximum_judgments=100),
+            provider_spend_consented=True,
+            created_at=_TIME,
+            code_revision=_REVISION,
+        )
+        == result
+    )
+    assert len(state.completion_calls) == before
+
+
+@pytest.mark.parametrize("resumed_limit", [100, None])
+def test_budget_pause_resumes_partial_turn_without_repeating_paid_calls(
+    tmp_path: Path, resumed_limit: float | None
+) -> None:
     """An allowance far below the theoretical bound pauses, then replays a paid prefix for free."""
 
     project, catalog, state, prepared = _prepare(tmp_path)
@@ -234,7 +628,7 @@ def test_budget_pause_resumes_partial_turn_without_repeating_paid_calls(tmp_path
         project,
         prepared,
         runtime,
-        budget=EvaluationBudget(maximum_cost_usd=100, maximum_judgments=100),
+        budget=EvaluationBudget(maximum_cost_usd=resumed_limit, maximum_judgments=100),
         provider_spend_consented=True,
         created_at=_TIME,
         code_revision=_REVISION,
@@ -288,13 +682,6 @@ def test_runtime_refuses_changed_accepted_inputs_before_provider_dispatch(
         len(state.completion_calls),
         len(state.embedding_calls),
     )
-
-
-def test_prepared_runtime_is_public() -> None:
-    """Hosting uses the public engine API instead of copying its runtime construction."""
-
-    assert exp.run_prepared_model_evaluation is run_prepared_model_evaluation
-    assert exp.SpendLimitReached is SpendLimitReached
 
 
 def test_prepared_workers_world_and_judge_accept_pinned_served_ids(

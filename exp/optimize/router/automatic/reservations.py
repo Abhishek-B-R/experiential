@@ -67,7 +67,7 @@ def simulation_input_token_estimate(
     The estimate sums explicit deterministic components instead of a model's full context
     window: one median-length trace for the visible episode transcript, one median-length trace
     for each of the world model's retrieved fit-RAG transitions rendered into the prompt (one
-    whole trace bounds one transition), the explicit retrieval query token budget, one full
+    whole trace bounds one transition), the full resolved query input ceiling, one full
     output turn echoed back into the next request, and a fixed prompt-framing allowance.
 
     The estimate prices provider reservations only. It never bounds an individual request:
@@ -76,7 +76,7 @@ def simulation_input_token_estimate(
     Args:
         traces: Verified traces persisted by the completed build.
         retrieved_transition_count: Frozen world-model retrieval count rendered per prediction.
-        maximum_retrieval_query_tokens: Explicit rendered RAG query token budget.
+        maximum_retrieval_query_tokens: Explicit or capacity-derived aggregate query ceiling.
         maximum_output_tokens: Per-turn completion output ceiling echoed into later prompts.
 
     Returns:
@@ -103,13 +103,28 @@ def simulation_input_token_estimate(
 
 @dataclass(frozen=True)
 class AutomaticRouterOptions:
-    """Tasteful bounded controls for one automatic router optimization."""
+    """Bounded controls for one automatic router optimization.
+
+    Attributes:
+        maximum_provider_cost_usd: Aggregate provider allowance, default 25 dollars.
+        maximum_judgments: Durable judgment count ceiling, default 100.
+        maximum_model_calls: Candidate turn ceiling, default 50.
+        maximum_router_feature_tokens: Router feature input limit, default 8,192.
+        maximum_retrieval_query_tokens: Optional query input ceiling; omission derives it from
+            the world model's available input capacity. Individual chunks obey embedder capacity.
+        router_embedding_maximum_attempts: Embedding retry allowance, default three.
+        completion_maximum_attempts: Completion retry allowance, default three.
+        simulation_maximum_output_tokens: Per-turn generation allowance, default 16,000.
+        maximum_concurrency: Simultaneous rollout allowance, default one.
+        seed: Deterministic scheduling seed, default zero.
+        stop_on_overspend: Whether to stop when reconciled costs reach the allowance.
+    """
 
     maximum_provider_cost_usd: float = 25.0
     maximum_judgments: int = 100
     maximum_model_calls: int = 50
     maximum_router_feature_tokens: int = 8_192
-    maximum_retrieval_query_tokens: int = 32_768
+    maximum_retrieval_query_tokens: int | None = None
     router_embedding_maximum_attempts: int = 3
     completion_maximum_attempts: int = 3
     simulation_maximum_output_tokens: int = 16_000
@@ -353,12 +368,52 @@ def simulation_completion_reservations(
     return tuple(candidate_requests), world_request
 
 
+def retrieval_query_input_limit(
+    problems: list[str],
+    *,
+    catalog: ModelCatalog,
+    world_alias: str | None,
+    maximum_output_tokens: int,
+    configured_limit: int | None,
+) -> int | None:
+    """Derive omitted aggregate query limits from the required world prompt's input capacity.
+
+    A query contains task, initial context and one action, all of which also belong to the
+    required world prompt. Its lossless embedding chunks have separate per-input bounds;
+    their aggregate allowance must not be confused with one embedding context window.
+
+    Args:
+        problems: Mutable aggregate preflight problem list.
+        catalog: Verified model metadata.
+        world_alias: World-model alias, or None when role selection is incomplete.
+        maximum_output_tokens: Requested per-call world output reservation.
+        configured_limit: Explicit user ceiling, retained exactly when supplied.
+
+    Returns:
+        Finite aggregate input bound, or None after reporting unavailable world capacity.
+    """
+    if configured_limit is not None:
+        return configured_limit
+    record = catalog.models.get(world_alias) if world_alias is not None else None
+    capabilities = record.capabilities if record is not None else None
+    context = capabilities.context_window_tokens if capabilities is not None else None
+    if capabilities is None or context is None:
+        problems.append("retrieval query capacity requires world-model context metadata")
+        return None
+    output = capabilities.maximum_output_tokens
+    available = context if output is None else context - min(output, maximum_output_tokens)
+    if available <= 0:
+        problems.append("world-model output reservation leaves no capacity for a retrieval query")
+        return None
+    return available
+
+
 def retrieval_embedding_reservation(
     problems: list[str],
     catalog: ModelCatalog,
     alias: str | None,
     model: ModelSnapshot | None,
-    maximum_input_tokens: int,
+    maximum_input_tokens: int | None,
     maximum_attempts: int,
 ) -> EmbeddingCostReservation | None:
     """Freeze one query-embedding price, retry, and input ceiling.
@@ -368,13 +423,13 @@ def retrieval_embedding_reservation(
         catalog: Verified local model catalog.
         alias: Build-frozen embedder alias.
         model: Exact embedder model identity.
-        maximum_input_tokens: Maximum rendered RAG query input.
+        maximum_input_tokens: Maximum rendered RAG query input, or unavailable capacity.
         maximum_attempts: Active embedding retry ceiling.
 
     Returns:
         Exact retrieval reservation, or ``None`` when metadata is unavailable.
     """
-    if alias is None or model is None:
+    if alias is None or model is None or maximum_input_tokens is None:
         return None
     capabilities = catalog.models[alias].capabilities
     price = capabilities.input_cost_per_million_tokens_usd if capabilities is not None else None
@@ -476,6 +531,7 @@ def completion_reservation_from_catalog(
     try:
         return completion_cost_reservation(
             model=model,
+            token_prices=catalog.models[alias].token_prices,
             input_usd_per_million_tokens=input_price,
             output_usd_per_million_tokens=output_price,
             cached_input_usd_per_million_tokens=cached_input_price,
@@ -561,6 +617,7 @@ def judge_completion_reservation(
     try:
         return completion_cost_reservation(
             model=judge,
+            token_prices=catalog.models[judge_alias].token_prices,
             input_usd_per_million_tokens=input_price,
             output_usd_per_million_tokens=output_price,
             cached_input_usd_per_million_tokens=cached_input_price,
@@ -656,7 +713,13 @@ def plan_automatic_router_cost(
         catalog,
         embedder_alias,
         embedder,
-        options.maximum_retrieval_query_tokens,
+        retrieval_query_input_limit(
+            problems,
+            catalog=catalog,
+            world_alias=world_model_alias,
+            maximum_output_tokens=options.simulation_maximum_output_tokens,
+            configured_limit=options.maximum_retrieval_query_tokens,
+        ),
         options.router_embedding_maximum_attempts,
     )
     candidates, world_request = simulation_completion_reservations(
@@ -684,6 +747,17 @@ def plan_automatic_router_cost(
         problems.append("automatic cost plan lacks a request reservation for a candidate")
     if any(value is None for value in (router, query, world_request, judge_request)):
         problems.append("automatic cost plan has incomplete provider reservations")
+    completion_requests = [
+        *((item.candidate_alias, item.request) for item in candidates),
+        ("world model", world_request),
+        ("judge", judge_request),
+    ]
+    for label, request in completion_requests:
+        if request is not None and not request.maximum_is_upper_bound():
+            problems.append(
+                f"{label} has an incomplete token tariff; a finite router allowance "
+                "requires every reachable price dimension"
+            )
     if problems:
         raise ValueError("automatic router cost plan failed:\n- " + "\n- ".join(problems))
     assert router is not None and query is not None

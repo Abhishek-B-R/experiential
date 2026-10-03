@@ -17,6 +17,7 @@ use crate::events::Event;
 use crate::guardrails;
 use crate::guardrails::plan::OutputPlan;
 use crate::metrics::METRICS;
+use crate::reasoning_display::ReasoningOutput;
 use crate::replay_repair::replay_repair_headers;
 use crate::respond::error_response;
 use crate::server::AppState;
@@ -179,6 +180,37 @@ impl Admission {
             .is_some_and(|wire| wire.reasoning_output_exposed)
     }
 
+    /// Both reasoning facts of the rung at `depth`.
+    pub(crate) fn reasoning_output_at(&self, depth: usize) -> ReasoningOutput {
+        ReasoningOutput {
+            exposed: self.reasoning_exposed_at(depth),
+            displayed: self.reasoning_displayed_at(depth),
+        }
+    }
+
+    /// Whether the rung at `depth` renders its reasoning text as display copy.
+    ///
+    /// On unless the rung opts out. An output guardrail turns it off for the
+    /// whole request: guardrails judge content, not reasoning, so display copy
+    /// would carry text the chain never saw.
+    pub(crate) fn reasoning_displayed_at(&self, depth: usize) -> bool {
+        !self.buffers_output()
+            && self
+                .route
+                .get(depth)
+                .is_some_and(|wire| !wire.reasoning_output_hidden)
+    }
+
+    /// The Responses envelope for the attempt that won at `depth`, carrying
+    /// that rung's plaintext-reasoning exposure and display.
+    pub(crate) fn responses_envelope_at(&self, depth: usize) -> ResponsesEnvelope {
+        let mut envelope = self.envelope.clone().unwrap_or_default();
+        envelope.reasoning_output_exposed = self.reasoning_exposed_at(depth);
+        envelope.reasoning_displayed = self.reasoning_displayed_at(depth);
+        envelope.reasoning_withheld = !envelope.reasoning_displayed;
+        envelope
+    }
+
     /// Whether the attempt at `depth` may enforce its output chain as bytes
     /// stream, instead of buffering the whole completion first.
     ///
@@ -204,7 +236,7 @@ impl Admission {
     }
 }
 
-/// Commit-independent headers, mirroring `commit_independent_headers`,
+/// Headers every admitted response carries whatever rung serves it,
 /// including the caller's echoed request identity when one was supplied.
 pub(crate) fn commit_independent(
     admission: &Admission,
@@ -224,7 +256,7 @@ pub(crate) fn commit_independent(
     headers
 }
 
-/// Commit-dependent headers, mirroring `commit_dependent_headers`: the
+/// Headers that depend on the committed rung: the
 /// deployment identity and route depth that actually served the request.
 pub(crate) fn commit_dependent(admission: &Admission, depth: usize) -> Vec<(String, String)> {
     let served = admission.route.get(depth);

@@ -1,10 +1,11 @@
 """Evaluation provider wrappers enforcing an approved allowance with durable replay."""
 
 from collections.abc import Sequence
+from typing import Self
 
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, model_validator
 
-from exp.common.core.artifacts import sha256_json
+from exp.common.core.artifacts import ContractModel, JsonObject, sha256_json
 from exp.common.models import (
     CompletionCostReservation,
     Embedding,
@@ -16,8 +17,55 @@ from exp.common.models import (
     completion_request_cost_usd,
     reconcile_completion_economics,
 )
+from exp.common.models.token_cost import schedule_prices_complete
 from exp.runtime.models.budget import RequestBudget
+from exp.runtime.models.providers.errors import (
+    ProviderPricingUnavailableError,
+    ProviderTruncatedResponseError,
+    retain_unbounded_response_liability,
+)
 from exp.simulation.engines.text.tokens import Utf8UpperBoundTokenCounter
+
+
+class _RecordedCompletion(ContractModel):
+    """Keep a paid response replayable even when its frozen tariff cannot price it.
+
+    Attributes:
+        response: Complete paid provider result, or None for truncated tool JSON.
+        raw_response: Exact decoded HTTP body of a truncated response, mutually exclusive
+            with response. The owning provider client supplies it before parsing rejects it.
+        pricing_error: Frozen valuation error re-raised after durable save or exact replay.
+        charge_usd: Known reconciled charge, or None for explicitly unbounded liability.
+    """
+
+    response: ModelResponse | None = None
+    raw_response: JsonObject | None = None
+    pricing_error: str | None = None
+    charge_usd: float | None
+
+    @model_validator(mode="after")
+    def _require_one_response(self) -> Self:
+        """Keep saved usable and truncated responses distinct, with unknown truncated cost.
+
+        Returns:
+            This envelope after validating its mutually exclusive response representations.
+
+        Raises:
+            ValueError: The envelope has no response, or combines a raw truncated body with
+                a parsed response, pricing error or known charge.
+        """
+        if self.raw_response is not None:
+            if (
+                self.response is not None
+                or self.pricing_error is not None
+                or self.charge_usd is not None
+            ):
+                raise ValueError(
+                    "a saved truncated response cannot contain a parsed result or cost"
+                )
+        elif self.response is None:
+            raise ValueError("a saved completion requires its provider response")
+        return self
 
 
 class BudgetedCompletion:
@@ -59,41 +107,80 @@ class BudgetedCompletion:
         if request.maximum_output_tokens is None:
             raise ValueError("evaluation request is missing its output reservation")
         # Reconciliation retains the frozen output ceiling for any unobserved retries.
+        input_tokens = Utf8UpperBoundTokenCounter().count(request)
         maximum = completion_request_cost_usd(
             self._reservation,
-            input_tokens=Utf8UpperBoundTokenCounter().count(request),
+            input_tokens=input_tokens,
             output_tokens=self._reservation.maximum_output_tokens,
         )
-        fingerprint = sha256_json(
-            {
-                "request": request.model_dump(mode="json"),
-                "reservation": self._reservation.model_dump(mode="json"),
-                "served_model": self._served_model.model_dump(mode="json"),
-            }
+        cost_is_upper_bound = self._reservation.token_prices is None or schedule_prices_complete(
+            self._reservation.token_prices, maximum_input_tokens=input_tokens
         )
+        identity: JsonObject = {
+            "request": request.model_dump(mode="json"),
+            "reservation": self._reservation.model_dump(mode="json"),
+            "served_model": self._served_model.model_dump(mode="json"),
+            "response_contract": "priced-completion-v1",
+        }
+        fingerprint = sha256_json(identity)
 
-        def dispatch() -> ModelResponse:
+        def dispatch() -> _RecordedCompletion:
             """Retain the raw response; recorders independently reconcile its economics."""
-            response = self._client.complete(request)
+            try:
+                response = self._client.complete(request)
+            except ProviderTruncatedResponseError as error:
+                if error.response_body is None:
+                    raise
+                return _RecordedCompletion(raw_response=error.response_body, charge_usd=None)
             if response.model not in (self._reservation.model, self._served_model):
                 raise ValueError("provider response identity differs from the request reservation")
-            return response
+            try:
+                economics = reconcile_completion_economics(self._reservation, response.economics)
+                assert economics.cost_usd is not None
+                if cost_is_upper_bound and economics.cost_usd.value > maximum + 1e-9:
+                    raise ValueError("provider charge exceeds the admitted request reservation")
+                return _RecordedCompletion(response=response, charge_usd=economics.cost_usd.value)
+            except ValueError as error:
+                # This is retained liability, not a measured price. Save the paid
+                # response before rejecting it, including across lower-cap replay.
+                return _RecordedCompletion(
+                    response=response, pricing_error=str(error), charge_usd=None
+                )
 
-        def charge(response: ModelResponse) -> float:
-            """Price observed usage and unresolved retry attempts with the frozen market rates."""
-            economics = reconcile_completion_economics(self._reservation, response.economics)
-            assert economics.cost_usd is not None
-            return economics.cost_usd.value
-
-        return self._budget.call(
+        recorded = self._budget.call(
             role=self._role,
             fingerprint=fingerprint,
             maximum_cost_usd=maximum,
             operation=dispatch,
-            encode=lambda response: response.model_dump_json(),
-            decode=ModelResponse.model_validate_json,
-            charge=charge,
+            # One response contract covers all current tariffs. Old unwrapped
+            # receipts fail the fingerprint check without migration or dispatch.
+            encode=lambda result: result.model_dump_json(),
+            decode=_RecordedCompletion.model_validate_json,
+            charge=lambda result: result.charge_usd,
+            cost_is_upper_bound=cost_is_upper_bound,
         )
+        if recorded.raw_response is not None:
+            truncated = ProviderTruncatedResponseError(
+                "saved provider response ended inside tool JSON; the paid body is retained",
+                response_body=recorded.raw_response,
+            )
+            retain_unbounded_response_liability(truncated)
+            raise truncated
+        assert recorded.response is not None
+        if recorded.pricing_error is not None:
+            # Recover the type from the exact saved economics and frozen reservation,
+            # never from error-message matching or by dispatching the request again.
+            failure: ValueError = ValueError(recorded.pricing_error)
+            try:
+                reconcile_completion_economics(self._reservation, recorded.response.economics)
+            except ProviderPricingUnavailableError:
+                failure = ProviderPricingUnavailableError(recorded.pricing_error)
+            except ValueError:
+                pass
+            if recorded.charge_usd is None:
+                retain_unbounded_response_liability(failure)
+            raise failure from None
+        return recorded.response
 
 
 class BudgetedEmbedding:

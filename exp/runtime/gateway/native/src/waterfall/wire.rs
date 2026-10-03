@@ -40,6 +40,16 @@ pub struct DeploymentWire {
     /// The host still reserves and settles each cache operation separately.
     #[serde(default)]
     pub explicit_cache: bool,
+    /// Gateway-selected automatic prefix cache the client never asked for. Any
+    /// cache failure then falls back to the plain generation instead of failing it.
+    #[serde(default)]
+    pub automatic_cache: bool,
+    /// Prompt tokens this attempt's own automatic create wrote into the cache
+    /// its generation reads. Usage then reports them as cache writes read back
+    /// in the same call (OpenRouter's shape), priced at the lane's write rate.
+    /// Set only on the overlaid wire, never by the host.
+    #[serde(skip)]
+    pub automatic_cache_written_tokens: Option<u64>,
     pub timeout_seconds: f64,
     /// Structured payload the data plane serializes itself; null for
     /// body-signing dialects, whose route entry carries `upstream_body`.
@@ -64,6 +74,14 @@ pub struct DeploymentWire {
     /// stripped. Defaults false so every other provider is unchanged.
     #[serde(default)]
     pub reasoning_output_exposed: bool,
+    /// When true, this rung never renders the model's reasoning text to the
+    /// caller (an operator opt-out or the process-wide kill switch). Defaults
+    /// false: every rung returns the reasoning its provider streams, as
+    /// display copy beside the content (Chat `reasoning`, Messages unsigned
+    /// thinking, Responses summary text). Display never changes replay or the
+    /// sealed carrier, which `reasoning_output_exposed` alone governs.
+    #[serde(default)]
+    pub reasoning_output_hidden: bool,
     /// Caller stop sequences the data plane enforces on this rung's stream
     /// because the provider wire has no stop field (OpenAI Responses). The
     /// relay cuts visible text at the first match and terminates with
@@ -74,6 +92,11 @@ pub struct DeploymentWire {
     /// no such control: the relay serializes the turn to one tool call.
     #[serde(default)]
     pub serialize_tool_calls: bool,
+    /// This rung's provider reports Chat Completions cache writes as a subset
+    /// of cache reads: it created the cache and read the written tokens back
+    /// in the same call. Usage normalization separates the two legs.
+    #[serde(default)]
+    pub cache_writes_within_reads: bool,
     /// Codex native-tool inversion map for this request (provider-facing
     /// mangled name -> origin name, namespace, is-custom). Empty unless the
     /// request carried translated Codex native tools; see

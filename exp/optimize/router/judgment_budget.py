@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from collections.abc import Callable, Mapping
+from concurrent.futures import CancelledError
 from typing import Literal
 
 from exp.common.core.artifacts import (
@@ -32,6 +34,7 @@ from exp.optimize.router.errors import (
     JudgeTranscriptAdmissionError,
     RouterCompositionError,
 )
+from exp.optimize.router.judgment_dispatch import dispatch_judgments
 from exp.simulation.engines.text.resume import reexecutable_dispatch_failure
 
 logger = logging.getLogger(__name__)
@@ -491,12 +494,14 @@ def complete_cell_evidence(
     judge: Judge,
     maximum_judgments: int,
     *,
-    remaining_cost_usd: float,
+    remaining_cost_usd: float | None,
     stop_on_overspend: bool,
     spend_ceiling_crossed: Callable[[bool, str, str], None],
     progress: ProgressHook | None = None,
     progress_detail: str | None = None,
     reconciled_spend: Callable[[], float] | None = None,
+    maximum_concurrency: int = 1,
+    allow_judgment_dispatch: bool = True,
 ) -> tuple[tuple[EvaluationCellEvidence, ...], int, float]:
     """Verify evidence and reserve each bounded judgment dispatch durably before calling it.
 
@@ -532,12 +537,16 @@ def complete_cell_evidence(
         review: Approved rubric and calibration identifiers.
         judge: Injected judge completing missing judgments.
         maximum_judgments: Finite whole-workflow judgment dispatch ceiling.
-        remaining_cost_usd: Shared provider-spend remainder available to judging.
+        remaining_cost_usd: Shared provider-spend remainder, or None without an aggregate cap.
         stop_on_overspend: Whether crossing the shared ceiling blocks the next dispatch.
         spend_ceiling_crossed: Fail-closed or warn-once handler for a crossed spend ceiling.
         progress: Optional progress hook for judgment counting.
         progress_detail: Optional stable progress label.
         reconciled_spend: Optional authoritative ledger including incomplete paid responses.
+        allow_judgment_dispatch: False permits only verified judgments or terminal exclusions,
+            preserving free replay when unknown prior liability forbids more paid work.
+        maximum_concurrency: Phase-wide judgment allowance, one by default. Concurrent judges
+            must enforce provider spend with a shared request-admission budget.
 
     Returns:
         Bound cell evidence, consumed dispatch count, and reconciled judge spend.
@@ -601,7 +610,6 @@ def complete_cell_evidence(
     except JudgmentBudgetError as exc:
         raise RouterCompositionError(str(exc)) from exc
 
-    evidence: list[EvaluationCellEvidence] = []
     consumed = 0
     overspend_warned = False
     judge_spend_usd = math.fsum(
@@ -609,84 +617,36 @@ def complete_cell_evidence(
     )
     excluded_costs: list[float] = []
 
-    def _report_judgments() -> None:
-        """Report judgment progress after appending one evidence row."""
+    def _report_judgments(completed: int) -> None:
+        """Report completed evidence on the coordinating caller's thread."""
         report(
             progress,
             "judgments",
-            completed=len(evidence),
+            completed=completed,
             total=len(bound_cells),
             detail=progress_detail,
         )
 
     report(progress, "judgments", completed=0, total=len(bound_cells), detail=progress_detail)
-    for cell, rollout_id, protocol in bound_cells:
+    state_lock = threading.Lock()
+    rollout_locks = {rollout_id: threading.Lock() for rollout_id in protocols_by_rollout}
+
+    def complete_one(
+        item: tuple[EvaluationCell, str, EvaluationProtocol], cancelled: Callable[[], bool]
+    ) -> EvaluationCellEvidence:
+        """Coordinate one exact rollout while allowing independent provider calls to overlap."""
+        nonlocal consumed, overspend_warned, judge_spend_usd
+        cell, rollout_id, protocol = item
         rollout = rollouts_by_id[rollout_id]
-        if _rollout_failed(rollout):
-            evidence.append(_unjudged_cell_evidence(cell, protocol, rollout))
-            _report_judgments()
-            continue
-        try:
-            judgment = judgments_by_rollout.get(rollout_id)
-            receipt = read_dispatch_reservation(
-                project,
-                plan_input,
-                cell,
-                rollout_id,
-                review.rubric_id,
-                review.calibration_id,
-                protocol,
-            )
-            exclusion = read_judgment_exclusion(
-                project,
-                plan_input,
-                cell,
-                rollout_id,
-                review.rubric_id,
-                review.calibration_id,
-                protocol,
-            )
-            if judgment is None and receipt is not None:
-                judgment = find_verified_judgment(
-                    project,
-                    rollout_id,
-                    review.rubric_id,
-                    review.calibration_id,
-                    protocol,
-                )
-                if judgment is not None:
-                    judgments_by_rollout[rollout_id] = judgment
-                    judge_spend_usd = math.fsum((judge_spend_usd, _known_judgment_spend(judgment)))
-        except JudgmentBudgetError as exc:
-            raise RouterCompositionError(str(exc)) from exc
-        if judgment is not None or receipt is not None:
-            consumed += 1
-        if consumed > maximum_judgments:
-            raise RouterCompositionError("judgment dispatch budget exhausted")
-        if judgment is None and exclusion is not None:
-            excluded_costs.append(exclusion.conservative_cost_usd)
-            judge_spend_usd = math.fsum((judge_spend_usd, exclusion.conservative_cost_usd))
-            evidence.append(_unjudged_cell_evidence(cell, protocol, rollout))
-            _report_judgments()
-            continue
-        if judgment is None:
-            if reconciled_spend is not None:
-                judge_spend_usd = reconciled_spend()
-            if judge_spend_usd >= remaining_cost_usd:
-                if stop_on_overspend or not overspend_warned:
-                    spend_ceiling_crossed(
-                        stop_on_overspend,
-                        "reconciled provider spend reached the shared ceiling before judgment "
-                        "dispatch; increase --maximum-simulation-cost-usd and rerun to resume",
-                        f"reconciled judge spend ${judge_spend_usd:.4f} reached the shared "
-                        f"authorized remainder ${remaining_cost_usd:.4f}",
-                    )
-                    overspend_warned = True
-            if receipt is None:
-                if consumed >= maximum_judgments:
-                    raise RouterCompositionError("judgment dispatch budget exhausted")
+        with rollout_locks[rollout_id]:
+            with state_lock:
+                if cancelled():
+                    raise CancelledError
+                if _rollout_failed(rollout):
+                    return _unjudged_cell_evidence(cell, protocol, rollout)
                 try:
-                    persist_dispatch_reservation(
+                    judgment = judgments_by_rollout.get(rollout_id)
+                    receipt = read_dispatch_reservation(
                         project,
                         plan_input,
                         cell,
@@ -695,55 +655,130 @@ def complete_cell_evidence(
                         review.calibration_id,
                         protocol,
                     )
+                    exclusion = read_judgment_exclusion(
+                        project,
+                        plan_input,
+                        cell,
+                        rollout_id,
+                        review.rubric_id,
+                        review.calibration_id,
+                        protocol,
+                    )
+                    if judgment is None and receipt is not None:
+                        judgment = find_verified_judgment(
+                            project,
+                            rollout_id,
+                            review.rubric_id,
+                            review.calibration_id,
+                            protocol,
+                        )
+                        if judgment is not None:
+                            judgments_by_rollout[rollout_id] = judgment
+                            judge_spend_usd = math.fsum(
+                                (judge_spend_usd, _known_judgment_spend(judgment))
+                            )
                 except JudgmentBudgetError as exc:
                     raise RouterCompositionError(str(exc)) from exc
-                consumed += 1
-            try:
-                judgment = judge.judge_persisted(
-                    project,
-                    rollout_artifact_id=rollout_id,
-                    rubric_artifact_id=review.rubric_id,
-                    calibration_artifact_id=review.calibration_id,
-                )
-            except (JudgeTranscriptAdmissionError, JudgeDispatchExhaustedError) as exc:
-                exhausted_cost_usd = (
-                    exc.conservative_cost_usd
-                    if isinstance(exc, JudgeDispatchExhaustedError)
-                    else 0.0
-                )
-                _record_judgment_exclusion(
-                    project,
-                    plan_input,
-                    cell,
-                    rollout_id,
-                    review,
-                    protocol,
-                    reason=(
-                        "transcript_exceeds_judge_admission_ceiling"
-                        if isinstance(exc, JudgeTranscriptAdmissionError)
-                        else "judge_dispatch_failed"
-                    ),
-                    error=exc,
-                    conservative_cost_usd=exhausted_cost_usd,
-                )
-                judge_spend_usd = math.fsum((judge_spend_usd, exhausted_cost_usd))
-                excluded_costs.append(exhausted_cost_usd)
-                evidence.append(_unjudged_cell_evidence(cell, protocol, rollout))
-                _report_judgments()
-                continue
-            _persist_judgment(project, judgment)
-            judgments_by_rollout[rollout_id] = judgment
-            judge_spend_usd = math.fsum((judge_spend_usd, _known_judgment_spend(judgment)))
-        evidence.append(
-            EvaluationCellEvidence(
+                if judgment is not None or receipt is not None:
+                    consumed += 1
+                if consumed > maximum_judgments:
+                    raise RouterCompositionError("judgment dispatch budget exhausted")
+                if judgment is None and exclusion is not None:
+                    excluded_costs.append(exclusion.conservative_cost_usd)
+                    judge_spend_usd = math.fsum((judge_spend_usd, exclusion.conservative_cost_usd))
+                    return _unjudged_cell_evidence(cell, protocol, rollout)
+                if judgment is None:
+                    if not allow_judgment_dispatch:
+                        raise RouterCompositionError(
+                            "unknown prior simulation spend requires an explicitly uncapped "
+                            "request budget before new judgment dispatch; "
+                            "saved evidence is unchanged"
+                        )
+                    # In parallel, the request ledger may include siblings' temporary
+                    # reservations. Its atomic admission waits for those requests to settle;
+                    # treating them here as final spend would pause an affordable run early.
+                    if reconciled_spend is not None and maximum_concurrency == 1:
+                        judge_spend_usd = reconciled_spend()
+                    if remaining_cost_usd is not None and judge_spend_usd >= remaining_cost_usd:
+                        if stop_on_overspend or not overspend_warned:
+                            spend_ceiling_crossed(
+                                stop_on_overspend,
+                                "reconciled provider spend reached the shared ceiling before "
+                                "judgment dispatch; increase --maximum-simulation-cost-usd "
+                                "and rerun to resume",
+                                f"reconciled judge spend ${judge_spend_usd:.4f} reached the shared "
+                                f"authorized remainder ${remaining_cost_usd:.4f}",
+                            )
+                            overspend_warned = True
+                    if receipt is None:
+                        if consumed >= maximum_judgments:
+                            raise RouterCompositionError("judgment dispatch budget exhausted")
+                        try:
+                            persist_dispatch_reservation(
+                                project,
+                                plan_input,
+                                cell,
+                                rollout_id,
+                                review.rubric_id,
+                                review.calibration_id,
+                                protocol,
+                            )
+                        except JudgmentBudgetError as exc:
+                            raise RouterCompositionError(str(exc)) from exc
+                        consumed += 1
+            if judgment is None:
+                if cancelled():
+                    raise CancelledError
+                try:
+                    judgment = judge.judge_persisted(
+                        project,
+                        rollout_artifact_id=rollout_id,
+                        rubric_artifact_id=review.rubric_id,
+                        calibration_artifact_id=review.calibration_id,
+                    )
+                except (JudgeTranscriptAdmissionError, JudgeDispatchExhaustedError) as exc:
+                    exhausted_cost_usd = (
+                        exc.conservative_cost_usd
+                        if isinstance(exc, JudgeDispatchExhaustedError)
+                        else 0.0
+                    )
+                    _record_judgment_exclusion(
+                        project,
+                        plan_input,
+                        cell,
+                        rollout_id,
+                        review,
+                        protocol,
+                        reason=(
+                            "transcript_exceeds_judge_admission_ceiling"
+                            if isinstance(exc, JudgeTranscriptAdmissionError)
+                            else "judge_dispatch_failed"
+                        ),
+                        error=exc,
+                        conservative_cost_usd=exhausted_cost_usd,
+                    )
+                    with state_lock:
+                        judge_spend_usd = math.fsum((judge_spend_usd, exhausted_cost_usd))
+                        excluded_costs.append(exhausted_cost_usd)
+                        return _unjudged_cell_evidence(cell, protocol, rollout)
+                _persist_judgment(project, judgment)
+                with state_lock:
+                    judgments_by_rollout[rollout_id] = judgment
+                    judge_spend_usd = math.fsum((judge_spend_usd, _known_judgment_spend(judgment)))
+            return EvaluationCellEvidence(
                 cell_id=cell.cell_id,
                 protocol_id=protocol.protocol_id,
                 rollout_artifact_id=rollout_id,
                 judgment_artifact_id=judgment.judgment_id,
                 source_run_id=rollout.source_run_id,
             )
-        )
-        _report_judgments()
+
+    ordered_evidence = dispatch_judgments(
+        bound_cells,
+        complete_one,
+        maximum_concurrency=maximum_concurrency,
+        on_completed=_report_judgments,
+    )
     # Sum the same complete ledger on first execution and replay, rather than returning
     # different rounding from iterative versus batch accumulation.
     reconciled = math.fsum(
@@ -751,7 +786,7 @@ def complete_cell_evidence(
     )
     if reconciled_spend is not None:
         reconciled = reconciled_spend()
-    return tuple(evidence), consumed, reconciled
+    return ordered_evidence, consumed, reconciled
 
 
 def _record_judgment_exclusion(

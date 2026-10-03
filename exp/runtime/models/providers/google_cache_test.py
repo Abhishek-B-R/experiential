@@ -7,6 +7,7 @@ from dataclasses import FrozenInstanceError, replace
 from typing import cast
 
 import pytest
+from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject, canonical_json_bytes, sha256_json
 from exp.common.models import ToolCall
@@ -19,10 +20,13 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
 )
+from exp.runtime.models.providers import google_cache as google_cache_module
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.cache_policy import cache_markers
 from exp.runtime.models.providers.google_cache import (
     GoogleCachePlan,
     VertexCacheProject,
+    build_automatic_google_cache_plans,
     build_google_cache_plan,
 )
 from exp.runtime.models.providers.messages_payloads import gemini_generate_content_stream_payload
@@ -628,3 +632,198 @@ def test_plain_assistant_history_after_prefix_is_retained_verbatim() -> None:
         plan.generation_payload["contents"]
         == cast("list[JsonObject]", _payload(request)["contents"])[1:]
     )
+
+
+def test_automatic_vertex_plans_preserve_changed_suffix_and_schema() -> None:
+    """Whole-message caches share exact prefix bytes while schemas stay per request."""
+
+    profile = _profile(
+        f"https://aiplatform.us.rep.googleapis.com/v1/projects/fruit-project/locations/us/"
+        f"publishers/google/models/{_MODEL}:streamGenerateContent?alt=sse"
+    )
+    first = _request().model_copy(
+        update={
+            "messages": (
+                GatewayMessage(role="system", content="Follow the fictional inventory."),
+                GatewayMessage(role="user", content="Apple inventory: 42.\n" * 1024),
+                GatewayMessage(role="user", content="Batch 1"),
+                GatewayMessage(role="user", content="Return the count."),
+            )
+        }
+    )
+    second = first.model_copy(
+        update={
+            "messages": (
+                *first.messages[:2],
+                GatewayMessage(role="user", content="Batch 2"),
+                GatewayMessage(role="user", content="Return the count in another shape."),
+            )
+        }
+    )
+    a, b = _payload(first), _payload(second)
+    b["generationConfig"] = {
+        "responseMimeType": "application/json",
+        "responseJsonSchema": {
+            "type": "object",
+            "properties": {"count": {"type": "integer"}},
+            "required": ["count"],
+        },
+    }
+    pa = build_automatic_google_cache_plans(profile, first, a)
+    pb = build_automatic_google_cache_plans(profile, second, b)
+    assert pa and pb and pa[0].prefix_sha256 == pb[0].prefix_sha256
+    for plan, original in [(pa[0], a), (pb[0], b)]:
+        assert plan.create_url.startswith("https://aiplatform.us.rep.googleapis.com/")
+        restored = deepcopy(plan.generation_payload)
+        resource = plan.create_payload
+        restored["systemInstruction"] = resource["systemInstruction"]
+        restored["contents"] = cast("list[JsonValue]", resource["contents"]) + cast(
+            "list[JsonValue]", restored["contents"]
+        )
+        assert restored == original
+    assert pa[0].generation_payload != pb[0].generation_payload
+    assert "generationConfig" not in pa[0].create_payload
+    # A changed instruction changes every candidate. Nothing is normalized away.
+    changed = first.model_copy(
+        update={
+            "messages": (
+                GatewayMessage(role="system", content="Different instructions."),
+                *first.messages[1:],
+            )
+        }
+    )
+    pc = build_automatic_google_cache_plans(profile, changed, _payload(changed))
+    assert not {p.prefix_sha256 for p in pa} & {p.prefix_sha256 for p in pc}
+
+
+@pytest.mark.parametrize("location", ["us", "eu"])
+def test_jurisdictional_endpoint_requires_exact_host_and_location(location: str) -> None:
+    """No suffix match, credential-bearing authority, or cross-location URL is trusted."""
+    url = (
+        f"https://aiplatform.{location}.rep.googleapis.com/v1/projects/fruit-project/"
+        f"locations/{location}/publishers/google/models/{_MODEL}:streamGenerateContent"
+    )
+    plan = build_google_cache_plan(_profile(url), _request(), _payload(_request()))
+    assert plan is not None and f"/locations/{location}/cachedContents" in plan.create_url
+    for invalid in [
+        url.replace(".rep.googleapis.com", ".rep.googleapis.com.evil.test"),
+        url.replace(f"/locations/{location}/", "/locations/global/"),
+        url.replace("https://", "https://name:password@"),
+        url.replace(f"aiplatform.{location}.rep", "aiplatform.global.rep"),
+    ]:
+        assert build_google_cache_plan(_profile(invalid), _request(), _payload(_request())) is None
+
+
+@pytest.mark.parametrize("shape", ["history", "single", "oversized", "gemini"])
+def test_automatic_cache_skips_unsupported_shapes(shape: str) -> None:
+    """Automatic selection never invents message boundaries or caches history."""
+
+    profile = _profile(
+        f"https://aiplatform.us.rep.googleapis.com/v1/projects/fruit-project/locations/us/publishers/google/models/{_MODEL}:streamGenerateContent"
+    )
+    request = _request()
+    if shape == "history":
+        request = request.model_copy(
+            update={
+                "messages": (
+                    GatewayMessage(role="user", content="Fruit context." * 1024),
+                    GatewayMessage(role="assistant", content="Ready."),
+                    GatewayMessage(role="user", content="Count fruit."),
+                )
+            }
+        )
+    elif shape == "single":
+        request = request.model_copy(
+            update={"messages": (GatewayMessage(role="user", content="Fruit context." * 1024),)}
+        )
+    elif shape == "oversized":
+        request = request.model_copy(
+            update={
+                "messages": (
+                    GatewayMessage(role="user", content="a" * 262145),
+                    GatewayMessage(role="user", content="Count fruit."),
+                )
+            }
+        )
+    elif shape == "gemini":
+        profile = _profile()
+    assert build_automatic_google_cache_plans(profile, request, _payload(request)) == ()
+
+
+def test_automatic_plain_function_tools_are_excluded() -> None:
+    """Unmarked function definitions must not become provider-held automatic resources."""
+    request = _request().model_copy(
+        update={
+            "messages": (
+                GatewayMessage(role="user", content="Fictional fruit context. " * 1000),
+                GatewayMessage(role="user", content="Count oranges."),
+            ),
+            "tools": (GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+        }
+    )
+    profile = _profile(
+        f"https://aiplatform.us.rep.googleapis.com/v1/projects/fruit-project/locations/us/publishers/google/models/{_MODEL}:streamGenerateContent"
+    )
+    assert build_automatic_google_cache_plans(profile, request, _payload(request)) == ()
+
+
+def test_automatic_cache_stops_before_copying_prefixes_past_the_byte_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A huge early message cannot make every later boundary copy the whole payload."""
+    profile = _profile(
+        f"https://aiplatform.us.rep.googleapis.com/v1/projects/fruit-project/locations/us/publishers/google/models/{_MODEL}:streamGenerateContent"
+    )
+    request = _request().model_copy(
+        update={
+            "messages": (
+                GatewayMessage(role="user", content="Fictional fruit context. " * 400),
+                GatewayMessage(role="user", content="a" * 262145),
+                GatewayMessage(role="user", content="Batch 1"),
+                GatewayMessage(role="user", content="Count fruit."),
+            )
+        }
+    )
+    real = google_cache_module._plan_at_checkpoint
+    calls: list[int] = []
+
+    def counted(
+        endpoint: tuple[str, str, str],
+        request: GatewayRequest,
+        upstream_payload: JsonObject,
+        message_index: int,
+        offset: int,
+    ) -> GoogleCachePlan | None:
+        """Record each attempted checkpoint before building its real plan."""
+        calls.append(message_index)
+        return real(endpoint, request, upstream_payload, message_index, offset)
+
+    monkeypatch.setattr(google_cache_module, "_plan_at_checkpoint", counted)
+    plans = build_automatic_google_cache_plans(profile, request, _payload(request))
+    assert calls == [0]
+    assert len(plans) == 1
+
+
+def test_automatic_cache_ignores_caller_text_markers() -> None:
+    """A marked request caches exactly like its unmarked twin instead of opting out."""
+    profile = _profile(
+        f"https://aiplatform.us.rep.googleapis.com/v1/projects/fruit-project/locations/us/"
+        f"publishers/google/models/{_MODEL}:streamGenerateContent?alt=sse"
+    )
+    marked = _request()
+    assert cache_markers(marked)
+    plain = marked.model_copy(
+        update={
+            "messages": tuple(
+                GatewayMessage(role=m.role, content=m.content) for m in marked.messages
+            )
+        }
+    )
+    assert not cache_markers(plain)
+    for request in (
+        marked,
+        marked.model_copy(update={"provider_cache_control": {"type": "ephemeral"}}),
+    ):
+        plans = build_automatic_google_cache_plans(profile, request, _payload(request))
+        twins = build_automatic_google_cache_plans(profile, plain, _payload(plain))
+        assert plans and [p.prefix_sha256 for p in plans] == [p.prefix_sha256 for p in twins]

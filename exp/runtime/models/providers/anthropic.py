@@ -380,9 +380,40 @@ def _anthropic_usage(payload: JsonObject) -> Usage | None:
     cache_write = require_integer(
         usage.get("cache_creation_input_tokens"), "Anthropic usage.cache_creation_input_tokens"
     )
+    hour = _anthropic_write_hour_subset(usage, total=cache_write)
     return Usage(
         input_tokens=input_tokens + cache_read + cache_write,
         output_tokens=require_integer(usage.get("output_tokens"), "Anthropic usage.output_tokens"),
         cached_input_tokens=cache_read,
         cache_write_input_tokens=cache_write,
+        cache_write_1h_input_tokens=hour,
     )
+
+
+def _anthropic_write_hour_subset(usage: JsonObject, *, total: int) -> int | None:
+    """Preserve only a complete, consistent TTL split, matching the native normalizer.
+
+    Missing or partial evidence remains unknown. Every present count is validated
+    even when its counterpart is absent, so malformed partial usage cannot hide.
+
+    Raises:
+        ProviderResponseError: A TTL count is malformed or contradicts the write total.
+    """
+    raw = usage.get("cache_creation")
+    if raw is None:
+        return None
+    details = require_object(raw, "Anthropic usage.cache_creation")
+    counts = tuple(
+        None
+        if details.get(key) is None
+        else require_integer(details[key], f"Anthropic usage.cache_creation.{key}")
+        for key in ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens")
+    )
+    if any(count is not None and (count > total or count > 2**63 - 1) for count in counts):
+        raise ProviderResponseError("Anthropic usage.cache_creation TTL count exceeds total")
+    five, hour = counts
+    if five is None or hour is None:
+        return None
+    if five + hour > 2**63 - 1 or five + hour != total:
+        raise ProviderResponseError("Anthropic usage.cache_creation TTL counts differ from total")
+    return hour

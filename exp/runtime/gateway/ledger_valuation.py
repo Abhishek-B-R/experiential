@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from exp.common.models.token_cost import token_cost_nano_usd
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayEvent,
@@ -68,8 +69,9 @@ def estimated_cost_nano_usd(
 
     Cache reads and writes are disjoint input subsets; one-hour writes are a
     subset of all writes. Clamp reads, then writes, to remaining input. A missing
-    rate or TTL breakdown for observed writes preserves unknown cost. Reasoning
-    is an output subset. Price each remainder at its base rate exactly once.
+    rate preserves unknown cost. An absent TTL split is priceable only when both
+    authored write rates are identical, so every possible split has the same cost.
+    Reasoning is an output subset. Price each remainder at its base rate exactly once.
 
     Rates are nano-USD per million tokens, so the sum of ``tokens * rate`` is divided by one
     million and rounded half-up at one nano-USD. This is the ONE rounding rule of the ledger:
@@ -96,26 +98,21 @@ def estimated_cost_nano_usd(
         return None
     assert usage.input_tokens is not None
     assert usage.output_tokens is not None
-    cached_input_tokens = min(usage.cached_input_tokens or 0, usage.input_tokens)
-    cache_creation = min(
-        usage.cache_creation_input_tokens or 0, usage.input_tokens - cached_input_tokens
+    cost = token_cost_nano_usd(
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        cached_input_tokens=usage.cached_input_tokens,
+        cache_write_input_tokens=usage.cache_creation_input_tokens,
+        cache_write_1h_input_tokens=usage.cache_creation_1h_input_tokens,
+        reasoning_tokens=usage.reasoning_tokens,
+        input_rate=input_rate,
+        cached_input_rate=cached_input_rate,
+        cache_creation_input_rate=cache_creation_input_rate,
+        cache_creation_1h_input_rate=cache_creation_1h_input_rate,
+        output_rate=output_rate,
+        reasoning_rate=reasoning_rate,
     )
-    if cache_creation and usage.cache_creation_1h_input_tokens is None:
-        return None
-    hour_creation = min(usage.cache_creation_1h_input_tokens or 0, cache_creation)
-    reasoning_tokens = min(usage.reasoning_tokens or 0, usage.output_tokens)
-    dimensions = (
-        (usage.input_tokens - cached_input_tokens - cache_creation, input_rate),
-        (cache_creation - hour_creation, cache_creation_input_rate),
-        (hour_creation, cache_creation_1h_input_rate),
-        (cached_input_tokens, cached_input_rate),
-        (usage.output_tokens - reasoning_tokens, output_rate),
-        (reasoning_tokens, reasoning_rate),
-    )
-    if any(tokens > 0 and rate is None for tokens, rate in dimensions):
-        return None
-    numerator = sum(tokens * (rate or 0) for tokens, rate in dimensions)
-    return require_representable_nano_usd((numerator + 500_000) // 1_000_000, what="attempt cost")
+    return None if cost is None else require_representable_nano_usd(cost, what="attempt cost")
 
 
 def terminal_values(

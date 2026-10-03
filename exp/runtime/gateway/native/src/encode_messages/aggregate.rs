@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use crate::encode::{reasoning_carrier_candidate, stable_public_id};
 use crate::errors::{Failure, PublicError};
 use crate::events::{Event, Usage};
+use crate::reasoning_display::{unsigned_thinking_delta, DisplayJoiner, ReasoningOutput};
 
 use super::{messages_usage, refusal_failure, stop_reason};
 
@@ -21,9 +22,10 @@ pub struct AggregatedMessage {
     pub tool_names: Vec<String>,
 }
 
-/// Build one non-streaming Anthropic message from ordered events, mirroring
-/// the python `completed_messages_body`. Provider refusal content has no
-/// Anthropic message shape, so it aggregates as a sanitized failure.
+/// Build one non-streaming Anthropic message from ordered events (the
+/// aggregate counterpart of `MessagesSseEncoder`). Provider refusal content
+/// has no Anthropic message shape, so it aggregates as a sanitized failure.
+#[cfg(test)]
 pub fn completed_messages_body(
     request_id: &str,
     model: &str,
@@ -33,8 +35,10 @@ pub fn completed_messages_body(
 }
 
 /// Build one non-streaming Anthropic message carrying the turn's reasoning,
-/// mirroring `completed_chat_body_with_carrier`: an exposure-gated rung's
-/// plaintext reasoning leads the content as one UNSIGNED thinking block, and a
+/// mirroring `completed_chat_body_with_carrier`: an exposure-gated or
+/// reasoning-displaying rung's plaintext reasoning (route reasoning, plaintext
+/// reasoning, OpenAI summaries) becomes UNSIGNED thinking blocks in provider
+/// order, and a
 /// tool turn's hidden reasoning closes it as one `redacted_thinking` block
 /// holding the sealed carrier (never plaintext: a CoT-injection vector on the
 /// way back in). The block sequence equals the streaming encoder's.
@@ -44,8 +48,9 @@ pub fn completed_messages_body_with_reasoning(
     events: &[Event],
     ignored_parameters: &[String],
     reasoning_content_carrier: Option<&str>,
-    reasoning_output_exposed: bool,
+    reasoning_output: impl Into<ReasoningOutput>,
 ) -> Result<AggregatedMessage, PublicError> {
+    let reasoning_output = reasoning_output.into();
     let terminal = events.iter().rev().find(|event| event.is_terminal());
     let terminal = match terminal {
         Some(event) => event,
@@ -108,20 +113,10 @@ pub fn completed_messages_body_with_reasoning(
     // sentinel, after later text.
     let mut slots: Vec<Option<Value>> = Vec::new();
     let reasoning = reasoning_carrier_candidate(events)?;
-    if reasoning_output_exposed {
-        let reasoning_text: String = events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ReasoningContentDelta { delta, .. } => Some(delta.as_str()),
-                _ => None,
-            })
-            .collect();
-        if !reasoning_text.is_empty() {
-            slots.push(Some(
-                json!({"type": "thinking", "thinking": reasoning_text, "signature": ""}),
-            ));
-        }
-    }
+    let mut joiner = DisplayJoiner::default();
+    // The gateway's unsigned thinking block, extended while it is the newest
+    // slot and reopened after any later block, as the streaming encoder does.
+    let mut display_position: Option<usize> = None;
     let mut tool_positions: HashMap<u32, usize> = HashMap::new();
     let mut server_positions: HashMap<u32, usize> = HashMap::new();
     let mut thinking_positions: HashMap<u32, usize> = HashMap::new();
@@ -188,6 +183,33 @@ pub fn completed_messages_body_with_reasoning(
                     slots.push(Some(json!({"type": "text", "text": delta})));
                 }
             }
+            Event::ReasoningContentDelta { .. }
+            | Event::ReasoningTextDelta(_)
+            | Event::ReasoningSummaryDelta { .. } => {
+                // A new block (later output intervened) starts without the
+                // paragraph break that only separates units inside one block.
+                if display_position.is_some_and(|position| position + 1 != slots.len()) {
+                    joiner = DisplayJoiner::default();
+                }
+                let Some(delta) = unsigned_thinking_delta(&mut joiner, event, reasoning_output)
+                else {
+                    continue;
+                };
+                match display_position.filter(|position| position + 1 == slots.len()) {
+                    Some(position) => {
+                        let block = slots[position].as_mut().expect("thinking slot is filled");
+                        if let Some(Value::String(text)) = block.get_mut("thinking") {
+                            text.push_str(&delta);
+                        }
+                    }
+                    None => {
+                        display_position = Some(slots.len());
+                        slots.push(Some(
+                            json!({"type": "thinking", "thinking": delta, "signature": ""}),
+                        ));
+                    }
+                }
+            }
             Event::ThinkingDelta { index, delta } if !delta.is_empty() => {
                 let block = thinking_slot(&mut slots, &mut thinking_positions, *index);
                 if let Some(Value::String(text)) = block.get_mut("thinking") {
@@ -212,8 +234,7 @@ pub fn completed_messages_body_with_reasoning(
                     saw_tool_use = true;
                     // The raw argument text was validated as one JSON object
                     // by the normalizer; preserve_order keeps its key order,
-                    // matching the python engine's parsed-object
-                    // serialization.
+                    // so the parsed object serializes in the provider's order.
                     let input: Value = serde_json::from_str(&call.raw_arguments)
                         .map_err(|_| PublicError::internal())?;
                     slots[*position] = Some(json!({

@@ -165,6 +165,56 @@ fn close_preserves_latest_cumulative_usage() {
     assert_eq!(after.output_tokens, Some(4));
 }
 
+#[test]
+fn corrected_reasoning_meter_survives_completion_and_close() {
+    for additive in [false, true] {
+        for terminal in [false, true] {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut relay = UpstreamRelay::from_stream(
+                futures_util::stream::pending().boxed(),
+                Dialect::OpenAiCompatible,
+                deadline,
+            );
+            let observed = Observation::default();
+            relay.set_observation(observed.clone());
+            for usage in [
+                serde_json::json!({"prompt_tokens": 100, "completion_tokens": 10,
+                    "total_tokens": if additive { 110 } else { 115 }}),
+                serde_json::json!({"completion_tokens_details": {"reasoning_tokens": 5}}),
+                serde_json::json!({"prompt_tokens": if additive { 100 } else { 105 },
+                    "completion_tokens": 10, "total_tokens": 115,
+                    "completion_tokens_details": {"reasoning_tokens": 5}}),
+            ] {
+                let events = relay
+                    .normalizer
+                    .feed(&crate::sse::SseEvent {
+                        event: None,
+                        data: serde_json::json!({"choices": [], "usage": usage}).to_string(),
+                    })
+                    .unwrap();
+                relay.queue_events(events);
+            }
+            if terminal {
+                let events = relay
+                    .normalizer
+                    .feed(&crate::sse::SseEvent {
+                        event: None,
+                        data: "[DONE]".into(),
+                    })
+                    .unwrap();
+                relay.queue_events(events);
+            }
+            relay.close_transport();
+            let snapshot = observed.snapshot();
+            assert_eq!(snapshot.terminal.is_some(), terminal);
+            let usage = snapshot.usage.unwrap();
+            assert_eq!(usage.input_tokens, Some(if additive { 100 } else { 105 }));
+            assert_eq!(usage.output_tokens, Some(if additive { 15 } else { 10 }));
+            assert_eq!(usage.reasoning_tokens, Some(5));
+        }
+    }
+}
+
 #[tokio::test]
 async fn malformed_sparse_frame_retains_meter_through_relay_failure() {
     let wire = concat!(
@@ -213,4 +263,40 @@ async fn parsed_compatible_meter_survives_before_its_deferred_usage_event() {
         .expect("parsed usage is not deferred until terminal delivery");
     assert_eq!(usage.input_tokens, Some(19));
     assert_eq!(usage.output_tokens, Some(7));
+}
+
+#[tokio::test]
+async fn writes_within_reads_meter_replaces_the_earlier_read_only_report() {
+    // Sparse OpenRouter Gemini reports: the read leg arrives before the write
+    // that was read back. Settlement reads the guard observation, so it must
+    // carry the separated legs, not a max-merge that restores the read leg.
+    let wire = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11933,\"completion_tokens\":9,",
+        "\"prompt_tokens_details\":{\"cached_tokens\":10663}}}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11933,\"completion_tokens\":9,",
+        "\"prompt_tokens_details\":{\"cached_tokens\":10663,\"cache_write_tokens\":10663}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let source = futures_util::stream::iter([Ok(Bytes::from_static(wire.as_bytes()))]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut relay = UpstreamRelay::from_stream(source.boxed(), Dialect::OpenAiCompatible, deadline);
+    relay.set_cache_writes_within_reads(true);
+    let observed = Observation::default();
+    relay.set_observation(observed.clone());
+    while relay
+        .next_event(deadline, Duration::from_secs(5), Instant::now())
+        .await
+        .unwrap()
+        .is_some()
+    {}
+    let usage = observed.snapshot().usage.expect("settled meter");
+    assert_eq!(
+        (
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.cache_creation_input_tokens
+        ),
+        (Some(11933), Some(0), Some(10663))
+    );
 }

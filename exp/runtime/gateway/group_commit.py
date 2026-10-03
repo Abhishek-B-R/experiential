@@ -37,6 +37,8 @@ from exp.runtime.gateway.contracts import (
     ExecutionSnapshot,
     GatewayEvent,
     GatewayFailure,
+    GatewayServiceTierAdmission,
+    GatewayServiceTierSettlement,
 )
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.model_chain_authority import ChainOperation, SQLiteChainPreflight
@@ -215,6 +217,7 @@ class GroupCommitAttemptLedger:
         fallback_reason: str | None = None,
         dispatch_reason: str | None = None,
         preferred_deployment: ExactModelDeployment | None = None,
+        service_tier: GatewayServiceTierAdmission | None = None,
     ) -> AttemptId:
         """Durably reserve budget and record one dispatch before provider work.
 
@@ -253,6 +256,7 @@ class GroupCommitAttemptLedger:
                             fallback_reason=fallback_reason,
                             dispatch_reason=dispatch_reason,
                             preferred_deployment=preferred_deployment,
+                            **({} if service_tier is None else {"service_tier": service_tier}),
                         ),
                     )
                 )
@@ -275,6 +279,7 @@ class GroupCommitAttemptLedger:
         upstream_provider: str | None = None,
         web_search_requests: int = 0,
         tool_search_requests: int = 0,
+        service_tier: GatewayServiceTierSettlement | None = None,
     ) -> None:
         """Durably settle one attempt with normalized content-free fields.
 
@@ -310,6 +315,7 @@ class GroupCommitAttemptLedger:
                 ratelimit_remaining_requests=ratelimit_remaining_requests,
                 ratelimit_limit_tokens=ratelimit_limit_tokens,
                 ratelimit_remaining_tokens=ratelimit_remaining_tokens,
+                **({} if service_tier is None else {"service_tier": service_tier}),
                 **upstream_provider_kwarg(apply, upstream_provider),
                 **web_search_requests_kwarg(apply, web_search_requests),
                 **tool_search_requests_kwarg(apply, tool_search_requests),
@@ -321,16 +327,21 @@ class GroupCommitAttemptLedger:
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
-    ) -> None:
-        """Durably terminalize accepted work that never reached dispatch.
+        certify_no_effects: bool = False,
+    ) -> bool:
+        """Return the no-effects certificate only after the terminal write commits.
 
         Args:
             authorization: Frozen authority identifying the accepted request.
             failure: Sanitized pre-dispatch terminal failure.
+            certify_no_effects: Trusted admission attestation; omitted callers cannot certify.
         """
-        await self._submit(
+        return await self._submit(
             lambda connection: self.core.apply_finish_request(
-                connection, authorization=authorization, failure=failure
+                connection,
+                authorization=authorization,
+                failure=failure,
+                certify_no_effects=certify_no_effects,
             )
         )
 
@@ -626,6 +637,7 @@ class SyncGroupCommitLedger:
         fallback_reason: str | None = None,
         dispatch_reason: str | None = None,
         preferred_deployment: ExactModelDeployment | None = None,
+        service_tier: GatewayServiceTierAdmission | None = None,
     ) -> AttemptId:
         """Durably reserve budget and record one dispatch before provider work.
 
@@ -662,6 +674,7 @@ class SyncGroupCommitLedger:
                     fallback_reason=fallback_reason,
                     dispatch_reason=dispatch_reason,
                     preferred_deployment=preferred_deployment,
+                    **({} if service_tier is None else {"service_tier": service_tier}),
                 ),
             ).result(),
         )
@@ -682,6 +695,7 @@ class SyncGroupCommitLedger:
         upstream_provider: str | None = None,
         web_search_requests: int = 0,
         tool_search_requests: int = 0,
+        service_tier: GatewayServiceTierSettlement | None = None,
     ) -> None:
         """Durably settle one attempt with normalized content-free fields.
 
@@ -715,6 +729,7 @@ class SyncGroupCommitLedger:
                 ratelimit_remaining_requests=ratelimit_remaining_requests,
                 ratelimit_limit_tokens=ratelimit_limit_tokens,
                 ratelimit_remaining_tokens=ratelimit_remaining_tokens,
+                **({} if service_tier is None else {"service_tier": service_tier}),
                 **upstream_provider_kwarg(apply, upstream_provider),
                 **web_search_requests_kwarg(apply, web_search_requests),
                 **tool_search_requests_kwarg(apply, tool_search_requests),
@@ -726,16 +741,21 @@ class SyncGroupCommitLedger:
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
-    ) -> None:
-        """Durably terminalize accepted work that never reached dispatch.
+        certify_no_effects: bool = False,
+    ) -> bool:
+        """Return the no-effects certificate only after the terminal write commits.
 
         Args:
             authorization: Frozen authority identifying the accepted request.
             failure: Sanitized pre-dispatch terminal failure.
+            certify_no_effects: Trusted admission attestation; omitted callers cannot certify.
         """
-        self._writer.submit_blocking(
+        return self._writer.submit_blocking(
             lambda connection: self._writer.core.apply_finish_request(
-                connection, authorization=authorization, failure=failure
+                connection,
+                authorization=authorization,
+                failure=failure,
+                certify_no_effects=certify_no_effects,
             )
         )
 

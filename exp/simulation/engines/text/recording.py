@@ -5,12 +5,10 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime
 from threading import Lock
 from typing import TYPE_CHECKING, cast
-
-from pydantic import JsonValue
 
 from exp.common.core.artifacts import (
     FailureAttribution,
@@ -34,11 +32,10 @@ from exp.common.models import (
     ToolCall,
     combine_economics,
     completion_request_cost_usd,
-    reconcile_completion_economics,
     verify_completion_reservation,
 )
+from exp.common.models.catalog_prices import GatewayTokenPrices
 from exp.common.rollouts import (
-    UNKNOWN_DISPATCH_RESERVED_COST_KEY,
     RolloutEventKind,
     RolloutSpan,
     StopReason,
@@ -47,10 +44,9 @@ from exp.common.rollouts.checkpoint import TextRolloutCheckpoint
 from exp.common.tasks import TaskCase
 from exp.runtime.environments import Observation
 from exp.runtime.models import ResolvedModel
-from exp.runtime.models.providers.errors import ProviderRefusalError, ProviderRetryableResponseError
-from exp.runtime.models.providers.transport import classify_retry
 from exp.simulation.engines.clock import timestamp
 from exp.simulation.engines.text.environment import SimulatedToolUseError
+from exp.simulation.engines.text.errors import provider_call_failure
 from exp.simulation.engines.text.grounding import estimate_retrieval_economics
 from exp.simulation.engines.text.prompt import (
     SimulatedToolResult,
@@ -61,13 +57,19 @@ from exp.simulation.engines.text.prompt import (
     text_prompt_sha256,
 )
 from exp.simulation.engines.text.recording_payloads import (
+    RecordedTextCalls,
     bounded_candidate_request,
     delivered_world_span,
     model_span,
+    priced_response,
     world_retry_request,
 )
 from exp.simulation.engines.text.redaction import redact_json
-from exp.simulation.engines.text.tokens import TokenCounter, bound_unpublished_output
+from exp.simulation.engines.text.tokens import (
+    TokenCounter,
+    WorldModelCapacityError,
+    bound_unpublished_output,
+)
 from exp.simulation.retrieval import RAGQuery
 from exp.simulation.retrieval.retriever import RAGQueryInputLimitError
 
@@ -87,19 +89,6 @@ class TextSimulationError(RuntimeError):
         self.failure = failure
 
 
-@dataclass(frozen=True)
-class RecordedTextCalls:
-    """Immutable recorded calls, visible world transitions, and separated operation economics."""
-
-    candidate_spans: tuple[RolloutSpan, ...]
-    world_model_spans: tuple[RolloutSpan, ...]
-    candidate_economics: OperationEconomics
-    world_model_economics: OperationEconomics
-    retrieval_economics: OperationEconomics
-    transitions: tuple[TextWorldModelTransition, ...]
-    retrieved_transition_ids: tuple[tuple[str, ...], ...]
-
-
 class RecordingCandidateClient:
     """Injects text-world turns after candidate calls while retaining only visible evidence."""
 
@@ -117,6 +106,7 @@ class RecordingCandidateClient:
         maximum_cost_usd: float,
         stop_on_overspend: bool,
         maximum_steps: int,
+        retry_uncapped_infrastructure: bool = False,
         maximum_rollout_output_tokens: int = 1_000_000,
         maximum_output_tokens: int,
         world_model_json_object_output: bool = False,
@@ -140,6 +130,7 @@ class RecordingCandidateClient:
             stop_on_overspend: When true, reconciled spend reaching the ceiling blocks the
                 next dispatch; by default the authorized episode warns once and continues.
             maximum_steps: Maximum candidate model turns allowed in this episode.
+            retry_uncapped_infrastructure: Whether uncapped authority permits a fresh generation.
             maximum_output_tokens: Per-call output budget used without silent truncation.
             world_model_json_object_output: Frozen provider JSON mode for simulation responses.
             maximum_transition_attempts: Bounded simulator attempts for each candidate action.
@@ -153,7 +144,7 @@ class RecordingCandidateClient:
         self._task = task
         self._candidate = candidate
         self._world_model = world_model
-        self._grounded_world_model = grounded_world_model
+        self._grounded_world_model = replace(grounded_world_model, token_counter=token_counter)
         self._query_embedding = query_embedding
         self._candidate_request = candidate_request
         self._world_model_request = world_model_request
@@ -161,6 +152,7 @@ class RecordingCandidateClient:
         self._maximum_cost_usd = maximum_cost_usd
         self._stop_on_overspend = stop_on_overspend
         self._maximum_steps = maximum_steps
+        self._retry_uncapped_infrastructure = retry_uncapped_infrastructure
         self._maximum_rollout_output_tokens = maximum_rollout_output_tokens
         self._maximum_output_tokens = maximum_output_tokens
         self._world_model_json_object_output = world_model_json_object_output
@@ -183,6 +175,7 @@ class RecordingCandidateClient:
         self._failure: TextSimulationError | None = None
         self._provider_dispatch_unknown_spend = False
         self._unknown_dispatch_reserved_cost_usd: float | None = None
+        self._unknown_dispatch_is_upper_bound = False
         self._overspend_warned = False
 
     def observe_tool(self, action: ToolCall) -> Observation:
@@ -299,24 +292,12 @@ class RecordingCandidateClient:
             self._failure = self._failure or exc
             raise
         except Exception as exc:  # noqa: BLE001 - provider exceptions become durable episode evidence
-            classification = classify_retry(exc)
-            details: dict[str, JsonValue] = {
-                "phase": "candidate_or_world_model",
-                "retry_classification": classification.reason,
-            }
-            if self._provider_dispatch_unknown_spend:
-                details["provider_dispatch_unknown_spend"] = True
-                reserved = self._unknown_dispatch_reserved_cost_usd
-                if reserved is not None:
-                    details[UNKNOWN_DISPATCH_RESERVED_COST_KEY] = reserved
-            failure = StructuredFailure(
-                code=FailureCode.PROVIDER,
-                message=f"text simulation provider call failed with {type(exc).__name__}",
-                retryable=classification.retryable
-                or isinstance(exc, (ProviderRefusalError, ProviderRetryableResponseError)),
-                exception_type=type(exc).__name__,
-                attribution=FailureAttribution.MODEL,
-                details=details,
+            failure = provider_call_failure(
+                exc,
+                retry_uncapped_infrastructure=self._retry_uncapped_infrastructure,
+                unknown_spend=self._provider_dispatch_unknown_spend,
+                reserved_cost_usd=self._unknown_dispatch_reserved_cost_usd,
+                reserved_cost_is_upper_bound=self._unknown_dispatch_is_upper_bound,
             )
             text_error = TextSimulationError(StopReason.FAILURE, failure)
             self._failure = self._failure or text_error
@@ -387,6 +368,7 @@ class RecordingCandidateClient:
                 self._candidate_request,
                 model=self._candidate.snapshot,
                 capabilities=self._candidate.capabilities,
+                token_prices=self._candidate.token_prices,
                 maximum_attempts=self._completion_maximum_attempts,
                 role="candidate",
             )
@@ -405,16 +387,17 @@ class RecordingCandidateClient:
                 if self._candidate_request is not None
                 else None
             ),
+            reserved_cost_is_upper_bound=(
+                self._candidate_request is not None
+                and self._candidate_request.maximum_is_upper_bound()
+                and self._token_counter.count(candidate_request)
+                <= self._candidate_request.planning_input_tokens()
+            ),
         )
-        if self._candidate_request is not None:
-            candidate_response = candidate_response.model_copy(
-                update={
-                    "economics": reconcile_completion_economics(
-                        self._candidate_request,
-                        candidate_response.economics,
-                    )
-                }
-            )
+        self._unknown_dispatch_is_upper_bound = False
+        candidate_response, pricing_error = priced_response(
+            candidate_response, self._candidate_request
+        )
         candidate_ended_at = timestamp(self._clock, not_before=candidate_started_at)
         self._candidate_responses.append(candidate_response)
         self._candidate_spans.append(
@@ -428,6 +411,8 @@ class RecordingCandidateClient:
                 redacted_field_names=self._redacted_field_names,
             )
         )
+        if pricing_error is not None:
+            raise pricing_error
         _require_response_identity(candidate_response, self._candidate, role="candidate")
         self._clear_unknown_dispatch()
         _require_complete_response(candidate_response, role="candidate")
@@ -442,6 +427,31 @@ class RecordingCandidateClient:
                 "candidate tool calls require declared tool names and unique call IDs",
                 phase="candidate_tools",
             )
+        world_output = min(
+            self._maximum_output_tokens,
+            self._world_model.capabilities.maximum_output_tokens or self._maximum_output_tokens,
+        )
+        try:
+            self._grounded_world_model.preflight_turn(
+                task=self._task,
+                visible_messages=candidate_request.messages,
+                candidate_response=candidate_response.output,
+                maximum_output_tokens=world_output,
+                state=self._environment_state,
+                json_object_output=self._world_model_json_object_output,
+                maximum_input_tokens=(
+                    self._world_model_request.maximum_input_tokens
+                    if self._world_model_request
+                    else None
+                ),
+            )
+        except WorldModelCapacityError as exc:
+            raise _text_failure(
+                StopReason.CONTEXT_OVERFLOW,
+                FailureCode.CONTEXT_OVERFLOW,
+                str(exc),
+                phase="world_model_preflight",
+            ) from exc
         queries = tuple(
             RAGQuery(
                 task=self._task.instruction,
@@ -472,27 +482,15 @@ class RecordingCandidateClient:
                 candidate_response=candidate_response.output,
                 excluded_lineage_ids=(self._task.lineage_group_id,),
                 state=self._environment_state,
-                maximum_output_tokens=min(
-                    self._maximum_output_tokens,
-                    self._world_model.capabilities.maximum_output_tokens
-                    or self._maximum_output_tokens,
-                ),
+                maximum_output_tokens=world_output,
+                json_object_output=self._world_model_json_object_output,
             ),
             # The retained retrieval estimate above already covers this dispatch's worst case
             # in every reconciliation path, so the window's incremental reservation is zero.
             reserved_cost_usd=0.0,
+            reserved_cost_is_upper_bound=True,
         )
         self._clear_unknown_dispatch()
-        prepared = replace(
-            prepared,
-            request=bound_unpublished_output(
-                prepared.request.model_copy(
-                    update={"json_object_output": self._world_model_json_object_output}
-                ),
-                self._world_model.capabilities,
-                self._token_counter,
-            ),
-        )
         transition = self._complete_world_turn(prepared, candidate_ended_at)
         self._transitions.append(transition)
         self._visible_transcript = (
@@ -547,6 +545,11 @@ class RecordingCandidateClient:
         self, prepared: PreparedGroundedWorldModelCall, candidate_ended_at: datetime
     ) -> TextWorldModelTransition:
         """Admit, record and validate one simulator reply, including rejected reply costs."""
+        prepared = prepared.fit_context(
+            self._world_model.capabilities,
+            self._token_counter,
+            self._world_model_request.maximum_input_tokens if self._world_model_request else None,
+        )
         _preflight_context(
             self._world_model.alias,
             self._world_model.capabilities,
@@ -558,6 +561,7 @@ class RecordingCandidateClient:
                 self._world_model_request,
                 model=self._world_model.snapshot,
                 capabilities=self._world_model.capabilities,
+                token_prices=self._world_model.token_prices,
                 maximum_attempts=self._completion_maximum_attempts,
                 role="world model",
             )
@@ -576,19 +580,18 @@ class RecordingCandidateClient:
                 if self._world_model_request is not None
                 else None
             ),
+            reserved_cost_is_upper_bound=(
+                self._world_model_request is not None
+                and self._world_model_request.maximum_is_upper_bound()
+                and self._token_counter.count(prepared.request)
+                <= self._world_model_request.planning_input_tokens()
+            ),
         )
         world_request = dispatched.request
         world_response = dispatched.response
-        if self._world_model_request is not None:
-            world_response = world_response.model_copy(
-                update={
-                    "economics": reconcile_completion_economics(
-                        self._world_model_request,
-                        world_response.economics,
-                    )
-                }
-            )
-            dispatched = replace(dispatched, response=world_response)
+        self._unknown_dispatch_is_upper_bound = False
+        world_response, pricing_error = priced_response(world_response, self._world_model_request)
+        dispatched = replace(dispatched, response=world_response)
         world_ended_at = timestamp(self._clock, not_before=world_started_at)
         self._retrieved_transition_ids.append(
             tuple(match.transition.transition_id for match in dispatched.matches)
@@ -605,6 +608,8 @@ class RecordingCandidateClient:
                 redacted_field_names=self._redacted_field_names,
             )
         )
+        if pricing_error is not None:
+            raise pricing_error
         _require_response_identity(world_response, self._world_model, role="world model")
         self._clear_unknown_dispatch()
         _require_complete_response(world_response, role="world model")
@@ -746,18 +751,14 @@ class RecordingCandidateClient:
         operation: Callable[[], ResultT],
         *,
         reserved_cost_usd: float | None,
+        reserved_cost_is_upper_bound: bool,
     ) -> ResultT:
         """Run one provider dispatch inside an explicit unknown-spend accounting window.
 
-        The executing client owns bounded transport retries inside the same retry-inclusive
-        reservation that admitted this dispatch, so this boundary never multiplies attempts.
-        While the dispatch is in flight its worst-case reservation is retained so a failure
-        that leaves spend unknown persists an exact conservative charge with its evidence
-        instead of an unpriceable hole.
-
         Args:
             operation: One provider dispatch whose spend is ambiguous until it returns.
-            reserved_cost_usd: Retry-inclusive worst-case charge admitted for this dispatch.
+            reserved_cost_usd: Retained retry-inclusive estimate for this dispatch.
+            reserved_cost_is_upper_bound: Whether that estimate bounds all possible charges.
 
         Returns:
             The successful dispatch result.
@@ -767,12 +768,14 @@ class RecordingCandidateClient:
         """
         self._provider_dispatch_unknown_spend = True
         self._unknown_dispatch_reserved_cost_usd = reserved_cost_usd
+        self._unknown_dispatch_is_upper_bound = reserved_cost_is_upper_bound
         return operation()
 
     def _clear_unknown_dispatch(self) -> None:
         """Mark the most recent provider dispatch as fully priced and recorded."""
         self._provider_dispatch_unknown_spend = False
         self._unknown_dispatch_reserved_cost_usd = None
+        self._unknown_dispatch_is_upper_bound = False
 
 
 def _require_completion_request_bounds(
@@ -826,6 +829,7 @@ def _verify_completion_budget_binding(
     capabilities: ModelCapabilities,
     maximum_attempts: int,
     role: str,
+    token_prices: GatewayTokenPrices | None = None,
 ) -> None:
     """Translate active reservation drift into a structured zero-dispatch budget failure.
 
@@ -835,6 +839,7 @@ def _verify_completion_budget_binding(
         capabilities: Active explicit prices and capacities.
         maximum_attempts: Active provider retry ceiling.
         role: Candidate or world-model diagnostic label.
+        token_prices: Optional full active schedule, verified against frozen preparation.
 
     Raises:
         TextSimulationError: Active model, economics, capacity, or retry metadata drifted.
@@ -844,6 +849,7 @@ def _verify_completion_budget_binding(
             reservation,
             model=model,
             capabilities=capabilities,
+            token_prices=token_prices,
             maximum_attempts=maximum_attempts,
         )
     except ValueError as exc:

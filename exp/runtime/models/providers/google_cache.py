@@ -32,6 +32,8 @@ _VERTEX_CACHE_PATH = re.compile(rf"/v1/projects/({_SEGMENT})/locations/([a-z0-9-
 _REGION = re.compile(r"[a-z]+(?:-[a-z]+)+[0-9]+")
 _RESOURCE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 _POLICY = "google-explicit-text-prefix-v1"
+_AUTOMATIC_MINIMUM_PREFIX_BYTES = 4096
+_AUTOMATIC_MAXIMUM_PREFIX_BYTES = 256 * 1024
 
 
 @dataclass(frozen=True)
@@ -220,6 +222,18 @@ def build_google_cache_plan(
     ):
         return None
 
+    return _plan_at_checkpoint(endpoint, request, upstream_payload, message_index, offset)
+
+
+def _plan_at_checkpoint(
+    endpoint: tuple[str, str, str],
+    request: GatewayRequest,
+    upstream_payload: JsonObject,
+    message_index: int,
+    offset: int,
+) -> GoogleCachePlan | None:
+    """Move only a verified prefix, preserving the native continuation exactly."""
+    system_count = sum(message.role == "system" for message in request.messages)
     create_url, model, resource_prefix = endpoint
     generation = cast("JsonObject", json.loads(canonical_json_bytes(upstream_payload)))
     resource: JsonObject = {"model": model}
@@ -255,6 +269,77 @@ def build_google_cache_plan(
         _create_payload_json=resource_json,
         _generation_payload_json=canonical_json_bytes(generation),
     )
+
+
+def build_automatic_google_cache_plans(
+    profile: GatewayWireProfile,
+    request: GatewayRequest,
+    upstream_payload: JsonObject,
+) -> tuple[GoogleCachePlan, ...]:
+    """Offer bounded whole-message Vertex prefixes without adding caller markers.
+
+    Only leading plain system/user text messages qualify, with at least one
+    original user message left uncached. History, media, tools and native carriers
+    retain ordinary generation. Caller cache hints on text (block or top-level
+    ``cache_control``) are ignored rather than disqualifying: they only change cost,
+    the native wire drops them, and the gateway already caches the whole-message
+    prefix they would mark. Up to eight early message boundaries are offered; the
+    host selects which prefix to cache using content-free scoped fingerprints.
+    Generation settings and output schemas remain outside every cache resource.
+    No token eligibility, spending authority or repeated-use claim is inferred here.
+    """
+    if (
+        profile.dialect != "gemini_generate_content"
+        or profile.signs_request_body
+        or request.provider_server_tools
+        or request.provider_native_tools
+        or request.web_search is not None
+        or request.tool_search is not None
+        or request.tools
+        or not _payload_matches(request, upstream_payload)
+    ):
+        return ()
+    endpoint = _cache_endpoint(profile)
+    if endpoint is None or endpoint[2] == "cachedContents/":
+        return ()
+    started = False
+    for message in request.messages:
+        if (
+            message.role not in {"system", "user"}
+            or not message.content
+            or message.content_parts
+            or message.tool_calls
+            or message.provider_reasoning
+            or message.provider_native_item is not None
+            or message.provider_anthropic_block is not None
+            or message.provider_anthropic_blocks is not None
+            or message.provider_item_id is not None
+            or (started and message.role == "system")
+        ):
+            return ()
+        started = started or message.role == "user"
+    system_count = sum(m.role == "system" for m in request.messages)
+    first = max(0, system_count - 1)
+    plans: list[GoogleCachePlan] = []
+    # Cached text alone lower-bounds each resource body, so stop before copying
+    # the whole payload for prefixes that cannot fit the byte ceiling.
+    cached_text_bytes = sum(len((m.content or "").encode()) for m in request.messages[:first])
+    for index in range(first, min(len(request.messages) - 1, first + 8)):
+        cached_text_bytes += len((request.messages[index].content or "").encode())
+        if cached_text_bytes > _AUTOMATIC_MAXIMUM_PREFIX_BYTES:
+            break
+        plan = _plan_at_checkpoint(
+            endpoint, request, upstream_payload, index, len(request.messages[index].content or "")
+        )
+        # Bound transient plan copying; bytes are not a provider token count.
+        if (
+            plan is not None
+            and _AUTOMATIC_MINIMUM_PREFIX_BYTES
+            <= plan.conservative_input_bound
+            <= _AUTOMATIC_MAXIMUM_PREFIX_BYTES
+        ):
+            plans.append(plan)
+    return tuple(plans)
 
 
 def _five_minute_marker(marker: JsonObject) -> bool:
@@ -305,6 +390,8 @@ def _cache_endpoint(profile: GatewayWireProfile) -> tuple[str, str, str] | None:
     scope, location, model_id = match[1], match[3], match[4]
     if location == "global":
         host = "aiplatform.googleapis.com"
+    elif location in {"us", "eu"}:
+        host = f"aiplatform.{location}.rep.googleapis.com"
     elif _REGION.fullmatch(location):
         host = f"{location}-aiplatform.googleapis.com"
     else:

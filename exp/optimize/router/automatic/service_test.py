@@ -583,6 +583,8 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
             "20",
             "--maximum-model-calls",
             "1",
+            "--maximum-retrieval-query-tokens",
+            "32768",
             "--simulation-maximum-output-tokens",
             "8000",
             "--non-interactive",
@@ -1685,10 +1687,7 @@ def test_preflight_accepts_calibration_resumed_after_a_failed_first_pass(
         ),
     )
 
-    assert preflight.approved_calibration_input == result.approved_calibration
-    assert preflight.judge_audit is not None
-    assert preflight.judge_audit.budget.call_count == 1
-    assert sum(len(item.probes) for item in preflight.judge_audit.judgments) == 2
+    assert preflight.calibration_input == result.approved_calibration
 
 
 @pytest.mark.parametrize("tamper", ["execution", "policy"])

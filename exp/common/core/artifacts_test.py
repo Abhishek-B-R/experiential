@@ -16,6 +16,8 @@ from exp.common.core.artifacts import (
     SecretBoundaryError,
     SourceIdentity,
     StructuredFailure,
+    assert_key_secret_free,
+    assert_prose_secret_free,
     assert_secret_free,
     assert_text_secret_free,
     canonical_json_bytes,
@@ -172,6 +174,65 @@ def test_structured_evidence_preserves_public_credential_variable_names(content:
     assert_secret_free({"messages": [{"role": "tool", "content": content}]})
     with pytest.raises(SecretBoundaryError, match="secret-like"):
         assert_secret_free({"content": content + " = sk-abcdefghijklmnopqrstuvwxyz123456"})
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "The company sells password management and authorization software.",
+        "Set OPENAI_API_KEY in the environment. Do not share the secret.",
+        "Password management: resets and vaults.",
+    ],
+)
+def test_prose_allows_credential_mentions(content: str) -> None:
+    """Credential vocabulary is ordinary prose when it does not assign a value."""
+    assert_prose_secret_free(content)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "export OPENAI_API_KEY=arbitrary-value",
+        '"CUSTOM_AUTH_TOKEN": "arbitrary-value"',
+        "password = arbitrary-value",
+        "api key: arbitrary-value",
+        "The password is arbitrary-value",
+        "The API key was arbitrary-value",
+        "Use sk-abcdefghijklmnopqrstuvwxyz123456 to connect.",
+    ],
+)
+def test_prose_rejects_credential_assignments_and_values(content: str) -> None:
+    """Unrecognized credential values and known token prefixes remain prohibited."""
+    with pytest.raises(SecretBoundaryError):
+        assert_prose_secret_free(content)
+
+
+@pytest.mark.parametrize(
+    "key", ["password-policy", "authorization status", "security.password-policy"]
+)
+def test_descriptive_keys_are_not_credential_fields(key: str) -> None:
+    """A schema can describe credentials without storing a credential field."""
+    assert_key_secret_free(key)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "api_key",
+        " api_key ",
+        "credential-ref",
+        "OPENAI_API_KEY",
+        "OPENAI_API_KEY=arbitrary-value",
+        "openai_api_key",
+        "provider.auth_token",
+        "provider/password",
+        "sk-abcdefghijklmnopqrstuvwxyz123456",
+    ],
+)
+def test_exact_credential_keys_and_secret_values_are_rejected(key: str) -> None:
+    """Precise field validation still rejects decoded credential and environment names."""
+    with pytest.raises(SecretBoundaryError):
+        assert_key_secret_free(key)
 
 
 def test_artifact_file_paths_reject_nonportable_components() -> None:

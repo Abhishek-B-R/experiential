@@ -63,12 +63,15 @@ impl StreamedOutput {
             }
             Event::ReasoningSummaryDelta { delta, .. }
             | Event::ThinkingDelta { delta, .. }
-            | Event::ReasoningContentDelta { delta, .. } => Self::append(
+            | Event::ReasoningContentDelta { delta, .. }
+            | Event::ReasoningTextDelta(delta) => Self::append(
                 &mut self.reasoning,
                 &mut self.reasoning_overflow_chars,
                 delta,
             ),
-            Event::GeminiThoughtPart(part) => {
+            // Thought-summary text arrives as `ReasoningTextDelta` too, so only
+            // a signed non-thought part's text is counted from the part.
+            Event::GeminiThoughtPart(part) if part.get("thought") != Some(&Value::Bool(true)) => {
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
                     Self::append(
                         &mut self.reasoning,
@@ -98,6 +101,7 @@ pub(crate) struct Observed {
     pub terminal: Option<Event>,
     pub first_token_at: Option<SystemTime>,
     pub streamed_output: StreamedOutput,
+    pub service_tier: crate::service_tier::ServiceTierObservation,
 }
 
 impl Default for Observed {
@@ -112,6 +116,7 @@ impl Default for Observed {
             terminal: None,
             first_token_at: None,
             streamed_output: StreamedOutput::default(),
+            service_tier: crate::service_tier::ServiceTierObservation::default(),
         }
     }
 }
@@ -128,6 +133,23 @@ impl Observation {
             started: previous.started,
             ..Observed::default()
         })))
+    }
+
+    /// Replace the meter with a normalizer's latest cumulative report when
+    /// that report may lower a field (see `Normalizer::meter_replaces_earlier`);
+    /// merging by maximum would restore a count the normalizer moved. A queued
+    /// terminal still fixes the meter, and a report without token counts is
+    /// no observation.
+    pub(crate) fn replace_usage(&self, usage: &Usage) {
+        let mut observed = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if observed.terminal.is_none()
+            && (usage.input_tokens.is_some() || usage.output_tokens.is_some())
+        {
+            observed.usage = Some(usage.clone());
+        }
     }
 
     /// Remember normalized facts before public delivery can suspend or fail.
@@ -191,6 +213,14 @@ impl Observation {
         }
     }
 
+    /// Retain the normalizer's cumulative tier verdict before delivery can suspend.
+    pub(crate) fn record_service_tier(&self, tier: &crate::service_tier::ServiceTierObservation) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .service_tier = tier.clone();
+    }
+
     pub(crate) fn snapshot(&self) -> Observed {
         self.0
             .lock()
@@ -216,6 +246,15 @@ mod tests {
         let snapshot = observation.snapshot();
         assert!(snapshot.terminal_at.unwrap() >= first_token_at);
         assert!(snapshot.duration.unwrap() >= Duration::from_millis(1));
+    }
+
+    #[test]
+    fn gemini_thought_text_counts_once_from_its_display_event() {
+        let mut streamed = StreamedOutput::default();
+        let part = serde_json::json!({"thought": true, "text": "plan", "thoughtSignature": "s"});
+        streamed.record(&Event::GeminiThoughtPart(std::sync::Arc::new(part)));
+        streamed.record(&Event::ReasoningTextDelta("plan".into()));
+        assert_eq!(streamed.reasoning, "plan");
     }
 
     #[test]

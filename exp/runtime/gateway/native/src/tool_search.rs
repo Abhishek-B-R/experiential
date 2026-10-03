@@ -34,6 +34,7 @@ use crate::encode_responses::{
 };
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{CompletedToolCall, Event, Usage};
+use crate::reasoning_display::ReasoningOutput;
 use crate::waterfall::{CommittedAttempt, DeploymentWire, Won};
 use crate::web_search::{
     completed_messages_body_with_web_search, configure_messages_encoder, WebSearchAdmission,
@@ -533,7 +534,7 @@ pub fn completed_messages_body_with_gateway_tools(
     events: &[Event],
     ignored_parameters: &[String],
     reasoning_content_carrier: Option<&str>,
-    reasoning_output_exposed: bool,
+    reasoning_output: impl Into<ReasoningOutput>,
     web_search: Option<&WebSearchAdmission>,
     tool_search: Option<&MessagesToolSearch>,
 ) -> Result<AggregatedMessage, PublicError> {
@@ -544,7 +545,7 @@ pub fn completed_messages_body_with_gateway_tools(
             events,
             ignored_parameters,
             reasoning_content_carrier,
-            reasoning_output_exposed,
+            reasoning_output,
             web_search,
         );
     };
@@ -556,7 +557,7 @@ pub fn completed_messages_body_with_gateway_tools(
         &prefixed,
         ignored_parameters,
         reasoning_content_carrier,
-        reasoning_output_exposed,
+        reasoning_output,
         web_search,
     )?;
     for name in [TOOL_SEARCH_BM25_TOOL_NAME, TOOL_SEARCH_REGEX_TOOL_NAME] {
@@ -653,7 +654,7 @@ pub(crate) fn completed_messages_body_for(
     admission: &Admission,
     events: &[Event],
     reasoning_content_carrier: Option<&str>,
-    reasoning_output_exposed: bool,
+    reasoning_output: impl Into<ReasoningOutput>,
 ) -> Result<AggregatedMessage, PublicError> {
     completed_messages_body_with_gateway_tools(
         &admission.request_id,
@@ -661,7 +662,7 @@ pub(crate) fn completed_messages_body_for(
         events,
         &admission.ignored_parameters,
         reasoning_content_carrier,
-        reasoning_output_exposed,
+        reasoning_output,
         admission.web_search.as_ref(),
         messages_tool_search(&admission.tool_search_rounds, &admission.request_id).as_ref(),
     )
@@ -681,8 +682,10 @@ pub(crate) fn configure_responses_encoder(
 
 /// Aggregate one Responses turn for the admission, rendering its search
 /// rounds as hosted items ahead of the answer and citing its web search.
+/// `depth` is the winning attempt's rung, whose reasoning exposure applies.
 pub(crate) fn completed_responses_body_for(
     admission: &Admission,
+    depth: usize,
     created_at: i64,
     events: &[Event],
     reasoning_content_carrier: Option<&str>,
@@ -691,7 +694,7 @@ pub(crate) fn completed_responses_body_for(
         &admission.request_id,
         &admission.alias,
         created_at,
-        admission.envelope.clone().unwrap_or_default(),
+        admission.responses_envelope_at(depth),
         events,
         reasoning_content_carrier,
         admission.web_search.as_ref(),
@@ -699,14 +702,16 @@ pub(crate) fn completed_responses_body_for(
     )
 }
 
-/// Encode admitted Responses events with their unchanged gateway tool configuration.
+/// Encode admitted Responses events with their unchanged gateway tool
+/// configuration and the reasoning exposure of the rung that won at `depth`.
 pub(crate) fn encode_responses_sse(
     admission: &Admission,
+    depth: usize,
     created_at: i64,
     events: &[Event],
     reasoning_content_carrier: Option<&str>,
 ) -> Result<Vec<u8>, PublicError> {
-    let envelope = admission.envelope.clone().unwrap_or_default();
+    let envelope = admission.responses_envelope_at(depth);
     let mut encoder = ResponsesSseEncoder::new(
         &admission.request_id,
         &admission.alias,

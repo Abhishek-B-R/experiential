@@ -54,8 +54,9 @@ def run_prepared_model_evaluation(
         project: Owner of the completed scenario, world-model and judge evidence.
         prepared: Exact engine preparation whose quote the user accepted.
         catalog: Runtime catalog holding transient provider credential references.
-        budget: Approved total provider allowance and judgment count. Raising only the
+        budget: Optional total provider allowance and finite judgment count. Changing only the
             allowance resumes the same plan and replays completed provider responses for free.
+            None removes the aggregate cap while preserving finite request reservations.
         provider_spend_consented: Explicit consent after the host's atomic credit reservation.
         created_at: Stable run timestamp.
         code_revision: Exact engine revision.
@@ -112,6 +113,14 @@ def run_prepared_model_evaluation(
         selected, judge_request, judging_protocol = revised_judge_setup(
             project, prepared, judging_revision
         )
+    if budget.maximum_cost_usd is not None and (
+        not quote.maximum_is_upper_bound or not judge_request.maximum_is_upper_bound()
+    ):
+        raise ValueError(
+            "a finite spending limit requires complete tariffs for every evaluation stage; "
+            "refresh the catalog and prepare again, or use maximum_cost_usd=None "
+            "to retain uncapped execution and replay"
+        )
     report(progress, "Verifying built project")
     completed = completed_project_build(project)
     completion_input = setup.simulation_completion_input
@@ -161,6 +170,7 @@ def run_prepared_model_evaluation(
             request,
             model=resolved.snapshot,
             capabilities=resolved.capabilities,
+            token_prices=resolved.token_prices,
             maximum_attempts=attempts,
         )
     if retrieval.maximum_attempts != attempts:
@@ -211,6 +221,7 @@ def run_prepared_model_evaluation(
         reservation=judge_request,
         model=judge_model.snapshot,
         capabilities=judge_model.capabilities,
+        token_prices=judge_model.token_prices,
         maximum_attempts=attempts,
         maximum_provider_calls=quote.judgment_count * calls_per_rollout,
         served_model_id=judge_model.served_model_id,
@@ -241,6 +252,7 @@ def run_prepared_model_evaluation(
         project.artifacts,
         completed.world_model,
         client=world.client,
+        capabilities=world.capabilities,
         fit_retriever=retriever,
     )
 
@@ -288,11 +300,15 @@ def run_prepared_model_evaluation(
             (runtime_input,),
             judging_protocol=judging_protocol,
             judging_input=judging_revision,
-            spending_limit_usd=budget.maximum_cost_usd,
+            # Every inference role shares the request ledger above. It enforces the
+            # operator cap before new dispatch; post-hoc service checks must not reject
+            # replay of already-paid evidence when that cap is lowered on resume.
+            spending_limit_usd=None,
             judge_spend=judge_spend,
+            request_budget=ledger,
         ),
-        # Semantic execution bounds stay frozen across allowance increases. The request
-        # ledger enforces the smaller approved amount before every paid dispatch.
+        # Semantic execution bounds stay frozen across allowance changes. The request
+        # ledger independently enforces an enabled aggregate cap before every paid dispatch.
         budget=budget.model_copy(update={"maximum_cost_usd": max(quote.maximum_cost_usd, 1e-12)}),
         created_at=created_at,
         code_revision=code_revision,

@@ -82,6 +82,12 @@ pub(super) async fn run_attempt(
                 };
             }
         };
+    // A gateway-chosen cache the provider refuses (expired early, evicted, a
+    // stale resource) re-dials the same rung on its plain wire: the successor
+    // is a reactive repair, which never prepares a cache.
+    let automatic_overlay = cached_wire
+        .as_ref()
+        .is_some_and(|cached| cached.automatic_cache);
     let wire = cached_wire.as_ref().unwrap_or(wire);
     // The connection's raw timeout paces each BODY chunk read, exactly like
     // the python streaming path. The open (request/response-header) phase is
@@ -150,6 +156,13 @@ pub(super) async fn run_attempt(
                         tool_names: Vec::new(),
                     };
                 }
+                if automatic_overlay && google_cache::plain_redial_after(&failure) {
+                    return AttemptEnd::Repair {
+                        failure: google_cache::overlay_refusal(failure),
+                        usage: None,
+                        tool_names: Vec::new(),
+                    };
+                }
                 return AttemptEnd::Ladder {
                     failure: customer_owned(failure, wire),
                     refusal_eligible: false,
@@ -188,6 +201,8 @@ pub(super) async fn run_attempt(
         relay.set_stop_sequences(wire.stop_sequences.iter().cloned());
         relay.set_probability_output(ctx.chat_logprobs, &wire.upstream_payload);
         relay.set_serialize_tool_calls(wire.serialize_tool_calls);
+        relay.set_cache_writes_within_reads(wire.cache_writes_within_reads);
+        relay.set_gemini_cache_writes(wire.automatic_cache_written_tokens);
         relay.set_native_tool_translation(wire.native_tool_translation.clone());
         relay.set_tool_search_tool_name(ctx.tool_search.map(|search| search.tool_name.clone()));
         if !wire.model_id.is_empty() {

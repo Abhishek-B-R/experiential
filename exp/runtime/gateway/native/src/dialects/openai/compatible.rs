@@ -161,6 +161,7 @@ impl Normalizer {
             ))]);
         }
         let mut events = Vec::new();
+        self.service_tier.observe(payload.get("service_tier"));
         // An aggregator names the upstream that serves the stream on each
         // chunk (OpenRouter `provider`, opted in by its metadata header); the
         // first label is kept for settlement so a zero-data-retention
@@ -251,12 +252,12 @@ impl Normalizer {
             self.refusal_seen = true;
             events.push(Event::RefusalDelta(refusal.clone()));
         }
+        let reasoning = delta
+            .get("reasoning_content")
+            .filter(|value| !value.is_null())
+            .or_else(|| delta.get("reasoning"));
         if let Some(route_sha256) = self.reasoning_content_route_sha256.clone() {
-            if let Some(value) = delta
-                .get("reasoning_content")
-                .filter(|value| !value.is_null())
-                .or_else(|| delta.get("reasoning"))
-            {
+            if let Some(value) = reasoning {
                 let reasoning = match value {
                     Value::Null => None,
                     Value::String(text) => Some(text),
@@ -270,6 +271,15 @@ impl Normalizer {
                     });
                 }
             }
+        } else if let Some(text) = reasoning
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            // No replay route: the plaintext is display copy only. Encoders
+            // render it on rungs whose reasoning display is on; it never seals
+            // a carrier and never replays.
+            self.reserve_summary_bytes(text.len())?;
+            events.push(Event::ReasoningTextDelta(text.to_string()));
         }
         if let Some(raw_tools) = delta.get("tool_calls") {
             if !raw_tools.is_null() {

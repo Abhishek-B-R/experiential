@@ -16,17 +16,21 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
     AssistantAction,
     BillingSource,
+    ModelFinishReason,
     ModelMessage,
     ModelRequest,
     ModelSnapshot,
     ToolCall,
     ToolChoice,
 )
+from exp.common.models.catalog_prices import GatewayTokenPrices
+from exp.common.models.token_cost import schedule_usage_cost_nano_usd
 from exp.common.tasks import ToolSchema
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
     ProviderResponseError,
+    ProviderTruncatedResponseError,
 )
 from exp.runtime.models.providers.openai_compatible import (
     OPENROUTER_BASE_URL,
@@ -37,11 +41,13 @@ from exp.runtime.models.providers.openai_compatible import (
     openai_compatible_response,
     openai_embedding_request,
     openai_embedding_response_raw,
+    parse_openai_wire_tool_call,
 )
 from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
     RetryPolicy,
     ScriptedJsonTransport,
+    classify_retry,
 )
 
 
@@ -247,6 +253,164 @@ def test_openai_compatible_client_retries_only_the_same_endpoint() -> None:
     idempotency_keys = [request[1]["Idempotency-Key"] for request in transport.requests]
     assert idempotency_keys[0].startswith("exp-")
     assert idempotency_keys[0] == idempotency_keys[1]
+
+
+@pytest.mark.parametrize(
+    ("provider", "model_id", "details", "expected_read", "expected_write", "expected_cost"),
+    [
+        (
+            "openrouter",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 80, "cache_write_tokens": 80},
+            0,
+            80,
+            180_000,
+        ),
+        (
+            "openrouter",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 40, "cache_write_tokens": 20},
+            20,
+            20,
+            105_000,
+        ),
+        (
+            "openrouter",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 100, "cache_write_tokens": 100},
+            0,
+            100,
+            200_000,
+        ),
+        (
+            "openrouter",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 80, "cache_write_tokens": 0},
+            80,
+            0,
+            40_000,
+        ),
+        (
+            "openrouter",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 10, "cache_write_tokens": 20},
+            10,
+            20,
+            112_500,
+        ),
+        ("openrouter", "google/gemini-2.5-pro", {"cache_write_tokens": 20}, None, 20, None),
+        ("openrouter", "google/gemini-2.5-pro", {"cached_tokens": 40}, 40, None, None),
+        ("openrouter", "google/gemini-2.5-pro", {}, None, None, None),
+        (
+            "openrouter",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 0, "cache_write_tokens": 0},
+            0,
+            0,
+            100_000,
+        ),
+        (
+            "openrouter",
+            "google/gemma-3-27b-it",
+            {"cached_tokens": 40, "cache_write_tokens": 20},
+            40,
+            20,
+            90_000,
+        ),
+        (
+            "openrouter",
+            "anthropic/claude-sonnet-4",
+            {"cached_tokens": 40, "cache_write_tokens": 20},
+            40,
+            20,
+            90_000,
+        ),
+        (
+            "openai-compatible",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 40, "cache_write_tokens": 20},
+            40,
+            20,
+            90_000,
+        ),
+    ],
+)
+def test_client_cache_accounting_uses_only_the_configured_provider_policy(
+    provider: str,
+    model_id: str,
+    details: JsonObject,
+    expected_read: int | None,
+    expected_write: int | None,
+    expected_cost: int | None,
+) -> None:
+    """Gemini writes leave the overlapping read leg; other models retain disjoint usage.
+
+    Different fresh, read, and write rates expose both overbilling on a small
+    overlap and incorrectly unpriceable usage when the raw slices exceed input.
+    The write rate includes the provider's write plus read charge for that leg.
+    """
+    transport = ScriptedJsonTransport(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                body={
+                    "model": "served-model-alias",
+                    "choices": [{"message": {"content": "done"}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 0,
+                        "prompt_tokens_details": details,
+                    },
+                },
+            )
+        ]
+    )
+    client_type = OpenRouterClient if provider == "openrouter" else OpenAICompatibleClient
+    client = client_type(
+        model=_snapshot(provider, model_id),
+        base_url=OPENROUTER_BASE_URL if provider == "openrouter" else "https://example.test/v1",
+        api_key="fixture-key",
+        transport=transport,
+    )
+    response = client.complete(_request())
+    usage = response.economics.usage
+    assert usage is not None
+    assert usage.input_tokens == 100
+    assert usage.cached_input_tokens == expected_read
+    assert usage.cache_write_input_tokens == expected_write
+    assert response.model.model_id == "served-model-alias"
+    prices = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=1_000_000_000,
+        cached_input_nano_usd_per_million_tokens=250_000_000,
+        cache_creation_input_nano_usd_per_million_tokens=2_000_000_000,
+        cache_creation_1h_input_nano_usd_per_million_tokens=2_000_000_000,
+        output_nano_usd_per_million_tokens=4_000_000_000,
+        reasoning_nano_usd_per_million_tokens=4_000_000_000,
+    )
+    assert schedule_usage_cost_nano_usd(prices, usage) == expected_cost
+
+
+@pytest.mark.parametrize("unknown", ["cached_tokens", "cache_write_tokens"])
+def test_openrouter_cache_overlap_preserves_explicit_unknown_meters(unknown: str) -> None:
+    """A compatibility zero marked unreported must not become measured cache usage."""
+    details: JsonObject = {"cached_tokens": 0, "cache_write_tokens": 0}
+    response = openai_compatible_response(
+        {
+            "choices": [{"message": {"content": "done"}}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 0,
+                "prompt_tokens_details": details,
+                "unreported_token_details": [unknown],
+            },
+        },
+        configured_model=_snapshot("openrouter", "google/gemini-2.5-pro"),
+        latency_seconds=1,
+    )
+    usage = response.economics.usage
+    assert usage is not None
+    assert usage.cached_input_tokens == (None if unknown == "cached_tokens" else 0)
+    assert usage.cache_write_input_tokens == (None if unknown == "cache_write_tokens" else 0)
 
 
 def test_response_without_choices_fails_closed_without_exposing_the_key() -> None:
@@ -780,3 +944,203 @@ def test_buffered_request_folds_non_leading_system_turns_on_a_leading_only_rung(
     ]
     kept = cast(list[JsonObject], openai_compatible_request("qwen3.8-27b", request)["messages"])
     assert [message["role"] for message in kept] == ["system", "user", "system", "user"]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{"a":1',
+        '{"a":',
+        '{"a":"unfinished',
+        '{"a":t',
+        '{"a":tr',
+        '{"a":tru',
+        '{"a":f',
+        '{"a":fa',
+        '{"a":fal',
+        '{"a":fals',
+        '{"a":n',
+        '{"a":nu',
+        '{"a":nul',
+        '{"a":-',
+        '{"a":1.',
+        '{"a":1e',
+        '{"a":1e-',
+        '{"a":-2.3E+',
+        r'{"a":"\u',
+        r'{"a":"\u0',
+        r'{"a":"\u01',
+        r'{"a":"\u012',
+        r'{"a":[true,{"key":"\u12',
+        r'{"\u01',
+    ],
+)
+@pytest.mark.parametrize("finish_reason", ["length", "stop", "tool_calls"])
+def test_incomplete_tool_json_requires_retained_length_and_never_http_retries(
+    arguments: str, finish_reason: str
+) -> None:
+    """EOF tool fragments merit only a fresh rollout; normal-stop malformed data stays unchanged.
+
+    Args:
+        arguments: Exact incomplete tool-argument JSON retained in the response body.
+        finish_reason: Length, stop, or tool-calls terminal reason paired with that fragment.
+    """
+    transport = ScriptedJsonTransport(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                body={
+                    "choices": [
+                        {
+                            "finish_reason": finish_reason,
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "id": "call-a",
+                                        "function": {
+                                            "name": "create_ticket",
+                                            "arguments": arguments,
+                                        },
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+    client = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://example.test/v1",
+        api_key="fake-key",
+        transport=transport,
+        retry_policy=RetryPolicy(maximum_attempts=3, initial_delay_seconds=0),
+    )
+    expected = (
+        ProviderTruncatedResponseError
+        if finish_reason == "length"
+        else OpenAICompatibleResponseError
+    )
+    with pytest.raises(expected) as caught:
+        client.complete(_request())
+    assert not classify_retry(caught.value).retryable
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{"a": invalid}',
+        "[]",
+        '[{"a":',
+        '{"a":1,}',
+        '{"a":"bad\\x"}',
+        '{"a":truX',
+        '{"a":tru ',
+        '{"a":True',
+        '{"a":nux',
+        '{"a":01',
+        '{"a":1.e',
+        '{"a":1e+-',
+        '{"a":1. ',
+        '{"a":+1',
+        '{"a":--',
+        '{"a":١',
+        r'{"a":"\u0x',
+        r'{"a":"\q',
+        '{"a":"bad\n',
+        '{"a":1 "b":"unfinished',
+        '{"a":1,] ',
+        '{"a":[1,}',
+        '{"a":true false',
+        "{} {",
+        '{"a" "b":',
+    ],
+)
+def test_length_does_not_upgrade_malformed_or_structural_tool_arguments(arguments: str) -> None:
+    """A length label alone cannot turn an invalid complete value into infrastructure evidence.
+
+    Args:
+        arguments: Complete or malformed JSON that cannot qualify as a valid object prefix.
+    """
+    with pytest.raises(OpenAICompatibleResponseError):
+        openai_compatible_response(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "call-a",
+                                    "function": {"name": "create_ticket", "arguments": arguments},
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+            configured_model=_snapshot(),
+            latency_seconds=0,
+        )
+
+
+def test_length_keeps_valid_output_and_rejects_missing_tool_identity() -> None:
+    """Complete length output retains the native limit flag; absent call identity is unchanged.
+
+    Raises:
+        AssertionError: Valid length-limited output or missing tool identity changes classification.
+    """
+    payload: JsonObject = {"choices": [{"finish_reason": "length", "message": {"content": "done"}}]}
+    response = openai_compatible_response(payload, configured_model=_snapshot(), latency_seconds=0)
+    assert response.finish_reason == ModelFinishReason.LENGTH
+    with pytest.raises(ProviderResponseError) as caught:
+        openai_compatible_response(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {
+                            "tool_calls": [
+                                {"function": {"name": "create_ticket", "arguments": "{"}}
+                            ]
+                        },
+                    }
+                ]
+            },
+            configured_model=_snapshot(),
+            latency_seconds=0,
+        )
+    assert not isinstance(caught.value, ProviderTruncatedResponseError)
+
+
+@pytest.mark.parametrize(
+    "complete",
+    [
+        r'{"a":[true,false,null, -12.34e+5, {"\u00e9":"x\n\u0000"}]}',
+        r'{"a":0,"b":-0.001,"c":1E-9,"d":1.0e+10,"e":"quote\"slash\\"}',
+    ],
+)
+def test_every_proper_prefix_of_nested_tool_json_is_truncated(complete: str) -> None:
+    """Every cut inside a valid object is recoverable without accepting its partial contents.
+
+    Args:
+        complete: Valid nested JSON object whose proper prefixes are tested independently.
+    """
+    for end in range(1, len(complete)):
+        with pytest.raises(ProviderTruncatedResponseError):
+            parse_openai_wire_tool_call(
+                {
+                    "id": "call-a",
+                    "function": {"name": "create_ticket", "arguments": complete[:end]},
+                },
+                0,
+                hit_length_limit=True,
+            )
+    result = parse_openai_wire_tool_call(
+        {"id": "call-a", "function": {"name": "create_ticket", "arguments": complete}},
+        0,
+        hit_length_limit=True,
+    )
+    assert result.raw_arguments == complete

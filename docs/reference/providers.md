@@ -4,6 +4,16 @@ Experiential resolves models from a secret-free `.exp/models.toml` catalog. `Run
 only construction service. Provider names do not imply capabilities or prices. Every completion or
 embedding alias must declare the protocol features and token prices it uses.
 
+Python applications can set `RuntimeModelCatalog(catalog, http_timeout_seconds=120.0)`
+when a custom HTTP transport performs durable work around dispatch. This finite, positive
+timeout covers the entire client operation, including the injected transport. Its default
+is 60 seconds; completion requests keep a longer output-derived allowance when needed.
+Values above the operating system's `threading.TIMEOUT_MAX` are rejected before resolution,
+so configured timeouts remain representable in Python and native dispatch.
+`with_catalog()` preserves the setting. A transport that needs a shorter network deadline
+must enforce that deadline separately. Bedrock, Tinker, and native-only TypeSafe execution
+retain their own timeout policies.
+
 Configure connections with `exp config providers` or the first `exp build` on a clean checkout.
 An interactive terminal opens a provider list: Up and Down move focus, Enter selects or deselects
 the focused provider, and the Complete row submits the selection. Agents skip that list with
@@ -205,15 +215,17 @@ all three question types; replace `systemone` with the decision alias your gatew
 The response contains `id`, the requested public `model` alias, `answers` under the original
 question IDs, and `usage.input_tokens` / `usage.output_tokens`. These are structured decision
 values, not assistant text. Probabilities and confidence must be finite values from 0 to 1,
-distributions must sum to 1 within validation tolerance, the selected choice must have the highest
-probability, and a score must be consistent with the distribution's weighted zero-based index.
-Scores and probabilities retain their provider values: they are never recomputed or normalized.
-Exact numeric consistency uses a `1e-6` tolerance. If the score and every probability are
-hundredth-valued, the score may instead match a unit distribution within their independently
-rounded half-hundredth intervals, clipped to `[0, 1]`. This bounded check respects the shared
-probability mass and admits closed interval endpoints because rounding ties are unspecified.
-Finer-precision inconsistent scores remain invalid. Probability totals still use the `1e-6`
-normalization check; category winners must still have the greatest published probability.
+distributions must sum to 1, the selected choice must have the highest probability, and a score
+must be consistent with the distribution's weighted zero-based index. Probability keys must equal
+the requested criteria exactly. Scores and probabilities retain their provider values: they are
+never recomputed or normalized. Exact numeric consistency uses a `1e-6` tolerance. If every
+probability is hundredth-valued, it may instead be explained by one unit distribution within
+their independently rounded half-hundredth intervals, clipped to `[0, 1]`: the published total
+may then read 0.99 or 1.01, a choice may sit one hundredth below another category only if that
+distribution can make it highest, and a hundredth-valued score must match that distribution's
+weighted index. These bounded checks respect the shared probability mass and admit closed
+interval endpoints because rounding ties are unspecified. Finer-precision totals, winners and
+scores keep the exact checks.
 Missing answers, mismatched types or criteria, and missing or invalid usage fail closed. Only validated answer fields are returned; extra provider metadata is omitted.
 
 Limits are 1 through 32 questions, 1 through 256 UTF-8 bytes per question ID or choice category
@@ -248,6 +260,66 @@ after checking the provider's outcome. Zero releases the hold; a positive assign
 that budget amount while token usage and the provider cost estimate stay unknown. Repeating the
 same assignment is a no-op; a different assignment is refused. Holds survive request completion
 and process restarts until this explicit reconciliation, so unresolved work cannot fund repeats.
+
+## Completed responses with unknown pricing
+
+An adapter that has durably saved a completed paid response and its unknown liability can
+report missing price-relevant usage through the typed boundary:
+
+```python
+from exp.runtime.models.providers.errors import ProviderPricingUnavailableError
+
+raise ProviderPricingUnavailableError(
+    "Saved response cannot be priced from its reported usage; inspect the retained receipt."
+)
+```
+
+This error does not retry the HTTP request or permit the unpriceable answer to execute. A text
+evaluation using an explicitly uncapped `RequestBudget` records infrastructure-invalid evidence
+and may create a fresh rollout generation for the same task, model, and repeat. The existing
+three-generation limit includes the initial attempt. Every generation has new request coordinates;
+prior responses, invalid rollouts, and unknown liabilities remain saved. Persistent failure stays
+invalid after the final generation. Evaluation orchestration retries eligible cells after the
+current simulation phase completes.
+
+Finite budgets and simulations without a shared request ledger do not enable this retry.
+Reopening a retryable pricing failure rechecks the current budget before allocating a new
+generation. A finite cap preserves the original failure and receipt for a later uncapped retry;
+already completed generations still replay without spending under a finite cap.
+Generic `ValueError` failures, including previously saved ones, remain nonretryable. Identity,
+reservation-bound, and persistence failures must not be translated into the pricing-unavailable
+type. Missing usage is never replaced with zero or a measured charge.
+
+The same bounded fresh-generation policy applies when a paid cell's execution is interrupted
+before saving its rollout. Existing ownership checks must first prove the lease owner stopped.
+An uncapped shared ledger then permits a new generation while retaining the old lease tombstone,
+all paid responses, and any unknown request liabilities. The interrupted generation is recorded
+as infrastructure invalidity, not a model-quality or spending-limit failure. Its requests are
+never resent at the old coordinates.
+
+Catalog-backed evaluation supplies its shared ledger through `EvaluationServices.request_budget`.
+That current authority also permits recovery of saved stale-lease outcomes classified as budget
+failures by older executions, without rewriting those artifacts or their original selection.
+Finite budgets and callers without that ledger keep their existing stale-lease behavior. Completed
+successors replay for free even if the caller later lowers its cap. Interruptions count toward
+the same three-generation ceiling; an exhausted cell remains invalid.
+
+An unbounded paid-response liability, or an interrupted ancestor without a retained whole-cell
+reservation, leaves aggregate simulation spend and total execution cost unknown. A numeric
+reservation estimate is not a verified upper bound. Lineage and receipts are still verified,
+and valid successor rollouts determine report costs. A completed report may replay under a lower
+cap; missing judgments with unknown prior liability require explicit uncapped authorization.
+Invalid usage remains nonretryable even when its owning receipt records unbounded liability.
+
+A Chat response with retained `finish_reason="length"` whose tool arguments form an unfinished
+JSON object prefix raises `ProviderTruncatedResponseError`. Partial strings, literals, numbers
+and Unicode escapes qualify only when the preceding grammar is valid. A length label alone does
+not upgrade structural tool errors or malformed complete values. This error never retries the
+HTTP request. Catalog-backed evaluation saves the decoded HTTP body before rejection; exact
+replay raises from that saved body without contacting the provider. Explicitly uncapped
+evaluations may instead use the same bounded fresh-generation policy, retaining prior raw
+receipts and invalid evidence. Malformed ordinary stop responses keep their existing behavior,
+and a valid length response retains its length flag.
 
 ## OpenAI-compatible listing metadata
 

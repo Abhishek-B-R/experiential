@@ -121,8 +121,14 @@ class AttemptLedger(Protocol):
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
-    ) -> None:
-        """Terminalize accepted work that failed before a provider dispatch existed."""
+        certify_no_effects: bool = False,
+    ) -> bool:
+        """Terminalize work, returning a committed no-effects certificate.
+
+        Certification defaults false and requires trusted admission without paid prework.
+        The terminal write and attempt-absence check serialize with attempt creation.
+        Historical failures and any prior attempt remain uncertified; failed writes raise.
+        """
         ...
 
 

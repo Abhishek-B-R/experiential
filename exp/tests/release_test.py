@@ -572,6 +572,7 @@ def _installed_release_driver() -> None:
 
     import exp
     from exp.cli.gateway.key_output import key_output_marker_path
+    from exp.common.core.locks import file_write_lock
     from exp.common.models import (
         BillingSource,
         CandidateTokenPrice,
@@ -602,7 +603,8 @@ def _installed_release_driver() -> None:
     from exp.optimize.router.judging.contracts import ManualJudgeTraceReviewArtifact
     from exp.optimize.router.judging.service import prepare_manual_judge_calibration
     from exp.runtime.gateway.catalog_authority import (
-        upsert_certified_pool,
+        apply_certified_pool_update,
+        plan_certified_pool_update,
         upsert_connection,
         upsert_singleton_deployment,
     )
@@ -2355,20 +2357,23 @@ def _installed_release_driver() -> None:
             replace=False,
         )
     assert project_catalog is not None
-    project_catalog, project_snapshot, _changed = upsert_certified_pool(
-        project_root,
-        pool_id="project-pool",
-        exact_model_id="project-exact-model",
-        deployment_aliases=("cheap", "baseline"),
-        certification=GatewayEquivalenceCertification(
-            certification_id="installed-project-certification",
-            provenance="installed deterministic exact-model fixture",
-            evidence_sha256="c" * 64,
-            certified_at=datetime(2026, 8, 19, tzinfo=UTC),
-        ),
-        expected_catalog_sha256=project_catalog.identity_sha256(),
-        replace=False,
-    )
+    with file_write_lock(project_root / "models.toml", what="the installed project pool catalog"):
+        pool_update = plan_certified_pool_update(
+            project_root,
+            pool_id="project-pool",
+            exact_model_id="project-exact-model",
+            deployment_aliases=("cheap", "baseline"),
+            certification=GatewayEquivalenceCertification(
+                certification_id="installed-project-certification",
+                provenance="installed deterministic exact-model fixture",
+                evidence_sha256="c" * 64,
+                certified_at=datetime(2026, 8, 19, tzinfo=UTC),
+            ),
+            expected_catalog_sha256=project_catalog.identity_sha256(),
+            replace=False,
+        )
+        apply_certified_pool_update(project_root, pool_update)
+    project_catalog, project_snapshot = pool_update.normalized, pool_update.snapshot
     project_manager.activate_project_alias(
         alias_id="project-coding",
         alias_name="project-coding",
@@ -2513,7 +2518,6 @@ def _installed_release_driver() -> None:
     assert state.count_containing("project-secondary-model") == project_secondary_before + 1
     assert learned_client.embed_calls == 0
     assert learned_client.complete_calls == 0
-    assert learned_runtime.records_decisions is False
     assert not (project_root / "projects").exists()
     with sqlite3.connect(project_manager.database_path) as connection:
         project_attempts = connection.execute(

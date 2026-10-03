@@ -206,6 +206,34 @@ impl Normalizer {
         self.request_words = words.into_iter().map(Into::into).collect();
     }
 
+    /// Select the rung's Chat Completions cache-write accounting: when set,
+    /// reported cache writes are a subset of reported cache reads (see
+    /// `OpenAiUsageAccumulator`). Only a Chat Completions normalizer honours
+    /// it; every other dialect keeps disjoint cache accounting.
+    pub fn set_cache_writes_within_reads(&mut self, writes_within_reads: bool) {
+        self.openai_usage.set_writes_within_reads(
+            writes_within_reads && self.dialect == Dialect::OpenAiCompatible,
+        );
+    }
+
+    /// Report reads of the cache this attempt just created as cache writes.
+    /// Only the Gemini usage observer honours it.
+    pub fn set_gemini_cache_writes(&mut self, written: Option<u64>) {
+        self.gemini_cache_writes =
+            written.filter(|_| self.dialect == Dialect::GeminiGenerateContent);
+    }
+
+    /// Whether the latest normalized meter replaces earlier ones instead of
+    /// merging by maximum. OpenAI accumulators already coalesce raw reports;
+    /// normalized counts can decrease when reasoning evidence becomes decisive
+    /// or cache writes move tokens out of the overlapping read leg.
+    pub(crate) fn meter_replaces_earlier(&self) -> bool {
+        matches!(
+            self.dialect,
+            Dialect::OpenAiCompatible | Dialect::OpenAiResponses
+        )
+    }
+
     /// Classify a provider failure and retain bounded detail; exact relay verdicts
     /// require the raw envelope sentence, never a metadata-derived replacement.
     fn provider_stream_failure(
@@ -411,7 +439,7 @@ pub struct Normalizer {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     cache_read: u64,
-    cache_write: u64,
+    cache_write: Option<u64>,
     cache_write_1h: Option<u64>,
     stop_reason: Option<String>,
     // OpenAI-compatible and Gemini accumulation.
@@ -423,6 +451,9 @@ pub struct Normalizer {
     // mapper's local counter.
     gemini_tool_index: u32,
     gemini: gemini::StreamState,
+    // Tokens this attempt's own automatic Google cache create wrote; reported
+    // cache reads up to this count settle as writes read back in the same call.
+    gemini_cache_writes: Option<u64>,
     // Fireworks-only route identity authorizing reasoning_content capture.
     reasoning_content_route_sha256: Option<String>,
     // Caller-known label words (the dispatched model id) exempt from the
@@ -445,6 +476,7 @@ pub struct Normalizer {
     // opted into its response metadata. First non-empty value wins; a label
     // only (bounded, printable ASCII), never content.
     upstream_provider: Option<String>,
+    pub(crate) service_tier: crate::service_tier::ServiceTierObservation,
     chat_logprobs: bool,
     responses_logprobs: bool,
 }
@@ -477,7 +509,7 @@ impl Normalizer {
             input_tokens: None,
             output_tokens: None,
             cache_read: 0,
-            cache_write: 0,
+            cache_write: None,
             cache_write_1h: None,
             stop_reason: None,
             usage: None,
@@ -485,6 +517,7 @@ impl Normalizer {
             finish_reason: None,
             gemini_tool_index: 0,
             gemini: gemini::StreamState::default(),
+            gemini_cache_writes: None,
             reasoning_content_route_sha256,
             request_words: Vec::new(),
             deferred_tool_failure: None,
@@ -492,6 +525,7 @@ impl Normalizer {
             anthropic_stopped_tools: BTreeSet::new(),
             dropped_cut_call: false,
             upstream_provider: None,
+            service_tier: crate::service_tier::ServiceTierObservation::default(),
             chat_logprobs: false,
             responses_logprobs: false,
         }
@@ -650,7 +684,11 @@ impl Normalizer {
         if self.terminal {
             return Ok(Vec::new());
         }
-        let previous_usage = self.usage.clone();
+        let previous_usage = if self.meter_replaces_earlier() {
+            None
+        } else {
+            self.usage.clone()
+        };
         let result = match self.dialect {
             Dialect::OpenAiResponses => self.feed_openai_responses(frame),
             Dialect::AnthropicMessages => self.feed_anthropic(frame),
@@ -679,7 +717,13 @@ impl Normalizer {
             }
         }
         self.usage = observed;
-        if events.iter().any(Event::is_output_token) {
+        // Display-only reasoning is held privately until real output, so it
+        // must not turn a mid-reasoning abnormal end into a settled
+        // `Incomplete`: that turn still fails over as terminal-less.
+        if events
+            .iter()
+            .any(|event| event.is_output_token() && !matches!(event, Event::ReasoningTextDelta(_)))
+        {
             self.emitted_output = true;
         }
         if events.iter().any(Event::is_terminal) {

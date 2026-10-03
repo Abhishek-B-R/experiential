@@ -12,6 +12,8 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import BillingSource, ModelMessage, ModelRequest, ModelSnapshot, Usage
+from exp.common.models.catalog_prices import GatewayTokenPrices
+from exp.common.models.token_cost import schedule_usage_cost_nano_usd
 from exp.runtime.models.providers.async_transport import run_then_close_pooled_client
 from exp.runtime.models.providers.errors import ProviderResponseError
 from exp.runtime.models.providers.gemini import GeminiClient, gemini_generate_response
@@ -55,7 +57,7 @@ def _completed_usage(usage: JsonObject) -> Usage:
 
 
 def test_absent_thoughts_leave_output_at_candidates_token_count() -> None:
-    """Omitting thoughtsTokenCount keeps output equal to candidatesTokenCount."""
+    """A present proto3 usage object supplies a measured zero for omitted thoughts."""
     usage = _completed_usage(
         {
             "promptTokenCount": 11,
@@ -63,7 +65,28 @@ def test_absent_thoughts_leave_output_at_candidates_token_count() -> None:
             "cachedContentTokenCount": 2,
         }
     )
-    assert usage == Usage(input_tokens=11, output_tokens=5, cached_input_tokens=2)
+    assert usage == Usage(
+        input_tokens=11, output_tokens=5, cached_input_tokens=2, reasoning_tokens=0
+    )
+    prices = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=1_000_000_000,
+        cached_input_nano_usd_per_million_tokens=1_000_000_000,
+        cache_creation_input_nano_usd_per_million_tokens=1_000_000_000,
+        cache_creation_1h_input_nano_usd_per_million_tokens=1_000_000_000,
+        output_nano_usd_per_million_tokens=2_000_000_000,
+        reasoning_nano_usd_per_million_tokens=9_000_000_000,
+    )
+    assert schedule_usage_cost_nano_usd(prices, usage) == 21_000
+
+
+def test_absent_gemini_usage_metadata_remains_unknown() -> None:
+    """The provider-specific scalar default does not manufacture an entire usage object."""
+    response = gemini_generate_response(
+        {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]},
+        configured_model=_snapshot(),
+        latency_seconds=0.1,
+    )
+    assert response.economics.usage is None
 
 
 def test_thoughts_fold_into_billed_output_tokens() -> None:
@@ -77,7 +100,9 @@ def test_thoughts_fold_into_billed_output_tokens() -> None:
             "totalTokenCount": 19,
         }
     )
-    assert usage == Usage(input_tokens=11, output_tokens=8, cached_input_tokens=2)
+    assert usage == Usage(
+        input_tokens=11, output_tokens=8, cached_input_tokens=2, reasoning_tokens=3
+    )
 
 
 def test_zero_thoughts_keep_output_at_candidates_token_count() -> None:
@@ -90,7 +115,9 @@ def test_zero_thoughts_keep_output_at_candidates_token_count() -> None:
             "thoughtsTokenCount": 0,
         }
     )
-    assert usage == Usage(input_tokens=11, output_tokens=5, cached_input_tokens=2)
+    assert usage == Usage(
+        input_tokens=11, output_tokens=5, cached_input_tokens=2, reasoning_tokens=0
+    )
 
 
 @pytest.mark.parametrize("bad", ("3", True, -1, 1.5, []))
@@ -162,11 +189,14 @@ def test_completed_and_streamed_gemini_usage_agree(thoughts: int | None) -> None
             "input_tokens": 11,
             "output_tokens": 5 + (thoughts or 0),
             "cached_input_tokens": 2,
-            "reasoning_tokens": thoughts,
+            "reasoning_tokens": thoughts or 0,
         }
     ]
     assert observed == Usage(
-        input_tokens=11, output_tokens=5 + (thoughts or 0), cached_input_tokens=2
+        input_tokens=11,
+        output_tokens=5 + (thoughts or 0),
+        cached_input_tokens=2,
+        reasoning_tokens=thoughts or 0,
     )
 
 
@@ -229,7 +259,7 @@ def test_gemini_completion_bills_thoughts_over_loopback(asynchronous: bool) -> N
             )
             assert response.output.content == "ok"
             assert response.economics.usage == Usage(
-                input_tokens=11, output_tokens=8, cached_input_tokens=2
+                input_tokens=11, output_tokens=8, cached_input_tokens=2, reasoning_tokens=3
             )
             assert len(requests) == 1
             path, key, payload = requests[0]

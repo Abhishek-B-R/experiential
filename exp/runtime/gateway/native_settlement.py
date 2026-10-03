@@ -28,9 +28,12 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayRefusalReason,
     GatewayRequest,
+    GatewayServiceTierAdmission,
+    GatewayServiceTierSettlement,
     GatewayUsage,
 )
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
+from exp.runtime.gateway.native_service_tiers import settlement_kwarg
 from exp.runtime.gateway.rate_limit_headers import (
     RateLimitObservation,
     rate_limit_observation_from_payload,
@@ -49,8 +52,8 @@ _TERMINAL_KINDS = {
 }
 
 
-def exhausted_attempt_payload(failure: GatewayFailure) -> str:
-    """Serialize one sanitized terminal attempt-selection failure for the native boundary."""
+def exhausted_attempt_payload(failure: GatewayFailure, *, known_unbilled: bool = False) -> str:
+    """Serialize terminal selection failure with optional committed admission proof."""
     payload: JsonObject = {
         "failure_class": failure.failure_class.value,
         "safe_message": failure.safe_message,
@@ -65,7 +68,10 @@ def exhausted_attempt_payload(failure: GatewayFailure) -> str:
         payload["refusal_reason"] = failure.refusal_reason.value
     if failure.retry_after_seconds is not None:
         payload["retry_after_seconds"] = failure.retry_after_seconds
-    return json.dumps({"exhausted": True, "failure": payload}, separators=(",", ":"))
+    result: JsonObject = {"exhausted": True, "failure": payload}
+    if known_unbilled and failure.failure_class is GatewayFailureClass.THROTTLED:
+        result["known_unbilled"] = True
+    return json.dumps(result, separators=(",", ":"))
 
 
 def budget_quota_failure() -> GatewayFailure:
@@ -531,10 +537,14 @@ class SettlementMetadata(TypedDict):
     ratelimit_limit_tokens: int | None
     ratelimit_remaining_tokens: int | None
     upstream_provider: NotRequired[str | None]
+    service_tier: NotRequired[GatewayServiceTierSettlement]
 
 
 def settlement_metadata(
-    data: JsonObject | None, settle: Callable[..., object]
+    data: JsonObject | None,
+    settle: Callable[..., object],
+    *,
+    service_tier: GatewayServiceTierAdmission | None = None,
 ) -> SettlementMetadata:
     """Project original observations while withholding unsupported host keywords."""
     observed = settlement_rate_limit(data)
@@ -548,6 +558,7 @@ def settlement_metadata(
     }
     if accepts_keyword(settle, "upstream_provider"):
         fields["upstream_provider"] = upstream_provider_from_settlement(data)
+    fields.update(settlement_kwarg(service_tier, {} if data is None else data))
     return fields
 
 

@@ -38,6 +38,7 @@ from exp.common.traces.ingest.dataset import (
 from exp.optimize.router.automatic.attribution import resolve_router_observed_attributions
 from exp.optimize.router.automatic.reservations import (
     retrieval_embedding_reservation,
+    retrieval_query_input_limit,
     simulation_completion_reservations,
     simulation_input_token_estimate,
 )
@@ -384,6 +385,7 @@ def _router_stage_reservations(
     assert cached_price is not None and write_price is not None
     judgment = completion_cost_reservation(
         model=judge.model,
+        token_prices=catalog.models[judge.alias].token_prices,
         input_usd_per_million_tokens=input_price,
         output_usd_per_million_tokens=output_price,
         cached_input_usd_per_million_tokens=cached_price,
@@ -392,10 +394,19 @@ def _router_stage_reservations(
         maximum_input_tokens=options.maximum_judge_input_tokens,
         maximum_output_tokens=options.maximum_judge_output_tokens,
     )
+    query_limit = retrieval_query_input_limit(
+        problems,
+        catalog=catalog,
+        world_alias=world_model.alias,
+        maximum_output_tokens=options.simulation_maximum_output_tokens,
+        configured_limit=options.maximum_retrieval_query_tokens,
+    )
+    if query_limit is None:
+        return (), ()
     estimated_input_tokens = simulation_input_token_estimate(
         traces,
         retrieved_transition_count=setup.retrieval.top_k,
-        maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
+        maximum_retrieval_query_tokens=query_limit,
         maximum_output_tokens=options.simulation_maximum_output_tokens,
     )
     if estimated_input_tokens is None:
@@ -415,10 +426,22 @@ def _router_stage_reservations(
         catalog,
         embedder.alias,
         embedder.model,
-        options.maximum_retrieval_query_tokens,
+        query_limit,
         RetryPolicy().maximum_attempts,
     )
     if len(candidate_requests) != len(candidates) or world_request is None or retrieval is None:
+        return (), ()
+    for alias, request in (
+        *((item.candidate_alias, item.request) for item in candidate_requests),
+        (world_model.alias, world_request),
+        (judge.alias, judgment),
+    ):
+        if not request.maximum_is_upper_bound():
+            problems.append(
+                f"hosted completion alias {alias!r} requires a complete token tariff "
+                "at its maximum request size; refresh the catalog before hosted execution"
+            )
+    if problems:
         return (), ()
     retrieval_call = (
         retrieval.maximum_input_tokens
