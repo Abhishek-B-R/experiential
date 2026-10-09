@@ -11,7 +11,7 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
-from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
+from exp.runtime.gateway.tool_contracts import GatewayCustomToolChoice
 from exp.runtime.gateway.tool_search.contracts import gateway_tool_search_name
 from exp.runtime.models.providers.allowed_tools import (
     ALLOWED_TOOLS_CLEARED,
@@ -22,6 +22,7 @@ from exp.runtime.models.providers.allowed_tools import (
 from exp.runtime.models.providers.codex_tools import (
     convert_native_history,
     translate_native_tools,
+    translated_tool_choice,
 )
 from exp.runtime.models.providers.dialect_dispatch import (
     CACHE_CONTROL_NOT_FORWARDED_SUFFIX,
@@ -793,6 +794,11 @@ def route_generation_parameter_requests(
         if request.provider_native_tools:
             provider_updates["tools"] = translation.tools
             provider_updates["provider_native_tools"] = ()
+            current_choice = provider_updates.get("tool_choice", request.tool_choice)
+            if isinstance(current_choice, GatewayCustomToolChoice):
+                provider_updates["tool_choice"] = translated_tool_choice(
+                    current_choice, native_mapping
+                )
             for disclosure in translation.disclosures:
                 if disclosure not in ignored:
                     ignored.append(disclosure)
@@ -895,6 +901,23 @@ def route_generation_parameter_requests(
             code="unsupported_parameter",
         )
 
+    def shape_parallel_tool_calls() -> None:
+        """Drop, or emulate per rung, a parallel-tool control the route cannot carry."""
+        if request.parallel_tool_calls is None:
+            return
+        if request.tool_choice == "none":
+            ignore("parallel_tool_calls")
+        elif all(profile.dialect in _NO_PARALLEL_TOOL_CONTROL_DIALECTS for profile in profiles):
+            # No rung has a parallel-tool control: true drops, false is serialized per rung.
+            if request.parallel_tool_calls:
+                ignore("parallel_tool_calls", "parallel_tool_calls->dropped(provider_default)")
+            else:
+                ignore(
+                    "parallel_tool_calls",
+                    "parallel_tool_calls->emulated(serialized_by_gateway)",
+                )
+                provider_updates["serialize_tool_calls"] = True
+
     # Tool-selection controls have no semantics without tool definitions and
     # several provider APIs reject the otherwise harmless combination.
     # Verbatim server tools are tool definitions too: a request carrying only
@@ -903,7 +926,7 @@ def route_generation_parameter_requests(
         str(entry["name"]) for entry in request.provider_server_tools if "name" in entry
     )
     if not request.tools and not request.provider_server_tools:
-        if request.tool_choice == "required" or isinstance(
+        if (request.tool_choice == "required" and not request.provider_native_tools) or isinstance(
             request.tool_choice, GatewayNamedToolChoice
         ):
             raise ProviderParameterError(
@@ -914,15 +937,19 @@ def route_generation_parameter_requests(
                 param="tool_choice",
                 code="invalid_parameter",
             )
-        if request.tool_choice is not None and not (
-            isinstance(request.tool_choice, GatewayAllowedToolsChoice)
-            and request.provider_native_tools
-        ):
-            # An allowed set over native-only declarations still selects among
-            # them; restriction below (or the native wire) owns it.
+        # Native-only declarations are tool definitions too, while any survive
+        # on this route verbatim or translated: the selector (an allowed set,
+        # a custom choice, a plain mode) still selects among them.
+        native_served = bool(
+            provider_updates.get("provider_native_tools", request.provider_native_tools)
+            or provider_updates.get("tools")
+        )
+        if request.tool_choice is not None and not native_served:
             ignore("tool_choice")
-        if request.parallel_tool_calls is not None:
+        if request.parallel_tool_calls is not None and not native_served:
             ignore("parallel_tool_calls")
+        elif native_served:
+            shape_parallel_tool_calls()
     elif (
         isinstance(request.tool_choice, GatewayNamedToolChoice)
         and not any(tool.name == request.tool_choice.name for tool in request.tools)
@@ -936,20 +963,8 @@ def route_generation_parameter_requests(
             param="tool_choice",
             code="invalid_parameter",
         )
-    elif request.tool_choice == "none" and request.parallel_tool_calls is not None:
-        ignore("parallel_tool_calls")
-    elif request.parallel_tool_calls is not None and all(
-        profile.dialect in _NO_PARALLEL_TOOL_CONTROL_DIALECTS for profile in profiles
-    ):
-        # No rung has a parallel-tool control: true drops, false is serialized per rung.
-        if request.parallel_tool_calls:
-            ignore("parallel_tool_calls", "parallel_tool_calls->dropped(provider_default)")
-        else:
-            ignore(
-                "parallel_tool_calls",
-                "parallel_tool_calls->emulated(serialized_by_gateway)",
-            )
-            provider_updates["serialize_tool_calls"] = True
+    else:
+        shape_parallel_tool_calls()
 
     if request.logprobs is False:
         ignore("logprobs")
