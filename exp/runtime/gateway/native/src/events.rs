@@ -64,6 +64,12 @@ pub struct Usage {
     /// Media units priced by the deployment's unit card; absent on token-priced attempts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billed_units: Option<BilledUnits>,
+    /// The provider read this call's cache writes back in-call (Google explicit
+    /// caching). Settlement stays disjoint; Chat reports the writes inside
+    /// `cached_tokens` too, as OpenRouter's Gemini relay does. A rendering fact
+    /// only, never serialized.
+    #[serde(skip)]
+    pub cache_writes_read_back: bool,
 }
 
 /// One completed tool call with provider-order raw argument text.

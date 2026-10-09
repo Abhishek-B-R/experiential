@@ -15,6 +15,7 @@ pub(super) fn responses_usage(usage: Option<&Usage>) -> Value {
     let input = usage.input_tokens.unwrap_or(0);
     let output = usage.output_tokens.unwrap_or(0);
     let mut input_details = json!({
+        // Responses stays disjoint: its parsers have no overlapping mode.
         "cached_tokens": usage.cached_input_tokens.unwrap_or(0),
         "cache_write_tokens": usage.cache_creation_input_tokens.unwrap_or(0),
     });
