@@ -44,6 +44,7 @@ fn chat_cache_ttl_survives_two_gateway_hops_without_inventing_zero() {
             cache_creation_1h_input_tokens: hour,
             reasoning_tokens: Some(5),
             billed_units: None,
+            cache_writes_read_back: false,
         };
         for streaming in [false, true] {
             let mut current = usage.clone();
@@ -527,4 +528,199 @@ fn chat_aggregate_gains_annotations_and_the_usage_meter_only_when_searched() {
     );
     assert!(!plain.contains("annotations"));
     assert!(!plain.contains("server_tool_use_details"));
+}
+
+fn custom_tool_events(custom: bool, name: &str, deltas: &[&str], raw: &str) -> Vec<Event> {
+    let mut events = vec![Event::ToolCallStarted {
+        custom,
+        namespace: None,
+        caller: None,
+        index: 0,
+        call_id: "call-custom".to_string(),
+        name: name.to_string(),
+    }];
+    events.extend(deltas.iter().map(|delta| Event::ToolArgumentsDelta {
+        index: 0,
+        delta: (*delta).to_string(),
+    }));
+    events.push(Event::ToolCallCompleted {
+        index: 0,
+        call: crate::events::CompletedToolCall {
+            namespace: None,
+            caller: None,
+            call_id: "call-custom".to_string(),
+            name: name.to_string(),
+            raw_arguments: raw.to_string(),
+            provider_item_id: None,
+            provider_status: None,
+            custom,
+        },
+    });
+    events.push(Event::Completed);
+    events
+}
+
+fn chat_stream_payloads(events: &[Event]) -> Vec<Value> {
+    let mut encoder =
+        ChatSseEncoder::new_with_ignored("request-1", "coding", 1_700_000_000, false, Vec::new());
+    let mut frames = encoder.start().expect("starts");
+    for event in events {
+        frames.extend(encoder.feed(event).expect("encodes"));
+    }
+    frames
+        .iter()
+        .filter(|frame| frame.starts_with("data: {"))
+        .map(|frame| chat_payload(frame))
+        .collect()
+}
+
+#[test]
+fn chat_stream_renders_a_custom_tool_call_in_openais_chat_shape() {
+    // Captured from api.openai.com Chat Completions (gpt-5-nano, 2026-10-09):
+    // the start carries `type: custom` with an empty input, each delta
+    // carries only `custom.input`, and the turn finishes with `tool_calls`.
+    let events = custom_tool_events(true, "code_exec", &["print", "(2+2)"], "print(2+2)");
+    let payloads = chat_stream_payloads(&events);
+    let calls: Vec<&Value> = payloads
+        .iter()
+        .filter_map(|payload| payload["choices"][0]["delta"].get("tool_calls"))
+        .collect();
+    assert_eq!(
+        calls,
+        vec![
+            &json!([{"index": 0, "id": "call-custom", "type": "custom",
+                     "custom": {"name": "code_exec", "input": ""}}]),
+            &json!([{"index": 0, "custom": {"input": "print"}}]),
+            &json!([{"index": 0, "custom": {"input": "(2+2)"}}]),
+        ]
+    );
+    let finish = payloads
+        .iter()
+        .find_map(|payload| payload["choices"][0]["finish_reason"].as_str())
+        .expect("finish chunk");
+    assert_eq!(finish, "tool_calls");
+}
+
+#[test]
+fn chat_stream_refuses_a_completion_that_changes_the_custom_kind() {
+    let mut events = custom_tool_events(false, "code_exec", &["{}"], "{}");
+    if let Event::ToolCallCompleted { call, .. } = &mut events[2] {
+        call.custom = true;
+    }
+    let mut encoder =
+        ChatSseEncoder::new_with_ignored("request-1", "coding", 1_700_000_000, false, Vec::new());
+    encoder.start().expect("starts");
+    encoder.feed(&events[0]).expect("start encodes");
+    encoder.feed(&events[1]).expect("delta encodes");
+    assert!(encoder.feed(&events[2]).is_err());
+}
+
+#[test]
+fn chat_aggregate_renders_a_custom_tool_call_in_openais_chat_shape() {
+    let events = custom_tool_events(true, "code_exec", &["print(2+2)\n"], "print(2+2)\n");
+    let completed =
+        completed_chat_body_with_ignored("request-1", "coding", 1_700_000_000, &events, &[], false)
+            .expect("completed body must encode");
+    let choice = &completed.body["choices"][0];
+    assert_eq!(
+        choice["message"]["tool_calls"],
+        json!([{"id": "call-custom", "type": "custom",
+                "custom": {"name": "code_exec", "input": "print(2+2)\n"}}])
+    );
+    assert_eq!(choice["finish_reason"], json!("tool_calls"));
+}
+
+#[test]
+fn chat_stream_unwraps_a_translated_custom_call_for_a_chat_caller() {
+    // A foreign wire served the custom tool as a function with one `input`
+    // string; the inverter restores the custom call and the Chat encoder
+    // emits the caller's custom shape with the whole freeform input at once.
+    let mut inverter = crate::codex_native_inversion::NativeToolInverter::default();
+    inverter.translation = std::collections::HashMap::from([(
+        "code_exec".to_string(),
+        ("code_exec".to_string(), None, true),
+    )]);
+    let provider = custom_tool_events(
+        false,
+        "code_exec",
+        &["{\"input\":\"print(", "2+2)\"}"],
+        "{\"input\":\"print(2+2)\"}",
+    );
+    let mut inverted = Vec::new();
+    for event in provider {
+        inverted.extend(inverter.filter(event).expect("inverts"));
+    }
+    let payloads = chat_stream_payloads(&inverted);
+    let calls: Vec<&Value> = payloads
+        .iter()
+        .filter_map(|payload| payload["choices"][0]["delta"].get("tool_calls"))
+        .collect();
+    assert_eq!(
+        calls,
+        vec![
+            &json!([{"index": 0, "id": "call-custom", "type": "custom",
+                     "custom": {"name": "code_exec", "input": ""}}]),
+            &json!([{"index": 0, "custom": {"input": "print(2+2)"}}]),
+        ]
+    );
+}
+
+/// A Gemini automatic-cache creation read back in-call (10,663 of 11,933
+/// input tokens written, none read from an earlier cache).
+fn written_and_read_back() -> Usage {
+    Usage {
+        input_tokens: Some(11_933),
+        output_tokens: Some(9),
+        cached_input_tokens: Some(0),
+        cache_creation_input_tokens: Some(10_663),
+        cache_creation_1h_input_tokens: Some(0),
+        cache_writes_read_back: true,
+        ..Usage::default()
+    }
+}
+
+#[test]
+fn openai_shapes_report_writes_read_back_inside_cached_tokens_like_openrouter() {
+    // OpenRouter's Gemini relay reports the creating call's written tokens in
+    // `cached_tokens` too; the OpenAI-shape renderers match it.
+    let usage = written_and_read_back();
+    for wire in [
+        streaming_chat_usage(&usage),
+        completed_chat_usage(Some(&usage)),
+    ] {
+        let details = &wire["prompt_tokens_details"];
+        assert_eq!(details["cached_tokens"], 10_663);
+        assert_eq!(details["cache_write_tokens"], 10_663);
+        assert_eq!(wire["prompt_tokens"], 11_933);
+    }
+    // A reuse on the same call adds to the read-back writes.
+    let mixed = Usage {
+        cached_input_tokens: Some(500),
+        ..written_and_read_back()
+    };
+    assert_eq!(
+        completed_chat_usage(Some(&mixed))["prompt_tokens_details"]["cached_tokens"],
+        11_163
+    );
+}
+
+#[test]
+fn disjoint_writes_and_the_anthropic_shape_keep_reads_and_writes_apart() {
+    // Writes that were not read back (Anthropic, Bedrock) stay disjoint.
+    let disjoint = Usage {
+        cache_writes_read_back: false,
+        ..written_and_read_back()
+    };
+    assert_eq!(
+        completed_chat_usage(Some(&disjoint))["prompt_tokens_details"]["cached_tokens"],
+        0
+    );
+    // Anthropic clients sum the legs into the prompt size, so the Messages
+    // shape never double reports a written token as read.
+    let messages = crate::encode_messages::messages_usage(Some(&written_and_read_back()));
+    assert_eq!(messages["cache_read_input_tokens"], 0);
+    assert_eq!(messages["cache_creation_input_tokens"], 10_663);
+    assert_eq!(messages["input_tokens"], 1_270);
+    // Settlement's disjoint read leg is untouched by the reporting convention.
+    assert_eq!(written_and_read_back().cached_input_tokens, Some(0));
 }

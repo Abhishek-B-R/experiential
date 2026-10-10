@@ -28,6 +28,7 @@ from exp.runtime.gateway.explicit_cache import (
     CacheOffer,
     CachePrefix,
     CacheReady,
+    CacheRenewal,
     CacheResult,
     ExplicitCacheHost,
     GoogleCacheAuthority,
@@ -315,14 +316,16 @@ def _assert_private(value: str) -> None:
         assert secret not in value
 
 
-@pytest.mark.parametrize("method", ["authority", "claim", "record"])
+@pytest.mark.parametrize("method", ["authority", "claim", "record", "record_renewal"])
 @pytest.mark.parametrize("malformation", ["missing", "noncallable"])
 def test_invalid_host_contract_is_refused_before_admission(
     tmp_path: Path, method: str, malformation: str
 ) -> None:
     """Incomplete cache hosts cannot start a control plane that might later dispatch HTTP."""
     control, _key = _control(tmp_path)
-    invalid = SimpleNamespace(authority=mock.Mock(), claim=mock.Mock(), record=mock.Mock())
+    invalid = SimpleNamespace(
+        authority=mock.Mock(), claim=mock.Mock(), record=mock.Mock(), record_renewal=mock.Mock()
+    )
     if malformation == "missing":
         delattr(invalid, method)
     else:
@@ -336,7 +339,7 @@ def test_invalid_host_contract_is_refused_before_admission(
         NativeControlPlane(control._components, explicit_cache=cast("ExplicitCacheHost", invalid))
     _assert_private(str(error.value) + repr(error.value))
     accept.assert_not_called()
-    for candidate in ("authority", "claim", "record"):
+    for candidate in ("authority", "claim", "record", "record_renewal"):
         retained = getattr(invalid, candidate, None)
         if isinstance(retained, mock.Mock):
             retained.assert_not_called()
@@ -1326,3 +1329,119 @@ def test_automatic_selection_skips_the_host_when_no_candidate_binds(
     _start_first(control, first)
     assert _prepare(control, first) == {"state": "unavailable"}
     assert host.selections == [] and host.claim_calls == 0
+
+
+class _RenewingHost(_Host):
+    """Grant one renewal lease on every reuse; settled outcomes land in ``renewals``."""
+
+    def claim(self, offer: CacheOffer) -> CacheClaim:
+        """Extend a reused resource to fifteen minutes after this offer."""
+        claim = super().claim(offer)
+        if isinstance(claim, CacheReady) and offer.renewable:
+            operation = next(iter(self.offers.values())).operation_id
+            return replace(
+                claim, renewal_operation_id=operation, renew_until=offer.requested_at + 900
+            )
+        return claim
+
+
+def _renew(control: NativeControlPlane, argument: JsonObject) -> JsonObject:
+    """Run the typed renewal callback without sending a provider request."""
+    return json.loads(control.renew_explicit_cache(json.dumps(argument)))
+
+
+def test_a_reused_resource_carries_one_renewal_lease_settled_by_the_engine(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    """A renewing host extends a reused resource once; the report is checked against the lease."""
+    host = _RenewingHost(_authority())
+    control, key = _control(tmp_path, host)
+    first = _admission(control, key)
+    _start_first(control, first)
+    creation = _prepare(control, first)
+    assert _finish(control, _finish_argument(first, creation))["state"] == "ready"
+    offer = next(iter(host.offers.values()))
+    assert offer.renewable, "a host that settles renewals is offered them"
+    clock.now += 1
+    second = _admission(control, key, suffix="What is the inventory count now?")
+    _start_first(control, second)
+    reused = _prepare(control, second)
+    assert reused["state"] == "ready"
+    renew = reused["renew"]
+    assert isinstance(renew, dict)
+    until = clock.now + 900
+    assert renew["operation_id"] == offer.operation_id
+    assert renew["expires_at"] == until
+    assert renew["expire_time"] == datetime.fromtimestamp(until, UTC).isoformat()
+    selector = {**_selector(second), "operation_id": offer.operation_id}
+    # A renewed expiry beyond the granted horizon is never trusted as renewed.
+    assert _renew(
+        control,
+        {
+            **selector,
+            "outcome": "renewed",
+            "expire_time": datetime.fromtimestamp(until + 60, UTC).isoformat(),
+        },
+    ) == {"state": "recorded"}
+    assert host.renewals[-1].outcome == "unknown"
+    # The lease settles once: a second report has nothing to settle.
+    assert _renew(control, {**selector, "outcome": "failed"}) == {"state": "unavailable"}
+    assert len(host.renewals) == 1
+
+
+def test_a_confirmed_renewal_records_the_provider_expiry(tmp_path: Path, clock: _Clock) -> None:
+    """A provider-confirmed expiry inside the lease is recorded as renewed."""
+    host = _RenewingHost(_authority())
+    control, key = _control(tmp_path, host)
+    first = _admission(control, key)
+    _start_first(control, first)
+    _finish(control, _finish_argument(first, _prepare(control, first)))
+    clock.now += 1
+    second = _admission(control, key, suffix="Any pears?")
+    _start_first(control, second)
+    reused = _prepare(control, second)
+    renew = reused["renew"]
+    assert isinstance(renew, dict)
+    assert _renew(
+        control,
+        {
+            **_selector(second),
+            "operation_id": renew["operation_id"],
+            "outcome": "renewed",
+            "expire_time": renew["expire_time"],
+        },
+    ) == {"state": "recorded"}
+    assert host.renewals == [
+        CacheRenewal(
+            operation_id=renew["operation_id"],
+            outcome="renewed",
+            observed_at=clock.now,
+            expire_time=renew["expires_at"],
+        )
+    ]
+
+
+def test_a_lease_whole_seconds_cannot_use_is_settled_as_failed(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    """A fractional lease ending within the resource's own expiry second is released."""
+
+    class _FractionalHost(_RenewingHost):
+        def claim(self, offer: CacheOffer) -> CacheClaim:
+            claim = super().claim(offer)
+            if isinstance(claim, CacheReady) and claim.renew_until is not None:
+                return replace(claim, renew_until=claim.expires_at + 0.5)
+            return claim
+
+    clock.now = 1_800_000_000.25
+    host = _FractionalHost(_authority())
+    control, key = _control(tmp_path, host)
+    first = _admission(control, key)
+    _start_first(control, first)
+    _finish(control, _finish_argument(first, _prepare(control, first)))
+    clock.now += 1
+    second = _admission(control, key, suffix="Any figs?")
+    _start_first(control, second)
+    reused = _prepare(control, second)
+    assert reused["state"] == "ready" and "renew" not in reused
+    assert [renewal.outcome for renewal in host.renewals] == ["failed"]

@@ -36,6 +36,13 @@ impl Host {
             .map(|value| value.to_string())
     }
 
+    pub(super) fn push_error(&self) {
+        self.replies
+            .lock()
+            .unwrap()
+            .push_back(Err(PublicError::internal()));
+    }
+
     pub(super) fn calls(&self) -> Vec<(&'static str, Value)> {
         self.calls.lock().unwrap().clone()
     }
