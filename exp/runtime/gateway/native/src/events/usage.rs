@@ -5,6 +5,10 @@
 use serde_json::{Map, Value};
 
 use super::Usage;
+use cache_subsets::{cache_subsets, separate_written_reads, validate_cache_subsets};
+
+#[path = "usage/cache_subsets.rs"]
+mod cache_subsets;
 
 impl Usage {
     /// Mark unknown subsets that an OpenAI-compatible shape represents as zero.
@@ -47,6 +51,19 @@ impl Usage {
             .cache_creation_input_tokens
             .max(newer.cache_creation_input_tokens);
         self.reasoning_tokens = self.reasoning_tokens.max(newer.reasoning_tokens);
+        self.cache_writes_read_back |= newer.cache_writes_read_back;
+    }
+
+    /// The `cached_tokens` an OpenAI-shape response reports: the disjoint
+    /// read leg, plus the writes when the provider read them back in-call.
+    /// Absent stays absent; billing never reads this.
+    pub fn reported_cached_input_tokens(&self) -> Option<u64> {
+        match (self.cached_input_tokens, self.cache_creation_input_tokens) {
+            (cached, Some(written)) if self.cache_writes_read_back => {
+                Some(cached.unwrap_or(0).saturating_add(written))
+            }
+            (cached, _) => cached,
+        }
     }
 }
 
@@ -317,6 +334,7 @@ impl OpenAiUsageAccumulator {
             cache_creation_1h_input_tokens: covering_writes.and(cache_creation_1h_input_tokens),
             reasoning_tokens,
             billed_units: None,
+            cache_writes_read_back: false,
         });
         // Initial split fragments support a provisional mode until counters
         // change. A coherent raw output/reasoning/total sample may correct it;
@@ -406,28 +424,6 @@ fn unreported_token_details(
     Ok(unreported)
 }
 
-fn validate_cache_subsets(usage: &Usage) -> Result<(), String> {
-    if let (Some(hour), Some(written)) = (
-        usage.cache_creation_1h_input_tokens,
-        usage.cache_creation_input_tokens,
-    ) {
-        if hour > written {
-            return Err("one-hour cache writes exceed total cache writes".into());
-        }
-    }
-    let subsets = bounded_ledger_sum(
-        &[
-            usage.cached_input_tokens.unwrap_or(0),
-            usage.cache_creation_input_tokens.unwrap_or(0),
-        ],
-        "cache subsets",
-    )?;
-    if usage.input_tokens.is_some_and(|input| subsets > input) {
-        return Err("cache read and write tokens exceed total input tokens".into());
-    }
-    Ok(())
-}
-
 /// Parse a Chat Completions usage object: a malformed object fails the stream
 /// instead of silently dropping token accounting.
 /// `completion_tokens_details.reasoning_tokens` folds into `output_tokens`
@@ -435,54 +431,6 @@ fn validate_cache_subsets(usage: &Usage) -> Result<(), String> {
 #[cfg(test)]
 pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
     OpenAiUsageAccumulator::default().update_chat(value)
-}
-
-/// Read the cache subsets of OpenAI-shaped total input. Disjoint reads and
-/// writes must fit input together; writes reported within reads must fit the
-/// reads, which must fit input.
-fn cache_subsets(
-    object: &Map<String, Value>,
-    detail_key: &str,
-    input_tokens: Option<u64>,
-    writes_within_reads: bool,
-) -> Result<(Option<u64>, Option<u64>), String> {
-    let reads = optional_usage_detail(object, detail_key, "cached_tokens", "cached_tokens")?;
-    let writes = optional_usage_detail(
-        object,
-        detail_key,
-        "cache_write_tokens",
-        "cache_write_tokens",
-    )?;
-    // A write not covered by its read count is reported the ordinary disjoint
-    // way; it must then fit input like any other rung. Usage arrives after the
-    // content already streamed, so a placeable report never fails the stream.
-    if writes_within_reads && writes.unwrap_or(0) <= reads.unwrap_or(0) {
-        if input_tokens.is_some_and(|input| reads.unwrap_or(0) > input) {
-            return Err("cache read tokens exceed total input tokens".to_string());
-        }
-        return Ok((reads, writes));
-    }
-    let subsets = bounded_ledger_sum(&[reads.unwrap_or(0), writes.unwrap_or(0)], "cache subsets")?;
-    if input_tokens.is_some_and(|input| subsets > input) {
-        return Err("cache read and write tokens exceed total input tokens".to_string());
-    }
-    Ok((reads, writes))
-}
-
-/// Move tokens written and read back in one call out of the read leg, so the
-/// coalesced counts satisfy the disjoint contract every settlement prices.
-/// A write without a covering read count cannot be placed and is malformed.
-fn separate_written_reads(usage: &mut Usage) -> Result<(), String> {
-    let writes = usage.cache_creation_input_tokens.unwrap_or(0);
-    if writes == 0 {
-        return Ok(());
-    }
-    // Uncovered writes are the disjoint shape: leave them for the ordinary check.
-    let Some(reads) = usage.cached_input_tokens.filter(|reads| *reads >= writes) else {
-        return Ok(());
-    };
-    usage.cached_input_tokens = Some(reads - writes);
-    Ok(())
 }
 
 /// Parse a present Gemini `usageMetadata`: its non-optional proto3 int32
@@ -528,6 +476,7 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
         cache_creation_1h_input_tokens: None,
         reasoning_tokens: Some(reasoning_tokens),
         billed_units: None,
+        cache_writes_read_back: false,
     })
 }
 
@@ -568,6 +517,7 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
         cache_creation_1h_input_tokens: bedrock_cache_hour_subset(usage, cache_write)?,
         reasoning_tokens: None,
         billed_units: None,
+        cache_writes_read_back: false,
     })
 }
 

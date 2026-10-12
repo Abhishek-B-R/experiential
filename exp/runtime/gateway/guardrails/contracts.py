@@ -17,6 +17,10 @@ from exp.runtime.gateway.contracts import (
     IdentityId,
     OrganizationId,
 )
+from exp.runtime.gateway.guardrails.subjects import (
+    observation_subject_bytes,
+    observation_subject_exceeds,
+)
 
 DEFAULT_MAX_REQUEST_BYTES = 1_048_576
 DEFAULT_MAX_RESPONSE_BYTES = 1_048_576
@@ -113,9 +117,10 @@ class GuardrailPolicy(ContractModel):
         identity_id: Assigned identity, or None for platform scope.
         revision: Detector and rollout revision used to invalidate cached replay.
         input_execution: Inspect before dispatch by default, or overlap safe generation.
+        mode: Enforce by default, or observe read-only input checks without gating delivery.
         protected: Fail closed on classifier uncertainty; required for platform policies.
         checks: Ordered checks, empty by default.
-        max_request_bytes: Total canonical input inspection bound, default 1 MiB.
+        max_request_bytes: Complete in-memory input inspection bound, default 1 MiB.
         max_response_bytes: Total canonical output inspection bound, default 1 MiB.
     """
 
@@ -124,6 +129,7 @@ class GuardrailPolicy(ContractModel):
     identity_id: IdentityId | None = None
     revision: str = Field(default="configured", min_length=1, max_length=256)
     input_execution: Literal["before_dispatch", "parallel"] = "before_dispatch"
+    mode: Literal["enforce", "observe"] = "enforce"
     protected: bool = False
     checks: tuple[GuardrailCheck, ...] = ()
     max_request_bytes: int = Field(default=DEFAULT_MAX_REQUEST_BYTES, ge=1, le=64 * 1024 * 1024)
@@ -146,6 +152,11 @@ class GuardrailPolicy(ContractModel):
             raise ValueError("guardrail scope requires both organization_id and identity_id")
         if self.organization_id is None and not self.protected:
             raise ValueError("platform guardrail policies must be protected")
+        if self.mode == "observe" and any(
+            check.stage is GuardrailCheckStage.OUTPUT or check.action is GuardrailAction.MODIFY
+            for check in self.checks
+        ):
+            raise ValueError("observation requires read-only input checks")
         return self
 
     def bind(self, organization_id: OrganizationId, identity_id: IdentityId) -> GuardrailPolicy:
@@ -209,6 +220,48 @@ class ClassifierVerdict(ContractModel):
     replacement_messages: tuple[GatewayMessage, ...] | None = None
 
 
+class GuardrailOutcome(StrEnum):
+    """Content-free inspection outcomes, distinct from authored enforcement actions."""
+
+    ALLOW = "allow"
+    FLAGGED = "flagged"
+    UNSUPPORTED = "unsupported"
+    UNCERTAIN = "uncertain"
+    UNAVAILABLE = "unavailable"
+    TIMEOUT = "timeout"
+    SKIPPED = "skipped"
+
+
+class ClassifierCoverageError(Exception):
+    """The complete subject cannot be inspected; retries cannot restore coverage."""
+
+    def __init__(self) -> None:
+        """Carry no detector diagnostics or request content across the adapter boundary."""
+        super().__init__("Content inspection does not support this complete request.")
+
+
+class ClassifierUncertainError(Exception):
+    """The classifier completed without establishing an allow or a violation."""
+
+    def __init__(self) -> None:
+        """Keep uncertainty distinguishable without retaining classifier diagnostics."""
+        super().__init__("Content inspection could not determine a decision.")
+
+
+def coverage_failure(*, check_id: str | None = None) -> GatewayFailure:
+    """Return a content-free, nonretryable coverage error with no failover authority."""
+    return GatewayFailure(
+        failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
+        safe_message=(
+            "Content inspection does not support this complete request. "
+            "Use a supported context or modality."
+        ),
+        safe_details={"action": "error", **({} if check_id is None else {"check_id": check_id})},
+        retryable_same_deployment=False,
+        failover_eligible=False,
+    )
+
+
 class GuardrailRejected(Exception):
     """A guardrail chain decided to block or fail a request."""
 
@@ -225,9 +278,10 @@ class GuardrailRejected(Exception):
 def request_content_bytes(request: GatewayRequest) -> int:
     """Return UTF-8 size of the compact JSON request subject sent to classifiers.
 
-    The bound is the exact deterministic serialization used as the ``request``
+    This count is the exact deterministic serialization used as the ``request``
     subject on the ``http_json`` contract: every canonical field, including
-    messages, tool definitions, structured schemas, and metadata.
+    messages, tool definitions, structured schemas, and metadata. Inspection
+    admission separately bounds the complete in-memory subject, including exclusions.
 
     Args:
         request: Canonical request after optional continuation expansion.
@@ -236,6 +290,19 @@ def request_content_bytes(request: GatewayRequest) -> int:
         Byte count of the compact UTF-8 JSON subject.
     """
     return len(canonical_json_bytes(request))
+
+
+def request_exceeds_inspection_limit(request: GatewayRequest, maximum_bytes: int) -> bool:
+    """Bound every classifier-visible field before any adapter constructs its projection.
+
+    The ordinary HTTP serialization excludes private provider carriers that local
+    adapters can inspect. Apply a no-copy size lower bound to the complete subject
+    first, then encode only a bounded candidate for exact UTF-8 JSON accounting.
+    The HTTP adapter's narrower wire representation remains unchanged.
+    """
+    return observation_subject_exceeds(request, maximum_bytes) or (
+        len(observation_subject_bytes(request)) > maximum_bytes
+    )
 
 
 def guardrail_failure(*, action: GuardrailAction, check_id: str | None = None) -> GatewayFailure:

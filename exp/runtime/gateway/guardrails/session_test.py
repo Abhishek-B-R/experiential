@@ -35,6 +35,8 @@ from exp.runtime.gateway.guardrails.native import validate_guardrail_engine
 from exp.runtime.gateway.guardrails.native_test import _authorization
 from exp.runtime.gateway.guardrails.session import GuardrailSession
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
+from exp.runtime.gateway.guardrails.subjects import observation_subject_bytes
+from exp.runtime.gateway.native_capture import capture_unavailable_failure
 from exp.runtime.gateway.tests.parallel_input_guardrails_test import _Classifier, _engine
 from exp.runtime.gateway.tool_contracts import GatewayProviderNativeTool
 
@@ -60,6 +62,146 @@ def _await(session: GuardrailSession) -> None:
     while session.input_decision()["action"] == "pending" and time.monotonic() < deadline:
         time.sleep(0.001)
     assert session.input_decision()["action"] != "pending"
+
+
+def _observer_policy() -> GuardrailPolicy:
+    """Select one bounded input observer shared by the admission preparation tests."""
+    return GuardrailPolicy(
+        policy_id="observer",
+        mode="observe",
+        protected=True,
+        checks=(
+            GuardrailCheck(
+                check_id="input",
+                adapter_id="criminal",
+                capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+                stage=GuardrailCheckStage.INPUT,
+                action=GuardrailAction.BLOCK,
+                timeout_ms=1000,
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize("mode", ["observe", "enforce"])
+def test_explicit_required_release_failure_survives_policy_mode_and_later_cancel(mode: str) -> None:
+    """Optional observation cannot hide a host capture failure or its charge waiver."""
+    policy = _observer_policy().model_copy(update={"mode": mode})
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": ScriptedClassifier()})),
+        monotonic=time.monotonic,
+    )
+    try:
+        session = _session(engine)
+        session.inspect_input(_request())
+        assert session.input_decision() == {"action": "allow"}
+        session.cancel(capture_unavailable_failure())
+        session.cancel()
+        decision = session.input_decision()
+        assert decision["action"] == "error"
+        failure = session.settlement_failure()
+        assert failure is not None
+        assert failure.safe_details["code"] == "capture_unavailable"
+        assert failure.safe_details["input_guardrail_denied"] is True
+        assert decision["failure"] == failure.model_dump(mode="json")
+        with pytest.raises(GuardrailRejected) as inspected:
+            session.inspect_input(_request())
+        assert inspected.value.failure == failure
+        with pytest.raises(GuardrailRejected) as dispatched:
+            session.prepare_dispatch((_request(),), overlap=True)
+        assert dispatched.value.failure == failure
+    finally:
+        engine.close(timeout_seconds=2)
+
+
+@pytest.mark.parametrize("defer", [False, True])
+@pytest.mark.parametrize("overlap", [False, True])
+def test_closed_observer_remains_optional_without_accepting_new_subjects(
+    defer: bool, overlap: bool
+) -> None:
+    """Late host callbacks preserve delivery and billing without restarting observation."""
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((_observer_policy(),)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": ScriptedClassifier()})),
+        monotonic=time.monotonic,
+    )
+    try:
+        session = _session(engine)
+        session.cancel()
+        request = _request("late callback")
+        with patch.object(engine, "observe_inputs") as observe:
+            assert session.inspect_input(request, defer=defer) is request
+            session.prepare_dispatch((request,), overlap=overlap)
+            observe.assert_not_called()
+        assert session.input_decision() == {"action": "allow"}
+        assert session.settlement_failure() is None
+        completion = GuardrailCompletion(text="still deliverable")
+        assert session.inspect_output(completion) is completion
+        assert not session.input_pending
+    finally:
+        engine.close(timeout_seconds=2)
+
+
+def test_observing_policies_share_one_complete_subject_encoding() -> None:
+    """Three policies reuse one request-path encoding while copies still deduplicate inspection."""
+    policies = tuple(
+        _observer_policy().model_copy(update={"policy_id": f"observer-{index}"})
+        for index in range(3)
+    )
+    classifier = KeywordClassifier(("blocked",))
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore(policies),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": classifier})),
+        monotonic=time.monotonic,
+    )
+    session = _session(engine)
+    request = _request("visible")
+    try:
+        with patch(
+            "exp.runtime.gateway.guardrails.enforcement.observation_subject_bytes",
+            wraps=observation_subject_bytes,
+        ) as encoded:
+            assert session.inspect_input(request) is request
+            assert encoded.call_count == 1
+            copied = request.model_copy(deep=True)
+            assert session.inspect_input(copied) is copied
+            assert encoded.call_count == 2
+    finally:
+        engine.close(timeout_seconds=2)
+    assert classifier.input_calls == 3
+
+
+@pytest.mark.parametrize("unavailable", ["expired", "closed", "oversized", "full"])
+def test_rejected_observation_admission_does_not_serialize_the_request(unavailable: str) -> None:
+    """Oversized optional subjects never allocate JSON, including after other admission closes."""
+    classifier = _Classifier("allow")
+    policy = _observer_policy().model_copy(update={"max_request_bytes": 8192})
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": classifier})),
+        monotonic=time.monotonic,
+        max_observations=1,
+    )
+    session = _session(engine)
+    try:
+        if unavailable == "expired":
+            session.deadline_monotonic = time.monotonic() - 1
+        elif unavailable == "closed":
+            engine.close(timeout_seconds=0)
+        elif unavailable == "full":
+            session.inspect_input(_request("first"))
+            assert classifier.started.wait(2)
+        request = _request("x" * 100_000)
+        with patch(
+            "exp.runtime.gateway.guardrails.enforcement.observation_subject_bytes",
+            side_effect=AssertionError("rejected observer serialized customer input"),
+        ):
+            assert session.inspect_input(request) is request
+    finally:
+        classifier.release.set()
+        engine.close(timeout_seconds=2)
+    assert len(classifier.requests) == (1 if unavailable == "full" else 0)
 
 
 @pytest.mark.parametrize("scope", ["platform", "identity"])

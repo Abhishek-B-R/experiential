@@ -26,6 +26,7 @@ from exp.runtime.gateway.guardrails.deterministic import (
     native_output_plan,
 )
 from exp.runtime.gateway.guardrails.streaming import StreamSegment
+from exp.runtime.gateway.guardrails.subjects import ObservedSubjects
 
 if TYPE_CHECKING:
     from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
@@ -65,6 +66,7 @@ class GuardrailSession:
         _input_approved_at: Approval time, or None before the current subject is approved.
         _closed: Whether cancellation closed this session, false initially.
         _inspected: Exact input and approved-result pairs, empty before inspection.
+        _observed: Content-free subject identities and optional observation admission state.
     """
 
     engine: GuardrailEngine
@@ -78,10 +80,28 @@ class GuardrailSession:
     _inspected: list[tuple[GatewayRequest, GatewayRequest]] = field(
         default_factory=list, init=False, repr=False
     )
+    _observed: ObservedSubjects = field(default_factory=ObservedSubjects, init=False, repr=False)
+
+    @property
+    def enforcing_policies(self) -> tuple[GuardrailPolicy, ...]:
+        """Return the frozen policies authorized to affect delivery or settlement."""
+        return tuple(policy for policy in self.policies if policy.mode == "enforce")
+
+    def _observe_input(self, request: GatewayRequest) -> None:
+        """Submit each complete context once without retaining its text in the session."""
+        observers = tuple(p for p in self.policies if p.mode == "observe" and p.input_checks)
+        if not observers:
+            return
+        self.engine.observe_inputs(
+            policies=observers,
+            request=request,
+            deadline_monotonic=self.deadline_monotonic,
+            observed=self._observed,
+        )
 
     def can_overlap_input(self, request: GatewayRequest) -> bool:
         """Overlap read-only input decisions only when generation cannot cause side effects."""
-        inputs = tuple(p for p in self.policies if p.input_checks)
+        inputs = tuple(p for p in self.enforcing_policies if p.input_checks)
         return (
             bool(inputs)
             and all(p.input_execution == "parallel" for p in inputs)
@@ -95,10 +115,15 @@ class GuardrailSession:
 
     def inspect_input(self, request: GatewayRequest, *, defer: bool = False) -> GatewayRequest:
         """Enforce the authored input chain and validate its final rewrite."""
-        if self._closed:
-            raise GuardrailRejected(denied_input_failure())
         if self._input_failure is not None:
             raise GuardrailRejected(self._input_failure)
+        if self._closed:
+            if self.enforcing_policies:
+                raise GuardrailRejected(denied_input_failure())
+            return request
+        self._observe_input(request)
+        if not self.enforcing_policies:
+            return request
         if defer:
             return request
         for subject, result in self._inspected:
@@ -122,7 +147,7 @@ class GuardrailSession:
         """Retain scope and authored order for each check's execution and final validation."""
         return tuple(
             policy.model_copy(update={"checks": (check,)})
-            for policy in self.policies
+            for policy in self.enforcing_policies
             for check in policy.checks
             if check.stage is stage
         )
@@ -172,15 +197,18 @@ class GuardrailSession:
 
     def prepare_dispatch(self, subjects: Sequence[GatewayRequest], *, overlap: bool) -> None:
         """Finish admission or start one approval task before any upstream attempt."""
-        if self._closed:
-            raise GuardrailRejected(denied_input_failure())
         if self._input_failure is not None:
             raise GuardrailRejected(self._input_failure)
+        if self._closed:
+            if self.enforcing_policies:
+                raise GuardrailRejected(denied_input_failure())
+            return
         remaining: list[GatewayRequest] = []
         for subject in subjects:
+            self._observe_input(subject)
             if subject not in remaining and not any(subject == old for old, _ in self._inspected):
                 remaining.append(subject)
-        if not remaining or not any(p.input_checks for p in self.policies):
+        if not remaining or not any(p.input_checks for p in self.enforcing_policies):
             return
         if self._input is not None:
             raise RuntimeError("guardrail input execution already started")
@@ -213,7 +241,7 @@ class GuardrailSession:
 
     def _approved_before_deadline(self) -> bool:
         """Retain timely approval across late settlement without accepting a late verdict."""
-        return not any(p.input_checks for p in self.policies) or (
+        return not any(p.input_checks for p in self.enforcing_policies) or (
             self._input_approved_at is not None
             and self._input_approved_at < self.deadline_monotonic
         )
@@ -225,9 +253,11 @@ class GuardrailSession:
 
     def input_decision(self) -> JsonObject:
         """Poll approval without tying up a bridge worker or renewing its deadline."""
-        future = self._input
         if self._input_failure is not None:
             return {"action": "error", "failure": self._input_failure.model_dump(mode="json")}
+        if not self.enforcing_policies:
+            return {"action": "allow"}
+        future = self._input
         if self._closed or (future is None and not self._approved_before_deadline()):
             return {"action": "error", "failure": denied_input_failure().model_dump(mode="json")}
         if future is None:
@@ -274,7 +304,7 @@ class GuardrailSession:
     @property
     def output_policies(self) -> tuple[GuardrailPolicy, ...]:
         """Return the same frozen policy set restricted to output checks."""
-        return tuple(p for p in self.policies if p.output_checks)
+        return tuple(p for p in self.enforcing_policies if p.output_checks)
 
     def output_mode(
         self, request: GatewayRequest, *, reasoning: bool = False, images: bool = False

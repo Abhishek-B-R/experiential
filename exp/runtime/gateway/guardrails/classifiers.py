@@ -13,6 +13,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailCheck,
     GuardrailCompletion,
 )
+from exp.runtime.gateway.guardrails.text_coverage import text_input_context
 
 
 class ClassifierRegistry:
@@ -128,13 +129,15 @@ class KeywordClassifier:
         request: GatewayRequest,
         check: GuardrailCheck,
     ) -> ClassifierVerdict:
-        """Flag when any needle appears in canonical message content."""
+        """Flag complete supported message, tool, and schema text."""
         del check
         self.input_calls += 1
-        parts: list[str] = []
+        context = text_input_context(request)
+        parts = [context] if context else []
         for message in request.messages:
-            if message.content:
-                parts.append(message.content)
+            content = message.folded_tool_error_content()
+            if content:
+                parts.append(content)
             for call in message.tool_calls:
                 parts.append(call.arguments_json())
         return ClassifierVerdict(flagged=_contains_needle("\n".join(parts), self._needles))

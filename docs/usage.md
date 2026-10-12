@@ -336,6 +336,8 @@ calls. The quote and result exclude earlier trace mining and grounding costs; a 
 those separately before offering a complete trace-to-report price. Credit conversion, promotions,
 identity authorization and job persistence remain hosting responsibilities.
 
+Authored (written or imported) scenarios: see `reference/authored-scenarios.md`.
+
 Catalog-backed evaluations and `exp eval` have no aggregate spending limit by default. The
 estimate remains visible and uncapped execution requires an explicit Start action or `--yes`.
 Every request keeps finite token bounds and a retry-inclusive cost
