@@ -1,0 +1,33 @@
+# Shared hidden keys for the jobs in .gitlab/ci. Jobs use them with
+# `extends:` or `!reference`; see docs/gitlab-ci.md.
+
+# Pinned tool versions. Rust follows the stable channel through rustup.
+.tools:
+  variables:
+    UV_VERSION: "0.12.18"
+    MATURIN_VERSION: "1.14.1"
+
+.snippets:
+  # Installs the pinned uv into an official python image's interpreter.
+  uv:
+    - python3 -m pip install --quiet --no-cache-dir --disable-pip-version-check --root-user-action=ignore "uv==${UV_VERSION}"
+  # Installs the pinned uv on a hosted macOS runner.
+  uv-macos:
+    - curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | env UV_INSTALL_DIR="$HOME/.local/bin" UV_NO_MODIFY_PATH=1 sh
+    - export PATH="$HOME/.local/bin:$PATH"
+  # Installs the pinned uv on the hosted Windows runner, whose shell is PowerShell.
+  uv-windows:
+    - $env:UV_INSTALL_DIR = "$env:USERPROFILE\.local\bin"
+    - $env:UV_NO_MODIFY_PATH = "1"
+    - Invoke-RestMethod "https://astral.sh/uv/$env:UV_VERSION/install.ps1" | Invoke-Expression
+    - $env:Path = "$env:USERPROFILE\.local\bin;$env:Path"
+  # Installs the stable Rust toolchain with rustup into $CARGO_HOME, or
+  # ~/.cargo when the job sets no CARGO_HOME.
+  rust:
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable
+    - export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+  # Installs the stable MSVC Rust toolchain on the hosted Windows runner.
+  rust-windows:
+    - Invoke-WebRequest -UseBasicParsing -Uri "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe" -OutFile "$env:TEMP\rustup-init.exe"
+    - '& "$env:TEMP\rustup-init.exe" -y --no-modify-path --profile minimal --default-toolchain stable'
+    - $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"

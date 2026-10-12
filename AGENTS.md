@@ -234,7 +234,7 @@ uv run pytest -q
    its existing identity digest remains frozen for router artifact compatibility.
 
 5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `exp/`,
-   `docs/`, `assets/`, `.claude/`, `.github/`. That list is closed.
+   `docs/`, `assets/`, `.claude/`, `.github/`, `.gitlab/`. That list is closed.
 
    `.agents/` is the one sanctioned scratchpad: a local, gitignored working directory for agent
    sessions (notes, probe scripts, run outputs). It is never tracked, never part of a PR, and
@@ -255,9 +255,10 @@ uv run pytest -q
      and their rendered figures under `docs/research/figures/`), `docs/reference/` (how-to
      references verified against main), and `docs/cookbook/` (end-to-end walks through the whole
      pipeline on one benchmark, each step one real CLI command plus the artifact it creates),
-     plus two root pages: `docs/usage.md` (the terse map of the CLI surface: one line of purpose
-     and one artifact per command) and `docs/release-scope.md` (the supported and explicitly
-     excluded claims of the current release, checked by `exp/tests/release_test.py`). Nothing else: raw
+     plus three root pages: `docs/usage.md` (the terse map of the CLI surface: one line of purpose
+     and one artifact per command), `docs/release-scope.md` (the supported and explicitly
+     excluded claims of the current release, checked by `exp/tests/release_test.py`), and
+     `docs/gitlab-ci.md` (the CI pipeline conventions). Nothing else: raw
      result JSONs, vector sources, design notes, and drafts stay out of the repo. `docs/README.md`
      indexes every doc and records its purpose. Update or remove superseded material only after
      checking references and retaining durable evidence.
@@ -273,7 +274,9 @@ uv run pytest -q
      `exp/runtime/models/providers/`.
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.
-   - `.github/` — CI workflows.
+   - `.github/`: the gate and gateway-latency workflows.
+   - `.gitlab/`: GitLab CI. `.gitlab/ci/` holds one file per pipeline area, included by the
+     root `.gitlab-ci.yml`; `docs/gitlab-ci.md` describes the conventions.
 
    Scratch work has no home in this repo. One-off scripts, experiment runners, scratchpads, and
    drafts go outside the checkout (`/tmp`, a personal directory, or the Notion experiments area
@@ -376,9 +379,10 @@ Rules of the road:
 - **Gate scoping**: the root gate is `uv run ruff check .`, `uv run ty check`, `uv run pytest -q`,
   all over the single `testpaths = ["exp"]`. Tests are inline `*_test.py` beside the module they
   cover. There is exactly one ruff config and one ty config, at the root.
-- **Publishing**: `.github/workflows/python-package.yml` builds and publishes the flagship
+- **Publishing**: `.gitlab/ci/python-package.yml` builds and publishes the flagship
   `experiential` distribution and the `exp-gateway-native` abi3 wheel matrix; the publish job
-  runs only for a GitHub release and uses the `pypi` trusted-publisher environment.
+  runs only for a protected release tag pipeline (`v<version>`) or an explicit latest-release
+  replay on `main`, and uses the `pypi` trusted-publisher environment.
 
 ## Docs
 
