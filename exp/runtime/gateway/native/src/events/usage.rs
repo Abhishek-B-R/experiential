@@ -273,13 +273,25 @@ impl OpenAiUsageAccumulator {
         let input_tokens = count_if_present(object, input_key, "OpenAI usage")?;
         let output_tokens = count_if_present(object, output_key, "OpenAI usage")?;
         let unreported = unreported_token_details(object, input_details, output_details)?;
-        let reasoning_tokens = optional_usage_detail(
+        let nested_reasoning = optional_usage_detail(
             object,
             output_details,
             "reasoning_tokens",
             "OpenAI reasoning_tokens",
-        )?
-        .filter(|_| !unreported[3]);
+        )?;
+        // Azure AI Foundry's DeepSeek models report the Chat reasoning subset
+        // as a top-level count; the nested placement wins when both appear.
+        let top_level_reasoning = if chat {
+            count_if_present(object, "reasoning_tokens", "OpenAI usage")?
+        } else {
+            None
+        };
+        if unreported[3] && top_level_reasoning.is_some_and(|count| count != 0) {
+            return Err("an unreported token detail cannot contain a positive count".into());
+        }
+        let reasoning_tokens = nested_reasoning
+            .or(top_level_reasoning)
+            .filter(|_| !unreported[3]);
         let total_tokens = count_if_present(object, "total_tokens", "OpenAI usage")?;
         let (cached_input_tokens, cache_creation_input_tokens) = cache_subsets(
             object,

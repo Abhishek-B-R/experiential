@@ -69,4 +69,9 @@ def unreported_token_details(usage: JsonObject, *, responses: bool = False) -> f
         count = details.get(name)
         if count is not None and (type(count) is not int or count != 0):
             raise ValueError("unreported token detail contradicts its compatibility placeholder")
+    if "reasoning_tokens" in names and not responses:
+        # A top-level Chat reasoning count is held to the same placeholder rule.
+        count = usage.get("reasoning_tokens")
+        if count is not None and (type(count) is not int or count != 0):
+            raise ValueError("unreported token detail contradicts its compatibility placeholder")
     return names

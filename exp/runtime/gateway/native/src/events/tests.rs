@@ -505,6 +505,66 @@ fn openai_compatible_usage_folds_an_additive_provider_into_output_tokens() {
 }
 
 #[test]
+fn openai_compatible_usage_reads_a_top_level_reasoning_count() {
+    // Verbatim streamed usage from Azure Foundry DeepSeek-V4.1-Flash
+    // (2026-10-11, reasoning_effort high): the reasoning count sits at the
+    // top level of usage, inside completion_tokens (40 + 20 = 60).
+    let usage = openai_compatible_usage(&json!({
+        "total_tokens": 60,
+        "completion_tokens": 20,
+        "prompt_tokens": 40,
+        "prompt_tokens_details": null,
+        "reasoning_tokens": 18,
+    }))
+    .expect("valid usage");
+    assert_eq!(usage.output_tokens, Some(20));
+    assert_eq!(usage.reasoning_tokens, Some(18));
+    // The nested OpenAI placement wins when a wire carries both.
+    let both = openai_compatible_usage(&json!({
+        "prompt_tokens": 40,
+        "completion_tokens": 20,
+        "total_tokens": 60,
+        "completion_tokens_details": {"reasoning_tokens": 12},
+        "reasoning_tokens": 18,
+    }))
+    .expect("valid usage");
+    assert_eq!(both.reasoning_tokens, Some(12));
+    // A relay's unknown-meter marker keeps a zero placeholder unknown and
+    // refuses a positive top-level count, as it does a nested one.
+    let unreported = openai_compatible_usage(&json!({
+        "prompt_tokens": 40,
+        "completion_tokens": 20,
+        "reasoning_tokens": 0,
+        "unreported_token_details": ["reasoning_tokens"],
+    }))
+    .expect("valid usage");
+    assert_eq!(unreported.reasoning_tokens, None);
+    assert!(openai_compatible_usage(&json!({
+        "prompt_tokens": 40,
+        "completion_tokens": 20,
+        "reasoning_tokens": 18,
+        "unreported_token_details": ["reasoning_tokens"],
+    }))
+    .is_err());
+    // A malformed top-level count is a contract violation, as a nested one is.
+    assert!(openai_compatible_usage(&json!({
+        "prompt_tokens": 40,
+        "completion_tokens": 20,
+        "reasoning_tokens": "18",
+    }))
+    .is_err());
+    // Responses usage keeps reading only output_tokens_details.
+    let responses = openai_usage(Some(&json!({
+        "input_tokens": 40,
+        "output_tokens": 20,
+        "reasoning_tokens": 18,
+    })))
+    .expect("valid usage")
+    .expect("usage present");
+    assert_eq!(responses.reasoning_tokens, None);
+}
+
+#[test]
 fn gemini_usage_folds_thoughts_into_output_tokens() {
     // Verbatim usageMetadata from gemini-3.7-flash (generateContent,
     // 2026-09-03), thinking on: Google's totalTokenCount is prompt +
