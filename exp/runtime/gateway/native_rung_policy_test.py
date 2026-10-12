@@ -253,6 +253,38 @@ def test_reserve_rung_slot_sheds_fresh_sessions_early_only_with_warm_standing_ab
     )
 
 
+def test_reserve_rung_slot_classes_a_caching_off_request_as_a_fresh_session() -> None:
+    """With prompt caching off a request has no fingerprint yet still sheds early.
+
+    Without the rule, a request carrying no fingerprint would skip the early
+    threshold entirely and compete for the slice kept for warm sessions.
+    """
+    loads = RungLoadRegistry()
+    sticky = StickySpillRegistry()
+    deployment = _deployment(
+        "deployment-a",
+        connection_sha256="b" * 64,
+        dispatch=GatewayRungDispatchPolicy(
+            concurrency_bound=4, fresh_session_spill_fraction=0.5, sticky_spill_seconds=60
+        ),
+    )
+    plain = _entry((deployment,), failover_mode="maximize_cache_affinity")
+    caching_off = dataclasses.replace(
+        plain,
+        authorization=plain.authorization.model_copy(update={"prompt_caching_disabled": True}),
+    )
+    for _ in range(2):
+        assert isinstance(
+            reserve_rung_slot(loads, sticky, plain, deployment, reserved_tokens=0, force=False),
+            str,
+        )
+    shed = reserve_rung_slot(loads, sticky, caching_off, deployment, reserved_tokens=0, force=False)
+    assert isinstance(shed, RungShed) and shed.reason == "fresh_session_spill"
+    assert isinstance(
+        reserve_rung_slot(loads, sticky, plain, deployment, reserved_tokens=0, force=False), str
+    )
+
+
 def test_scoped_warmth_expires_at_reservation_and_never_bypasses_hard_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

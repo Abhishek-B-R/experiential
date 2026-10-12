@@ -22,7 +22,7 @@ from exp.common.models.content import (
 )
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
 from exp.common.models.gateway_chains import ModelExecutionStage
-from exp.common.models.model import ModelCapabilities
+from exp.common.models.model import ModelCapabilities, ToolCall
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -47,6 +47,10 @@ from exp.runtime.gateway.native_admission import (
 )
 from exp.runtime.gateway.native_dispatch import NativeWireClient
 from exp.runtime.gateway.native_execution import deployment_health_key
+from exp.runtime.gateway.prompt_caching import (
+    PROMPT_CACHING_BEST_EFFORT,
+    PROMPT_CACHING_OFF_SUFFIX,
+)
 from exp.runtime.gateway.prompt_size import MAXIMUM_BYTES_PER_TOKEN
 from exp.runtime.gateway.recovery import SessionRecoveryRegistry
 from exp.runtime.gateway.routing import GatewayRoute
@@ -2467,4 +2471,75 @@ def test_reasoning_summary_serves_without_summaries_on_chat_wire_lanes() -> None
     assert public.reasoning_summary == "auto"
     assert public.ignored_parameters == (
         "reasoning.generate_summary->dropped(unsupported_by_provider)",
+    )
+
+
+def test_prompt_caching_off_keeps_certified_order_and_adds_no_cache_state() -> None:
+    """An organization with caching off gets no affinity placement, key or marker.
+
+    The affinity pool would otherwise reorder each session by rendezvous and
+    send the tenant cache key; with the switch off every session dispatches in
+    the certified order, the provider request carries neither the key nor the
+    caller's markers, and the public request names what was removed plus the
+    best-effort note for rungs whose provider caches on its own.
+    """
+    route, wires = _affinity_fixture()
+    authorization = route.snapshot.authorization.model_copy(
+        update={"prompt_caching_disabled": True}
+    )
+    route = route.model_copy(
+        update={"snapshot": route.snapshot.model_copy(update={"authorization": authorization})}
+    )
+    for session in ("session-1", "session-2", "session-3"):
+        ordered, _wires_out, placement = _affinity_ordered_rungs(
+            route,
+            wires,
+            _session_request(session),
+            accounting=_affinity_accounting(),
+            authorization=authorization,
+            continuation=None,
+        )
+        assert _order(ordered) == ("dep-house", "dep-fireworks", "dep-openrouter")
+        assert placement.fingerprint is None
+
+    streaming = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True, supports_streaming_tool_arguments=True
+        )
+    )
+    single = _mixed_route(
+        "maximize_cache_affinity",
+        (_deployment("shim", gateway=streaming),),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="system", content="You are Terminus."),
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(
+                    ToolCall(call_id="call-1", name="ls", cache_control={"type": "ephemeral"}),
+                ),
+            ),
+            GatewayMessage(role="tool", tool_call_id="call-1", content="a.txt"),
+        ),
+        prompt_cache_key="session-7",
+        stream=True,
+        include_usage=True,
+    )
+    _route, _wires, public, provider, placement = admitted_route_requests(
+        single,
+        wires[:1],
+        request,
+        accounting=_affinity_accounting(),
+        authorization=authorization,
+    )
+    assert provider.provider_prompt_cache_key is None
+    assert all(call.cache_control is None for m in provider.messages for call in m.tool_calls)
+    assert placement.fingerprint is None
+    assert public.ignored_parameters == (
+        f"messages.tool_calls.cache_control{PROMPT_CACHING_OFF_SUFFIX}",
+        f"prompt_cache_key{PROMPT_CACHING_OFF_SUFFIX}",
+        PROMPT_CACHING_BEST_EFFORT,
     )
