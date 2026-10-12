@@ -282,8 +282,7 @@ class GatewayMessage(ContractModel):
     the blocks' concatenated text equals ``content`` exactly and Anthropic
     rungs re-emit them verbatim; other wires keep the flattened string and
     disclose the dropped markers. A cache hint changes cost, not semantics,
-    so like the other cache carriers this joins neither serialization nor
-    replay identity.
+    so like the other cache carriers this joins neither serialization nor replay identity.
     """
     content_parts: tuple[MessageContentPart, ...] = ()
     """Ordered caller content parts for a message that carries attachments.
@@ -657,8 +656,7 @@ class GatewayRequest(ContractModel):
     conversation stem (the leading system/developer messages, else the first
     user turn), so every request sharing a cacheable prefix lands on the
     provider cache node that holds it while the caller's raw key never leaves
-    the gateway. Excluded from serialization: it is routing state, never
-    request identity.
+    the gateway. Excluded from serialization: it is routing state, never request identity.
     """
     service_tier: str | None = Field(default=None, max_length=64, exclude=True)
     """Caller provider processing tier, forwarded only on BYOK OpenAI-family
@@ -903,6 +901,7 @@ class AuthorizationSnapshot(ClientAttribution):
         descendant_start_authorized: False unless the host proves root funding
             and policy gates before allowing a request to start at a child.
         zdr_requested: Caller demand for stricter ZDR filtering, default False.
+        prompt_caching_disabled: The org turned prompt caching off (prompt_caching.py).
         requested_route_id: Optional public selector, excluded from durable serialization.
     """
 
@@ -938,6 +937,7 @@ class AuthorizationSnapshot(ClientAttribution):
     priority_admission: int = Field(default=0, ge=0, le=2)
     descendant_start_authorized: bool = False
     zdr_requested: bool = False
+    prompt_caching_disabled: bool = False
 
 
 class ExecutionSnapshot(ContractModel):

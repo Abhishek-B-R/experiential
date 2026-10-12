@@ -42,7 +42,11 @@ from exp.runtime.gateway.native_stage_admission import (
     require_native_model_stage_contract,
     stage_affinity_ordered_rungs,
 )
-from exp.runtime.gateway.prompt_cache_affinity import provider_prompt_cache_key
+from exp.runtime.gateway.prompt_caching import (
+    disclose_best_effort_caching,
+    with_cache_affinity,
+    without_prompt_caching,
+)
 from exp.runtime.gateway.prompt_size import context_window_compatible_indexes
 from exp.runtime.gateway.recovery_binding import bind_recovery_profiles
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
@@ -82,29 +86,6 @@ _logger = logging.getLogger(__name__)
 _ResolvedWires = tuple[tuple[GatewayWireProfile, NativeWireClient], ...]
 
 
-def _with_cache_affinity(
-    provider_request: GatewayRequest, authorization: AuthorizationSnapshot
-) -> GatewayRequest:
-    """Attach the tenant's cache-affinity key to the final dispatch request.
-
-    Cache affinity is per tenant and per session, so it is derived once, from
-    the request admission settled on and the frozen authority, and read by
-    every rung's payload builder that forwards it. It is applied last so no
-    admission-time rebuild (route narrowing, capability or schema coercion)
-    can drop it; the public request keeps the caller's own ``prompt_cache_key``
-    untouched.
-    """
-    return provider_request.model_copy(
-        update={
-            "provider_prompt_cache_key": provider_prompt_cache_key(
-                provider_request,
-                organization_id=str(authorization.organization_id),
-                identity_id=str(authorization.identity_id),
-            ),
-        }
-    )
-
-
 def admitted_route_requests(
     route: GatewayRoute,
     resolved_wires: _ResolvedWires,
@@ -142,11 +123,11 @@ def admitted_route_requests(
             rejection.
     """
     route, resolved_wires, public_request, provider_request, disclosures = prepare_route_requests(
-        route, resolved_wires, request
+        route, resolved_wires, without_prompt_caching(request, authorization)
     )
     if disclosures:
         record_admission_coercions(accounting, authorization, disclosures)
-    provider_request = _with_cache_affinity(provider_request, authorization)
+    provider_request = with_cache_affinity(provider_request, authorization)
     resolved_wires = bind_recovery_profiles(
         route.deployments,
         resolved_wires,
@@ -191,6 +172,9 @@ def admitted_route_requests(
     # Every surviving rung failover-only would leave nothing to dial first:
     # fail closed here, named, instead of exhausting a ladder that dialed nothing.
     require_unrestricted_rung(route)
+    public_request = disclose_best_effort_caching(
+        public_request, route.deployments, [profile for profile, _ in resolved_wires], authorization
+    )
     return route, resolved_wires, public_request, provider_request, placement
 
 
@@ -226,7 +210,8 @@ def select_single_route_before_search(
         resolved_wires = tuple(resolved_wires[index] for index in root_indexes)
     if route.resolved_route_id is not None:
         return restrict_fallbacks(request, route), resolved_wires[:1], None
-    preview = strip_search_carriers(request) if request.web_search is not None else request
+    preview = without_prompt_caching(request, authorization)
+    preview = strip_search_carriers(preview) if preview.web_search is not None else preview
     preview = plan_tool_search(preview, [profile.dialect for profile, _ in resolved_wires]).request
     route, resolved_wires, _, prepared, _ = prepare_route_requests(route, resolved_wires, preview)
     route, resolved_wires = _prefer_cache_capable_rungs(route, resolved_wires, prepared)
@@ -576,8 +561,11 @@ def _affinity_ordered_rungs(
     pin a conversation to a dead lane. The cache-marker guarantee composes: a
     cache-marked request on a route mixing marker-honoring and marker-dropping
     wires still dispatches the marker-honoring group first, ordered within
-    each group. The other two failover modes are untouched.
+    each group. The other two failover modes are untouched, and an organization
+    with prompt caching off keeps the certified order on every pool.
     """
+    if authorization.prompt_caching_disabled:
+        return route, resolved_wires, AffinityPlacement()
     if route.snapshot.model_stages or accounting.recovery_host is not None:
         return stage_affinity_ordered_rungs(
             route,

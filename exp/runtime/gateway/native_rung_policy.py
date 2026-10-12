@@ -24,7 +24,12 @@ import time
 from collections.abc import Callable
 
 from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.runtime.gateway.contracts import GatewayEvent, GatewayFailure, GatewayFailureClass
+from exp.runtime.gateway.contracts import (
+    GatewayEvent,
+    GatewayFailure,
+    GatewayFailureClass,
+    GatewayRequest,
+)
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.lane_saturation import priority_overflow_ceiling
 from exp.runtime.gateway.native_execution import (
@@ -88,7 +93,13 @@ def reserve_rung_slot(
     # The early threshold
     # only exists on affinity pools AND for requests that carry a fingerprint
     # (chat/Responses admission): a surface with no session concept
-    # (embeddings, images) must never be classed fresh wholesale.
+    # (embeddings, images) must never be classed fresh wholesale. A chat or
+    # Responses request from an organization with prompt caching off has no
+    # fingerprint and no cache to protect, so it is always a fresh session:
+    # turning caching off never buys the warm sessions' top slice.
+    caching_off = entry.authorization.prompt_caching_disabled and isinstance(
+        entry.request, GatewayRequest
+    )
     fresh_fraction = (
         policy.fresh_session_spill_fraction
         if policy is not None
@@ -96,10 +107,10 @@ def reserve_rung_slot(
             entry.route.snapshot.deployment_ids.index(deployment.deployment_id)
         ).failover_mode
         == "maximize_cache_affinity"
-        and entry.affinity_fingerprint is not None
+        and (entry.affinity_fingerprint is not None or caching_off)
         else None
     )
-    warm_session = True
+    warm_session = not caching_off
     if (
         fresh_fraction is not None
         and entry.affinity_fingerprint is not None
