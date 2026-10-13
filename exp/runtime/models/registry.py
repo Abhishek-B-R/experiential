@@ -62,6 +62,8 @@ from exp.runtime.models.providers.chatgpt_subscription import (
     chatgpt_re_sign_in_hint,
     chatgpt_refresher,
 )
+from exp.runtime.models.providers.elevenlabs import ElevenLabsClient
+from exp.runtime.models.providers.elevenlabs_audio import ELEVENLABS_BASE_URL
 from exp.runtime.models.providers.gemini import GEMINI_BASE_URL, GeminiClient
 from exp.runtime.models.providers.openai import OPENAI_BASE_URL, OpenAIClient
 from exp.runtime.models.providers.openai_compatible import (
@@ -634,6 +636,10 @@ class RuntimeModelCatalog:
             )
         if provider in {"openrouter", "openai-compatible"}:
             http_kwargs["chat_max_tokens_field"] = capabilities.chat_max_tokens_field
+        if provider == "elevenlabs":
+            # Audio only: no sampling or reasoning facts apply, but the
+            # configured dispatch timeout does.
+            http_kwargs["timeout_seconds"] = self._http_timeout_seconds
         if provider in {"anthropic", "gemini", "openrouter", "openai-compatible"}:
             http_kwargs.update(
                 {
@@ -826,6 +832,7 @@ class RuntimeModelCatalog:
 
 _HTTP_PROVIDERS: Mapping[str, tuple[_HttpClientFactory, str | None]] = {
     "anthropic": (AnthropicClient, ANTHROPIC_BASE_URL),
+    "elevenlabs": (ElevenLabsClient, ELEVENLABS_BASE_URL),
     "gemini": (GeminiClient, GEMINI_BASE_URL),
     "openai-compatible": (OpenAICompatibleClient, None),
     "openrouter": (OpenRouterClient, OPENROUTER_BASE_URL),
