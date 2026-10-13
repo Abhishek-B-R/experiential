@@ -43,6 +43,14 @@ A manual run sets `RUN_WORKFLOW=python-package` and the area's inputs in the
 - **Ordering.** Jobs order with `needs:`; a job without dependencies sets
   `needs: []` so it starts at once. Values pass between jobs through
   `artifacts:reports:dotenv`, and files through `artifacts:`.
+- **Caches.** The windows-x86_64 wheel, the slowest job, keeps the Rust
+  toolchain, crate downloads, and compiled dependencies in the job cache under
+  `.ci-cache/`, which `.gitignore` lists. uv's Python installs stay out of it,
+  because the runner cannot archive the directory links uv creates there.
+  Pipelines for protected refs, or started by a Maintainer or Owner, use the
+  protected cache, and every other pipeline a separate one, so a Developer's
+  merge request cannot seed what a release builds with. The first run after
+  the cache is cleared rebuilds everything.
 
 ## Runners
 
