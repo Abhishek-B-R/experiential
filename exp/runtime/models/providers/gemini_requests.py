@@ -149,9 +149,14 @@ def gemini_generate_request(
             {"includeThoughts": True} if reasoning_display_enabled() else {}
         )
         if effective_reasoning_effort is not None:
-            thinking_config["thinkingLevel"] = gemini_thinking_level(
-                model_id, effective_reasoning_effort
-            ).upper()
+            level = gemini_thinking_level(model_id, effective_reasoning_effort)
+            if level == "none":
+                # thinkingLevel has no off value; the families whose table
+                # admits "none" switch thinking off with a zero budget, and
+                # Google rejects a request that sets both fields.
+                thinking_config["thinkingBudget"] = 0
+            else:
+                thinking_config["thinkingLevel"] = level.upper()
         if thinking_config:
             generation["thinkingConfig"] = thinking_config
     # The normalized gateway response has no logprob representation. Keep the

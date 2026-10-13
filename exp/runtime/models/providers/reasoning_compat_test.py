@@ -482,6 +482,12 @@ def test_gemini_thinking_levels_follow_exact_model_tables() -> None:
         gemini_thinking_level("gemini-2.5-pro", "minimal")
     with pytest.raises(UnsupportedReasoningEffortError):
         gemini_thinking_level("gemini-3.99-unknown", "low")
+    assert gemini_thinking_level("gemini-4-argon", "none") == "none"
+    assert gemini_thinking_level("models/gemini-4-argon", "medium") == "medium"
+    with pytest.raises(UnsupportedReasoningEffortError):
+        gemini_thinking_level("gemini-4-argon", "minimal")
+    with pytest.raises(UnsupportedReasoningEffortError):
+        gemini_thinking_level("gemini-4-argon", "xhigh")
     assert (
         gemini_thinking_level(
             "publishers/google/models/gemini-2.5-pro",
@@ -630,6 +636,12 @@ def test_exact_effort_support_covers_each_reasoning_wire_family() -> None:
         "low",
         "high",
     )
+    assert supported_reasoning_efforts("gemini-4-argon", "gemini_thinking") == (
+        "none",
+        "low",
+        "medium",
+        "high",
+    )
     assert supported_reasoning_efforts("openai/gpt-5-pro", "reasoning") == ("high",)
     assert supported_reasoning_efforts("anthropic/claude-opus-5", "reasoning") == (
         "low",
@@ -661,6 +673,7 @@ def test_default_effort_is_always_valid_for_the_exact_model() -> None:
     assert default_reasoning_effort("gpt-5.6-sol", "openai_responses") == "medium"
     assert default_reasoning_effort("gpt-5-pro", "openai_responses") == "high"
     assert default_reasoning_effort("gemini-3-pro-preview", "gemini_thinking") == "high"
+    assert default_reasoning_effort("gemini-4-argon", "gemini_thinking") == "medium"
     assert default_reasoning_effort("vendor/reasoner", "reasoning") == "medium"
 
 
