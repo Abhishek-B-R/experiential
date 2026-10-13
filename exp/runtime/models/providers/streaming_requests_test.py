@@ -2308,6 +2308,34 @@ def test_reasoning_effort_uses_each_provider_native_wire_shape() -> None:
 
 
 @pytest.mark.parametrize(
+    ("effort", "thinking_config"),
+    (
+        ("none", {"includeThoughts": True, "thinkingBudget": 0}),
+        ("low", {"includeThoughts": True, "thinkingLevel": "LOW"}),
+        ("medium", {"includeThoughts": True, "thinkingLevel": "MEDIUM"}),
+        ("high", {"includeThoughts": True, "thinkingLevel": "HIGH"}),
+    ),
+)
+def test_gemini_argon_effort_maps_to_level_or_zero_budget(
+    effort: ReasoningEffort, thinking_config: dict[str, object]
+) -> None:
+    """Argon's off switch is a zero budget; every other level stays a thinkingLevel."""
+    payload = dialect_stream_payload(
+        GatewayWireProfile(
+            dialect="gemini_generate_content",
+            url="https://gemini.test",
+            model_id="gemini-4-argon",
+            supports_reasoning=True,
+            reasoning_wire_format="gemini_thinking",
+        ),
+        _chat_request().model_copy(update={"reasoning_effort": effort}),
+    )
+
+    generation = cast("dict[str, object]", payload["generationConfig"])
+    assert generation["thinkingConfig"] == thinking_config
+
+
+@pytest.mark.parametrize(
     "profile",
     (
         GatewayWireProfile(

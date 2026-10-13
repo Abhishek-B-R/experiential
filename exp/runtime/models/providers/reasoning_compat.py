@@ -323,8 +323,14 @@ def _gemini_supported_efforts(model_id: str) -> Collection[str]:
         .removeprefix("publishers/google/models/")
         .removeprefix("models/")
     )
-    if "gemini-3-7-flash" in normalized or "gemini-3-1-pro" in normalized:
-        supported: Collection[str] = ("low", "medium", "high")
+    if "gemini-4-argon" in normalized:
+        # Live on AI Studio 2026-10-13: LOW, MEDIUM and HIGH are accepted and
+        # think measurably differently (0 / ~150-400 / ~1000-1350 thought
+        # tokens on one prompt); MINIMAL and XHIGH answer 400. "none" rides
+        # thinkingBudget 0, which this model accepts with zero thoughts.
+        supported: Collection[str] = ("none", "low", "medium", "high")
+    elif "gemini-3-7-flash" in normalized or "gemini-3-1-pro" in normalized:
+        supported = ("low", "medium", "high")
     elif "gemini-3-pro" in normalized:
         supported = ("low", "high")
     elif "gemini-3-1-flash-lite-image" in normalized:
