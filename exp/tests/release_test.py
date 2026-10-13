@@ -3265,32 +3265,65 @@ def test_gateway_canary_scanner_covers_every_persistent_and_observable_channel(
             )
 
 
+def _ci_job(area: str, name: str) -> str:
+    """Return the raw YAML block of one top-level job in a GitLab CI file.
+
+    Args:
+        area: File path under ``.gitlab/ci`` without the ``.yml`` suffix, such as
+            ``python-package``.
+        name: Top-level job or hidden key.
+
+    Returns:
+        The job's indented block, without the job name line.
+    """
+    repository = Path(__file__).resolve().parent.parent.parent
+    text = (repository / ".gitlab" / "ci" / f"{area}.yml").read_text(encoding="utf-8")
+    block = text.split(f"\n{name}:\n", 1)[1]
+    return re.split(r"\n(?=\S)", block, maxsplit=1)[0]
+
+
 def test_package_workflow_installs_the_exact_certified_openai_sdk() -> None:
     """The archive smoke lane constrains the SDK version claimed by certification."""
-    repository = Path(__file__).resolve().parent.parent.parent
-    workflow = (repository / ".github" / "workflows" / "python-package.yml").read_text(
-        encoding="utf-8"
-    )
-
-    assert 'dist/*.whl "openai==3.0.0"' in workflow
+    assert 'dist/*.whl "openai==3.0.0"' in _ci_job("python-package", "python-package-build")
 
 
 def test_capture_release_imports_cannot_modify_the_publish_artifact() -> None:
     """Public Capture dependencies execute only against an isolated artifact copy."""
-    repository = Path(__file__).resolve().parent.parent.parent
-    workflow = (repository / ".github" / "workflows" / "python-package.yml").read_text()
-    build, smoke = workflow.split("  build:\n", 1)[1].split("  capture-release-smoke:\n", 1)
-    smoke, publish = smoke.split("  publish:\n", 1)
+    build = _ci_job("python-package", "python-package-build")
+    smoke = _ci_job("python-package", "python-package-capture-smoke")
+    publish = _ci_job("python-package", "python-package-publish")
     assert "uv venv --python 3.12 /tmp/exp-wheel-smoke" in build
     assert "import mitmproxy" not in build
-    assert "    needs: build\n" in smoke
-    assert "if: github.event_name == 'release' || inputs.publish == true" in smoke
+    assert "    - job: python-package-build\n" in smoke
+    assert "$CI_COMMIT_TAG =~ /^v" in smoke
+    assert '$PYTHON_PACKAGE_PUBLISH == "true"' in smoke
     assert "import mitmproxy, mitmproxy_rs" in smoke
-    assert "upload-artifact" not in smoke
-    assert "id-token: write" not in smoke
-    assert "contents: write" not in smoke
-    assert "    needs: [build, capture-release-smoke]\n" in publish
-    assert "name: python-dist" in smoke and "name: python-dist" in publish
+    assert "artifacts:" not in smoke
+    assert "id_tokens" not in smoke
+    assert "    - job: python-package-build\n" in publish
+    assert "    - job: python-package-capture-smoke\n      artifacts: false\n" in publish
+
+
+def test_release_publishes_only_from_protected_tags_with_every_wheel() -> None:
+    """A release tag publishes only once protected, and never a partial wheel matrix."""
+    repository = Path(__file__).resolve().parent.parent.parent
+    text = (repository / ".gitlab" / "ci" / "python-package.yml").read_text(encoding="utf-8")
+    wheels = re.findall(r"^(python-package-wheel-[a-z0-9_-]+):\n", text, re.MULTILINE)
+    assert len(wheels) == 5
+    publish = _ci_job("python-package", "python-package-publish")
+    for wheel in wheels:
+        assert "  rules: !reference [.python-package-rules, rules]\n" in _ci_job(
+            "python-package", wheel
+        )
+        assert f"    - job: {wheel}\n" in publish
+        assert f"    - job: {wheel}\n      optional: true" not in publish
+    for job in ("python-package-capture-smoke", "python-package-publish"):
+        tag_rule = next(
+            line for line in _ci_job("python-package", job).splitlines() if "CI_COMMIT_TAG" in line
+        )
+        assert '$CI_COMMIT_REF_PROTECTED == "true"' in tag_rule
+    assert "      aud: pypi\n" in publish
+    assert "    name: pypi\n" in publish
 
 
 def test_windows_authority_gate_executes_kernel_cases_without_weakening_capture() -> None:

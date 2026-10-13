@@ -30,10 +30,11 @@ HAND_AUTHORED_SUFFIXES = {
     ".yaml",
     ".yml",
 }
-ALLOWED_TOP_DIRS = {".claude", ".github", "assets", "docs", "exp"}
+ALLOWED_TOP_DIRS = {".claude", ".github", ".gitlab", "assets", "docs", "exp"}
 ALLOWED_TOP_FILES = {
     ".env.example",
     ".gitignore",
+    ".gitlab-ci.yml",
     "AGENTS.md",
     "CLAUDE.md",
     "LICENSE",
