@@ -161,7 +161,11 @@ python-package-wheel-macos-x86_64:
     - uvx --from "maturin==${MATURIN_VERSION}" maturin build --release --target x86_64-apple-darwin --manifest-path exp/runtime/gateway/native/Cargo.toml --out native-dist
 
 # The hosted Windows runner runs a fixed Windows Server 2022 VM with
-# PowerShell and takes no image.
+# PowerShell and takes no image. It has two cores, so compiling the crate's
+# dependencies dominates the job: the Rust toolchain, the crate downloads, and
+# the compiled dependencies persist in the job cache under .ci-cache/, the only
+# place GitLab caches from. uv's Python installs stay out of the cache, because
+# the runner cannot archive the directory links uv creates there.
 python-package-wheel-windows-x86_64:
   extends: [.tools]
   stage: build
@@ -170,6 +174,14 @@ python-package-wheel-windows-x86_64:
     - job: python-package-source
       optional: true
   rules: !reference [.python-package-rules, rules]
+  variables:
+    CARGO_HOME: $CI_PROJECT_DIR/.ci-cache/cargo
+    RUSTUP_HOME: $CI_PROJECT_DIR/.ci-cache/rustup
+    CARGO_TARGET_DIR: $CI_PROJECT_DIR/.ci-cache/target
+  cache:
+    key: python-package-wheel-windows-x86_64
+    paths:
+      - .ci-cache/
   script:
     - !reference [.python-package-snippets, release-source-windows]
     - !reference [.snippets, uv-windows]
