@@ -311,11 +311,11 @@ python-package-publish:
     - job: python-package-wheel-windows-x86_64
   environment:
     name: pypi
-  # PyPI trusted publishing: uv publish finds this token, exchanges it for a
-  # short-lived PyPI token, and revokes that token after the upload.
-  id_tokens:
-    PYPI_ID_TOKEN:
-      aud: pypi
+  # This project's path was used by an earlier project, so GitLab issues it no
+  # ID tokens, and PyPI's GitLab trusted publisher only accepts a path subject.
+  # The upload uses the account-scoped PyPI API token in the protected, masked
+  # PYPI_TOKEN_EXPERIENTIAL variable. Its environment scope is pypi, so this is
+  # the only job that receives it; no other job may declare an environment.
   variables:
     GIT_STRATEGY: none
   script:
@@ -344,9 +344,10 @@ python-package-publish:
       done
       ls dist/
     - |
-      # Publish to PyPI with trusted publishing.
+      # Publish both distributions to PyPI with the API token.
       if [ -z "$(ls -A dist)" ]; then
         echo "Nothing to publish: every built file is already on PyPI"
         exit 0
       fi
-      uv publish --trusted-publishing always --check-url https://pypi.org/simple/ dist/*
+      : "${PYPI_TOKEN_EXPERIENTIAL:?PYPI_TOKEN_EXPERIENTIAL is not available to this pipeline}"
+      UV_PUBLISH_TOKEN="${PYPI_TOKEN_EXPERIENTIAL}" uv publish --trusted-publishing never --check-url https://pypi.org/simple/ dist/*

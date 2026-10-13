@@ -382,7 +382,8 @@ Rules of the road:
 - **Publishing**: `.gitlab/ci/python-package.yml` builds and publishes the flagship
   `experiential` distribution and the `exp-gateway-native` abi3 wheel matrix; the publish job
   runs only for a protected release tag pipeline (`v<version>`) or an explicit latest-release
-  replay on `main`, and uses the `pypi` trusted-publisher environment.
+  replay on `main`, deploys to the `pypi` environment, and uploads with the protected, masked
+  `PYPI_TOKEN_EXPERIENTIAL` API token, whose environment scope is `pypi` so no other job sees it.
 
 ## Docs
 
