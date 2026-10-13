@@ -13,7 +13,8 @@
 //! - OpenAI-shaped wires (Responses via `openai_usage`, Chat Completions via
 //!   `openai_compatible_usage`): OpenAI, OpenRouter, DeepSeek, and Fireworks
 //!   report reasoning inside the output total; xAI (native and relayed by
-//!   Azure Foundry) reports it outside on both wires. The provider's own
+//!   Azure Foundry) reports it outside on both wires; Azure Foundry DeepSeek
+//!   puts the Chat count in top-level `reasoning_tokens`. The provider's own
 //!   `total_tokens` decides: `input + output` is the subset shape and is
 //!   forwarded as reported, `input + output + reasoning` is the additive shape
 //!   and folds (`fold_openai_shaped_reasoning`). Without a decisive total, a

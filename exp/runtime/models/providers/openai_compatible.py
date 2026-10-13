@@ -909,6 +909,13 @@ def _usage(payload: JsonObject, *, cache_writes_within_reads: bool) -> Usage | N
         return None if value is None else require_integer(value, f"usage.{group}.{field}")
 
     reasoning = detail("completion_tokens_details", "reasoning_tokens")
+    raw_top_level = usage.get("reasoning_tokens")
+    if raw_top_level is not None:
+        # Azure AI Foundry's DeepSeek models report the same subset as a top-level
+        # count, validated like the native mapper; the nested placement wins.
+        top_level = require_integer(raw_top_level, "usage.reasoning_tokens")
+        if reasoning is None and "reasoning_tokens" not in unknown:
+            reasoning = top_level
     raw_total = usage.get("total_tokens")
     total = None if raw_total is None else require_integer(raw_total, "usage.total_tokens")
     try:
