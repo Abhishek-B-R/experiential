@@ -75,26 +75,23 @@ GitLab release. Files whose exact names are already on PyPI are skipped.
 While `.github/deferred-native-release.toml` exists, release tags and
 publishing runs fail before they publish.
 
-Publishing uses PyPI trusted publishing. The `python-package-publish` job runs
-in the `pypi` environment and requests a GitLab ID token with audience `pypi`
-as `PYPI_ID_TOKEN`; `uv publish` exchanges it for a short-lived PyPI token.
-Both PyPI projects, `experiential` and `exp-gateway-native`, trust this
-publisher:
-
-| Field | Value |
-| --- | --- |
-| Namespace | `experiential-labs-group` |
-| Project name | `experiential` |
-| Top-level pipeline file path | `.gitlab-ci.yml` |
-| Environment name | `pypi` |
+Publishing uploads with a PyPI API token. GitLab issues this project no ID
+tokens, because its path was used by an earlier project, and PyPI's GitLab
+trusted publisher accepts only a path-based subject. The
+`python-package-publish` job runs in the `pypi` environment and passes the
+`PYPI_TOKEN_EXPERIENTIAL` variable to `uv publish`. The token is scoped to the
+PyPI account that owns both projects, `experiential` and `exp-gateway-native`.
+The variable's environment scope is `pypi`, so the build and smoke-test jobs,
+which install third-party packages, never receive it, and no other job may
+declare an environment.
 
 ## Variables and settings
 
-The pipelines read no secret CI/CD variables. Jobs authenticate with
-`CI_JOB_TOKEN` and with the PyPI ID token.
+Jobs authenticate with `CI_JOB_TOKEN`, and the publish job with the PyPI token.
 
 | Setting | Use |
 | --- | --- |
+| **Settings > CI/CD > Variables**: `PYPI_TOKEN_EXPERIENTIAL`, protected, masked, not expanded, environment scope `pypi` | The PyPI API token `python-package-publish` uploads with; only that job, on protected refs, receives it |
 | **Settings > Repository > Protected tags**: `v*`, Maintainers | Release tag pipelines run and publish only for protected tags |
 | **Settings > CI/CD > Variables > Minimum role to use pipeline variables**: Maintainer | Manual runs set `RUN_WORKFLOW` and the `PYTHON_PACKAGE_*` inputs |
 | Environment `pypi` | `python-package-publish` deploys to it |
