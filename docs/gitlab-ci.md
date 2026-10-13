@@ -78,20 +78,21 @@ publishing runs fail before they publish.
 Publishing uploads with a PyPI API token. GitLab issues this project no ID
 tokens, because its path was used by an earlier project, and PyPI's GitLab
 trusted publisher accepts only a path-based subject. The
-`python-package-publish` job runs in the `pypi` environment and passes the
-`PYPI_TOKEN_EXPERIENTIAL` variable to `uv publish`. The token is scoped to the
-PyPI account that owns both projects, `experiential` and `exp-gateway-native`.
-The variable's environment scope is `pypi`, so the build and smoke-test jobs,
-which install third-party packages, never receive it, and no other job may
-declare an environment.
+`python-package-publish` job runs in the `pypi` environment and uploads each
+distribution with its own project-scoped token: `exp-gateway-native` first with
+`PYPI_TOKEN_EXP_GATEWAY_NATIVE`, then `experiential` with
+`PYPI_TOKEN_EXPERIENTIAL`, so `experiential` never reaches PyPI ahead of the
+native version it requires. Both variables have environment scope `pypi`, so the
+build and smoke-test jobs, which install third-party packages, never receive
+them, and no other job may declare an environment.
 
 ## Variables and settings
 
-Jobs authenticate with `CI_JOB_TOKEN`, and the publish job with the PyPI token.
+Jobs authenticate with `CI_JOB_TOKEN`, and the publish job with the PyPI tokens.
 
 | Setting | Use |
 | --- | --- |
-| **Settings > CI/CD > Variables**: `PYPI_TOKEN_EXPERIENTIAL`, protected, masked, not expanded, environment scope `pypi` | The PyPI API token `python-package-publish` uploads with; only that job, on protected refs, receives it |
+| **Settings > CI/CD > Variables**: `PYPI_TOKEN_EXP_GATEWAY_NATIVE` and `PYPI_TOKEN_EXPERIENTIAL`, protected, masked, not expanded, environment scope `pypi` | The project-scoped PyPI API tokens `python-package-publish` uploads `exp-gateway-native` and `experiential` with; only that job, on protected refs, receives them |
 | **Settings > Repository > Protected tags**: `v*`, Maintainers | Release tag pipelines run and publish only for protected tags |
 | **Settings > CI/CD > Variables > Minimum role to use pipeline variables**: Maintainer | Manual runs set `RUN_WORKFLOW` and the `PYTHON_PACKAGE_*` inputs |
 | Environment `pypi` | `python-package-publish` deploys to it |

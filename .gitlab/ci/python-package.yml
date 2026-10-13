@@ -313,9 +313,10 @@ python-package-publish:
     name: pypi
   # This project's path was used by an earlier project, so GitLab issues it no
   # ID tokens, and PyPI's GitLab trusted publisher only accepts a path subject.
-  # The upload uses the account-scoped PyPI API token in the protected, masked
-  # PYPI_TOKEN_EXPERIENTIAL variable. Its environment scope is pypi, so this is
-  # the only job that receives it; no other job may declare an environment.
+  # Each distribution uploads with its own project-scoped PyPI API token, in
+  # the protected, masked PYPI_TOKEN_EXP_GATEWAY_NATIVE and
+  # PYPI_TOKEN_EXPERIENTIAL variables. Their environment scope is pypi, so this
+  # is the only job that receives them; no other job may declare an environment.
   variables:
     GIT_STRATEGY: none
   script:
@@ -344,10 +345,18 @@ python-package-publish:
       done
       ls dist/
     - |
-      # Publish both distributions to PyPI with the API token.
+      # Publish each distribution with its own project-scoped API token. The
+      # native package goes first, so experiential never reaches PyPI ahead of
+      # the native version it requires.
       if [ -z "$(ls -A dist)" ]; then
         echo "Nothing to publish: every built file is already on PyPI"
         exit 0
       fi
+      : "${PYPI_TOKEN_EXP_GATEWAY_NATIVE:?PYPI_TOKEN_EXP_GATEWAY_NATIVE is not available to this pipeline}"
       : "${PYPI_TOKEN_EXPERIENTIAL:?PYPI_TOKEN_EXPERIENTIAL is not available to this pipeline}"
-      UV_PUBLISH_TOKEN="${PYPI_TOKEN_EXPERIENTIAL}" uv publish --trusted-publishing never --check-url https://pypi.org/simple/ dist/*
+      if ls dist/exp_gateway_native-* >/dev/null 2>&1; then
+        UV_PUBLISH_TOKEN="${PYPI_TOKEN_EXP_GATEWAY_NATIVE}" uv publish --trusted-publishing never --check-url https://pypi.org/simple/ dist/exp_gateway_native-*
+      fi
+      if ls dist/experiential-* >/dev/null 2>&1; then
+        UV_PUBLISH_TOKEN="${PYPI_TOKEN_EXPERIENTIAL}" uv publish --trusted-publishing never --check-url https://pypi.org/simple/ dist/experiential-*
+      fi
