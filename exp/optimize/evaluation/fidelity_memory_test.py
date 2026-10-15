@@ -319,7 +319,7 @@ def test_learning_reuse_restart_duplicate_and_frozen_checkpoint(
         + ["--non-interactive"],
     )
     assert shown.exit_code == 0, shown.output
-    assert "frozen checkpoint v1" in shown.output and "Whole trajectory exact: no" in shown.output
+    assert "frozen run read v1" in shown.output and "Whole trajectory exact: no" in shown.output
 
 
 def test_boundaries_refuse_wrong_scope_stale_parent_and_missing_reranker(

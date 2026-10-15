@@ -644,10 +644,20 @@ def _receipt_recorder(
     return record
 
 
-def fidelity_memory_plan(project: ProjectStore, spec: FidelitySpec) -> str | None:
-    """Describe the memory version a run would read, without credentials or provider calls."""
+def fidelity_memory_plan(
+    project: ProjectStore, spec: FidelitySpec, prepared: PreparedFidelity | None = None
+) -> str | None:
+    """Describe the memory a run read (once executed) or would read, without provider calls."""
     if spec.memory is None:
         return None
+    intent = None if prepared is None else prepared.id + "-execution"
+    if intent is not None and project.artifacts.exists(intent):
+        pinned = json.loads(project.artifacts.read_bytes(intent, "execution.json")).get("memory")
+        if isinstance(pinned, dict):
+            return (
+                f"{spec.memory.lineage} {pinned.get('mode')} run read v{pinned.get('version')} "
+                f"({pinned.get('consumed_trajectories')} consumed trajectories)"
+            )
     if spec.memory.checkpoint is not None:
         frozen = read_memory_version(project.artifacts, spec.memory.lineage, spec.memory.checkpoint)
         return (

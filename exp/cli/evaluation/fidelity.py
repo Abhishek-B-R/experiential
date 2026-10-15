@@ -62,7 +62,7 @@ def run_fidelity(
                     f"memory top {spec.retrieval.memory_top_k}"
                 )
             )
-        memory = fidelity_memory_plan(store, spec)
+        memory = fidelity_memory_plan(store, spec, prepared)
         if memory is not None:
             console.print(Text(f"Memory: {memory}"))
         if spec.online_research is not None:
