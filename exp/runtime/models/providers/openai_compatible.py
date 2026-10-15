@@ -29,6 +29,7 @@ from exp.common.models.usage_observability import (
     fold_openai_shaped_reasoning,
     unreported_token_details,
 )
+from exp.common.traces.ingest.json_strict import reject_duplicate_json_keys
 from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
@@ -774,7 +775,7 @@ def parse_openai_wire_tool_call(
         function.get("arguments"), f"tool_calls[{index}].function.arguments"
     )
     try:
-        arguments = json.loads(raw_arguments)
+        arguments = json.loads(raw_arguments, object_pairs_hook=reject_duplicate_json_keys)
     except json.JSONDecodeError as exc:
         if hit_length_limit and _incomplete_json_object_prefix(raw_arguments):
             raise ProviderTruncatedResponseError(
@@ -783,6 +784,10 @@ def parse_openai_wire_tool_call(
             ) from exc
         raise OpenAICompatibleResponseError(
             f"tool_calls[{index}].function.arguments is not JSON"
+        ) from exc
+    except ValueError as exc:
+        raise OpenAICompatibleResponseError(
+            f"tool_calls[{index}].function.arguments contains duplicate JSON keys"
         ) from exc
     if not isinstance(arguments, dict):
         raise OpenAICompatibleResponseError(

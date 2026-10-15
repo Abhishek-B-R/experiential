@@ -23,6 +23,7 @@ from exp.common.project import ArtifactStore, artifact_input
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.simulation.engines.text.packing import pack_world_model_request
 from exp.simulation.engines.text.prompt import (
+    RECONSTRUCTED_TEXT_PROMPT_VERSION,
     TextWorldModelTransition,
     build_world_model_request,
     candidate_rag_actions,
@@ -42,6 +43,7 @@ from exp.simulation.retrieval import (
     load_rag_index,
 )
 from exp.simulation.retrieval.embedding import RAGEmbedderBinding
+from exp.simulation.retrieval.jev import JEVSelector
 from exp.simulation.world_model.artifact import (
     GROUNDED_WORLD_MODEL_PROMPT_VERSION,
     WORLD_MODEL_ARTIFACT_PATH,
@@ -141,6 +143,7 @@ class GroundedWorldModel:
         capabilities: Required resolved metadata matching the artifact's frozen identity.
             Unknown capacity fields remain explicit rather than disabling identity verification.
         token_counter: Complete-request counter used for capacity admission.
+        evidence_selector: Optional artifact-bound JEV policy over eligible candidates.
     """
 
     artifact_input: ArtifactInput
@@ -149,10 +152,16 @@ class GroundedWorldModel:
     client: ModelClient
     capabilities: ModelCapabilities
     token_counter: TokenCounter = field(default_factory=Utf8UpperBoundTokenCounter)
+    evidence_selector: JEVSelector | None = None
 
     def __post_init__(self) -> None:
         """Require the current prompt and the immutable build's exact capacity binding."""
         _require_current_prompt(self.artifact)
+        selector_id = (
+            None if self.evidence_selector is None else self.evidence_selector.policy.identity
+        )
+        if selector_id != self.artifact.selection_policy_sha256:
+            raise ValueError("evidence selection policy differs from the simulator artifact")
         if self.capabilities.identity_sha256() != self.artifact.model.capabilities_sha256:
             raise ValueError(
                 "world-model capabilities differ from the frozen build artifact; "
@@ -198,11 +207,26 @@ class GroundedWorldModel:
                 initial_context=task.initial_context,
                 action=action,
                 excluded_lineage_ids=excluded_lineage_ids,
-                top_k=self.artifact.top_k,
+                top_k=(
+                    self.evidence_selector.policy.candidate_limit
+                    if self.evidence_selector
+                    else self.artifact.top_k
+                ),
             )
             for action in candidate_rag_actions(candidate_response)
         )
         batches = tuple(self.retriever.retrieve(query) for query in queries)
+        if self.evidence_selector is not None:
+            batches = tuple(
+                self.evidence_selector.select(
+                    query,
+                    candidates,
+                    state=state or {},
+                    history=visible_messages,
+                    top_k=self.artifact.top_k,
+                )
+                for query, candidates in zip(queries, batches, strict=True)
+            )
         # Round-robin over each call's nearest examples, retaining the pinned total context bound.
         selected: dict[str, RAGMatch] = {}
         for rank in range(self.artifact.top_k):
@@ -216,6 +240,7 @@ class GroundedWorldModel:
             visible_messages=visible_messages,
             candidate_response=candidate_response,
             grounded_examples=matches,
+            knowledge=self.artifact.knowledge,
             maximum_output_tokens=maximum_output_tokens,
             state=state,
         )
@@ -255,6 +280,7 @@ class GroundedWorldModel:
             visible_messages=visible_messages,
             candidate_response=candidate_response,
             grounded_examples=(),
+            knowledge=self.artifact.knowledge,
             maximum_output_tokens=maximum_output_tokens,
             state=state,
         ).model_copy(update={"json_object_output": json_object_output})
@@ -402,6 +428,7 @@ def load_grounded_world_model(
     capabilities: ModelCapabilities,
     embedder: RAGEmbedderBinding | None = None,
     token_counter: TokenCounter | None = None,
+    evidence_selector: JEVSelector | None = None,
 ) -> GroundedWorldModel:
     """Load and verify one executable grounded world-model artifact.
 
@@ -414,6 +441,7 @@ def load_grounded_world_model(
         capabilities: Required resolved metadata for pre-dispatch packing. Its identity must
             match the artifact's frozen model snapshot, including unknown capacity fields.
         token_counter: Optional exact counter; otherwise uses a conservative UTF-8 bound.
+        evidence_selector: Reranker whose identity must match the persisted policy.
 
     Returns:
         Executable grounded world model.
@@ -432,6 +460,7 @@ def load_grounded_world_model(
         client=client,
         capabilities=capabilities,
         token_counter=token_counter or Utf8UpperBoundTokenCounter(),
+        evidence_selector=evidence_selector,
     )
 
 
@@ -576,6 +605,8 @@ def _load_verified_artifact(
         prompt_sha256=artifact.prompt_sha256,
         top_k=artifact.top_k,
         code_revision=artifact.code_revision,
+        knowledge=artifact.knowledge,
+        selection_policy_sha256=artifact.selection_policy_sha256,
     )
     if stable_id("grounded-world-model", content) != artifact_id:
         raise ValueError("grounded world-model artifact ID differs from its complete content")
@@ -585,12 +616,16 @@ def _load_verified_artifact(
 
 def _require_current_prompt(artifact: GroundedWorldModelArtifact) -> None:
     """Require the frozen prompt identity before loading or directly constructing a runtime."""
-    if artifact.prompt_version != GROUNDED_WORLD_MODEL_PROMPT_VERSION:
+    reconstructed = artifact.knowledge is not None
+    version = (
+        RECONSTRUCTED_TEXT_PROMPT_VERSION if reconstructed else GROUNDED_WORLD_MODEL_PROMPT_VERSION
+    )
+    if artifact.prompt_version != version:
         raise ValueError(
             "grounded world-model prompt version is not supported by this runtime; "
             "persist a new world model over the unchanged RAG index and prepare a new evaluation"
         )
-    if artifact.prompt_sha256 != grounded_world_model_prompt_sha256():
+    if artifact.prompt_sha256 != grounded_world_model_prompt_sha256(reconstructed=reconstructed):
         raise ValueError(
             "grounded world-model prompt digest differs from this runtime; "
             "persist a new world model over the unchanged RAG index and prepare a new evaluation"

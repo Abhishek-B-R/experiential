@@ -15,13 +15,14 @@ from exp.common.models import (
     structured_json_text,
 )
 from exp.common.tasks import TaskCase
+from exp.simulation.engines.text.knowledge import SimulationKnowledge
 from exp.simulation.retrieval import RAGAction, RAGMatch
 from exp.simulation.retrieval.contracts import RAG_KEY_SCHEMA_VERSION
 
 WORLD_MODEL_TEXT_PROMPT_VERSION = "text-world-model-v3"
 WORLD_MODEL_TEXT_PROMPT_ID = "world-model-text-v3"
 WORLD_MODEL_TEXT_GROUNDING_SCHEMA_VERSION = "fit-rag-examples-v2"
-WORLD_MODEL_TEXT_SYSTEM_PROMPT = """Protocol version: text-world-model-v3.
+_WORLD_MODEL_INSTRUCTIONS = """Protocol version: text-world-model-v3.
 Simulate the environment for a customer agent using the task, initial context, visible history,
 declared tool schemas, previous environment state, and retrieved real action/observation examples.
 Each grounded example's context_ref identifies its exact task and initial_context in
@@ -35,12 +36,58 @@ Return exactly one result per supplied call_id, in the same order, including par
 Never substitute a user message for a tool result or end the episode before the agent sees it.
 For a text action, generate the next user/environment message or mark the scenario terminal.
 Do not infer or reveal hidden candidate reasoning, reference answers, or grading instructions.
-Return only JSON with these fields:
+"""
+_WORLD_MODEL_TEXT_OUTPUT = """Return only JSON with these fields:
 {"message":"","tool_results":[{"call_id":"id","content":"tool response","is_error":false}],
 "state":{},"terminal":false}
 For tool actions, message must be empty and terminal must be false. For text actions, tool_results
 must be empty and message may be empty only when terminal is true. State is the complete updated
 environment state, retained privately across turns. Do not include markdown fences or other keys."""
+
+WORLD_MODEL_TEXT_SYSTEM_PROMPT = _WORLD_MODEL_INSTRUCTIONS + _WORLD_MODEL_TEXT_OUTPUT
+
+RECONSTRUCTED_TEXT_PROMPT_VERSION = "reconstructed-text-world-model-v2"
+RECONSTRUCTED_TEXT_PROMPT_ID = "reconstructed-world-model-text-v1"
+_RECONSTRUCTED_CONTEXT = """
+Interpret the four context channels separately:
+1. behavioral_knowledge contains frozen rules, tool contracts and explicit unknowns.
+2. grounded_examples, grounding_contexts and library_originals contain historical observations.
+3. task.initial_context, visible_conversation and environment_state concern this instance.
+4. research_history.target and research_history.prior_library contain investigations,
+including rejected or unresolved hypotheses. Neither source is native truth.
+Research history is not native truth. Prior-environment values are not current-instance facts.
+For example, a trace where order A is pending does not prove current order B is pending.
+A rejected hypothesis that every cancellation succeeds must not become a behavioral rule.
+Retain explicit unknowns rather than claiming a missing value was observed.
+"""
+
+RECONSTRUCTED_TEXT_SYSTEM_PROMPT = (
+    WORLD_MODEL_TEXT_SYSTEM_PROMPT.replace(
+        "Protocol version: text-world-model-v3.",
+        "Protocol version: reconstructed-text-world-model-v2.",
+    )
+    + _RECONSTRUCTED_CONTEXT
+)
+
+
+RECONSTRUCTED_JSON_TOOL_SYSTEM_PROMPT = (
+    _WORLD_MODEL_INSTRUCTIONS.replace(
+        "Protocol version: text-world-model-v3.",
+        "Protocol version: grounded-json-transition-v1.",
+    )
+    + """Submit exactly one submit_transition proposal. This answer tool only records your
+proposed consequences; it does not execute the requested environment action.
+Use observations in the supplied call_id order. reply is the native JSON value with encoding
+json, or an exact native text string with encoding text. Do not serialize a JSON object into
+a string. effect is kind replace with the complete updated candidate state. terminal is false.
+The external observation is serialized by code; you decide every reply value and state effect.
+Fictional format example only: {"observations":[{"call_id":"c1","reply":{"id":"a",
+"optional":null},"encoding":"json","is_error":false}],"effect":{"kind":"replace",
+"state":{"records":{"a":{"id":"a","optional":null}}}},"terminal":false}.
+Use actual call IDs, observed formats and current facts, not these fictional fields.
+"""
+    + _RECONSTRUCTED_CONTEXT
+)
 
 
 class SimulatedToolResult(ContractModel):
@@ -100,6 +147,7 @@ def build_world_model_request(
     grounded_examples: Sequence[RAGMatch],
     maximum_output_tokens: int,
     state: JsonObject | None = None,
+    knowledge: SimulationKnowledge | None = None,
 ) -> ModelRequest:
     """Frame a simulated environment transition without enabling provider tools.
 
@@ -110,6 +158,7 @@ def build_world_model_request(
         grounded_examples: Nearest immutable real transitions after current-lineage exclusion.
         maximum_output_tokens: Explicit non-truncating provider output budget.
         state: Private environment state from the previous world-model turn.
+        knowledge: Frozen behavioral and investigation context, empty for the baseline.
 
     Returns:
         A text-only provider request with the pinned prompt and no candidate hidden state.
@@ -148,9 +197,15 @@ def build_world_model_request(
         "grounding_contexts": contexts,
         "grounded_examples": examples,
     }
+    system_prompt = WORLD_MODEL_TEXT_SYSTEM_PROMPT
+    if knowledge is not None:
+        system_prompt = RECONSTRUCTED_TEXT_SYSTEM_PROMPT
+        evidence["behavioral_knowledge"] = knowledge.behavioral_context()
+        evidence["library_originals"] = knowledge.original_library_evidence()
+        evidence["research_history"] = knowledge.research_context()
     return ModelRequest(
         messages=(
-            ModelMessage(role="system", content=WORLD_MODEL_TEXT_SYSTEM_PROMPT),
+            ModelMessage(role="system", content=system_prompt),
             ModelMessage(
                 role="user",
                 content=json.dumps(

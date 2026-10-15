@@ -45,6 +45,7 @@ class WorldModelSessionError(ValueError):
 class WorldModelSessionLimits:
     """Explicit resource limits for one in-memory public world-model runtime."""
 
+    maximum_output_tokens: int = 1_024
     maximum_sessions: int = 256
     session_ttl_seconds: float = 3_600.0
     maximum_messages_per_session: int = 128
@@ -60,6 +61,7 @@ class WorldModelSessionLimits:
             ValueError: A limit is nonpositive or the TTL is not finite.
         """
         integer_limits = (
+            self.maximum_output_tokens,
             self.maximum_sessions,
             self.maximum_messages_per_session,
             self.maximum_transcript_bytes,
@@ -272,7 +274,7 @@ class WorldModel:
                     candidate_response=candidate_action,
                     state=state.environment_state,
                     excluded_lineage_ids=(),
-                    maximum_output_tokens=1_024,
+                    maximum_output_tokens=self.limits.maximum_output_tokens,
                 )
                 dispatched = self._runtime.complete_turn(prepared)
             except WorldModelCapacityError as exc:

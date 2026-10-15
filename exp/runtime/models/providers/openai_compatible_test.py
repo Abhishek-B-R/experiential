@@ -1200,3 +1200,20 @@ def test_typed_content_parts_concatenate_text_and_reject_non_object_parts() -> N
                 configured_model=_snapshot("mistral", "mistral-small-2603"),
                 latency_seconds=1,
             )
+
+
+def test_tool_argument_duplicate_keys_are_rejected_before_typed_replay() -> None:
+    """Raw arguments cannot collapse duplicates into an apparently valid cached proposal."""
+    from exp.runtime.models.providers.openai_compatible import (
+        OpenAICompatibleResponseError,
+        parse_openai_wire_tool_call,
+    )
+
+    with pytest.raises(OpenAICompatibleResponseError, match="duplicate JSON keys"):
+        parse_openai_wire_tool_call(
+            {
+                "id": "answer",
+                "function": {"name": "submit_proposal", "arguments": '{"value":1,"value":2}'},
+            },
+            0,
+        )
