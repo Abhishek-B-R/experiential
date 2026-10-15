@@ -63,6 +63,8 @@ def memory_version_id(lineage: str, version: int) -> str:
 def read_memory_version(store: ArtifactStore, lineage: str, version: int) -> MemoryVersion:
     """Load one verified checkpoint, rejecting a different lineage or number."""
     identity = memory_version_id(lineage, version)
+    if not store.exists(identity):
+        raise ValueError(f"memory lineage {lineage!r} has no version {version}")
     saved = MemoryVersion.model_validate_json(store.read_bytes(identity, "memory.json"))
     if saved.lineage != lineage or saved.version != version:
         raise ValueError("memory version artifact differs from its lineage position")

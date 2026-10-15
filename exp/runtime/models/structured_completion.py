@@ -16,6 +16,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.json_schema import expand_local_references
 from exp.common.models import (
     ModelCapabilities,
     ModelClient,
@@ -145,7 +146,7 @@ class StructuredCompletion:
                 ToolSchema(
                     name="submit_proposal",
                     description="Submit the requested structured proposal.",
-                    input_schema=schema,
+                    input_schema=expand_local_references(schema),
                 ),
             )
         return ModelRequest(

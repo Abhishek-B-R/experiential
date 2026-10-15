@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 from exp.common.core.artifacts import JsonObject, Sha256, sha256_json
+from exp.common.core.json_schema import expand_local_references
 from exp.common.models import (
     AssistantAction,
     ModelFinishReason,
@@ -80,7 +81,9 @@ def frame_grounded_output(
                     ToolSchema(
                         name="submit_transition",
                         description="Submit observations and the complete candidate state.",
-                        input_schema=_GroundedJsonProposal.model_json_schema(),
+                        input_schema=expand_local_references(
+                            _GroundedJsonProposal.model_json_schema()
+                        ),
                     ),
                 ),
                 "tool_choice": ToolChoice(name="submit_transition"),
@@ -137,7 +140,7 @@ class GroundedTransitionEngine:
                 "output_tokens": self.maximum_output_tokens,
                 "json_object_output": self.json_object_output,
                 "output_protocol": self.output_protocol,
-                "protocol": "grounded-typed-response-v1",
+                "protocol": "grounded-typed-response-v2",
             }
         )
 

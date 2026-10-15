@@ -330,7 +330,7 @@ def test_boundaries_refuse_wrong_scope_stale_parent_and_missing_reranker(
     with pytest.raises(ValueError, match="checkpoint"):
         trajectory(base, "bad", "k", "frozen")
     missing = trajectory(base, "missing", "k", "frozen", checkpoint=1)
-    with pytest.raises(Exception, match="experience-memory"):
+    with pytest.raises(ValueError, match="has no version 1"):
         prepare_fidelity_evaluation(project, missing, code_revision="fixture")
     store = project.artifacts
     now = datetime.now(UTC)
@@ -394,3 +394,41 @@ def test_boundaries_refuse_wrong_scope_stale_parent_and_missing_reranker(
     monkeypatch.setattr(fidelity, "load_grounded_world_model_artifact", bound)
     with pytest.raises(ValueError, match="binds a JEV reranker"):
         prepare_fidelity_evaluation(project, unbound, code_revision="fixture")
+
+
+def test_wire_tool_schemas_are_reference_free_and_string_effects_stay_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Served models see inline shapes; a stringified effect is still refused, not coerced.
+
+    The refused shape is the one GLM 5.3 Flash returned under the referenced schema
+    (saved tau-efficacy-flash proposals): ``effect`` as a JSON-encoded string.
+    """
+    project, base = memory_project(tmp_path)
+    monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
+    a = trajectory(base, "traj-wire", "alpha", "learn")
+    stringified = transition_reply(
+        {
+            "observations": [
+                {"call_id": "traj-wire-1", "reply": "alpha-reply-1", "encoding": "json"}
+            ],
+            "effect": json.dumps({"kind": "replace", "state": {"last": "traj-wire-1"}}),
+        }
+    )
+    wire = RoutedTransport(
+        [predicted("traj-wire-0", "wrong"), investigation("alpha"), stringified, judged(a)]
+    )
+    monkeypatch.setattr(fidelity, "HttpxJsonTransport", lambda: wire)
+    prepared = prepare_fidelity_evaluation(project, a, code_revision="fixture")
+    result = execute_fidelity_evaluation(project, prepared)
+    schemas = []
+    for request in wire.requests:
+        tools = request.payload.get("tools")
+        for tool in tools if isinstance(tools, list) else []:
+            if isinstance(tool, dict) and isinstance(tool.get("function"), dict):
+                schemas.append(tool["function"]["parameters"])
+    assert len(schemas) == 4
+    assert all("$ref" not in json.dumps(schema) for schema in schemas)
+    assert result.mechanical["valid_steps"] == 1 and result.mechanical["failed_steps"] == 1
+    receipt = saved_memory_receipt(project, prepared)
+    assert receipt is not None and receipt["published"] is False
