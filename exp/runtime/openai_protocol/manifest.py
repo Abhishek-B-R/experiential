@@ -197,6 +197,10 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         # (context is never truncated; served routes cache implicitly).
         _field("truncation", CompatibilityDisposition.SUPPORTED),
         _field("prompt_cache_options", CompatibilityDisposition.SUPPORTED),
+        # ``include_obfuscation`` padding is never emitted, so ``false`` is
+        # honored and ``true`` is disclosed as ignored
+        # (``client_field_repairs.accept_responses_stream_options``).
+        _field("stream_options", CompatibilityDisposition.SUPPORTED),
         # The Responses tool-call cap is refused until a route can honor it.
         # ``tool_call_limit`` is the catalog vocabulary for that decision.
         _field("max_tool_calls", CompatibilityDisposition.UNSUPPORTED, "tool_call_limit"),
@@ -221,7 +225,6 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "moderation",
                 "prompt",
                 "prompt_cache_retention",
-                "stream_options",
             )
         ),
     ),

@@ -749,15 +749,18 @@ class _ResponseReasoningItem(_WireModel):
 class _ResponseFormat(_WireModel):
     """Supported Responses text format.
 
+    ``json_object`` is the schema-free JSON mode, carried like the Chat
+    ``response_format`` spelling; it takes no name or schema.
+
     Attributes:
-        type: Required text or JSON-schema discriminator.
+        type: Required text, JSON-object, or JSON-schema discriminator.
         name: Optional nonempty name, required for structured output and at most 256 characters.
         description: Optional format instructions, at most 65,536 characters.
         schema_: Optional public schema object, required for structured output.
         strict: Whether strict output validation is requested, true by default.
     """
 
-    type: Literal["text", "json_schema"]
+    type: Literal["text", "json_object", "json_schema"]
     name: str | None = Field(default=None, min_length=1, max_length=256)
     description: str | None = Field(default=None, max_length=_MAXIMUM_FORMAT_DESCRIPTION_CHARACTERS)
     schema_: JsonObject | None = Field(default=None, alias="schema")

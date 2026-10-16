@@ -30,6 +30,7 @@ from exp.runtime.models.providers.images import (
     openai_chat_image_part,
     responses_image_part,
 )
+from exp.runtime.models.providers.openai_item_ids import openai_issued_item_id
 from exp.runtime.models.providers.videos import openai_chat_video_part, reject_video_part
 
 TOOL_RESULT_IMAGE_FOLD_HEADER = (
@@ -212,24 +213,31 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
             if message.provider_item_id is None:
                 raise ProviderResponseError("Responses assistant output omitted its provider ID")
             output_message: JsonObject = {
-                "type": "message",
-                "id": message.provider_item_id,
+                # A client- or gateway-minted id OpenAI would refuse: the turn
+                # replays at its position as plain assistant history.
                 "role": "assistant",
-                "status": message.provider_status or "completed",
-                "content": (
-                    [
-                        {
-                            "type": "output_text",
-                            "text": message.content,
-                            "annotations": [],
-                        }
-                    ]
-                    if message.content is not None
-                    else []
-                ),
+                "content": message.content or "",
             }
-            if message.provider_phase is not None:
-                output_message["phase"] = message.provider_phase
+            if openai_issued_item_id(message.provider_item_id, "message"):
+                output_message = {
+                    "type": "message",
+                    "id": message.provider_item_id,
+                    "role": "assistant",
+                    "status": message.provider_status or "completed",
+                    "content": (
+                        [
+                            {
+                                "type": "output_text",
+                                "text": message.content,
+                                "annotations": [],
+                            }
+                        ]
+                        if message.content is not None
+                        else []
+                    ),
+                }
+                if message.provider_phase is not None:
+                    output_message["phase"] = message.provider_phase
             indexed_items.append((message.provider_output_index, output_message))
     for call in message.tool_calls:
         item: JsonObject = {
@@ -247,7 +255,9 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
         # like the namespace; absent stays absent.
         if call.provider_caller is not None:
             item["caller"] = call.provider_caller
-        if call.provider_item_id is not None:
+        if call.provider_item_id is not None and openai_issued_item_id(
+            call.provider_item_id, "function_call"
+        ):
             item["id"] = call.provider_item_id
         if call.provider_status is not None:
             item["status"] = call.provider_status

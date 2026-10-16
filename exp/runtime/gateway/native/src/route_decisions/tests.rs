@@ -300,7 +300,7 @@ fn score_requires_exact_legend_index_set_and_expected_value() {
     assert_malformed(provider);
 }
 
-fn score_payload(probabilities: &[f64], score: f64) -> (DecisionsAdmission, Value) {
+pub(super) fn score_payload(probabilities: &[f64], score: f64) -> (DecisionsAdmission, Value) {
     let mut admitted = admission();
     let criteria: Vec<Value> = (0..probabilities.len())
         .map(|i| json!(format!("Level {i}")))

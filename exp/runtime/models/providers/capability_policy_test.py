@@ -93,7 +93,7 @@ def test_efforts_order_by_nearness_and_prefer_the_lower_level_on_ties() -> None:
     assert efforts_by_nearness("bogus", ("high",)) == ()
 
 
-@pytest.mark.parametrize("effort", ("none", "minimal", "low", "medium"))
+@pytest.mark.parametrize("effort", ("low", "medium"))
 def test_explicit_effort_cannot_be_upsold(effort: ReasoningEffort) -> None:
     """A high-only rung cannot replace an explicit lower requested effort."""
     assert (
@@ -102,6 +102,33 @@ def test_explicit_effort_cannot_be_upsold(effort: ReasoningEffort) -> None:
         )
         is None
     )
+
+
+@pytest.mark.parametrize("effort", ("none", "minimal"))
+def test_an_effort_below_the_whole_ladder_takes_the_lowest_tier(effort: ReasoningEffort) -> None:
+    """``none``/``minimal`` on a route that cannot reason that little takes its shallowest tier.
+
+    Pinned clients send ``none`` to every model; the gateway refused 925 such
+    requests a day on ladders like ``low, high, max``. The route cannot turn
+    reasoning off, so the lowest tier it serves is the nearest reading.
+    """
+    coercion = coerce_generation_parameters(
+        (_reasoning_profile("gpt-5-pro"),), _request(reasoning_effort=effort)
+    )
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "high"
+    assert coercion.disclosures == ("reasoning_effort->high(lowest_supported)",)
+    ladder = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://glm.test",
+        model_id="glm-5.3-flash",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("low", "high", "max"),
+    )
+    coercion = coerce_generation_parameters((ladder,), _request(reasoning_effort=effort))
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "low"
 
 
 def test_effort_snap_updates_the_native_output_config() -> None:

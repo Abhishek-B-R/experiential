@@ -5636,12 +5636,11 @@ def test_keyed_reasoning_content_joins_replay_identity(tmp_path: Path) -> None:
             )
         )
 
-    # The seeded route is OpenAI-compatible, so the carrier is rejected at
-    # parameter admission; the accepted request still lands a durable keyed
-    # terminal, which is exactly what replay identity is checked against.
-    with pytest.raises(NativeBridgeError) as first:
-        admit_keyed(reasoning_body("blob-one=="))
-    assert json.loads(first.value.public_error_json)["code"] == "unsupported_parameter"
+    # The seeded route is OpenAI-compatible, so it cannot read the carrier and
+    # admission drops it with disclosure; the accepted keyed request is still
+    # what replay identity is checked against.
+    first = admit_keyed(reasoning_body("blob-one=="))
+    assert "input.reasoning.encrypted_content->dropped(foreign_route)" in json.dumps(first)
 
     with pytest.raises(NativeBridgeError) as changed:
         admit_keyed(reasoning_body("blob-two=="))

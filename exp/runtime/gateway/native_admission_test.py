@@ -1066,9 +1066,9 @@ def test_an_explicit_thinking_budget_is_not_replaced_with_advisory_effort() -> N
 
 
 def test_named_processing_tier_fails_closed_when_no_rung_offers_it() -> None:
-    """A flex/priority request rejects fail-closed before reservation when no
-    rung can honor it: a host lane without per-tier pass-through pricing and no
-    BYOK rung. auto/default never reject."""
+    """A flex request rejects fail-closed before reservation when no rung can
+    honor it (a host lane without per-tier pass-through pricing and no BYOK
+    rung); priority runs at standard with disclosure; auto/default never reject."""
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 
     route = _mixed_route(
@@ -1090,21 +1090,33 @@ def test_named_processing_tier_fails_closed_when_no_rung_offers_it() -> None:
     wires = ((GatewayWireProfile(dialect="openai_compatible", url="https://house.test"), client),)
     accounting = cast(NativeAttemptAccounting, _CoercionCounter())
 
-    for tier in ("flex", "priority"):
-        request = GatewayRequest(
-            surface=GatewayApiSurface.CHAT_COMPLETIONS,
-            messages=(GatewayMessage(role="user", content="go"),),
-            service_tier=tier,
+    # Flex asks for a cheaper tier; serving it at standard would bill more
+    # than the caller chose, so it stays refused.
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"),),
+        service_tier="flex",
+    )
+    with pytest.raises(ProviderCapabilityError) as exc:
+        admitted_route_requests(
+            route,
+            wires,
+            request,
+            accounting=accounting,
+            authorization=route.snapshot.authorization,
         )
-        with pytest.raises(ProviderCapabilityError) as exc:
-            admitted_route_requests(
-                route,
-                wires,
-                request,
-                accounting=accounting,
-                authorization=route.snapshot.authorization,
-            )
-        assert exc.value.capability == "service_tier"
+    assert exc.value.capability == "service_tier"
+    # Priority falls back to standard processing with disclosure: it never
+    # costs the caller more (Codex Fast mode, 213 refusals a day).
+    _route, _wires, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request.model_copy(update={"service_tier": "priority"}),
+        accounting=accounting,
+        authorization=route.snapshot.authorization,
+    )
+    assert provider.service_tier is None
+    assert public.ignored_parameters == ("service_tier->default(priority_unavailable)",)
 
     # auto/default carry no price, and `scale` (a valid OpenAI tier we do not
     # price as opt-in) is stripped downstream, not rejected: only flex/priority
@@ -1267,15 +1279,17 @@ def test_tier_without_a_card_rejects_while_byok_forwards_any_tier() -> None:
         messages=(GatewayMessage(role="user", content="go"),),
         service_tier="priority",
     )
-    with pytest.raises(ProviderCapabilityError) as exc:
-        admitted_route_requests(
-            flex_only_route,
-            house_wires,
-            priority_request,
-            accounting=accounting,
-            authorization=flex_only_route.snapshot.authorization,
-        )
-    assert exc.value.capability == "service_tier"
+    # Priority without its card dispatches at standard (billed at the base
+    # schedule the provider then runs), disclosed; it is never forwarded.
+    _route, _wires, public, provider, _placement = admitted_route_requests(
+        flex_only_route,
+        house_wires,
+        priority_request,
+        accounting=accounting,
+        authorization=flex_only_route.snapshot.authorization,
+    )
+    assert provider.service_tier is None
+    assert "service_tier->default(priority_unavailable)" in public.ignored_parameters
 
     # A BYOK rung (billing_customer_managed) forwards ANY tier with no card.
     byok_route = _mixed_route(

@@ -4513,22 +4513,140 @@ def test_responses_input_status_does_not_require_output_identity(role: str, stat
     assert with_status.request.messages[0].provider_item_id is None
 
 
-def test_responses_assistant_output_status_still_requires_identity() -> None:
-    """An output lifecycle marker does not become anonymous input history."""
-    with pytest.raises(OpenAIProtocolError, match="status requires an item id"):
+@pytest.mark.parametrize(
+    ("marker", "disclosure"),
+    (
+        ({"status": "completed"}, "input.status->dropped(no_item_id)"),
+        ({"phase": "final_answer"}, "input.phase->dropped(no_item_id)"),
+    ),
+)
+def test_responses_unanchored_output_markers_decode_as_plain_history(
+    marker: JsonObject, disclosure: str
+) -> None:
+    """An id-less assistant echo decodes as plain history and names the dropped marker.
+
+    LiteLLM 1.104 echoes prior assistant output with ``status`` (and other
+    clients with ``phase``) but no item id; the gateway refused 4,371 and 271
+    such requests a day. Without the id the marker cannot anchor a replay, so
+    the turn is the same text-only history it would be without the marker.
+    """
+    item: JsonObject = {
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "Done", "annotations": []}],
+    }
+    history = [{"role": "user", "content": "go"}, item, {"role": "user", "content": "again"}]
+    plain = decode_responses({"model": "coding", "input": history})
+    marked = decode_responses(
+        {"model": "coding", "input": [history[0], {**item, **marker}, history[2]]}
+    )
+    assert marked.request.messages == plain.request.messages
+    assert marked.request.messages[1].provider_item_id is None
+    assert marked.request.ignored_parameters == (disclosure,)
+
+
+def test_responses_output_markers_with_an_item_id_are_retained() -> None:
+    """A real output item keeps its status and phase for exact replay."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"role": "user", "content": "go"},
+                {
+                    "type": "message",
+                    "id": "msg_abc123",
+                    "role": "assistant",
+                    "status": "completed",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "Done", "annotations": []}],
+                },
+            ],
+        }
+    )
+    replayed = decoded.request.messages[1]
+    assert replayed.provider_item_id == "msg_abc123"
+    assert replayed.provider_status == "completed"
+    assert replayed.provider_phase == "final_answer"
+    assert decoded.request.ignored_parameters == ()
+
+
+def test_responses_json_object_text_format_selects_json_mode() -> None:
+    """``text.format.type: json_object`` is the Responses spelling of Chat JSON mode.
+
+    codex-tui 0.162 sends it; the gateway refused 334 requests a day.
+    """
+    decoded = decode_responses(
+        {"model": "coding", "input": "hi", "text": {"format": {"type": "json_object"}}}
+    )
+    assert decoded.request.json_object_output is True
+    assert decoded.request.structured_text is None
+    with pytest.raises(OpenAIProtocolError):
         decode_responses(
             {
                 "model": "coding",
-                "input": [
-                    {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": "Done",
-                        "status": "completed",
-                    }
-                ],
+                "input": "hi",
+                "text": {"format": {"type": "json_object", "name": "x", "schema": {}}},
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("stream", "options", "disclosures"),
+    (
+        (True, {"include_obfuscation": False}, ()),
+        (True, {}, ()),
+        (
+            True,
+            {"include_obfuscation": True},
+            ("stream_options.include_obfuscation->ignored(not_emitted)",),
+        ),
+        (False, {"include_obfuscation": False}, ("stream_options->ignored(stream_false)",)),
+    ),
+)
+def test_responses_stream_options_are_accepted(
+    stream: bool, options: JsonObject, disclosures: tuple[str, ...]
+) -> None:
+    """The OpenAI SDK's Responses ``stream_options`` decode; ignored settings are named."""
+    decoded = decode_responses(
+        {"model": "coding", "input": "hi", "stream": stream, "stream_options": options}
+    )
+    assert decoded.request.ignored_parameters == disclosures
+
+
+def test_responses_stream_options_unknown_keys_are_named() -> None:
+    """Only ``include_obfuscation`` is defined; anything else keeps a named 400."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": "hi",
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+        )
+    assert error.value.detail.param == "stream_options.include_usage"
+
+
+def test_chat_message_cot_id_is_dropped_with_disclosure() -> None:
+    """GitHub Copilot Chat's ``cot_id`` message tag decodes and is named as dropped."""
+    messages: list[JsonValue] = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "yo"},
+        {"role": "user", "content": "again"},
+    ]
+    plain = decode_chat({"model": "coding", "messages": messages})
+    tagged = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                messages[0],
+                {"role": "assistant", "content": "yo", "cot_id": "cot-1"},
+                {**cast("JsonObject", messages[2]), "cot_id": "cot-2"},
+            ],
+        }
+    )
+    assert tagged.request.messages == plain.request.messages
+    assert tagged.request.ignored_parameters == ("messages.cot_id->dropped(client_annotation)",)
 
 
 def test_responses_decoder_accepts_an_assistant_history_message_without_an_item_id() -> None:
