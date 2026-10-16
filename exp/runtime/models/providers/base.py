@@ -372,6 +372,8 @@ class GatewayWireProfile:
             "gemini_generate_content",
             "bedrock_converse_stream",
             "typesafe_systemone",
+            # ElevenLabs' audio wire: admitted only on the audio surfaces.
+            "elevenlabs_audio",
         }:
             raise ValueError("gateway wire dialect is not implemented")
         if self.reasoning_wire_format not in {

@@ -98,6 +98,7 @@ def _admit(
         surface="speech",
         rung_url=native_audio._speech_rung,  # noqa: SLF001
         payload=lambda *_: {},
+        refusal=lambda *_: None,
         extra={},
     )
     return plane

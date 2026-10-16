@@ -8,6 +8,7 @@
 
 mod admission;
 mod audio_duration;
+mod audio_elevenlabs;
 mod audio_upload;
 mod bridge;
 mod capture;

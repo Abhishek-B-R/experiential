@@ -9,6 +9,7 @@ from exp.common.models.model import BillingSource
 from exp.runtime.gateway.audio_billing import AudioSurface, billing_mode
 from exp.runtime.models import ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.elevenlabs_audio import ELEVENLABS_AUDIO_DIALECT
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.protocol import NativeWireClient
 
@@ -202,10 +203,11 @@ def _audio_claim_blockers(
 ) -> tuple[str, ...]:
     """Name each audio surface a deployment claims but cannot serve or bill.
 
-    A claimed surface without its OpenAI-wire endpoint, or whose price card
-    names no single valid meter (``audio_billing.billing_mode``), could only
-    fail after a request was durably accepted, so the alias is excluded at
-    startup instead.
+    A claimed surface without its endpoint, or whose price card names no
+    single valid meter (``audio_billing.billing_mode``), could only fail after
+    a request was durably accepted, so the alias is excluded at startup
+    instead. An ElevenLabs rung must bill a unit card (characters or audio
+    seconds): its wire reports no token usage.
     """
     capabilities = deployment.gateway.capabilities
     claims: tuple[tuple[AudioSurface, bool, str | None], ...] = (
@@ -225,5 +227,13 @@ def _audio_claim_blockers(
             reasons.append(
                 f"deployment {deployment.deployment_id!r} claims {surface} without a "
                 "single billable meter"
+            )
+        elif (
+            profile.dialect == ELEVENLABS_AUDIO_DIALECT
+            and billing_mode(deployment, surface) != "units"
+        ):
+            reasons.append(
+                f"deployment {deployment.deployment_id!r} claims {surface} on ElevenLabs "
+                "without a unit card"
             )
     return tuple(reasons)
