@@ -7284,3 +7284,36 @@ def test_gemini_rung_folds_a_mid_conversation_system_turn_instead_of_refusing(
         {"role": "user", "parts": [{"text": "Go ahead."}]},
     ]
     assert HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE in cast(list[str], admission["ignored_parameters"])
+
+
+def test_provider_routing_preferences_are_resolved_at_admission(tmp_path: Path) -> None:
+    """OpenRouter-style ``provider`` pins resolve against our rungs, never silently.
+
+    A pin no rung matches is a 400 naming the providers the model offers
+    (request-5ff5f798: ``order: [no_such_host]`` returned 200); a matching
+    pin admits; unsupported keys are disclosed.
+    """
+    control, raw_key = _control_plane(tmp_path)
+
+    def body(preferences: JsonObject) -> str:
+        """One chat body carrying ``preferences``."""
+        return json.dumps(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "provider": preferences,
+            }
+        )
+
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit(control, raw_key, body({"order": ["no_such_host"], "allow_fallbacks": False}))
+    error = json.loads(raised.value.public_error_json)
+    assert error["param"] == "provider.order"
+    assert "Providers serving this model:" in error["message"]
+    admitted_provider = cast("list[JsonObject]", _admit(control, raw_key, _chat_body())["route"])
+    served = _admit(
+        control,
+        raw_key,
+        body({"only": [str(admitted_provider[0]["provider"])], "sort": "price"}),
+    )
+    assert "provider.sort->ignored(unsupported)" in cast("list[str]", served["ignored_parameters"])

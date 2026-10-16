@@ -375,3 +375,28 @@ requires exact-version provider and ledger verification in its authorized enviro
 OpenRouter documents omission of optional upstream token caps, not a universal numeric default.
 Its public streaming schema carries argument strings and termination reasons; it does not
 specify an internal repair algorithm for every malformed tool response.
+
+## Provider routing preferences
+
+Every surface accepts OpenRouter's documented `provider` object
+([provider routing](https://openrouter.ai/docs/features/provider-routing)). The gateway resolves
+its routing keys against the model's own rungs at admission and never forwards them to an
+aggregator upstream:
+
+- `only` keeps rungs of the listed providers; `ignore` drops them.
+- `order` tries the listed providers first, in that order; the rest remain fallbacks.
+- `allow_fallbacks: false` with `order` serves only the listed providers; without `order` it
+  serves only the first eligible rung. A pinned rung that fails, or is unavailable, is the
+  request's error, never a failover.
+
+A rung is named by its catalog provider id (`bedrock`, `azure_openai`, `openai`, `anthropic`,
+`openrouter`, ...), or by the label a host assigns through its components' optional
+`provider_label` callable (a hosted platform maps a masked house lane to the name it shows, such
+as `experiential_cloud`, so callers pin the name they see in `x-gateway-provider`). OpenRouter
+slugs are aliases: `amazon-bedrock`, `azure`, `google-vertex`, `google-ai-studio`. A preference
+no rung satisfies (an unknown name, or `only`/`ignore` excluding every rung) is a 400 on
+`provider.<key>` naming the providers serving the model. `zdr` keeps its zero-data-retention
+handling; `zdr` and `data_collection` are the only caller keys an OpenRouter rung receives. Any
+other key (`sort`, `quantizations`, `max_price`, `require_parameters`, ...) is disclosed as
+`provider.<key>->ignored(unsupported)`. `gateway.routing` (`route_id`, `allow_fallbacks`)
+applies on top of the narrowed route.

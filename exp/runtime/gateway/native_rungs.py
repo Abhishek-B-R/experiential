@@ -144,8 +144,8 @@ def build_rung_dispatch(
     if rung_request.provider_preferences is not None and openrouter_chat_wire(
         deployment.provider, profile.dialect
     ):
-        # The caller's routing preferences reach the one wire that defines
-        # them; every other dialect's builder never emits the field.
+        # Only the caller's data-policy keys reach OpenRouter; routing keys
+        # were resolved against our own rungs at admission.
         upstream_payload = forward_provider_preferences(
             upstream_payload, rung_request.provider_preferences
         )

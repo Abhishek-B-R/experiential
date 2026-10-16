@@ -16,9 +16,9 @@ the response, which the data plane records per attempt as the settlement's
 
 from __future__ import annotations
 
-from typing import Final, Literal
+from typing import Annotated, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints
 
 from exp.common.core.artifacts import JsonObject, JsonValue
 
@@ -35,6 +35,9 @@ GOOGLE_MODEL_PREFIX: Final = "google/gemini"
 The wider ``google/`` namespace also holds Gemma, which third parties serve with
 ordinary disjoint cache accounting, so it keeps the default contract."""
 
+ProviderName = Annotated[str, StringConstraints(strict=True, min_length=1, max_length=128)]
+"""One provider name in a routing preference list."""
+
 ZDR_PROVIDER_PREFERENCES: Final[JsonObject] = {"zdr": True, "data_collection": "deny"}
 """The strict values the constraint forces onto ``payload["provider"]``."""
 
@@ -43,20 +46,32 @@ class ProviderRoutingPreferences(BaseModel):
     """The caller's top-level ``provider`` object, OpenRouter's routing-preference shape.
 
     Accepted on every gateway surface (Chat Completions, Responses, Messages).
-    ``zdr: true`` is the one field the gateway acts on itself: it DEMANDS
-    zero-data-retention routing for the request (the host's route filter
-    applies the same posture filter as an organization ``require_zdr``, and
-    the request can only tighten an organization policy, never loosen it).
-    Every other key (``data_collection``, ``order``, ``only``, ...) is
-    forwarded to OpenRouter rungs verbatim, tightened by the constraint when
-    the route is constrained, and dropped on every other wire, which has no
-    such field.
+    ``zdr: true`` DEMANDS zero-data-retention routing for the request (the
+    host's route filter applies the same posture filter as an organization
+    ``require_zdr``, and the request can only tighten an organization policy).
+    ``order``, ``only``, ``ignore`` and ``allow_fallbacks`` are resolved
+    against the gateway's own rungs at admission. ``data_collection`` (and
+    ``zdr``) are forwarded to OpenRouter rungs; every other key is disclosed
+    as ignored.
+
+    Attributes:
+        zdr: Demand zero-data-retention routing.
+        data_collection: OpenRouter's upstream data-collection policy.
+        order: Provider names to try first, in order.
+        only: Provider names allowed to serve.
+        ignore: Provider names never allowed to serve.
+        allow_fallbacks: Whether providers outside ``order`` (or after the first
+            rung) may serve.
     """
 
     model_config = ConfigDict(extra="allow", frozen=True)
 
     zdr: StrictBool | None = None
     data_collection: Literal["allow", "deny"] | None = None
+    order: tuple[ProviderName, ...] | None = Field(default=None, max_length=32)
+    only: tuple[ProviderName, ...] | None = Field(default=None, max_length=32)
+    ignore: tuple[ProviderName, ...] | None = Field(default=None, max_length=32)
+    allow_fallbacks: StrictBool | None = None
 
     @property
     def demands_zdr(self) -> bool:
@@ -64,19 +79,33 @@ class ProviderRoutingPreferences(BaseModel):
         return self.zdr is True
 
 
+FORWARDED_PREFERENCE_KEYS: Final = frozenset({"zdr", "data_collection"})
+"""The only caller preference keys an OpenRouter upstream receives.
+
+Routing keys (``order``, ``only``, ``ignore``, ``allow_fallbacks``) name the
+gateway's own providers and are resolved at admission
+(``exp.runtime.gateway.provider_preferences``); forwarding them made OpenRouter
+look for providers it does not have (a pin on ``experiential_cloud`` answered
+404). Other keys are disclosed as ignored, never forwarded."""
+
+
 def forward_provider_preferences(payload: JsonObject, preferences: JsonObject) -> JsonObject:
-    """Return ``payload`` carrying the caller's ``provider`` object for an OpenRouter rung.
+    """Return ``payload`` carrying the caller's data-policy preferences for an OpenRouter rung.
 
     Args:
         payload: A built Chat Completions payload for an OpenRouter rung.
         preferences: The caller's validated ``provider`` object.
 
     Returns:
-        A new payload whose ``provider`` is a copy of ``preferences``; the
+        A new payload whose ``provider`` holds only the caller's ``zdr`` and
+        ``data_collection`` keys (unchanged when the caller sent neither); the
         constraint (:func:`constrain_openrouter_zero_data_retention`) tightens
         on top when the rung is flagged. The input is never mutated.
     """
-    forwarded: JsonValue = dict(preferences)
+    kept = {key: value for key, value in preferences.items() if key in FORWARDED_PREFERENCE_KEYS}
+    if not kept:
+        return payload
+    forwarded: JsonValue = kept
     return {**payload, "provider": forwarded}
 
 

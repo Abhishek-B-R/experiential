@@ -343,12 +343,21 @@ def test_a_flagged_rung_on_another_wire_fails_closed() -> None:
 
 
 def test_caller_provider_preferences_forward_to_openrouter_and_tighten_under_the_flag() -> None:
-    """The caller object reaches OpenRouter verbatim; a flagged rung tightens it, never loosens."""
+    """Only the caller's data-policy keys reach OpenRouter; routing keys never do.
+
+    llama-4-maverick (2026-10-16): a caller's ``order`` naming our own provider
+    label reached OpenRouter verbatim and OpenRouter answered 404 for a provider
+    it does not have. Routing keys are resolved against our rungs at admission.
+    """
     rung = _deployment("or-rung", "openrouter")
     preferences: JsonObject = {
         "zdr": False,
         "data_collection": "allow",
-        "order": ["Azure"],
+        "order": ["experiential_cloud"],
+        "only": ["openrouter"],
+        "ignore": ["bedrock"],
+        "allow_fallbacks": False,
+        "sort": "price",
     }
 
     plain = _dispatch(_route((rung,)), rung, preferences).wire_entry
@@ -356,14 +365,14 @@ def test_caller_provider_preferences_forward_to_openrouter_and_tighten_under_the
 
     plain_payload = plain["upstream_payload"]
     assert isinstance(plain_payload, dict)
-    assert plain_payload["provider"] == preferences
+    assert plain_payload["provider"] == {"zdr": False, "data_collection": "allow"}
     tight_payload = tight["upstream_payload"]
     assert isinstance(tight_payload, dict)
-    assert tight_payload["provider"] == {
-        "zdr": True,
-        "data_collection": "deny",
-        "order": ["Azure"],
-    }
+    assert tight_payload["provider"] == {"zdr": True, "data_collection": "deny"}
+    routing_only = _dispatch(_route((rung,)), rung, {"order": ["x"]}).wire_entry
+    routing_payload = routing_only["upstream_payload"]
+    assert isinstance(routing_payload, dict)
+    assert "provider" not in routing_payload
 
 
 def test_caller_provider_preferences_are_dropped_on_wires_without_the_field() -> None:
