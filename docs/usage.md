@@ -11,7 +11,7 @@ The root surface is deliberately small:
 | `exp login [--root ROOT]` | Sign in to Experiential Cloud, save the returned organization key, and synchronize account-visible models with the catalog's default-route capabilities and undiscounted prices. Known metadata is reused without capability or price questions. | User-local credential plus secret-free hosted provider/model records in `.exp/models.toml`. |
 | `exp capture [--verbose] [--domain HOST ...]` | Capture supported OpenAI and Anthropic traffic across macOS apps until Ctrl+C, reusing `exp login`. | Cloud traces and bounded private retry batches. |
 | `exp run [PROJECT] [--root ROOT] [--check]` | Start the local gateway directly, optionally with one project-backed alias. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
-| `exp eval [PROJECT] --models ALIAS,ALIAS` | Compare models on the project scenarios, or open the terminal project picker. | Saved resumable run, JSON evidence, and offline Pareto report. |
+| `exp eval [PROJECT] --models ALIAS,ALIAS` | Compare models on the project scenarios, simulated with the build's learned memory, or open the terminal project picker. | Saved resumable run, JSON evidence, and offline Pareto report. |
 | `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Import file or gateway traces, mine scenarios, and prepare world-model grounding; omitting traces opens the guided build. | Canonical imports in `gateway/traffic.db`, versioned scenarios, serving RAG, fit RAG and a grounded world model. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
 | `exp optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
@@ -471,6 +471,19 @@ The build ends by retesting every learned trace that had at least one inexact re
 the final memory checkpoint, and compares each turn before and after learning: fixed, still
 wrong, or regressed. The retest reads what memory learned from those
 traces, so it checks that the lessons of a miss stuck; it does not measure unlearned tasks.
+
+`exp eval PROJECT --models A,B` evaluates workers on the learned simulator, with no flag.
+Preparation pins the build's memory at its latest version, and every simulated turn reads it:
+records are recalled per tool call through the learning plan's recall alias and policy, and the
+version's pinned overview comes with every turn. Evaluation only reads memory; it never publishes
+or researches. Evaluation tasks are mined from the traces memory learned, so each task reads
+memory with its own task lineage (and the lineages of its source traces) hidden, exactly as
+learning hides it. Lineages reserved for evaluation stay withheld, and a held-out task reads only
+memory of known provenance. The memory version is part of the evaluation plan: saved results
+replay only for identical memory, and a run saved without memory resumes without it. The review
+header and the saved report name the version (`Simulator memory: vN (...)`). A build that learned
+nothing evaluates on the bare simulator and says so in one line. Recall decisions are saved and
+replay on resume; they are not part of the spend estimate.
 
 `exp eval PROJECT --audit N [--verbose]` is the independent audit. It first learns a separate
 memory from fit traces only: held-out lineages are reserved before the first trace, so they are

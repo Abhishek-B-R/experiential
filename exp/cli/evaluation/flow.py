@@ -25,7 +25,7 @@ from exp.common.progress import ProgressEvent, ProgressHook
 from exp.common.project import ProjectStore
 from exp.common.project.config_sqlite import list_projects
 from exp.common.release_revision import installed_release_revision
-from exp.optimize.evaluation.export import export_report
+from exp.optimize.evaluation.export import export_report, simulator_memory_line
 from exp.optimize.evaluation.judging_resume import prepare_judging_revision
 from exp.optimize.evaluation.runs import (
     EvaluationRun,
@@ -320,6 +320,7 @@ def _preflight(project: ProjectStore, run: EvaluationRun, *, reviewing: bool = F
     )
     _console.print(Text("Models: " + ", ".join(candidate.alias for candidate in setup.candidates)))
     _console.print(Text(f"World model: {setup.world_model_settings.world_model_alias}"))
+    _console.print(Text(simulator_memory_line(run)))
     _console.print(
         Text(f"Judge: {run.prepared.judge_request.model.model_id} ({setup.judgment_status})")
     )
