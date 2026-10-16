@@ -37,6 +37,7 @@ from exp.runtime.openai_protocol.cache_control import (
     drop_opencode_cache_control,
     restore_chat_cache_control,
 )
+from exp.runtime.openai_protocol.client_field_repairs import repair_chat, repair_responses
 from exp.runtime.openai_protocol.custom_tool_wire import (
     ChatCustomToolCall,
     CustomToolCallItem,
@@ -74,7 +75,6 @@ from exp.runtime.openai_protocol.responses_input import (
     responses_input_messages,
 )
 from exp.runtime.openai_protocol.responses_probe import (
-    drop_gateway_web_search_items,
     official_responses_probe,
     require_responses_input,
     require_responses_text_spelling,
@@ -82,6 +82,7 @@ from exp.runtime.openai_protocol.responses_probe import (
 from exp.runtime.openai_protocol.structured_text import (
     chat_json_object_output,
     chat_structured_text,
+    responses_json_object_output,
     responses_structured_text,
 )
 from exp.runtime.openai_protocol.tool_choice import chat_tool_choice, responses_tool_choice
@@ -259,7 +260,7 @@ def decode_chat(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
-    payload, alias_disclosures = fold_prompt_cache_key_alias(payload)
+    payload, alias_disclosures = repair_chat(*fold_prompt_cache_key_alias(payload))
     cache_payload = payload
     payload = drop_opencode_cache_control(payload)
     validate_manifest(payload, CHAT_MANIFEST)
@@ -426,7 +427,7 @@ def decode_responses(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
-    payload, alias_disclosures = fold_prompt_cache_key_alias(drop_gateway_web_search_items(payload))
+    payload, alias_disclosures = repair_responses(*fold_prompt_cache_key_alias(payload))
     validate_manifest(payload, RESPONSES_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
@@ -495,6 +496,7 @@ def decode_responses(
             tool_choice=responses_tool_choice(request.tool_choice, native_tools=native_tools),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=responses_structured_text(request.text),
+            json_object_output=responses_json_object_output(request.text),
             ignored_parameters=(
                 *alias_disclosures,
                 *_replayed_reasoning_disclosures(

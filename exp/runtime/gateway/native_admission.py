@@ -229,6 +229,10 @@ def select_single_route_before_search(
     return restricted, (resolved_wires[index],), placement
 
 
+PRIORITY_TIER_UNAVAILABLE_DISCLOSURE = "service_tier->default(priority_unavailable)"
+"""Disclosure recorded when no rung offers the priority tier and the request runs at standard."""
+
+
 def prepare_route_requests(
     route: GatewayRoute,
     resolved_wires: _ResolvedWires,
@@ -263,6 +267,7 @@ def prepare_route_requests(
         route = select_route_deployments(route, window_indexes)
         resolved_wires = tuple(resolved_wires[index] for index in window_indexes)
 
+    tier_disclosures: tuple[str, ...] = ()
     if request.service_tier in ("flex", "priority"):
         tier = request.service_tier
         tier_indexes = tuple(
@@ -270,11 +275,20 @@ def prepare_route_requests(
             for index, (profile, _client) in enumerate(resolved_wires)
             if profile.forwards_tier(tier)
         )
-        if not tier_indexes:
+        if not tier_indexes and tier == "priority":
+            # Priority asks for faster processing at a higher price; the
+            # standard tier is what OpenAI itself serves when priority is
+            # unavailable, and it never costs the caller more, so the request
+            # dispatches at standard with disclosure. Flex asks for a CHEAPER
+            # tier: serving it at the standard price would bill more than the
+            # caller chose, so flex keeps the typed refusal below.
+            request = request.model_copy(update={"service_tier": None})
+            tier_disclosures = (PRIORITY_TIER_UNAVAILABLE_DISCLOSURE,)
+        elif not tier_indexes:
             raise ProviderCapabilityError(
                 capability="service_tier",
                 detail=(
-                    "This model does not offer a flex or priority processing tier. "
+                    "This model does not offer a flex processing tier. "
                     "Remove service_tier, or choose a model with tiered pricing enabled."
                 ),
             )
@@ -287,7 +301,7 @@ def prepare_route_requests(
             resolved_wires = tuple(resolved_wires[index] for index in tier_indexes)
 
     admitted_request = request
-    coercion_disclosures: tuple[str, ...] = ()
+    coercion_disclosures: tuple[str, ...] = tier_disclosures
     full_route = route
     full_wires = resolved_wires
 

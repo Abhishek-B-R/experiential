@@ -21,6 +21,7 @@ from exp.runtime.models.providers.instruction_turns import (
     fold_instruction_turns_after_the_first,
     fold_trailing_instruction_turns,
 )
+from exp.runtime.models.providers.openai_item_ids import openai_issued_item_id
 from exp.runtime.models.providers.reasoning_compat import (
     openai_reasoning_effort,
     reasoning_display_enabled,
@@ -67,7 +68,13 @@ def _replayable_native_item(item: JsonObject) -> JsonObject | None:
     """
     shaped = _without_probability_metadata(item)
     item_id = shaped.get("id")
-    if isinstance(item_id, str) and item_id.startswith(_FOREIGN_ITEM_ID_PREFIX):
+    item_type = shaped.get("type")
+    if isinstance(item_id, str) and (
+        item_id.startswith(_FOREIGN_ITEM_ID_PREFIX)
+        or not openai_issued_item_id(
+            item_id, item_type if isinstance(item_type, str) else "message"
+        )
+    ):
         if shaped.get("type") == "reasoning" and "encrypted_content" not in shaped:
             return None
         shaped = {key: value for key, value in shaped.items() if key != "id"}

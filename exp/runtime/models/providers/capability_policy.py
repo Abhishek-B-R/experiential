@@ -19,8 +19,6 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, cast
 
-from pydantic import JsonValue
-
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.model import ReasoningEffort
 from exp.runtime.gateway.contracts import (
@@ -48,6 +46,8 @@ from exp.runtime.models.providers.reasoning_compat import (
     anthropic_thinking_budget_tokens,
     efforts_by_nearness,
 )
+from exp.runtime.models.providers.route_repairs import apply_route_repairs
+from exp.runtime.models.providers.schema_closing import close_schema_objects
 from exp.runtime.models.providers.streaming_requests import (
     TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
     route_generation_parameter_requests,
@@ -483,9 +483,68 @@ def coerce_generation_parameters(
 ) -> RequestCoercion | None:
     """Build the minimal disclosed coercion after verbatim narrowing failed.
 
+    The independent route repairs (``route_repairs``: an out-of-range output
+    ceiling, a thinking toggle no rung can honor, encrypted reasoning no rung
+    can carry) apply first and compose with each other; when the repaired
+    request still does not serve, the effort substitutions below run on it and
+    both sets of disclosures are returned together. See
+    :func:`_coerce_generation_semantics` for the effort rules.
+
+    Args:
+        profiles: Ordered wire profiles for every live route deployment.
+        request: Decoded public request that no rung accepted verbatim.
+        admits: Optional caller probe that must accept a candidate.
+
+    Returns:
+        The disclosed substitution to retry with, or ``None``.
+    """
+    repair = apply_route_repairs(profiles, request)
+    if repair is None:
+        return _coerce_generation_semantics(profiles, request, admits=admits)
+    if _route_serves(profiles, repair.request, admits):
+        return RequestCoercion(request=repair.request, disclosures=repair.disclosures)
+    semantic = _coerce_generation_semantics(profiles, repair.request, admits=admits)
+    if semantic is not None:
+        return RequestCoercion(
+            request=semantic.request,
+            disclosures=(*repair.disclosures, *semantic.disclosures),
+        )
+    if admits is None:
+        # Unprobed: carry the repair forward so the stage that actually
+        # refuses names the caller's remedy.
+        return RequestCoercion(request=repair.request, disclosures=repair.disclosures)
+    return None
+
+
+def _route_serves(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+    admits: Callable[[GatewayRequest], bool] | None,
+) -> bool:
+    """Whether a candidate survives narrowing, full route shaping, and the probe."""
+    try:
+        indexes = compatible_generation_parameter_profile_indexes(profiles, request)
+        route_generation_parameter_requests(tuple(profiles[index] for index in indexes), request)
+    except (ProviderParameterError, ProviderCapabilityError):
+        return False
+    return admits is None or admits(request)
+
+
+def _coerce_generation_semantics(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+    *,
+    admits: Callable[[GatewayRequest], bool] | None = None,
+) -> RequestCoercion | None:
+    """Build the minimal disclosed effort or thinking substitution.
+
     Only substitutions whose semantics survive are offered: an explicit
-    reasoning effort may snap down to a supported level, never up. An off
-    switch must remain off or receive a typed refusal. An effort on a route
+    reasoning effort may snap down to a supported level, never up, except
+    that ``none`` or ``minimal`` below a route's whole ladder takes the
+    shallowest tier it serves (disclosed as ``lowest_supported``): the route
+    cannot reason less, and refusing pinned clients wedges every turn. A
+    thinking ``disabled`` config must remain off or receive a typed refusal.
+    An effort on a route
     with no reasoning support at all is dropped with disclosure. A
     zero-reasoning route cannot honor any
     depth, so the only serviceable semantic is the model's sole behavior,
@@ -590,7 +649,15 @@ def coerce_generation_parameters(
     # reject some other control, so candidates are tried in nearness order
     # and the snap is the closest level that actually admits a rung.
     permitted = set(REASONING_EFFORTS[: REASONING_EFFORTS.index(request.reasoning_effort) + 1])
-    for candidate in efforts_by_nearness(request.reasoning_effort, ladder & permitted):
+    candidates = efforts_by_nearness(request.reasoning_effort, ladder & permitted)
+    lowest_supported = not candidates and request.reasoning_effort in ("none", "minimal")
+    if lowest_supported:
+        # Below the whole ladder: the route cannot turn reasoning off or go
+        # that shallow, so the shallowest tier it serves is the nearest
+        # faithful reading (pinned clients send "none" to every model; the
+        # gateway refused 925 such requests a day). Lowest tier first.
+        candidates = tuple(effort for effort in REASONING_EFFORTS if effort in ladder)
+    for candidate in candidates:
         snap_updates: JsonObject = {"reasoning_effort": candidate}
         if (
             request.provider_output_config is not None
@@ -618,7 +685,11 @@ def coerce_generation_parameters(
             continue
         return RequestCoercion(
             request=snapped_request,
-            disclosures=(f"reasoning_effort->{candidate}",),
+            disclosures=(
+                f"reasoning_effort->{candidate}(lowest_supported)"
+                if lowest_supported
+                else f"reasoning_effort->{candidate}",
+            ),
         )
     return None
 
@@ -831,7 +902,7 @@ def coerce_structured_text_schema(
         profile.dialect in _SCHEMA_DIALECTS_REQUIRING_CLOSED_OBJECTS for profile in profiles
     ):
         return None
-    closed, changed = _close_schema_objects(request.structured_text.json_schema)
+    closed, changed = close_schema_objects(request.structured_text.json_schema)
     if not changed:
         return None
     return RequestCoercion(
@@ -881,7 +952,7 @@ def coerce_strict_tool_schemas(
         if not tool.strict:
             tools.append(tool)
             continue
-        closed, changed = _close_schema_objects(tool.parameters)
+        closed, changed = close_schema_objects(tool.parameters)
         changed_any = changed_any or changed
         tools.append(tool.model_copy(update={"parameters": closed}) if changed else tool)
     if not changed_any:
@@ -890,65 +961,3 @@ def coerce_strict_tool_schemas(
         request=request.model_copy(update={"tools": tuple(tools)}),
         disclosures=(STRICT_TOOL_SCHEMA_CLOSED_DISCLOSURE,),
     )
-
-
-_SCHEMA_CHILD_KEYS = ("properties", "$defs", "definitions", "patternProperties")
-"""Schema keys whose values map names to subschemas."""
-
-_SCHEMA_LIST_KEYS = ("anyOf", "oneOf", "allOf", "prefixItems")
-"""Schema keys whose values list subschemas."""
-
-_SCHEMA_SINGLE_KEYS = ("items", "not", "if", "then", "else")
-"""Schema keys whose values are one subschema."""
-
-
-def _close_schema_objects(schema: JsonObject) -> tuple[JsonObject, bool]:
-    """Return ``schema`` with ``additionalProperties: false`` on every object.
-
-    An object is any node typed ``object`` or carrying ``properties``. The
-    walk descends through the standard composition and container keywords
-    and copies only the nodes it changes.
-
-    Args:
-        schema: One JSON Schema node.
-
-    Returns:
-        The closed node and whether any node changed.
-    """
-    changed = False
-    closed: JsonObject = dict(schema)
-    is_object = schema.get("type") == "object" or "properties" in schema
-    if is_object and schema.get("additionalProperties") is not False:
-        closed["additionalProperties"] = False
-        changed = True
-    for key in _SCHEMA_CHILD_KEYS:
-        children = schema.get(key)
-        if isinstance(children, dict):
-            closed_children: dict[str, JsonValue] = {}
-            for name, child in children.items():
-                if isinstance(child, dict):
-                    closed_child, child_changed = _close_schema_objects(child)
-                    changed = changed or child_changed
-                    closed_children[name] = closed_child
-                else:
-                    closed_children[name] = child
-            closed[key] = closed_children
-    for key in _SCHEMA_LIST_KEYS:
-        members = schema.get(key)
-        if isinstance(members, list):
-            closed_members: list[JsonValue] = []
-            for member in members:
-                if isinstance(member, dict):
-                    closed_member, member_changed = _close_schema_objects(member)
-                    changed = changed or member_changed
-                    closed_members.append(closed_member)
-                else:
-                    closed_members.append(member)
-            closed[key] = closed_members
-    for key in _SCHEMA_SINGLE_KEYS:
-        single = schema.get(key)
-        if isinstance(single, dict):
-            closed_single, single_changed = _close_schema_objects(single)
-            changed = changed or single_changed
-            closed[key] = closed_single
-    return (closed if changed else schema), changed

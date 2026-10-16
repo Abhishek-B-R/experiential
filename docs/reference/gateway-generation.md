@@ -6,9 +6,15 @@ not permission to select a smaller output budget or a more expensive reasoning m
 ## Output limits
 
 Chat Completions accepts `max_completion_tokens`, `max_tokens`, or `max_output_tokens`
-(one non-null spelling per request) through its protocol decoder. Messages requires `max_tokens`. An explicit limit remains a ceiling:
-a route that requires a larger minimum is excluded or refused before dispatch, not served
-with a silently increased limit.
+(one non-null spelling per request) through its protocol decoder. Messages requires `max_tokens`. An explicit limit remains a ceiling.
+Admission prefers any rung that accepts the exact value. When no rung on the route does, the
+limit is clamped onto the leading rung's accepted range and the change is disclosed: a limit
+above the route maximum dispatches at that maximum (`max_tokens->32768(route_maximum)`; Claude
+Code sends 64000 or 128000 to every model), and a limit below the route floor (16 on the OpenAI
+Responses wire, or a catalog-declared minimum) dispatches at the floor
+(`max_output_tokens->16(route_minimum)`). Lowering never bills more than the caller allowed;
+raising adds at most the floor's few tokens. A plan account that refuses any ceiling still
+narrows out instead.
 
 When the caller omits a limit:
 
@@ -38,10 +44,49 @@ It does not promise that every billed output token appears as visible text or to
 Responses input messages with role `user`, `system`, or `developer` may include
 `status` without an output item ID, as in the official input-message contract.
 Their status does not create assistant replay identity. An assistant output
-message carrying `status` still requires its item ID; replay phase markers keep
-their existing identity requirement.
+message replayed with `status` or `phase` but without its item ID (LiteLLM's
+Responses bridge echoes history this way) decodes as plain assistant history:
+the markers cannot anchor a replay without the ID, so they are dropped and
+disclosed as `input.status->dropped(no_item_id)` / `input.phase->dropped(no_item_id)`.
+Messages that carry their ID keep status and phase for exact replay.
+
+Item IDs the OpenAI Responses API could not have issued (a client's `msg_<uuid>`,
+another gateway's `item_` prefix, a non-`fc_` function-call ID) are never sent to
+an OpenAI Responses rung, which refuses them. The item replays without its ID at
+its original position; `store=false` means the provider resolves nothing by ID.
+
+## Tolerated client fields
+
+- Responses `stream_options` is accepted. The gateway never emits obfuscation
+  padding, so `include_obfuscation: false` is honored exactly; `true` is disclosed
+  as `stream_options.include_obfuscation->ignored(not_emitted)`, and the object on
+  a non-streaming call as `stream_options->ignored(stream_false)`.
+- Responses `text.format.type: "json_object"` selects the same schema-free JSON mode
+  as Chat `response_format: {"type": "json_object"}`.
+- Chat messages carrying GitHub Copilot Chat's `cot_id` tag decode; the tag is
+  disclosed as `messages.cot_id->dropped(client_annotation)`.
+- `service_tier: "priority"` (Codex Fast mode) on a route with no priority-capable
+  rung dispatches at the standard tier, disclosed as
+  `service_tier->default(priority_unavailable)`. Standard never costs more. `flex`
+  asks for a cheaper tier, so it stays a typed refusal on such a route.
 
 ## Reasoning controls
+
+When no rung on a route can honor a reasoning control verbatim, admission applies the
+nearest servable reading and discloses it:
+
+- `none` or `minimal` below a route's whole effort ladder (for example `low, high, max`)
+  takes the shallowest tier the route serves, `reasoning_effort->low(lowest_supported)`.
+  Such a route cannot turn reasoning off; other efforts still only snap down.
+- A level-less enable-thinking toggle (`enable_thinking`, `chat_template_kwargs`) on a
+  route whose rungs cannot reason at any depth is dropped,
+  `enable_thinking->dropped(no_reasoning_rung)`. Numerical thinking budgets are never
+  dropped this way.
+- `include: ["reasoning.encrypted_content"]` on a route with no native Responses rung and no
+  gateway reasoning carrier is dropped, `include.reasoning.encrypted_content->dropped(no_reasoning_carrier)`:
+  the answer is what an omitted selector produces. Replayed native encrypted reasoning that no
+  rung can read is removed from history, `input.reasoning.encrypted_content->dropped(foreign_route)`.
+  A route with a native Responses rung keeps the payload and the provider judges it.
 
 Valid explicit thinking-off settings remain off. Model families distinguish support for
 budgeted thinking from support for disabling thinking. Claude Opus 5.5, Fable and Mythos
@@ -330,3 +375,28 @@ requires exact-version provider and ledger verification in its authorized enviro
 OpenRouter documents omission of optional upstream token caps, not a universal numeric default.
 Its public streaming schema carries argument strings and termination reasons; it does not
 specify an internal repair algorithm for every malformed tool response.
+
+## Provider routing preferences
+
+Every surface accepts OpenRouter's documented `provider` object
+([provider routing](https://openrouter.ai/docs/features/provider-routing)). The gateway resolves
+its routing keys against the model's own rungs at admission and never forwards them to an
+aggregator upstream:
+
+- `only` keeps rungs of the listed providers; `ignore` drops them.
+- `order` tries the listed providers first, in that order; the rest remain fallbacks.
+- `allow_fallbacks: false` with `order` serves only the listed providers; without `order` it
+  serves only the first eligible rung. A pinned rung that fails, or is unavailable, is the
+  request's error, never a failover.
+
+A rung is named by its catalog provider id (`bedrock`, `azure_openai`, `openai`, `anthropic`,
+`openrouter`, ...), or by the label a host assigns through its components' optional
+`provider_label` callable (a hosted platform maps a masked house lane to the name it shows, such
+as `experiential_cloud`, so callers pin the name they see in `x-gateway-provider`). OpenRouter
+slugs are aliases: `amazon-bedrock`, `azure`, `google-vertex`, `google-ai-studio`. A preference
+no rung satisfies (an unknown name, or `only`/`ignore` excluding every rung) is a 400 on
+`provider.<key>` naming the providers serving the model. `zdr` keeps its zero-data-retention
+handling; `zdr` and `data_collection` are the only caller keys an OpenRouter rung receives. Any
+other key (`sort`, `quantizations`, `max_price`, `require_parameters`, ...) is disclosed as
+`provider.<key>->ignored(unsupported)`. `gateway.routing` (`route_id`, `allow_fallbacks`)
+applies on top of the narrowed route.

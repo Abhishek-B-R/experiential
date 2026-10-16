@@ -457,13 +457,14 @@ def route_generation_parameter_requests(
     if request.json_object_output and any(
         profile.dialect not in _JSON_OBJECT_OUTPUT_DIALECTS for profile in profiles
     ):
+        field = "text.format" if request.surface == "responses" else "response_format"
         raise ProviderParameterError(
             message=(
-                "The parameter 'response_format.type' value 'json_object' is not "
+                f"The parameter '{field}.type' value 'json_object' is not "
                 "supported by every deployment in this model route. Use "
                 "'json_schema' or choose a different model."
             ),
-            param="response_format.type",
+            param=f"{field}.type",
             code="unsupported_parameter",
         )
 

@@ -607,8 +607,10 @@ fn public_decisions(
                     || score > criteria.len().saturating_sub(1) as f64
                     || !score_matches_distribution(score, &probabilities)
                 {
-                    return Err(malformed(
+                    return Err(score_mismatch(
                         "decision score does not match its probability distribution",
+                        score,
+                        &probabilities,
                     ));
                 }
                 json!({"type": kind, "score": answer["score"], "confidence": answer["confidence"],
@@ -659,28 +661,51 @@ fn decision_usage(payload: &Value) -> Result<Usage, Failure> {
     })
 }
 
-/// Check a score without treating rounded wire probabilities as exact model values.
-fn score_matches_distribution(score: f64, probabilities: &[f64]) -> bool {
-    let expected: f64 = probabilities
+/// The probability-weighted level average recomputed from the wire bins.
+fn expected_score(probabilities: &[f64]) -> f64 {
+    probabilities
         .iter()
         .enumerate()
         .map(|(index, value)| index as f64 * value)
-        .sum();
-    if (score - expected).abs() <= PROBABILITY_TOLERANCE {
+        .sum()
+}
+
+/// Check a score without treating rounded wire probabilities as exact model values.
+fn score_matches_distribution(score: f64, probabilities: &[f64]) -> bool {
+    if (score - expected_score(probabilities)).abs() <= PROBABILITY_TOLERANCE {
         return true;
     }
-    // Hundredth-valued wire scores need not equal an expectation recomputed from
-    // rounded bins. Only that precision gets an envelope; finer data stays strict.
-    let Some(score_hundredths) = hundredths(score) else {
-        return false;
-    };
     // A single unit distribution must explain all bins together, not a separate
-    // error allowance for each weighted term.
-    let Some(bounds) = rounding_bounds(probabilities) else {
+    // error allowance for each weighted term. Only hundredth-valued bins get an
+    // envelope; finer bins stay strict.
+    let Some((minimum, maximum)) = score_envelope(probabilities) else {
         return false;
     };
+    match hundredths(score) {
+        // Closed envelopes admit unspecified half-way rounding of a hundredth
+        // score. No output is repaired or normalized, and structurally invalid
+        // distributions never reach this check.
+        Some(score_hundredths) => {
+            2 * score_hundredths + 1 >= minimum && 2 * score_hundredths - 1 <= maximum
+        }
+        // A thousandth-valued score is the provider rounding the latent
+        // expectation one decimal finer than its bins (thirds published as
+        // 0.33 each beside a score of 1.001). It must lie inside the closed
+        // half-thousandth envelope of the expectations every latent unit
+        // distribution behind those bins can take. Finer scores stay strict.
+        None => thousandths(score).is_some_and(|score_thousandths| {
+            2 * score_thousandths + 1 >= 10 * minimum && 2 * score_thousandths - 1 <= 10 * maximum
+        }),
+    }
+}
+
+/// Extreme expectations, in half-hundredths, of every unit distribution whose
+/// bins round to the published hundredth bins; `None` when the bins are finer
+/// than hundredths or no unit distribution explains them.
+fn score_envelope(probabilities: &[f64]) -> Option<(i64, i64)> {
+    let bounds = rounding_bounds(probabilities)?;
     if !admits_unit_total(&bounds) {
-        return false;
+        return None;
     }
     let lower_sum: i64 = bounds.iter().map(|(low, _)| low).sum();
     let base: i64 = bounds
@@ -690,9 +715,31 @@ fn score_matches_distribution(score: f64, probabilities: &[f64]) -> bool {
         .sum();
     let minimum = rounded_expectation(base, 200 - lower_sum, bounds.iter().enumerate());
     let maximum = rounded_expectation(base, 200 - lower_sum, bounds.iter().enumerate().rev());
-    // Closed envelopes admit unspecified half-way rounding. No output is repaired
-    // or normalized, and structurally invalid distributions never reach this check.
-    2 * score_hundredths + 1 >= minimum && 2 * score_hundredths - 1 <= maximum
+    Some((minimum, maximum))
+}
+
+/// A score rejection that names the numbers it was judged on.
+///
+/// The reason is replaced by the generic malformed-response message on the
+/// public error, but rides into the operator log and the ledger detail
+/// (`Failure::boundary`), so a rejected score can be told apart as provider
+/// inconsistency or an overly strict check. Every value is a numeric model
+/// output or a gateway constant, never prompt content.
+fn score_mismatch(reason: &str, score: f64, probabilities: &[f64]) -> Failure {
+    let bins = probabilities
+        .iter()
+        .map(f64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let envelope = score_envelope(probabilities).map_or_else(
+        || "none".to_string(),
+        |(minimum, maximum)| format!("[{},{}]", minimum as f64 / 200.0, maximum as f64 / 200.0),
+    );
+    malformed(&format!(
+        "{reason} (score={score}, expected={}, probabilities=[{bins}], \
+         rounding_envelope={envelope}, tolerance={PROBABILITY_TOLERANCE})",
+        expected_score(probabilities)
+    ))
 }
 
 /// Check a selected category without treating rounded wire probabilities as exact.
@@ -746,7 +793,17 @@ fn admits_unit_total(bounds: &[(i64, i64)]) -> bool {
 
 /// Recognize decimal hundredths, including their binary floating-point residue.
 fn hundredths(value: f64) -> Option<i64> {
-    let scaled = value * 100.0;
+    decimal_units(value, 100.0)
+}
+
+/// Recognize decimal thousandths, including their binary floating-point residue.
+fn thousandths(value: f64) -> Option<i64> {
+    decimal_units(value, 1000.0)
+}
+
+/// Recognize a value with at most the decimal precision `scale` names.
+fn decimal_units(value: f64, scale: f64) -> Option<i64> {
+    let scaled = value * scale;
     let rounded = scaled.round();
     // Allow binary representation and multiplication roundoff, not extra decimal
     // precision. A relative bound also keeps tiny nonzero bins distinct from zero.
@@ -847,5 +904,8 @@ mod openai;
 #[cfg(test)]
 #[path = "route_decisions/openai_tests.rs"]
 mod openai_tests;
+#[cfg(test)]
+#[path = "route_decisions/score_tests.rs"]
+mod score_tests;
 #[cfg(test)]
 mod tests;

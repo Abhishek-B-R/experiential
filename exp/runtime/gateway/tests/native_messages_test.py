@@ -1744,10 +1744,35 @@ def test_native_drops_unsupported_top_k_with_disclosure(
     )
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    (("temperature", 1.1), ("max_tokens", 129)),
-)
+def test_native_clamps_an_output_ceiling_above_the_catalog_maximum(
+    engine: _ServingEngine,
+) -> None:
+    """A ``max_tokens`` above the route maximum dispatches at that maximum, disclosed.
+
+    Claude Code sends 64000 or 128000 to every model; refusing it failed 2,137
+    requests a day. Lowering the ceiling can only reduce what the caller pays.
+    """
+    payload = _messages_body("fast-token")
+    payload["max_tokens"] = 129
+    with _SseUpstream.payloads_lock:
+        dispatched_before = len(_SseUpstream.payloads)
+    native = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=payload,
+        timeout=10.0,
+    )
+    assert native.status_code == 200
+    assert "max_tokens->128(route_maximum)" in native.json()["x-experiential-ignored-parameters"]
+    with _SseUpstream.payloads_lock:
+        dispatched = _SseUpstream.payloads[dispatched_before:]
+    assert dispatched
+    assert all(
+        sent.get("max_tokens", sent.get("max_completion_tokens")) == 128 for sent in dispatched
+    )
+
+
+@pytest.mark.parametrize(("field", "value"), (("temperature", 1.1),))
 def test_native_enforces_catalog_generation_limits_before_dispatch(
     engine: _ServingEngine,
     field: str,
@@ -2463,10 +2488,15 @@ def test_replayed_thinking_history_serves_with_disclosure_on_a_foreign_route(
     assert "done" in sent
 
 
-def test_encrypted_reasoning_include_rejects_non_responses_routes(
+def test_encrypted_reasoning_include_drops_on_routes_without_a_carrier(
     engine: _ServingEngine,
 ) -> None:
-    """The encrypted reasoning include selector needs a native Responses route."""
+    """A route that cannot seal reasoning answers without those items, disclosed.
+
+    The selector asks to RECEIVE encrypted reasoning; refusing it failed 575
+    requests a day on Claude routes. Without a carrier the answer is exactly
+    what an omitted selector produces.
+    """
     response = httpx.post(
         f"{engine.base}/v1/responses",
         headers={"authorization": f"Bearer {engine.raw_key}"},
@@ -2477,10 +2507,13 @@ def test_encrypted_reasoning_include_rejects_non_responses_routes(
         },
         timeout=10.0,
     )
-    assert response.status_code == 400
+    assert response.status_code == 200, response.text
     body = response.json()
-    assert body["error"]["param"] == "include"
-    assert body["error"]["code"] == "unsupported_parameter"
+    assert (
+        "include.reasoning.encrypted_content->dropped(no_reasoning_carrier)"
+        in body["x-experiential-ignored-parameters"]
+    )
+    assert not any(item["type"] == "reasoning" for item in body["output"])
 
 
 def _responses_result(

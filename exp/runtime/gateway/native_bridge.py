@@ -122,6 +122,8 @@ from exp.runtime.gateway.native_settlement import (
     optional_text,
 )
 from exp.runtime.gateway.native_tool_search import NativeToolSearchMixin
+from exp.runtime.gateway.provider_preferences import reorder_admitted_route as _reorder
+from exp.runtime.gateway.provider_preferences import route_by_provider_preferences
 from exp.runtime.gateway.reasoning_carrier import (
     ReasoningCarrierAuthority,
 )
@@ -460,6 +462,7 @@ class NativeControlPlane(
                 if continuation_context is None
                 else continuation_context.required_route_binding,
             )
+            route, request = route_by_provider_preferences(route, request, self._components)
             # Skip unavailable deployments at admission so a live fallback can still serve.
             dispatchable = dispatchable_route_profiles(self._components.runtime_catalogs, route)
             record_dead_admission_rungs(
@@ -554,8 +557,7 @@ class NativeControlPlane(
                     web_search_requests=int(web_search_admission is not None),
                 )
 
-        # Admission returns the full ordered route; no attempt row exists
-        # until the data plane's first `start_attempt`.
+        # Admission returns the full ordered route; no attempt row before `start_attempt`.
         public_request = request
         provider_request = request.model_copy(update={"stream": True, "include_usage": True})
         try:
@@ -572,6 +574,7 @@ class NativeControlPlane(
                 )
             )
             placement = selected_placement or placement
+            route, resolved_wires = _reorder(route, resolved_wires, request, self._components)
             require_route_authority(authorization, request, route)
             require_unmodified_probability_output(
                 request, bool(guardrails and guardrails.output_policies)
@@ -582,13 +585,8 @@ class NativeControlPlane(
             signers: list[GatewayDispatchSigner | None] = []
             dispatch_bindings: list[FrozenDispatchBinding | None] = []
             carrier_authorities: list[ReasoningCarrierAuthority | None] = []
-            # How long a throttle is worth waiting on per rung for THIS
-            # request (the pool's schedule scaled by the cache at stake),
-            # decided here so the data plane never waits on a rung whose
-            # throttle should fail over cold at once. `route` is the admitted
-            # route (dead and incompatible rungs already removed), so its last
-            # rung is the one with no cold alternative; the sticky binding is
-            # the one placement already read.
+            # Per-rung throttle waits for THIS request (pool schedule scaled by the cache
+            # at stake), over the admitted route whose last rung has no cold alternative.
             redial_budgets = throttle_redial_budgets(
                 self._accounting.loads,
                 route,

@@ -404,6 +404,21 @@ async fn non_success_failure(
         Ok(Some(body)) => Some(body),
         _ => None,
     };
+    if body
+        .as_deref()
+        .is_some_and(crate::rejection_shapes::names_account_policy_block)
+    {
+        // An account-level policy block is the provider's verdict on the
+        // ACCOUNT, under whatever status the relay chose (OpenRouter answers
+        // 403 or a 400 `invalid_prompt`): the credential class, so the ladder
+        // fails over and the lane can be demoted. Ledger detail only.
+        return transport_failure(Some(403))
+            .with_provider_detail(Some(format!(
+                "{}: account_policy_block",
+                status_detail(status)
+            )))
+            .with_rate_limit_facts(rate_limit.clone(), retry_after);
+    }
     if status == 429 {
         // OpenAI answers an out-of-quota account with 429
         // `insufficient_quota`, the same status as a throttle. A status-

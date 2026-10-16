@@ -801,8 +801,8 @@ class GatewayRequest(ContractModel):
             raise ValueError("include_usage is valid only for streaming requests")
         if self.json_object_output and self.structured_text is not None:
             raise ValueError("json_object_output and structured_text are mutually exclusive")
-        if self.json_object_output and self.surface != GatewayApiSurface.CHAT_COMPLETIONS:
-            raise ValueError("json_object_output is valid only for Chat Completions requests")
+        if self.json_object_output and self.surface not in ("chat_completions", "responses"):
+            raise ValueError("json_object_output is valid only for Chat and Responses requests")
         parts = (part for message in self.messages for part in message.content_parts)
         require_attachment_ceilings(parts)
         if len({handle.provider for handle in self.media_handles}) > 1:
