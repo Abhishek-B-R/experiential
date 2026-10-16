@@ -15,7 +15,12 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
-from exp.common.evaluations.reconstruction import DualReport, EvaluationReferences, JudgeConfig
+from exp.common.evaluations.reconstruction import (
+    DualReport,
+    EvaluationReferences,
+    JudgeConfig,
+    JudgeNotRun,
+)
 from exp.common.models import ModelCapabilities, ModelCatalog, load_model_catalog
 from exp.common.models.model import ReasoningEffort
 from exp.common.progress import ProgressHook, report
@@ -188,6 +193,8 @@ class FidelitySpec(ContractModel):
             ``maximum_output_tokens`` and the catalog's reasoning configuration.
         proposal_reasks: Times a refused simulator proposal is asked again with the refusal
             reason, within the same turn; refused output is never repaired.
+        judged: False skips the judge; the report records it as not run. Learning uses it:
+            its score is exact replies, so a judge call per trace would buy nothing.
     """
 
     run_id: str = Field(pattern=r"^[a-z][a-z0-9-]{0,79}$")
@@ -212,6 +219,7 @@ class FidelitySpec(ContractModel):
     memory: FidelityMemory | None = Field(default=None, exclude_if=lambda value: value is None)
     roles: RoleBudgets | None = Field(default=None, exclude_if=lambda value: value is None)
     proposal_reasks: int = Field(default=0, ge=0, le=3, strict=True, exclude_if=lambda v: not v)
+    judged: bool = Field(default=True, strict=True, exclude_if=lambda value: value)
 
     @model_validator(mode="after")
     def separate_references(self) -> "FidelitySpec":
@@ -317,8 +325,10 @@ def prepare_fidelity_evaluation(
         )
         if saved.spec != spec:
             raise ValueError("fidelity run inputs changed; use the saved spec or a new run ID")
+        artifact = load_grounded_world_model_artifact(project.artifacts, spec.world_model)
+        # A registration may predate a guard: recheck what the predictor could see.
+        _require_unexposed(project, artifact, spec)
         if spec.memory is not None and spec.memory.reserved:
-            artifact = load_grounded_world_model_artifact(project.artifacts, spec.world_model)
             _validate_memory(project, spec, artifact)
             _establish_reservation(project, spec, code_revision)
         return saved
@@ -352,8 +362,7 @@ def prepare_fidelity_evaluation(
         if record is None or catalog.connections[record.connection].provider != "typesafe":
             raise ValueError("JEV retrieval requires a configured native decision-model alias")
     _validate_memory(project, spec, artifact)
-    require_unindexed_held_out_task(project, artifact, spec.task)
-    require_unexposed_task(project, artifact, spec.task)
+    _require_unexposed(project, artifact, spec)
     prepared = PreparedFidelity(
         id=plan_id,
         spec=spec,
@@ -459,6 +468,9 @@ def execute_fidelity_evaluation(
                 "(a derived held-out or learning run is bought again only with --retry-incomplete)"
             )
         spec = prepared.spec
+        _require_unexposed(
+            project, load_grounded_world_model_artifact(project.artifacts, spec.world_model), spec
+        )
         if spec.retrieval is not None and research_selection is not None:
             raise ValueError("registered JEV retrieval cannot be replaced by an injected selector")
         if (
@@ -714,6 +726,8 @@ def execute_fidelity_evaluation(
 
         def judge_call(body: JsonObject, logical_id: str) -> JsonObject:
             """Expose the real judging stage without adding a retry or scoring loop."""
+            if not spec.judged:
+                raise JudgeNotRun("judging is skipped for this run; it is scored by exact replies")
             report(progress, "Judging")
             return judging(body, logical_id)
 
@@ -731,6 +745,8 @@ def execute_fidelity_evaluation(
             if spec.online_research is not None
             else None,
             progress=progress,
+            feedback_after_predictions=spec.online_research is not None
+            and not spec.online_research.notes_reach_predictions,
         )
         learning = spec.memory is not None and spec.memory.mode == "learn"
         if learning:
@@ -745,6 +761,18 @@ def execute_fidelity_evaluation(
                 now(),
             )
         return result
+
+
+def _require_unexposed(
+    project: ProjectStore, artifact: GroundedWorldModelArtifact, spec: FidelitySpec
+) -> None:
+    """Refuse a task whose own evidence the simulator could retrieve or knows.
+
+    Runs at registration, on reuse of a saved registration, and before any new dispatch, so
+    a registration created before a guard existed is checked too.
+    """
+    require_unindexed_held_out_task(project, artifact, spec.task)
+    require_unexposed_task(project, artifact, spec.task)
 
 
 def role_model(

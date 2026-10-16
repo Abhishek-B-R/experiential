@@ -12,9 +12,11 @@ exists. A rerun replays completed traces without provider calls and continues wh
 
 Measurement is test-then-train: each trace is predicted whole on the memory pinned before it,
 with none of its own feedback or investigations, and with memory from earlier traces of the
-same task lineage hidden. Its recorded history stays visible (replay feeds the recorded agent
-the recorded replies). Every saved learning report therefore measures the simulator, replayed
-against recorded history, on a task it has not learned, with all traces consumed.
+same task lineage hidden. The recorded actions are replayed in order; after the trace's public
+prefix the simulator sees its own earlier replies and state, never the recorded replies, so its
+errors carry forward. Every saved learning report therefore measures the simulator, on the
+recorded actions over its own simulated history, on a task it has not learned, with all traces
+consumed.
 
 Scope ``fit`` keeps the build's held-out lineages out instead: they are reserved before the
 first trace is registered, can never be learned, and remain for an independent held-out panel.
@@ -147,10 +149,11 @@ class LearningCurve(ContractModel):
     """Accuracy of each trace's prediction, made before that trace was learned.
 
     Attributes:
-        points: The consumed attempt's result for each learned trace, in consumption order.
+        points: Each scored trace's result in consumption order: its consumed attempt, or
+            its last attempt when it was never learned.
         quarters: Four consumption windows; the boundary after the second is ~50% consumed.
         halves: First and second half of consumption.
-        incomplete: Traces that ran but were never consumed; not part of the score.
+        incomplete: Traces not learned into memory (scored when their predictions completed).
     """
 
     points: tuple[ReplayResult, ...]
@@ -163,15 +166,15 @@ class LearningCurve(ContractModel):
 
         Each trace was predicted whole on the memory pinned before it, with earlier traces of its
         task hidden, so this measures tasks memory has not learned even though every trace is
-        consumed; replay keeps the recorded history visible. The second half reads memory that
-        has learned at least half the traces.
+        consumed. Recorded actions are replayed over the simulator's own history, so errors
+        carry forward. The second half reads memory that has learned at least half the traces.
         """
         exact = sum(p.exact for p in self.points)
         steps = sum(p.steps for p in self.points)
         matched = sum(p.fields_matched for p in self.points)
         total = sum(p.fields_total for p in self.points)
         line = (
-            f"Test-then-train fidelity (recorded history)  {exact}/{steps} replies exact "
+            f"Test-then-train fidelity (recorded actions)  {exact}/{steps} replies exact "
             f"({_share(exact, steps)}) · "
             f"{_share(matched, total)} reply fields match ({matched}/{total}) · "
             f"{len(self.points)} traces"
@@ -179,7 +182,7 @@ class LearningCurve(ContractModel):
         if len(self.halves) == 2:
             line += f" · second half {self.halves[1].share} exact"
         if self.incomplete:
-            line += f" · {self.incomplete} incomplete trace(s) not learned or scored"
+            line += f" · {self.incomplete} trace(s) not learned"
         return line
 
     def line(self) -> str:
@@ -415,11 +418,10 @@ def learning_spec(
 ) -> FidelitySpec:
     """Learn-mode spec of one case, with a content-addressed run ID.
 
-    Per-turn judging is off while learning: the judge still runs once per trace (the fidelity
-    owner requires it), and the learning curve uses exact replies, not judge scores. Every
+    The judge does not run while learning: the learning score is exact replies. Every
     prediction reads the memory pinned before the trace, without this trace's feedback or
-    investigations and without earlier traces of its task lineage; the trace's recorded
-    history stays visible, as replay requires.
+    investigations and without earlier traces of its task lineage. Recorded actions are
+    replayed over the simulator's own earlier replies and state.
 
     Args:
         project: Project with a completed build.
@@ -444,6 +446,7 @@ def learning_spec(
             notes_reach_predictions=False,
         ),
         per_turn=False,
+        judged=False,
     )
 
 
@@ -546,15 +549,15 @@ def learning_curve(project: ProjectStore, scope: Scope | None = None) -> Learnin
     Returns:
         The curve over learned traces, or None before anything was learned.
     """
-    runs, incomplete = learning_progress(project, learning_plan(project, None, scope))
-    points = [result for _, _, result in runs]
+    runs, unscored = learning_progress(project, learning_plan(project, None, scope))
+    points = [result for _, _, result, _ in runs]
     if not points:
         return None
     return LearningCurve(
         points=tuple(points),
         quarters=_windows(points, 4),
         halves=_windows(points, 2) if len(points) > 1 else (),
-        incomplete=len(incomplete),
+        incomplete=sum(not learned for *_, learned in runs) + len(unscored),
     )
 
 
@@ -571,30 +574,38 @@ def learned_runs(
         Each learned case with the registration and test-then-train result of the attempt
         that was consumed into memory.
     """
-    return learning_progress(project, plan)[0]
+    learned, _ = learning_progress(project, plan)
+    return [(case, prepared, result) for case, prepared, result, ok in learned if ok]
 
 
 def learning_progress(
     project: ProjectStore, plan: LearningPlan
-) -> tuple[list[tuple[ReplayCase, PreparedFidelity, ReplayResult]], list[ReplayCase]]:
-    """Learned and incomplete traces, read from saved attempts without provider calls.
+) -> tuple[list[tuple[ReplayCase, PreparedFidelity, ReplayResult, bool]], list[ReplayCase]]:
+    """Every scored trace in consumption order, read from saved attempts without calls.
 
-    The score of a learned trace is the attempt consumed into memory, never an earlier
-    attempt that stopped. A trace whose attempts ran but none was consumed is incomplete and
-    unscored. Reading stops at the first trace no attempt has run for.
+    Each trace is predicted whole before any of its feedback is used, so every attempt with
+    a saved report scores the whole trace. A trace is scored by the attempt consumed into
+    memory; a trace never consumed (for example, an investigation failed on every attempt)
+    is scored by its last attempt and reported as not learned. Learning success therefore
+    never decides which traces are scored. Reading stops at the first trace no attempt has
+    run for.
 
     Args:
         project: Project with a recorded learning plan.
         plan: That plan.
 
     Returns:
-        Learned traces with their consumed attempt, and incomplete traces.
+        ``(case, attempt, result, learned)`` per scored trace, and traces whose every attempt
+        stopped before a report was saved.
     """
-    learned: list[tuple[ReplayCase, PreparedFidelity, ReplayResult]] = []
-    incomplete: list[ReplayCase] = []
+    scored: list[tuple[ReplayCase, PreparedFidelity, ReplayResult, bool]] = []
+    unscored: list[ReplayCase] = []
     for case in learning_cases(project, plan.scope):
         attempts = _saved_attempts(project, plan, case)
         if not attempts:
+            if _registered(project, plan, case):
+                unscored.append(case)
+                continue
             break
         consumed = [
             (prepared, report)
@@ -602,12 +613,27 @@ def learning_progress(
             if (receipt := saved_memory_receipt(project, prepared)) is not None
             and receipt.get("reason") in ("consumed", DUPLICATE)
         ]
-        if consumed:
-            prepared, report = consumed[0]
-            learned.append((case, prepared, replay_result(project, case, prepared, report)))
-        else:
-            incomplete.append(case)
-    return learned, incomplete
+        prepared, report = consumed[0] if consumed else attempts[-1]
+        result = replay_result(project, case, prepared, report)
+        scored.append((case, prepared, result, bool(consumed)))
+    return scored, unscored
+
+
+def _registered(project: ProjectStore, plan: LearningPlan, case: ReplayCase) -> bool:
+    """Whether any attempt of one case was registered and stopped without a saved report."""
+    spec = learning_spec(project, plan, case, deadline=datetime.now().astimezone())
+    plan_id = stable_id("fidelity", {"run_id": content_run_id(spec, LABEL, case.trace_id, 1)})
+    return project.artifacts.exists(plan_id) and project.artifacts.exists(
+        _intent_of(project, plan_id)
+    )
+
+
+def _intent_of(project: ProjectStore, plan_id: str) -> str:
+    """Execution intent identity of one registration: present once dispatch began."""
+    prepared = PreparedFidelity.model_validate_json(
+        project.artifacts.read_bytes(plan_id, "plan.json")
+    )
+    return prepared.id + "-execution"
 
 
 def _saved_attempts(

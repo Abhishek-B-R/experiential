@@ -1,5 +1,6 @@
 """Held-out simulation fidelity in the existing evaluation terminal conventions."""
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -29,6 +30,8 @@ from exp.optimize.evaluation.held_out_fidelity import (
 from exp.optimize.evaluation.trace_learning import fit_cases, learning_curve
 from exp.optimize.evaluation.trace_replay import ReplayAggregate, ReplayResult, aggregate
 from exp.runtime.models.providers.transport import ProviderTransportError
+
+PANEL_CONCURRENCY = 4  # traces of a frozen panel replayed at once
 
 
 def run_held_out_fidelity(
@@ -140,14 +143,25 @@ def run_held_out_fidelity(
 def execute_runs(
     console: Console, store: ProjectStore, registrations: tuple[PreparedFidelity, ...]
 ) -> None:
-    """Run every registered trace through the fidelity owner, one progress row per stage."""
+    """Run the registered traces concurrently through the fidelity owner.
+
+    Panel traces read frozen memory and never publish, so they are independent; each keeps its
+    own ledger, session and progress row.
+    """
     total = len(registrations)
     try:
-        with progress_display(console) as progress:
-            for index, prepared in enumerate(registrations, start=1):
-                execute_fidelity_evaluation(
-                    store, prepared, progress=qualified(progress, f"trace {index}/{total}")
+        with progress_display(console) as progress, ThreadPoolExecutor(PANEL_CONCURRENCY) as pool:
+            futures = [
+                pool.submit(
+                    execute_fidelity_evaluation,
+                    store,
+                    prepared,
+                    progress=qualified(progress, f"trace {index}/{total}"),
                 )
+                for index, prepared in enumerate(registrations, start=1)
+            ]
+            for future in futures:
+                future.result()
     except ProviderTransportError as exc:
         console.print(f"[red]error[/red] a provider request failed: {exc}")
         console.print(

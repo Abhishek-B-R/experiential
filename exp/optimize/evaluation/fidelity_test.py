@@ -282,7 +282,10 @@ def test_predictions_references_and_completed_replay(
                     "observations": [
                         {"call_id": f"call-{i}", "reply": native_reply, "encoding": "json"}
                     ],
-                    "effect": {"kind": "replace", "state": {"seen": i + 1}},
+                    "effect": {
+                        "kind": "edits",
+                        "edits": [{"op": "set", "path": ["seen"], "value": i + 1}],
+                    },
                     "terminal": False,
                 }
             )
@@ -386,7 +389,10 @@ def test_invalid_returned_proposal_is_not_committed_or_retried(
                 "observations": [
                     {"call_id": "wrong", "reply": {"value": "uncommitted"}, "encoding": "json"}
                 ],
-                "effect": {"kind": "replace", "state": {"uncommitted": True}},
+                "effect": {
+                    "kind": "edits",
+                    "edits": [{"op": "set", "path": ["uncommitted"], "value": True}],
+                },
                 "terminal": False,
             }
         )

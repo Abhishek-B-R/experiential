@@ -43,6 +43,7 @@ from exp.simulation.world_model.observed_tools import observed_calls
 from exp.simulation.world_model.runtime import persist_fit_only_world_model
 
 LABEL = "held-out"
+PANEL_JUDGE_EFFORT = "low"  # panels report the judge alongside exact replies; low suffices
 Profile = Literal["memory", "source-rag"]
 
 
@@ -192,6 +193,7 @@ def register_held_out_fidelity(
             label=LABEL,
             memory=memory,
             retrieval=retrieval,
+            judge_effort=PANEL_JUDGE_EFFORT,
         )
         registration, replaced = register_replay(
             project,

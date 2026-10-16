@@ -324,7 +324,10 @@ class SimulatedProvider(ScriptedJsonTransport):
             observations.append({"call_id": call["call_id"], "reply": reply, "encoding": "json"})
         return {
             "observations": observations,
-            "effect": {"kind": "replace", "state": {"calls": len(observations)}},
+            "effect": {
+                "kind": "edits",
+                "edits": [{"op": "set", "path": ["calls"], "value": len(observations)}],
+            },
         }
 
     def predictions(self) -> list[JsonObject]:

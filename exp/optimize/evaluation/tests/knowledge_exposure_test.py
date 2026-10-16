@@ -7,12 +7,21 @@ import pytest
 
 from exp.common.core.artifacts import ArtifactEnvelope, JsonObject, sha256_bytes
 from exp.common.project import ProjectStore, artifact_input
-from exp.optimize.evaluation.fidelity import FidelitySpec, prepare_fidelity_evaluation
-from exp.optimize.evaluation.tests.fidelity_memory_test import memory_project
+from exp.optimize.evaluation import fidelity
+from exp.optimize.evaluation.fidelity import (
+    FidelitySpec,
+    execute_fidelity_evaluation,
+    prepare_fidelity_evaluation,
+)
+from exp.optimize.evaluation.tests.fidelity_memory_test import RoutedTransport, memory_project
 from exp.simulation.engines.text.knowledge import SimulationKnowledge
 from exp.simulation.reconstruction.library import LibraryEntry
 from exp.simulation.reconstruction.revision import ResearchNote
-from exp.simulation.world_model.artifact import persist_grounded_world_model
+from exp.simulation.retrieval import load_rag_index
+from exp.simulation.world_model.artifact import (
+    GroundedWorldModelArtifact,
+    persist_grounded_world_model,
+)
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
 SECRET = "HELDOUT_REPLY_SECRET: reply-0"
@@ -20,12 +29,17 @@ OWN = "held-out-trace"
 
 
 def bound(root: Path, knowledge: SimulationKnowledge | None = None, case: str = "") -> FidelitySpec:
-    """A held-out task (sourced from ``OWN``) on the fixture simulator with this knowledge."""
+    """A held-out task (sourced from ``OWN``) on the fixture simulator with this knowledge.
+
+    ``same-lineage`` puts the task in the lineage of the indexed trace ``observed`` and binds
+    a simulator without recorded-evidence retrieval, so only knowledge could expose it.
+    """
     project, base = memory_project(root)
     artifact = load_grounded_world_model_artifact(project.artifacts, base.world_model)
-    if case == "library":
+    if case in ("library", "dependency-only"):
         knowledge = SimulationKnowledge(
-            source_trace_ids=("observed",), transfer_context=_selected(project)
+            source_trace_ids=("observed",),
+            transfer_context=_selected(project, own_source=case == "library"),
         )
     model = persist_grounded_world_model(
         project.artifacts,
@@ -36,24 +50,33 @@ def bound(root: Path, knowledge: SimulationKnowledge | None = None, case: str = 
         code_revision="test",
         top_k=artifact.top_k,
         knowledge=knowledge,
+        original_evidence="none" if case == "same-lineage" else artifact.original_evidence,
     )
     data = base.model_dump(mode="json")
     data["world_model"] = artifact_input(model.manifest).model_dump(mode="json")
     data["task"]["source_trace_ids"] = [OWN]
     data["task"]["origin"] = "mined"
     data["output_protocol"] = "json-tool"
+    if case == "same-lineage":
+        data["task"]["lineage_group_id"] = _indexed_lineage(project, artifact)
     spec = FidelitySpec.model_validate(data)
     assert spec.task.partition == "held_out"
     return spec
 
 
-def _selected(project: ProjectStore) -> JsonObject:
-    """A prior-library selection whose entry derives from the held-out trace."""
+def _indexed_lineage(project: ProjectStore, artifact: GroundedWorldModelArtifact) -> str:
+    """Task lineage of the fixture's indexed trace ``observed``."""
+    index = load_rag_index(project.artifacts, artifact.serving_rag.artifact_id)
+    return next(row.lineage_id for row in index.transitions if row.trace_id == "observed")
+
+
+def _selected(project: ProjectStore, *, own_source: bool = True) -> JsonObject:
+    """A prior-library selection whose entry derives from (or only depends on) held-out data."""
     payload = {
         "trajectory": {
             "task": "Inspect current entries",
-            "task_lineage": "other",
-            "source_trace_ids": [OWN],
+            "task_lineage": "other" if own_source else "independent",
+            "source_trace_ids": [OWN if own_source else "observed"],
             "actions": [{"name": "inspect", "arguments": {"key": "current"}}],
             "observed_replies": [SECRET],
         }
@@ -75,7 +98,8 @@ def _selected(project: ProjectStore) -> JsonObject:
         path="trajectory.json",
         payload_sha256=sha256_bytes(stored),
         disposition="source",
-        derived_from=ref,
+        derived_from=ref if own_source else None,
+        depends_on=() if own_source else (ref,),
     )
     return {"selected": [{"entry": entry.model_dump(mode="json"), "payload": payload}]}
 
@@ -137,3 +161,41 @@ def test_authored_or_independent_knowledge_is_accepted(
     spec = bound(tmp_path, knowledge)
     project = ProjectStore(tmp_path, "fidelity-test")
     assert prepare_fidelity_evaluation(project, spec, code_revision="test").spec == spec
+
+
+@pytest.mark.parametrize(
+    ("knowledge", "case", "message"),
+    [
+        (SimulationKnowledge(source_trace_ids=("observed",), rules=SECRET), "same-lineage", "own"),
+        (SimulationKnowledge(source_trace_ids=("ghost",), rules=SECRET), "", "trace ghost"),
+        (None, "dependency-only", "prior-library entry held-out-source"),
+    ],
+    ids=["same-lineage-trace", "nonexistent-trace", "dependency-only-library"],
+)
+def test_lineages_resolve_and_unknown_sources_are_never_verified(
+    tmp_path: Path, knowledge: SimulationKnowledge | None, case: str, message: str
+) -> None:
+    """Knowledge trace IDs resolve to lineages; unresolvable or borrowed provenance refuses."""
+    spec = bound(tmp_path, knowledge, case)
+    project = ProjectStore(tmp_path, "fidelity-test")
+    with pytest.raises(ValueError, match=message):
+        prepare_fidelity_evaluation(project, spec, code_revision="test")
+
+
+def test_a_registration_made_before_the_guard_is_refused_on_reuse_and_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Saved registrations are rechecked; none can buy a prediction past the guard."""
+    spec = bound(tmp_path, SimulationKnowledge(rules=SECRET))
+    project = ProjectStore(tmp_path, "fidelity-test")
+    with monkeypatch.context() as unguarded:
+        unguarded.setattr(fidelity, "require_unexposed_task", lambda *_args: None)
+        prepared = prepare_fidelity_evaluation(project, spec, code_revision="test")
+    with pytest.raises(ValueError, match="no recorded provenance"):
+        prepare_fidelity_evaluation(project, spec, code_revision="test")
+    monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
+    wire = RoutedTransport([])
+    monkeypatch.setattr(fidelity, "HttpxJsonTransport", lambda: wire)
+    with pytest.raises(ValueError, match="no recorded provenance"):
+        execute_fidelity_evaluation(project, prepared)
+    assert not wire.requests

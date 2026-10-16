@@ -2,7 +2,7 @@
 
 import copy
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from operator import not_
 from pathlib import Path
@@ -136,6 +136,14 @@ class DurableWorldModelSession:
         if self._research is None:
             raise ValueError("session was not opened with an online research policy")
         return self._research.observe(operation_id, observed_reply, source)
+
+    def observe_all_reply_feedback(
+        self, feedback: Sequence[tuple[str, JsonValue]], *, source: str
+    ) -> list[JsonObject | Exception]:
+        """Disclose every reply after the whole trajectory is predicted (pinned delivery)."""
+        if self._research is None:
+            raise ValueError("session was not opened with an online research policy")
+        return self._research.observe_all(feedback, source)
 
     @property
     def evaluation_context(self) -> JsonObject:

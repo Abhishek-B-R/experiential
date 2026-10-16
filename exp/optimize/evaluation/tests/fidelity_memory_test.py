@@ -176,7 +176,10 @@ def predicted(call_id: str, reply: str) -> JsonHttpResponse:
     return transition_reply(
         {
             "observations": [{"call_id": call_id, "reply": reply, "encoding": "json"}],
-            "effect": {"kind": "replace", "state": {"last": call_id}},
+            "effect": {
+                "kind": "edits",
+                "edits": [{"op": "set", "path": ["last"], "value": call_id}],
+            },
         }
     )
 
@@ -435,7 +438,9 @@ def test_wire_tool_schemas_are_reference_free_and_string_effects_stay_invalid(
             "observations": [
                 {"call_id": "traj-wire-1", "reply": "alpha-reply-1", "encoding": "json"}
             ],
-            "effect": json.dumps({"kind": "replace", "state": {"last": "traj-wire-1"}}),
+            "effect": json.dumps(
+                {"kind": "edits", "edits": [{"op": "set", "path": ["last"], "value": "x"}]}
+            ),
         }
     )
     wire = RoutedTransport(

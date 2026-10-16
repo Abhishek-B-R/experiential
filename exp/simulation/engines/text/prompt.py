@@ -74,17 +74,23 @@ RECONSTRUCTED_TEXT_SYSTEM_PROMPT = (
 RECONSTRUCTED_JSON_TOOL_SYSTEM_PROMPT = (
     _WORLD_MODEL_INSTRUCTIONS.replace(
         "Protocol version: text-world-model-v3.",
-        "Protocol version: grounded-json-transition-v1.",
+        "Protocol version: grounded-json-transition-v2.",
     )
     + """Submit exactly one submit_transition proposal. This answer tool only records your
 proposed consequences; it does not execute the requested environment action.
 Use observations in the supplied call_id order. reply is the native JSON value with encoding
 json, or an exact native text string with encoding text. Do not serialize a JSON object into
-a string. effect is kind replace with the complete updated candidate state. terminal is false.
+a string. effect is kind edits: only the changes this call makes to environment_state, as
+ordered ops. set {"op":"set","path":[...],"value":...} creates or replaces an object key
+(missing parent objects are created) or an existing list index; delete removes a key or index;
+append adds to an existing list; remove_value removes the first equal list element. Paths are
+lists of object keys and list indexes. Use an empty edits list when the state does not change;
+never restate unchanged state. terminal is false.
 The external observation is serialized by code; you decide every reply value and state effect.
 Fictional format example only: {"observations":[{"call_id":"c1","reply":{"id":"a",
-"optional":null},"encoding":"json","is_error":false}],"effect":{"kind":"replace",
-"state":{"records":{"a":{"id":"a","optional":null}}}},"terminal":false}.
+"optional":null},"encoding":"json","is_error":false}],"effect":{"kind":"edits",
+"edits":[{"op":"set","path":["records","a"],"value":{"id":"a","optional":null}}]},
+"terminal":false}.
 Use actual call IDs, observed formats and current facts, not these fictional fields.
 """
     + _RECONSTRUCTED_CONTEXT

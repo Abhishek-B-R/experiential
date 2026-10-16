@@ -437,10 +437,11 @@ it. None of the trace's own feedback or investigations reaches its predictions; 
 published with the trace. Memory from earlier traces of the same task lineage is hidden too,
 just as retrieval hides the trace's own lineage. Memory written after a prediction saw retrieved
 evidence depends on the retrieved traces, so a retrieved fact never reaches its own task through
-memory either. Replay keeps the recorded history visible (the
-recorded agent chose each action after the recorded reply), which makes the score somewhat
-easier than a free-running simulation. Every learning report is therefore a measurement, against
-recorded history, on a task memory has not learned, even though every trace is consumed. The pass prints this
+memory either. The recorded actions are replayed in order, but after the trace's public prefix
+the simulator sees its own earlier replies and state, never the recorded replies, so an early
+error carries forward into later turns. Every learning report is therefore a measurement of
+recorded actions over the simulator's own history, on a task memory has not learned, even though
+every trace is consumed. The pass prints this
 test-then-train fidelity (replies exact, reply fields matching, and the second half alone, once
 memory has learned half the traces) and a learning curve of exact replies by consumption order.
 
@@ -473,9 +474,11 @@ calls. A run that stopped after buying calls is never bought again silently: rer
 `--retry-incomplete` (on `exp build --learn`, `exp eval --retest-misses` or
 `exp eval --held-out-fidelity`) to replace it. A learning trace that stops before completing is
 retried up to three times in the same pass; any trace still not learned is reported, and only
-learned traces count. A learned trace is scored by the attempt that was consumed into memory,
-never by an earlier attempt that stopped; the curve and the retest report incomplete traces
-separately. A cancelled `--learn` preflight records nothing; without `--hold-out`, later commands
+learned traces count. Every trace is predicted whole before any of its replies is disclosed;
+investigations of its misses then run together, so a failed investigation never prevents a
+prediction. A trace is scored by the attempt consumed into memory, or by its last attempt when
+it was never learned, and the curve reports traces not learned separately; the retest covers
+learned traces only. A cancelled `--learn` preflight records nothing; without `--hold-out`, later commands
 read the memory that learned most recently.
 
 Knowledge pinned in a simulator (built outside `exp build`, for example for `exp eval --fidelity`)

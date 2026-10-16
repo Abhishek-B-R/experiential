@@ -197,7 +197,7 @@ def test_production_schemas_keep_validation_under_random_mutation() -> None:
             _GroundedJsonProposal.model_json_schema(),
             {
                 "observations": [{"call_id": "c", "reply": {"a": [1]}, "encoding": "json"}],
-                "effect": {"kind": "replace", "state": {"x": 1}},
+                "effect": {"kind": "edits", "edits": [{"op": "set", "path": ["x"], "value": 1}]},
                 "terminal": False,
             },
         ),

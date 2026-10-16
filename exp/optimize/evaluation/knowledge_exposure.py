@@ -6,6 +6,8 @@ constructor provenance, research notes, and prior-library entries are resolved t
 traces and task lineages behind them.
 """
 
+from collections.abc import Mapping
+
 from pydantic import ValidationError
 
 from exp.common.core.artifacts import ContractModel, JsonObject
@@ -13,6 +15,8 @@ from exp.common.project import ArtifactStore, ProjectStore
 from exp.common.tasks import TaskCase
 from exp.simulation.engines.text.knowledge import SimulationKnowledge
 from exp.simulation.reconstruction.library import LibraryEntry
+from exp.simulation.retrieval import load_rag_index
+from exp.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings
 from exp.simulation.world_model.artifact import GroundedWorldModelArtifact
 from exp.simulation.world_model.experience_memory import load_source
 
@@ -31,12 +35,19 @@ class KnowledgeExposure(ContractModel):
     unknown: tuple[str, ...]
 
 
-def knowledge_exposure(store: ArtifactStore, knowledge: SimulationKnowledge) -> KnowledgeExposure:
+def knowledge_exposure(
+    store: ArtifactStore, knowledge: SimulationKnowledge, lineage_of: Mapping[str, str]
+) -> KnowledgeExposure:
     """Resolve every predictor-visible knowledge channel to its recorded evidence.
+
+    Constructor and research-note trace IDs are resolved to their task lineages; an ID that
+    resolves to no known trace is unknown provenance, never verified. A library entry needs
+    its own source (``derived_from``); its dependencies cannot stand in for it.
 
     Args:
         store: Artifact owner resolving library source references.
         knowledge: Knowledge pinned by the simulator.
+        lineage_of: Task lineage of every known recorded trace.
 
     Returns:
         Traces, task lineages and channels of unknown provenance.
@@ -57,6 +68,11 @@ def knowledge_exposure(store: ArtifactStore, knowledge: SimulationKnowledge) -> 
         traces.update(note.source_trace_ids)
         if not note.source_trace_ids:
             unknown.append(f"research note {note.id}")
+    for trace in sorted(traces):
+        if trace in lineage_of:
+            lineages.add(lineage_of[trace])
+        else:
+            unknown.append(f"trace {trace}")
     selected = knowledge.transfer_context.get("selected", [])
     for record in selected if isinstance(selected, list) else []:
         entry = _entry(record)
@@ -65,7 +81,7 @@ def knowledge_exposure(store: ArtifactStore, knowledge: SimulationKnowledge) -> 
             continue
         references = [ref for ref in (entry.derived_from, *entry.depends_on) if ref is not None]
         sources = [load_source(store, ref) for ref in references]
-        if not references or any(source is None for source in sources):
+        if entry.derived_from is None or any(source is None for source in sources):
             unknown.append(f"prior-library entry {entry.entry_id}")
         for source in sources:
             if source is None:
@@ -97,7 +113,8 @@ def require_unexposed_task(
     """
     if artifact.knowledge is None:
         return
-    exposure = knowledge_exposure(project.artifacts, artifact.knowledge)
+    lineage_of = _lineages(project, artifact)
+    exposure = knowledge_exposure(project.artifacts, artifact.knowledge, lineage_of)
     own = sorted(set(task.source_trace_ids) & exposure.trace_ids)
     if own or task.lineage_group_id in exposure.task_lineages:
         named = ", ".join(own) if own else f"task lineage {task.lineage_group_id}"
@@ -111,6 +128,21 @@ def require_unexposed_task(
             f"{', '.join(exposure.unknown)} has no recorded provenance; record the source "
             "traces, or declare hand-written knowledge with authored=True"
         )
+
+
+def _lineages(project: ProjectStore, artifact: GroundedWorldModelArtifact) -> dict[str, str]:
+    """Task lineage of every recorded trace the simulator's index or the build knows."""
+    found = {
+        row.trace_id: row.lineage_id
+        for row in load_rag_index(project.artifacts, artifact.serving_rag.artifact_id).transitions
+    }
+    build = project.load_project().build
+    if build is not None:
+        found.update(
+            (row.trace_id, row.lineage_id)
+            for row in load_completed_build_rag_lineage_bindings(project.artifacts, build)
+        )
+    return found
 
 
 def _entry(record: object) -> LibraryEntry | None:

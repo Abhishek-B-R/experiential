@@ -52,8 +52,13 @@ def evaluate_workflow(
     evaluation_id: ArtifactId | None = None,
     reply_feedback_source: str | None = None,
     progress: ProgressHook | None = None,
+    feedback_after_predictions: bool = False,
 ) -> DualReport:
     """Run without native rescue; retain blocked slots and a separate receipt identity.
+
+    With ``feedback_after_predictions`` (pinned memory delivery), every step is predicted
+    first and replies are disclosed and investigated only afterwards, together, so a failed
+    investigation never prevents a prediction.
 
     Matched parent/child evaluations share a public workload ID but must use distinct
     evaluation IDs for their immutable request and result artifacts. ``progress`` observes
@@ -133,7 +138,7 @@ def evaluate_workflow(
                     after=session.state,
                 )
             )
-            if reply_feedback_source is not None:
+            if reply_feedback_source is not None and not feedback_after_predictions:
                 try:
                     feedback_receipts.append(
                         session.observe_reply_feedback(
@@ -145,6 +150,20 @@ def evaluate_workflow(
                 except Exception as error:  # noqa: BLE001 - failed adaptation blocks future slots.
                     feedback_error = type(error).__name__
                     stopped = True
+    if reply_feedback_source is not None and feedback_after_predictions and not stopped:
+        # Whole-trace boundary: every step is predicted before any reply is disclosed, so an
+        # investigation can never decide which predictions exist.
+        report(progress, "Investigating misses")
+        settled = session.observe_all_reply_feedback(
+            [
+                (action.call_id, references.steps[i].reply)
+                for i, action in enumerate(workload.actions)
+            ],
+            source=reply_feedback_source,
+        )
+        feedback_receipts = [row for row in settled if not isinstance(row, Exception)]
+        failures = [row for row in settled if isinstance(row, Exception)]
+        feedback_error = type(failures[0]).__name__ if failures else None
     simulated = sum(step.status != "blocked" for step in steps)
     report(
         progress,

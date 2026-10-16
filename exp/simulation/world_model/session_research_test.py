@@ -90,14 +90,20 @@ def test_next_turn_and_restart_preserve_feedback_without_state_rescue(
             transition_reply(
                 {
                     "observations": [{"call_id": "call-0", "reply": "wrong", "encoding": "json"}],
-                    "effect": {"kind": "replace", "state": {"seen": 1}},
+                    "effect": {
+                        "kind": "edits",
+                        "edits": [{"op": "set", "path": ["seen"], "value": 1}],
+                    },
                 }
             ),
             *([structured_reply(investigation)] if generate_hypotheses else []),
             transition_reply(
                 {
                     "observations": [{"call_id": "call-1", "reply": "reply-1", "encoding": "json"}],
-                    "effect": {"kind": "replace", "state": {"seen": 2}},
+                    "effect": {
+                        "kind": "edits",
+                        "edits": [{"op": "set", "path": ["seen"], "value": 2}],
+                    },
                 }
             ),
             structured_reply({"axes": axes}),
@@ -215,7 +221,10 @@ def test_failed_investigation_retains_wrong_step_and_blocks_unqualified_suffix(
             transition_reply(
                 {
                     "observations": [{"call_id": "call-0", "reply": "wrong", "encoding": "json"}],
-                    "effect": {"kind": "replace", "state": {"seen": 1}},
+                    "effect": {
+                        "kind": "edits",
+                        "edits": [{"op": "set", "path": ["seen"], "value": 1}],
+                    },
                 }
             ),
             structured_reply(

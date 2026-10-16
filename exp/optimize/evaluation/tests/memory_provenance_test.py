@@ -22,6 +22,7 @@ from exp.optimize.evaluation.trace_learning_test import memory_delivered
 from exp.runtime.models.providers.transport import JsonHttpResponse, RecordedRequest
 
 CANARY = re.compile(r"CANARY_user_\d+")
+HASH = re.compile(r"[0-9a-f]{20,}")
 
 
 class CopyingProvider(SimulatedProvider):
@@ -109,3 +110,58 @@ def test_a_retrieved_fact_written_into_memory_never_reaches_its_own_task(
     for prediction in own:
         assert provider.canary not in memory_delivered(prediction)
         assert provider.canary not in json.dumps(prediction["grounded_examples"])
+
+
+class BitProvider(SimulatedProvider):
+    """The first prediction that retrieves the audit bit misses only when the bit is set."""
+
+    def __init__(self, episodes: list[JsonObject]) -> None:
+        """Track whether the bit has been seen."""
+        super().__init__(episodes)
+        self.seen = False
+
+    def _transition(self, payload: JsonObject) -> JsonObject:
+        """Let the retrieved bit decide whether this prediction matches."""
+        result = super()._transition(payload)
+        examples = _user_content(payload).get("grounded_examples")
+        if not self.seen and "audit_bit" in json.dumps(examples):
+            self.seen = True
+            bits = [
+                json.loads(str(_at(row, "observation", "content"))).get("audit_bit")
+                for row in _arr(examples)
+            ]
+            if 1 in bits:
+                _obj(_arr(result["observations"])[0])["reply"] = {"error": "wrong"}
+        return result
+
+
+def test_a_trace_memory_never_reflects_its_own_recorded_answer_through_another_trace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Flipping one bit in B's answer leaves the memory delivered to B's predictions unchanged.
+
+    Another trace retrieves B's bit and its prediction succeeds or fails on it; nothing that
+    outcome writes to memory may reach B.
+    """
+    delivered = []
+    for bit in (0, 1):
+        episodes = [episode(i) for i in range(4)]
+        exchanges = episodes[2]["exchanges"]
+        assert isinstance(exchanges, list)
+        _, _, reply = exchanges[1]
+        reply["audit_bit"] = bit
+        root = tmp_path / f"bit-{bit}"
+        root.mkdir()
+        provider = BitProvider(episodes)
+        build_project(
+            root, monkeypatch, provider, "--learn", "--memory-recall", "jev", episodes=episodes
+        )
+        assert provider.seen, "another trace retrieved B's recorded answer"
+        own = [
+            prediction
+            for prediction in provider.predictions()
+            if _at(prediction, "task", "initial_context", "task_lineage") == "user_02"
+        ]
+        # Content hashes (lineage and trajectory IDs) differ because B's trace differs.
+        delivered.append([HASH.sub("#", memory_delivered(prediction)) for prediction in own])
+    assert delivered[0] == delivered[1]

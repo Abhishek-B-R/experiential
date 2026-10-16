@@ -43,7 +43,7 @@ from exp.common.evaluations.reconstruction import (
     default_judge,
     saved_turn_outcomes,
 )
-from exp.common.models import ModelCapabilities, ToolCall, load_model_catalog
+from exp.common.models import ModelCapabilities, ReasoningEffort, ToolCall, load_model_catalog
 from exp.common.project import ProjectStore
 from exp.common.tasks import TaskCase
 from exp.common.traces import Trace
@@ -294,6 +294,8 @@ def replay_spec(
     retrieval: FidelityRetrieval | None = None,
     online_research: OnlineResearchPolicy | None = None,
     per_turn: bool = True,
+    judged: bool = True,
+    judge_effort: ReasoningEffort | None = None,
 ) -> FidelitySpec:
     """Derive one fidelity spec for a replay case, with a content-addressed run ID.
 
@@ -313,6 +315,8 @@ def replay_spec(
         retrieval: Native JEV memory recall, required with memory.
         online_research: Per-step disclosure and investigation, for learning.
         per_turn: Ask the judge for per-turn scores too.
+        judged: False skips the judge (learning is scored by exact replies).
+        judge_effort: Judge reasoning effort, applied when the judge model pins one.
 
     Returns:
         Complete spec; its run ID is a generation-one content address.
@@ -344,7 +348,7 @@ def replay_spec(
     # Per turn: the prediction, a query embedding when it retrieves recorded facts, a memory
     # recall decision, an investigation while learning, and the allowed re-asks.
     per_step = 1 + retrieves + (memory is not None) + learning + PROPOSAL_REASKS
-    tail = 1 + (memory.maximum_compressions if memory is not None and learning else 0)
+    tail = judged + (memory.maximum_compressions if memory is not None and learning else 0)
     prediction = _allowance(PREDICTION_TOKENS, predictor)
     spec = FidelitySpec(
         run_id="pending",
@@ -367,8 +371,9 @@ def replay_spec(
             ),
         ),
         judge=default_judge(judge_model.model_id, protocol="keyed-v3").model_copy(
-            update={"per_turn": per_turn}
+            update={"per_turn": per_turn and judged}
         ),
+        judged=judged,
         judge_alias=judge_alias,
         deadline=deadline,
         maximum_physical_attempts=RetryPolicy().maximum_attempts * (per_step * len(actions) + tail),
@@ -382,7 +387,12 @@ def replay_spec(
         roles=RoleBudgets(
             prediction=RoleBudget(output_tokens=prediction),
             investigation=RoleBudget(output_tokens=_allowance(INVESTIGATION_TOKENS, predictor)),
-            judging=RoleBudget(output_tokens=_allowance(JUDGING_TOKENS, judge_caps)),
+            judging=RoleBudget(
+                output_tokens=_allowance(JUDGING_TOKENS, judge_caps),
+                reasoning_effort=judge_effort
+                if judge_caps.supports_reasoning is True and judge_caps.reasoning_effort is not None
+                else None,
+            ),
         ),
     )
     return spec.model_copy(update={"run_id": content_run_id(spec, label, case.trace_id)})

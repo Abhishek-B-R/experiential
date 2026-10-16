@@ -3,6 +3,7 @@
 import copy
 import json
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol, Self
@@ -368,6 +369,148 @@ class SessionResearch:
             )
             self._save(identity, record)
             return copy.deepcopy(record)
+
+    def observe_all(
+        self,
+        feedback: Sequence[tuple[str, JsonValue]],
+        source: str,
+        *,
+        workers: int = 8,
+    ) -> list[JsonObject | Exception]:
+        """Disclose every reply after the whole trajectory is predicted; investigate concurrently.
+
+        Only for pinned delivery, where no investigation can inform a prediction. Each
+        investigation sees the disclosed reply, its own predicted transition and the pinned
+        prior research, never another investigation of this session, so the outcome does not
+        depend on completion order. The first ``maximum_updates`` misses, in step order, are
+        investigated; later misses are recorded as raw feedback. One failed investigation
+        affects only its own receipt.
+
+        Args:
+            feedback: ``(operation_id, disclosed reply)`` for each predicted step, in order.
+            source: Declared disclosure source.
+            workers: Concurrent investigations.
+
+        Returns:
+            One saved record, or the exception that prevented it, per feedback item.
+        """
+        policy, complete = self.policy, self._complete
+        if policy is None or complete is None:
+            raise ValueError("frozen memory sessions do not accept feedback")
+        if policy.notes_reach_predictions:
+            raise ValueError("deferred feedback requires predictions on pinned memory")
+        if source != policy.feedback_source:
+            raise ValueError("feedback source differs from the registered disclosure policy")
+        with self._lock:
+            current = self._store.read_session(self.session_id)
+        transitions = current.state.get("transitions")
+        if not isinstance(transitions, list):
+            raise ValueError("feedback requires completed predictions")
+        by_operation = {
+            str(row["operation_id"]): row
+            for row in transitions
+            if isinstance(row, dict) and isinstance(row.get("operation_id"), str)
+        }
+        prior = self._prior_research([])[-policy.retained_notes :]
+        supplied = self._supplied(transitions, {}) | {str(row["id"]) for row in prior}
+        depends_on = self._dependencies(
+            supplied, {}, [*_recorded_overview_sources(transitions), *self._retrieved(transitions)]
+        )
+        budget = policy.maximum_updates
+        plans: list[tuple[str, JsonObject, bool] | Exception] = []
+        for operation_id, observed_reply in feedback:
+            identity = self._record_id(operation_id)
+            latest = by_operation.get(operation_id)
+            replies = latest.get("replies") if latest is not None else None
+            if latest is None or not isinstance(replies, list) or len(replies) != 1:
+                plans.append(ValueError("feedback requires one single-tool prediction"))
+                continue
+            matched = strict_equal(replies[0], observed_reply)
+            investigate = not matched and policy.generate_hypotheses and budget > 0
+            if not matched and policy.generate_hypotheses:
+                budget -= 1
+            record: JsonObject = {
+                "id": identity,
+                "session_id": self.session_id,
+                "operation_id": operation_id,
+                "actions": latest["actions"],
+                "committed_version": current.version,
+                "source": source,
+                "transition_sha256": sha256_json(latest),
+                "predicted_reply": replies[0],
+                "observed_reply": observed_reply,
+                "reply_matched": matched,
+                "authority": "disclosed-past-reply; hypotheses-unverified",
+                "investigation": None,
+                "depends_on": depends_on,
+            }
+            if not matched and policy.generate_hypotheses and not investigate:
+                record["investigation_skipped"] = "session investigation budget exhausted"
+            plans.append((identity, record, investigate))
+
+        def settle(plan: tuple[str, JsonObject, bool]) -> JsonObject:
+            """Replay a saved receipt, or investigate and save a new one."""
+            identity, record, investigate = plan
+            if self._artifacts.exists(identity):
+                saved = json.loads(self._artifacts.read_bytes(identity, "record.json"))
+                if not strict_equal(saved["observed_reply"], record["observed_reply"]):
+                    raise ValueError("feedback replay changed the disclosed observation")
+                return saved
+            if self._artifacts.exists(identity + "-intent"):
+                raise ValueError("unfinished research update requires explicit recovery")
+            if self._clock() >= current.binding.deadline:
+                raise TimeoutError("session deadline reached before investigation")
+            if investigate:
+                body: JsonObject = {
+                    "messages": [
+                        {"role": "system", "content": _INVESTIGATE},
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                {
+                                    "feedback": {
+                                        k: v for k, v in record.items() if k != "depends_on"
+                                    },
+                                    "candidate_transition": by_operation[
+                                        str(record["operation_id"])
+                                    ],
+                                    "previous_investigations": [],
+                                    "prior_trajectory_investigations": prior,
+                                },
+                                ensure_ascii=False,
+                                allow_nan=False,
+                            ),
+                        },
+                    ],
+                    "response_schema": investigation_schema(),
+                }
+                self._save(identity + "-intent", {"request": body})
+                proposal = complete(body, identity + "-investigate")
+                self._save(identity + "-proposal", {"proposal": proposal})
+                update = Investigation.model_validate(proposal)
+                available = {str(row["id"]) for row in prior}
+                if len(set(update.supersedes)) != len(update.supersedes) or not set(
+                    update.supersedes
+                ).issubset(available):
+                    raise ValueError("investigation can supersede only supplied prior notes")
+                if self._clock() >= current.binding.deadline:
+                    raise TimeoutError("late investigation retained but not activated")
+                record = {**record, "investigation": update.model_dump(mode="json")}
+            self._save(identity, record)
+            return copy.deepcopy(record)
+
+        results: list[JsonObject | Exception | None] = [
+            plan if isinstance(plan, Exception) else None for plan in plans
+        ]
+        pending = [(i, plan) for i, plan in enumerate(plans) if not isinstance(plan, Exception)]
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(pending) or 1))) as pool:
+            futures = {pool.submit(settle, plan): i for i, plan in pending}
+            for future, index in futures.items():
+                try:
+                    results[index] = future.result()
+                except Exception as error:  # noqa: BLE001 - one failure stays with its receipt.
+                    results[index] = error
+        return [row for row in results if row is not None]
 
     def _retrieved(self, transitions: list[JsonValue]) -> Sequence[ArtifactInput]:
         """Recorded traces behind every retrieved transition this session's predictions saw."""

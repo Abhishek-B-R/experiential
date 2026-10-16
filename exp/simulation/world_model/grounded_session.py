@@ -27,6 +27,7 @@ from exp.simulation.engines.text.prompt import (
     validate_transition_action,
 )
 from exp.simulation.engines.transition import (
+    ApplyEdits,
     Completion,
     PreparedPrediction,
     ProposedObservation,
@@ -48,14 +49,16 @@ from exp.simulation.world_model.session_research import (
 
 
 class _GroundedJsonProposal(ProposedTransition):
-    """Typed observations using the grounded engine's existing replacement semantics.
+    """Typed observations plus compact edits to the candidate state.
 
     Attributes:
-        effect: Complete model-authored replacement, excluding compact edits.
+        effect: Ordered set/delete/append/remove_value edits to the current candidate state.
+            Re-writing the complete state every turn dominated output tokens; an edit that does
+            not apply is refused and asked again like any invalid proposal.
         terminal: Tool observations cannot terminate the actor before delivery.
     """
 
-    effect: ReplaceState
+    effect: ApplyEdits
     terminal: Literal[False] = False
 
 
@@ -77,7 +80,7 @@ def frame_grounded_output(
                 "tools": (
                     ToolSchema(
                         name="submit_transition",
-                        description="Submit observations and the complete candidate state.",
+                        description="Submit observations and edits to the candidate state.",
                         input_schema=expand_local_references(
                             _GroundedJsonProposal.model_json_schema()
                         ),
@@ -137,7 +140,7 @@ class GroundedTransitionEngine:
                 "output_tokens": self.maximum_output_tokens,
                 "json_object_output": self.json_object_output,
                 "output_protocol": self.output_protocol,
-                "protocol": "grounded-typed-response-v2",
+                "protocol": "grounded-typed-response-v3",
             }
         )
 

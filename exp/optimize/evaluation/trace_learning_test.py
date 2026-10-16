@@ -88,9 +88,11 @@ def test_default_learning_consumes_every_trace_and_reports_test_then_train(
     assert not any(is_reserved(store.artifacts, plan.lineage, lineage) for lineage in held)
     assert f"learned {USERS}/{USERS} traces · memory v{USERS}" in output
     exact = 3 * USERS - 1  # only the first trace's learnable turn is wrong
-    headline = f"Test-then-train fidelity (recorded history) {exact}/{3 * USERS} replies exact"
+    headline = f"Test-then-train fidelity (recorded actions) {exact}/{3 * USERS} replies exact"
     assert headline in output
     assert "next: exp eval retail --retest-misses N" in output
+    judging = [r for r in provider.requests if "axes" in json.dumps(r.payload.get("tools"))]
+    assert not judging, "learning is scored by exact replies and never buys a judge call"
     refused = CliRunner().invoke(
         app,
         ["eval", PROJECT, "--root", str(root), "--held-out-fidelity", "3", "--non-interactive"],

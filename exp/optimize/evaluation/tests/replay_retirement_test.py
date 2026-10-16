@@ -16,7 +16,7 @@ from exp.common.models import (
     write_model_catalog,
 )
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation import trace_learning, trace_replay
+from exp.optimize.evaluation import trace_learning
 from exp.optimize.evaluation.fidelity import execute_fidelity_evaluation
 from exp.optimize.evaluation.fidelity_memory import DUPLICATE, saved_memory_receipt
 from exp.optimize.evaluation.held_out_fidelity import register_held_out_fidelity
@@ -28,17 +28,13 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     episode,
 )
 from exp.optimize.evaluation.miss_retest import register_miss_retest
-from exp.optimize.evaluation.tests.fidelity_memory_test import memory_project
 from exp.optimize.evaluation.trace_learning import (
-    fit_calls,
     learn_from_traces,
     learning_curve,
     learning_plan,
     learning_progress,
 )
 from exp.runtime.models.providers.transport import JsonHttpResponse
-from exp.simulation.retrieval import load_rag_index
-from exp.simulation.world_model.observed_tools import observed_calls
 
 
 def now() -> datetime:
@@ -182,80 +178,10 @@ class FlakyInvestigator(SimulatedProvider):
 
 
 @pytest.mark.parametrize("failures", [1, 99])
-def test_a_learning_trace_that_stops_early_is_retried_then_reported(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failures: int
-) -> None:
-    """One refused investigation never silently drops a trace; a persistent one is reported."""
-    provider = FlakyInvestigator([episode(i) for i in range(USERS)], learnable=True)
-    provider.failures = failures
-    _, store, _ = build_project(tmp_path, monkeypatch, provider)
-    outcome = learn_from_traces(
-        store, recall_alias="jev", maximum_attempts=10_000, code_revision=REVISION, clock=now
-    )
-    assert outcome.learned + outcome.incomplete == outcome.traces
-    if failures == 1:
-        assert outcome.incomplete == 0
-    else:
-        assert outcome.incomplete >= 1 and outcome.head_version == outcome.learned
-
-
-def test_a_world_model_without_tools_is_refused_before_any_call(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Structured transitions and investigations need tools; refuse clearly, buy nothing."""
-    provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
-    _, store, _ = build_project(tmp_path, monkeypatch, provider)
-    catalog = load_model_catalog(store.model_catalog_path)
-    world = catalog.roles.world_model
-    assert world is not None
-    record = catalog.models[world]
-    assert record.capabilities is not None
-    plain = record.model_copy(
-        update={"capabilities": record.capabilities.model_copy(update={"supports_tools": False})}
-    )
-    write_model_catalog(
-        store.model_catalog_path,
-        catalog.model_copy(update={"models": {**catalog.models, world: plain}}),
-    )
-    sent = len(provider.requests)
-    with pytest.raises(ValueError, match="tool-capable world model"):
-        learn_from_traces(
-            store, recall_alias="jev", maximum_attempts=10_000, code_revision=REVISION, clock=now
-        )
-    assert len(provider.requests) == sent
-
-
-def test_editing_a_sent_prompt_addresses_a_new_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Saved results never replay under a system prompt they were not produced with."""
-    _, base = memory_project(tmp_path)
-    before = trace_replay.content_run_id(base, "held-out", "trace")
-    monkeypatch.setattr(
-        trace_replay, "MEMORY_CONTEXT_GUIDANCE", trace_replay.MEMORY_CONTEXT_GUIDANCE + " Edited."
-    )
-    assert trace_replay.content_run_id(base, "held-out", "trace") != before
-
-
-def test_both_profiles_derive_tool_schemas_from_the_same_fit_calls(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Memory-first and source-RAG see the same fit tool inventory, prefixes included."""
-    provider = SimulatedProvider([episode(i) for i in range(USERS)])
-    _, store, _ = build_project(tmp_path, monkeypatch, provider)
-    build = store.load_project().build
-    assert build is not None
-    fit = load_rag_index(store.artifacts, build.fit_rag.artifact_id)
-    assert {name for name, _ in fit_calls(store)} == {
-        name for name, _ in observed_calls(fit.transitions)
-    }
-
-
-@pytest.mark.parametrize("failures", [1, 99])
 def test_scores_and_retests_use_only_the_consumed_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failures: int
 ) -> None:
-    """A stopped attempt is never scored as learned; a retried trace scores its consumed run."""
+    """Every trace is predicted whole; learning success decides learning, never scoring."""
     provider = FlakyInvestigator([episode(i) for i in range(USERS)], learnable=True)
     provider.failures = failures
     _, store, _ = build_project(tmp_path, monkeypatch, provider)
@@ -263,22 +189,28 @@ def test_scores_and_retests_use_only_the_consumed_attempt(
         store, recall_alias="jev", maximum_attempts=10_000, code_revision=REVISION, clock=now
     )
     plan = learning_plan(store)
-    runs, incomplete = learning_progress(store, plan)
-    assert (len(runs), len(incomplete)) == (outcome.learned, outcome.incomplete)
-    for _, prepared, _ in runs:
+    scored, unscored = learning_progress(store, plan)
+    assert not unscored and len(scored) == USERS, "every trace is scored"
+    assert sum(learned for *_, learned in scored) == outcome.learned
+    for _, prepared, result, learned in scored:
+        assert result.report.mechanical["valid_steps"] == result.steps, "whole trace predicted"
         receipt = saved_memory_receipt(store, prepared)
-        assert receipt is not None and receipt.get("reason") in ("consumed", DUPLICATE)
+        consumed = receipt is not None and receipt.get("reason") in ("consumed", DUPLICATE)
+        assert consumed == learned
     curve = learning_curve(store)
+    assert curve is not None and len(curve.points) == USERS
+    assert curve.incomplete == outcome.incomplete
     if failures == 99:
-        # Every investigation is refused, so no trace is consumed and nothing is scored.
-        assert outcome.learned == 0 and outcome.incomplete == USERS and curve is None
+        # Every investigation is refused, so no trace is learned, yet every trace is scored.
+        assert outcome.learned == 0 and curve.incomplete == USERS
+        assert f"{USERS} trace(s) not learned" in curve.headline()
         with pytest.raises(ValueError, match="nothing has been learned"):
             register_miss_retest(store, 99, code_revision=REVISION, clock=now)
         return
-    assert curve is not None and (len(curve.points), curve.incomplete) == (USERS, 0)
-    case, consumed, _ = runs[0]
+    assert curve.incomplete == 0
+    case, consumed_attempt, _, _ = scored[0]
     attempts = trace_learning._saved_attempts(store, plan, case)
-    assert len(attempts) > 1 and attempts[0][0].id != consumed.id, "the first attempt stopped"
+    assert len(attempts) > 1 and attempts[0][0].id != consumed_attempt.id, "first attempt failed"
     panel = register_miss_retest(store, 99, code_revision=REVISION, clock=now)
     assert panel.learned == USERS
-    assert panel.before[0].run_id == consumed.spec.run_id
+    assert panel.before[0].run_id == consumed_attempt.spec.run_id

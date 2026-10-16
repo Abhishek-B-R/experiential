@@ -135,20 +135,16 @@ def consume_trajectory(project: ProjectStore, prepared: PreparedFidelity, now: d
 def memory_lines(spec: FidelitySpec, receipts: list[JsonObject]) -> list[tuple[LineKind, str, str]]:
     """Derive this trajectory's log lines: one observed record, then each transferable rule.
 
-    The observed line is deterministic code over public actions and disclosed match flags.
+    The observed line is deterministic code over public actions only. It never records how
+    well the simulator predicted: those predictions read evidence retrieved from other
+    lineages, so a match count would carry that evidence back into memory without its
+    provenance. Mismatches stay in the investigation records, which carry it.
     Only investigations the investigator marked transferable become rule lines, phrased by the
     observable cue that triggers them; every investigation stays recallable as a record.
     """
     names = [action.name for action in spec.workload.actions]
-    missed = [
-        f"{index} {names[index]}"
-        for index, row in enumerate(receipts)
-        if row.get("reply_matched") is False
-    ]
     observed = (
-        f"[observed] task {spec.task.lineage_group_id}: {len(names)} actions "
-        f"({', '.join(names)}); simulator matched {len(names) - len(missed)}/{len(names)} "
-        "native replies" + (f"; mismatched at {'; '.join(missed)}" if missed else "")
+        f"[observed] task {spec.task.lineage_group_id}: {len(names)} actions ({', '.join(names)})"
     )
     lines: list[tuple[LineKind, str, str]] = [
         ("observed", fit_line(observed), spec.task.lineage_group_id)

@@ -17,6 +17,7 @@ from exp.common.core.artifacts import ArtifactInput, ContractModel
 from exp.common.evaluations.reconstruction import DualReport
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.fidelity import FidelityMemory, PreparedFidelity
+from exp.optimize.evaluation.held_out_fidelity import PANEL_JUDGE_EFFORT
 from exp.optimize.evaluation.trace_learning import learned_runs, learning_plan
 from exp.optimize.evaluation.trace_replay import (
     DEADLINE,
@@ -124,6 +125,7 @@ def register_miss_retest(
             label=LABEL,
             memory=memory,
             retrieval=plan.recall,
+            judge_effort=PANEL_JUDGE_EFFORT,
         )
         registration, replaced = register_replay(
             project,
