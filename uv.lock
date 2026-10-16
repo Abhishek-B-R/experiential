@@ -844,7 +844,7 @@ source = { directory = "exp/runtime/gateway/native" }
 [[package]]
 name = "exp-mitmproxy"
 version = "12.2.3.post2"
-source = { git = "https://github.com/experientiallabs/mitmproxy?rev=3863dc9dc0c09f9eb655614c4b9b63e5570a39e3#3863dc9dc0c09f9eb655614c4b9b63e5570a39e3" }
+source = { git = "https://gitlab.com/experiential-labs-group/mitmproxy.git?rev=95b902a8ffb0b02da8a8888d6cb86f0fa9255e5b#95b902a8ffb0b02da8a8888d6cb86f0fa9255e5b" }
 dependencies = [
     { name = "aioquic", marker = "python_full_version >= '3.13'" },
     { name = "argon2-cffi", marker = "python_full_version >= '3.13'" },
@@ -881,7 +881,7 @@ dependencies = [
 [[package]]
 name = "exp-mitmproxy-rs"
 version = "0.12.11.post1"
-source = { git = "https://github.com/experientiallabs/mitmproxy_rs?subdirectory=mitmproxy-rs&rev=866da0a0aff1a8e57def4da6a941fca0c44dd98d#866da0a0aff1a8e57def4da6a941fca0c44dd98d" }
+source = { git = "https://gitlab.com/experiential-labs-group/mitmproxy_rs.git?subdirectory=mitmproxy-rs&rev=866da0a0aff1a8e57def4da6a941fca0c44dd98d#866da0a0aff1a8e57def4da6a941fca0c44dd98d" }
 dependencies = [
     { name = "mitmproxy-linux", marker = "python_full_version >= '3.13' and sys_platform == 'linux'" },
     { name = "mitmproxy-macos", marker = "python_full_version >= '3.13' and sys_platform == 'darwin'" },
@@ -948,8 +948,8 @@ requires-dist = [
     { name = "click", specifier = ">=8.2" },
     { name = "cryptography", marker = "python_full_version >= '3.13'", specifier = ">=50.0.1,<51" },
     { name = "exp-gateway-native", directory = "exp/runtime/gateway/native" },
-    { name = "exp-mitmproxy", marker = "python_full_version >= '3.13'", git = "https://github.com/experientiallabs/mitmproxy?rev=3863dc9dc0c09f9eb655614c4b9b63e5570a39e3" },
-    { name = "exp-mitmproxy-rs", marker = "python_full_version >= '3.13'", git = "https://github.com/experientiallabs/mitmproxy_rs?subdirectory=mitmproxy-rs&rev=866da0a0aff1a8e57def4da6a941fca0c44dd98d" },
+    { name = "exp-mitmproxy", marker = "python_full_version >= '3.13'", git = "https://gitlab.com/experiential-labs-group/mitmproxy.git?rev=95b902a8ffb0b02da8a8888d6cb86f0fa9255e5b" },
+    { name = "exp-mitmproxy-rs", marker = "python_full_version >= '3.13'", git = "https://gitlab.com/experiential-labs-group/mitmproxy_rs.git?subdirectory=mitmproxy-rs&rev=866da0a0aff1a8e57def4da6a941fca0c44dd98d" },
     { name = "experiential", extras = ["sft"], marker = "extra == 'dev'" },
     { name = "filelock", specifier = ">=3.12" },
     { name = "google-auth", specifier = ">=2.35,<3" },
