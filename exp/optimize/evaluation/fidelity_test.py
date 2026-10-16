@@ -360,6 +360,7 @@ def test_predictions_references_and_completed_replay(
             "--fidelity",
             str(spec_path),
             "--non-interactive",
+            "--verbose",
         ],
     )
     assert replay.exit_code == 0, replay.output

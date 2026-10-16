@@ -28,6 +28,7 @@ from exp.simulation.world_model.artifact import (
     PersistedGroundedWorldModel,
     persist_grounded_world_model,
 )
+from exp.simulation.world_model.observed_tools import observed_calls, observed_tool_schemas
 
 
 @dataclass(frozen=True)
@@ -145,31 +146,16 @@ def construct_world_model(
         prior_context=transfer_context,
     )
 
-    def guided(body: JsonObject, operation_id: str) -> JsonObject:
-        """Apply only the registered constructor text, preserving its exact output schema."""
-        messages = body.get("messages")
-        if not isinstance(messages, list):
-            raise ValueError("constructor request requires explicit messages")
-        if construction_guidance:
-            body = {
-                **body,
-                "messages": [
-                    messages[0],
-                    {"role": "developer", "content": construction_guidance},
-                    *messages[1:],
-                ],
-            }
-        return complete(body, operation_id)
-
     bundle = reconstruct(
         raw,
         citation_protocol=citation_protocol,
         artifacts=store,
         run_id=run_id,
-        complete=guided,
+        complete=complete,
         clock=clock,
         deadline=deadline,
         code_revision=code_revision,
+        guidance=construction_guidance,
     )
     knowledge = SimulationKnowledge(
         source_trace_ids=ids,
@@ -252,28 +238,9 @@ def ground_world_model_from_traces(
         Current-instance initialization remains the caller's explicit information treatment.
     """
     rag = _verified_trace_index(store, serving_rag, traces)
-    arguments: dict[str, set[str]] = {}
-    for transition in rag.transitions:
-        action = transition.action
-        if action.kind != "tool_call" or action.tool_name is None:
-            continue
-        if not isinstance(action.tool_arguments, dict):
-            raise ValueError("Observed tool arguments must be JSON objects for tool simulation")
-        arguments.setdefault(action.tool_name, set()).update(action.tool_arguments)
-    if not arguments:
+    tools = observed_tool_schemas(observed_calls(rag.transitions))
+    if not tools:
         raise ValueError("No observed tool calls; provide source episodes with tool results")
-    tools = tuple(
-        ToolSchema(
-            name=name,
-            description="Observed signature only; requirements and behavior are unspecified.",
-            input_schema={
-                "type": "object",
-                "properties": {key: {} for key in sorted(keys)},
-                "additionalProperties": True,
-            },
-        )
-        for name, keys in sorted(arguments.items())
-    )
     knowledge = SimulationKnowledge(
         source_trace_ids=tuple(trace.trace_id for trace in traces),
         contracts={

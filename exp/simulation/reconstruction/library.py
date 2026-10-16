@@ -41,6 +41,10 @@ class LibraryEntry(ContractModel):
         disposition: Source observation, development-accepted revision or unaccepted attempt.
         cues: Indexable descriptions; matching them does not establish transfer correctness.
         supersedes: Earlier entry replaced by an accepted child; old evidence remains retained.
+        derived_from: Source trajectory artifact this entry was produced from. Eligibility
+            decisions use this typed reference, never ``cues``; absent means unknown provenance.
+        depends_on: Other source trajectories whose memory was supplied to the work that
+            produced this entry. Eligibility requires every one of them.
     """
 
     entry_id: str = Field(min_length=1)
@@ -51,6 +55,8 @@ class LibraryEntry(ContractModel):
     disposition: Literal["source", "accepted", "rejected", "unresolved"]
     cues: tuple[str, ...] = ()
     supersedes: str | None = None
+    derived_from: ArtifactInput | None = Field(default=None, exclude_if=lambda value: value is None)
+    depends_on: tuple[ArtifactInput, ...] = Field(default=(), exclude_if=lambda value: not value)
 
     @model_validator(mode="after")
     def authority(self) -> LibraryEntry:

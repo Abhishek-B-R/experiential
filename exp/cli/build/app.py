@@ -160,6 +160,25 @@ def build(
         help="Require complete model flags and never ask setup or cost questions.",
     ),
     provider: list[str] | None = _PROVIDER_OPTION,
+    learn: bool = typer.Option(
+        False,
+        "--learn",
+        help="Then learn simulator memory trace by trace from fit traces (provider calls).",
+    ),
+    memory_recall: str | None = typer.Option(
+        None, "--memory-recall", help="Native decision alias recalling memory while learning."
+    ),
+    maximum_learning_attempts: int | None = typer.Option(
+        None,
+        "--max-learning-attempts",
+        min=1,
+        help="Physical-attempt budget for learning, retries included.",
+    ),
+    retry_incomplete: bool = typer.Option(
+        False,
+        "--retry-incomplete",
+        help="With --learn, buy again the calls of a trace that stopped incomplete.",
+    ),
 ) -> None:
     """Build a reusable grounded world model and immutable fit evidence.
 
@@ -187,10 +206,22 @@ def build(
         dry_run: Print the complete preflight and stop before credentials or selection.
         no_interactive: Disable inline setup and cost questions even at a terminal.
         provider: Repeatable provider names that skip the opening list during setup.
+        learn: After the build, run the sequential learning pass over fit traces.
+        memory_recall: Native decision alias for memory recall; required with ``--learn``.
+        retry_incomplete: With ``--learn``, replace an interrupted trace, buying it again.
+        maximum_learning_attempts: Learning's physical-attempt budget; omitted allows every
+            trace's full ceiling.
 
     Raises:
         typer.BadParameter: Input, setup, role, cost, project, or artifact validation fails.
     """
+    if learn != (memory_recall is not None) or (
+        (maximum_learning_attempts is not None or retry_incomplete) and not learn
+    ):
+        raise typer.BadParameter(
+            "--learn requires --memory-recall ALIAS; --memory-recall, "
+            "--max-learning-attempts and --retry-incomplete apply only with --learn"
+        )
     if legacy_trace_file is not None:
         if trace_file is not None:
             raise typer.BadParameter("provide traces once, using -t/--traces or the trace path")
@@ -206,6 +237,8 @@ def build(
     elif identity is not None:
         raise typer.BadParameter("--identity requires --source gateway")
     if trace_file is None and import_id is None:
+        if learn:
+            raise typer.BadParameter("--learn requires -t/--traces PATH or --import-id ID")
         if dry_run or no_interactive or not can_prompt(_console):
             raise typer.BadParameter(
                 "automation and dry runs require -t/--traces PATH or --import-id ID; bare "
@@ -403,6 +436,25 @@ def build(
         duration_seconds=time.monotonic() - started,
     )
     _render_completed_build(completed, project=project)
+    if learn:
+        assert memory_recall is not None
+        # Learning loads the fidelity lifecycle; defer it to dispatch so `exp --help` and
+        # plain builds stay free of optimization machinery (startup-isolation gate).
+        from exp.cli.build.learning import run_learning
+
+        with usage_error(ArtifactStoreError, ModelCatalogError, ProjectStoreError, ValueError):
+            run_learning(
+                _console,
+                store,
+                project=project,
+                root=root,
+                recall_alias=memory_recall,
+                maximum_attempts=maximum_learning_attempts,
+                yes=yes,
+                non_interactive=no_interactive,
+                code_revision=code_revision,
+                retry_incomplete=retry_incomplete,
+            )
 
 
 def _load_or_setup_catalog(

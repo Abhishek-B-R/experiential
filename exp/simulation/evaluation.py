@@ -18,6 +18,7 @@ from exp.common.evaluations.reconstruction import (
 )
 from exp.common.models import ToolCall
 from exp.common.models.client import RequestCapacityExceeded
+from exp.common.progress import ProgressHook, report
 from exp.common.project import ArtifactStore
 from exp.runtime.models.budget import SpendLimitReached
 from exp.simulation.engines.transition import Completion
@@ -50,11 +51,14 @@ def evaluate_workflow(
     code_revision: str,
     evaluation_id: ArtifactId | None = None,
     reply_feedback_source: str | None = None,
+    progress: ProgressHook | None = None,
 ) -> DualReport:
     """Run without native rescue; retain blocked slots and a separate receipt identity.
 
     Matched parent/child evaluations share a public workload ID but must use distinct
-    evaluation IDs for their immutable request and result artifacts.
+    evaluation IDs for their immutable request and result artifacts. ``progress`` observes
+    each simulated turn as an exact completed/total count; after a hard stop it reports
+    the turns actually simulated, qualified as stopped, never the blocked remainder.
     """
     if session.transitions:
         raise ValueError("a scored workflow requires a fresh initialized session")
@@ -82,6 +86,8 @@ def evaluate_workflow(
     feedback_receipts: list[JsonObject] = []
     feedback_error: str | None = None
     for index, action in enumerate(workload.actions):
+        if not stopped:
+            report(progress, "Simulating turns", completed=index, total=len(workload.actions))
         before = session.state
         if stopped:
             steps.append(WorkflowStep(step=index, action=actions[index], status="blocked"))
@@ -139,6 +145,14 @@ def evaluate_workflow(
                 except Exception as error:  # noqa: BLE001 - failed adaptation blocks future slots.
                     feedback_error = type(error).__name__
                     stopped = True
+    simulated = sum(step.status != "blocked" for step in steps)
+    report(
+        progress,
+        "Simulating turns",
+        completed=simulated,
+        total=len(workload.actions),
+        detail="stopped" if simulated < len(workload.actions) else None,
+    )
     context = session.evaluation_context
     if reply_feedback_source is not None:
         sources = context.get("sources", {})

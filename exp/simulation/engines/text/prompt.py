@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from typing import Literal
 
 from pydantic import Field, JsonValue, ValidationError
 
@@ -139,6 +140,36 @@ class TextWorldModelProtocolError(ValueError):
     """The world model did not return the pinned text-transition JSON contract."""
 
 
+MEMORY_CONTEXT_GUIDANCE = """
+Cross-trajectory memory, when present, keeps the same separation:
+memory_observations are original native replies observed in other, completed instances;
+they belong to the historical-observation channel. research_history.session holds this
+instance's post-prediction feedback and provisional investigations. research_history.
+prior_trajectories holds unresolved hypotheses from earlier trajectories, and
+research_history.memory_overview is the whole memory at reduced resolution, oldest first,
+with older blocks as model-written summaries. None of these describe this instance's current
+state, and hypotheses are not verified rules. Propose any resulting state change through the
+normal transition protocol; never claim an automatic state correction occurred.
+"""
+
+
+class MemoryContext(ContractModel):
+    """Cross-trajectory memory for one prediction, already selected and split by authority.
+
+    Attributes:
+        observations: Original native observations from other completed instances. Rendered
+            in the historical-observation channel as ``memory_observations``.
+        session: This instance's disclosed feedback and provisional investigations.
+        prior_trajectories: Unresolved hypotheses produced by earlier trajectories.
+        overview: Budgeted memory overview of log lines and model-written summaries.
+    """
+
+    observations: tuple[JsonObject, ...] = ()
+    session: tuple[JsonObject, ...] = ()
+    prior_trajectories: tuple[JsonObject, ...] = ()
+    overview: tuple[JsonObject, ...] = ()
+
+
 def build_world_model_request(
     task: TaskCase,
     *,
@@ -148,6 +179,8 @@ def build_world_model_request(
     maximum_output_tokens: int,
     state: JsonObject | None = None,
     knowledge: SimulationKnowledge | None = None,
+    memory: MemoryContext | None = None,
+    output_protocol: Literal["text", "json-tool"] = "text",
 ) -> ModelRequest:
     """Frame a simulated environment transition without enabling provider tools.
 
@@ -159,6 +192,8 @@ def build_world_model_request(
         maximum_output_tokens: Explicit non-truncating provider output budget.
         state: Private environment state from the previous world-model turn.
         knowledge: Frozen behavioral and investigation context, empty for the baseline.
+        memory: Cross-trajectory memory, rendered into the declared authority channels.
+        output_protocol: Text transition or typed-proposal system instructions.
 
     Returns:
         A text-only provider request with the pinned prompt and no candidate hidden state.
@@ -203,6 +238,18 @@ def build_world_model_request(
         evidence["behavioral_knowledge"] = knowledge.behavioral_context()
         evidence["library_originals"] = knowledge.original_library_evidence()
         evidence["research_history"] = knowledge.research_context()
+    if output_protocol == "json-tool":
+        system_prompt = RECONSTRUCTED_JSON_TOOL_SYSTEM_PROMPT
+    if memory is not None:
+        system_prompt += MEMORY_CONTEXT_GUIDANCE
+        evidence["memory_observations"] = list(memory.observations)
+        research = evidence.get("research_history")
+        evidence["research_history"] = {
+            **(research if isinstance(research, dict) else {}),
+            "session": list(memory.session),
+            "prior_trajectories": list(memory.prior_trajectories),
+            "memory_overview": list(memory.overview),
+        }
     return ModelRequest(
         messages=(
             ModelMessage(role="system", content=system_prompt),

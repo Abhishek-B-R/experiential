@@ -18,7 +18,11 @@ from exp.common.models import (
 )
 from exp.common.project import ProjectConfig, ProjectStore
 from exp.runtime.models.budget import RequestBudget
-from exp.runtime.models.structured_completion import CompletionPlan, StructuredCompletion
+from exp.runtime.models.structured_completion import (
+    CompletionPlan,
+    ReturnedOutputRejected,
+    StructuredCompletion,
+)
 
 
 class _Client:
@@ -172,5 +176,6 @@ def test_named_tool_output_uses_actual_schema_and_validates_response(tmp_path: P
     )
     from jsonschema import ValidationError
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(ReturnedOutputRejected) as refused:
         complete(body, "tool-invalid")
+    assert isinstance(refused.value.__cause__, ValidationError)

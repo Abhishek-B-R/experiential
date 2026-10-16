@@ -72,6 +72,8 @@ def test_next_turn_and_restart_preserve_feedback_without_state_rescue(
         "scope": "current entry after call-0",
         "uncertainty": "One read does not establish all entries or their update rules",
         "supersedes": [],
+        "transferable": True,
+        "observable_cue": "the same tool and arguments",
     }
     axes = {
         dimension.dimension_id: {
@@ -223,6 +225,8 @@ def test_failed_investigation_retains_wrong_step_and_blocks_unqualified_suffix(
                     "scope": "Current entry",
                     "uncertainty": "Only one read observed",
                     "supersedes": ["nonexistent-investigation"],
+                    "transferable": True,
+                    "observable_cue": "the same tool and arguments",
                 }
             ),
             structured_reply({"axes": {}}),

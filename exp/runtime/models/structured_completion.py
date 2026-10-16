@@ -36,6 +36,21 @@ from exp.runtime.models.budget import RequestBudget
 _JSON_OBJECT = TypeAdapter(JsonObject)
 
 
+class CompletionNotDispatched(TimeoutError):
+    """The completion was refused before any provider request was sent.
+
+    Nothing was purchased, so a caller may close the attempt and try again later.
+    """
+
+
+class ReturnedOutputRejected(ValueError):
+    """A provider response returned and was retained, but its output was refused.
+
+    Raised only after the client returned, so callers may treat the attempt as closed and
+    explain the refusal on a new attempt. Any other error leaves the purchase unresolved.
+    """
+
+
 class CompletionPlan(ContractModel):
     """Frozen limits for structured calls over one registered client.
 
@@ -106,19 +121,31 @@ class StructuredCompletion:
         """
         request, schema = self._prepare(body)
         response = self.complete_request(request, logical_id)
+        try:
+            return self._accept(response, schema)
+        except ReturnedOutputRejected:
+            raise
+        except Exception as error:  # noqa: BLE001 - only output checks run after return.
+            raise ReturnedOutputRejected(f"{type(error).__name__}: {error}") from error
+
+    def _accept(self, response: ModelResponse, schema: JsonObject | None) -> JsonObject:
+        """Check returned output; every failure here concerns a retained response."""
+        from jsonschema import Draft202012Validator
+
         if response.finish_reason != ModelFinishReason.COMPLETED:
-            raise ValueError("structured proposal did not complete; raw response retained")
+            raise ReturnedOutputRejected(
+                "structured proposal did not complete; raw response retained"
+            )
         if self.plan.output_protocol == "tool":
             calls = response.output.tool_calls
             if len(calls) != 1 or calls[0].name != "submit_proposal":
-                raise ValueError("Expected exactly one named structured proposal")
-            from jsonschema import Draft202012Validator
-
-            assert isinstance(schema, dict)
+                raise ReturnedOutputRejected("Expected exactly one named structured proposal")
+            if not isinstance(schema, dict):
+                raise ValueError("named-tool output requires a response schema")
             Draft202012Validator(schema).validate(calls[0].arguments)
             return copy.deepcopy(calls[0].arguments)
         if response.output.tool_calls:
-            raise ValueError("structured proposals cannot execute provider tools")
+            raise ReturnedOutputRejected("structured proposals cannot execute provider tools")
         return _JSON_OBJECT.validate_python(
             json.loads(
                 response.output.content or "",
@@ -198,7 +225,7 @@ class StructuredCompletion:
         if caps.maximum_output_tokens is not None and requested_output > caps.maximum_output_tokens:
             raise RequestCapacityExceeded("output reservation exceeds the declared route capacity")
         if self._clock() >= self.plan.deadline:
-            raise TimeoutError("completion deadline reached before dispatch")
+            raise CompletionNotDispatched("completion deadline reached before dispatch")
 
     def complete_request(self, request: ModelRequest, logical_id: str) -> ModelResponse:
         """Retain and meter a typed request, including actor tool calls, through one owner.

@@ -1,7 +1,6 @@
 """Prepare and execute simulation fidelity through existing durable runtime owners."""
 
-import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -17,10 +16,23 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.evaluations.reconstruction import DualReport, EvaluationReferences, JudgeConfig
-from exp.common.models import load_model_catalog
+from exp.common.models import ModelCapabilities, ModelCatalog, load_model_catalog
+from exp.common.models.model import ReasoningEffort
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
+from exp.optimize.evaluation.decision_access import decision_caller
+from exp.optimize.evaluation.fidelity_memory import (
+    check_partition,
+    consume_trajectory,
+    maintain_memory,
+    trajectory_record,
+)
+from exp.optimize.evaluation.retrieval_binding import (
+    bind_index_embedder,
+    index_embedder_alias,
+    require_unindexed_held_out_task,
+)
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.budget import RequestBudget
@@ -37,16 +49,28 @@ from exp.runtime.sessions.store import SessionStore
 from exp.simulation.evaluation import FixedWorkflow, evaluate_workflow
 from exp.simulation.retrieval.jev import JEVCueSelector, JEVPolicy, JEVSelector
 from exp.simulation.retrieval.selection import EvidencePolicy
+from exp.simulation.world_model.artifact import GroundedWorldModelArtifact
 from exp.simulation.world_model.durable import SessionPolicy
 from exp.simulation.world_model.experience_memory import (
+    Eligibility,
     MemoryVersion,
+    load_source,
+    materialize_log,
     memory_head,
-    memory_records,
-    publish_trajectory,
+    memory_view,
+    provenance_gaps,
+    public_trajectory_identity,
     read_memory_version,
     require_memory_scope,
+    reserve_task_lineage,
+    reserved_task_lineages,
+    summary_generations,
 )
 from exp.simulation.world_model.grounded_session import open_grounded_session
+from exp.simulation.world_model.memory_tree import (
+    overview,
+    overview_sources,
+)
 from exp.simulation.world_model.runtime import (
     load_grounded_world_model,
     load_grounded_world_model_artifact,
@@ -68,6 +92,33 @@ class FidelityRetrieval(ContractModel):
     memory_top_k: int = Field(default=4, gt=0, strict=True)
 
 
+class RoleBudget(ContractModel):
+    """Output allowance and optional reasoning configuration for one model role.
+
+    Attributes:
+        output_tokens: Output reservation for every call in this role.
+        reasoning_effort: Effort for this role; accepted only for models whose capabilities
+            pin a reasoning effort, the same rule catalog role efforts follow.
+    """
+
+    output_tokens: int = Field(gt=0, strict=True)
+    reasoning_effort: ReasoningEffort | None = None
+
+
+class RoleBudgets(ContractModel):
+    """Separate allowances for each model role; attempts and deadline remain shared.
+
+    Attributes:
+        prediction: Simulator transition proposals.
+        investigation: Post-feedback investigations and memory compression.
+        judging: The required LLM judge.
+    """
+
+    prediction: RoleBudget
+    investigation: RoleBudget
+    judging: RoleBudget
+
+
 class FidelityMemory(ContractModel):
     """Cross-trajectory memory: learn from this trajectory, or evaluate a frozen checkpoint.
 
@@ -76,17 +127,27 @@ class FidelityMemory(ContractModel):
         mode: ``learn`` pins the current head and publishes the next version after a
             completed trajectory; ``frozen`` reads an exact checkpoint and never publishes.
         checkpoint: Exact frozen version; absent in learning mode.
+        reserved: Frozen evaluation that declares this task lineage reserved: it is refused if
+            the lineage already consumed the task lineage, and later learning of it is refused.
+            Without it a frozen run is a diagnostic and relies on same-trajectory withholding.
+        overview_lines: Line budget of the memory overview delivered with every prediction.
+        maximum_compressions: Compression calls a learning run may buy after publication.
     """
 
     lineage: str = Field(pattern=r"^[a-z][a-z0-9-]{0,63}$")
     mode: Literal["learn", "frozen"]
     checkpoint: int | None = Field(default=None, ge=1, strict=True)
+    reserved: bool = Field(default=False, strict=True, exclude_if=lambda value: not value)
+    overview_lines: int = Field(default=32, ge=1, strict=True)
+    maximum_compressions: int = Field(default=16, ge=0, strict=True)
 
     @model_validator(mode="after")
     def checkpoint_mode(self) -> "FidelityMemory":
         """Reserved evaluation names its checkpoint; learning always follows the head."""
         if (self.mode == "frozen") != (self.checkpoint is not None):
             raise ValueError("frozen memory requires a checkpoint; learning uses the head")
+        if self.reserved and self.mode != "frozen":
+            raise ValueError("only frozen evaluation can declare a reserved task lineage")
         return self
 
 
@@ -110,6 +171,10 @@ class FidelitySpec(ContractModel):
         online_research: Optional declared per-step reply feedback; absent freezes knowledge.
         retrieval: Native JEV selection for originals and memory, resolved from the catalog.
         memory: Cross-trajectory memory lineage and its learning or frozen mode.
+        roles: Per-role output and reasoning budgets; absent, every role uses
+            ``maximum_output_tokens`` and the catalog's reasoning configuration.
+        proposal_reasks: Times a refused simulator proposal is asked again with the refusal
+            reason, within the same turn; refused output is never repaired.
     """
 
     run_id: str = Field(pattern=r"^[a-z][a-z0-9-]{0,79}$")
@@ -132,6 +197,8 @@ class FidelitySpec(ContractModel):
         default=None, exclude_if=lambda value: value is None
     )
     memory: FidelityMemory | None = Field(default=None, exclude_if=lambda value: value is None)
+    roles: RoleBudgets | None = Field(default=None, exclude_if=lambda value: value is None)
+    proposal_reasks: int = Field(default=0, ge=0, le=3, strict=True, exclude_if=lambda v: not v)
 
     @model_validator(mode="after")
     def separate_references(self) -> "FidelitySpec":
@@ -169,6 +236,12 @@ class FidelitySpec(ContractModel):
             raise ValueError("online research must register the spec's JEV memory selector")
         return self
 
+    def budget(self, role: Literal["prediction", "investigation", "judging"]) -> RoleBudget:
+        """The registered budget for one role, or the shared legacy allowance."""
+        if self.roles is None:
+            return RoleBudget(output_tokens=self.maximum_output_tokens)
+        return getattr(self.roles, role)
+
     @property
     def memory_selection_identity(self) -> str | None:
         """Identity of the JEV memory selector this spec constructs, without a provider."""
@@ -199,12 +272,15 @@ class PreparedFidelity(ContractModel):
         spec: Complete frozen evaluation inputs and limits.
         catalog_sha256: Model configuration identity; credential references stay local.
         code_revision: Installed producer identity.
+        embedder_alias: Configured alias embedding retrieval queries for a semantic index;
+            absent for the local hashing index.
     """
 
     id: str
     spec: FidelitySpec
     catalog_sha256: str
     code_revision: str
+    embedder_alias: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 def prepare_fidelity_evaluation(
@@ -228,6 +304,10 @@ def prepare_fidelity_evaluation(
         )
         if saved.spec != spec:
             raise ValueError("fidelity run inputs changed; use the saved spec or a new run ID")
+        if spec.memory is not None and spec.memory.reserved:
+            artifact = load_grounded_world_model_artifact(project.artifacts, spec.world_model)
+            _validate_memory(project, spec, artifact)
+            _establish_reservation(project, spec, code_revision)
         return saved
     manifest = project.artifacts.read(spec.world_model.artifact_id).manifest
     if artifact_input(manifest) != spec.world_model:
@@ -235,8 +315,14 @@ def prepare_fidelity_evaluation(
     artifact = load_grounded_world_model_artifact(project.artifacts, spec.world_model)
     catalog = load_model_catalog(project.model_catalog_path)
     registry = RuntimeModelCatalog(catalog)
-    predictor, _ = registry.snapshot(artifact.model_alias)
+    predictor, predictor_caps = registry.snapshot(artifact.model_alias)
     judge_model, judge_caps = registry.snapshot(spec.judge_alias)
+    for role, caps in (
+        ("prediction", predictor_caps),
+        ("investigation", predictor_caps),
+        ("judging", judge_caps),
+    ):
+        _check_budget(role, spec.budget(role), caps)
     if predictor != artifact.model:
         raise ValueError("configured predictor differs from the simulation; bind a new artifact")
     if spec.judge.model_identity != judge_model.model_id or judge_caps.supports_tools is not True:
@@ -252,19 +338,14 @@ def prepare_fidelity_evaluation(
         record = catalog.models.get(spec.retrieval.jev_alias)
         if record is None or catalog.connections[record.connection].provider != "typesafe":
             raise ValueError("JEV retrieval requires a configured native decision-model alias")
-    if spec.memory is not None and spec.memory.mode == "frozen":
-        assert spec.memory.checkpoint is not None
-        frozen = read_memory_version(project.artifacts, spec.memory.lineage, spec.memory.checkpoint)
-        require_memory_scope(
-            frozen,
-            world_model=spec.world_model,
-            selection_policy_sha256=str(spec.memory_selection_identity),
-        )
+    _validate_memory(project, spec, artifact)
+    require_unindexed_held_out_task(project, artifact, spec.task)
     prepared = PreparedFidelity(
         id=plan_id,
         spec=spec,
         catalog_sha256=sha256_json(catalog.model_dump(mode="json")),
         code_revision=code_revision,
+        embedder_alias=index_embedder_alias(project, catalog, artifact),
     )
     project.artifacts.write_json(
         artifact_id=plan_id,
@@ -277,7 +358,41 @@ def prepare_fidelity_evaluation(
         ),
         files={"plan.json": prepared.model_dump(mode="json")},
     )
+    _establish_reservation(project, spec, code_revision)
     return prepared
+
+
+def _validate_memory(
+    project: ProjectStore, spec: FidelitySpec, artifact: GroundedWorldModelArtifact
+) -> None:
+    """Check partition, checkpoint and knowledge before anything is written."""
+    if spec.memory is None:
+        return
+    check_partition(project, spec)
+    pinned = (
+        memory_head(project.artifacts, spec.memory.lineage)
+        if spec.memory.checkpoint is None
+        else read_memory_version(project.artifacts, spec.memory.lineage, spec.memory.checkpoint)
+    )
+    require_memory_scope(
+        pinned,
+        world_model=spec.world_model,
+        artifact=artifact,
+        selection_policy_sha256=str(spec.memory_selection_identity),
+    )
+
+
+def _establish_reservation(project: ProjectStore, spec: FidelitySpec, code_revision: str) -> None:
+    """Register a declared held-out panel only after validation, under the lineage lock."""
+    if spec.memory is None or not spec.memory.reserved:
+        return
+    reserve_task_lineage(
+        project.artifacts,
+        spec.memory.lineage,
+        spec.task.lineage_group_id,
+        created_at=datetime.now(UTC),
+        code_revision=code_revision,
+    )
 
 
 def saved_fidelity_report(project: ProjectStore, prepared: PreparedFidelity) -> DualReport | None:
@@ -322,11 +437,12 @@ def execute_fidelity_evaluation(
         intent = prepared.id + "-execution"
         if previous is not None:
             report(progress, "Saved fidelity result")
-            _consume_trajectory(project, prepared, now())
+            consume_trajectory(project, prepared, now())
             return previous
         if project.artifacts.exists(intent):
             raise ValueError(
-                "incomplete fidelity run; inspect saved operations before new dispatch"
+                "incomplete fidelity run; inspect saved operations before new dispatch "
+                "(a derived held-out or learning run is bought again only with --retry-incomplete)"
             )
         spec = prepared.spec
         if spec.retrieval is not None and research_selection is not None:
@@ -364,25 +480,31 @@ def execute_fidelity_evaluation(
             raise ValueError("model configuration changed; prepare a new fidelity run")
         registry = RuntimeModelCatalog(catalog, transport_factory=lambda: transport)
         artifact = load_grounded_world_model_artifact(project.artifacts, spec.world_model)
-        predictor = registry.resolve(artifact.model_alias)
-        judge_model = registry.resolve(spec.judge_alias)
+        predictor = role_model(registry, catalog, artifact.model_alias, spec, "prediction")
         budget = RequestBudget(project, identity=identity, maximum_cost_usd=None)
         originals: JEVSelector | None = None
         prior: MemoryVersion | None = None
         prior_identity: JsonObject | None = None
+        prior_records: dict[str, JsonObject] = {}
+        prior_overview: list[JsonObject] = []
+        overview_refs: tuple[ArtifactInput, ...] = ()
+        prior_sources: dict[str, tuple[ArtifactInput, ...]] = {}
+        overview_view: Callable[[frozenset[str]], list[JsonObject]] | None = None
+        overview_sources_of: Callable[[Sequence[JsonObject]], Sequence[ArtifactInput]] | None = None
         if spec.retrieval is not None:
-            decide = _decision_caller(
+            decide = decision_caller(
                 registry.resolve(spec.retrieval.jev_alias), transport, spec.deadline, now
             )
             record = _receipt_recorder(project, prepared, now)
             if artifact.selection_policy_sha256 is not None:
                 originals = JEVSelector(policy=spec.retrieval.jev, decide=decide, record=record)
-            research_selection = JEVCueSelector(
-                policy=spec.retrieval.jev,
-                top_k=spec.retrieval.memory_top_k,
-                decide=decide,
-                record=record,
-            )
+            if spec.memory is not None or spec.online_research is not None:
+                research_selection = JEVCueSelector(
+                    policy=spec.retrieval.jev,
+                    top_k=spec.retrieval.memory_top_k,
+                    decide=decide,
+                    record=record,
+                )
         if spec.memory is not None:
             prior = (
                 memory_head(project.artifacts, spec.memory.lineage)
@@ -394,17 +516,85 @@ def execute_fidelity_evaluation(
             require_memory_scope(
                 prior,
                 world_model=spec.world_model,
+                artifact=artifact,
                 selection_policy_sha256=str(spec.memory_selection_identity),
             )
+            materialize_log(project.artifacts, prior)
+            check_partition(project, spec)
+            if spec.memory.reserved:
+                reserve_task_lineage(
+                    project.artifacts,
+                    spec.memory.lineage,
+                    spec.task.lineage_group_id,
+                    created_at=now(),
+                    code_revision=prepared.code_revision,
+                )
+            rule = Eligibility(
+                exclude_public=public_trajectory_identity(trajectory_record(spec)),
+                reserved_task_lineages=reserved_task_lineages(
+                    project.artifacts, spec.memory.lineage
+                ),
+                strict=spec.memory.reserved,
+            )
+            view = memory_view(project.artifacts, prior, rule)
+            prior_records, withheld = view.records, view.withheld
+            total = 0 if prior is None else prior.log_length or 0
+            sources: dict[ArtifactInput, bool] = {}
+
+            def admits(reference: ArtifactInput) -> bool:
+                """One cached eligibility decision per typed source reference."""
+                if reference not in sources:
+                    sources[reference] = rule.admits(load_source(project.artifacts, reference))
+                return sources[reference]
+
+            lineage, rows = spec.memory.lineage, spec.memory.overview_lines
+            generations = summary_generations(prior)
+
+            def render(extra_retired: frozenset[str]) -> list[JsonObject]:
+                """Serving overview: admissible lines, minus every retired hypothesis."""
+                retired = set(view.retired) | extra_retired
+                return overview(
+                    project.artifacts,
+                    lineage,
+                    total,
+                    rows,
+                    admits=admits,
+                    admits_line=lambda line: line.origin not in retired,
+                    generations=generations,
+                )
+
+            prior_overview = render(frozenset())
+            overview_refs = overview_sources(
+                project.artifacts, lineage, prior_overview, generations
+            )
+            prior_sources, overview_view = view.sources, render
+
+            def sources_of(delivered: Sequence[JsonObject]) -> Sequence[ArtifactInput]:
+                """Sources behind exactly the overview rows a prediction received."""
+                return overview_sources(project.artifacts, lineage, delivered, generations)
+
+            overview_sources_of = sources_of
             prior_identity = {
                 "lineage": spec.memory.lineage,
                 "mode": spec.memory.mode,
+                "reserved": spec.memory.reserved,
                 "version": 0 if prior is None else prior.version,
                 "consumed_trajectories": 0 if prior is None else len(prior.consumed),
                 "library": None if prior is None else prior.library.model_dump(mode="json"),
+                "withheld_same_trajectory": withheld,
+                "log_length": total,
+                "excluded_sources": sorted(r.artifact_id for r, ok in sources.items() if not ok),
+                "unknown_provenance": provenance_gaps(project.artifacts, prior),
+                "retired": view.retired,
+                "overview_sha256": sha256_json(prior_overview),
             }
 
-        def completion(resolved: ResolvedModel, *, structured: bool) -> StructuredCompletion:
+        def completion(
+            resolved: ResolvedModel,
+            *,
+            structured: bool,
+            role: Literal["prediction", "investigation", "judging"],
+        ) -> StructuredCompletion:
             """Share provider resolution, physical admission and logical accounting."""
             return StructuredCompletion(
                 client=resolved.client,
@@ -412,7 +602,7 @@ def execute_fidelity_evaluation(
                     model=resolved.snapshot,
                     capabilities=resolved.capabilities,
                     deadline=spec.deadline,
-                    output_tokens=spec.maximum_output_tokens,
+                    output_tokens=spec.budget(role).output_tokens,
                     maximum_cost_per_call=spec.request_reservation_usd,
                     code_revision=prepared.code_revision,
                     output_protocol="tool" if structured else "json",
@@ -422,13 +612,21 @@ def execute_fidelity_evaluation(
                 clock=now,
             )
 
-        prediction = completion(predictor, structured=False)
-        judging = completion(judge_model, structured=True)
+        prediction = completion(predictor, structured=False, role="prediction")
+        investigating = role_model(registry, catalog, artifact.model_alias, spec, "investigation")
+        judging = completion(
+            role_model(registry, catalog, spec.judge_alias, spec, "judging"),
+            structured=True,
+            role="judging",
+        )
         runtime = load_grounded_world_model(
             project.artifacts,
             spec.world_model.artifact_id,
             client=predictor.client,
             capabilities=predictor.capabilities,
+            embedder=bind_index_embedder(
+                registry, prepared.embedder_alias, artifact, project, budget
+            ),
             evidence_selector=originals,
         )
         project.artifacts.write_json(
@@ -447,7 +645,7 @@ def execute_fidelity_evaluation(
                 }
             },
         )
-        report(progress, "Predicting supplied actions")
+        report(progress, "Loading simulator and memory")
         session = open_grounded_session(
             runtime=runtime,
             task=spec.task,
@@ -457,29 +655,33 @@ def execute_fidelity_evaluation(
             policy=SessionPolicy(
                 deadline=spec.deadline,
                 maximum_operations=len(spec.workload.actions),
+                maximum_reasks=spec.proposal_reasks,
                 inference_identity=identity,
                 code_revision=prepared.code_revision,
             ),
             complete=ModelCompletion(prediction),
             lock_path=directory / (prepared.id + "-session.lock"),
-            maximum_output_tokens=spec.maximum_output_tokens,
+            maximum_output_tokens=spec.budget("prediction").output_tokens,
             json_object_output=spec.json_object_output,
             output_protocol=spec.output_protocol,
             research_policy=spec.online_research,
             research_selection=research_selection,
-            research_complete=completion(predictor, structured=True)
+            research_complete=completion(investigating, structured=True, role="investigation")
             if spec.online_research is not None
             else None,
-            research_prior=memory_records(project.artifacts, prior)
-            if prior_identity is not None
-            else None,
+            research_prior=prior_records if prior_identity is not None else None,
+            research_overview=prior_overview,
+            research_prior_sources=prior_sources,
+            research_overview_sources=overview_refs,
+            research_overview_view=overview_view,
+            research_overview_sources_of=overview_sources_of,
             research_prior_identity=prior_identity,
             clock=now,
         )
 
         def judge_call(body: JsonObject, logical_id: str) -> JsonObject:
             """Expose the real judging stage without adding a retry or scoring loop."""
-            report(progress, "Judging simulation fidelity")
+            report(progress, "Judging")
             return judging(body, logical_id)
 
         result = evaluate_workflow(
@@ -495,132 +697,61 @@ def execute_fidelity_evaluation(
             reply_feedback_source=spec.online_research.feedback_source
             if spec.online_research is not None
             else None,
+            progress=progress,
         )
-        _consume_trajectory(project, prepared, now())
-        report(progress, "Fidelity evaluation completed")
+        learning = spec.memory is not None and spec.memory.mode == "learn"
+        if learning:
+            report(progress, "Publishing memory")
+        consume_trajectory(project, prepared, now())
+        if learning:
+            report(progress, "Compressing memory")
+            maintain_memory(
+                project,
+                prepared,
+                completion(investigating, structured=True, role="investigation"),
+                now(),
+            )
         return result
 
 
-def saved_memory_receipt(project: ProjectStore, prepared: PreparedFidelity) -> JsonObject | None:
-    """Read the memory version a completed learning trajectory produced, if any."""
-    identity = prepared.id + "-memory"
-    if not project.artifacts.exists(identity):
-        return None
-    return json.loads(project.artifacts.read_bytes(identity, "memory.json"))
+def role_model(
+    registry: RuntimeModelCatalog,
+    catalog: ModelCatalog,
+    alias: str,
+    spec: FidelitySpec,
+    role: Literal["prediction", "investigation", "judging"],
+) -> ResolvedModel:
+    """Resolve an alias with this role's registered reasoning effort, if any.
 
-
-def _consume_trajectory(project: ProjectStore, prepared: PreparedFidelity, now: datetime) -> None:
-    """Publish a completed learning trajectory exactly once; replay resumes publication.
-
-    Deterministic code decides admission: only a learning spec whose every planned step
-    was predicted and disclosed is consumed. Model-authored investigations enter as
-    unresolved research, never as accepted rules.
+    The effort replaces the catalog capability pin only; capability identity excludes
+    reasoning effort, so model and artifact bindings are unchanged.
     """
-    spec = prepared.spec
-    receipt_id = prepared.id + "-memory"
-    if (
-        spec.memory is None
-        or spec.memory.mode != "learn"
-        or spec.online_research is None
-        or project.artifacts.exists(receipt_id)
+    effort = spec.budget(role).reasoning_effort
+    if effort is None:
+        return registry.resolve(alias)
+    record = catalog.models[alias]
+    if record.capabilities is None:
+        raise ValueError(f"{role} model {alias!r} has no capability record for reasoning")
+    adjusted = record.capabilities.model_copy(update={"reasoning_effort": effort})
+    patched = catalog.model_copy(
+        update={
+            "models": {
+                **catalog.models,
+                alias: record.model_copy(update={"capabilities": adjusted}),
+            }
+        }
+    )
+    return registry.with_catalog(patched).resolve(alias)
+
+
+def _check_budget(role: str, budget: RoleBudget, caps: ModelCapabilities) -> None:
+    """Refuse allowances or reasoning settings the role's model cannot honor."""
+    if caps.maximum_output_tokens is not None and budget.output_tokens > caps.maximum_output_tokens:
+        raise ValueError(f"{role} output allowance exceeds the model's maximum output")
+    if budget.reasoning_effort is not None and (
+        caps.supports_reasoning is not True or caps.reasoning_effort is None
     ):
-        return
-    pinned = json.loads(project.artifacts.read_bytes(prepared.id + "-execution", "execution.json"))
-    memory = pinned.get("memory")
-    if not isinstance(memory, dict) or memory.get("lineage") != spec.memory.lineage:
-        raise ValueError("learning execution did not pin its memory version")
-    evidence = json.loads(
-        project.artifacts.read_bytes(prepared.id + "-report-intent", "evidence.json")
-    )
-    feedback = evidence.get("sources", {}).get("online_feedback", {})
-    receipts = [row for row in feedback.get("receipts", []) if isinstance(row, dict)]
-    research = [
-        str(row["id"])
-        for row in receipts
-        if isinstance(row.get("investigation"), dict) or row.get("reply_matched") is False
-    ]
-    outcome: JsonObject = {
-        "lineage": spec.memory.lineage,
-        "parent_version": memory["version"],
-        "research_ids": list(research),
-        "feedback_receipts": len(receipts),
-    }
-    if evidence.get("stop_reason") != "completed" or len(receipts) != len(spec.workload.actions):
-        outcome |= {"published": False, "reason": "incomplete trajectory is not consumed"}
-    else:
-        parent_number = memory["version"]
-        parent = (
-            read_memory_version(project.artifacts, spec.memory.lineage, int(parent_number))
-            if parent_number
-            else None
-        )
-        trajectory: JsonObject = {
-            "task": spec.task.instruction,
-            "task_lineage": spec.task.lineage_group_id,
-            "initial_context": spec.task.initial_context,
-            "actions": [{"name": a.name, "arguments": a.arguments} for a in spec.workload.actions],
-            "observed_replies": [row.reply for row in spec.references.steps],
-            "source": spec.online_research.feedback_source,
-        }
-        version, consumed = publish_trajectory(
-            project.artifacts,
-            lineage=spec.memory.lineage,
-            parent=parent,
-            world_model=spec.world_model,
-            selection_policy_sha256=str(spec.memory_selection_identity),
-            trajectory=trajectory,
-            research=research,
-            created_at=now,
-            code_revision=prepared.code_revision,
-        )
-        outcome |= {
-            "published": consumed,
-            "reason": "consumed" if consumed else "duplicate trajectory already consumed",
-            "version": version.version,
-            "consumed_trajectories": len(version.consumed),
-            "library": version.library.model_dump(mode="json"),
-        }
-    project.artifacts.write_json(
-        artifact_id=receipt_id,
-        artifact_type="fidelity-memory",
-        envelope=ArtifactEnvelope(
-            schema_version=1,
-            created_at=now,
-            code_revision=prepared.code_revision,
-            inputs=(artifact_input(project.artifacts.read(prepared.id + "-report").manifest),),
-        ),
-        files={"memory.json": outcome},
-    )
-
-
-def _decision_caller(
-    resolved: ResolvedModel,
-    transport: AdmittedJsonTransport,
-    deadline: datetime,
-    clock: Callable[[], datetime],
-) -> Callable[[DecisionRequest], JsonObject]:
-    """Send JEV decisions on the catalog's native wire through the admitted transport."""
-    profile_of = getattr(resolved.client, "gateway_wire_profile", None)
-    if profile_of is None:
-        raise ValueError("JEV alias does not resolve to a native decision client")
-    profile = profile_of()
-    if profile.dialect != "typesafe_systemone" or not profile.decisions_url:
-        raise ValueError("JEV alias does not expose the native decision wire")
-
-    def decide(request: DecisionRequest) -> JsonObject:
-        """Dispatch one decision; physical attempts share the run's ledger and deadline."""
-        remaining = (deadline - clock()).total_seconds()
-        response = transport.post(
-            profile.decisions_url,
-            headers=profile.headers,
-            payload=request.provider_body(profile.model_id),
-            timeout_seconds=max(min(remaining, 120.0), 0.001),
-        )
-        if response.status_code != 200 or not isinstance(response.body, dict):
-            raise RuntimeError(f"JEV decision returned HTTP {response.status_code}")
-        return response.body
-
-    return decide
+        raise ValueError(f"{role} model does not accept a configured reasoning effort")
 
 
 def _receipt_recorder(
@@ -642,77 +773,3 @@ def _receipt_recorder(
             )
 
     return record
-
-
-def fidelity_memory_plan(
-    project: ProjectStore, spec: FidelitySpec, prepared: PreparedFidelity | None = None
-) -> str | None:
-    """Describe the memory a run read (once executed) or would read, without provider calls."""
-    if spec.memory is None:
-        return None
-    intent = None if prepared is None else prepared.id + "-execution"
-    if intent is not None and project.artifacts.exists(intent):
-        pinned = json.loads(project.artifacts.read_bytes(intent, "execution.json")).get("memory")
-        if isinstance(pinned, dict):
-            return (
-                f"{spec.memory.lineage} {pinned.get('mode')} run read v{pinned.get('version')} "
-                f"({pinned.get('consumed_trajectories')} consumed trajectories)"
-            )
-    if spec.memory.checkpoint is not None:
-        frozen = read_memory_version(project.artifacts, spec.memory.lineage, spec.memory.checkpoint)
-        return (
-            f"{spec.memory.lineage} frozen checkpoint v{frozen.version} "
-            f"({len(frozen.consumed)} consumed trajectories); outcomes never update memory"
-        )
-    head = memory_head(project.artifacts, spec.memory.lineage)
-    count = 0 if head is None else len(head.consumed)
-    return (
-        f"{spec.memory.lineage} learning from v{0 if head is None else head.version} "
-        f"({count} consumed trajectories); a completed trajectory publishes the next version"
-    )
-
-
-def fidelity_decision_trace(project: ProjectStore, prepared: PreparedFidelity) -> list[JsonObject]:
-    """Return per-step model decisions and deterministic commits from saved artifacts only."""
-    path = project.artifacts.project_directory / (prepared.id + "-sessions.sqlite")
-    if not path.exists():
-        return []
-    state = SessionStore(path).read_session(prepared.id).state
-    transitions = state.get("transitions")
-    receipts: dict[str, JsonObject] = {}
-    evidence_id = prepared.id + "-report-intent"
-    if project.artifacts.exists(evidence_id):
-        evidence = json.loads(project.artifacts.read_bytes(evidence_id, "evidence.json"))
-        feedback = evidence.get("sources", {}).get("online_feedback", {})
-        receipts = {
-            str(row["operation_id"]): row
-            for row in feedback.get("receipts", [])
-            if isinstance(row, dict)
-        }
-    rows: list[JsonObject] = []
-    for index, transition in enumerate(transitions if isinstance(transitions, list) else []):
-        if not isinstance(transition, dict):
-            continue
-        evidence = transition.get("evidence")
-        evidence = evidence if isinstance(evidence, dict) else {}
-        selection = evidence.get("session_research_selection")
-        feedback_row = receipts.get(str(transition.get("operation_id")), {})
-        investigation = feedback_row.get("investigation")
-        rows.append(
-            {
-                "step": index,
-                "committed_version": index + 1,
-                "request_sha256": evidence.get("request_sha256"),
-                "originals": evidence.get("grounded_transition_ids"),
-                "memory_selected": selection.get("selected_ids")
-                if isinstance(selection, dict)
-                else None,
-                "proposal": transition.get("proposal"),
-                "reply_matched": feedback_row.get("reply_matched"),
-                "research_id": feedback_row.get("id") if isinstance(investigation, dict) else None,
-                "hypothesis": investigation.get("hypothesis")
-                if isinstance(investigation, dict)
-                else None,
-            }
-        )
-    return rows

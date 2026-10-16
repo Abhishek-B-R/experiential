@@ -46,7 +46,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-prompt-optimization = ["gepa @ git+https://github.com/gepa-ai/gepa.git@f1cfdee2856e9dc4b5b4dc5cc2e391d0aa20d819"]
+# GEPA prompt search; the published release carries every API exp/optimize/simulation uses.
+prompt-optimization = ["gepa>=0.1.4,<0.2"]
 # Persisted supervised fine-tuning uses the native Tinker SDK and cookbook renderer surface.
 sft = ["tinker>=0.23,<0.24", "tinker-cookbook>=0.4.3,<0.5"]
 dev = [
@@ -73,9 +74,6 @@ exp = "exp.cli:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-[tool.hatch.metadata]
-allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["exp"]

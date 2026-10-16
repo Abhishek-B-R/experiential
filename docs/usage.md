@@ -419,6 +419,42 @@ quality measurement can call the separate `build_fidelity_evaluation_plan` and
 reports contain measurements only, never an approval or denial. See the
 [router contracts](reference/router_optimization_config.md).
 
+### Learning from traces and held-out fidelity
+
+`exp build PROJECT -t PATH --learn --memory-recall ALIAS [--max-learning-attempts N]` adds an
+opt-in learning pass after the build. It replays every fit trace once, in export order, on a
+hybrid simulator: learned memory supplies behavioral rules, and the build's fit-only index
+supplies recorded facts (a trace never retrieves its own lineage, and held-out traces are not in
+that index). Each step is predicted, then the recorded reply is disclosed and mismatches are
+investigated. Only investigations the investigator marks transferable, phrased by the
+observable cue that triggers them, become memory rules; every investigation stays recallable as
+a record. Each trace is published as one memory version and the memory log is compressed.
+`ALIAS` is a native decision model that recalls memory records. Held-out lineages are reserved
+before the first trace, so they are never learned. The pass is resumable: completed traces
+replay without provider calls. It prints a learning curve of exact replies by consumption order,
+because each fit trace is predicted before it is learned.
+
+A simulator proposal that fails validation is never repaired: it is asked again, at most twice,
+with the refusal reason, and each re-ask is saved and counted. After that the turn fails.
+
+`exp eval PROJECT --held-out-fidelity N [--verbose]` then replays N held-out traces,
+selected deterministically, against the final memory checkpoint and prints one aggregate line
+(replies exact, reply fields matching, judge mean), how often the judge's per-turn verdict
+agrees with exact reproduction (a check on the judge, not a score), and the learning curve.
+Turns the simulator never answered count as not reproduced. `--verbose` adds every trace and
+turn. Run IDs are derived from the run's inputs, including the prompts the simulator sends, so a
+changed input starts a new run and an unchanged one replays without provider calls. A run that
+stopped after buying calls is never bought again silently: rerun with `--retry-incomplete` (on
+`exp build --learn` or `exp eval --held-out-fidelity`) to replace it. A learning trace that
+stops before completing is retried up to three times in the same pass; any trace still not
+learned is reported, and only learned traces count.
+
+A trace may mark its public prefix in its request context (`exp.request.context`, for example
+`{"task_lineage": "user_17", "replay_from": 2}`): the first `replay_from` recorded tool calls and
+their replies are given to the simulator as initial observations, and measurement starts at the
+next call. Without it, every recorded call is measured. Traces that declare no tool list
+(`exp.request.tools`) get tool signatures observed in fit traces: names and argument names only.
+
 ### Simulated tool observations
 
 Text world models generate environment observations for declared tools. Candidate tool calls are

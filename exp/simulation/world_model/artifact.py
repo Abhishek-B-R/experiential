@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 from pydantic import Field, model_validator
 
@@ -79,6 +80,7 @@ def grounded_world_model_content(
     code_revision: str,
     knowledge: SimulationKnowledge | None = None,
     selection_policy_sha256: str | None = None,
+    original_evidence: OriginalEvidence = "retrieved",
 ) -> dict[str, object]:
     """Return the complete content-addressed identity of a grounded world model.
 
@@ -92,11 +94,18 @@ def grounded_world_model_content(
         code_revision: Exact code revision that creates the artifact.
         knowledge: Frozen reconstruction and investigation context.
         selection_policy_sha256: Optional explicit reranker identity.
+        original_evidence: ``retrieved`` grounds each prediction in nearest recorded
+            transitions; ``none`` predicts from task, history and learned memory only. The
+            default adds nothing, so existing identities are unchanged.
 
     Returns:
         Canonical content mapping used to derive the artifact identity.
     """
+    extra: dict[str, object] = (
+        {} if original_evidence == "retrieved" else {"original_evidence": original_evidence}
+    )
     return {
+        **extra,
         "selection_policy_sha256": selection_policy_sha256,
         "knowledge": knowledge.model_dump(mode="json") if knowledge is not None else None,
         "serving_rag": serving_rag.model_dump(mode="json"),
@@ -109,8 +118,18 @@ def grounded_world_model_content(
     }
 
 
+OriginalEvidence = Literal["retrieved", "none"]
+
+
 class GroundedWorldModelArtifact(ArtifactEnvelope):
-    """Executable text world model bound to one immutable serving RAG snapshot."""
+    """Executable text world model bound to one immutable serving RAG snapshot.
+
+    Attributes:
+        original_evidence: ``retrieved`` (source-RAG profile) retrieves nearest recorded
+            transitions for every prediction. ``none`` (memory-first profile) never retrieves
+            them; the serving index is kept only as the identity of the stored evidence corpus,
+            and predictions read the task, visible history and learned memory.
+    """
 
     world_model_id: ArtifactId
     serving_rag: ArtifactInput
@@ -121,6 +140,9 @@ class GroundedWorldModelArtifact(ArtifactEnvelope):
     top_k: int = Field(gt=0)
     knowledge: SimulationKnowledge | None = None
     selection_policy_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    original_evidence: OriginalEvidence = Field(
+        default="retrieved", exclude_if=lambda value: value == "retrieved"
+    )
 
     @model_validator(mode="after")
     def _require_single_rag_input(self) -> GroundedWorldModelArtifact:
@@ -156,6 +178,7 @@ def persist_grounded_world_model(
     top_k: int,
     knowledge: SimulationKnowledge | None = None,
     selection_policy_sha256: str | None = None,
+    original_evidence: OriginalEvidence = "retrieved",
 ) -> PersistedGroundedWorldModel:
     """Persist a reusable world model over one verified immutable serving index.
 
@@ -169,6 +192,7 @@ def persist_grounded_world_model(
         top_k: Number of grounded demonstrations supplied per step.
         knowledge: Optional frozen reconstructed knowledge and research history.
         selection_policy_sha256: Frozen reranker identity, required when using JEV.
+        original_evidence: Retrieve recorded transitions, or predict from memory only.
 
     Returns:
         Completed artifact and exact verified manifest.
@@ -193,7 +217,10 @@ def persist_grounded_world_model(
         code_revision=code_revision,
         knowledge=knowledge,
         selection_policy_sha256=selection_policy_sha256,
+        original_evidence=original_evidence,
     )
+    if original_evidence == "none" and selection_policy_sha256 is not None:
+        raise ValueError("a memory-first simulator retrieves no originals to rerank")
     artifact = GroundedWorldModelArtifact(
         schema_version=1,
         created_at=created_at,
@@ -213,6 +240,7 @@ def persist_grounded_world_model(
         top_k=top_k,
         knowledge=knowledge,
         selection_policy_sha256=selection_policy_sha256,
+        original_evidence=original_evidence,
     )
     try:
         stored, manifest = store.write_or_replay(
