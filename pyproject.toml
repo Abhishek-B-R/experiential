@@ -1,6 +1,6 @@
 [project]
 name = "experiential"
-version = "0.7.185"
+version = "0.7.186"
 description = "Build simulations and optimize model routing from agent traces."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -8,7 +8,7 @@ requires-python = ">=3.12"
 dependencies = [
     # Cross-platform advisory locking for durable registries edited in place. Declared directly
     # because `exp.common.core.locks` imports it and Unix-only `fcntl` is not a portable boundary.
-    "exp-gateway-native>=0.3.144,<0.4",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
+    "exp-gateway-native>=0.3.145,<0.4",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
     "filelock>=3.12",
     "jsonschema>=4.23,<5",  # Validate induced local-only tool and state contracts.
     "ijson>=3.4,<4",  # incremental parsing of local trace archives
@@ -127,5 +127,5 @@ python-version = "3.12"
 exp-gateway-native = { path = "exp/runtime/gateway/native" }
 
 # Immutable development pins for Capture's reviewed forks; release metadata uses PyPI names.
-exp-mitmproxy = { git = "https://github.com/experientiallabs/mitmproxy", rev = "3863dc9dc0c09f9eb655614c4b9b63e5570a39e3" }
-exp-mitmproxy-rs = { git = "https://github.com/experientiallabs/mitmproxy_rs", rev = "866da0a0aff1a8e57def4da6a941fca0c44dd98d", subdirectory = "mitmproxy-rs" }
+exp-mitmproxy = { git = "https://gitlab.com/experiential-labs-group/mitmproxy.git", rev = "95b902a8ffb0b02da8a8888d6cb86f0fa9255e5b" }
+exp-mitmproxy-rs = { git = "https://gitlab.com/experiential-labs-group/mitmproxy_rs.git", rev = "866da0a0aff1a8e57def4da6a941fca0c44dd98d", subdirectory = "mitmproxy-rs" }
