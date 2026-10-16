@@ -74,13 +74,12 @@ def test_budget_stops_between_traces_and_a_rerun_continues(
 def test_default_learning_consumes_every_trace_and_reports_test_then_train(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Without --hold-out every trace is learned, nothing is reserved, and the score is shown."""
+    """A plain build learns every trace, reserves nothing, and retests its own misses."""
     provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
-    root, store, output = build_project(
-        tmp_path, monkeypatch, provider, "--learn", "--memory-recall", "jev"
-    )
+    root, store, output = build_project(tmp_path, monkeypatch, provider, learn=True)
     plan = learning_plan(store)
     assert plan.scope == "all"
+    assert plan.recall.jev_alias == "jev", "the catalog's only decision model is chosen"
     head = memory_head(store.artifacts, plan.lineage)
     assert head is not None and head.version == USERS
     held = held_out_lineages(store)
@@ -93,16 +92,17 @@ def test_default_learning_consumes_every_trace_and_reports_test_then_train(
     # Traces 10-12 learn on nearly final memory; all their turns are exact.
     estimate = "latest unseen-task estimate 100% replies exact (9/9) over the last 3 trace(s)"
     assert estimate in output
-    assert "run exp build --learn --hold-out, then exp eval --held-out-fidelity N" in output
-    assert "next: exp eval retail --retest-misses N" in output
+    assert "run exp eval retail --audit N" in output
+    # The build ends by retesting its one missed trace; that retest is the only judge call.
+    assert "Miss retest" in output and "fixed 1 of 1 missed turns" in output
     judging = [r for r in provider.requests if "axes" in json.dumps(r.payload.get("tools"))]
-    assert not judging, "learning is scored by exact replies and never buys a judge call"
-    refused = CliRunner().invoke(
+    assert len(judging) == 1, "learning is scored by exact replies; only the retest is judged"
+    audit = CliRunner().invoke(
         app,
-        ["eval", PROJECT, "--root", str(root), "--held-out-fidelity", "3", "--non-interactive"],
+        ["eval", PROJECT, "--root", str(root), "--audit", "3", "--dry-run", "--non-interactive"],
     )
-    assert refused.exit_code == 2
-    assert "--learn --hold-out" in " ".join(refused.output.split())
+    assert audit.exit_code == 0, audit.output
+    assert "learns a separate memory from fit traces only" in " ".join(audit.output.split())
 
 
 def test_learning_hides_earlier_traces_of_the_same_task(
@@ -119,9 +119,7 @@ def test_learning_hides_earlier_traces_of_the_same_task(
     ]
     episodes = [*(episode(i) for i in range(USERS)), repeat]
     provider = SimulatedProvider(episodes)
-    _, store, _ = build_project(
-        tmp_path, monkeypatch, provider, "--learn", "--memory-recall", "jev", episodes=episodes
-    )
+    _, store, _ = build_project(tmp_path, monkeypatch, provider, episodes=episodes, learn=True)
     cases = learning_cases(store, "all")
     positions = [
         index
@@ -195,9 +193,7 @@ def test_a_trace_is_predicted_whole_before_its_own_feedback_is_used(
         item["exchanges"] = [*exchanges, again]
         episodes.append(item)
     provider = SimulatedProvider(episodes, learnable=True)
-    _, store, output = build_project(
-        tmp_path, monkeypatch, provider, "--learn", "--memory-recall", "jev", episodes=episodes
-    )
+    _, store, output = build_project(tmp_path, monkeypatch, provider, episodes=episodes, learn=True)
     curve = learning_curve(store)
     assert curve is not None and len(curve.points) == USERS
     first = curve.points[0]

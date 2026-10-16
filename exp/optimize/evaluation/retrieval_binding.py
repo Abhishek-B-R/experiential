@@ -171,6 +171,6 @@ def require_unindexed_held_out_task(
         raise ValueError(
             f"the simulator's retrieval index contains held-out task {task.task_id}'s own "
             "recorded traces; bind a simulator that cannot retrieve them: the build's "
-            "fit-only simulator, or the memory-first one that exp eval PROJECT "
-            "--held-out-fidelity N uses"
+            "fit-only simulator, or the memory-first one that exp eval PROJECT --audit N "
+            "uses"
         )

@@ -101,7 +101,7 @@ def run_miss_retest(
                 yes=yes,
                 estimated_cost_usd=None,
                 cost_is_upper_bound=False,
-                command=f"exp eval {project} --retest-misses {count}",
+                command=f"exp build {project}",
                 non_interactive=not interactive,
             ):
                 return

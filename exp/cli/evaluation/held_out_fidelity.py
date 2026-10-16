@@ -47,7 +47,7 @@ def run_held_out_fidelity(
 ) -> None:
     """Measure the learned simulator on held-out traces it never learned, or replay the result.
 
-    Uses the hybrid profile: the memory learned with ``--hold-out`` at its final checkpoint,
+    Uses the hybrid profile: the audit's fit-only memory at its final checkpoint,
     with every held-out lineage reserved, plus recorded facts from the fit-only index.
 
     Args:
@@ -94,8 +94,8 @@ def run_held_out_fidelity(
         if panel.memory_version is not None and panel.memory_version < fit:
             console.print(
                 f"[yellow]warning[/yellow] memory v{panel.memory_version} learned "
-                f"{panel.memory_version} of {fit} fit traces; finish `exp build --learn` "
-                "to measure the fully learned simulator"
+                f"{panel.memory_version} of {fit} fit traces; run the audit again to finish "
+                "learning and measure the fully learned simulator"
             )
         if dry_run:
             for prepared in panel.prepared:
@@ -118,7 +118,7 @@ def run_held_out_fidelity(
                 yes=yes,
                 estimated_cost_usd=None,
                 cost_is_upper_bound=False,
-                command=f"exp eval {project} --held-out-fidelity {count}",
+                command=f"exp eval {project} --audit {count}",
                 non_interactive=not interactive,
             ):
                 return
@@ -237,3 +237,78 @@ def _judge(result: ReplayResult) -> str:
 def share(part: int, whole: int) -> str:
     """A whole-number percentage, or a dash without a denominator."""
     return f"{part / whole:.0%}" if whole else "-"
+
+
+def run_audit(
+    project: str,
+    count: int,
+    *,
+    root: Path,
+    yes: bool,
+    non_interactive: bool,
+    dry_run: bool,
+    verbose: bool = False,
+    retry_incomplete: bool = False,
+) -> None:
+    """Independently audit the simulator on traces it never learned.
+
+    The default build learns every trace, so the audit learns its own memory from fit traces
+    only, with held-out lineages reserved first; saved results replay without calls. It then
+    replays up to ``count`` held-out traces on that memory's final checkpoint.
+
+    Args:
+        project: Existing project with a completed build.
+        count: Maximum held-out traces, selected deterministically.
+        root: Existing project and artifact root.
+        yes: Explicit authorization after the undefined-cost warning.
+        non_interactive: Disable terminal questions.
+        dry_run: Stop before credentials or provider calls.
+        verbose: Also print every trace, every turn, and every criterion.
+        retry_incomplete: Replace interrupted runs, buying their calls again.
+    """
+    # Deferred: learning loads the fidelity lifecycle.
+    from exp.cli.build.learning import resolve_memory_recall, run_learning
+    from exp.common.models import load_model_catalog
+    from exp.optimize.evaluation.trace_learning import recorded_plan
+
+    console = Console(theme=EXP_THEME)
+    with usage_error(OSError, ValueError):
+        store = ProjectStore(root, project)
+        if dry_run and not recorded_plan(store, "fit"):
+            console.print(
+                "The audit first learns a separate memory from fit traces only, then replays "
+                "held-out traces on it. Run without --dry-run to see its preflight."
+            )
+            return
+        if not dry_run:
+            recall = resolve_memory_recall(load_model_catalog(store.model_catalog_path))
+            if recall is None:
+                raise ValueError(
+                    "the audit learns a fit-only memory and needs a native decision model to "
+                    "recall it (for example cloudflare/clef-flash); add one to the model catalog"
+                )
+            run_learning(
+                console,
+                store,
+                project=project,
+                root=root,
+                recall_alias=recall,
+                maximum_attempts=None,
+                yes=yes,
+                non_interactive=non_interactive,
+                code_revision=installed_release_revision(),
+                retry_incomplete=retry_incomplete,
+                hold_out=True,
+            )
+            if not recorded_plan(store, "fit"):
+                return
+    run_held_out_fidelity(
+        project,
+        count,
+        root=root,
+        yes=yes,
+        non_interactive=non_interactive,
+        dry_run=dry_run,
+        verbose=verbose,
+        retry_incomplete=retry_incomplete,
+    )

@@ -1,4 +1,4 @@
-"""Miss retest: learned traces the simulator got wrong, replayed on the final memory."""
+"""Miss retest: the build's last step replays the traces it got wrong on its final memory."""
 
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +16,7 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     build_project,
     episode,
 )
+from exp.optimize.evaluation.miss_retest import register_miss_retest
 from exp.optimize.evaluation.trace_learning import (
     learn_from_traces,
     learning_cases,
@@ -25,94 +26,87 @@ from exp.optimize.evaluation.trace_learning import (
 )
 from exp.optimize.evaluation.trace_learning_test import memory_delivered
 
+STEPS = 3  # replayed exchanges per fixture trace, after its one-call public prefix
 
-def retest(root: Path, *flags: str) -> tuple[int, str]:
-    """Invoke ``exp eval PROJECT --retest-misses 5`` and return its exit code and output."""
+
+def rebuild(root: Path, store_import: str, *flags: str) -> tuple[int, str]:
+    """Run ``exp build`` again on the stored import and return its exit code and output."""
     result = CliRunner().invoke(
         app,
-        ["eval", PROJECT, "--root", str(root), "--retest-misses", "5", "--non-interactive"]
+        ["build", PROJECT, "--import-id", store_import, "--root", str(root), "--non-interactive"]
         + list(flags),
     )
     return result.exit_code, " ".join(result.output.split())
 
 
-def test_a_missed_turn_is_fixed_on_the_final_memory_and_replays_without_calls(
+def test_the_build_retests_its_miss_on_the_final_memory_and_replays_without_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Only the first trace missed (the learnable tool); the final memory reproduces it."""
     provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
-    root, store, _ = build_project(
-        tmp_path, monkeypatch, provider, "--learn", "--memory-recall", "jev"
-    )
-    learned, predicted = len(provider.requests), len(provider.predictions())
+    root, store, output = build_project(tmp_path, monkeypatch, provider, learn=True)
     own = learning_cases(store, "all")[0].task.lineage_group_id  # the trace that missed
-
-    code, dry = retest(root, "--dry-run")
-    assert code == 0, dry
-    assert f"1 of {USERS} learned traces had a miss · 3 turns" in dry
-    assert "Prepared without provider calls" in dry and len(provider.requests) == learned
-
-    code, output = retest(root, "--yes")
-    assert code == 0, output
+    assert f"1 of {USERS} learned traces had a miss · {STEPS} turns" in output
     assert "Miss retest 3/3 replies exact (100%)" in output
     assert "exact before learning 2/3 (67%) → after 3/3 (100%)" in output
     assert "fixed 1 of 1 missed turns · 0 regressed" in output
-    assert "Learning progress (test-then-train" in output
-    purchased = len(provider.requests)
-    assert purchased > learned
-    # Learning hid the trace's own task; the retest reads what memory learned from it.
-    retested = provider.predictions()[predicted:]
-    assert retested and all(own in memory_delivered(prediction) for prediction in retested)
+    # Learning hid each trace's own task; the retest reads what memory learned from it.
+    retested = provider.predictions()[STEPS * USERS :]
+    assert len(retested) == STEPS
+    assert all(own in memory_delivered(prediction) for prediction in retested)
 
-    code, replay = retest(root, "--verbose")
+    purchased = len(provider.requests)
+    code, replay = rebuild(root, _import_id(store), "--yes")
     assert code == 0, replay
-    assert "Saved results. No provider calls." in replay and "Retested trace" in replay
+    assert replay.count("Saved results. No provider calls.") >= 2, "learning and retest replay"
     assert len(provider.requests) == purchased
 
 
-def test_retest_needs_learning_and_a_miss(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Refused clearly, before any call, with nothing learned or nothing missed."""
+def test_the_build_skips_learning_without_a_recall_model_and_retest_without_a_miss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No decision model: a bare simulator and a clear note. No miss: no retest."""
     provider = SimulatedProvider([episode(i) for i in range(USERS)])
-    root, _, _ = build_project(tmp_path, monkeypatch, provider)
-    code, output = retest(root)
-    assert code == 2 and "--learn --memory-recall ALIAS" in output
+    _, store, output = build_project(tmp_path, monkeypatch, provider)
+    assert "built without learning" in output and "Miss retest" not in output
+    assert not recorded_plan(store, "all")
 
     other = tmp_path / "learned"
     other.mkdir()
     provider = SimulatedProvider([episode(i) for i in range(USERS)])
-    root, _, _ = build_project(other, monkeypatch, provider, "--learn", "--memory-recall", "jev")
-    sent = len(provider.requests)
-    code, output = retest(root)
-    assert code == 2 and "there is no miss to retest" in output
-    assert len(provider.requests) == sent
+    _, _, output = build_project(other, monkeypatch, provider, learn=True)
+    assert f"learned {USERS}/{USERS} traces" in output
+    assert "Miss retest" not in output, "every reply was exact, so there is nothing to retest"
 
 
 @pytest.mark.parametrize(
     "flags",
-    [
-        ["--held-out-fidelity", "2"],
-        ["--models", "a"],
-        ["--fidelity", "spec.json"],
-    ],
+    [["--models", "a"], ["--fidelity", "spec.json"], ["--resume", "run"]],
 )
-def test_retest_cannot_combine_with_other_modes(tmp_path: Path, flags: list[str]) -> None:
+def test_audit_cannot_combine_with_other_modes(tmp_path: Path, flags: list[str]) -> None:
     """One evaluation mode per command."""
-    code, output = retest(tmp_path / ".exp", *flags)
-    assert code == 2 and "cannot combine" in output
+    result = CliRunner().invoke(
+        app,
+        ["eval", PROJECT, "--root", str(tmp_path / ".exp"), "--audit", "3", *flags],
+    )
+    assert result.exit_code == 2 and "cannot combine" in " ".join(result.output.split())
+
+
+@pytest.mark.parametrize("flags", [["--retest-misses", "5"], ["--held-out-fidelity", "3"]])
+def test_removed_eval_flags_are_rejected(tmp_path: Path, flags: list[str]) -> None:
+    """The retest belongs to the build and the held-out panel to --audit."""
+    result = CliRunner().invoke(app, ["eval", PROJECT, "--root", str(tmp_path), *flags])
+    assert result.exit_code == 2 and "No such option" in result.output
 
 
 def test_a_cancelled_preflight_never_hides_learned_memory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Declining the default --learn records nothing; the --hold-out memory stays active."""
+    """Declining the build's learning records nothing; the audit's fit memory stays active."""
     provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
     root, store, _ = build_project(tmp_path, monkeypatch, provider)
-    declined = CliRunner().invoke(
-        app,
-        ["build", PROJECT, "--import-id", _import_id(store), "--root", str(root)]
-        + ["--non-interactive", "--learn", "--memory-recall", "jev"],
-    )
-    assert "learned" not in declined.output, declined.output
+    code, declined = rebuild(root, _import_id(store))
+    assert "learned" not in declined, declined
     assert not recorded_plan(store, "all"), "a preflight records no plan"
     outcome = learn_from_traces(
         store,
@@ -125,6 +119,5 @@ def test_a_cancelled_preflight_never_hides_learned_memory(
     assert learning_plan(store).scope == "fit"
     curve = learning_curve(store)
     assert curve is not None and len(curve.points) == outcome.learned
-    code, output = retest(root, "--dry-run")
-    assert code == 0, output
-    assert f"of {outcome.learned} learned traces had a miss" in output
+    panel = register_miss_retest(store, 99, code_revision=REVISION, clock=lambda: datetime.now(UTC))
+    assert panel.learned == outcome.learned

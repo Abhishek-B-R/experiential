@@ -5,8 +5,8 @@ consumes every trace and measures itself test-then-train; this module is the opt
 independent audit on traces kept out entirely. It measures how well the built simulator
 reproduces held-out traces, in one of two explicit profiles:
 
-- ``memory`` (hybrid): the simulator reads the memory learned with ``exp build --learn
-  --hold-out`` from fit traces only, frozen at its final checkpoint, with every held-out lineage
+- ``memory`` (hybrid): the simulator reads the memory ``exp eval --audit`` learns
+  from fit traces only, frozen at its final checkpoint, with every held-out lineage
   reserved so it was never learned, and retrieves recorded facts from the build's fit-only index.
 - ``source-rag``: the same world model retrieving from the build's fit-only index; the serving
   index also holds held-out traces and is never used here.
@@ -163,15 +163,15 @@ def register_held_out_fidelity(
             raise ValueError(
                 "held-out fidelity needs memory that never learned the held-out traces; "
                 "the default build learns every trace and reports test-then-train fidelity. "
-                "For an independent held-out panel, run exp build PROJECT --learn --hold-out "
-                "--memory-recall ALIAS"
+                "For an independent held-out panel, run exp eval PROJECT --audit N, which "
+                "learns its own fit-only memory first"
             )
         plan = learning_plan(project, scope="fit")
         head = memory_head(project.artifacts, plan.lineage)
         if head is None:
             raise ValueError(
-                "the learning pass has not published any memory yet; run exp build PROJECT "
-                "--learn --memory-recall ALIAS first"
+                "the fit-only learning pass has not published any memory yet; run exp eval "
+                "PROJECT --audit N to learn it"
             )
         world_model, version = plan.world_model, head.version
         cases = held_out_cases(project, count, fit_calls(project))

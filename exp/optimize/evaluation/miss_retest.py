@@ -102,7 +102,8 @@ def register_miss_retest(
     runs = learned_runs(project, plan)
     if head is None or not runs:
         raise ValueError(
-            "nothing has been learned yet; run exp build PROJECT --learn --memory-recall ALIAS"
+            "nothing has been learned yet; run exp build PROJECT with a native decision model "
+            "for memory recall in the catalog"
         )
     missed = [(case, result) for case, _, result in runs if result.exact < result.steps][:count]
     if not missed:

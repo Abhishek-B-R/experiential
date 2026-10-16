@@ -91,9 +91,7 @@ def test_a_retrieved_fact_written_into_memory_never_reaches_its_own_task(
         assert isinstance(exchanges, list)
         exchanges[1][2]["canary"] = f"CANARY_{item['user']}"
     provider = CopyingProvider(episodes)
-    build_project(
-        tmp_path, monkeypatch, provider, "--learn", "--memory-recall", "jev", episodes=episodes
-    )
+    build_project(tmp_path, monkeypatch, provider, episodes=episodes, learn=True)
     assert provider.canary is not None, "a prediction retrieved another task's canary"
     owner = provider.canary.removeprefix("CANARY_")
     own = [
@@ -155,9 +153,7 @@ def test_a_trace_memory_never_reflects_its_own_recorded_answer_through_another_t
         root = tmp_path / f"bit-{bit}"
         root.mkdir()
         provider = BitProvider(episodes)
-        _, store, _ = build_project(
-            root, monkeypatch, provider, "--learn", "--memory-recall", "jev", episodes=episodes
-        )
+        _, store, _ = build_project(root, monkeypatch, provider, episodes=episodes, learn=True)
         head = memory_head(store.artifacts, learning_plan(store).lineage)
         assert head is not None and head.version == len(episodes), "every trace was learned"
         assert provider.seen, "another trace retrieved B's recorded answer"

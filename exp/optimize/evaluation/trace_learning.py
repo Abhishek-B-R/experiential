@@ -168,8 +168,8 @@ class LearningCurve(ContractModel):
         task hidden, so the total averages simulators from empty memory to nearly final memory:
         a learning-progress diagnostic, not the final simulator's performance. The last-quarter
         window (memory nearly final) is the latest unseen-task estimate, shown with its trace
-        count. Claims about the final simulator on unseen traces come from ``--hold-out`` and
-        ``--held-out-fidelity``. Recorded actions are replayed over the simulator's own
+        count. Claims about the final simulator on unseen traces come from ``exp eval
+        --audit``. Recorded actions are replayed over the simulator's own
         history, so errors carry forward. Traces whose learning failed remain scored and are
         counted separately.
         """
@@ -243,10 +243,10 @@ def learning_plan(
             )
         return saved
     if recall_alias is None:
-        flag = " --hold-out" if scope == "fit" else ""
+        command = "exp eval PROJECT --audit N" if scope == "fit" else "exp build PROJECT"
         raise ValueError(
-            f"no learned memory for this build; run exp build PROJECT --learn{flag} "
-            "--memory-recall ALIAS first"
+            f"no learned memory for this build; run {command} with a native decision model "
+            "for memory recall in the catalog"
         )
     plan = LearningPlan(
         scope=scope,

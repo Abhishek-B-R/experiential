@@ -167,8 +167,11 @@ def package_rows(episodes: list[JsonObject]) -> list[JsonObject]:
     return rows
 
 
-def write_catalog(root: Path) -> None:
-    """Configure an OpenAI-compatible simulator, judge and embedder, and a memory-recall alias."""
+def write_catalog(root: Path, *, recall: bool = True) -> None:
+    """Configure an OpenAI-compatible simulator, judge and embedder, and a memory-recall alias.
+
+    Without ``recall`` the catalog has no native decision model, so a build skips learning.
+    """
     write_model_catalog(
         root / "models.toml",
         ModelCatalog(
@@ -218,11 +221,17 @@ def write_catalog(root: Path) -> None:
                         input_cost_per_million_tokens_usd=0.02,
                     ),
                 ),
-                "jev": ModelRecord(
-                    connection="decisions",
-                    model="jev-v1",
-                    billing_source=BillingSource.CUSTOMER_MANAGED,
-                    capabilities=ModelCapabilities(supports_completions=False),
+                **(
+                    {
+                        "jev": ModelRecord(
+                            connection="decisions",
+                            model="jev-v1",
+                            billing_source=BillingSource.CUSTOMER_MANAGED,
+                            capabilities=ModelCapabilities(supports_completions=False),
+                        )
+                    }
+                    if recall
+                    else {}
                 ),
             },
             roles=ModelRoles(world_model="world", judge="judge", embedder="embed"),
@@ -447,11 +456,17 @@ def build_project(
     provider: SimulatedProvider,
     *flags: str,
     episodes: list[JsonObject] | None = None,
+    learn: bool = False,
 ) -> tuple[Path, ProjectStore, str]:
-    """Run ``exp build`` on the package through the routed fake and return its output."""
+    """Run ``exp build`` on the package through the routed fake and return its output.
+
+    With ``learn`` the catalog has a memory-recall model, so the build learns every trace and
+    retests its misses. Without it the build stops at the bare simulator; the recall alias is
+    added afterwards so a test can drive learning itself.
+    """
     root = tmp_path / ".exp"
     root.mkdir()
-    write_catalog(root)
+    write_catalog(root, recall=learn)
     episodes = episodes or [episode(i) for i in range(USERS)]
     package = tmp_path / "package.jsonl"
     package.write_text("".join(json.dumps(row) + "\n" for row in package_rows(episodes)))
@@ -480,14 +495,16 @@ def build_project(
         ],
     )
     assert result.exit_code == 0, result.output
+    if not learn:
+        write_catalog(root)
     return root, ProjectStore(root, PROJECT), " ".join(result.output.split())
 
 
 def held_out_command(root: Path, count: int, *flags: str) -> str:
-    """Invoke ``exp eval PROJECT --held-out-fidelity N`` and return its output."""
+    """Invoke ``exp eval PROJECT --audit N`` and return its output."""
     result = CliRunner().invoke(
         app,
-        ["eval", PROJECT, "--root", str(root), "--held-out-fidelity", str(count)]
+        ["eval", PROJECT, "--root", str(root), "--audit", str(count)]
         + ["--yes", "--non-interactive", *flags],
     )
     assert result.exit_code == 0, result.output
@@ -516,15 +533,14 @@ def held_out_customers(store: ProjectStore) -> set[str]:
     }
 
 
-def test_build_learns_from_fit_traces_then_measures_held_out_on_final_memory(
+def test_audit_learns_fit_traces_then_measures_held_out_on_final_memory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The audit flow: build, learn fit traces with --hold-out, held-out fidelity on the head."""
+    """The audit: learn fit traces only with held-out reserved, then replay held-out traces."""
     provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
-    root, store, output = build_project(
-        tmp_path, monkeypatch, provider, "--learn", "--hold-out", "--memory-recall", "jev"
-    )
-    plan = learning_plan(store)
+    root, store, _ = build_project(tmp_path, monkeypatch, provider)
+    output = held_out_command(root, 3)
+    plan = learning_plan(store, scope="fit")
     head = memory_head(store.artifacts, plan.lineage)
     assert head is not None
     fit = USERS - len(held_out_lineages(store))
@@ -535,13 +551,12 @@ def test_build_learns_from_fit_traces_then_measures_held_out_on_final_memory(
     assert all(is_reserved(store.artifacts, plan.lineage, lineage) for lineage in held)
     assert not consumed_task_lineages(store.artifacts, head) & held
     # The first trace mispredicts the learnable tool; once memory names it, predictions match.
-    curve = learning_curve(store)
+    curve = learning_curve(store, "fit")
     assert curve is not None and len(curve.points) == fit
     assert curve.points[0].exact == 2 and all(p.exact == 3 for p in curve.points[1:])
     assert curve.halves[0].exact < curve.halves[1].exact or fit < 4
     # Hybrid: predictions carry recorded fit facts, but never from their own trace's lineage
     # or from any held-out lineage.
-    learned_requests = provider.requests[:]
     customers = held_out_customers(store)
     for prediction in provider.predictions():
         own = _at(prediction, "task", "initial_context", "task_lineage")
@@ -549,27 +564,16 @@ def test_build_learns_from_fit_traces_then_measures_held_out_on_final_memory(
         lineages = {_at(context, "initial_context", "task_lineage") for context in contexts}
         assert own not in lineages and lineages.isdisjoint(customers)
     assert any(prediction["grounded_examples"] for prediction in provider.predictions())
-
-    output = held_out_command(root, 3)
+    # The panel reads the final fit-only checkpoint, frozen.
     assert f"memory v{head.version}" in output
     assert "9/9 replies exact (100%)" in output and "judge 4.0/5" in output
     assert "judge agrees with exact replies on 9/9 turns (100%)" in output
-    assert "Learning curve" in output
-    fresh = provider.requests[len(learned_requests) :]
-    assert [r for r in fresh if r.url.endswith("/embeddings")], "fit facts are retrieved"
-    # Frozen held-out runs never publish memory.
     assert memory_head(store.artifacts, plan.lineage) == head
 
     purchased = len(provider.requests)
     replay = held_out_command(root, 3)
     assert "Saved results. No provider calls." in replay and "9/9 replies exact" in replay
-    rerun = CliRunner().invoke(
-        app,
-        ["build", PROJECT, "--import-id", _import_id(store), "--root", str(root)]
-        + ["--yes", "--non-interactive", "--learn", "--hold-out", "--memory-recall", "jev"],
-    )
-    assert rerun.exit_code == 0, rerun.output
-    assert len(provider.requests) == purchased, "completed learning replays without calls"
+    assert len(provider.requests) == purchased, "the learned audit replays without calls"
 
 
 def _import_id(store: ProjectStore) -> str:
