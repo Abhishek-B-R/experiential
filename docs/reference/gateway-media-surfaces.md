@@ -91,6 +91,32 @@ surface its wire has no endpoint for, or whose price card names no single billab
 card, or both token rates with a declared output ceiling for transcription), is excluded at
 startup.
 
+## ElevenLabs audio lanes
+
+An `elevenlabs` connection (base URL `https://api.elevenlabs.io/v1`, key in the `xi-api-key`
+header, default variable `ELEVENLABS_API_KEY`) serves the two audio surfaces above on ElevenLabs'
+own wire; callers keep the OpenAI request and response shapes. ElevenLabs serves no chat, so a
+completion naming an ElevenLabs alias is refused before dispatch.
+
+- Speech posts `{text, model_id, voice_settings?}` to `/text-to-speech/{voice_id}`. `voice` is an
+  ElevenLabs voice id (twenty alphanumerics) or one of the classic OpenAI names, mapped to
+  premade voices: alloy to River, echo to Eric, fable to George, onyx to Brian, nova to Bella,
+  shimmer to Sarah. `response_format` mp3, opus, pcm, and wav become `mp3_44100_128`,
+  `opus_48000_64`, `pcm_24000`, and `wav_24000`; `speed` from 0.7 to 1.2 becomes
+  `voice_settings.speed`.
+- Transcription uploads the audio as `file` beside `model_id` (and `language_code` from
+  `language`). ElevenLabs answers one JSON shape; the gateway renders `json` (the transcript
+  plus a duration usage), `text`, and `verbose_json` (language, duration, and word timestamps;
+  ElevenLabs reports no segments).
+- An option the ElevenLabs wire cannot carry is refused on its own field when no rung of the
+  alias can serve the request: an unknown voice name, `aac` or `flac`, a speed outside its
+  range, `instructions`, a transcription `prompt` or `temperature`, or `segment` timestamps.
+- Every ElevenLabs lane is unit-priced (a token-priced one is excluded at startup, since the wire
+  reports no token usage): speech bills the input characters (`character`; $0.04 per thousand
+  for Flash and Turbo, $0.08 for Multilingual v2, v3, and v4 on pay-as-you-go), and transcription
+  bills `audio_duration_secs` (`audio_second`; Scribe v2 is $0.22 per hour), bounded by the
+  admitted upload exactly like the OpenAI duration meter.
+
 ## Per-unit pricing
 
 Media priced by what it consumes or produces rather than by tokens carries a unit card on its
