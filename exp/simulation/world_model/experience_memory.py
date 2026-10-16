@@ -469,7 +469,7 @@ class Eligibility(ContractModel):
         if public_trajectory_identity(source) == self.exclude_public:
             return False
         lineage = source.get("task_lineage")
-        if not isinstance(lineage, str):
+        if not isinstance(lineage, str) or not lineage.strip():
             return not self.strict
         return lineage not in self.reserved_task_lineages and lineage != self.hidden_task_lineage
 
@@ -760,7 +760,7 @@ def publish_trajectory(
 def _require_admissible(trajectory: JsonObject) -> None:
     """Refuse a trajectory whose ownership or inventory a later reader could not trust."""
     lineage = trajectory.get("task_lineage")
-    if not isinstance(lineage, str) or not lineage:
+    if not isinstance(lineage, str) or not lineage.strip():
         raise ValueError("a consumed trajectory requires its task lineage")
     actions, replies = trajectory.get("actions"), trajectory.get("observed_replies")
     if not isinstance(actions, list) or not isinstance(replies, list):

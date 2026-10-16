@@ -382,9 +382,10 @@ class SessionResearch:
         Only for pinned delivery, where no investigation can inform a prediction. Each
         investigation sees the disclosed reply, its own predicted transition and the pinned
         prior research, never another investigation of this session, so the outcome does not
-        depend on completion order. The first ``maximum_updates`` misses, in step order, are
-        investigated; later misses are recorded as raw feedback. One failed investigation
-        affects only its own receipt.
+        depend on completion order. At most ``maximum_updates`` misses across all batches
+        are investigated, in supplied step order; later misses are recorded as raw feedback.
+        Failed investigation intents consume budget too. One failed investigation affects
+        only its own receipt. The session lease is held until every worker settles.
 
         Args:
             feedback: ``(operation_id, disclosed reply)`` for each predicted step, in order.
@@ -401,8 +402,22 @@ class SessionResearch:
             raise ValueError("deferred feedback requires predictions on pinned memory")
         if source != policy.feedback_source:
             raise ValueError("feedback source differs from the registered disclosure policy")
+        operations = [operation_id for operation_id, _ in feedback]
+        if len(set(operations)) != len(operations):
+            raise ValueError("feedback repeats an operation; supply each prediction only once")
         with self._lock:
-            current = self._store.read_session(self.session_id)
+            return self._observe_all_locked(feedback, source, policy, complete, workers)
+
+    def _observe_all_locked(
+        self,
+        feedback: Sequence[tuple[str, JsonValue]],
+        source: str,
+        policy: OnlineResearchPolicy,
+        complete: Completion,
+        workers: int,
+    ) -> list[JsonObject | Exception]:
+        """Plan and settle a batch while the caller owns the session lease."""
+        current = self._store.read_session(self.session_id)
         transitions = current.state.get("transitions")
         if not isinstance(transitions, list):
             raise ValueError("feedback requires completed predictions")
@@ -416,18 +431,35 @@ class SessionResearch:
         depends_on = self._dependencies(
             supplied, {}, [*_recorded_overview_sources(transitions), *self._retrieved(transitions)]
         )
-        budget = policy.maximum_updates
+        identities = {key: self._record_id(key) for key in by_operation}
+        claimed = {
+            identity
+            for identity in identities.values()
+            if self._artifacts.exists(identity + "-intent")
+        }
+        budget = max(0, policy.maximum_updates - len(claimed))
         plans: list[tuple[str, JsonObject, bool] | Exception] = []
         for operation_id, observed_reply in feedback:
-            identity = self._record_id(operation_id)
+            identity = identities.get(operation_id)
             latest = by_operation.get(operation_id)
             replies = latest.get("replies") if latest is not None else None
-            if latest is None or not isinstance(replies, list) or len(replies) != 1:
+            if (
+                identity is None
+                or latest is None
+                or not isinstance(replies, list)
+                or len(replies) != 1
+            ):
                 plans.append(ValueError("feedback requires one single-tool prediction"))
                 continue
             matched = strict_equal(replies[0], observed_reply)
-            investigate = not matched and policy.generate_hypotheses and budget > 0
-            if not matched and policy.generate_hypotheses:
+            investigate = (
+                not matched
+                and policy.generate_hypotheses
+                and budget > 0
+                and identity not in claimed
+                and not self._artifacts.exists(identity)
+            )
+            if investigate:
                 budget -= 1
             record: JsonObject = {
                 "id": identity,

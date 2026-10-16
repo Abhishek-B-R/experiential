@@ -166,6 +166,7 @@ def test_publication_admits_only_owned_well_formed_trajectories(tmp_path: Path) 
 
     read = {"name": "read", "arguments": {}}
     malformed: list[tuple[JsonObject, str]] = [
+        ({"task_lineage": " \t", "actions": [read], "observed_replies": ["r"]}, "task lineage"),
         ({"actions": [read], "observed_replies": ["r"]}, "task lineage"),
         ({"task_lineage": 7, "actions": [read], "observed_replies": ["r"]}, "task lineage"),
         ({"task_lineage": "B", "actions": [read], "observed_replies": []}, "one disclosed"),
@@ -206,3 +207,5 @@ def test_strict_eligibility_withholds_sources_without_a_task_lineage() -> None:
     assert not Eligibility(strict=True).admits(unowned)
     assert Eligibility(strict=True).admits(owned)
     assert not Eligibility(strict=True, reserved_task_lineages=("A",)).admits(owned)
+    for lineage in ("", " \t\n"):
+        assert not Eligibility(strict=True).admits({**unowned, "task_lineage": lineage})

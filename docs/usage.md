@@ -457,8 +457,10 @@ build.
 
 A simulator proposal that fails validation is never repaired: it is asked again, at most twice,
 with the refusal reason, and each re-ask is saved and counted. After that the turn fails. A trace
-buys at most 24 investigations; later misses are recorded as raw feedback without one, and the
-trace is still learned.
+buys at most 24 investigations across all feedback batches; failed investigation intents count
+toward that limit too. Later misses are recorded as raw feedback without one, and the trace is
+still learned. Concurrent investigations share one session lease, preventing another feedback
+batch or prediction from changing the session while their receipts settle.
 
 A memory version always shows the predictor the same overview: the first read of a version
 records which compressed summaries existed, and every later read of that version uses exactly
@@ -520,10 +522,18 @@ passed to the world model together with schemas, the visible transcript, retriev
 and private environment state. Parallel calls receive one ordered tool message per call ID; no
 external tool implementation runs. Malformed observation batches are invalid rollouts.
 
+Durable learning and fidelity sessions validate state-edit structure and commit a transition
+atomically. They do not mechanically enforce domain rules such as which ticket statuses may
+follow one another, or whether a literal reply agrees with the proposed state. A structurally
+valid wrong transition remains in the candidate world and can affect later predictions. Learned
+rules are provisional model hypotheses; compression is lossy and cannot certify their truth.
+Their full source records and provenance remain available. Structural correctness and measured
+reply fidelity therefore do not establish equivalence to an executable application's behavior.
+
 The public session API accepts `world.new_session(task="Research", tools=(tool_schema,))` followed
 by `world.step(session.id, assistant_message)`. Each result exposes `messages`, an ordered tuple
 of OpenAI user or tool messages, and `terminal`. Tool observations are nonterminal so the agent can
-consume them before producing its final answer. World-model artifacts pin the v2 prompt; rebuild
+consume them before producing its final answer. World-model artifacts pin the current prompt; rebuild
 projects created with a different prompt before running them.
 
 ### Build scenarios from traces
