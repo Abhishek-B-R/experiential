@@ -38,9 +38,9 @@ class RetestPanel(ContractModel):
     Attributes:
         world_model: Hybrid simulator the memory was learned on.
         memory_version: Final memory checkpoint every retest reads, frozen.
-        learned: Traces learned so far, in consumption order.
-        cases: Learned traces with at least one inexact reply, in consumption order.
-        before: Each case's test-then-train result, in the same order.
+        learned: Number of traces learned so far.
+        cases: Learned traces with at least one inexact first-measurement reply, in trace order.
+        before: Each case's first saved test-then-train measurement, in the same order.
         prepared: One saved fidelity registration per case, in the same order.
         retired: Earlier attempts that could not complete and were replaced.
     """
@@ -86,7 +86,7 @@ def register_miss_retest(
 
     Args:
         project: Project with a completed build and learning pass.
-        count: Maximum traces, the earliest misses in consumption order first.
+        count: Maximum traces, the earliest misses in trace order first.
         code_revision: Exact producing implementation identity.
         clock: Aware clock for deadlines and attempt retirement.
         retry_incomplete: Replace interrupted runs that already bought calls, buying them again.

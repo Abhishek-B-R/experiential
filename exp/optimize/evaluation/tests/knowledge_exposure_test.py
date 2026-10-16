@@ -28,7 +28,13 @@ SECRET = "HELDOUT_REPLY_SECRET: reply-0"
 OWN = "held-out-trace"
 
 
-def bound(root: Path, knowledge: SimulationKnowledge | None = None, case: str = "") -> FidelitySpec:
+def bound(
+    root: Path,
+    knowledge: SimulationKnowledge | None = None,
+    case: str = "",
+    *,
+    library_source: JsonObject | None = None,
+) -> FidelitySpec:
     """A held-out task (sourced from ``OWN``) on the fixture simulator with this knowledge.
 
     ``same-lineage`` puts the task in the lineage of the indexed trace ``observed`` and binds
@@ -36,6 +42,8 @@ def bound(root: Path, knowledge: SimulationKnowledge | None = None, case: str = 
     """
     project, base = memory_project(root)
     artifact = load_grounded_world_model_artifact(project.artifacts, base.world_model)
+    if library_source is not None:
+        knowledge = SimulationKnowledge(transfer_context=_selected(project, source=library_source))
     if case in ("library", "dependency-only"):
         knowledge = SimulationKnowledge(
             source_trace_ids=("observed",),
@@ -70,7 +78,9 @@ def _indexed_lineage(project: ProjectStore, artifact: GroundedWorldModelArtifact
     return next(row.lineage_id for row in index.transitions if row.trace_id == "observed")
 
 
-def _selected(project: ProjectStore, *, own_source: bool = True) -> JsonObject:
+def _selected(
+    project: ProjectStore, *, own_source: bool = True, source: JsonObject | None = None
+) -> JsonObject:
     """A prior-library selection whose entry derives from (or only depends on) held-out data."""
     payload = {
         "trajectory": {
@@ -81,6 +91,8 @@ def _selected(project: ProjectStore, *, own_source: bool = True) -> JsonObject:
             "observed_replies": [SECRET],
         }
     }
+    if source is not None:
+        payload = {"trajectory": source}
     manifest = project.artifacts.write_json(
         artifact_id="held-out-source",
         artifact_type="consumed-trajectory",
@@ -199,3 +211,38 @@ def test_a_registration_made_before_the_guard_is_refused_on_reuse_and_execution(
     with pytest.raises(ValueError, match="no recorded provenance"):
         execute_fidelity_evaluation(project, prepared)
     assert not wire.requests
+
+
+@pytest.mark.parametrize(
+    ("source", "case", "message"),
+    [
+        ({}, "", "no recorded provenance"),
+        ({"source_trace_ids": ["observed"]}, "", "no recorded provenance"),
+        ({"source_trace_ids": ["observed"]}, "same-lineage", "own recorded"),
+        (
+            {"task_lineage": "independent", "source_trace_ids": ["ghost"]},
+            "",
+            "trace ghost",
+        ),
+    ],
+    ids=["empty-source", "missing-lineage", "sibling-trace", "unknown-trace"],
+)
+def test_library_source_contents_must_establish_independence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: JsonObject, case: str, message: str
+) -> None:
+    """A valid artifact digest cannot substitute for its source's missing provenance."""
+    monkeypatch.delenv("FIDELITY_TEST_KEY", raising=False)
+    spec = bound(tmp_path, case=case, library_source=source)
+    project = ProjectStore(tmp_path, "fidelity-test")
+    with pytest.raises(ValueError, match=message):
+        prepare_fidelity_evaluation(project, spec, code_revision="test")
+
+
+def test_resolved_independent_library_source_is_accepted(tmp_path: Path) -> None:
+    """A library entry with known independent source evidence remains usable."""
+    spec = bound(
+        tmp_path,
+        library_source={"task_lineage": "source", "source_trace_ids": ["observed"]},
+    )
+    project = ProjectStore(tmp_path, "fidelity-test")
+    assert prepare_fidelity_evaluation(project, spec, code_revision="test").spec == spec

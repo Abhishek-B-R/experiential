@@ -529,7 +529,7 @@ def test_build_learns_from_fit_traces_then_measures_held_out_on_final_memory(
     assert head is not None
     fit = USERS - len(held_out_lineages(store))
     assert f"learned {fit}/{fit} fit traces · memory v{fit}" in output
-    assert "Learning curve exact replies by consumption order:" in output
+    assert "Learning curve exact replies by trace order:" in output
     # Held-out lineages were reserved before learning and never consumed.
     held = held_out_lineages(store)
     assert all(is_reserved(store.artifacts, plan.lineage, lineage) for lineage in held)

@@ -57,7 +57,7 @@ def test_a_missed_turn_is_fixed_on_the_final_memory_and_replays_without_calls(
     assert "Miss retest 3/3 replies exact (100%)" in output
     assert "exact before learning 2/3 (67%) → after 3/3 (100%)" in output
     assert "fixed 1 of 1 missed turns · 0 regressed" in output
-    assert "Test-then-train fidelity" in output
+    assert "Learning progress (test-then-train" in output
     purchased = len(provider.requests)
     assert purchased > learned
     # Learning hid the trace's own task; the retest reads what memory learned from it.

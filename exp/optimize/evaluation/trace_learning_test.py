@@ -88,8 +88,12 @@ def test_default_learning_consumes_every_trace_and_reports_test_then_train(
     assert not any(is_reserved(store.artifacts, plan.lineage, lineage) for lineage in held)
     assert f"learned {USERS}/{USERS} traces · memory v{USERS}" in output
     exact = 3 * USERS - 1  # only the first trace's learnable turn is wrong
-    headline = f"Test-then-train fidelity (recorded actions) {exact}/{3 * USERS} replies exact"
+    headline = f"Learning progress (test-then-train, recorded actions) {exact}/{3 * USERS} replies"
     assert headline in output
+    # Traces 10-12 learn on nearly final memory; all their turns are exact.
+    estimate = "latest unseen-task estimate 100% replies exact (9/9) over the last 3 trace(s)"
+    assert estimate in output
+    assert "run exp build --learn --hold-out, then exp eval --held-out-fidelity N" in output
     assert "next: exp eval retail --retest-misses N" in output
     judging = [r for r in provider.requests if "axes" in json.dumps(r.payload.get("tools"))]
     assert not judging, "learning is scored by exact replies and never buys a judge call"

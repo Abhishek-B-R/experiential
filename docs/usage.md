@@ -424,8 +424,8 @@ reports contain measurements only, never an approval or denial. See the
 `exp build PROJECT -t PATH --learn --memory-recall ALIAS [--max-learning-attempts N]` adds an
 opt-in learning pass after the build. It replays every trace once, in export order, on a hybrid
 simulator: learned memory supplies behavioral rules, and the build's index supplies recorded facts
-(a trace never retrieves its own lineage). Each step is predicted, then the recorded reply is
-disclosed and mismatches are investigated. Only investigations the investigator marks
+(a trace never retrieves its own lineage). Every step in a trace is predicted before its recorded
+replies are disclosed and mismatches are investigated. Only investigations the investigator marks
 transferable, phrased by the observable cue that triggers them, become memory rules; every
 investigation stays recallable as a record. Each trace is published as one memory version and
 the memory log is compressed. `ALIAS` is a native decision model on the SystemOne decisions wire
@@ -441,9 +441,19 @@ memory either. The recorded actions are replayed in order, but after the trace's
 the simulator sees its own earlier replies and state, never the recorded replies, so an early
 error carries forward into later turns. Every learning report is therefore a measurement of
 recorded actions over the simulator's own history, on a task memory has not learned, even though
-every trace is consumed. The pass prints this
-test-then-train fidelity (replies exact, reply fields matching, and the second half alone, once
-memory has learned half the traces) and a learning curve of exact replies by consumption order.
+every trace is consumed. The pass prints this as learning progress (replies exact and reply
+fields matching), a learning curve of exact replies by trace order, and the latest unseen-task
+estimate: the last quarter of traces, predicted on nearly final memory, with its trace count.
+Traces whose learning fails remain in the score; their separate count shows when prediction
+progress exceeds memory growth.
+
+Learning progress averages simulators from empty memory to nearly final memory, so it shows
+whether memory helps as it grows. It does not measure the final simulator on unseen traces:
+after the pass, no trace is left unseen. Claims about the final simulator on unseen traces
+come from `--hold-out` with `--held-out-fidelity` (below). That panel measures a simulator
+that learned only the fit traces, a conservative proxy for the one learned from every trace.
+One build gives one or the other: for a report, run the held-out audit, and ship the default
+build.
 
 A simulator proposal that fails validation is never repaired: it is asked again, at most twice,
 with the refusal reason, and each re-ask is saved and counted. After that the turn fails. A trace
@@ -467,18 +477,27 @@ one aggregate line (replies exact, reply fields matching, judge mean), how often
 per-turn verdict agrees with exact reproduction (a check on the judge, not a score), and the
 learning curve. Without `--hold-out` there is no held-out trace left, and it refuses.
 
+The audit stays independent only while nobody tunes the simulator on its cases. Held-out traces
+are selected deterministically, so a second audit replays the same ones. Once anyone inspects a
+held-out trace's per-trace results (`--verbose`, the per-trace table or its transcript) and
+changes prompts, rules or code in response, that trace is development data: a later score on it
+is a re-audit of fitted cases, not an independent measurement. The provenance checks cannot see
+this channel. An independent audit after such tuning needs held-out lineages nobody has
+inspected, which in practice means new traces from a new import.
+
 In every replay, turns the simulator never answered count as not reproduced, and `--verbose`
 adds every trace and turn. Run IDs are derived from the run's inputs, including the prompts the
 simulator sends, so a changed input starts a new run and an unchanged one replays without provider
 calls. A run that stopped after buying calls is never bought again silently: rerun with
 `--retry-incomplete` (on `exp build --learn`, `exp eval --retest-misses` or
 `exp eval --held-out-fidelity`) to replace it. A learning trace that stops before completing is
-retried up to three times in the same pass; any trace still not learned is reported, and only
-learned traces count. Every trace is predicted whole before any of its replies is disclosed;
+retried up to three times in the same pass; any trace still not learned is reported separately.
+Every trace is predicted whole before any of its replies is disclosed;
 investigations of its misses then run together, so a failed investigation never prevents a
-prediction. A trace is scored by the attempt consumed into memory, or by its last attempt when
-it was never learned, and the curve reports traces not learned separately; the retest covers
-learned traces only. A cancelled `--learn` preflight records nothing; without `--hold-out`, later commands
+prediction. A trace's first saved measurement fixes its score, including unanswered turns as
+misses. Later learning retries cannot replace that measurement, and the curve reports traces not
+learned separately. The retest covers learned traces only and preserves their first measurement
+as its baseline. A cancelled `--learn` preflight records nothing; without `--hold-out`, later commands
 read the memory that learned most recently.
 
 Knowledge pinned in a simulator (built outside `exp build`, for example for `exp eval --fidelity`)

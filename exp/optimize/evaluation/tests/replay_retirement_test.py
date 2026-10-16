@@ -16,7 +16,7 @@ from exp.common.models import (
     write_model_catalog,
 )
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation import trace_learning
+from exp.optimize.evaluation import trace_learning, trace_replay
 from exp.optimize.evaluation.fidelity import execute_fidelity_evaluation
 from exp.optimize.evaluation.fidelity_memory import DUPLICATE, saved_memory_receipt
 from exp.optimize.evaluation.held_out_fidelity import register_held_out_fidelity
@@ -24,17 +24,25 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     REVISION,
     USERS,
     SimulatedProvider,
+    _arr,
+    _at,
+    _obj,
+    _user_content,
     build_project,
     episode,
 )
 from exp.optimize.evaluation.miss_retest import register_miss_retest
+from exp.optimize.evaluation.tests.fidelity_memory_test import memory_project
 from exp.optimize.evaluation.trace_learning import (
+    fit_calls,
     learn_from_traces,
     learning_curve,
     learning_plan,
     learning_progress,
 )
 from exp.runtime.models.providers.transport import JsonHttpResponse
+from exp.simulation.retrieval import load_rag_index
+from exp.simulation.world_model.observed_tools import observed_calls
 
 
 def now() -> datetime:
@@ -178,7 +186,7 @@ class FlakyInvestigator(SimulatedProvider):
 
 
 @pytest.mark.parametrize("failures", [1, 99])
-def test_scores_and_retests_use_only_the_consumed_attempt(
+def test_scores_keep_first_report_and_retests_require_learning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failures: int
 ) -> None:
     """Every trace is predicted whole; learning success decides learning, never scoring."""
@@ -192,11 +200,17 @@ def test_scores_and_retests_use_only_the_consumed_attempt(
     scored, unscored = learning_progress(store, plan)
     assert not unscored and len(scored) == USERS, "every trace is scored"
     assert sum(learned for *_, learned in scored) == outcome.learned
-    for _, prepared, result, learned in scored:
+    for case, prepared, result, learned in scored:
         assert result.report.mechanical["valid_steps"] == result.steps, "whole trace predicted"
-        receipt = saved_memory_receipt(store, prepared)
-        consumed = receipt is not None and receipt.get("reason") in ("consumed", DUPLICATE)
-        assert consumed == learned
+        attempts = trace_learning._saved_attempts(store, plan, case)
+        assert prepared.id == attempts[0][0].id, "learning retries cannot replace a score"
+        consumed = [
+            receipt
+            for attempt, _ in attempts
+            if (receipt := saved_memory_receipt(store, attempt)) is not None
+            and receipt.get("reason") in ("consumed", DUPLICATE)
+        ]
+        assert bool(consumed) == learned
     curve = learning_curve(store)
     assert curve is not None and len(curve.points) == USERS
     assert curve.incomplete == outcome.incomplete
@@ -208,9 +222,110 @@ def test_scores_and_retests_use_only_the_consumed_attempt(
             register_miss_retest(store, 99, code_revision=REVISION, clock=now)
         return
     assert curve.incomplete == 0
-    case, consumed_attempt, _, _ = scored[0]
+    case, first_attempt, _, _ = scored[0]
     attempts = trace_learning._saved_attempts(store, plan, case)
-    assert len(attempts) > 1 and attempts[0][0].id != consumed_attempt.id, "first attempt failed"
+    assert len(attempts) > 1 and attempts[0][0].id == first_attempt.id, "first attempt stays scored"
     panel = register_miss_retest(store, 99, code_revision=REVISION, clock=now)
     assert panel.learned == USERS
-    assert panel.before[0].run_id == consumed_attempt.spec.run_id
+    assert panel.before[0].run_id == first_attempt.spec.run_id
+
+
+class RedrawnPrediction(FlakyInvestigator):
+    """An identical first draw misses; a subsequent draw of that tool happens to be correct."""
+
+    def __init__(self, episodes: list[JsonObject]) -> None:
+        """Track prediction draws independently of investigation success."""
+        super().__init__(episodes)
+        self.first_task: str | None = None
+        self.draws = 0
+
+    def _transition(self, payload: JsonObject) -> JsonObject:
+        """Miss the first task's first user-details draw regardless of investigator behavior."""
+        result = super()._transition(payload)
+        body = _user_content(payload)
+        task = str(_at(body, "task", "initial_context", "task_lineage"))
+        if self.first_task is None:
+            self.first_task = task
+        tool = _at(body, "candidate_response", "tool_calls", 0, "name")
+        if task == self.first_task and tool == "get_user_details":
+            self.draws += 1
+            if self.draws == 1:
+                _obj(_arr(result["observations"])[0])["reply"] = {"error": "first draw missed"}
+        return result
+
+
+@pytest.mark.parametrize("investigation_failures", [0, 1])
+def test_investigation_failure_cannot_select_a_better_prediction_score(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, investigation_failures: int
+) -> None:
+    """Retrying learning must preserve the first measurement and its miss-retest baseline."""
+    episodes = [episode(i) for i in range(4)]
+    provider = RedrawnPrediction(episodes)
+    provider.failures = investigation_failures
+    _, store, _ = build_project(tmp_path, monkeypatch, provider, episodes=episodes)
+    outcome = learn_from_traces(
+        store, recall_alias="jev", maximum_attempts=10_000, code_revision=REVISION, clock=now
+    )
+    assert outcome.learned == 4 and outcome.incomplete == 0
+    curve = learning_curve(store)
+    assert curve is not None
+    assert sum(point.exact for point in curve.points) == 11
+    assert sum(point.steps for point in curve.points) == 12
+    case = trace_learning.learning_cases(store, "all")[0]
+    attempts = trace_learning._saved_attempts(store, learning_plan(store), case)
+    assert len(attempts) == 1 + investigation_failures
+    assert curve.points[0].run_id == attempts[0][0].spec.run_id
+    panel = register_miss_retest(store, 4, code_revision=REVISION, clock=now)
+    assert panel.before[0].run_id == attempts[0][0].spec.run_id
+
+
+def test_a_world_model_without_tools_is_refused_before_any_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Structured transitions and investigations need tools; refuse clearly, buy nothing."""
+    provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
+    _, store, _ = build_project(tmp_path, monkeypatch, provider)
+    catalog = load_model_catalog(store.model_catalog_path)
+    world = catalog.roles.world_model
+    assert world is not None
+    record = catalog.models[world]
+    assert record.capabilities is not None
+    plain = record.model_copy(
+        update={"capabilities": record.capabilities.model_copy(update={"supports_tools": False})}
+    )
+    write_model_catalog(
+        store.model_catalog_path,
+        catalog.model_copy(update={"models": {**catalog.models, world: plain}}),
+    )
+    sent = len(provider.requests)
+    with pytest.raises(ValueError, match="tool-capable world model"):
+        learn_from_traces(
+            store, recall_alias="jev", maximum_attempts=10_000, code_revision=REVISION, clock=now
+        )
+    assert len(provider.requests) == sent
+
+
+def test_editing_a_sent_prompt_addresses_a_new_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Saved results never replay under a system prompt they were not produced with."""
+    _, base = memory_project(tmp_path)
+    before = trace_replay.content_run_id(base, "held-out", "trace")
+    monkeypatch.setattr(
+        trace_replay, "MEMORY_CONTEXT_GUIDANCE", trace_replay.MEMORY_CONTEXT_GUIDANCE + " Edited."
+    )
+    assert trace_replay.content_run_id(base, "held-out", "trace") != before
+
+
+def test_both_profiles_derive_tool_schemas_from_the_same_fit_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Memory-first and source-RAG see the same fit tool inventory, prefixes included."""
+    provider = SimulatedProvider([episode(i) for i in range(USERS)])
+    _, store, _ = build_project(tmp_path, monkeypatch, provider)
+    build = store.load_project().build
+    assert build is not None
+    fit = load_rag_index(store.artifacts, build.fit_rag.artifact_id)
+    assert {name for name, _ in fit_calls(store)} == {
+        name for name, _ in observed_calls(fit.transitions)
+    }

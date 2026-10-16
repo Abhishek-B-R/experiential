@@ -68,11 +68,6 @@ def knowledge_exposure(
         traces.update(note.source_trace_ids)
         if not note.source_trace_ids:
             unknown.append(f"research note {note.id}")
-    for trace in sorted(traces):
-        if trace in lineage_of:
-            lineages.add(lineage_of[trace])
-        else:
-            unknown.append(f"trace {trace}")
     selected = knowledge.transfer_context.get("selected", [])
     for record in selected if isinstance(selected, list) else []:
         entry = _entry(record)
@@ -81,12 +76,24 @@ def knowledge_exposure(
             continue
         references = [ref for ref in (entry.derived_from, *entry.depends_on) if ref is not None]
         sources = [load_source(store, ref) for ref in references]
-        if entry.derived_from is None or any(source is None for source in sources):
+        if entry.derived_from is None or any(
+            source is None
+            or not isinstance(source.get("task_lineage"), str)
+            or not source["task_lineage"]
+            for source in sources
+        ):
             unknown.append(f"prior-library entry {entry.entry_id}")
         for source in sources:
             if source is None:
                 continue
             _collect(source, traces, lineages)
+    # Resolve every channel's trace IDs, including those collected from library sources.
+    # A valid artifact manifest establishes integrity, not the source's provenance.
+    for trace in sorted(traces):
+        if trace in lineage_of:
+            lineages.add(lineage_of[trace])
+        else:
+            unknown.append(f"trace {trace}")
     return KnowledgeExposure(
         trace_ids=frozenset(traces), task_lineages=frozenset(lineages), unknown=tuple(unknown)
     )

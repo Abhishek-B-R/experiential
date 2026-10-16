@@ -18,8 +18,10 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     build_project,
     episode,
 )
+from exp.optimize.evaluation.trace_learning import learning_plan
 from exp.optimize.evaluation.trace_learning_test import memory_delivered
 from exp.runtime.models.providers.transport import JsonHttpResponse, RecordedRequest
+from exp.simulation.world_model.experience_memory import memory_head
 
 CANARY = re.compile(r"CANARY_user_\d+")
 HASH = re.compile(r"[0-9a-f]{20,}")
@@ -153,15 +155,22 @@ def test_a_trace_memory_never_reflects_its_own_recorded_answer_through_another_t
         root = tmp_path / f"bit-{bit}"
         root.mkdir()
         provider = BitProvider(episodes)
-        build_project(
+        _, store, _ = build_project(
             root, monkeypatch, provider, "--learn", "--memory-recall", "jev", episodes=episodes
         )
+        head = memory_head(store.artifacts, learning_plan(store).lineage)
+        assert head is not None and head.version == len(episodes), "every trace was learned"
         assert provider.seen, "another trace retrieved B's recorded answer"
         own = [
             prediction
             for prediction in provider.predictions()
             if _at(prediction, "task", "initial_context", "task_lineage") == "user_02"
         ]
+        assert len(own) == 3, "the source task completed all predictions without re-asks"
+        assert all(
+            _obj(prediction.get("research_history") or {}).get("memory_overview")
+            for prediction in own
+        ), "the comparison must include memory learned from another trace"
         # Content hashes (lineage and trajectory IDs) differ because B's trace differs.
         delivered.append([HASH.sub("#", memory_delivered(prediction)) for prediction in own])
     assert delivered[0] == delivered[1]

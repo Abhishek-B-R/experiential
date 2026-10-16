@@ -15,8 +15,8 @@ with none of its own feedback or investigations, and with memory from earlier tr
 same task lineage hidden. The recorded actions are replayed in order; after the trace's public
 prefix the simulator sees its own earlier replies and state, never the recorded replies, so its
 errors carry forward. Every saved learning report therefore measures the simulator, on the
-recorded actions over its own simulated history, on a task it has not learned, with all traces
-consumed.
+recorded actions over its own simulated history, on a task it has not learned. Prediction
+measurements remain available even when subsequent learning fails.
 
 Scope ``fit`` keeps the build's held-out lineages out instead: they are reserved before the
 first trace is registered, can never be learned, and remain for an independent held-out panel.
@@ -108,11 +108,11 @@ class LearningOutcome(ContractModel):
         plan: Learning plan.
         traces: Traces in learning order.
         learned: Traces consumed into memory (published, or already consumed).
-        incomplete: Traces whose every allowed attempt stopped before completing, so they
-            were not consumed; the pass continues past them and reports them.
+        incomplete: Traces not consumed after their allowed attempts. Their predictions can
+            still be complete when an investigation fails; the pass reports them separately.
         head_version: Memory version after the pass; 0 before any publication.
         attempts_used: Physical attempts this invocation claimed.
-        stopped: Why the pass stopped early, or None when every trace completed.
+        stopped: Why the pass stopped early, or None when every trace was visited.
     """
 
     plan: LearningPlan
@@ -125,13 +125,13 @@ class LearningOutcome(ContractModel):
 
 
 class CurveWindow(ContractModel):
-    """Exact replies over one contiguous stretch of consumption order.
+    """Exact replies over one contiguous stretch of trace order.
 
     Attributes:
         first: First trace position (1-based).
         last: Last trace position.
         exact: Exactly predicted replies.
-        steps: Predicted steps.
+        steps: Planned steps, including unanswered slots.
     """
 
     first: int
@@ -149,10 +149,10 @@ class LearningCurve(ContractModel):
     """Accuracy of each trace's prediction, made before that trace was learned.
 
     Attributes:
-        points: Each scored trace's result in consumption order: its consumed attempt, or
-            its last attempt when it was never learned.
-        quarters: Four consumption windows; the boundary after the second is ~50% consumed.
-        halves: First and second half of consumption.
+        points: Each trace's first saved measurement, in trace order. Learning retries never
+            replace an existing measurement, whether or not they publish memory.
+        quarters: Four windows of scored traces in export order.
+        halves: First and second half of scored traces, independent of learning success.
         incomplete: Traces not learned into memory (scored when their predictions completed).
     """
 
@@ -162,33 +162,42 @@ class LearningCurve(ContractModel):
     incomplete: int = 0
 
     def headline(self) -> str:
-        """Test-then-train fidelity over every learned trace, then over the second half.
+        """Learning progress over every scored trace, then the latest unseen-task estimate.
 
         Each trace was predicted whole on the memory pinned before it, with earlier traces of its
-        task hidden, so this measures tasks memory has not learned even though every trace is
-        consumed. Recorded actions are replayed over the simulator's own history, so errors
-        carry forward. The second half reads memory that has learned at least half the traces.
+        task hidden, so the total averages simulators from empty memory to nearly final memory:
+        a learning-progress diagnostic, not the final simulator's performance. The last-quarter
+        window (memory nearly final) is the latest unseen-task estimate, shown with its trace
+        count. Claims about the final simulator on unseen traces come from ``--hold-out`` and
+        ``--held-out-fidelity``. Recorded actions are replayed over the simulator's own
+        history, so errors carry forward. Traces whose learning failed remain scored and are
+        counted separately.
         """
         exact = sum(p.exact for p in self.points)
         steps = sum(p.steps for p in self.points)
         matched = sum(p.fields_matched for p in self.points)
         total = sum(p.fields_total for p in self.points)
         line = (
-            f"Test-then-train fidelity (recorded actions)  {exact}/{steps} replies exact "
-            f"({_share(exact, steps)}) · "
-            f"{_share(matched, total)} reply fields match ({matched}/{total}) · "
-            f"{len(self.points)} traces"
+            f"Learning progress (test-then-train, recorded actions)  {exact}/{steps} replies "
+            f"exact ({_share(exact, steps)}) · {_share(matched, total)} reply fields match "
+            f"({matched}/{total}) · {len(self.points)} traces"
         )
-        if len(self.halves) == 2:
-            line += f" · second half {self.halves[1].share} exact"
         if self.incomplete:
             line += f" · {self.incomplete} trace(s) not learned"
+        if self.quarters:
+            last = self.quarters[-1]
+            count = last.last - last.first + 1
+            line += (
+                f"\n  latest unseen-task estimate  {last.share} replies exact "
+                f"({last.exact}/{last.steps}) over the last {count} trace(s), {last.first}-"
+                f"{last.last}"
+            )
         return line
 
     def line(self) -> str:
-        """One line: exact replies per consumption quarter, then first versus second half."""
+        """One line: exact replies per trace-order quarter, then first versus second half."""
         quarters = " · ".join(f"{w.first}-{w.last} {w.share}" for w in self.quarters)
-        line = f"Learning curve  exact replies by consumption order: {quarters}"
+        line = f"Learning curve  exact replies by trace order: {quarters}"
         if len(self.halves) == 2:
             line += f" (first half → second half {' → '.join(w.share for w in self.halves)})"
         return line
@@ -540,14 +549,14 @@ def learn_from_traces(
 
 
 def learning_curve(project: ProjectStore, scope: Scope | None = None) -> LearningCurve | None:
-    """Accuracy of each trace's prediction in consumption order, from saved reports only.
+    """Accuracy of each trace's first measurement in trace order, from saved reports only.
 
     Args:
         project: Project with a recorded learning plan.
         scope: Plan to read; None reads the recorded plan (``all`` when both exist).
 
     Returns:
-        The curve over learned traces, or None before anything was learned.
+        The curve over scored traces, or None before any measurement was saved.
     """
     runs, unscored = learning_progress(project, learning_plan(project, None, scope))
     points = [result for _, _, result, _ in runs]
@@ -564,15 +573,15 @@ def learning_curve(project: ProjectStore, scope: Scope | None = None) -> Learnin
 def learned_runs(
     project: ProjectStore, plan: LearningPlan
 ) -> list[tuple[ReplayCase, PreparedFidelity, ReplayResult]]:
-    """Learned traces in consumption order, each with its consumed attempt.
+    """Learned traces in export order, each with its first saved measurement.
 
     Args:
         project: Project with a recorded learning plan.
         plan: That plan.
 
     Returns:
-        Each learned case with the registration and test-then-train result of the attempt
-        that was consumed into memory.
+        Each learned case with its original registration and test-then-train result. A later
+        successful learning retry never erases a miss from the retest baseline.
     """
     learned, _ = learning_progress(project, plan)
     return [(case, prepared, result) for case, prepared, result, ok in learned if ok]
@@ -581,14 +590,14 @@ def learned_runs(
 def learning_progress(
     project: ProjectStore, plan: LearningPlan
 ) -> tuple[list[tuple[ReplayCase, PreparedFidelity, ReplayResult, bool]], list[ReplayCase]]:
-    """Every scored trace in consumption order, read from saved attempts without calls.
+    """Every scored trace in export order, read from saved attempts without calls.
 
     Each trace is predicted whole before any of its feedback is used, so every attempt with
-    a saved report scores the whole trace. A trace is scored by the attempt consumed into
-    memory; a trace never consumed (for example, an investigation failed on every attempt)
-    is scored by its last attempt and reported as not learned. Learning success therefore
-    never decides which traces are scored. Reading stops at the first trace no attempt has
-    run for.
+    a saved report scores the whole trace, including unanswered slots as misses. The first
+    saved report fixes that trace's measurement. Later attempts can complete learning, but
+    cannot replace the score with a different prediction draw. Whether any attempt consumed
+    the trace determines only its learning status and eligibility for a retention retest.
+    Reading stops at the first trace no attempt has run for.
 
     Args:
         project: Project with a recorded learning plan.
@@ -613,7 +622,7 @@ def learning_progress(
             if (receipt := saved_memory_receipt(project, prepared)) is not None
             and receipt.get("reason") in ("consumed", DUPLICATE)
         ]
-        prepared, report = consumed[0] if consumed else attempts[-1]
+        prepared, report = attempts[0]
         result = replay_result(project, case, prepared, report)
         scored.append((case, prepared, result, bool(consumed)))
     return scored, unscored
@@ -658,7 +667,7 @@ def _saved_attempts(
 
 
 def _windows(points: list[ReplayResult], parts: int) -> tuple[CurveWindow, ...]:
-    """Split consumption order into ``parts`` contiguous, nearly equal windows."""
+    """Split scored trace order into ``parts`` contiguous, nearly equal windows."""
     windows = []
     for part in range(parts):
         lo = part * len(points) // parts

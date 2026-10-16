@@ -122,6 +122,14 @@ def run_learning(
     if curve is not None:
         console.print(Text(curve.headline()))
         console.print(Text(curve.line()))
+        console.print(
+            Text(
+                "This measures learning progress over an evolving memory. For the final "
+                "simulator on unseen traces, run exp build --learn --hold-out, then exp eval "
+                "--held-out-fidelity N.",
+                style="dim",
+            )
+        )
     console.print(f"next: exp eval {project} --retest-misses N")
     if hold_out:
         console.print(f"      exp eval {project} --held-out-fidelity N")
