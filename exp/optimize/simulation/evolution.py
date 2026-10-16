@@ -16,14 +16,18 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.project import ArtifactStore, artifact_input
-from exp.optimize.simulation.library import LibrarySelection, select_library_edit
-from exp.optimize.simulation.prompts import PromptCase, PromptEvaluation
+from exp.optimize.simulation.library import (
+    LibraryCase,
+    LibraryEvaluation,
+    LibrarySelection,
+    select_library_edit,
+)
 from exp.simulation.engines.text.knowledge import SimulationKnowledge
 from exp.simulation.reconstruction.library import LibraryEntry, LibrarySnapshot, extend_library
 from exp.simulation.reconstruction.revision import ResearchNote
 
 
-class LibraryTrainingCase(PromptCase):
+class LibraryTrainingCase(LibraryCase):
     """An exposed development example with explicit admitted-source identities.
 
     Attributes:
@@ -69,11 +73,11 @@ def evolve_library(
     store: ArtifactStore,
     run_id: str,
     training: Sequence[LibraryTrainingCase],
-    held_out: Sequence[PromptCase],
-    protected: Sequence[PromptCase],
+    held_out: Sequence[LibraryCase],
+    protected: Sequence[LibraryCase],
     evaluator_sha256: Sha256,
     complete: Callable[[JsonObject, str], JsonObject],
-    evaluate: Callable[[SimulationKnowledge, PromptCase], PromptEvaluation],
+    evaluate: Callable[[SimulationKnowledge, LibraryCase], LibraryEvaluation],
     record: Callable[[JsonObject], None],
     created_at: datetime,
     code_revision: str,

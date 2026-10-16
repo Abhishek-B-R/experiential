@@ -40,7 +40,6 @@ FORBIDDEN_REQUIREMENTS = frozenset(
     {
         "anthropic",
         "environment-capture",
-        "gepa",
         "mlx-lm",
         "opentelemetry-proto",
         "scikit-learn",

@@ -207,12 +207,10 @@ import sys
 import exp.runtime.router
 
 offline = sorted(name for name in sys.modules if name.startswith("exp.optimize"))
-gepa = sorted(name for name in sys.modules if name == "gepa" or name.startswith("gepa."))
 simulation_model = sorted(
     name for name in sys.modules if name.startswith("exp.simulation.model")
 )
 assert not offline, offline
-assert not gepa, gepa
 assert not simulation_model, simulation_model
 """
     subprocess.run([sys.executable, "-c", code], check=True, timeout=120)

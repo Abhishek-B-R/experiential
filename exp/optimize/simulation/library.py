@@ -1,10 +1,51 @@
 """Development selection of behavioral-library edits on fixed held-out logs."""
 
+from __future__ import annotations
+
 from collections.abc import Callable, Sequence
+from typing import Literal
+
+from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject, Sha256, sha256_json
-from exp.optimize.simulation.prompts import PromptCase, PromptEvaluation
 from exp.simulation.engines.text.knowledge import SimulationKnowledge
+
+
+class LibraryCase(ContractModel):
+    """One development example; confirmation data is absent from this selection interface.
+
+    Attributes:
+        case_id: Stable example identity.
+        lineage_id: Shared source or fixture family, disjoint across selection splits.
+        input: Permitted development inputs supplied to the declared evaluator.
+    """
+
+    case_id: str = Field(min_length=1)
+    lineage_id: str = Field(min_length=1)
+    input: JsonObject
+
+
+class LibraryEvaluation(ContractModel):
+    """Actual execution outcome and grounded feedback, including failed examples.
+
+    Attributes:
+        score: Fixed evaluator metric in [0, 1], with unavailable execution scoring zero.
+        status: Actual execution/evaluation status, retained separately from score.
+        output: Exact outputs or references retained by the evaluator.
+        feedback: Development-only observations for proposing edits.
+    """
+
+    score: float = Field(ge=0, le=1, allow_inf_nan=False)
+    status: Literal["completed", "failed", "unassessable"]
+    output: JsonObject
+    feedback: str
+
+    @model_validator(mode="after")
+    def unavailable(self) -> LibraryEvaluation:
+        """Do not reward failed evaluations by omitting them from the selection metric."""
+        if self.status != "completed" and self.score != 0:
+            raise ValueError("unavailable evaluations must retain zero selection credit")
+        return self
 
 
 class LibrarySelection(ContractModel):
@@ -33,11 +74,11 @@ def select_library_edit(
     parent: SimulationKnowledge,
     candidate: SimulationKnowledge,
     *,
-    training: Sequence[PromptCase],
-    held_out: Sequence[PromptCase],
-    protected: Sequence[PromptCase],
+    training: Sequence[LibraryCase],
+    held_out: Sequence[LibraryCase],
+    protected: Sequence[LibraryCase],
     evaluator_sha256: Sha256,
-    evaluate: Callable[[SimulationKnowledge, PromptCase], PromptEvaluation],
+    evaluate: Callable[[SimulationKnowledge, LibraryCase], LibraryEvaluation],
     record: Callable[[JsonObject], None],
     minimum_gain: float = 0,
 ) -> LibrarySelection:

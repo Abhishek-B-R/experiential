@@ -9,7 +9,7 @@ import pytest
 from exp.common.core.artifacts import ArtifactEnvelope, JsonObject, sha256_bytes
 from exp.common.project import ProjectConfig, ProjectStore, artifact_input
 from exp.optimize.simulation.evolution import LibraryTrainingCase, evolve_library
-from exp.optimize.simulation.prompts import PromptCase, PromptEvaluation
+from exp.optimize.simulation.library import LibraryCase, LibraryEvaluation
 from exp.simulation.engines.text.knowledge import SimulationKnowledge
 from exp.simulation.reconstruction.library import LibraryEntry, extend_library, retrieve_library
 from exp.simulation.world_model.runtime_test import _trace
@@ -51,8 +51,8 @@ def test_selected_edit_is_retrievable_and_rejected_edit_is_research_only(
             case_id="training", lineage_id="training-world", input={}, source_trace_ids=("source",)
         ),
     )
-    held = (PromptCase(case_id="secret-selection", lineage_id="selection-world", input={}),)
-    protected = (PromptCase(case_id="protected", lineage_id="protected-world", input={}),)
+    held = (LibraryCase(case_id="secret-selection", lineage_id="selection-world", input={}),)
+    protected = (LibraryCase(case_id="protected", lineage_id="protected-world", input={}),)
     events: list[JsonObject] = []
 
     def complete(body: JsonObject, logical_id: str) -> JsonObject:
@@ -66,13 +66,13 @@ def test_selected_edit_is_retrievable_and_rejected_edit_is_research_only(
             "source_trace_ids": ["source"],
         }
 
-    def evaluate(knowledge: SimulationKnowledge, case: PromptCase) -> PromptEvaluation:
+    def evaluate(knowledge: SimulationKnowledge, case: LibraryCase) -> LibraryEvaluation:
         """Give the child a held-out gain, optionally with a disqualifying regression."""
         edited = knowledge.rules != parent.rules
         score = 0.5 + (0.5 if edited else 0)
         if case.case_id == "protected":
             score = 0.5 if regress and edited else 1
-        return PromptEvaluation(
+        return LibraryEvaluation(
             score=score, status="completed", output={}, feedback="training failure"
         )
 
