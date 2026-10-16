@@ -65,11 +65,16 @@ class OnlineResearchPolicy(ContractModel):
         retained_notes: Maximum active investigations supplied to the investigator.
         selection_policy_sha256: Exact query-dependent memory selection policy.
         generate_hypotheses: False retains raw discrepancy feedback without an investigator call.
+        notes_reach_predictions: False keeps this session's feedback and investigations away
+            from its own later predictions: every prediction reads only the memory pinned before
+            the session, so a scored trajectory is predicted whole before any of its feedback is
+            used. Investigations still run and are published with the trajectory.
     """
 
     selection_policy_sha256: Sha256
     feedback_source: str = Field(min_length=1)
     generate_hypotheses: bool = Field(default=True, strict=True, exclude_if=bool)
+    notes_reach_predictions: bool = Field(default=True, strict=True, exclude_if=bool)
     maximum_updates: int = Field(default=24, gt=0, strict=True)
     retained_notes: int = Field(default=24, gt=0, strict=True)
 
@@ -143,6 +148,7 @@ class SessionResearch:
         overview_view: Callable[[frozenset[str]], list[JsonObject]] | None = None,
         overview_sources_of: Callable[[Sequence[JsonObject]], Sequence[ArtifactInput]]
         | None = None,
+        retrieved_sources_of: Callable[[Sequence[str]], Sequence[ArtifactInput]] | None = None,
     ) -> None:
         """Bind feedback policy, metered investigator and an optional frozen prior memory.
 
@@ -164,6 +170,9 @@ class SessionResearch:
             overview_view: Re-renders the overview with this session's retired notes removed.
             overview_sources_of: Resolves the sources behind any rendered overview, so each
                 delivered overview's sources are recorded with the prediction that saw it.
+            retrieved_sources_of: Resolves retrieved transition identities to the recorded
+                traces they came from, so research written after seeing retrieved evidence
+                depends on those traces' lineages.
         """
         if (policy is None) != (complete is None):
             raise ValueError("feedback learning requires both policy and investigator")
@@ -180,6 +189,7 @@ class SessionResearch:
         self._overview_sources = tuple(overview_sources)
         self._overview_view = overview_view
         self._overview_sources_of = overview_sources_of
+        self._retrieved_sources_of = retrieved_sources_of
         self._store, self._artifacts, self._complete = store, artifacts, complete
         self._lock = FileLock(lock_path, timeout=0)
         self._clock, self._code_revision = clock, code_revision
@@ -309,11 +319,14 @@ class SessionResearch:
             }
             local = {str(row["id"]): row for row in records}
             supplied = self._supplied(transitions, local)
-            if not matched and policy.generate_hypotheses:
-                if sum(isinstance(row.get("investigation"), dict) for row in records) >= (
-                    policy.maximum_updates
-                ):
-                    raise ValueError("session investigation budget exhausted")
+            exhausted = sum(isinstance(row.get("investigation"), dict) for row in records) >= (
+                policy.maximum_updates
+            )
+            if not matched and policy.generate_hypotheses and exhausted:
+                # The bound limits purchases, never consumption: the miss is still recorded
+                # as raw feedback, so the trajectory completes and is learned.
+                record["investigation_skipped"] = "session investigation budget exhausted"
+            elif not matched and policy.generate_hypotheses:
                 active = self._active(records)[-policy.retained_notes :]
                 prior = self._prior_research(records)[-policy.retained_notes :]
                 supplied |= {str(row["id"]) for row in (*active, *prior)}
@@ -349,10 +362,25 @@ class SessionResearch:
                     raise TimeoutError("late investigation retained but not activated")
                 record["investigation"] = update.model_dump(mode="json")
             record["depends_on"] = self._dependencies(
-                supplied, local, _recorded_overview_sources(transitions)
+                supplied,
+                local,
+                [*_recorded_overview_sources(transitions), *self._retrieved(transitions)],
             )
             self._save(identity, record)
             return copy.deepcopy(record)
+
+    def _retrieved(self, transitions: list[JsonValue]) -> Sequence[ArtifactInput]:
+        """Recorded traces behind every retrieved transition this session's predictions saw."""
+        ids: set[str] = set()
+        for transition in transitions:
+            evidence = transition.get("evidence") if isinstance(transition, dict) else None
+            rows = evidence.get("grounded_transition_ids") if isinstance(evidence, dict) else None
+            ids.update(str(row) for row in rows or ())
+        if not ids:
+            return ()
+        if self._retrieved_sources_of is None:
+            raise ValueError("retrieved evidence reached a prediction without its provenance")
+        return self._retrieved_sources_of(sorted(ids))
 
     def _supplied(self, transitions: list[JsonValue], local: Mapping[str, JsonObject]) -> set[str]:
         """Prior and local record identities delivered to any committed prediction."""
@@ -400,7 +428,7 @@ class SessionResearch:
 
     def serving_overview(self) -> list[JsonObject]:
         """The overview for the next prediction, minus notes this session has retired."""
-        if self._overview_view is None:
+        if self._overview_view is None or not self._notes_reach_predictions:
             return copy.deepcopy(self.overview)
         state = self._store.read_session(self.session_id).state
         transitions = state.get("transitions")
@@ -421,7 +449,8 @@ class SessionResearch:
             self._selection.identity != self.policy.selection_policy_sha256
         ):
             raise ValueError("online memory selection policy changed")
-        records = self._records(transitions)
+        # Pinned delivery: this session's own feedback never reaches its predictions.
+        records = self._records(transitions) if self._notes_reach_predictions else []
         active = self._active(records)
         retired = _superseded(records)
         catalog: dict[str, JsonValue] = {
@@ -434,6 +463,11 @@ class SessionResearch:
             catalog,
         )
         return [value for value in selected.values() if isinstance(value, dict)], receipt
+
+    @property
+    def _notes_reach_predictions(self) -> bool:
+        """Whether this session's feedback may inform its own later predictions."""
+        return self.policy is None or self.policy.notes_reach_predictions
 
     def _save(self, identity: str, payload: JsonObject) -> None:
         """Publish immutable receipts outside business-state storage."""

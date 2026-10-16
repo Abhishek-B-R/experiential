@@ -13,7 +13,16 @@ FIDELITY_OPTION = typer.Option(
 RETRY_INCOMPLETE_OPTION = typer.Option(
     False,
     "--retry-incomplete",
-    help="With --held-out-fidelity, buy again the calls of runs that stopped incomplete.",
+    help="With --held-out-fidelity or --retest-misses, buy again the calls of runs that "
+    "stopped incomplete.",
+)
+
+RETEST_MISSES_OPTION = typer.Option(
+    None,
+    "--retest-misses",
+    min=1,
+    metavar="N",
+    help="Replay up to N learned traces the simulator got wrong, on its final memory.",
 )
 
 HELD_OUT_FIDELITY_OPTION = typer.Option(
@@ -21,13 +30,14 @@ HELD_OUT_FIDELITY_OPTION = typer.Option(
     "--held-out-fidelity",
     min=1,
     metavar="N",
-    help="Measure the built simulator on N held-out traces it never indexed.",
+    help="Measure the simulator learned with --hold-out on N held-out traces it never saw.",
 )
 
 VERBOSE_OPTION = typer.Option(
     False,
     "--verbose",
-    help="With --fidelity or --held-out-fidelity, also print every turn and the configuration.",
+    help="With --fidelity, --held-out-fidelity or --retest-misses, also print every turn and "
+    "the configuration.",
 )
 
 
@@ -56,6 +66,7 @@ def evaluate(
     non_interactive: bool = typer.Option(False, "--non-interactive"),
     fidelity: Path | None = FIDELITY_OPTION,
     held_out_fidelity: int | None = HELD_OUT_FIDELITY_OPTION,
+    retest_misses: int | None = RETEST_MISSES_OPTION,
     retry_incomplete: bool = RETRY_INCOMPLETE_OPTION,
     verbose: bool = VERBOSE_OPTION,
 ) -> None:
@@ -76,13 +87,47 @@ def evaluate(
         non_interactive: Disable terminal questions.
         fidelity: Explicit reconstruction workload, separate from worker-model evaluation.
         held_out_fidelity: Number of held-out build traces replayed on the fit-only simulator.
-        retry_incomplete: Replace interrupted held-out runs, buying their calls again.
+        retest_misses: Number of missed learned traces replayed on the final memory.
+        retry_incomplete: Replace interrupted held-out or retest runs, buying their calls again.
         verbose: Plain per-turn fidelity detail, for agents and logs.
     """
-    if retry_incomplete and held_out_fidelity is None:
-        raise typer.BadParameter("--retry-incomplete applies only with --held-out-fidelity")
-    if verbose and fidelity is None and held_out_fidelity is None:
-        raise typer.BadParameter("--verbose applies only with --fidelity or --held-out-fidelity")
+    replay = held_out_fidelity if held_out_fidelity is not None else retest_misses
+    if retry_incomplete and replay is None:
+        raise typer.BadParameter(
+            "--retry-incomplete applies only with --held-out-fidelity or --retest-misses"
+        )
+    if verbose and fidelity is None and replay is None:
+        raise typer.BadParameter(
+            "--verbose applies only with --fidelity, --held-out-fidelity or --retest-misses"
+        )
+    if retest_misses is not None:
+        if (
+            project is None
+            or fidelity is not None
+            or held_out_fidelity is not None
+            or resume is not None
+            or report is not None
+            or any(
+                value is not None
+                for value in (models, repeats, concurrency, maximum_steps, maximum_output_tokens)
+            )
+        ):
+            raise typer.BadParameter(
+                "--retest-misses requires PROJECT and cannot combine with other evaluation modes"
+            )
+        from exp.cli.evaluation.miss_retest import run_miss_retest
+
+        run_miss_retest(
+            project,
+            retest_misses,
+            root=root,
+            yes=yes,
+            non_interactive=non_interactive,
+            dry_run=dry_run,
+            verbose=verbose,
+            retry_incomplete=retry_incomplete,
+        )
+        return
     if held_out_fidelity is not None:
         if (
             project is None

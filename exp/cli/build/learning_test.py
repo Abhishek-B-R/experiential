@@ -14,6 +14,7 @@ from exp.cli.app import app
         ["--learn"],
         ["--memory-recall", "jev"],
         ["--max-learning-attempts", "10"],
+        ["--hold-out"],
     ],
 )
 def test_learning_flags_require_each_other(tmp_path: Path, flags: list[str]) -> None:

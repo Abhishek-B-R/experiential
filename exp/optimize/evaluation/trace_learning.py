@@ -1,21 +1,28 @@
-"""Sequential learning pass: the hybrid simulator learns trace by trace from fit traces.
+"""Sequential learning pass: the hybrid simulator learns trace by trace from the build's traces.
 
-The build's fit traces are replayed one at a time in their export (JSONL) order on the hybrid
-simulator: learned memory supplies behavioral rules and the build's fit-only index supplies
-recorded facts, never from the trace's own lineage. Each trace runs through the
+By default every trace is learned (scope ``all``): the simulator should learn from every
+success and failure it is given. The traces are replayed one at a time in their export (JSONL)
+order on the hybrid simulator: learned memory supplies behavioral rules and the build's index
+supplies recorded facts, never from the trace's own lineage. Each trace runs through the
 existing learn-mode lifecycle of :func:`execute_fidelity_evaluation`: every step is predicted
 from the task, the visible history and the current memory, the recorded reply is disclosed only
 after the prediction commits, mismatches are investigated, the completed trajectory is
 published as one memory version, and maintenance compresses the memory log. No second runner
 exists. A rerun replays completed traces without provider calls and continues where it stopped.
 
-Held-out lineages are reserved in the learning lineage before the first trace is registered, so
-a held-out trace can never be learned. Because each fit trace is predicted before it is learned,
-the saved reports also give a learning curve over consumption order at no extra cost.
+Measurement is test-then-train: each trace is predicted whole on the memory pinned before it,
+with none of its own feedback or investigations, and with memory from earlier traces of the
+same task lineage hidden. Its recorded history stays visible (replay feeds the recorded agent
+the recorded replies). Every saved learning report therefore measures the simulator, replayed
+against recorded history, on a task it has not learned, with all traces consumed.
+
+Scope ``fit`` keeps the build's held-out lineages out instead: they are reserved before the
+first trace is registered, can never be learned, and remain for an independent held-out panel.
 """
 
 from collections.abc import Callable
 from datetime import datetime
+from typing import Literal
 
 from pydantic import Field, JsonValue
 
@@ -26,6 +33,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.evaluations.reconstruction import DualReport
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectBuildArtifacts, ProjectStore
 from exp.common.tasks import TaskCase
@@ -60,17 +68,22 @@ from exp.simulation.world_model.session_research import OnlineResearchPolicy
 LABEL = "learn"
 FEEDBACK_SOURCE = "recorded-trace-reply"
 _PLAN_TYPE = "trace-learning-plan"
+Scope = Literal["all", "fit"]
+SCOPES: tuple[Scope, ...] = ("all", "fit")
 
 
 class LearningPlan(ContractModel):
     """The memory a project's build learns into, and how memory is recalled.
 
     Attributes:
-        world_model: Memory-first simulator derived from the build's world model.
-        lineage: Memory lineage, one per learning simulator.
-        recall: Native JEV recall over memory records (not recorded-evidence retrieval).
+        scope: ``all`` learns every trace; ``fit`` learns fit traces and reserves held-out ones.
+        world_model: Hybrid simulator: the build's world model over its serving index (``all``)
+            or its fit-only index (``fit``).
+        lineage: Memory lineage, one per learning simulator and scope.
+        recall: Native decision recall over memory records (not recorded-evidence retrieval).
     """
 
+    scope: Scope
     world_model: ArtifactInput
     lineage: str = Field(pattern=r"^[a-z][a-z0-9-]{0,63}$")
     recall: FidelityRetrieval
@@ -91,7 +104,7 @@ class LearningOutcome(ContractModel):
 
     Attributes:
         plan: Learning plan.
-        traces: Fit traces in learning order.
+        traces: Traces in learning order.
         learned: Traces consumed into memory (published, or already consumed).
         incomplete: Traces whose every allowed attempt stopped before completing, so they
             were not consumed; the pass continues past them and reports them.
@@ -127,21 +140,47 @@ class CurveWindow(ContractModel):
     @property
     def share(self) -> str:
         """Whole-number exact-reply percentage, or a dash without steps."""
-        return f"{self.exact / self.steps:.0%}" if self.steps else "-"
+        return _share(self.exact, self.steps)
 
 
 class LearningCurve(ContractModel):
-    """Accuracy of each fit trace's prediction, made before that trace was learned.
+    """Accuracy of each trace's prediction, made before that trace was learned.
 
     Attributes:
-        points: One result per learned trace, in consumption order.
+        points: The consumed attempt's result for each learned trace, in consumption order.
         quarters: Four consumption windows; the boundary after the second is ~50% consumed.
         halves: First and second half of consumption.
+        incomplete: Traces that ran but were never consumed; not part of the score.
     """
 
     points: tuple[ReplayResult, ...]
     quarters: tuple[CurveWindow, ...]
     halves: tuple[CurveWindow, ...]
+    incomplete: int = 0
+
+    def headline(self) -> str:
+        """Test-then-train fidelity over every learned trace, then over the second half.
+
+        Each trace was predicted whole on the memory pinned before it, with earlier traces of its
+        task hidden, so this measures tasks memory has not learned even though every trace is
+        consumed; replay keeps the recorded history visible. The second half reads memory that
+        has learned at least half the traces.
+        """
+        exact = sum(p.exact for p in self.points)
+        steps = sum(p.steps for p in self.points)
+        matched = sum(p.fields_matched for p in self.points)
+        total = sum(p.fields_total for p in self.points)
+        line = (
+            f"Test-then-train fidelity (recorded history)  {exact}/{steps} replies exact "
+            f"({_share(exact, steps)}) · "
+            f"{_share(matched, total)} reply fields match ({matched}/{total}) · "
+            f"{len(self.points)} traces"
+        )
+        if len(self.halves) == 2:
+            line += f" · second half {self.halves[1].share} exact"
+        if self.incomplete:
+            line += f" · {self.incomplete} incomplete trace(s) not learned or scored"
+        return line
 
     def line(self) -> str:
         """One line: exact replies per consumption quarter, then first versus second half."""
@@ -152,13 +191,25 @@ class LearningCurve(ContractModel):
         return line
 
 
-def learning_plan(project: ProjectStore, recall_alias: str | None = None) -> LearningPlan:
-    """Derive the project's learning plan, persisting it on first use.
+def learning_plan(
+    project: ProjectStore,
+    recall_alias: str | None = None,
+    scope: Scope | None = None,
+    *,
+    record: bool = False,
+) -> LearningPlan:
+    """Derive the project's learning plan; only learning itself records it.
+
+    A preflight derives the plan without recording it, so a cancelled preflight leaves no
+    trace and cannot change which memory later commands read.
 
     Args:
         project: Project with a completed build.
         recall_alias: Native decision alias for memory recall; required the first time, and
             must match the recorded one afterwards. None reads the recorded plan.
+        scope: Traces to learn. None reads the recorded plan whose memory learned most
+            recently (``all`` when neither has learned anything yet).
+        record: Record a new plan; set only when learning starts.
 
     Returns:
         The plan for the build's current world model.
@@ -166,33 +217,33 @@ def learning_plan(project: ProjectStore, recall_alias: str | None = None) -> Lea
     Raises:
         ValueError: No completed build, no recorded plan and no alias, or a different alias.
     """
-    build = _build(project)
-    # Hybrid: learned memory supplies behavioral rules; the fit-only index supplies recorded
-    # facts. Held-out traces are not in that index, and each task's own lineage is excluded
-    # from retrieval, so a trace never retrieves its own recorded replies while it is learned.
-    world_model = persist_fit_only_world_model(project.artifacts, build.world_model, build.fit_rag)
-    lineage = "learn-" + sha256_json(world_model.model_dump(mode="json"))[:16]
-    identity = stable_id(_PLAN_TYPE, {"lineage": lineage})
+    if scope is None:
+        return learning_plan(project, recall_alias, _active_scope(project), record=record)
+    world_model, identity = _plan_identity(project, scope)
     if project.artifacts.exists(identity):
         saved = LearningPlan.model_validate_json(
             project.artifacts.read_bytes(identity, "plan.json")
         )
         if recall_alias is not None and saved.recall.jev_alias != recall_alias:
             raise ValueError(
-                f"memory {lineage} learns with recall alias {saved.recall.jev_alias!r}; "
+                f"memory {saved.lineage} learns with recall alias {saved.recall.jev_alias!r}; "
                 "keep that alias, or rebuild to start a new memory"
             )
         return saved
     if recall_alias is None:
+        flag = " --hold-out" if scope == "fit" else ""
         raise ValueError(
-            "no learned memory for this build; run exp build PROJECT --learn "
+            f"no learned memory for this build; run exp build PROJECT --learn{flag} "
             "--memory-recall ALIAS first"
         )
     plan = LearningPlan(
+        scope=scope,
         world_model=world_model,
-        lineage=lineage,
+        lineage=_lineage(world_model, scope),
         recall=FidelityRetrieval(jev_alias=recall_alias, jev=JEVPolicy()),
     )
+    if not record:
+        return plan
     project.artifacts.write_json(
         artifact_id=identity,
         artifact_type=_PLAN_TYPE,
@@ -207,14 +258,58 @@ def learning_plan(project: ProjectStore, recall_alias: str | None = None) -> Lea
     return plan
 
 
-def fit_cases(project: ProjectStore) -> tuple[ReplayCase, ...]:
-    """Every fit trace with something to replay, in the build's trace (JSONL) order.
+def _active_scope(project: ProjectStore) -> Scope:
+    """The scope whose memory published most recently; ``all`` before anything is learned."""
+    published: list[tuple[datetime, int, Scope]] = []
+    for rank, scope in enumerate(SCOPES):
+        if not recorded_plan(project, scope):
+            continue
+        world_model = _plan_identity(project, scope)[0]
+        head = memory_head(project.artifacts, _lineage(world_model, scope))
+        if head is not None:
+            published.append((head.created_at, -rank, scope))
+    if published:
+        return max(published)[2]
+    recorded = [scope for scope in SCOPES if recorded_plan(project, scope)]
+    return recorded[0] if recorded else "all"
+
+
+def recorded_plan(project: ProjectStore, scope: Scope) -> bool:
+    """Whether this build has a recorded learning plan in ``scope``."""
+    return project.artifacts.exists(_plan_identity(project, scope)[1])
+
+
+def _plan_identity(project: ProjectStore, scope: Scope) -> tuple[ArtifactInput, str]:
+    """The scope's hybrid simulator and the identity its recorded plan occupies."""
+    build = _build(project)
+    # Hybrid: learned memory supplies behavioral rules; the build's index supplies recorded
+    # facts. Each task's own lineage is excluded from retrieval, so a trace never retrieves its
+    # own recorded replies while it is learned. Scope ``fit`` uses the fit-only index, so
+    # held-out traces stay out of retrieval as well as out of memory.
+    world_model = (
+        build.world_model
+        if scope == "all"
+        else persist_fit_only_world_model(project.artifacts, build.world_model, build.fit_rag)
+    )
+    lineage = _lineage(world_model, scope)
+    return world_model, stable_id(_PLAN_TYPE, {"lineage": lineage})
+
+
+def _lineage(world_model: ArtifactInput, scope: Scope) -> str:
+    """Memory lineage of one learning simulator under the test-then-train protocol."""
+    key = {"world_model": world_model.model_dump(mode="json"), "scope": scope}
+    return "learn-" + sha256_json({**key, "protocol": "test-then-train"})[:16]
+
+
+def learning_cases(project: ProjectStore, scope: Scope) -> tuple[ReplayCase, ...]:
+    """Every trace in scope with something to replay, in the build's trace (JSONL) order.
 
     Each case's public task is the trace's own request: its task text, request context, public
-    prefix, and published tools, or signatures observed in fit traces when it declares none.
+    prefix, and published tools, or signatures observed in learned traces when it declares none.
 
     Args:
         project: Project with a completed build.
+        scope: ``all`` traces, or only ``fit`` traces.
 
     Returns:
         Replay cases in learning order.
@@ -227,7 +322,7 @@ def fit_cases(project: ProjectStore) -> tuple[ReplayCase, ...]:
     traces = [
         trace
         for trace in load_trace_dataset(project.artifacts, build.trace_dataset.artifact_id).traces
-        if bindings[trace.trace_id].partition == "fit"
+        if scope == "all" or bindings[trace.trace_id].partition == "fit"
     ]
     calls = [
         (row.name, row.arguments)
@@ -236,6 +331,7 @@ def fit_cases(project: ProjectStore) -> tuple[ReplayCase, ...]:
     ]
     cases = []
     for trace in traces:
+        # Every learned trace is fit data, whatever split the build assigned it.
         task = TaskCase(
             task_id=stable_id("learning-task", {"trace_id": trace.trace_id}),
             lineage_group_id=bindings[trace.trace_id].lineage_id,
@@ -250,6 +346,11 @@ def fit_cases(project: ProjectStore) -> tuple[ReplayCase, ...]:
         if case is not None:
             cases.append(case)
     return tuple(cases)
+
+
+def fit_cases(project: ProjectStore) -> tuple[ReplayCase, ...]:
+    """Every fit trace with something to replay, in the build's trace (JSONL) order."""
+    return learning_cases(project, "fit")
 
 
 def fit_calls(project: ProjectStore) -> list[tuple[str, JsonValue]]:
@@ -312,15 +413,18 @@ def reserve_held_out(project: ProjectStore, plan: LearningPlan, *, code_revision
 def learning_spec(
     project: ProjectStore, plan: LearningPlan, case: ReplayCase, *, deadline: datetime
 ) -> FidelitySpec:
-    """Learn-mode spec of one fit case, with a content-addressed run ID.
+    """Learn-mode spec of one case, with a content-addressed run ID.
 
     Per-turn judging is off while learning: the judge still runs once per trace (the fidelity
-    owner requires it), and the learning curve uses exact replies, not judge scores.
+    owner requires it), and the learning curve uses exact replies, not judge scores. Every
+    prediction reads the memory pinned before the trace, without this trace's feedback or
+    investigations and without earlier traces of its task lineage; the trace's recorded
+    history stays visible, as replay requires.
 
     Args:
         project: Project with a completed build.
         plan: Learning plan.
-        case: Fit replay case.
+        case: Replay case in the plan's scope.
         deadline: Absolute cutoff; excluded from the run identity.
 
     Returns:
@@ -332,26 +436,29 @@ def learning_spec(
         case,
         deadline=deadline,
         label=LABEL,
-        memory=FidelityMemory(lineage=plan.lineage, mode="learn"),
+        memory=FidelityMemory(lineage=plan.lineage, mode="learn", hide_task_lineage=True),
         retrieval=plan.recall,
         online_research=OnlineResearchPolicy(
-            feedback_source=FEEDBACK_SOURCE, selection_policy_sha256=plan.selector_identity
+            feedback_source=FEEDBACK_SOURCE,
+            selection_policy_sha256=plan.selector_identity,
+            notes_reach_predictions=False,
         ),
         per_turn=False,
     )
 
 
-def learn_from_fit_traces(
+def learn_from_traces(
     project: ProjectStore,
     *,
     recall_alias: str,
+    scope: Scope = "all",
     maximum_attempts: int,
     code_revision: str,
     clock: Callable[[], datetime],
     progress: ProgressHook | None = None,
     retry_incomplete: bool = False,
 ) -> LearningOutcome:
-    """Learn from every fit trace in order, within an explicit physical-attempt budget.
+    """Learn from every trace in scope, in order, within an explicit physical-attempt budget.
 
     A trace is started only when its whole attempt ceiling fits the remaining budget, so the
     pass never stops inside a trace for lack of budget; rerunning continues from the first
@@ -360,6 +467,7 @@ def learn_from_fit_traces(
     Args:
         project: Project with a completed build.
         recall_alias: Native decision alias for memory recall.
+        scope: ``all`` traces, or ``fit`` traces with held-out lineages reserved first.
         maximum_attempts: Physical attempts this invocation may claim, retries included.
         code_revision: Exact producing implementation identity.
         clock: Aware clock for deadlines.
@@ -369,9 +477,10 @@ def learn_from_fit_traces(
     Returns:
         The outcome; ``stopped`` explains an early stop.
     """
-    plan = learning_plan(project, recall_alias)
-    reserve_held_out(project, plan, code_revision=code_revision)
-    cases = fit_cases(project)
+    plan = learning_plan(project, recall_alias, scope, record=True)
+    if scope == "fit":
+        reserve_held_out(project, plan, code_revision=code_revision)
+    cases = learning_cases(project, scope)
     used, learned, incomplete, stopped = 0, 0, 0, None
     for index, case in enumerate(cases):
         report(progress, "Learning from traces", completed=index, total=len(cases))
@@ -427,48 +536,98 @@ def learn_from_fit_traces(
     )
 
 
-def learning_curve(project: ProjectStore) -> LearningCurve | None:
-    """Accuracy of fit-trace predictions in consumption order, from saved reports only.
+def learning_curve(project: ProjectStore, scope: Scope | None = None) -> LearningCurve | None:
+    """Accuracy of each trace's prediction in consumption order, from saved reports only.
 
     Args:
         project: Project with a recorded learning plan.
+        scope: Plan to read; None reads the recorded plan (``all`` when both exist).
 
     Returns:
         The curve over learned traces, or None before anything was learned.
     """
-    plan = learning_plan(project)
-    points: list[ReplayResult] = []
-    for case in fit_cases(project):
-        found = _saved_learning_run(project, plan, case)
-        if found is None:
-            break
-        points.append(found[1])
+    runs, incomplete = learning_progress(project, learning_plan(project, None, scope))
+    points = [result for _, _, result in runs]
     if not points:
         return None
     return LearningCurve(
         points=tuple(points),
         quarters=_windows(points, 4),
         halves=_windows(points, 2) if len(points) > 1 else (),
+        incomplete=len(incomplete),
     )
 
 
-def _saved_learning_run(
+def learned_runs(
+    project: ProjectStore, plan: LearningPlan
+) -> list[tuple[ReplayCase, PreparedFidelity, ReplayResult]]:
+    """Learned traces in consumption order, each with its consumed attempt.
+
+    Args:
+        project: Project with a recorded learning plan.
+        plan: That plan.
+
+    Returns:
+        Each learned case with the registration and test-then-train result of the attempt
+        that was consumed into memory.
+    """
+    return learning_progress(project, plan)[0]
+
+
+def learning_progress(
+    project: ProjectStore, plan: LearningPlan
+) -> tuple[list[tuple[ReplayCase, PreparedFidelity, ReplayResult]], list[ReplayCase]]:
+    """Learned and incomplete traces, read from saved attempts without provider calls.
+
+    The score of a learned trace is the attempt consumed into memory, never an earlier
+    attempt that stopped. A trace whose attempts ran but none was consumed is incomplete and
+    unscored. Reading stops at the first trace no attempt has run for.
+
+    Args:
+        project: Project with a recorded learning plan.
+        plan: That plan.
+
+    Returns:
+        Learned traces with their consumed attempt, and incomplete traces.
+    """
+    learned: list[tuple[ReplayCase, PreparedFidelity, ReplayResult]] = []
+    incomplete: list[ReplayCase] = []
+    for case in learning_cases(project, plan.scope):
+        attempts = _saved_attempts(project, plan, case)
+        if not attempts:
+            break
+        consumed = [
+            (prepared, report)
+            for prepared, report in attempts
+            if (receipt := saved_memory_receipt(project, prepared)) is not None
+            and receipt.get("reason") in ("consumed", DUPLICATE)
+        ]
+        if consumed:
+            prepared, report = consumed[0]
+            learned.append((case, prepared, replay_result(project, case, prepared, report)))
+        else:
+            incomplete.append(case)
+    return learned, incomplete
+
+
+def _saved_attempts(
     project: ProjectStore, plan: LearningPlan, case: ReplayCase
-) -> tuple[PreparedFidelity, ReplayResult] | None:
-    """The completed learning run of one case, found by content address without writing."""
+) -> list[tuple[PreparedFidelity, DualReport]]:
+    """Every attempt of one case that has a saved report, in attempt order, without writing."""
     spec = learning_spec(project, plan, case, deadline=datetime.now().astimezone())
+    attempts: list[tuple[PreparedFidelity, DualReport]] = []
     generation = 1
     while True:
         run_id = content_run_id(spec, LABEL, case.trace_id, generation)
         plan_id = stable_id("fidelity", {"run_id": run_id})
         if not project.artifacts.exists(plan_id):
-            return None
+            return attempts
         prepared = PreparedFidelity.model_validate_json(
             project.artifacts.read_bytes(plan_id, "plan.json")
         )
         saved = saved_fidelity_report(project, prepared)
         if saved is not None:
-            return prepared, replay_result(project, case, prepared, saved)
+            attempts.append((prepared, saved))
         generation += 1
 
 
@@ -490,6 +649,11 @@ def _windows(points: list[ReplayResult], parts: int) -> tuple[CurveWindow, ...]:
             )
         )
     return tuple(windows)
+
+
+def _share(part: int, whole: int) -> str:
+    """A whole-number percentage, or a dash without a denominator."""
+    return f"{part / whole:.0%}" if whole else "-"
 
 
 def _build(project: ProjectStore) -> ProjectBuildArtifacts:

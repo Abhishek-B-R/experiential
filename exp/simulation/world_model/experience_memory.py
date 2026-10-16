@@ -452,11 +452,14 @@ class Eligibility(ContractModel):
     Attributes:
         exclude_public: Public identity of the trajectory about to be predicted.
         reserved_task_lineages: Task lineages declared reserved for evaluation.
+        hidden_task_lineage: Task lineage being predicted, hidden from this read so earlier
+            trajectories of the same task cannot answer for it (test-then-train learning).
         strict: Reserved evaluation; content without resolvable provenance is ineligible.
     """
 
     exclude_public: Sha256 | None = None
     reserved_task_lineages: tuple[str, ...] = ()
+    hidden_task_lineage: str | None = None
     strict: bool = Field(default=False, strict=True)
 
     def admits(self, source: JsonObject | None) -> bool:
@@ -468,16 +471,52 @@ class Eligibility(ContractModel):
         lineage = source.get("task_lineage")
         if not isinstance(lineage, str):
             return not self.strict
-        return lineage not in self.reserved_task_lineages
+        return lineage not in self.reserved_task_lineages and lineage != self.hidden_task_lineage
+
+
+RETRIEVED_SOURCE = "retrieved-source"
+
+
+def retrieved_source(
+    store: ArtifactStore,
+    *,
+    trace_id: str,
+    task_lineage: str,
+    created_at: datetime,
+    code_revision: str,
+) -> ArtifactInput:
+    """Reference one recorded trace that retrieval delivered to a session, as a typed source.
+
+    Memory written by a session that saw retrieved evidence depends on this source, so the
+    retrieved trace's task lineage is withheld wherever it is hidden or reserved, exactly as a
+    consumed trajectory's would be: a retrieved fact cannot reach its own task through memory.
+    """
+    identity = stable_id(RETRIEVED_SOURCE, {"trace_id": trace_id, "task_lineage": task_lineage})
+    if not store.exists(identity):
+        store.write_json(
+            artifact_id=identity,
+            artifact_type=RETRIEVED_SOURCE,
+            envelope=ArtifactEnvelope(
+                schema_version=1, created_at=created_at, code_revision=code_revision
+            ),
+            files={"source.json": {"trace_id": trace_id, "task_lineage": task_lineage}},
+        )
+    return artifact_input(store.read(identity).manifest)
 
 
 def load_source(store: ArtifactStore, reference: ArtifactInput | None) -> JsonObject | None:
-    """Resolve a typed source reference to its consumed trajectory, verifying the manifest."""
+    """Resolve a typed source reference to its consumed trajectory, verifying the manifest.
+
+    A retrieved-source reference resolves to its recorded trace and task lineage.
+    """
     if reference is None or not store.exists(reference.artifact_id):
         return None
     stored = store.read(reference.artifact_id)
     if artifact_input(stored.manifest) != reference:
         raise ValueError("source trajectory artifact differs from its recorded reference")
+    if stored.manifest.artifact_type == RETRIEVED_SOURCE:
+        source = json.loads(store.read_bytes(reference.artifact_id, "source.json"))
+        return source if isinstance(source, dict) else None
     if stored.manifest.artifact_type != "consumed-trajectory":
         return None
     payload = json.loads(store.read_bytes(reference.artifact_id, "trajectory.json"))

@@ -104,12 +104,14 @@ def package_rows(episodes: list[JsonObject]) -> list[JsonObject]:
     start = datetime(2026, 10, 15, tzinfo=UTC)
     for item in episodes:
         user = str(item["user"])
-        trace_id = hashlib.sha256(user.encode()).hexdigest()[:32]
+        # A repeat of the same task (same user) is a different trace with its own identity.
+        key = user + str(item.get("repeat", ""))
+        trace_id = hashlib.sha256(key.encode()).hexdigest()[:32]
         context = {"task_lineage": user, "replay_from": item["prefix"]}
         rows.append(
             {
                 "trace_id": trace_id,
-                "span_id": hashlib.sha256((user + "chat").encode()).hexdigest()[:16],
+                "span_id": hashlib.sha256((key + "chat").encode()).hexdigest()[:16],
                 "name": "chat",
                 "start_time": start.isoformat(),
                 "end_time": start.isoformat(),
@@ -127,7 +129,7 @@ def package_rows(episodes: list[JsonObject]) -> list[JsonObject]:
         assert isinstance(exchanges, list)
         for position, (name, arguments, reply) in enumerate(exchanges):
             at = start + timedelta(seconds=2 * position + 1)
-            call_id = f"{user}-call-{position}"
+            call_id = f"{key}-call-{position}"
             for kind, offset, attributes in (
                 (
                     "tool.call",
@@ -441,12 +443,13 @@ def build_project(
     monkeypatch: pytest.MonkeyPatch,
     provider: SimulatedProvider,
     *flags: str,
+    episodes: list[JsonObject] | None = None,
 ) -> tuple[Path, ProjectStore, str]:
     """Run ``exp build`` on the package through the routed fake and return its output."""
     root = tmp_path / ".exp"
     root.mkdir()
     write_catalog(root)
-    episodes = [episode(i) for i in range(USERS)]
+    episodes = episodes or [episode(i) for i in range(USERS)]
     package = tmp_path / "package.jsonl"
     package.write_text("".join(json.dumps(row) + "\n" for row in package_rows(episodes)))
     monkeypatch.setenv("HELD_OUT_TEST_KEY", "fixture-only")
@@ -513,10 +516,10 @@ def held_out_customers(store: ProjectStore) -> set[str]:
 def test_build_learns_from_fit_traces_then_measures_held_out_on_final_memory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The hybrid flow: build, learn trace by trace, held-out fidelity on the checkpoint."""
+    """The audit flow: build, learn fit traces with --hold-out, held-out fidelity on the head."""
     provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
     root, store, output = build_project(
-        tmp_path, monkeypatch, provider, "--learn", "--memory-recall", "jev"
+        tmp_path, monkeypatch, provider, "--learn", "--hold-out", "--memory-recall", "jev"
     )
     plan = learning_plan(store)
     head = memory_head(store.artifacts, plan.lineage)
@@ -560,7 +563,7 @@ def test_build_learns_from_fit_traces_then_measures_held_out_on_final_memory(
     rerun = CliRunner().invoke(
         app,
         ["build", PROJECT, "--import-id", _import_id(store), "--root", str(root)]
-        + ["--yes", "--non-interactive", "--learn", "--memory-recall", "jev"],
+        + ["--yes", "--non-interactive", "--learn", "--hold-out", "--memory-recall", "jev"],
     )
     assert rerun.exit_code == 0, rerun.output
     assert len(provider.requests) == purchased, "completed learning replays without calls"

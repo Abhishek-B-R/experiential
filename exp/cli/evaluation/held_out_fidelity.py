@@ -17,9 +17,12 @@ from exp.cli.shared.progress import progress_display, qualified
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_release_revision
-from exp.optimize.evaluation.fidelity import execute_fidelity_evaluation, saved_fidelity_report
+from exp.optimize.evaluation.fidelity import (
+    PreparedFidelity,
+    execute_fidelity_evaluation,
+    saved_fidelity_report,
+)
 from exp.optimize.evaluation.held_out_fidelity import (
-    HeldOutPanel,
     register_held_out_fidelity,
     saved_held_out_results,
 )
@@ -41,8 +44,8 @@ def run_held_out_fidelity(
 ) -> None:
     """Measure the learned simulator on held-out traces it never learned, or replay the result.
 
-    Uses the hybrid profile: the build's learned memory at its final checkpoint, with every
-    held-out lineage reserved, plus recorded facts from the fit-only index.
+    Uses the hybrid profile: the memory learned with ``--hold-out`` at its final checkpoint,
+    with every held-out lineage reserved, plus recorded facts from the fit-only index.
 
     Args:
         project: Existing project with a completed build.
@@ -116,13 +119,13 @@ def run_held_out_fidelity(
                 non_interactive=not interactive,
             ):
                 return
-            _execute(console, store, panel)
+            execute_runs(console, store, panel.prepared)
         results = saved_held_out_results(store, panel)
         if verbose:
-            _render_traces(console, store, panel, results)
+            render_traces(console, store, panel.prepared, results, "Held-out trace")
         console.print()
         console.print(Text(aggregate_line(aggregate(results), len(panel.cases))))
-        curve = learning_curve(store)
+        curve = learning_curve(store, "fit")
         if curve is not None:
             console.print(Text(curve.line()))
         console.print(
@@ -134,12 +137,14 @@ def run_held_out_fidelity(
         )
 
 
-def _execute(console: Console, store: ProjectStore, panel: HeldOutPanel) -> None:
+def execute_runs(
+    console: Console, store: ProjectStore, registrations: tuple[PreparedFidelity, ...]
+) -> None:
     """Run every registered trace through the fidelity owner, one progress row per stage."""
-    total = len(panel.prepared)
+    total = len(registrations)
     try:
         with progress_display(console) as progress:
-            for index, prepared in enumerate(panel.prepared, start=1):
+            for index, prepared in enumerate(registrations, start=1):
                 execute_fidelity_evaluation(
                     store, prepared, progress=qualified(progress, f"trace {index}/{total}")
                 )
@@ -152,49 +157,54 @@ def _execute(console: Console, store: ProjectStore, panel: HeldOutPanel) -> None
         raise typer.Exit(code=1) from exc
 
 
-def aggregate_line(total: ReplayAggregate, planned: int) -> str:
+def aggregate_line(total: ReplayAggregate, planned: int, title: str = "Held-out fidelity") -> str:
     """One line: replies exact, reply-field agreement, and the judge mean.
 
     Args:
         total: Sums over completed traces.
         planned: Traces in the panel, including any without a saved report.
+        title: Leading label naming what was measured.
 
     Returns:
         Plain summary text with explicit denominators.
     """
-    exact = f"{total.exact}/{total.steps} replies exact ({_share(total.exact, total.steps)})"
+    exact = f"{total.exact}/{total.steps} replies exact ({share(total.exact, total.steps)})"
     fields = (
-        f"{_share(total.fields_matched, total.fields_total)} reply fields match "
+        f"{share(total.fields_matched, total.fields_total)} reply fields match "
         f"({total.fields_matched}/{total.fields_total})"
     )
     judge = "judge -" if total.judge_mean is None else f"judge {total.judge_mean:.1f}/5"
-    line = f"Held-out fidelity  {exact} · {fields} · {judge} · {total.traces}/{planned} traces"
+    line = f"{title}  {exact} · {fields} · {judge} · {total.traces}/{planned} traces"
     if total.judge_turns:
         line += (
             f"\n  judge agrees with exact replies on {total.judge_agreements}/{total.judge_turns} "
-            f"turns ({_share(total.judge_agreements, total.judge_turns)})"
+            f"turns ({share(total.judge_agreements, total.judge_turns)})"
         )
     return line
 
 
-def _render_traces(
-    console: Console, store: ProjectStore, panel: HeldOutPanel, results: tuple[ReplayResult, ...]
+def render_traces(
+    console: Console,
+    store: ProjectStore,
+    registrations: tuple[PreparedFidelity, ...],
+    results: tuple[ReplayResult, ...],
+    label: str,
 ) -> None:
     """Per-trace rows, then every turn and criterion of each trace."""
     table = Table(box=None, padding=(0, 2))
-    for column in ("Held-out trace", "Replies exact", "Field match", "Judge", "Turns"):
+    for column in (label, "Replies exact", "Field match", "Judge", "Turns"):
         table.add_column(column)
     for result in results:
         table.add_row(
             Text(result.trace_id),
             f"{result.exact}/{result.steps}",
-            _share(result.fields_matched, result.fields_total),
+            share(result.fields_matched, result.fields_total),
             _judge(result),
             turn_marks(result.turns),
         )
     console.print()
     console.print(table)
-    prepared = {p.spec.run_id: p for p in panel.prepared}
+    prepared = {p.spec.run_id: p for p in registrations}
     for result in results:
         registration = prepared[result.run_id]
         console.print()
@@ -210,6 +220,6 @@ def _judge(result: ReplayResult) -> str:
     return f"{sum(result.judge_scores) / len(result.judge_scores):.1f}"
 
 
-def _share(part: int, whole: int) -> str:
+def share(part: int, whole: int) -> str:
     """A whole-number percentage, or a dash without a denominator."""
     return f"{part / whole:.0%}" if whole else "-"

@@ -34,8 +34,11 @@ from exp.simulation.engines.transition import (
     ReplaceState,
     TransitionEngine,
 )
+from exp.simulation.retrieval import load_rag_index
+from exp.simulation.retrieval.contracts import RAGTransition
 from exp.simulation.retrieval.selection import EvidencePolicy
 from exp.simulation.world_model.durable import DurableWorldModelSession, SessionPolicy
+from exp.simulation.world_model.experience_memory import retrieved_source
 from exp.simulation.world_model.runtime import GroundedWorldModel
 from exp.simulation.world_model.session_research import (
     OnlineResearchPolicy,
@@ -310,6 +313,28 @@ def open_grounded_session(
     )
     research = None
     if research_selection is not None:
+        index: dict[str, RAGTransition] = {}
+
+        def retrieved_sources_of(ids: Sequence[str]) -> tuple[ArtifactInput, ...]:
+            """Typed sources for the recorded traces behind retrieved transitions."""
+            if not index:
+                rag = load_rag_index(artifacts, runtime.artifact.serving_rag.artifact_id)
+                index.update((row.transition_id, row) for row in rag.transitions)
+            missing = [key for key in ids if key not in index]
+            if missing:
+                raise ValueError("retrieved transition is absent from the simulator's index")
+            rows = sorted({(index[key].trace_id, index[key].lineage_id) for key in ids})
+            return tuple(
+                retrieved_source(
+                    artifacts,
+                    trace_id=trace,
+                    task_lineage=lineage,
+                    created_at=(clock or (lambda: datetime.now(UTC)))(),
+                    code_revision=policy.code_revision,
+                )
+                for trace, lineage in rows
+            )
+
         research = SessionResearch(
             selection=research_selection,
             session_id=session_id,
@@ -327,6 +352,7 @@ def open_grounded_session(
             overview_sources=research_overview_sources,
             overview_view=research_overview_view,
             overview_sources_of=research_overview_sources_of,
+            retrieved_sources_of=retrieved_sources_of,
         )
         engine = ResearchTransitionEngine(engine, research)
     binding = SessionBinding(

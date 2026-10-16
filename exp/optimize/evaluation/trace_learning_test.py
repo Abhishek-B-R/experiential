@@ -1,23 +1,38 @@
-"""The learning pass stops cleanly at its attempt budget and continues on rerun."""
+"""The learning pass: every trace by default, measured test-then-train, budgeted and resumable."""
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
+from exp.cli.app import app
+from exp.common.core.artifacts import JsonObject
+from exp.optimize.evaluation.fidelity import FidelityMemory
 from exp.optimize.evaluation.held_out_fidelity_test import (
+    PROJECT,
     REVISION,
     USERS,
     SimulatedProvider,
+    _at,
+    _obj,
     build_project,
     episode,
+    held_out_lineages,
 )
 from exp.optimize.evaluation.trace_learning import (
-    fit_cases,
-    learn_from_fit_traces,
+    learn_from_traces,
+    learning_cases,
     learning_curve,
     learning_plan,
     learning_spec,
+)
+from exp.simulation.world_model.experience_memory import (
+    Eligibility,
+    consumed_task_lineages,
+    is_reserved,
+    memory_head,
 )
 
 
@@ -30,7 +45,7 @@ def test_budget_stops_between_traces_and_a_rerun_continues(
 
     def learn(budget: int):  # noqa: ANN202 - local shorthand
         """Run the pass with one budget."""
-        return learn_from_fit_traces(
+        return learn_from_traces(
             store,
             recall_alias="jev",
             maximum_attempts=budget,
@@ -44,13 +59,144 @@ def test_budget_stops_between_traces_and_a_rerun_continues(
     one = learning_spec(
         store,
         learning_plan(store, "jev"),
-        fit_cases(store)[0],
+        learning_cases(store, "all")[0],
         deadline=datetime.now(UTC) + timedelta(hours=1),
     ).maximum_physical_attempts
     first = learn(one + one // 2)
     assert 0 < first.learned < first.traces and first.head_version == first.learned
     rest = learn(10_000)
-    assert rest.stopped is None and rest.learned == rest.traces == len(fit_cases(store))
+    assert rest.stopped is None and rest.learned == rest.traces == len(learning_cases(store, "all"))
     curve = learning_curve(store)
     assert curve is not None and len(curve.points) == rest.traces
     assert [w.last for w in curve.halves][-1] == rest.traces
+
+
+def test_default_learning_consumes_every_trace_and_reports_test_then_train(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without --hold-out every trace is learned, nothing is reserved, and the score is shown."""
+    provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
+    root, store, output = build_project(
+        tmp_path, monkeypatch, provider, "--learn", "--memory-recall", "jev"
+    )
+    plan = learning_plan(store)
+    assert plan.scope == "all"
+    head = memory_head(store.artifacts, plan.lineage)
+    assert head is not None and head.version == USERS
+    held = held_out_lineages(store)
+    assert held and held <= consumed_task_lineages(store.artifacts, head)
+    assert not any(is_reserved(store.artifacts, plan.lineage, lineage) for lineage in held)
+    assert f"learned {USERS}/{USERS} traces · memory v{USERS}" in output
+    exact = 3 * USERS - 1  # only the first trace's learnable turn is wrong
+    headline = f"Test-then-train fidelity (recorded history) {exact}/{3 * USERS} replies exact"
+    assert headline in output
+    assert "next: exp eval retail --retest-misses N" in output
+    refused = CliRunner().invoke(
+        app,
+        ["eval", PROJECT, "--root", str(root), "--held-out-fidelity", "3", "--non-interactive"],
+    )
+    assert refused.exit_code == 2
+    assert "--learn --hold-out" in " ".join(refused.output.split())
+
+
+def test_learning_hides_earlier_traces_of_the_same_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repeat of a learned task is predicted without the memory of its earlier trace."""
+    repeat: JsonObject = {**episode(1), "repeat": "-again"}
+    order = "#W2001"
+    repeat["instruction"] = f"I am user_01. Please cancel order {order} if it has not shipped."
+    repeat["exchanges"] = [
+        ("find_user_id_by_email", {"email": "user_01@example.test"}, {"user_id": "user_01"}),
+        ("get_order_details", {"order_id": order}, {"order_id": order, "status": "pending"}),
+        ("cancel_pending_order", {"order_id": order}, {"order_id": order, "status": "cancelled"}),
+    ]
+    episodes = [*(episode(i) for i in range(USERS)), repeat]
+    provider = SimulatedProvider(episodes)
+    _, store, _ = build_project(
+        tmp_path, monkeypatch, provider, "--learn", "--memory-recall", "jev", episodes=episodes
+    )
+    cases = learning_cases(store, "all")
+    positions = [
+        index
+        for index, case in enumerate(cases)
+        if case.task.initial_context.get("task_lineage") == "user_01"
+    ]
+    assert len(positions) == 2, "both traces of the task are learned"
+    assert order in cases[positions[1]].task.instruction, "the repeat is learned second"
+    sibling = cases[positions[0]].task.lineage_group_id  # names the task in every memory row
+    repeats = [
+        prediction
+        for prediction in provider.predictions()
+        if order in json.dumps(_at(prediction, "task", "instruction"))
+    ]
+    assert repeats, "the repeated task was predicted"
+    others = [
+        prediction
+        for prediction in provider.predictions()
+        if order not in json.dumps(_at(prediction, "task", "instruction"))
+        and sibling in memory_delivered(prediction)
+    ]
+    assert others, "other tasks do read the earlier trace's memory"
+    for prediction in repeats:
+        assert sibling not in memory_delivered(prediction)
+        contexts = _at(prediction, "grounding_contexts")
+        assert "user_01" not in json.dumps(contexts), "retrieval also excludes the task"
+
+
+def memory_delivered(prediction: JsonObject) -> str:
+    """Everything memory delivered to one prediction: recalled records and the overview."""
+    return json.dumps([prediction.get("memory_observations"), prediction.get("research_history")])
+
+
+def test_eligibility_hides_one_task_lineage() -> None:
+    """The hidden lineage is withheld like a reserved one; other lineages stay readable."""
+    rule = Eligibility(hidden_task_lineage="user_01")
+    assert not rule.admits({"task_lineage": "user_01"})
+    assert rule.admits({"task_lineage": "user_02"})
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    [
+        ({"mode": "frozen", "checkpoint": 1, "hide_task_lineage": True}, "only while learning"),
+        ({"mode": "learn", "withhold_own": False}, "unreserved frozen retest"),
+        (
+            {"mode": "frozen", "checkpoint": 1, "reserved": True, "withhold_own": False},
+            "unreserved frozen retest",
+        ),
+    ],
+)
+def test_memory_options_apply_only_where_they_mean_something(
+    fields: dict[str, object], message: str
+) -> None:
+    """Hiding is a learning option; reading one's own trajectory is an unreserved retest."""
+    with pytest.raises(ValueError, match=message):
+        FidelityMemory.model_validate({"lineage": "learn-a", **fields})
+
+
+def test_a_trace_is_predicted_whole_before_its_own_feedback_is_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first trace misses the learnable tool twice: its own investigation cannot help."""
+    episodes = []
+    for index in range(USERS):
+        item = episode(index)
+        user = f"user_{index:02d}"
+        again = ("get_user_details", {"user_id": user, "fields": "payment"}, {"payment": "card"})
+        exchanges = item["exchanges"]
+        assert isinstance(exchanges, list)
+        item["exchanges"] = [*exchanges, again]
+        episodes.append(item)
+    provider = SimulatedProvider(episodes, learnable=True)
+    _, store, output = build_project(
+        tmp_path, monkeypatch, provider, "--learn", "--memory-recall", "jev", episodes=episodes
+    )
+    curve = learning_curve(store)
+    assert curve is not None and len(curve.points) == USERS
+    first = curve.points[0]
+    assert (first.exact, first.steps) == (2, 4), "both learnable turns miss on pinned memory"
+    assert all(point.exact == point.steps for point in curve.points[1:])
+    for prediction in provider.predictions():
+        assert not _obj(prediction.get("research_history") or {}).get("session")
+    assert f"learned {USERS}/{USERS} traces" in output

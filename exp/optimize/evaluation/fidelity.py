@@ -28,6 +28,7 @@ from exp.optimize.evaluation.fidelity_memory import (
     maintain_memory,
     trajectory_record,
 )
+from exp.optimize.evaluation.knowledge_exposure import require_unexposed_task
 from exp.optimize.evaluation.retrieval_binding import (
     bind_index_embedder,
     index_embedder_alias,
@@ -71,6 +72,7 @@ from exp.simulation.world_model.memory_tree import (
     overview,
     overview_sources,
 )
+from exp.simulation.world_model.overview_pin import pinned_summaries
 from exp.simulation.world_model.runtime import (
     load_grounded_world_model,
     load_grounded_world_model_artifact,
@@ -130,6 +132,11 @@ class FidelityMemory(ContractModel):
         reserved: Frozen evaluation that declares this task lineage reserved: it is refused if
             the lineage already consumed the task lineage, and later learning of it is refused.
             Without it a frozen run is a diagnostic and relies on same-trajectory withholding.
+        hide_task_lineage: Learning only: memory from earlier trajectories of this task lineage
+            is hidden from the run, so every prediction is made on a task memory has not seen
+            (test-then-train), the same exclusion recorded-evidence retrieval applies.
+        withhold_own: False only for an unreserved frozen retest that reads what memory learned
+            from this very trajectory: a retention check, never a generalization measure.
         overview_lines: Line budget of the memory overview delivered with every prediction.
         maximum_compressions: Compression calls a learning run may buy after publication.
     """
@@ -138,6 +145,8 @@ class FidelityMemory(ContractModel):
     mode: Literal["learn", "frozen"]
     checkpoint: int | None = Field(default=None, ge=1, strict=True)
     reserved: bool = Field(default=False, strict=True, exclude_if=lambda value: not value)
+    hide_task_lineage: bool = Field(default=False, strict=True, exclude_if=lambda value: not value)
+    withhold_own: bool = Field(default=True, strict=True, exclude_if=lambda value: value)
     overview_lines: int = Field(default=32, ge=1, strict=True)
     maximum_compressions: int = Field(default=16, ge=0, strict=True)
 
@@ -148,6 +157,10 @@ class FidelityMemory(ContractModel):
             raise ValueError("frozen memory requires a checkpoint; learning uses the head")
         if self.reserved and self.mode != "frozen":
             raise ValueError("only frozen evaluation can declare a reserved task lineage")
+        if self.hide_task_lineage and self.mode != "learn":
+            raise ValueError("hiding the task lineage applies only while learning")
+        if not self.withhold_own and (self.mode != "frozen" or self.reserved):
+            raise ValueError("only an unreserved frozen retest may read its own trajectory")
         return self
 
 
@@ -340,6 +353,7 @@ def prepare_fidelity_evaluation(
             raise ValueError("JEV retrieval requires a configured native decision-model alias")
     _validate_memory(project, spec, artifact)
     require_unindexed_held_out_task(project, artifact, spec.task)
+    require_unexposed_task(project, artifact, spec.task)
     prepared = PreparedFidelity(
         id=plan_id,
         spec=spec,
@@ -530,10 +544,15 @@ def execute_fidelity_evaluation(
                     code_revision=prepared.code_revision,
                 )
             rule = Eligibility(
-                exclude_public=public_trajectory_identity(trajectory_record(spec)),
+                exclude_public=public_trajectory_identity(trajectory_record(spec))
+                if spec.memory.withhold_own
+                else None,
                 reserved_task_lineages=reserved_task_lineages(
                     project.artifacts, spec.memory.lineage
                 ),
+                hidden_task_lineage=spec.task.lineage_group_id
+                if spec.memory.hide_task_lineage
+                else None,
                 strict=spec.memory.reserved,
             )
             view = memory_view(project.artifacts, prior, rule)
@@ -549,6 +568,12 @@ def execute_fidelity_evaluation(
 
             lineage, rows = spec.memory.lineage, spec.memory.overview_lines
             generations = summary_generations(prior)
+            pinned = pinned_summaries(
+                project.artifacts,
+                prior,
+                created_at=now(),
+                code_revision=prepared.code_revision,
+            )
 
             def render(extra_retired: frozenset[str]) -> list[JsonObject]:
                 """Serving overview: admissible lines, minus every retired hypothesis."""
@@ -561,6 +586,7 @@ def execute_fidelity_evaluation(
                     admits=admits,
                     admits_line=lambda line: line.origin not in retired,
                     generations=generations,
+                    pinned=pinned,
                 )
 
             prior_overview = render(frozenset())
@@ -578,6 +604,13 @@ def execute_fidelity_evaluation(
                 "lineage": spec.memory.lineage,
                 "mode": spec.memory.mode,
                 "reserved": spec.memory.reserved,
+                # Recorded only when set, so earlier memory identities stay unchanged.
+                **(
+                    {"hidden_task_lineage": rule.hidden_task_lineage}
+                    if rule.hidden_task_lineage is not None
+                    else {}
+                ),
+                **({} if spec.memory.withhold_own else {"withhold_own": False}),
                 "version": 0 if prior is None else prior.version,
                 "consumed_trajectories": 0 if prior is None else len(prior.consumed),
                 "library": None if prior is None else prior.library.model_dump(mode="json"),

@@ -1,11 +1,13 @@
 """Held-out simulator fidelity: replay held-out traces the simulator never learned or indexed.
 
-A completed build splits traces into fit and held-out lineages. This module measures how well
-the built simulator reproduces held-out traces, in one of two explicit profiles:
+A completed build splits traces into fit and held-out lineages. By default the learning pass
+consumes every trace and measures itself test-then-train; this module is the optional,
+independent audit on traces kept out entirely. It measures how well the built simulator
+reproduces held-out traces, in one of two explicit profiles:
 
-- ``memory`` (hybrid): the simulator reads the memory the build's learning pass grew from fit
-  traces, frozen at its final checkpoint, with every held-out lineage reserved so it was never
-  learned, and retrieves recorded facts from the build's fit-only index.
+- ``memory`` (hybrid): the simulator reads the memory learned with ``exp build --learn
+  --hold-out`` from fit traces only, frozen at its final checkpoint, with every held-out lineage
+  reserved so it was never learned, and retrieves recorded facts from the build's fit-only index.
 - ``source-rag``: the same world model retrieving from the build's fit-only index; the serving
   index also holds held-out traces and is never used here.
 
@@ -25,7 +27,7 @@ from exp.common.project import ProjectBuildArtifacts, ProjectStore
 from exp.common.tasks.store import load_task_set
 from exp.common.traces.store import load_trace_dataset
 from exp.optimize.evaluation.fidelity import FidelityMemory, PreparedFidelity
-from exp.optimize.evaluation.trace_learning import fit_calls, learning_plan
+from exp.optimize.evaluation.trace_learning import fit_calls, learning_plan, recorded_plan
 from exp.optimize.evaluation.trace_replay import (
     DEADLINE,
     ReplayCase,
@@ -156,7 +158,14 @@ def register_held_out_fidelity(
     memory: FidelityMemory | None = None
     version: int | None = None
     if profile == "memory":
-        plan = learning_plan(project)
+        if not recorded_plan(project, "fit"):
+            raise ValueError(
+                "held-out fidelity needs memory that never learned the held-out traces; "
+                "the default build learns every trace and reports test-then-train fidelity. "
+                "For an independent held-out panel, run exp build PROJECT --learn --hold-out "
+                "--memory-recall ALIAS"
+            )
+        plan = learning_plan(project, scope="fit")
         head = memory_head(project.artifacts, plan.lineage)
         if head is None:
             raise ValueError(

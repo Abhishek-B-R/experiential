@@ -150,7 +150,7 @@ def test_prediction_guidance_is_serving_policy_but_rules_are_knowledge(
     """Tuning only prediction guidance reuses learned memory; older versions keep scheme 1."""
     project, base = memory_project(tmp_path)
     monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
-    known = SimulationKnowledge(rules="Retain observed identity and state.")
+    known = SimulationKnowledge(rules="Retain observed identity and state.", authored=True)
     served_by = load_grounded_world_model_artifact(project.artifacts, base.world_model)
     learner = persist_grounded_world_model(
         project.artifacts,

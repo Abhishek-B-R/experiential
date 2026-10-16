@@ -419,41 +419,77 @@ quality measurement can call the separate `build_fidelity_evaluation_plan` and
 reports contain measurements only, never an approval or denial. See the
 [router contracts](reference/router_optimization_config.md).
 
-### Learning from traces and held-out fidelity
+### Learning from traces
 
 `exp build PROJECT -t PATH --learn --memory-recall ALIAS [--max-learning-attempts N]` adds an
-opt-in learning pass after the build. It replays every fit trace once, in export order, on a
-hybrid simulator: learned memory supplies behavioral rules, and the build's fit-only index
-supplies recorded facts (a trace never retrieves its own lineage, and held-out traces are not in
-that index). Each step is predicted, then the recorded reply is disclosed and mismatches are
-investigated. Only investigations the investigator marks transferable, phrased by the
-observable cue that triggers them, become memory rules; every investigation stays recallable as
-a record. Each trace is published as one memory version and the memory log is compressed.
-`ALIAS` is a native decision model that recalls memory records. Held-out lineages are reserved
-before the first trace, so they are never learned. The pass is resumable: completed traces
-replay without provider calls. It prints a learning curve of exact replies by consumption order,
-because each fit trace is predicted before it is learned.
+opt-in learning pass after the build. It replays every trace once, in export order, on a hybrid
+simulator: learned memory supplies behavioral rules, and the build's index supplies recorded facts
+(a trace never retrieves its own lineage). Each step is predicted, then the recorded reply is
+disclosed and mismatches are investigated. Only investigations the investigator marks
+transferable, phrased by the observable cue that triggers them, become memory rules; every
+investigation stays recallable as a record. Each trace is published as one memory version and
+the memory log is compressed. `ALIAS` is a native decision model on the SystemOne decisions wire
+that recalls memory records, for example `cloudflare/clef-flash` or `jev-latest`. The pass is
+resumable: completed traces replay without provider calls.
+
+Learning is measured test-then-train: each trace is predicted whole on the memory pinned before
+it. None of the trace's own feedback or investigations reaches its predictions; they are
+published with the trace. Memory from earlier traces of the same task lineage is hidden too,
+just as retrieval hides the trace's own lineage. Memory written after a prediction saw retrieved
+evidence depends on the retrieved traces, so a retrieved fact never reaches its own task through
+memory either. Replay keeps the recorded history visible (the
+recorded agent chose each action after the recorded reply), which makes the score somewhat
+easier than a free-running simulation. Every learning report is therefore a measurement, against
+recorded history, on a task memory has not learned, even though every trace is consumed. The pass prints this
+test-then-train fidelity (replies exact, reply fields matching, and the second half alone, once
+memory has learned half the traces) and a learning curve of exact replies by consumption order.
 
 A simulator proposal that fails validation is never repaired: it is asked again, at most twice,
-with the refusal reason, and each re-ask is saved and counted. After that the turn fails.
+with the refusal reason, and each re-ask is saved and counted. After that the turn fails. A trace
+buys at most 24 investigations; later misses are recorded as raw feedback without one, and the
+trace is still learned.
 
-`exp eval PROJECT --held-out-fidelity N [--verbose]` then replays N held-out traces,
-selected deterministically, against the final memory checkpoint and prints one aggregate line
-(replies exact, reply fields matching, judge mean), how often the judge's per-turn verdict
-agrees with exact reproduction (a check on the judge, not a score), and the learning curve.
-Turns the simulator never answered count as not reproduced. `--verbose` adds every trace and
-turn. Run IDs are derived from the run's inputs, including the prompts the simulator sends, so a
-changed input starts a new run and an unchanged one replays without provider calls. A run that
-stopped after buying calls is never bought again silently: rerun with `--retry-incomplete` (on
-`exp build --learn` or `exp eval --held-out-fidelity`) to replace it. A learning trace that
-stops before completing is retried up to three times in the same pass; any trace still not
-learned is reported, and only learned traces count.
+A memory version always shows the predictor the same overview: the first read of a version
+records which compressed summaries existed, and every later read of that version uses exactly
+those, even after more compression completes.
+
+`exp eval PROJECT --retest-misses N [--verbose]` replays up to N learned traces that had at least
+one inexact reply, against the final memory checkpoint, and compares each turn before and after
+learning: fixed, still wrong, or regressed. The retest reads what memory learned from those
+traces, so it checks that the lessons of a miss stuck; it does not measure unlearned tasks.
+
+`--hold-out` on `exp build --learn` learns fit traces only. Held-out lineages are reserved before
+the first trace, so they are never learned, and the fit-only index is used for recorded facts.
+`exp eval PROJECT --held-out-fidelity N [--verbose]` then replays N held-out traces, selected
+deterministically, against that memory's final checkpoint, as an independent audit. It prints
+one aggregate line (replies exact, reply fields matching, judge mean), how often the judge's
+per-turn verdict agrees with exact reproduction (a check on the judge, not a score), and the
+learning curve. Without `--hold-out` there is no held-out trace left, and it refuses.
+
+In every replay, turns the simulator never answered count as not reproduced, and `--verbose`
+adds every trace and turn. Run IDs are derived from the run's inputs, including the prompts the
+simulator sends, so a changed input starts a new run and an unchanged one replays without provider
+calls. A run that stopped after buying calls is never bought again silently: rerun with
+`--retry-incomplete` (on `exp build --learn`, `exp eval --retest-misses` or
+`exp eval --held-out-fidelity`) to replace it. A learning trace that stops before completing is
+retried up to three times in the same pass; any trace still not learned is reported, and only
+learned traces count. A learned trace is scored by the attempt that was consumed into memory,
+never by an earlier attempt that stopped; the curve and the retest report incomplete traces
+separately. A cancelled `--learn` preflight records nothing; without `--hold-out`, later commands
+read the memory that learned most recently.
+
+Knowledge pinned in a simulator (built outside `exp build`, for example for `exp eval --fidelity`)
+is checked before any provider call. Its constructor sources, research notes and prior-library
+entries are resolved to recorded traces and task lineages, and a task whose own evidence they
+contain is refused. A held-out task is also refused when any knowledge channel has no recorded
+provenance, unless the hand-written rules are declared `authored`.
 
 A trace may mark its public prefix in its request context (`exp.request.context`, for example
 `{"task_lineage": "user_17", "replay_from": 2}`): the first `replay_from` recorded tool calls and
 their replies are given to the simulator as initial observations, and measurement starts at the
 next call. Without it, every recorded call is measured. Traces that declare no tool list
-(`exp.request.tools`) get tool signatures observed in fit traces: names and argument names only.
+(`exp.request.tools`) get tool signatures observed in learned traces: names and argument names
+only.
 
 ### Simulated tool observations
 

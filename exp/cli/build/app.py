@@ -163,7 +163,7 @@ def build(
     learn: bool = typer.Option(
         False,
         "--learn",
-        help="Then learn simulator memory trace by trace from fit traces (provider calls).",
+        help="Then learn simulator memory trace by trace from every trace (provider calls).",
     ),
     memory_recall: str | None = typer.Option(
         None, "--memory-recall", help="Native decision alias recalling memory while learning."
@@ -178,6 +178,12 @@ def build(
         False,
         "--retry-incomplete",
         help="With --learn, buy again the calls of a trace that stopped incomplete.",
+    ),
+    hold_out: bool = typer.Option(
+        False,
+        "--hold-out",
+        help="With --learn, learn fit traces only and keep held-out traces for "
+        "exp eval --held-out-fidelity.",
     ),
 ) -> None:
     """Build a reusable grounded world model and immutable fit evidence.
@@ -206,9 +212,10 @@ def build(
         dry_run: Print the complete preflight and stop before credentials or selection.
         no_interactive: Disable inline setup and cost questions even at a terminal.
         provider: Repeatable provider names that skip the opening list during setup.
-        learn: After the build, run the sequential learning pass over fit traces.
+        learn: After the build, run the sequential learning pass over every trace.
         memory_recall: Native decision alias for memory recall; required with ``--learn``.
         retry_incomplete: With ``--learn``, replace an interrupted trace, buying it again.
+        hold_out: With ``--learn``, learn fit traces only and reserve held-out lineages.
         maximum_learning_attempts: Learning's physical-attempt budget; omitted allows every
             trace's full ceiling.
 
@@ -216,11 +223,11 @@ def build(
         typer.BadParameter: Input, setup, role, cost, project, or artifact validation fails.
     """
     if learn != (memory_recall is not None) or (
-        (maximum_learning_attempts is not None or retry_incomplete) and not learn
+        (maximum_learning_attempts is not None or retry_incomplete or hold_out) and not learn
     ):
         raise typer.BadParameter(
-            "--learn requires --memory-recall ALIAS; --memory-recall, "
-            "--max-learning-attempts and --retry-incomplete apply only with --learn"
+            "--learn requires --memory-recall ALIAS; --memory-recall, --max-learning-attempts, "
+            "--retry-incomplete and --hold-out apply only with --learn"
         )
     if legacy_trace_file is not None:
         if trace_file is not None:
@@ -454,6 +461,7 @@ def build(
                 non_interactive=no_interactive,
                 code_revision=code_revision,
                 retry_incomplete=retry_incomplete,
+                hold_out=hold_out,
             )
 
 

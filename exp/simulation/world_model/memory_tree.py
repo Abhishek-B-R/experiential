@@ -23,7 +23,7 @@ that still admits such a line opens the block instead of losing it.
 
 import json
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Container, Mapping, Sequence
 from datetime import datetime
 from typing import Literal, cast
 
@@ -569,11 +569,14 @@ def overview(
     admits: Callable[[ArtifactInput], bool] | None = None,
     admits_line: Callable[[MemoryLine], bool] | None = None,
     generations: Generations | None = None,
+    pinned: Container[tuple[int, int, int]] | None = None,
 ) -> list[JsonObject]:
     """Render at most ``budget`` rows of the first ``total`` lines, oldest first.
 
-    Summaries are read at the generations pinned by the reader's memory version. A summary
-    that omitted a line is shown only if this reader excludes that line too.
+    Summaries are read at the generations pinned by the reader's memory version. When
+    ``pinned`` is given, only those ``(lo, hi, generation)`` summaries may be shown, so a
+    summary compressed after the version was pinned never changes what that version shows.
+    A summary that omitted a line is shown only if this reader excludes that line too.
 
     A line appears only if it is admitted: by default its source and every dependency pass
     ``admits``, and ``admits_line`` may additionally exclude it (for example, retired
@@ -629,7 +632,12 @@ def overview(
                 }
             )
             continue
-        summary = read_summary(store, lineage, lo, hi, (generations or {}).get((lo, hi), 0))
+        generation = (generations or {}).get((lo, hi), 0)
+        summary = (
+            read_summary(store, lineage, lo, hi, generation)
+            if pinned is None or (lo, hi, generation) in pinned
+            else None
+        )
         if (
             summary is None
             or not all(line_ok(x) for x in covered_lines(store, summary))

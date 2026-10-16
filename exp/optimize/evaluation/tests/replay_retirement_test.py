@@ -16,8 +16,9 @@ from exp.common.models import (
     write_model_catalog,
 )
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation import trace_replay
+from exp.optimize.evaluation import trace_learning, trace_replay
 from exp.optimize.evaluation.fidelity import execute_fidelity_evaluation
+from exp.optimize.evaluation.fidelity_memory import DUPLICATE, saved_memory_receipt
 from exp.optimize.evaluation.held_out_fidelity import register_held_out_fidelity
 from exp.optimize.evaluation.held_out_fidelity_test import (
     REVISION,
@@ -26,8 +27,15 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     build_project,
     episode,
 )
+from exp.optimize.evaluation.miss_retest import register_miss_retest
 from exp.optimize.evaluation.tests.fidelity_memory_test import memory_project
-from exp.optimize.evaluation.trace_learning import fit_calls, learn_from_fit_traces
+from exp.optimize.evaluation.trace_learning import (
+    fit_calls,
+    learn_from_traces,
+    learning_curve,
+    learning_plan,
+    learning_progress,
+)
 from exp.runtime.models.providers.transport import JsonHttpResponse
 from exp.simulation.retrieval import load_rag_index
 from exp.simulation.world_model.observed_tools import observed_calls
@@ -97,12 +105,12 @@ def test_a_learning_pass_continues_after_a_catalog_edit(
     """A budget stop leaves the next trace registered; editing the catalog must not wedge it."""
     provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
     _, store, _ = build_project(tmp_path, monkeypatch, provider)
-    stopped = learn_from_fit_traces(
+    stopped = learn_from_traces(
         store, recall_alias="jev", maximum_attempts=1, code_revision=REVISION, clock=now
     )
     assert stopped.stopped is not None
     add_unrelated_model(store)
-    done = learn_from_fit_traces(
+    done = learn_from_traces(
         store, recall_alias="jev", maximum_attempts=10_000, code_revision=REVISION, clock=now
     )
     assert done.stopped is None and done.learned == done.traces
@@ -181,7 +189,7 @@ def test_a_learning_trace_that_stops_early_is_retried_then_reported(
     provider = FlakyInvestigator([episode(i) for i in range(USERS)], learnable=True)
     provider.failures = failures
     _, store, _ = build_project(tmp_path, monkeypatch, provider)
-    outcome = learn_from_fit_traces(
+    outcome = learn_from_traces(
         store, recall_alias="jev", maximum_attempts=10_000, code_revision=REVISION, clock=now
     )
     assert outcome.learned + outcome.incomplete == outcome.traces
@@ -211,7 +219,7 @@ def test_a_world_model_without_tools_is_refused_before_any_call(
     )
     sent = len(provider.requests)
     with pytest.raises(ValueError, match="tool-capable world model"):
-        learn_from_fit_traces(
+        learn_from_traces(
             store, recall_alias="jev", maximum_attempts=10_000, code_revision=REVISION, clock=now
         )
     assert len(provider.requests) == sent
@@ -241,3 +249,36 @@ def test_both_profiles_derive_tool_schemas_from_the_same_fit_calls(
     assert {name for name, _ in fit_calls(store)} == {
         name for name, _ in observed_calls(fit.transitions)
     }
+
+
+@pytest.mark.parametrize("failures", [1, 99])
+def test_scores_and_retests_use_only_the_consumed_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failures: int
+) -> None:
+    """A stopped attempt is never scored as learned; a retried trace scores its consumed run."""
+    provider = FlakyInvestigator([episode(i) for i in range(USERS)], learnable=True)
+    provider.failures = failures
+    _, store, _ = build_project(tmp_path, monkeypatch, provider)
+    outcome = learn_from_traces(
+        store, recall_alias="jev", maximum_attempts=10_000, code_revision=REVISION, clock=now
+    )
+    plan = learning_plan(store)
+    runs, incomplete = learning_progress(store, plan)
+    assert (len(runs), len(incomplete)) == (outcome.learned, outcome.incomplete)
+    for _, prepared, _ in runs:
+        receipt = saved_memory_receipt(store, prepared)
+        assert receipt is not None and receipt.get("reason") in ("consumed", DUPLICATE)
+    curve = learning_curve(store)
+    if failures == 99:
+        # Every investigation is refused, so no trace is consumed and nothing is scored.
+        assert outcome.learned == 0 and outcome.incomplete == USERS and curve is None
+        with pytest.raises(ValueError, match="nothing has been learned"):
+            register_miss_retest(store, 99, code_revision=REVISION, clock=now)
+        return
+    assert curve is not None and (len(curve.points), curve.incomplete) == (USERS, 0)
+    case, consumed, _ = runs[0]
+    attempts = trace_learning._saved_attempts(store, plan, case)
+    assert len(attempts) > 1 and attempts[0][0].id != consumed.id, "the first attempt stopped"
+    panel = register_miss_retest(store, 99, code_revision=REVISION, clock=now)
+    assert panel.learned == USERS
+    assert panel.before[0].run_id == consumed.spec.run_id
