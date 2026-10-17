@@ -503,6 +503,60 @@ async fn an_azure_completion_finished_content_filter_under_a_400_is_a_refusal() 
 }
 
 #[tokio::test]
+async fn an_azure_streamed_content_filter_chunk_under_a_400_is_a_refusal() {
+    // Production 2026-10-17 (deepseek-v4-flash on azure_openai, 29 events):
+    // a STREAMING request's 4xx body is one SSE chunk finished
+    // content_filter. It is no JSON document, so it used to relay verbatim
+    // as "provider rejected the request: data: {...}" under invalid_request.
+    let body = "data: {\"created\":1792200000,\"object\":\"chat.completion.chunk\",\
+                \"id\":\"chatcmpl-1\",\"model\":\"\",\"choices\":[{\"delta\":{},\
+                \"finish_reason\":\"content_filter\",\"index\":0,\
+                \"content_filter_results\":{\"error\":{\"code\":\"content_filter\",\
+                \"message\":\"Response content blocked by label \
+                'MultiSeverity_ViolenceScore'.\"}}}]}\n\n";
+    let failure = open_against_body("400 Bad Request", body, "DeepSeek-V4-Flash").await;
+    assert_eq!(failure.failure_class, FailureClass::Refusal);
+    assert_eq!(
+        failure.refusal_reason,
+        Some(crate::errors::RefusalReason::ContentPolicy)
+    );
+    assert!(!failure.failover_eligible);
+    assert_eq!(
+        failure.provider_detail.as_deref(),
+        Some("Response content blocked by label 'MultiSeverity_ViolenceScore'.")
+    );
+    // Chat and Responses read the same public error; Messages wraps it in
+    // the Anthropic envelope with the same bounded reason. No frame text
+    // reaches any caller.
+    let public = failure.public_error();
+    assert_eq!(public.status_code, 400);
+    assert_eq!(public.code, "refusal");
+    assert_eq!(
+        public.message,
+        "provider refused the request: content policy"
+    );
+    let messages = crate::encode_messages::anthropic_error_body(&public);
+    assert_eq!(messages["error"]["type"], "invalid_request_error");
+    assert_eq!(messages["error"]["refusal_reason"], "content_policy");
+    assert_eq!(
+        messages["error"]["message"],
+        "provider refused the request: content policy"
+    );
+    // A chunk with only an error verdict (no finish yet) is the same refusal;
+    // a stream of ordinary chunks stays a request-shape error.
+    let early = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{},\
+                 \"index\":0,\"content_filter_results\":{\"error\":\
+                 {\"code\":\"content_filter\",\"message\":\"blocked\"}}}]}\n\n";
+    let failure = open_against_body("400 Bad Request", early, "m").await;
+    assert_eq!(failure.failure_class, FailureClass::Refusal);
+    let ordinary = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":\
+                    {\"content\":\"hi\"},\"index\":0,\"finish_reason\":\"stop\",\
+                    \"content_filter_results\":{\"hate\":{\"filtered\":false}}}]}\n\n";
+    let failure = open_against_body("400 Bad Request", ordinary, "m").await;
+    assert_eq!(failure.failure_class, FailureClass::InvalidRequest);
+}
+
+#[tokio::test]
 async fn an_aggregator_routing_gate_403_is_not_a_credential_failure() {
     let failure = open_against_body(
         "403 Forbidden",

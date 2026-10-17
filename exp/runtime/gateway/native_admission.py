@@ -18,6 +18,7 @@ import logging
 from collections.abc import Sequence
 
 from exp.common.models.catalog import GatewayDeploymentCapabilities
+from exp.runtime.gateway import prompt_size
 from exp.runtime.gateway.affinity import (
     affinity_fingerprint,
     affinity_seed_material,
@@ -47,7 +48,6 @@ from exp.runtime.gateway.prompt_caching import (
     with_cache_affinity,
     without_prompt_caching,
 )
-from exp.runtime.gateway.prompt_size import context_window_compatible_indexes
 from exp.runtime.gateway.recovery_binding import bind_recovery_profiles
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.sticky_affinity import AffinityPlacement, sticky_first_order
@@ -262,12 +262,12 @@ def prepare_route_requests(
     if len(chat_indexes) != len(route.deployments):
         route = select_route_deployments(route, chat_indexes)
         resolved_wires = tuple(resolved_wires[index] for index in chat_indexes)
-    window_indexes = context_window_compatible_indexes(route, request)
+    request, admission_disclosures = prompt_size.clamp_output_to_context_window(route, request)
+    window_indexes = prompt_size.context_window_compatible_indexes(route, request)
     if len(window_indexes) != len(route.deployments):
         route = select_route_deployments(route, window_indexes)
         resolved_wires = tuple(resolved_wires[index] for index in window_indexes)
 
-    tier_disclosures: tuple[str, ...] = ()
     if request.service_tier in ("flex", "priority"):
         tier = request.service_tier
         tier_indexes = tuple(
@@ -283,7 +283,7 @@ def prepare_route_requests(
             # tier: serving it at the standard price would bill more than the
             # caller chose, so flex keeps the typed refusal below.
             request = request.model_copy(update={"service_tier": None})
-            tier_disclosures = (PRIORITY_TIER_UNAVAILABLE_DISCLOSURE,)
+            admission_disclosures = (*admission_disclosures, PRIORITY_TIER_UNAVAILABLE_DISCLOSURE)
         elif not tier_indexes:
             raise ProviderCapabilityError(
                 capability="service_tier",
@@ -301,7 +301,7 @@ def prepare_route_requests(
             resolved_wires = tuple(resolved_wires[index] for index in tier_indexes)
 
     admitted_request = request
-    coercion_disclosures: tuple[str, ...] = tier_disclosures
+    coercion_disclosures: tuple[str, ...] = admission_disclosures
     full_route = route
     full_wires = resolved_wires
 
@@ -365,7 +365,7 @@ def prepare_route_requests(
     )
     # Re-check after semantic shaping. Output ceilings stay caller-owned;
     # omitted wire-required caps are resolved independently at payload build.
-    shaped_indexes = context_window_compatible_indexes(route, provider_request)
+    shaped_indexes = prompt_size.context_window_compatible_indexes(route, provider_request)
     if len(shaped_indexes) != len(route.deployments):
         route = select_route_deployments(route, shaped_indexes)
         resolved_wires = tuple(resolved_wires[index] for index in shaped_indexes)

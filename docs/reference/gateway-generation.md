@@ -16,6 +16,15 @@ Responses wire, or a catalog-declared minimum) dispatches at the floor
 raising adds at most the floor's few tokens. A plan account that refuses any ceiling still
 narrows out instead.
 
+A limit that no rung's declared context window can reserve beside the prompt (`max_tokens`
+10,000,000 on a 131,072-token route that declares no output maximum) is lowered before the
+window check to what the largest window leaves, disclosed as
+`max_tokens-><n>(context_window)`. The prompt is sized from above for this: one token per text
+byte plus a 256-token template reserve, or three bytes per token when that leaves no room. A
+rung that declares no window, or that already holds the request, keeps the value. Only the
+output limit changes: a prompt that alone exceeds every window is still refused with
+`context_length_exceeded`.
+
 When the caller omits a limit:
 
 - Optional upstream fields remain absent, including Gemini `maxOutputTokens`.

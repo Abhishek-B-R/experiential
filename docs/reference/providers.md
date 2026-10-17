@@ -224,10 +224,13 @@ their independently rounded half-hundredth intervals, clipped to `[0, 1]`: the p
 may then read 0.99 or 1.01, a choice may sit one hundredth below another category only if that
 distribution can make it highest, and a hundredth-valued score must match that distribution's
 weighted index. These bounded checks respect the shared probability mass and admit closed
-interval endpoints because rounding ties are unspecified. A thousandth-valued score beside
-hundredth-valued probabilities (the provider rounding its latent expectation one decimal finer
-than its bins) must lie within half a thousandth of that distribution's achievable weighted
-index. Finer-precision totals, winners and scores keep the exact checks. A rejected score
+interval endpoints because rounding ties are unspecified. Beside hundredth-valued
+probabilities, a score is judged at the precision the provider reported it to: a tenth-valued
+score (`3.9` beside an expectation of 3.87) must lie within half a tenth, a hundredth-valued
+one within half a hundredth, and a thousandth-valued one within half a thousandth of that
+distribution's achievable weighted index. A whole-number score is read at tenths. Precision is
+read from the number itself, so a hundredth-rounded score ending in zero (`1.10`) is read at
+tenths. Finer-precision totals, winners and scores keep the exact checks. A rejected score
 records its numbers (score, recomputed expectation, bins, achievable rounding envelope and
 tolerance) in the operator log and the ledger detail; the public error stays generic.
 Missing answers, mismatched types or criteria, and missing or invalid usage fail closed. Only validated answer fields are returned; extra provider metadata is omitted.

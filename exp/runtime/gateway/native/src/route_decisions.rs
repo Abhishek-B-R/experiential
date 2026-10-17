@@ -681,22 +681,29 @@ fn score_matches_distribution(score: f64, probabilities: &[f64]) -> bool {
     let Some((minimum, maximum)) = score_envelope(probabilities) else {
         return false;
     };
-    match hundredths(score) {
-        // Closed envelopes admit unspecified half-way rounding of a hundredth
-        // score. No output is repaired or normalized, and structurally invalid
-        // distributions never reach this check.
-        Some(score_hundredths) => {
-            2 * score_hundredths + 1 >= minimum && 2 * score_hundredths - 1 <= maximum
-        }
-        // A thousandth-valued score is the provider rounding the latent
-        // expectation one decimal finer than its bins (thirds published as
-        // 0.33 each beside a score of 1.001). It must lie inside the closed
-        // half-thousandth envelope of the expectations every latent unit
-        // distribution behind those bins can take. Finer scores stay strict.
-        None => thousandths(score).is_some_and(|score_thousandths| {
-            2 * score_thousandths + 1 >= 10 * minimum && 2 * score_thousandths - 1 <= 10 * maximum
-        }),
-    }
+    // The score is rounded at the precision the provider REPORTED it to
+    // (TypeSafe answers `score=3.9` beside bins whose latent expectation is
+    // 3.87, production 2026-10-17), so it stands for the closed interval of
+    // half a unit in its last decimal place, and passes only when that
+    // interval meets the envelope. A whole-number score is read at tenths,
+    // the coarsest precision the provider reports, so `4` cannot claim a
+    // half-unit allowance; scores finer than thousandths stay strict. No
+    // output is repaired or normalized, and structurally invalid
+    // distributions never reach this check.
+    let Some((units, scale)) = reported_precision(score) else {
+        return false;
+    };
+    // The envelope is in half-hundredths (1/200); the score interval is
+    // [(2u-1)/(2s), (2u+1)/(2s)]. Cross-multiplied to stay in integers.
+    (2 * units + 1) * 100 >= minimum * scale && (2 * units - 1) * 100 <= maximum * scale
+}
+
+/// The score in units of its reported decimal place, and that place's scale:
+/// tenths at the coarsest, thousandths at the finest, `None` finer still.
+fn reported_precision(score: f64) -> Option<(i64, i64)> {
+    [(10.0, 10), (100.0, 100), (1000.0, 1000)]
+        .into_iter()
+        .find_map(|(factor, scale)| decimal_units(score, factor).map(|units| (units, scale)))
 }
 
 /// Extreme expectations, in half-hundredths, of every unit distribution whose
@@ -794,11 +801,6 @@ fn admits_unit_total(bounds: &[(i64, i64)]) -> bool {
 /// Recognize decimal hundredths, including their binary floating-point residue.
 fn hundredths(value: f64) -> Option<i64> {
     decimal_units(value, 100.0)
-}
-
-/// Recognize decimal thousandths, including their binary floating-point residue.
-fn thousandths(value: f64) -> Option<i64> {
-    decimal_units(value, 1000.0)
 }
 
 /// Recognize a value with at most the decimal precision `scale` names.
