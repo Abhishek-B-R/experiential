@@ -41,6 +41,7 @@ pub(super) fn config() -> Configuration {
         asynchronous_delivery: true,
         capture_hidden_reasoning: true,
         capture_logprobs: false,
+        spill: None,
     }
 }
 
