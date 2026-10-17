@@ -112,7 +112,7 @@ def run_miss_retest(
         console.print()
         console.print(Text(aggregate_line(aggregate(results), len(panel.cases), "Miss retest")))
         console.print(Text(changes_line(turn_changes(panel, results))))
-        curve = learning_curve(store)
+        curve = learning_curve(store, "all")
         if curve is not None:
             console.print(Text(curve.headline()))
         console.print(

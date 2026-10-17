@@ -97,7 +97,9 @@ def register_miss_retest(
     Raises:
         ValueError: Nothing learned yet, or no learned trace had a miss.
     """
-    plan = learning_plan(project)
+    # The retest belongs to the build: it reads the build's all-traces memory, never the
+    # audit's fit-only memory, even when the audit learned more recently.
+    plan = learning_plan(project, scope="all")
     head = memory_head(project.artifacts, plan.lineage)
     runs = learned_runs(project, plan)
     if head is None or not runs:

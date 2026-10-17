@@ -119,5 +119,26 @@ def test_a_cancelled_preflight_never_hides_learned_memory(
     assert learning_plan(store).scope == "fit"
     curve = learning_curve(store)
     assert curve is not None and len(curve.points) == outcome.learned
+    with pytest.raises(ValueError, match="no learned memory for this build"):
+        register_miss_retest(store, 99, code_revision=REVISION, clock=lambda: datetime.now(UTC))
+
+
+def test_the_build_retest_reads_the_build_memory_after_an_audit_learned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An audit's fit-only memory publishing later never becomes what the build retests."""
+    provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
+    _, store, _ = build_project(tmp_path, monkeypatch, provider, learn=True)
+    build_plan = learning_plan(store, scope="all")
+    learn_from_traces(
+        store,
+        recall_alias="jev",
+        scope="fit",
+        maximum_attempts=10_000,
+        code_revision=REVISION,
+        clock=lambda: datetime.now(UTC),
+    )
+    assert learning_plan(store).scope == "fit", "the audit's memory published most recently"
     panel = register_miss_retest(store, 99, code_revision=REVISION, clock=lambda: datetime.now(UTC))
-    assert panel.learned == outcome.learned
+    assert panel.world_model == build_plan.world_model
+    assert panel.learned == USERS, "every trace, not only the fit traces"
