@@ -539,10 +539,11 @@ def _coerce_generation_semantics(
     """Build the minimal disclosed effort or thinking substitution.
 
     Only substitutions whose semantics survive are offered: an explicit
-    reasoning effort may snap down to a supported level, never up, except
-    that ``none`` or ``minimal`` below a route's whole ladder takes the
-    shallowest tier it serves (disclosed as ``lowest_supported``): the route
-    cannot reason less, and refusing pinned clients wedges every turn. A
+    reasoning effort snaps down to the nearest supported level first; only
+    when no level at or below it serves does it rise to the nearest level
+    above (disclosed as ``nearest_supported``, or ``lowest_supported`` for
+    ``none``/``minimal`` below a route's whole ladder): the route cannot
+    serve the asked depth, and refusing pinned clients wedges every turn. A
     thinking ``disabled`` config must remain off or receive a typed refusal.
     An effort on a route
     with no reasoning support at all is dropped with disclosure. A
@@ -650,14 +651,26 @@ def _coerce_generation_semantics(
     # and the snap is the closest level that actually admits a rung.
     permitted = set(REASONING_EFFORTS[: REASONING_EFFORTS.index(request.reasoning_effort) + 1])
     candidates = efforts_by_nearness(request.reasoning_effort, ladder & permitted)
-    lowest_supported = not candidates and request.reasoning_effort in ("none", "minimal")
-    if lowest_supported:
-        # Below the whole ladder: the route cannot turn reasoning off or go
-        # that shallow, so the shallowest tier it serves is the nearest
-        # faithful reading (pinned clients send "none" to every model; the
-        # gateway refused 925 such requests a day). Lowest tier first.
-        candidates = tuple(effort for effort in REASONING_EFFORTS if effort in ladder)
-    for candidate in candidates:
+    # When no tier at or below the request admits a rung, the request would
+    # otherwise be refused, so the nearest tier ABOVE it serves instead,
+    # nearest first (a tie with a lower tier never reaches here: every lower
+    # tier was already tried). "none"/"minimal" below the whole ladder keep
+    # their own reason: the route cannot turn reasoning off or go that
+    # shallow (pinned clients send "none" to every model; the gateway
+    # refused 925 such requests a day). Any other effort between or below
+    # the ladder's tiers is ``nearest_supported`` (gemini-3.8-flash serves
+    # only "high"; "medium" was refused, production 2026-10-17).
+    above = tuple(
+        effort
+        for effort in REASONING_EFFORTS[REASONING_EFFORTS.index(request.reasoning_effort) + 1 :]
+        if effort in ladder
+    )
+    raised_reason = (
+        "lowest_supported"
+        if request.reasoning_effort in ("none", "minimal")
+        else "nearest_supported"
+    )
+    for candidate in (*candidates, *above):
         snap_updates: JsonObject = {"reasoning_effort": candidate}
         if (
             request.provider_output_config is not None
@@ -686,8 +699,8 @@ def _coerce_generation_semantics(
         return RequestCoercion(
             request=snapped_request,
             disclosures=(
-                f"reasoning_effort->{candidate}(lowest_supported)"
-                if lowest_supported
+                f"reasoning_effort->{candidate}({raised_reason})"
+                if candidate in above
                 else f"reasoning_effort->{candidate}",
             ),
         )

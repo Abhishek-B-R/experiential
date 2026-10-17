@@ -19,6 +19,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.capability_policy import (
+    EFFORT_DROP_DISCLOSURE,
     coerce_capability,
     coerce_generation_parameters,
     coerce_structured_text_schema,
@@ -94,14 +95,58 @@ def test_efforts_order_by_nearness_and_prefer_the_lower_level_on_ties() -> None:
 
 
 @pytest.mark.parametrize("effort", ("low", "medium"))
-def test_explicit_effort_cannot_be_upsold(effort: ReasoningEffort) -> None:
-    """A high-only rung cannot replace an explicit lower requested effort."""
-    assert (
-        coerce_generation_parameters(
-            (_reasoning_profile("gpt-5-pro"),), _request(reasoning_effort=effort)
-        )
-        is None
+def test_an_effort_below_every_tier_rises_to_the_nearest_one(effort: ReasoningEffort) -> None:
+    """A high-only route serves an explicit lower effort at ``high``, disclosed.
+
+    gemini-3.8-flash serves only ``high``; ``medium`` was refused by name
+    (production 2026-10-17). Raising happens only when no tier at or below
+    the request serves, so it never replaces a lower tier that would.
+    """
+    coercion = coerce_generation_parameters(
+        (_reasoning_profile("gpt-5-pro"),), _request(reasoning_effort=effort)
     )
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "high"
+    assert coercion.disclosures == ("reasoning_effort->high(nearest_supported)",)
+    gemini = GatewayWireProfile(
+        dialect="gemini_generate_content",
+        url="https://gemini.test",
+        model_id="gemini-3.8-flash",
+        supports_reasoning=True,
+        reasoning_wire_format="gemini_thinking",
+        supported_reasoning_efforts=("high",),
+    )
+    request = _request(reasoning_effort=effort).model_copy(
+        update={"provider_output_config": {"effort": effort}}
+    )
+    coercion = coerce_generation_parameters((gemini,), request)
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "high"
+    # The Messages surface's verbatim channel carries the same tier.
+    assert coercion.request.provider_output_config == {"effort": "high"}
+
+
+def test_a_lower_tier_still_wins_over_raising_and_a_non_reasoning_route_drops() -> None:
+    """Snapping down stays first; a route that cannot reason keeps the drop."""
+    ladder = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://ladder.test",
+        model_id="ladder-model",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("low", "xhigh"),
+    )
+    coercion = coerce_generation_parameters((ladder,), _request(reasoning_effort="high"))
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "low"
+    assert coercion.disclosures == ("reasoning_effort->low",)
+    plain = GatewayWireProfile(
+        dialect="openai_compatible", url="https://plain.test", model_id="plain-model"
+    )
+    dropped = coerce_generation_parameters((plain,), _request(reasoning_effort="medium"))
+    assert dropped is not None
+    assert dropped.request.reasoning_effort is None
+    assert dropped.disclosures == (EFFORT_DROP_DISCLOSURE,)
 
 
 @pytest.mark.parametrize("effort", ("none", "minimal"))
