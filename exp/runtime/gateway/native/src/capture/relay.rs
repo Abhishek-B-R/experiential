@@ -40,6 +40,22 @@ impl Relay {
                 .sum::<usize>()
     }
 
+    /// Decode for a split-capable destination: a body above `keep_raw_above`
+    /// bytes is returned raw instead of parsed in memory, for the split builder.
+    pub(super) fn decode_split(mut self, keep_raw_above: usize) -> (Value, Option<Vec<u8>>) {
+        if self.body.len() <= keep_raw_above {
+            return (self.decode(), None);
+        }
+        let body = std::mem::take(&mut self.body);
+        let mut value = self.decode();
+        if let Some(wire) = value.get_mut("wire_request").and_then(Value::as_object_mut) {
+            // The split builder sets the real kind and body.
+            wire.insert("body_kind".into(), Value::String("json".into()));
+            wire.insert("body".into(), Value::Null);
+        }
+        (value, Some(body))
+    }
+
     pub(super) fn decode(self) -> Value {
         let mut wire = self.metadata.wire_request;
         if let Some(wire) = wire.as_mut().and_then(Value::as_object_mut) {

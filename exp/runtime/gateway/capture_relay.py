@@ -24,6 +24,8 @@ if TYPE_CHECKING:
     from exp_gateway_native import CaptureCollector
 
 _LOGGER = logging.getLogger(__name__)
+# Twice the largest body serving accepts; a spilling collector keeps it whole.
+MAXIMUM_WIRE_BYTES = 128 * 1024 * 1024
 _HEADERS = frozenset(
     {
         "authorization",
@@ -200,7 +202,9 @@ class CaptureRelay:
         app: Outer caller-facing ASGI app, after presentation decorators.
         collector: Collector configured with relay_metadata=True.
         wire_capture: Existing wire capture kill switch, default false.
-        wire_maximum_bytes: Retained request body bound, default 4 MiB.
+        wire_maximum_bytes: Retained request body bound, default 4 MiB. Up to
+            128 MiB for a collector that spills to split records; serving
+            itself refuses bodies above 64 MiB.
     """
 
     def __init__(
@@ -212,8 +216,8 @@ class CaptureRelay:
         wire_maximum_bytes: int = 4_194_304,
     ) -> None:
         """Bind the native collector and the existing wire capture settings."""
-        if not 1 <= wire_maximum_bytes <= 4_194_304:
-            raise ValueError("wire capture limit must be between 1 byte and 4 MiB")
+        if not 1 <= wire_maximum_bytes <= MAXIMUM_WIRE_BYTES:
+            raise ValueError("wire capture limit must be between 1 byte and 128 MiB")
         self.app = cast("_App", app)
         self.collector = collector
         self.wire_capture = wire_capture
