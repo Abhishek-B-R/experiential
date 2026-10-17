@@ -51,7 +51,7 @@ from exp.runtime.gateway.prompt_caching import (
     PROMPT_CACHING_BEST_EFFORT,
     PROMPT_CACHING_OFF_SUFFIX,
 )
-from exp.runtime.gateway.prompt_size import MAXIMUM_BYTES_PER_TOKEN
+from exp.runtime.gateway.prompt_size import MAXIMUM_BYTES_PER_TOKEN, TEMPLATE_RESERVE_TOKENS
 from exp.runtime.gateway.recovery import SessionRecoveryRegistry
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
@@ -1643,6 +1643,38 @@ def test_an_omitted_output_budget_never_copies_a_fallback_cap_across_the_route()
     assert provider.maximum_output_tokens is None
     assert narrowed.snapshot.deployment_ids == ("shim", "native")
     assert wires_out == wires
+
+
+def test_an_output_ceiling_no_window_can_reserve_is_clamped_and_disclosed() -> None:
+    """Production 2026-10-17: max_tokens=10,000,000 on a route with windows but no output max."""
+    deployments = (
+        _deployment("shim", gateway=_TOOL_CAPABLE).model_copy(
+            update={"capabilities": ModelCapabilities(context_window_tokens=32_768)}
+        ),
+        _deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE).model_copy(
+            update={"capabilities": ModelCapabilities(context_window_tokens=131_072)}
+        ),
+    )
+    route = _mixed_route("maximize_availability", deployments)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        maximum_output_tokens=10_000_000,
+        maximum_output_tokens_parameter="max_tokens",
+    )
+    accounting = _CoercionCounter()
+    narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        _wires(),
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    target = 131_072 - len(b"hi") - TEMPLATE_RESERVE_TOKENS
+    assert provider.maximum_output_tokens == target
+    assert narrowed.snapshot.deployment_ids == ("native",)
+    assert f"max_tokens->{target}(context_window)" in public.ignored_parameters
+    assert accounting.recorded == 1
 
 
 def test_a_prompt_certain_to_overflow_the_route_is_refused_before_shaping() -> None:
