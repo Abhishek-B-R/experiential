@@ -11,10 +11,12 @@ from exp.runtime.models.providers.route_repairs import (
     ENCRYPTED_REASONING_INCLUDE_DROPPED,
     apply_route_repairs,
     clamp_output_ceiling,
+    clamp_sampling_range,
     drop_unservable_enable,
     drop_unservable_encrypted_reasoning,
 )
-from exp.runtime.openai_protocol.requests import decode_responses
+from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
 
 
 def _request(
@@ -51,6 +53,63 @@ def test_a_ceiling_below_the_route_floor_is_raised_to_it() -> None:
     assert coercion is not None
     assert coercion.request.maximum_output_tokens == 16
     assert coercion.disclosures == ("max_output_tokens->16(route_minimum)",)
+
+
+_THINKING_CLAUDE = GatewayWireProfile(
+    dialect="anthropic_messages",
+    url="https://a.test",
+    minimum_temperature=1.0,
+    maximum_temperature=1.0,
+    supports_top_p=True,
+    minimum_top_p=0.95,
+    maximum_top_p=1.0,
+)
+"""A route whose sampling is locked, as Claude's thinking lanes are in the catalog."""
+
+
+def test_a_temperature_below_a_locked_route_is_raised_onto_it() -> None:
+    """claude-haiku-5.5 refused temperature 0.1 as "between 1.0 and 1.0" (41 a day)."""
+    coercion = coerce_generation_parameters((_THINKING_CLAUDE,), _request(temperature=0.1))
+    assert coercion is not None
+    assert coercion.request.temperature == 1.0
+    assert coercion.disclosures == ("temperature->1.0(route_minimum)",)
+
+
+def test_a_top_p_outside_the_route_is_clamped_beside_temperature() -> None:
+    """Both sampling controls repair together, each disclosed by name."""
+    coercion = coerce_generation_parameters(
+        (_THINKING_CLAUDE,), _request(temperature=1.5, top_p=0.5)
+    )
+    assert coercion is not None
+    assert (coercion.request.temperature, coercion.request.top_p) == (1.0, 0.95)
+    assert coercion.disclosures == (
+        "temperature->1.0(route_maximum)",
+        "top_p->0.95(route_minimum)",
+    )
+
+
+def test_a_sampling_value_some_rung_carries_is_never_clamped() -> None:
+    """A rung that accepts the value, or drops an undeclared control, keeps it verbatim."""
+    open_rung = GatewayWireProfile(dialect="openai_compatible", url="https://r.test")
+    blind_rung = GatewayWireProfile(
+        dialect="openai_compatible", url="https://b.test", supports_temperature=False
+    )
+    request = _request(temperature=0.1)
+    assert clamp_sampling_range((_THINKING_CLAUDE, open_rung), request) is None
+    assert clamp_sampling_range((_THINKING_CLAUDE, blind_rung), request) is None
+
+
+def test_a_sampling_value_outside_the_public_bounds_is_still_refused() -> None:
+    """Clamping is a route repair, never a validity repair: -1 and NaN stay 400s."""
+    for value in (-1, float("nan"), 3):
+        try:
+            decode_chat(
+                {"model": "m", "messages": [{"role": "user", "content": "x"}], "temperature": value}
+            )
+        except OpenAIProtocolError as exc:
+            assert exc.status_code == 400
+        else:
+            raise AssertionError(f"temperature {value!r} was admitted")
 
 
 def test_a_ceiling_some_rung_honors_is_never_clamped() -> None:

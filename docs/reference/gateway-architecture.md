@@ -855,9 +855,9 @@ while the third-party servers behind that dialect enumerate only the classic rol
 (`sampling_requires_reasoning_none`, e.g. gpt-5.6-sol/luna), a `temperature`/`top_p` sent with
 reasoning on is dropped and disclosed as `temperature->dropped(set_reasoning_effort_none)` rather
 than rejected — the model accepts sampling, just not at that effort, so the request serves and the
-caller is told how to keep the value (set `reasoning_effort=none`); a route that never declares the
-control at all (Anthropic constrained `[1,1]` sampling) still hard-rejects it, since there is
-nothing to honor at any effort. `top_k` prefers a carrying rung; when no rung supports it,
+caller is told how to keep the value (set `reasoning_effort=none`); a value outside every declaring
+rung's range (a Claude thinking lane accepts only `1.0`) is clamped onto the lead rung's range,
+e.g. `temperature->1.0(route_minimum)` ([gateway-generation.md](gateway-generation.md)). `top_k` prefers a carrying rung; when no rung supports it,
 admission drops it with `top_k->dropped(unsupported_by_provider)` because defaults still serve.
 `frequency_penalty` and `presence_penalty` follow their per-rung capability truth and otherwise
 drop with `<parameter>->dropped(unsupported_by_provider)`. These are soft preferences.

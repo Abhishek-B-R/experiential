@@ -16,6 +16,30 @@ Responses wire, or a catalog-declared minimum) dispatches at the floor
 raising adds at most the floor's few tokens. A plan account that refuses any ceiling still
 narrows out instead.
 
+## Sampling ranges
+
+`temperature` and `top_p` outside the public bounds (`temperature` 0 to 2, `top_p` 0 to 1, never
+NaN) are refused by the protocol decoder. Inside them, admission prefers any rung that accepts the
+exact value. When every rung that declares the control refuses the value on range, it is clamped
+onto the leading rung's range like an output limit and disclosed: Claude's thinking lanes accept
+only `temperature` 1.0, so a caller's 0.1 serves as `temperature->1.0(route_minimum)` instead of
+a 400. A rung that does not declare the control serves by dropping it
+(`temperature->dropped(unsupported_by_provider)`), so its presence leaves the value unclamped.
+
+## Structured output routing
+
+A `response_format` (Chat) or `text.format` (Responses) json_schema request is a hard capability:
+admission first narrows the route to the rungs whose catalog declares structured output, in route
+order, and only then ranks them by how exactly they keep sampling and thinking preferences.
+Otherwise a lead rung that keeps the caller's `temperature` exactly but cannot enforce a schema
+would win the ranking and be refused, although a later rung serves the schema (qwen3.8-27b,
+2026-10-17). When the lead is passed over the move is disclosed as
+`response_format->routed(structured_output_rung)` (`text.format->...` on Responses). A route
+with no structured-output rung keeps failing closed on the field. A continuation pinned to the
+rung that sealed its reasoning, and a caller-pinned `gateway.routing.route_id`, never move.
+
+## Output limits and context windows
+
 A limit that no rung's declared context window can reserve beside the prompt (`max_tokens`
 10,000,000 on a 131,072-token route that declares no output maximum) is lowered before the
 window check to what the largest window leaves, disclosed as

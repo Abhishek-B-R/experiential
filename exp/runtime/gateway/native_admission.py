@@ -6,8 +6,7 @@ payload build both run here. When no rung preserves the request verbatim,
 this module applies the capability-preservation policy's minimal disclosed
 coercion exactly once per layer and re-selects; when nothing coercible
 remains, the first rung's own field-scoped rejection stays the answer. A
-coercion is never
-silent: every substitution is disclosed through ``ignored_parameters`` in
+coercion is never silent: every substitution is disclosed through ``ignored_parameters`` in
 ``path->effective`` form, warn-logged for operators, and counted in the
 admission metrics.
 """
@@ -24,6 +23,7 @@ from exp.runtime.gateway.affinity import (
     affinity_seed_material,
     rendezvous_order,
 )
+from exp.runtime.gateway.capability_rungs import narrow_to_capable_rungs
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, GatewayRequest
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_components import NativeGatewayComponents
@@ -76,9 +76,7 @@ from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
 )
 from exp.runtime.models.providers.protocol import NativeWireClient
-from exp.runtime.models.providers.streaming_requests import (
-    route_generation_parameter_requests,
-)
+from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 from exp.runtime.openai_protocol.state import ProtocolNamespace, episode_namespace
 
 _logger = logging.getLogger(__name__)
@@ -267,7 +265,8 @@ def prepare_route_requests(
     if len(window_indexes) != len(route.deployments):
         route = select_route_deployments(route, window_indexes)
         resolved_wires = tuple(resolved_wires[index] for index in window_indexes)
-
+    route, resolved_wires, capable = narrow_to_capable_rungs(route, resolved_wires, request)
+    admission_disclosures = (*admission_disclosures, *capable)
     if request.service_tier in ("flex", "priority"):
         tier = request.service_tier
         tier_indexes = tuple(

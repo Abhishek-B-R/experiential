@@ -1772,30 +1772,28 @@ def test_native_clamps_an_output_ceiling_above_the_catalog_maximum(
     )
 
 
-@pytest.mark.parametrize(("field", "value"), (("temperature", 1.1),))
-def test_native_enforces_catalog_generation_limits_before_dispatch(
-    engine: _ServingEngine,
-    field: str,
-    value: float | int,
-) -> None:
-    """Model-specific sampling and output ceilings fail locally, with no upstream dispatch."""
-    payload = _messages_body("must-not-dispatch")
-    payload[field] = value
-    headers = {"x-api-key": engine.raw_key}
+def test_native_clamps_a_temperature_above_the_route_maximum(engine: _ServingEngine) -> None:
+    """A temperature above the route's maximum dispatches at that maximum, disclosed.
+
+    Sampling is a preference: Claude's thinking lanes accept only 1.0, and
+    refusing a caller's 0.1 failed 56 requests a day (2026-10-17).
+    """
+    payload = _messages_body("fast-token")
+    payload["temperature"] = 1.1
     with _SseUpstream.payloads_lock:
         dispatched_before = len(_SseUpstream.payloads)
-
     native = httpx.post(
         f"{engine.base}/v1/messages",
-        headers=headers,
+        headers={"x-api-key": engine.raw_key},
         json=payload,
         timeout=10.0,
     )
-
-    assert native.status_code == 400
-    assert field in native.json()["error"]["message"]
+    assert native.status_code == 200
+    assert "temperature->1.0(route_maximum)" in native.json()["x-experiential-ignored-parameters"]
     with _SseUpstream.payloads_lock:
-        assert len(_SseUpstream.payloads) == dispatched_before
+        dispatched = _SseUpstream.payloads[dispatched_before:]
+    assert dispatched
+    assert all(sent.get("temperature") == 1.0 for sent in dispatched)
 
 
 _ZERO_OUTPUT_CHAT_CASES = (
