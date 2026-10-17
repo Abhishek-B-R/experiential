@@ -9,6 +9,9 @@ and every repair is named in ``ignored_parameters``:
 * an output ceiling outside the route's accepted range is clamped onto it
   (Claude Code sends ``max_tokens`` 64000 or 128000 to every model; a probe
   sends a ceiling below a reasoning lane's floor);
+* a ``temperature`` or ``top_p`` outside the route's accepted range is clamped
+  onto it the same way (Claude's thinking routes accept only 1.0; a caller's
+  0.1 would otherwise be refused);
 * a level-less enable-thinking toggle on a route whose rungs cannot reason at
   any depth is dropped, because the model can only answer without it;
 * a request to RECEIVE encrypted reasoning on a route with no reasoning
@@ -16,7 +19,7 @@ and every repair is named in ``ignored_parameters``:
   the selector had been omitted), and replayed native encrypted reasoning
   that no rung can read is removed from history.
 
-Numerical thinking budgets, sampling, and explicit efforts are not handled
+Numerical thinking budgets and explicit efforts are not handled
 here; their substitutions live beside the rest of the effort ladder logic.
 """
 
@@ -112,6 +115,57 @@ def clamp_output_ceiling(
         request=request.model_copy(update={"maximum_output_tokens": target}),
         disclosures=(f"{parameter}->{target}({reason})",),
     )
+
+
+def _sampling_range(profile: GatewayWireProfile, control: str) -> tuple[float, float] | None:
+    """Return one rung's accepted range for a sampling control, ``None`` if undeclared."""
+    if control == "top_p":
+        if profile.supports_top_p is not True:
+            return None
+        return profile.minimum_top_p, profile.maximum_top_p
+    if not profile.supports_temperature:
+        return None
+    return profile.minimum_temperature, profile.maximum_temperature
+
+
+def clamp_sampling_range(
+    profiles: Sequence[GatewayWireProfile], request: GatewayRequest
+) -> RouteRepair | None:
+    """Clamp ``temperature`` and ``top_p`` onto the lead rung's accepted range.
+
+    Sampling is a preference, so a value the route cannot carry verbatim
+    dispatches at the nearest value the leading rung accepts rather than
+    being refused. Each control is repaired only when it is a blocker: some
+    rung declares it, and every rung that declares it refuses the value on
+    range. A rung that does not declare the control serves by dropping it
+    (disclosed in route shaping), so its presence leaves the value alone.
+    Values outside the public bounds never reach here: the request decoder
+    refuses them.
+
+    Args:
+        profiles: Ordered wire profiles for every live route deployment.
+        request: Decoded public request that no rung accepted verbatim.
+
+    Returns:
+        The clamped request, or ``None`` when no sampling value is the blocker.
+    """
+    updates: dict[str, object] = {}
+    disclosures: list[str] = []
+    for control, value in (("temperature", request.temperature), ("top_p", request.top_p)):
+        if value is None or not profiles:
+            continue
+        ranges = [_sampling_range(profile, control) for profile in profiles]
+        if any(bounds is None or bounds[0] <= value <= bounds[1] for bounds in ranges):
+            continue
+        floor, top = ranges[0] or (value, value)
+        if floor > top:
+            continue
+        target, reason = (top, "route_maximum") if value > top else (floor, "route_minimum")
+        updates[control] = target
+        disclosures.append(f"{control}->{target}({reason})")
+    if not updates:
+        return None
+    return RouteRepair(request=request.model_copy(update=updates), disclosures=tuple(disclosures))
 
 
 def drop_unservable_enable(
@@ -213,7 +267,12 @@ def drop_unservable_encrypted_reasoning(
 
 ROUTE_REPAIRS: tuple[
     Callable[[Sequence[GatewayWireProfile], GatewayRequest], RouteRepair | None], ...
-] = (clamp_output_ceiling, drop_unservable_enable, drop_unservable_encrypted_reasoning)
+] = (
+    clamp_output_ceiling,
+    clamp_sampling_range,
+    drop_unservable_enable,
+    drop_unservable_encrypted_reasoning,
+)
 """Independent repairs admission composes before any effort substitution."""
 
 
