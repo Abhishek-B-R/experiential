@@ -825,9 +825,10 @@ controls narrow the waterfall to the rungs that preserve every exact value
 request only through a disclosed drop when no rung preserves it, and each remaining deployment
 passes the capability preflight plus payload build. Only when zero rungs survive does the
 capability-preservation policy (`exp/runtime/models/providers/capability_policy.py`) attempt one
-minimal COERCE-WITH-DISCLOSURE: a reasoning effort may snap downward to the nearest supported
-level that can serve the complete request, never upward. Explicit `none` remains off and is
-refused when the route cannot honor it; it cannot become `minimal`. Any effort on a route with no reasoning
+minimal COERCE-WITH-DISCLOSURE: a reasoning effort snaps downward to the nearest supported
+level that can serve the complete request; only when none at or below it serves does it rise to
+the nearest level above (`reasoning_effort->high(nearest_supported)` for `medium` on a `high`-only
+route; `(lowest_supported)` for `none`/`minimal` below the whole ladder). Any effort on a route with no reasoning
 support at all drops (first-party clients pin effort globally, so a named rejection made whole
 sessions unusable against non-reasoning models the provider itself serves fine without the
 parameter; the Messages surface's verbatim `output_config.effort` is stripped with it so the
