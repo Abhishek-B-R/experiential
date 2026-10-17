@@ -52,6 +52,8 @@ pub(crate) struct ResponsesRetention {
     pub(crate) carrier_events: Vec<Event>,
     retained_bytes: usize,
     pub(crate) overflowed: bool,
+    // This stream's share of the worker-wide retained-output budget.
+    lease: crate::retained::RetainedLease,
 }
 
 impl ResponsesRetention {
@@ -59,10 +61,12 @@ impl ResponsesRetention {
         if self.overflowed {
             return;
         }
-        self.retained_bytes = self
-            .retained_bytes
-            .saturating_add(event_retained_bytes(event));
-        if self.retained_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES {
+        let bytes = event_retained_bytes(event);
+        self.retained_bytes = self.retained_bytes.saturating_add(bytes);
+        // Past the per-stream bound, or with the worker's retention budget
+        // full, the continuation is simply not retained; the stream serves on.
+        if self.retained_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES || !self.lease.reserve(bytes) {
+            self.lease.clear();
             self.overflowed = true;
             self.text.clear();
             self.messages.clear();

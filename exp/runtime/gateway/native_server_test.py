@@ -53,6 +53,7 @@ def test_host_passes_the_serve_configuration(
         public_upstreams_only=public_only,
         time_to_first_byte_seconds=12.0,
         native_usage_enabled=False,
+        maximum_retained_output_bytes=512 * 1024 * 1024,
     )
 
     assert captured["control_plane"] is control
@@ -67,6 +68,7 @@ def test_host_passes_the_serve_configuration(
     assert config["public_upstreams_only"] is public_only
     assert config["time_to_first_byte_seconds"] == 12.0
     assert config["native_usage_enabled"] is False
+    assert config["maximum_retained_output_bytes"] == 512 * 1024 * 1024
     assert captured["guardrail_detectors"] == {}
     assert captured["capture"] is None
 

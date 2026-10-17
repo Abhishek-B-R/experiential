@@ -39,6 +39,7 @@ mod replay_repair;
 mod request_policy;
 mod respond;
 mod responses_retention;
+mod retained;
 mod route_audio;
 mod route_batches;
 mod route_chat;
@@ -212,6 +213,7 @@ fn serve(
 ) -> PyResult<()> {
     let config: ServeConfig = serde_json::from_str(config_json)
         .map_err(|error| PyValueError::new_err(format!("invalid serve config: {error}")))?;
+    retained::configure(config.maximum_retained_output_bytes);
     let detectors = Arc::new(collect_detectors(guardrail_detectors)?);
     let bridge = Arc::new(
         Bridge::new(control_plane, config.callback_permits).map_err(PyRuntimeError::new_err)?,

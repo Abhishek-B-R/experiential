@@ -5,6 +5,7 @@ mod anthropic;
 mod bedrock;
 mod deferred_tools;
 mod relay_finish;
+mod retention;
 mod stream_end;
 pub(in crate::dialects) use relay_finish::{
     complete_streamed_tool_or_drop_cut, drop_cut_call, finish_open_tools_relay,
@@ -479,6 +480,8 @@ pub struct Normalizer {
     pub(crate) service_tier: crate::service_tier::ServiceTierObservation,
     chat_logprobs: crate::capture::logprobs::ChatProbabilities,
     responses_logprobs: bool,
+    // This stream's share of the worker-wide retained-output budget.
+    retained: crate::retained::RetainedLease,
 }
 
 /// Longest upstream label kept from a stream (mirrors the python settlement bound).
@@ -528,6 +531,7 @@ impl Normalizer {
             service_tier: crate::service_tier::ServiceTierObservation::default(),
             chat_logprobs: Default::default(),
             responses_logprobs: false,
+            retained: crate::retained::RetainedLease::default(),
         }
     }
 
@@ -565,46 +569,6 @@ impl Normalizer {
             return;
         }
         self.upstream_provider = Some(trimmed.to_string());
-    }
-
-    /// Bound aggregate image output even when images are delivered incrementally.
-    fn reserve_image_bytes(&mut self, additional: usize) -> Result<(), Failure> {
-        self.accumulated_image_bytes = self.accumulated_image_bytes.saturating_add(additional);
-        self.reserve_tool_bytes(0)
-    }
-
-    /// Reserve retained-output budget for accumulated tool-argument text.
-    fn reserve_tool_bytes(&mut self, additional: usize) -> Result<(), Failure> {
-        self.accumulated_tool_bytes = self.accumulated_tool_bytes.saturating_add(additional);
-        if self
-            .accumulated_tool_bytes
-            .saturating_add(self.accumulated_summary_bytes)
-            .saturating_add(self.accumulated_image_bytes)
-            > MAXIMUM_RETAINED_OUTPUT_BYTES
-        {
-            return Err(Failure::new(
-                FailureClass::ProviderInternal,
-                OUTPUT_OVERFLOW_MESSAGE,
-            ));
-        }
-        Ok(())
-    }
-
-    /// Reserve retained-output budget for reasoning-summary verification.
-    fn reserve_summary_bytes(&mut self, additional: usize) -> Result<(), Failure> {
-        self.accumulated_summary_bytes = self.accumulated_summary_bytes.saturating_add(additional);
-        if self
-            .accumulated_tool_bytes
-            .saturating_add(self.accumulated_summary_bytes)
-            .saturating_add(self.accumulated_image_bytes)
-            > MAXIMUM_RETAINED_OUTPUT_BYTES
-        {
-            return Err(Failure::new(
-                FailureClass::ProviderInternal,
-                OUTPUT_OVERFLOW_MESSAGE,
-            ));
-        }
-        Ok(())
     }
 
     /// Reserve one provider-indexed state entry across tools and summaries.
