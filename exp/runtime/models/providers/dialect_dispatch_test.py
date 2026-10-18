@@ -275,3 +275,41 @@ def test_reasoning_off_template_rule_is_scoped_to_vertex_glm(url: str, model_id:
     payload = dialect_stream_payload(_maas_profile(url, model_id), _effort_request("none"))
     assert payload["reasoning_effort"] == "none"
     assert "chat_template_kwargs" not in payload
+
+
+_ZAI_URL = "https://api.z.ai/api/paas/v4/chat/completions"
+
+
+@pytest.mark.parametrize("model_id", ["glm-5", "GLM-5.1"])
+def test_zai_glm_takes_its_own_thinking_switch_never_an_effort(model_id: str) -> None:
+    """Z.ai GLM-5/5.1 serve effort none as thinking disabled and any other as enabled.
+
+    docs.z.ai (read 2026-10-18): reasoning_effort exists for GLM-5.2 and above
+    only; GLM-5 and 5.1 are controlled by thinking {type: enabled | disabled}
+    and think by default. Unverified live until the house Z.ai account is recharged.
+    """
+    profile = _maas_profile(_ZAI_URL, model_id)
+    off = dialect_stream_payload(profile, _effort_request("none"))
+    assert off["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in off
+    assert "chat_template_kwargs" not in off
+    on = dialect_stream_payload(profile, _effort_request("high"))
+    assert on["thinking"] == {"type": "enabled"}
+    assert "reasoning_effort" not in on
+
+
+@pytest.mark.parametrize(
+    ("url", "model_id"),
+    [
+        (_ZAI_URL, "embedding-3"),
+        (_ZAI_URL, "glm-5.2"),
+        (_ZAI_URL, "glm-5.3"),
+        ("https://api.novita.ai/openai/v1/chat/completions", "zai-org/glm-5.1"),
+        ("https://openrouter.ai/api/v1/chat/completions", "z-ai/glm-5"),
+    ],
+)
+def test_zai_thinking_switch_is_scoped_to_zai_glm(url: str, model_id: str) -> None:
+    """GLM-5.2+ on Z.ai (documented effort), other models and other hosts keep reasoning_effort."""
+    payload = dialect_stream_payload(_maas_profile(url, model_id), _effort_request("none"))
+    assert "thinking" not in payload
+    assert payload["reasoning_effort"] == "none"
