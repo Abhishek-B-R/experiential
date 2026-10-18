@@ -97,7 +97,31 @@ its original position; `store=false` means the provider resolves nothing by ID.
 - Responses `text.format.type: "json_object"` selects the same schema-free JSON mode
   as Chat `response_format: {"type": "json_object"}`.
 - Chat messages carrying GitHub Copilot Chat's `cot_id` tag decode; the tag is
-  disclosed as `messages.cot_id->dropped(client_annotation)`.
+  disclosed as `messages.cot_id->dropped(client_annotation)`. Its `cot_summary`, and the
+  `timestamp` and `startsNewUserRequest` bookkeeping other agents stamp on messages, are
+  dropped the same way, each under its own `messages.<field>->dropped(client_annotation)`.
+- OpenAI's optional participant `name` on a system, developer, user or assistant message is
+  dropped, disclosed as `messages.name->dropped(participant_name)`. On tool messages `name`
+  still attributes the result.
+- `chat_template_kwargs.preserve_thinking` is accepted and disclosed as
+  `chat_template_kwargs.preserve_thinking->ignored(not_forwarded)`: no wire receives
+  `chat_template_kwargs` verbatim.
+- A Responses reasoning input item with neither `id` nor `encrypted_content` cannot be resolved
+  by any provider, and its summary never reaches provider history, so it is removed,
+  `input.reasoning->dropped(no_id_or_encrypted_content)`.
+- Codex Desktop's `internal_chat_message_metadata_passthrough` on Responses input items is
+  removed, `input.internal_chat_message_metadata_passthrough->dropped(client_annotation)`, and
+  its `stream_options.reasoning_summary_delivery` is disclosed as
+  `stream_options.reasoning_summary_delivery->ignored(not_supported)`.
+- Inline input images are accepted up to 20 MiB decoded (OpenAI's per-image limit; the base64
+  text may be up to 27,962,028 characters). Narrower provider limits (Anthropic, Bedrock)
+  surface as provider errors on those rungs.
+- On the Messages surface a `document` block with Anthropic's `text` source
+  (`media_type: "text/plain"`) joins the turn as the caller's text, title first. A content
+  block of a type the surface does not define is refused naming that type.
+- A control-store refusal that names no caller field (for example a model-chain release
+  crossing) answers a retryable 503 `gateway_authority_unavailable`, with the store's reason in
+  the worker log, instead of an unnamed 400.
 - `service_tier: "priority"` (Codex Fast mode) on a route with no priority-capable
   rung dispatches at the standard tier, disclosed as
   `service_tier->default(priority_unavailable)`. Standard never costs more. `flex`

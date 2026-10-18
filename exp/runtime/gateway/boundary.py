@@ -8,6 +8,7 @@ every control-plane surface answers the same failure identically.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
 from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
@@ -28,6 +29,7 @@ from exp.runtime.models.providers.async_transport import ProviderDeadlineExceede
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 
 _DRAINING_RETRY_AFTER_SECONDS = 10
+_LOGGER = logging.getLogger(__name__)
 
 
 class GatewayDrainingError(RuntimeError):
@@ -128,28 +130,34 @@ def boundary_protocol_error(exception: BaseException) -> OpenAIProtocolError:
             "Ask the operator to verify publication and rollback protections.",
             error_type="api_error",
         )
-    elif isinstance(exception, (GatewayRoutingError, GatewayStoreError)):
+    elif isinstance(exception, GatewayRoutingError):
         error = OpenAIProtocolError(
-            status_code=503 if isinstance(exception, GatewayRoutingError) else 400,
-            code=(
-                "unavailable_route"
-                if isinstance(exception, GatewayRoutingError)
-                else "invalid_request"
-            ),
+            status_code=503,
+            code="unavailable_route",
             message=(
                 "The authorized model route is unavailable. Retry after a short delay; "
                 "if this persists, ask the gateway operator to check the alias deployments."
-                if isinstance(exception, GatewayRoutingError)
-                else (
-                    "The gateway request is invalid. Verify the model alias and request "
-                    "fields, then resend."
-                )
             ),
-            error_type=(
-                "api_error"
-                if isinstance(exception, GatewayRoutingError)
-                else "invalid_request_error"
+            error_type="api_error",
+        )
+    elif isinstance(exception, GatewayStoreError):
+        # Every typed caller fault (key, grant, ZDR, idempotency) has its own
+        # branch above. A bare store refusal is the control store declining to
+        # vouch for its own serving authority (a model-chain release crossing,
+        # a malformed revision target, a missing registry row), never a field
+        # the caller sent, so it is a retryable 503, and the store's internal
+        # reason goes to the worker log rather than the caller (2026-10-17:
+        # Claude Code read it as an unnamed 400 for hours).
+        _LOGGER.warning("gateway store refused the request: %s", exception)
+        error = OpenAIProtocolError(
+            status_code=503,
+            code="gateway_authority_unavailable",
+            message=(
+                "The gateway could not confirm serving authority for this request. "
+                "Retry after a short delay; if this persists, ask the gateway operator "
+                "to check the gateway logs."
             ),
+            error_type="api_error",
         )
     elif isinstance(exception, asyncio.CancelledError):
         error = OpenAIProtocolError(

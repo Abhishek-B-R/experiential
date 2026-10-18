@@ -15,7 +15,7 @@ from exp.runtime.openai_protocol.client_field_repairs import (
     STREAM_OBFUSCATION_IGNORED,
     STREAM_OPTIONS_NOT_STREAMING,
     accept_responses_stream_options,
-    drop_chat_message_cot_ids,
+    drop_chat_message_client_annotations,
     drop_unanchored_output_markers,
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
@@ -24,7 +24,7 @@ from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 def test_untagged_chat_payload_is_returned_unchanged() -> None:
     """No ``cot_id`` means no copy and no disclosure."""
     payload: JsonObject = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
-    repaired, disclosures = drop_chat_message_cot_ids(payload)
+    repaired, disclosures = drop_chat_message_client_annotations(payload)
     assert repaired is payload
     assert disclosures == ()
 
@@ -38,7 +38,7 @@ def test_cot_id_is_removed_from_every_message_without_mutating_the_caller() -> N
             {"role": "assistant", "content": "yo", "cot_id": "b"},
         ],
     }
-    repaired, disclosures = drop_chat_message_cot_ids(payload)
+    repaired, disclosures = drop_chat_message_client_annotations(payload)
     assert repaired["messages"] == [
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "yo"},

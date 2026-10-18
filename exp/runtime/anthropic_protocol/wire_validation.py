@@ -25,6 +25,26 @@ _REJECTED_BLOCK_HINTS = {
     )
     for kind in ("video", "audio")
 }
+_MESSAGE_BLOCK_TYPES = frozenset(
+    {
+        "text",
+        "image",
+        "document",
+        "thinking",
+        "redacted_thinking",
+        "tool_use",
+        "tool_result",
+        "server_tool_use",
+        "web_search_tool_result",
+        "tool_search_tool_result",
+        "tool_reference",
+    }
+)
+"""Every message content block type the decoder's block union admits.
+
+A block outside it misses every union arm at the same depth, and the deepest
+error would name the first arm (``Input should be 'text'``) instead of the
+block the caller actually sent."""
 _REJECTED_TOOL_RESULT_BLOCK_HINTS = {
     "document": "document blocks are not supported inside tool_result content",
     **_REJECTED_BLOCK_HINTS,
@@ -120,9 +140,16 @@ def rejected_block_hint(payload: JsonObject) -> tuple[str, str] | None:
                 continue
             block_object = cast(JsonObject, block)
             param = f"messages.{message_index}.content.{block_index}"
-            hint = _REJECTED_BLOCK_HINTS.get(str(block_object.get("type")))
+            block_type = str(block_object.get("type"))
+            hint = _REJECTED_BLOCK_HINTS.get(block_type)
             if hint is not None:
                 return param, hint
+            if block_type not in _MESSAGE_BLOCK_TYPES:
+                return f"{param}.type", (
+                    f"unsupported content block type '{block_type[:64]}'; message content "
+                    "supports text, image, document, thinking, redacted_thinking, "
+                    "tool_use, tool_result, and echoed server tool blocks."
+                )
             if block_object.get("type") == "tool_result" and isinstance(
                 block_object.get("content"), list
             ):

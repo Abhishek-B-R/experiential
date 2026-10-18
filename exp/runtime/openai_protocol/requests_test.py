@@ -1255,8 +1255,8 @@ def test_responses_decoder_accepts_encrypted_reasoning_without_item_id() -> None
     ]
 
 
-def test_responses_decoder_rejects_reasoning_without_id_or_encrypted_content() -> None:
-    """A reasoning input still needs a usable ID or its encrypted replay payload."""
+def test_responses_decoder_rejects_input_of_only_unresolvable_reasoning() -> None:
+    """An unresolvable reasoning item drops, so input holding nothing else is empty."""
     with pytest.raises(OpenAIProtocolError) as raised:
         decode_responses(
             {
@@ -1266,7 +1266,7 @@ def test_responses_decoder_rejects_reasoning_without_id_or_encrypted_content() -
         )
 
     assert raised.value.status_code == 400
-    assert raised.value.detail.param == "input.0.id"
+    assert raised.value.detail.param == "input"
 
 
 def test_responses_decoder_replays_output_message_in_provider_order() -> None:
@@ -4149,18 +4149,19 @@ def test_a_name_free_tool_message_keeps_its_exact_chat_wire_shape() -> None:
     assert chat_messages[-1] == {"role": "tool", "content": "ok", "tool_call_id": "call_1"}
 
 
-def test_a_name_on_a_non_tool_message_stays_a_named_400() -> None:
-    """The participant-name field on other roles keeps the explicit rejection."""
-    with pytest.raises(OpenAIProtocolError) as error:
-        decode_chat(
-            {
-                "model": "coding",
-                "messages": [{"role": "user", "content": "hi", "name": "alice"}],
-            }
-        )
-    assert error.value.status_code == 400
-    assert error.value.detail.param == "messages.0"
-    assert "name is valid only for tool messages" in str(error.value.detail.message)
+@pytest.mark.parametrize("role", ["system", "developer", "user", "assistant"])
+def test_a_participant_name_on_a_non_tool_message_is_dropped_with_disclosure(role: str) -> None:
+    """OpenAI's optional participant ``name`` decodes on every non-tool role.
+
+    No non-OpenAI wire carries it, so it is removed and named rather than
+    refused (29+ requests across 6+ organizations, 2026-10-17).
+    """
+    plain = decode_chat({"model": "coding", "messages": [{"role": role, "content": "hi"}]})
+    named = decode_chat(
+        {"model": "coding", "messages": [{"role": role, "content": "hi", "name": "alice"}]}
+    )
+    assert named.request.messages == plain.request.messages
+    assert named.request.ignored_parameters == ("messages.name->dropped(participant_name)",)
 
 
 @pytest.mark.parametrize("reasoning", ["", " \n\t", "The user wants the time; call get_time."])
@@ -5469,4 +5470,129 @@ def test_gateway_issued_web_search_items_are_dropped_on_replay() -> None:
     assert any(
         (message.provider_native_item or {}).get("id") == "ws_provider"
         for message in kept.request.messages
+    )
+
+
+def test_chat_message_client_annotations_are_dropped_with_one_disclosure_each() -> None:
+    """Copilot's ``cot_summary`` and agents' ``timestamp``/``startsNewUserRequest`` decode."""
+    messages: list[JsonValue] = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "yo"},
+        {"role": "user", "content": "again"},
+    ]
+    plain = decode_chat({"model": "coding", "messages": messages})
+    tagged = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "hi",
+                    "timestamp": 1760700000,
+                    "startsNewUserRequest": True,
+                },
+                {"role": "assistant", "content": "yo", "cot_summary": "Thought about it."},
+                {"role": "user", "content": "again", "timestamp": "2026-10-17T00:00:00Z"},
+            ],
+        }
+    )
+    assert tagged.request.messages == plain.request.messages
+    assert tagged.request.ignored_parameters == (
+        "messages.cot_summary->dropped(client_annotation)",
+        "messages.timestamp->dropped(client_annotation)",
+        "messages.startsNewUserRequest->dropped(client_annotation)",
+    )
+
+
+def test_chat_template_preserve_thinking_is_accepted_and_disclosed() -> None:
+    """Qwen's ``preserve_thinking`` template switch decodes; no wire receives it."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "chat_template_kwargs": {"preserve_thinking": True},
+        }
+    )
+    assert decoded.request.ignored_parameters == (
+        "chat_template_kwargs.preserve_thinking->ignored(not_forwarded)",
+    )
+    assert decoded.request.reasoning_effort is None
+
+
+def test_chat_image_data_url_above_five_mib_is_admitted() -> None:
+    """OpenAI accepts images up to 20 MB; a 6 MiB screenshot no longer 400s."""
+    data = "A" * (6 * 1024 * 1024)
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "look"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{data}"},
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+    images = [part for part in decoded.request.messages[0].content_parts if part.kind == "image"]
+    assert len(images) == 1
+
+
+def test_summary_only_reasoning_item_is_dropped_with_disclosure() -> None:
+    """A reasoning item with neither id nor encrypted_content can not be resolved.
+
+    ai-sdk, Bun and codex-tui replay them; the summary never reaches provider
+    history, so the item drops and is named instead of refusing the turn.
+    """
+    plain = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "yo"},
+                {"role": "user", "content": "again"},
+            ],
+        }
+    )
+    replayed = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"role": "user", "content": "hi"},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "thinking"}]},
+                {"role": "assistant", "content": "yo"},
+                {"role": "user", "content": "again"},
+            ],
+        }
+    )
+    assert replayed.request.messages == plain.request.messages
+    assert replayed.request.ignored_parameters == (
+        "input.reasoning->dropped(no_id_or_encrypted_content)",
+    )
+
+
+def test_codex_desktop_item_metadata_and_summary_delivery_are_disclosed() -> None:
+    """Codex Desktop 0.153's per-item metadata and stream option decode, named."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {
+                    "role": "user",
+                    "content": "hi",
+                    "internal_chat_message_metadata_passthrough": {"turn": 1},
+                }
+            ],
+            "stream": True,
+            "stream_options": {"reasoning_summary_delivery": "streamed"},
+        }
+    )
+    assert decoded.request.ignored_parameters == (
+        "input.internal_chat_message_metadata_passthrough->dropped(client_annotation)",
+        "stream_options.reasoning_summary_delivery->ignored(not_supported)",
     )
