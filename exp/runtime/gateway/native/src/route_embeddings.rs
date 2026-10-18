@@ -115,7 +115,7 @@ pub(crate) async fn embeddings(
         METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
         // The accepted request is already finalized control-plane side;
         // startup validation guarantees native servability, so fail closed.
-        return error_response(&escalation_error());
+        return error_response(&escalation_error(reason.as_str().unwrap_or_default()));
     }
     let admission: EmbeddingsAdmission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,
