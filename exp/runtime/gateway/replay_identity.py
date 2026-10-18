@@ -11,6 +11,7 @@ from exp.runtime.gateway.contracts import EncryptedReasoningBlock, GatewayReques
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
+from exp.runtime.gateway.video.contracts import VideoRequest
 
 
 def caller_operation_sha256(request: GatewayRequest) -> Sha256 | None:
@@ -214,7 +215,7 @@ def canonical_request_sha256(request: ServingRequest) -> Sha256:
     request with no carrier digests exactly as its plain serialization, so
     every request decoded before the carriers existed keeps its identity.
 
-    The embeddings, images, decisions, speech, and transcription surfaces have no
+    The embeddings, images, decisions, speech, transcription, and video surfaces have no
     messages, tools, or excluded provider carriers, so they digest exactly as
     their plain serialization.
 
@@ -231,6 +232,7 @@ def canonical_request_sha256(request: ServingRequest) -> Sha256:
             | DecisionRequest()
             | SpeechRequest()
             | TranscriptionRequest()
+            | VideoRequest()
         ):
             return sha256_json(request)
         case GatewayRequest():

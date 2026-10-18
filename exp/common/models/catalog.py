@@ -459,10 +459,10 @@ class GatewayDeploymentCapabilities(ContractModel):
     gateway protocol without invalidating existing router artifacts.
 
     Attributes:
-        supports_decisions: Whether this deployment serves native typed decisions instead of
-            chat.
+        supports_decisions: Whether it serves native typed decisions instead of chat.
         supports_speech: Whether this deployment serves ``/audio/speech`` (fail-closed).
         supports_transcription: Whether it serves ``/audio/transcriptions`` (fail-closed).
+        supports_video_generation: Whether it serves ``/v1/videos`` jobs (fail-closed).
         supports_developer_messages: Whether developer-role messages are supported.
         supports_streaming: Whether streaming responses are supported.
         supports_streaming_tool_arguments: Whether tool arguments can be streamed incrementally.
@@ -490,8 +490,7 @@ class GatewayDeploymentCapabilities(ContractModel):
             cap.
         supports_structured_text: Whether schema-constrained text output is supported.
         supports_stop_sequences: Whether caller-specified stop sequences are supported.
-        supports_image_input: Whether the wire and model accept images; undeclared image input
-            is rejected.
+        supports_image_input: Whether the wire and model accept images; else images are refused.
         supports_image_url_input: Whether the provider fetches remote images; undeclared URLs
             are rejected.
 
@@ -614,6 +613,7 @@ class GatewayDeploymentCapabilities(ContractModel):
     supports_decisions: bool = False
     supports_speech: bool = False
     supports_transcription: bool = False
+    supports_video_generation: bool = False
 
     supports_developer_messages: bool = False
     supports_streaming: bool = False

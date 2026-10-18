@@ -73,6 +73,7 @@ from exp.runtime.models.providers.reasoning_compat import (
     require_sampling_reasoning_compatibility,
 )
 from exp.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
+from exp.runtime.models.providers.xai import xai_videos_url
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_REFERER = "https://github.com/experientiallabs/experiential"
@@ -613,6 +614,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             images_url=f"{self._base_url}/{self._request_path('images/generations')}",
             speech_url=f"{self._base_url}/{self._request_path('audio/speech')}",
             transcriptions_url=f"{self._base_url}/{self._request_path('audio/transcriptions')}",
+            videos_url=xai_videos_url(self._base_url),
             headers=self._headers(),
             model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,

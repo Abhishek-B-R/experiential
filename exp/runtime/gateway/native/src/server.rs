@@ -39,6 +39,9 @@ use crate::route_images::images;
 use crate::route_messages::{messages, messages_count_tokens};
 use crate::route_responses::responses;
 use crate::route_responses_ws::responses_ws;
+use crate::route_videos::{
+    videos_body_limit, videos_content, videos_create, videos_delete, videos_list, videos_retrieve,
+};
 
 /// Serve-time configuration passed from `exp --engine rust`.
 #[derive(Debug, Clone, Deserialize)]
@@ -246,6 +249,17 @@ pub async fn run(
         .route("/v1/files", post(files_create).layer(files_body_limit()))
         .route("/v1/files/{file_id}", get(files_retrieve))
         .route("/v1/files/{file_id}/content", get(files_content))
+        .route(
+            "/v1/videos",
+            post(videos_create)
+                .layer(videos_body_limit())
+                .get(videos_list),
+        )
+        .route(
+            "/v1/videos/{video_id}",
+            get(videos_retrieve).delete(videos_delete),
+        )
+        .route("/v1/videos/{video_id}/content", get(videos_content))
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
         .route("/metrics.json", get(metrics_json))

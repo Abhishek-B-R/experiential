@@ -459,3 +459,17 @@ TRANSCRIPTION_MANIFEST = CompatibilityManifest(
         ),
     ),
 )
+
+VIDEO_MANIFEST = CompatibilityManifest(
+    schema_version=1,
+    surface=GatewayApiSurface.VIDEO,
+    fields=(
+        *(
+            _field(path, CompatibilityDisposition.SUPPORTED)
+            for path in ("model", "prompt", "seconds", "size", "input_reference")
+        ),
+        # Sora character references have no equivalent on any served video
+        # provider; the field is refused by name rather than silently dropped.
+        _field("characters", CompatibilityDisposition.UNSUPPORTED),
+    ),
+)

@@ -23,9 +23,9 @@ It serves:
   (the Anthropic provider client does not forward `count_tokens`), so every answer is an
   estimate and the body says so through the shared `x-experiential-ignored-parameters`
   disclosure (`input_tokens->estimated(gateway_tokenizer)`).
-- `POST /v1/embeddings`, `POST /v1/images/generations`, `POST /v1/audio/speech`, and
-  `POST /v1/audio/transcriptions` (the OpenAI media APIs, buffered and never streamed; see
-  [gateway-media-surfaces.md](gateway-media-surfaces.md))
+- `POST /v1/embeddings`, `/v1/images/generations`, `/v1/audio/speech`, `/v1/audio/transcriptions`
+  (OpenAI media APIs, buffered), and OpenAI's asynchronous `/v1/videos` jobs (create, list,
+  retrieve, delete, `/content`); see [gateway-media-surfaces.md](gateway-media-surfaces.md)
 - `POST /v1/systemone` (TypeSafe native decisions: typed `noul`, `choice`, and `score`
   questions, buffered answers, provider-reported usage, and explicit decision capability and
   pricing admission; no chat, streaming, continuation, or idempotency replay); and `POST /v1/decisions`, its OpenAI Decisions API wire
