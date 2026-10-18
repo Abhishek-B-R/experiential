@@ -6,8 +6,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from rich.console import Console
+from rich.text import Text
 
 from exp.cli.shared.progress import duration_text
+from exp.common.core.files import write_text_atomic
+from exp.common.project import ProjectStore
+from exp.common.project.paths import validate_local_id
 from exp.simulation.build import ProjectBuild
 
 if TYPE_CHECKING:  # learning loads the fidelity lifecycle; keep `exp --help` free of it
@@ -20,7 +24,7 @@ def render_completed_build(
     *,
     project: str,
     learning: BuildLearning,
-    report: Path,
+    report: Path | None,
     duration_seconds: float,
 ) -> None:
     """Present a few result lines: traces, learning, retest, the report and the next command.
@@ -30,7 +34,7 @@ def render_completed_build(
         completed: Persisted project build and mining results.
         project: Local project identifier used in the next recommended command.
         learning: What the learning stage did.
-        report: File holding the full learning and retest output.
+        report: Saved full learning and retest output, when learning ran.
         duration_seconds: Wall-clock time the whole command took.
     """
     dataset = completed.artifacts.trace_dataset.dataset
@@ -46,8 +50,8 @@ def render_completed_build(
         console.print("[yellow]guidance[/yellow] 100 to 1,000 traces is the usual starting range")
     for line in learning_lines(learning):
         console.print(line)
-    if learning.outcome is not None:
-        console.print(f"[dim]Report: {shown(report)}[/dim]")
+    if report is not None:
+        console.print(Text(f"Report: {report}"))
     console.print(f"[green]Complete[/green] [dim]in {duration_text(duration_seconds)}[/dim]")
     if learning.outcome is not None:
         console.print(f"next: exp eval {project} --audit N  [dim](check on held-out traces)[/dim]")
@@ -103,9 +107,20 @@ def _percent(part: int, whole: int) -> str:
     return f"{part / whole:.0%}" if whole else "-"
 
 
-def shown(path: Path) -> str:
-    """A path relative to the working directory when it is inside it."""
-    try:
-        return str(path.resolve().relative_to(Path.cwd().resolve()))
-    except ValueError:
-        return str(path)
+def save_details(store: ProjectStore, kind: str, identity: str, text: str) -> Path:
+    """Write a command's full output beside its saved run state, like an evaluation report.
+
+    Args:
+        store: Project owning the run.
+        kind: Runtime family, such as ``learning`` or ``audits``.
+        identity: Exact identity of the saved state the output describes.
+        text: The rendered full output.
+
+    Returns:
+        ``<project>/runtime/<kind>/<identity>/report.txt``, written atomically.
+    """
+    validate_local_id(identity, label=f"{kind} identity")
+    path = store.paths.runtime_directory / kind / identity / "report.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(path, text)
+    return path

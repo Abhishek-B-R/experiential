@@ -290,7 +290,7 @@ def run_build_wizard(
             "automatic router cost plan changed after the grounded build; rerun exp build"
         )
     console.print(f"[bold]4/{total_stages} Router optimization[/bold]")
-    with progress_display(console, single_line=True) as progress:
+    with progress_display(console) as progress:
         optimize_project_router(
             store,
             candidate_plan,

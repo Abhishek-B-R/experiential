@@ -124,7 +124,7 @@ def run_evaluation(
                     return
         catalog = load_model_catalog(store.model_catalog_path)
         if resume is not None:
-            with progress_display(_console, single_line=True) as progress:
+            with progress_display(_console) as progress:
                 progress(ProgressEvent(stage="Loading saved evaluation"))
                 run = load_run(store, resume)
                 if run.status == "failed" and run.stage in {"judging", "judgments"}:
@@ -162,7 +162,7 @@ def run_evaluation(
                 )
                 if selected_defaults is None:
                     return
-            with progress_display(_console, single_line=True) as progress:
+            with progress_display(_console) as progress:
                 run = prepare_run(
                     store,
                     catalog,
@@ -202,7 +202,7 @@ def run_evaluation(
             save_run(store, run)
             heading(_console, project, "Running evaluation · Ctrl-C to pause")
             try:
-                with progress_display(_console, single_line=True) as progress:
+                with progress_display(_console) as progress:
                     progress(ProgressEvent(stage="Preparing evaluation"))
                     execute_run(
                         store,

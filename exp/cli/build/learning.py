@@ -16,7 +16,7 @@ from rich.text import Text
 
 from exp.cli.evaluation.miss_retest import RetestOutcome, run_miss_retest
 from exp.cli.shared.consent import can_prompt, require_spend_consent
-from exp.cli.shared.progress import PipelineDisplay, progress_display
+from exp.cli.shared.progress import ProgressDisplay, progress_display
 from exp.common.models import ModelCatalog, load_model_catalog
 from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore
@@ -241,7 +241,7 @@ def learn_and_retest(
     code_revision: str,
     retry_incomplete: bool = False,
     details: Console | None = None,
-    pipeline: PipelineDisplay | None = None,
+    pipeline: ProgressDisplay | None = None,
 ) -> BuildLearning:
     """The build's default pipeline: learn from every trace, then retest the misses.
 

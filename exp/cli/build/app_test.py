@@ -1356,8 +1356,8 @@ def test_build_preflight_auto_runs_without_proceed(tmp_path: Path) -> None:
     assert "embedding    at most $" in output
     assert "budget       $5.000000" in output
     assert "Proceed?" not in output
-    # One progress line covers indexing; a log shows each phase once, not every stage.
-    assert "Building indexes" in output and "fit-only index" not in output
+    # One progress line covers indexing; a log names the phase and each index stage once.
+    assert "Building indexes" in output and output.count("fit-only index") == 1
     assert "next: exp optimize router support" in output
     assert _RESOLVE_CALLS == ["embed"]
 

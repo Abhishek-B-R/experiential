@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -19,13 +20,13 @@ from exp.cli.build.checkpoints import (
 )
 from exp.cli.build.providers import configure_build_providers
 from exp.cli.build.source import load_stored_build_import, project_for_build
-from exp.cli.build.summary import render_completed_build
+from exp.cli.build.summary import render_completed_build, save_details
 from exp.cli.build.traces import load_build_traces
 from exp.cli.providers.provider_picker import resolve_setup_providers
 from exp.cli.providers.setup import provider_setup_json_examples
 from exp.cli.shared.consent import SpendBudget, can_prompt, require_spend_consent
 from exp.cli.shared.options import ROOT_OPTION, usage_error
-from exp.cli.shared.progress import Phase, PipelineDisplay, progress_display, qualified
+from exp.cli.shared.progress import Phase, ProgressDisplay, progress_display, qualified
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.core.money import exact_usd
 from exp.common.models import (
@@ -305,7 +306,7 @@ def build(
             selected,
         )
         _console.print("[dim]loading[/dim] Import trace evidence and mine scenarios")
-        with progress_display(_console, single_line=True) as progress:
+        with progress_display(_console) as progress:
             report(progress, "normalization")
             if import_id is not None:
                 source, normalized = load_stored_build_import(root, project, import_id)
@@ -398,7 +399,7 @@ def build(
         ):
             return
         # One progress line from here to the end of the build: indexes, learning, retest.
-        pipeline = PipelineDisplay(_console, BUILD_PHASES)
+        pipeline = ProgressDisplay(_console, BUILD_PHASES)
         pipeline.start()
         try:
             completion = _complete_grounded_build(
@@ -416,7 +417,7 @@ def build(
                 progress=pipeline.phase("index"),
             )
         except BaseException:
-            pipeline.stop()
+            pipeline.abort()
             raise
         pipeline.complete("index")
         built = completion.artifacts
@@ -430,14 +431,10 @@ def build(
     # dispatch: `exp --help` stays free of optimization machinery (startup-isolation gate).
     from exp.cli.build.learning import learn_and_retest
 
-    report_path = store.artifacts.project_directory / "reports" / "build.txt"
-    report_path.parent.mkdir(parents=True, exist_ok=True)
+    buffer = io.StringIO()
+    details = Console(file=buffer, width=110, theme=EXP_THEME, no_color=True)
     try:
-        with (
-            usage_error(ArtifactStoreError, ModelCatalogError, ProjectStoreError, ValueError),
-            report_path.open("w", encoding="utf-8") as handle,
-        ):
-            details = Console(file=handle, width=110, theme=EXP_THEME, no_color=True)
+        with usage_error(ArtifactStoreError, ModelCatalogError, ProjectStoreError, ValueError):
             learning = learn_and_retest(
                 _console,
                 store,
@@ -450,8 +447,15 @@ def build(
                 details=details,
                 pipeline=pipeline,
             )
-    finally:
-        pipeline.stop()
+    except BaseException:
+        pipeline.abort()
+        raise
+    pipeline.stop()
+    report_path = (
+        None
+        if learning.outcome is None
+        else save_details(store, "learning", learning.outcome.plan.lineage, buffer.getvalue())
+    )
     render_completed_build(
         _console,
         completed,

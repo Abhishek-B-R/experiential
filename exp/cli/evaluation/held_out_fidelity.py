@@ -1,5 +1,6 @@
 """Held-out simulation fidelity in the existing evaluation terminal conventions."""
 
+import io
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import AbstractContextManager, nullcontext
@@ -20,8 +21,8 @@ from exp.cli.shared.options import usage_error
 from exp.cli.shared.progress import (
     Phase,
     duration_text,
-    pipeline_display,
     progress_display,
+    progress_phases,
     qualified,
 )
 from exp.cli.shared.theme import EXP_THEME
@@ -307,7 +308,7 @@ def run_audit(
     """
     # Deferred: learning loads the fidelity lifecycle.
     from exp.cli.build.learning import BuildLearning, resolve_memory_recall, run_learning
-    from exp.cli.build.summary import learning_lines, shown
+    from exp.cli.build.summary import learning_lines, save_details
     from exp.common.models import load_model_catalog
     from exp.optimize.evaluation.trace_learning import learning_curve, recorded_plan
 
@@ -341,13 +342,9 @@ def run_audit(
                 "recall it (for example cloudflare/clef-flash); add one to the model catalog"
             )
     heading(console, project, "Held-out simulation fidelity")
-    report_path = store.artifacts.project_directory / "reports" / "audit.txt"
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    with (
-        report_path.open("w", encoding="utf-8") as handle,
-        pipeline_display(console, AUDIT_PHASES) as pipeline,
-    ):
-        details = Console(file=handle, width=110, theme=EXP_THEME, no_color=True)
+    buffer = io.StringIO()
+    details = Console(file=buffer, width=110, theme=EXP_THEME, no_color=True)
+    with progress_phases(console, AUDIT_PHASES) as pipeline:
         with usage_error(OSError, ValueError):
             outcome = run_learning(
                 details,
@@ -385,5 +382,7 @@ def run_audit(
             progress=pipeline.phase("panel"),
             pause=pipeline.paused,
         )
-    console.print(f"[dim]Report: {shown(report_path)}[/dim]")
+    console.print(
+        Text(f"Report: {save_details(store, 'audits', outcome.plan.lineage, buffer.getvalue())}")
+    )
     console.print(f"[green]Complete[/green] [dim]in {duration_text(monotonic() - started)}[/dim]")

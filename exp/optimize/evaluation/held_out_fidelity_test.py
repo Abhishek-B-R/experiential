@@ -501,14 +501,16 @@ def build_project(
 
 
 def build_report(store: ProjectStore) -> str:
-    """The full learning and retest output ``exp build`` wrote to its report file."""
-    report = store.artifacts.project_directory / "reports" / "build.txt"
+    """The full learning and retest output ``exp build`` saved beside its memory."""
+    lineage = learning_plan(store, scope="all").lineage
+    report = store.paths.runtime_directory / "learning" / lineage / "report.txt"
     return " ".join(report.read_text(encoding="utf-8").split())
 
 
 def audit_report(store: ProjectStore) -> str:
-    """The full learning and panel output ``exp eval --audit`` wrote to its report file."""
-    report = store.artifacts.project_directory / "reports" / "audit.txt"
+    """The full learning and panel output ``exp eval --audit`` saved beside its memory."""
+    lineage = learning_plan(store, scope="fit").lineage
+    report = store.paths.runtime_directory / "audits" / lineage / "report.txt"
     return " ".join(report.read_text(encoding="utf-8").split())
 
 
@@ -559,7 +561,7 @@ def test_audit_learns_fit_traces_then_measures_held_out_on_final_memory(
     assert f"learned {fit}/{fit} fit traces · memory v{fit}" in output
     report = audit_report(store)
     assert "Learning curve exact replies by trace order:" in report
-    assert "Report:" in output and "audit.txt" in output
+    assert "Report:" in output and "report.txt" in output
     assert re.search(r"Complete in (under 1s|\d+(s|m\d\ds|h\d\dm))", output), "time taken"
     # Held-out lineages were reserved before learning and never consumed.
     held = held_out_lineages(store)
