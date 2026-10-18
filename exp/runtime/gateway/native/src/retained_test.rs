@@ -111,3 +111,19 @@ fn a_responses_continuation_is_dropped_not_retained_past_the_worker_budget() {
         assert_eq!(budget.held(), 0, "an abandoned continuation holds nothing");
     });
 }
+
+#[test]
+fn the_default_budget_is_off_so_nothing_is_ever_refused() {
+    assert_eq!(DEFAULT_WORKER_RETAINED_OUTPUT_BYTES, usize::MAX);
+    assert_eq!(crate::server::default_retained_for_tests(), usize::MAX);
+    let budget = budget(DEFAULT_WORKER_RETAINED_OUTPUT_BYTES);
+    with_test_budget(budget, || {
+        let mut leases: Vec<RetainedLease> = (0..64).map(|_| RetainedLease::default()).collect();
+        for lease in &mut leases {
+            assert!(
+                lease.reserve(64 * 1024 * 1024),
+                "an unconfigured worker retains as before"
+            );
+        }
+    });
+}

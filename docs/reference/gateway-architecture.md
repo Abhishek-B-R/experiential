@@ -197,7 +197,7 @@ Durable gateway request records store that digest without retaining the descript
 Provider output the gateway holds while relaying (tool arguments and reasoning summaries in the
 normalizer, Messages blocks held for ordering, a non-streaming aggregation, a Responses
 continuation) is bounded twice: 64 MiB per stream, and one worker-wide budget across all streams
-(`maximum_retained_output_bytes`, default 1 GiB). A stream whose next retained bytes would cross
+(`maximum_retained_output_bytes`; off by default, which is the behavior before it existed, and 1 GiB is the suggested value once enabled). A stream whose next retained bytes would cross
 the worker budget fails with a retryable 503 `gateway_unavailable`; a Responses continuation that
 would cross it is not retained and the stream serves on. Bytes relayed straight through to the
 caller never count, and every reservation returns when its stream ends.

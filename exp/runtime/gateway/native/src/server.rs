@@ -133,6 +133,12 @@ fn default_maximum_retained_output_bytes() -> usize {
     crate::retained::DEFAULT_WORKER_RETAINED_OUTPUT_BYTES
 }
 
+/// The serde default the server config uses, for the retained-output tests.
+#[cfg(test)]
+pub(crate) fn default_retained_for_tests() -> usize {
+    default_maximum_retained_output_bytes()
+}
+
 fn default_native_usage_enabled() -> bool {
     true
 }

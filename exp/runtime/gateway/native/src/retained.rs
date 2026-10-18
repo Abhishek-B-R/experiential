@@ -14,11 +14,15 @@
 //! with a retryable unavailable error, or a continuation is simply not
 //! retained), so retention is never the reason a worker runs out of memory.
 //! A lease returns everything it holds when dropped.
+//!
+//! The budget is OFF by default (unbounded, today's behavior): an embedder
+//! opts in by passing `maximum_retained_output_bytes`. Production enables it
+//! with a later env flip and a watch, never in the release that ships it.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Default worker-wide retention: a quarter of a 4 GiB production worker.
-pub const DEFAULT_WORKER_RETAINED_OUTPUT_BYTES: usize = 1024 * 1024 * 1024;
+/// Default worker-wide retention: unbounded (the budget is off until configured).
+pub const DEFAULT_WORKER_RETAINED_OUTPUT_BYTES: usize = usize::MAX;
 
 /// The caller-facing message when the worker-wide budget refuses a stream.
 pub const WORKER_RETENTION_EXHAUSTED_MESSAGE: &str =

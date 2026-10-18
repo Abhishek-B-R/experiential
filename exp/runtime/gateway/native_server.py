@@ -108,8 +108,10 @@ def serve_native_gateway(
             Messages blocks, non-streaming aggregations, Responses
             continuations). A stream that would cross it fails with a
             retryable 503 instead of growing worker memory; a continuation
-            that would cross it is simply not retained. None keeps the
-            engine default (1 GiB, a quarter of a 4 GiB worker).
+            that would cross it is simply not retained. None (the default)
+            leaves the budget off, which is the behavior before this
+            setting existed; 1 GiB (a quarter of a 4 GiB worker) is the
+            suggested value when enabling it.
         capture: The collector shared with the admission controller; None retains no content.
         shutdown: Optional embedder-owned stop handle from
             ``exp_gateway_native.shutdown_handle()``. A host serving on a
