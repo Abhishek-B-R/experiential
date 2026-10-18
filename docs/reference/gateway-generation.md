@@ -465,3 +465,15 @@ handling; `zdr` and `data_collection` are the only caller keys an OpenRouter run
 other key (`sort`, `quantizations`, `max_price`, `require_parameters`, ...) is disclosed as
 `provider.<key>->ignored(unsupported)`. `gateway.routing` (`route_id`, `allow_fallbacks`)
 applies on top of the narrowed route.
+
+## Retained provider output
+
+Provider output the gateway holds while relaying (tool arguments and reasoning summaries in the
+normalizer, Messages blocks held for ordering, a non-streaming aggregation, a Responses
+continuation) is bounded per stream at 64 MiB. An embedder may also bound it across all streams
+of one worker with `maximum_retained_output_bytes` (`serve_native_gateway`). The worker-wide
+budget is off by default, which is the behavior before it existed; 1 GiB, a quarter of a 4 GiB
+worker, is the suggested value once enabled. With it on, a stream whose next retained bytes would
+cross the budget fails with a retryable 503 `gateway_unavailable`, and a Responses continuation
+that would cross it is not retained while the stream serves on. Bytes relayed straight through to
+the caller never count, and every reservation returns when its stream ends.
