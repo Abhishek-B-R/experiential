@@ -914,6 +914,7 @@ def deployment_wire_entry(
         # provider account there is the customer's own configuration, so the
         # data plane surfaces it as their 400 instead of operator deadness.
         "billing_customer_managed": profile.billing_customer_managed,
+        "tenant_origin": profile.tenant_origin,  # opaque failures, tenant socket policy
         "timeout_seconds": profile.timeout_seconds,
         "upstream_payload": None if upstream_body is not None else upstream_payload,
         "upstream_body": upstream_body,

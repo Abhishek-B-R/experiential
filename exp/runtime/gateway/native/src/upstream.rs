@@ -26,20 +26,29 @@ pub(crate) use network::UpstreamClient;
 /// `connect_timeout` bounds only the TCP+TLS connect phase; a dead lane whose
 /// host never accepts the connection fails over after this window instead of
 /// hanging on the per-deployment request timeout.
+///
+/// A public-only (hosted) client also carries a tenant-origin sibling whose
+/// sockets additionally refuse the platform's own infrastructure and any port
+/// outside the tenant set ([`UpstreamClient::for_origin`]).
 pub fn build_client(
     connect_timeout: Duration,
     public_only: bool,
 ) -> Result<UpstreamClient, String> {
-    let builder = client_builder(connect_timeout);
-    let builder = if public_only {
-        network::restrict(builder)
-    } else {
-        builder
-    };
-    builder
+    let failed = |error: reqwest::Error| format!("upstream client construction failed: {error}");
+    if !public_only {
+        return client_builder(connect_timeout)
+            .build()
+            .map(|inner| UpstreamClient::new(inner, false))
+            .map_err(failed);
+    }
+    let policy = std::sync::Arc::new(network::TenantPolicy::from_env());
+    let public = network::restrict(client_builder(connect_timeout))
         .build()
-        .map(|inner| UpstreamClient::new(inner, public_only))
-        .map_err(|error| format!("upstream client construction failed: {error}"))
+        .map_err(failed)?;
+    let tenant = network::restrict_tenant(client_builder(connect_timeout), policy.clone())
+        .build()
+        .map_err(failed)?;
+    Ok(UpstreamClient::new(public, true).with_tenant(tenant, policy))
 }
 
 /// One transport configuration shared by production and protocol-level tests.

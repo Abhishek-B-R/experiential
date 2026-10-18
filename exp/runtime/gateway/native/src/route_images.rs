@@ -239,9 +239,11 @@ async fn run_ladder(
         total_attempts += 1;
         counts[depth] += 1;
         let units = admission.unit_billing.get(depth).cloned().flatten();
-        match dispatch(&state.http, wire, deadline, admission, units.as_ref()).await {
+        let http = state.http.for_origin(wire.tenant_origin);
+        match dispatch(http, wire, deadline, admission, units.as_ref()).await {
             Ok((body, usage)) => return Ok(Served { depth, body, usage }),
             Err((failure, opened)) => {
+                let failure = failure.with_tenant_origin(wire.tenant_origin);
                 if opened {
                     guard.mark_opened();
                 }

@@ -36,6 +36,12 @@ pub struct DeploymentWire {
     /// deadness that fails over.
     #[serde(default)]
     pub billing_customer_managed: bool,
+    /// Whether this rung's origin is customer-addressed (a tenant's own
+    /// endpoint). Every upstream failure on it answers one opaque error, and
+    /// its socket is held to the tenant destination policy (allowed ports,
+    /// never the platform's own infrastructure).
+    #[serde(default)]
+    pub tenant_origin: bool,
     /// Host-authorized Google explicit-cache execution for this attempt.
     /// The host still reserves and settles each cache operation separately.
     #[serde(default)]

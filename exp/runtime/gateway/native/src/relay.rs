@@ -178,6 +178,8 @@ pub struct UpstreamRelay {
     /// failure the provider declares on this stream, before or after commit,
     /// is re-owned as the customer's. `None` on house rungs.
     customer_managed_provider: Option<String>,
+    /// A tenant origin: every failure this stream yields answers opaquely.
+    tenant_origin: bool,
     eof: bool,
     /// Whether any body byte has arrived: stamps the time-to-first-byte
     /// histogram once. It does NOT satisfy the stall bound below: a provider
@@ -278,6 +280,7 @@ impl UpstreamRelay {
             stop_guard: None,
             tool_serializer: None,
             customer_managed_provider: None,
+            tenant_origin: false,
             eof: false,
             first_byte_recorded: false,
             stall_bound_armed: true,
@@ -368,14 +371,7 @@ impl UpstreamRelay {
                 match event {
                     Event::Usage(_) => observation.record(event),
                     Event::Failed(failure) => {
-                        let failure = match self.customer_managed_provider.as_deref() {
-                            Some(provider) => crate::stream_errors::customer_credential_failure(
-                                failure.clone(),
-                                provider,
-                            ),
-                            None => failure.clone(),
-                        };
-                        observation.record(&Event::Failed(failure));
+                        observation.record(&Event::Failed(self.owned_failure(failure.clone())));
                     }
                     _ if event.is_terminal() => observation.record(event),
                     _ => {}
@@ -517,6 +513,21 @@ impl UpstreamRelay {
         self.customer_managed_provider = provider;
     }
 
+    /// Mark this relay's origin as a tenant's, so every failure it yields is opaque.
+    pub fn set_tenant_origin(&mut self, tenant: bool) {
+        self.tenant_origin = tenant;
+    }
+
+    /// Attribute one yielded failure: a customer-managed provider owns its
+    /// credential failures, and a tenant origin's answer is opaque.
+    fn owned_failure(&self, failure: Failure) -> Failure {
+        let failure = match self.customer_managed_provider.as_deref() {
+            Some(provider) => crate::stream_errors::customer_credential_failure(failure, provider),
+            None => failure,
+        };
+        failure.with_tenant_origin(self.tenant_origin)
+    }
+
     /// Serialize this relay's tool calls to one per turn (the caller sent
     /// `parallel_tool_calls: false` to a wire without that control).
     pub fn set_serialize_tool_calls(&mut self, serialize: bool) {
@@ -552,13 +563,8 @@ impl UpstreamRelay {
         let Some(mut event) = self.pending.pop_front() else {
             return Ok(false);
         };
-        if let (Some(provider), Event::Failed(failure)) =
-            (self.customer_managed_provider.as_deref(), &event)
-        {
-            event = Event::Failed(crate::stream_errors::customer_credential_failure(
-                failure.clone(),
-                provider,
-            ));
+        if let Event::Failed(failure) = &event {
+            event = Event::Failed(self.owned_failure(failure.clone()));
         }
         // Progress belongs to the provider, not the outward projection. A
         // stop-sequence match suppresses later text while still draining the

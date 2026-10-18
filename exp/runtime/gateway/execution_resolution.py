@@ -68,6 +68,7 @@ def _resolved_wire_profile(
                 and profile.dialect == "openai_responses"
             ),
             billing_customer_managed=(deployment.billing_source == BillingSource.CUSTOMER_MANAGED),
+            tenant_origin=runtime_model.tenant_origin,
             service_tier_pricing_enabled=capabilities.service_tier_pricing_enabled,
             service_tier_cards=frozenset(
                 tier

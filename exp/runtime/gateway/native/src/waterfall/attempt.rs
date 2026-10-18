@@ -159,7 +159,7 @@ pub(super) async fn run_attempt(
             .flatten();
         let logprobs_injected = injected_payload.is_some();
         let opened = open_stream(
-            ctx.http,
+            ctx.http.for_origin(wire.tenant_origin),
             &wire.url,
             &headers,
             if logprobs_injected {
@@ -257,6 +257,7 @@ pub(super) async fn run_attempt(
             // so a committed stream's late credential error is the customer's too.
             relay.set_customer_managed_provider(Some(wire.provider.clone()));
         }
+        relay.set_tenant_origin(wire.tenant_origin);
         // Refusal deltas are withheld when the alias revision opted into
         // refusal failover, or when a failover-only rung downstream accepts
         // an unnamed refusal (`fallback_rules`); the ladder decision below
