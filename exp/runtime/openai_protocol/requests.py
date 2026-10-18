@@ -212,6 +212,16 @@ dropped-and-disclosed) forms.
 """
 
 
+CHAT_TEMPLATE_PRESERVE_THINKING_IGNORED = (
+    "chat_template_kwargs.preserve_thinking->ignored(not_forwarded)"
+)
+"""Disclosure recorded when Qwen's ``preserve_thinking`` template switch is accepted unused.
+
+No wire receives ``chat_template_kwargs`` verbatim (``enable_thinking`` is
+translated to the canonical reasoning control), so the switch cannot reach a
+chat template; it is named rather than refused."""
+
+
 def _without_chat_message_extensions(payload: JsonObject) -> JsonObject:
     """Hide the wire-model-owned message keys from official OpenAI validation."""
     raw_messages = payload.get("messages")
@@ -325,6 +335,12 @@ def decode_chat(
                 *cache_disclosures,
                 *custom_turn_cache_disclosures(cache_payload.get("messages")),
                 *thinking.disclosures,
+                *(
+                    (CHAT_TEMPLATE_PRESERVE_THINKING_IGNORED,)
+                    if request.chat_template_kwargs is not None
+                    and request.chat_template_kwargs.preserve_thinking is not None
+                    else ()
+                ),
                 *_replayed_reasoning_disclosures(request.messages),
             ),
             zdr_requested=request.provider is not None and request.provider.demands_zdr,

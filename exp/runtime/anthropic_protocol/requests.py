@@ -53,6 +53,7 @@ from exp.runtime.anthropic_protocol.media_blocks import (
     ImageBlock,
     document_part_from_block,
     image_part_from_block,
+    text_document_text,
 )
 from exp.runtime.anthropic_protocol.reasoning_channels import (
     ReasoningConfig,
@@ -862,7 +863,28 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                     f"{param}.content.{block_index}",
                     "document blocks are only valid in user messages.",
                 )
-            content_parts.append(document_part_from_block(block, f"{param}.content.{block_index}"))
+            text = text_document_text(block)
+            if text is None:
+                content_parts.append(
+                    document_part_from_block(block, f"{param}.content.{block_index}")
+                )
+                continue
+            if block.citations is not None and block.citations.enabled:
+                raise invalid_field(
+                    f"{param}.content.{block_index}.citations",
+                    "document citations are not supported over this gateway; "
+                    "send citations.enabled as false or omit the field.",
+                )
+            # A plain-text document is the caller's text: it joins the turn as
+            # a text block, so every wire serves it and a cache marker on the
+            # block survives through the marked-run carrier.
+            marker = (
+                block.cache_control.model_dump(mode="json", exclude_none=True)
+                if block.cache_control is not None
+                else None
+            )
+            text_parts.append(_TextBlock(type="text", text=text, cache_control=block.cache_control))
+            content_parts.append(TextContentPart(text=text, cache_control=marker))
         elif isinstance(block, (_ThinkingBlock, _RedactedThinkingBlock)):
             if message.role != "assistant":
                 raise invalid_field(

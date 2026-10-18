@@ -125,12 +125,16 @@ impl Normalizer {
                     let retained_whole = part.contains_key("thoughtSignature")
                         || (thought && thought_text.is_none());
                     if retained_whole {
-                        let bytes = crate::dialects::records_retained_bytes(raw_part)
+                        // A signed generated image keeps its signature and media
+                        // type as evidence; its inline bytes are charged to the
+                        // image budget and delivered as the image below, so
+                        // retaining them here too would hold a multi-MiB image
+                        // against the 1 MiB evidence bound and fail the stream.
+                        let retained = gemini_part_without_inline_data(raw_part);
+                        let bytes = crate::dialects::records_retained_bytes(&retained)
                             .ok_or_else(|| malformed(super::OUTPUT_OVERFLOW_MESSAGE))?;
                         self.reserve_summary_bytes(bytes.max(64))?;
-                        events.push(Event::GeminiThoughtPart(std::sync::Arc::new(
-                            raw_part.clone(),
-                        )));
+                        events.push(Event::GeminiThoughtPart(std::sync::Arc::new(retained)));
                     }
                     if thought {
                         // The thought summary text is the model's displayable
@@ -255,6 +259,22 @@ impl Normalizer {
     }
 }
 
+/// The retained evidence copy of a signed part: the provider's part with
+/// `inlineData.data` (generated image bytes, delivered to the caller as an
+/// image event) replaced by its encoded length.
+fn gemini_part_without_inline_data(part: &Value) -> Value {
+    let mut retained = part.clone();
+    if let Some(inline) = retained
+        .get_mut("inlineData")
+        .and_then(Value::as_object_mut)
+    {
+        if let Some(Value::String(data)) = inline.remove("data") {
+            inline.insert("dataBytes".to_string(), Value::from(data.len()));
+        }
+    }
+    retained
+}
+
 /// Whether `promptFeedback` reports a prompt-level block: any `blockReason`
 /// other than the enum's unspecified default means Google refused the prompt
 /// before generating. An absent or null `promptFeedback`, or one that only
@@ -344,6 +364,48 @@ mod gemini_tests {
         let private = Event::GeminiThoughtPart(std::sync::Arc::new(parts[0].clone()));
         assert!(!private.is_output_token());
         assert!(private.is_generation_progress());
+    }
+
+    #[test]
+    fn signed_generated_image_over_the_evidence_bound_reaches_the_caller_intact() {
+        // Gemini image models sign the image part itself. A real PNG padded past
+        // the 1 MiB evidence bound still decodes, as large generated images do.
+        use base64::Engine;
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC")
+            .unwrap();
+        let mut bytes = png;
+        bytes.resize(1_500_000, 0);
+        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let part = json!({
+            "inlineData": {"mimeType": "image/png", "data": data},
+            "thoughtSignature": "image-signature==",
+        });
+        let chunk =
+            sse(&json!({"candidates":[{"content":{"parts":[part]},"finishReason":"STOP"}]}));
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &[chunk.as_slice()]);
+        assert!(failure.is_none(), "{failure:?}");
+        let images: Vec<_> = events
+            .iter()
+            .filter(|event| event["kind"] == "image")
+            .collect();
+        assert_eq!(images.len(), 1);
+        assert_eq!(
+            images[0]["url"],
+            json!(format!("data:image/png;base64,{data}"))
+        );
+        let captured: Vec<_> = events
+            .iter()
+            .filter(|event| event["kind"] == "gemini_thought_part")
+            .map(|event| event["part"].clone())
+            .collect();
+        assert_eq!(
+            captured,
+            vec![json!({
+                "inlineData": {"mimeType": "image/png", "dataBytes": data.len()},
+                "thoughtSignature": "image-signature==",
+            })]
+        );
     }
 
     #[test]

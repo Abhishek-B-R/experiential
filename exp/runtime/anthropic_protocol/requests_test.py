@@ -2459,3 +2459,71 @@ def test_tool_search_result_blocks_in_history_are_accepted() -> None:
         )
     )
     assert len(decoded.request.messages) >= 3
+
+
+def test_plain_text_document_source_decodes_as_the_callers_text() -> None:
+    """Anthropic's ``text`` document source (Claude Code attachments) is served.
+
+    It joins the turn as text, title first, so every wire can carry it.
+    """
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Summarize:\n"},
+                        {
+                            "type": "document",
+                            "title": "notes.md",
+                            "source": {
+                                "type": "text",
+                                "media_type": "text/plain",
+                                "data": "line one",
+                            },
+                        },
+                    ],
+                }
+            ]
+        )
+    )
+    (message,) = decoded.request.messages
+    assert message.content == "Summarize:\nnotes.md\n\nline one"
+    assert message.content_parts == ()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        {"type": "text", "media_type": "text/html", "data": "<p>x</p>"},
+        {"type": "text", "media_type": "text/plain"},
+    ],
+)
+def test_text_document_source_needs_plain_text_data(source: JsonObject) -> None:
+    """A text source carries its data as ``text/plain``, as Anthropic defines it."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(messages=[{"role": "user", "content": [{"type": "document", "source": source}]}])
+        )
+    assert (excinfo.value.detail.param or "").startswith("messages.0.content.0")
+
+
+def test_an_unknown_content_block_type_is_named_instead_of_the_text_arm() -> None:
+    """A block outside the union names its own type, not "Input should be 'text'"."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "hi"},
+                            {"type": "container_upload", "file_id": "file_1"},
+                        ],
+                    }
+                ]
+            )
+        )
+    assert excinfo.value.detail.param == "messages.0.content.1.type"
+    assert "'container_upload'" in excinfo.value.detail.message
+    assert "Input should be 'text'" not in excinfo.value.detail.message

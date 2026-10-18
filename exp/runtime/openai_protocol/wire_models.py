@@ -537,9 +537,12 @@ class _ChatTemplateKwargs(_WireModel):
     """vLLM/Hunyuan-native ``chat_template_kwargs`` on a Chat request.
 
     Only ``enable_thinking`` is recognized and translated to the canonical
-    reasoning control; the field is never forwarded verbatim to any wire."""
+    reasoning control; the field is never forwarded verbatim to any wire.
+    ``preserve_thinking`` (Qwen's keep-prior-reasoning template switch) is
+    accepted and disclosed as ignored, because no wire receives the object."""
 
     enable_thinking: bool | None = None
+    preserve_thinking: bool | None = None
 
 
 class _ChatRequest(_WireModel):

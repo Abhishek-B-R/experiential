@@ -62,9 +62,12 @@ class MediaSource(AnthropicWireModel):
     @model_validator(mode="after")
     def _require_matching_carrier(self) -> MediaSource:
         """Reject carrier fields that belong to a different source type."""
-        expected = {"base64": ("data", "media_type"), "url": ("url",), "file": ("file_id",)}[
-            self.type
-        ]
+        expected = {
+            "base64": ("data", "media_type"),
+            "text": ("data", "media_type"),
+            "url": ("url",),
+            "file": ("file_id",),
+        }[self.type]
         present = {
             name
             for name, value in (
@@ -99,14 +102,22 @@ class ImageBlock(AnthropicWireModel):
 
 
 class DocumentSource(MediaSource):
-    """Where one document block's bytes come from: base64, a URL, or a file id.
+    """Where one document block's bytes come from: base64, text, a URL, or a file id.
 
-    ``text`` and ``content`` sources carry non-PDF documents no other wire
-    accepts, so only the carriers every declared route can serve are
-    accepted.
+    A ``text`` source (Anthropic's plain-text document, ``media_type``
+    ``text/plain``) is decoded as the caller's text rather than a document,
+    so every route serves it. ``content`` sources stay refused.
     """
 
+    type: Literal["base64", "text", "url", "file"]
     data: str | None = Field(default=None, max_length=MAXIMUM_DOCUMENT_BASE64_BYTES)
+
+    @model_validator(mode="after")
+    def _require_plain_text(self) -> DocumentSource:
+        """A text source carries its data as ``text/plain``, as Anthropic defines it."""
+        if self.type == "text" and (self.data is None or self.media_type != "text/plain"):
+            raise ValueError("a text source needs data and media_type 'text/plain'")
+        return self
 
 
 class DocumentCitations(AnthropicWireModel):
@@ -179,6 +190,26 @@ def image_part_from_block(block: ImageBlock, param: str) -> ImageContentPart:
             "JPEG, GIF, or WebP image, an Anthropic Files id (file_...), or an "
             "s3:// or gs:// URI of an uploaded image whose suffix states its format.",
         ) from exc
+
+
+def text_document_text(block: DocumentBlock) -> str | None:
+    """Return a plain-text document's text, or None for any other source.
+
+    Anthropic renders a text document to the model as its title and body; the
+    same text reaches every other wire as an ordinary text part, so a title
+    leads the data on its own line.
+
+    Args:
+        block: Validated caller document block.
+
+    Returns:
+        The document's text with its title, or None when the source is not text.
+    """
+    if block.source.type != "text" or block.source.data is None:
+        return None
+    if block.title:
+        return f"{block.title}\n\n{block.source.data}"
+    return block.source.data
 
 
 def document_part_from_block(block: DocumentBlock, param: str) -> DocumentContentPart:
