@@ -16,6 +16,7 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
+from exp.runtime.openai_protocol.reasoning_estimate import ReasoningEstimate
 from exp.runtime.openai_protocol.response_streaming_state import ResponseReasoningState
 from exp.runtime.openai_protocol.tool_choice import responses_tool_choice_echo
 
@@ -58,6 +59,7 @@ class ChatSseEncoder:
         self._tool_indices: dict[int, tuple[str, str]] = {}
         self._tool_arguments: dict[int, str] = {}
         self._usage: GatewayUsage | None = None
+        self._reasoning_estimate = ReasoningEstimate()
 
     def start(self) -> tuple[str, ...]:
         """Emit the single initial assistant-role chunk."""
@@ -79,6 +81,7 @@ class ChatSseEncoder:
             OpenAIProtocolError: Event order, tool identity, or terminal state is invalid.
         """
         self._require_event(event)
+        self._reasoning_estimate.observe(event)
         if event.usage is not None and event.usage.has_token_counts:
             self._usage = event.usage
         if event.kind == GatewayEventKind.TEXT_DELTA:
@@ -217,7 +220,9 @@ class ChatSseEncoder:
             "created": self.created_at,
             "model": self.model,
             "choices": [],
-            "usage": _chat_usage(usage),
+            "usage": self._reasoning_estimate.annotate(
+                _chat_usage(usage), usage, "completion_tokens_details"
+            ),
         }
         return _chat_data(payload)
 
@@ -296,6 +301,7 @@ class ResponsesSseEncoder:
         self._text_started = False
         self._refusal_started = False
         self._usage: GatewayUsage | None = None
+        self._reasoning_estimate = ReasoningEstimate()
 
     def start(self) -> tuple[str, ...]:
         """Emit required created and in-progress lifecycle events once."""
@@ -311,6 +317,7 @@ class ResponsesSseEncoder:
     def feed(self, event: GatewayEvent) -> tuple[str, ...]:
         """Encode one ordered normalized event into Responses lifecycle frames."""
         self._require_event(event)
+        self._reasoning_estimate.observe(event)
         if event.kind == GatewayEventKind.CHOICE_LOGPROBS_DELTA:
             raise self._state_error(
                 "Responses encoder received a Chat probability event; native Responses "
@@ -793,7 +800,13 @@ class ResponsesSseEncoder:
             ],
             "max_output_tokens": self.request.maximum_output_tokens,
             "previous_response_id": self.request.previous_response_id,
-            "usage": _responses_usage(self._usage) if status != "in_progress" else None,
+            "usage": (
+                self._reasoning_estimate.annotate(
+                    _responses_usage(self._usage), self._usage, "output_tokens_details"
+                )
+                if status != "in_progress"
+                else None
+            ),
         }
         if self.request.ignored_parameters:
             payload["x-experiential-ignored-parameters"] = list(self.request.ignored_parameters)

@@ -16,6 +16,7 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+from exp.runtime.openai_protocol.reasoning_estimate import ReasoningEstimate
 from exp.runtime.openai_protocol.streaming import (
     ResponsesSseEncoder,
     stable_public_id,
@@ -123,7 +124,9 @@ def completed_body(
                 "logprobs": probability_value,
             }
         ],
-        "usage": chat_usage(usage),
+        "usage": ReasoningEstimate.from_events(events).annotate(
+            chat_usage(usage), usage, "completion_tokens_details"
+        ),
         **_ignored_parameters_extension(request),
     }
 

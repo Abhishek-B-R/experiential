@@ -80,6 +80,11 @@ impl ResponsesSseEncoder {
             "previous_response_id": self.envelope.previous_response_id,
             "usage": if include_content {
                 let mut usage = aggregate::responses_usage(self.usage.as_ref());
+                self.reasoning_estimate.annotate(
+                    &mut usage,
+                    self.usage.as_ref(),
+                    "output_tokens_details",
+                );
                 annotate_usage_details(&mut usage, self.web_search.as_ref());
                 annotate_tool_search_usage_details(&mut usage, self.tool_search_requests());
                 usage

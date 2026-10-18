@@ -32,6 +32,7 @@ mod metrics;
 mod param_attribution;
 mod rate_limit_headers;
 mod reasoning_display;
+mod reasoning_estimate;
 mod rejection_shapes;
 mod relay;
 mod replay;

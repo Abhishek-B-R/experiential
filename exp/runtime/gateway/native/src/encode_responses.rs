@@ -10,6 +10,7 @@ use crate::events::{
     CompletedToolCall, Event, ProviderAssistantMessagePhase, ProviderOutputItemKind,
     ProviderOutputItemStatus, Usage,
 };
+use crate::reasoning_estimate::ReasoningEstimate;
 use crate::tool_search::ResponsesToolSearch;
 use crate::web_search::{
     responses_web_search_events, url_citations, CitationShape, WebSearchAdmission,
@@ -68,6 +69,8 @@ pub struct ResponsesSseEncoder {
     messages: HashMap<MessageKey, MessageState>,
     provider_output_starts: HashMap<u32, ProviderOutputStart>,
     usage: Option<Usage>,
+    /// Visible output and thinking for the estimated reasoning count.
+    reasoning_estimate: ReasoningEstimate,
     web_search: Option<WebSearchAdmission>,
     /// The gateway-run tool-search rounds, rendered as leading hosted items
     /// at `start` and metered on usage; `None` changes nothing.
@@ -101,6 +104,7 @@ impl ResponsesSseEncoder {
             messages: HashMap::new(),
             provider_output_starts: HashMap::new(),
             usage: None,
+            reasoning_estimate: ReasoningEstimate::default(),
             web_search: None,
             tool_search: None,
         }
@@ -179,6 +183,7 @@ impl ResponsesSseEncoder {
                 "Responses stream received an event after its terminal.",
             ));
         }
+        self.reasoning_estimate.observe(event);
         match event {
             Event::ProviderResponsesLogprobs {
                 output_index,

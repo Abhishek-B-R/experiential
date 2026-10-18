@@ -724,3 +724,62 @@ fn disjoint_writes_and_the_anthropic_shape_keep_reads_and_writes_apart() {
     // Settlement's disjoint read leg is untouched by the reporting convention.
     assert_eq!(written_and_read_back().cached_input_tokens, Some(0));
 }
+
+/// An Anthropic-style turn (thinking billed inside output, no count) reports
+/// an estimated reasoning count on both Chat encoders, marked as estimated,
+/// while the settled `Usage` keeps reasoning unknown.
+#[test]
+fn chat_reports_an_estimated_reasoning_count_when_the_provider_publishes_none() {
+    let usage = Usage {
+        input_tokens: Some(48),
+        output_tokens: Some(40),
+        ..Usage::default()
+    };
+    let events = vec![
+        Event::ThinkingDelta {
+            index: 0,
+            delta: "1001 is 7 x 11 x 13.".into(),
+        },
+        Event::TextDelta("No.".into()),
+        Event::Usage(usage.clone()),
+        Event::Completed,
+    ];
+    let mut stream = ChatSseEncoder::new_with_ignored("request-1", "claude", 1, true, vec![]);
+    let mut frames = stream.start().expect("stream start must encode");
+    for event in &events {
+        frames.extend(stream.feed(event).expect("event must encode"));
+    }
+    let usage_frame = frames
+        .iter()
+        .filter_map(|frame| frame.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+        .find(|payload| payload.get("usage").is_some_and(|usage| !usage.is_null()))
+        .expect("include_usage emits a usage chunk");
+    assert_eq!(
+        usage_frame["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        39
+    );
+    assert_eq!(
+        usage_frame["usage"]["estimated_token_details"],
+        json!(["reasoning_tokens"])
+    );
+    assert!(usage_frame["usage"]["unreported_token_details"]
+        .as_array()
+        .is_none_or(|fields| !fields.contains(&json!("reasoning_tokens"))));
+
+    let completed = completed_chat_body_with_ignored("request-1", "claude", 1, &events, &[], false)
+        .expect("completed body must encode");
+    assert_eq!(
+        completed.body["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        39
+    );
+    assert_eq!(
+        completed.body["usage"]["estimated_token_details"],
+        json!(["reasoning_tokens"])
+    );
+    // Settlement reads the aggregated Usage, which stays unreported.
+    assert_eq!(
+        completed.usage.expect("usage aggregates").reasoning_tokens,
+        None
+    );
+}

@@ -403,6 +403,20 @@ fn unreported_token_details(
     output_details: &str,
 ) -> Result<[bool; 4], String> {
     let mut unreported = [false; 4];
+    // A gateway upstream's estimated reasoning count (`reasoning_estimate`)
+    // is display only: read it as unreported, never as a billed subset.
+    if let Some(raw) = object.get(crate::reasoning_estimate::ESTIMATED_TOKEN_DETAILS) {
+        let fields = raw
+            .as_array()
+            .ok_or("estimated_token_details must be an array")?;
+        if fields
+            .iter()
+            .any(|field| field.as_str() != Some("reasoning_tokens"))
+        {
+            return Err("estimated_token_details may only name reasoning_tokens".into());
+        }
+        unreported[3] = !fields.is_empty();
+    }
     let Some(raw) = object.get("unreported_token_details") else {
         return Ok(unreported);
     };
