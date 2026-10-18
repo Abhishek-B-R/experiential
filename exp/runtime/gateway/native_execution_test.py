@@ -712,6 +712,17 @@ def test_wire_entry_names_customer_managed_billing_for_the_data_plane() -> None:
     assert not deployment_wire_entry(route, route.deployment, house, {})["billing_customer_managed"]
 
 
+def test_wire_entry_names_a_tenant_origin_for_the_data_plane() -> None:
+    """A tenant origin's entry says so, so the data plane answers it opaquely."""
+    route = _route()
+    tenant = GatewayWireProfile(
+        dialect="openai_compatible", url="https://tenant.example.test", tenant_origin=True
+    )
+    house = GatewayWireProfile(dialect="openai_compatible", url="https://provider.test")
+    assert deployment_wire_entry(route, route.deployment, tenant, {})["tenant_origin"] is True
+    assert deployment_wire_entry(route, route.deployment, house, {})["tenant_origin"] is False
+
+
 @pytest.mark.parametrize(
     ("failover_mode", "expected"),
     (

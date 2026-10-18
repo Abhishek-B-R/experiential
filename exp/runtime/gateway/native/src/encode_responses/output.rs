@@ -48,7 +48,7 @@ impl ResponsesSseEncoder {
             json!({
                 "code": "server_error",
                 "message": failure
-                    .map(|failure| failure.safe_message.clone())
+                    .map(|failure| failure.caller_message().to_string())
                     .unwrap_or_else(|| "Gateway stream failed.".to_string()),
             })
         } else {

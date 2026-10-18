@@ -164,6 +164,7 @@ mod tests {
             headers: HashMap::new(),
             model_id: String::new(),
             billing_customer_managed: tokens.is_some(),
+            tenant_origin: false,
             explicit_cache: false,
             automatic_cache: false,
             automatic_cache_written_tokens: None,

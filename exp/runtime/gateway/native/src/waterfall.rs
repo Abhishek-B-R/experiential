@@ -369,7 +369,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
         // A rung a tool-search round rebuilt dials its rebuilt wire; the
         // route's own entry still answers every policy question above.
         let dial_wire = search_wires[depth].as_ref().unwrap_or(wire);
-        let end = run_attempt(
+        let mut end = run_attempt(
             ctx,
             guard,
             dial_wire,
@@ -379,6 +379,11 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
             &tool_search_rounds,
         )
         .await;
+        // Every pre-commit failure of a tenant origin answers opaquely; the
+        // relay marks the failures it yields after an open the same way.
+        if let AttemptEnd::Ladder { failure, .. } | AttemptEnd::Repair { failure, .. } = &mut end {
+            failure.tenant_origin |= dial_wire.tenant_origin;
+        }
         if guard.input_gate.is_some() {
             if let AttemptEnd::Ladder { failure, .. } | AttemptEnd::Repair { failure, .. } = &end {
                 // Gate rejection can drop settlement while it awaits the same input verdict.
@@ -681,6 +686,8 @@ mod ladder_tests;
 mod progress_tests;
 #[cfg(test)]
 mod repair_ladder_tests;
+#[cfg(test)]
+mod tenant_ladder_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

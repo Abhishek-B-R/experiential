@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import cast
 
 import pytest
@@ -249,6 +250,16 @@ def test_profile_resolution_binds_the_deployment_billing_source() -> None:
     # A house rung stays untiered by default, so service_tier is not forwarded.
     assert house.service_tier_pricing_enabled is False
     assert house.forwards_service_tier is False
+
+
+def test_profile_resolution_binds_the_runtime_tenant_origin() -> None:
+    """The wire profile carries the resolved connection's tenant-origin policy."""
+    base = GatewayWireProfile(dialect="openai_compatible", url="https://tenant.example.test")
+    resolved = _resolved(_NativeClient(base), ModelCapabilities())
+    plain = _resolved_wire_profile(_deployment(None), resolved)
+    assert plain.tenant_origin is False
+    tenant = _resolved_wire_profile(_deployment(None), replace(resolved, tenant_origin=True))
+    assert tenant.tenant_origin is True
 
 
 def test_profile_resolution_forwards_service_tier_on_a_tier_priced_house_lane() -> None:

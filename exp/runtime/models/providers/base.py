@@ -151,6 +151,9 @@ class GatewayWireProfile:
     """Whether the exact model accepts explicit sampling temperature."""
 
     billing_customer_managed: bool = False
+    tenant_origin: bool = False
+    """A customer-addressed origin: the data plane answers its failures opaquely and holds its
+    socket to the tenant destination policy (ports and platform infrastructure)."""
     service_tier_pricing_enabled: bool = False
     """Whether this HOST-funded rung may still forward ``service_tier``.
 

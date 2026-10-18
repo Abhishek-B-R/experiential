@@ -26,6 +26,7 @@ fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         image_output: false,
         model_id: String::new(),
         billing_customer_managed: false,
+        tenant_origin: false,
         explicit_cache: false,
         automatic_cache: false,
         automatic_cache_written_tokens: None,

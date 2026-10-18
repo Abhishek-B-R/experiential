@@ -75,12 +75,6 @@ _FIXED_ORIGIN_PROVIDERS = frozenset(
 )
 _EXPLICIT_CAPABILITY_PROVIDERS = frozenset({"azure", "bedrock", "openai-compatible", "vertex"})
 
-AzureApiSurface = Literal["openai_deployments", "model_inference"]
-"""Azure wire surface a connection speaks: classic deployments or Foundry model inference."""
-
-_FOUNDRY_HOST_SUFFIXES = (".services.ai.azure.com", ".inference.ai.azure.com")
-_AZURE_OPENAI_HOST_SUFFIX = ".openai.azure.com"
-_MODEL_INFERENCE_ROOT_SUFFIXES = ("/models", "/openai/v1")
 _MODEL_INFERENCE_IDENTITY_SUFFIX = "/models"
 
 
@@ -101,50 +95,6 @@ def _normalize_base_url(value: str) -> str:
     default_port = 443 if scheme == "https" else 80
     netloc = host if port in {None, default_port} else f"{host}:{port}"
     return urlunsplit((scheme, netloc, parsed.path.rstrip("/"), "", ""))
-
-
-def infer_azure_api_surface(endpoint: str) -> AzureApiSurface | None:
-    """Infer the Azure wire surface one resource endpoint serves.
-
-    Azure AI Foundry resources (``*.services.ai.azure.com``) serve the model-inference surface,
-    which carries provider-specific sampling fields such as ``top_k``. Azure OpenAI resources
-    (``*.openai.azure.com``) serve only the deployment surface.
-
-    Args:
-        endpoint: Azure resource endpoint from a connection.
-
-    Returns:
-        The surface the host is known to serve, or ``None`` for an unrecognized host such as a
-        private endpoint or a local recording proxy.
-    """
-    host = urlsplit(endpoint).hostname
-    if host is None:
-        return None
-    host = host.lower()
-    if host.endswith(_AZURE_OPENAI_HOST_SUFFIX):
-        return "openai_deployments"
-    if any(host.endswith(suffix) for suffix in _FOUNDRY_HOST_SUFFIXES):
-        return "model_inference"
-    return None
-
-
-def strip_model_inference_root(value: str) -> str:
-    """Remove the route suffix one Azure model-inference endpoint spelling carries.
-
-    The model-inference surface serves ``/models`` directly off the resource, so the bare resource,
-    its terminal ``/models`` form, and the Azure OpenAI ``/openai/v1`` root all name one resource.
-
-    Args:
-        value: Endpoint or endpoint path, with or without a trailing slash.
-
-    Returns:
-        The value reduced to the resource itself.
-    """
-    trimmed = value.rstrip("/")
-    for suffix in _MODEL_INFERENCE_ROOT_SUFFIXES:
-        if trimmed.lower().endswith(suffix):
-            return trimmed[: -len(suffix)].rstrip("/")
-    return trimmed
 
 
 def _normalize_connection_base_url(connection: ConnectionConfig) -> str | None:
@@ -199,6 +149,9 @@ class ConnectionConfig(ContractModel):
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
     # Opt-in: native provider via a trusted https base_url in its own dialect (default-off).
     trusted_custom_origin: bool = False
+    tenant_origin: bool = False
+    """The base_url is a customer-addressed origin, so the data plane collapses every upstream
+    failure into one opaque error and holds its socket to the tenant destination policy."""
     subscription: SubscriptionKind | None = None
     """Consumer plan sign-in this connection dispatches on, instead of an API key."""
 
@@ -239,6 +192,10 @@ class ConnectionConfig(ContractModel):
                 "aws_access_key_id_env and bedrock_auth_mode are only accepted for "
                 "provider='bedrock'"
             )
+        if self.tenant_origin and (
+            self.base_url is None or urlsplit(self.base_url).scheme != "https"
+        ):
+            raise ValueError("tenant_origin requires an explicit https base_url")
         if self.trusted_custom_origin:
             if self.provider not in _FIXED_ORIGIN_PROVIDERS:
                 raise ValueError("trusted_custom_origin applies only to a native provider")
@@ -390,6 +347,8 @@ class ConnectionConfig(ContractModel):
             identity["region"] = self.region
         if self.trusted_custom_origin:  # endpoint identity; added only when set
             identity["trusted_custom_origin"] = True
+        if self.tenant_origin:  # a different dispatch policy; added only when set
+            identity["tenant_origin"] = True
         if self.subscription is not None:  # a different backend than the API-key origin
             identity["subscription"] = self.subscription
         effective_bedrock_auth_mode = self.bedrock_auth_mode
@@ -430,6 +389,8 @@ class ConnectionConfig(ContractModel):
             serialized.pop("bedrock_auth_mode", None)
         if not self.trusted_custom_origin:
             serialized.pop("trusted_custom_origin", None)
+        if not self.tenant_origin:
+            serialized.pop("tenant_origin", None)
         if self.subscription is None:
             serialized.pop("subscription", None)
         return serialized

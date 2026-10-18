@@ -146,6 +146,17 @@ def test_runtime_preserves_http_timeout_in_resolved_wire_profile(
         assert client.gateway_wire_profile().timeout_seconds == (timeout or 60.0)
 
 
+def test_resolution_carries_the_connection_tenant_origin() -> None:
+    """Only an alias whose connection is a tenant origin resolves with the flag."""
+    plain = _catalog(provider="openai-compatible", base_url="https://tenant.example.test/v1")
+    connection = plain.connections["primary"].model_copy(update={"tenant_origin": True})
+    tenant = plain.model_copy(update={"connections": {"primary": connection}})
+    environment = {"FIXTURE_API_KEY": "fixture-key"}
+    runtime = RuntimeModelCatalog(plain, environment=environment)
+    assert runtime.resolve("fixture-model").tenant_origin is False
+    assert runtime.with_catalog(tenant).resolve("fixture-model").tenant_origin is True
+
+
 def test_embedding_call_uses_explicit_runtime_http_timeout() -> None:
     """An embedding dispatch receives the configured bound, including after catalog replacement."""
     wire = ScriptedAsyncJsonTransport(

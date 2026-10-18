@@ -276,10 +276,12 @@ async fn run_ladder(
         }
         total_attempts += 1;
         counts[depth] += 1;
-        match dispatch(&state.http, wire, deadline, admission, guard).await {
+        let http = state.http.for_origin(wire.tenant_origin);
+        match dispatch(http, wire, deadline, admission, guard).await {
             Ok((body, usage)) => return Ok(Served { depth, body, usage }),
             Err(failure) => {
-                let failure = route_failure(failure, wire, policy, counts[depth]);
+                let failure = route_failure(failure, wire, policy, counts[depth])
+                    .with_tenant_origin(wire.tenant_origin);
                 let boundary = failure.clone().boundary();
                 let possible = successor_possible(
                     policy,
