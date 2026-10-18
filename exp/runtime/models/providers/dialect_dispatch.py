@@ -169,6 +169,29 @@ def reasoning_off_via_chat_template(profile: GatewayWireProfile) -> bool:
     )
 
 
+# Z.ai GLM models whose only reasoning control is thinking enabled/disabled.
+_ZAI_THINKING_SWITCH_ONLY_MODELS = frozenset({"glm-5", "glm-5.1"})
+
+
+def reasoning_via_zai_thinking(profile: GatewayWireProfile) -> bool:
+    """Return whether this origin takes Z.ai's own ``thinking`` switch instead of an effort.
+
+    Z.ai's chat completions reference (docs.z.ai, read 2026-10-18) documents
+    ``reasoning_effort`` only for GLM-5.2 and above (5.2 skips thinking on none
+    or minimal; 5.3 and 5.3-Flash take low, high and max), so those keep the
+    effort field. GLM-5 and GLM-5.1 have no effort parameter: their only control
+    is ``thinking: {"type": "enabled" | "disabled"}`` ("Thinking Mode"), on by
+    default. Scoped to the Z.ai API hosts and those two models so no other
+    origin or model changes its wire.
+    """
+    host = (urlsplit(profile.url).hostname or "").lower()
+    return (
+        profile.dialect == "openai_compatible"
+        and host in {"api.z.ai", "open.bigmodel.cn"}
+        and profile.model_id.lower() in _ZAI_THINKING_SWITCH_ONLY_MODELS
+    )
+
+
 def dialect_stream_payload(
     profile: GatewayWireProfile,
     provider_request: GatewayRequest,
@@ -320,6 +343,7 @@ def dialect_stream_payload(
             forwards_prompt_cache_key=profile.forwards_prompt_cache_key,
             forwards_cache_control=profile.forwards_cache_control,
             reasoning_off_via_chat_template=reasoning_off_via_chat_template(profile),
+            reasoning_via_thinking_toggle=reasoning_via_zai_thinking(profile),
         )
         qwen_budget_payload(profile, provider_request, payload)
         return payload

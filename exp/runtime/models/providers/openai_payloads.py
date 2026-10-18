@@ -311,6 +311,7 @@ def openai_compatible_stream_payload(
     forwards_prompt_cache_key: bool = False,
     forwards_cache_control: bool = False,
     reasoning_off_via_chat_template: bool = False,
+    reasoning_via_thinking_toggle: bool = False,
 ) -> JsonObject:
     """Translate one canonical request to streaming Chat Completions JSON.
 
@@ -328,6 +329,10 @@ def openai_compatible_stream_payload(
             through ``chat_template_kwargs`` (Vertex MaaS GLM rejects
             ``reasoning_effort: "none"``), so effort ``none`` is sent as
             ``{"enable_thinking": false}`` and no ``reasoning_effort`` field.
+        reasoning_via_thinking_toggle: Whether this origin controls reasoning with
+            Z.ai's ``thinking: {"type": "enabled" | "disabled"}`` and no effort
+            levels, so effort ``none`` is sent as ``disabled``, any other effort as
+            ``enabled``, and no ``reasoning_effort`` field.
         reasoning_output_exposed: Whether this rung replays the caller's plaintext
             ``reasoning_content`` history verbatim (exposure-gated Tencent/DeepSeek rung).
         deepseek_reasoning_history: Whether this rung is DeepSeek's own origin,
@@ -435,7 +440,11 @@ def openai_compatible_stream_payload(
         # Cache-affinity key, matching the native Responses lane.
         payload["prompt_cache_key"] = request.provider_prompt_cache_key
     if supports_reasoning and effective_reasoning_effort is not None:
-        if effective_reasoning_effort == "none" and reasoning_off_via_chat_template:
+        if reasoning_via_thinking_toggle:
+            payload["thinking"] = {
+                "type": "disabled" if effective_reasoning_effort == "none" else "enabled"
+            }
+        elif effective_reasoning_effort == "none" and reasoning_off_via_chat_template:
             template_kwargs = payload.get("chat_template_kwargs")
             payload["chat_template_kwargs"] = {
                 **(template_kwargs if isinstance(template_kwargs, dict) else {}),
