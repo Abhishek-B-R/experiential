@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import sys
+import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
@@ -54,6 +55,10 @@ def can_prompt(console: Console) -> bool:
         True only when both terminal streams can reach the same operator.
     """
     return console.is_terminal and _stdin_is_terminal()
+
+
+# Consoles that already showed an authorized command its undefined-cost warning.
+_WARNED_UNDEFINED: weakref.WeakSet[Console] = weakref.WeakSet()
 
 
 def require_spend_consent(
@@ -214,11 +219,16 @@ def _confirm_undefined_cost(
         typer.Exit: No manual override is available in a noninteractive session, or terminal
             input ended before an answer.
     """
-    console.print(
-        "[yellow]warning[/yellow] the cost of this command is undefined: a selected model has "
-        "no catalog pricing, so EXP cannot estimate the spend or enforce the configured budget."
-    )
-    if yes or previously_confirmed:
+    authorized = yes or previously_confirmed
+    if not authorized or console not in _WARNED_UNDEFINED:
+        # One command can authorize several stages (indexes, learning, retest); an already
+        # authorized run states the undefined cost once, while every question repeats it.
+        console.print(
+            "[yellow]warning[/yellow] the cost of this command is undefined: a selected model has "
+            "no catalog pricing, so EXP cannot estimate the spend or enforce the configured budget."
+        )
+        _WARNED_UNDEFINED.add(console)
+    if authorized:
         return True
     if non_interactive or not can_prompt(console):
         console.print(
