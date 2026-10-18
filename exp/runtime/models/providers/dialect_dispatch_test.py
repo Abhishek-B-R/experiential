@@ -11,6 +11,7 @@ import pytest
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.model import ReasoningEffort
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -213,3 +214,64 @@ def test_openai_family_tool_keeps_a_supplied_description_and_explicit_strict(dia
     assert declaration["description"] == "Look up weather."
     assert declaration["strict"] is False
     assert declaration["parameters"] == {"type": "object"}
+
+
+def _maas_profile(url: str, model_id: str) -> GatewayWireProfile:
+    """One OpenAI-compatible MaaS profile that accepts a reasoning effort."""
+    return GatewayWireProfile(
+        dialect="openai_compatible",
+        url=url,
+        model_id=model_id,
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+    )
+
+
+def _effort_request(effort: ReasoningEffort) -> GatewayRequest:
+    """One streaming Chat request at an explicit reasoning effort."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        stream=True,
+        reasoning_effort=effort,
+    )
+
+
+_VERTEX_URL = (
+    "https://aiplatform.googleapis.com/v1/projects/p/locations/global/endpoints/openapi"
+    "/chat/completions"
+)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [_VERTEX_URL, _VERTEX_URL.replace("aiplatform.", "us-central1-aiplatform.")],
+)
+def test_vertex_glm_turns_thinking_off_through_the_chat_template(url: str) -> None:
+    """Vertex MaaS GLM serves effort none as enable_thinking false, never reasoning_effort.
+
+    The origin rejects reasoning_effort "none" and ignores thinking {type: disabled};
+    chat_template_kwargs {enable_thinking: false} answers with no reasoning
+    (zai-org/glm-5-maas, probed 2026-10-18). Other levels keep reasoning_effort.
+    """
+    profile = _maas_profile(url, "zai-org/glm-5-maas")
+    payload = dialect_stream_payload(profile, _effort_request("none"))
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "reasoning_effort" not in payload
+    low = dialect_stream_payload(profile, _effort_request("low"))
+    assert low["reasoning_effort"] == "low"
+    assert "chat_template_kwargs" not in low
+
+
+@pytest.mark.parametrize(
+    ("url", "model_id"),
+    [
+        (_VERTEX_URL, "moonshotai/kimi-k2-thinking-maas"),
+        ("https://api.novita.ai/openai/v1/chat/completions", "zai-org/glm-5.1"),
+    ],
+)
+def test_reasoning_off_template_rule_is_scoped_to_vertex_glm(url: str, model_id: str) -> None:
+    """Another Vertex publisher, or GLM on another host, keeps reasoning_effort none."""
+    payload = dialect_stream_payload(_maas_profile(url, model_id), _effort_request("none"))
+    assert payload["reasoning_effort"] == "none"
+    assert "chat_template_kwargs" not in payload

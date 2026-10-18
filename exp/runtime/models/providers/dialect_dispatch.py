@@ -151,6 +151,24 @@ def responses_origin_refuses_web_search_sources(profile: GatewayWireProfile) -> 
     )
 
 
+def reasoning_off_via_chat_template(profile: GatewayWireProfile) -> bool:
+    """Return whether this origin turns thinking off only through ``chat_template_kwargs``.
+
+    Vertex MaaS GLM rejects ``reasoning_effort: "none"`` ("Expected
+    'reasoning_effort' to be one of: 'high', 'low', 'max', 'medium',
+    'minimal'") and ignores ``thinking: {type: disabled}``, but
+    ``chat_template_kwargs: {enable_thinking: false}`` answers with no
+    reasoning at all (zai-org/glm-5-maas, probed 2026-10-18). Scoped to that
+    host and publisher so no other Vertex model changes its wire.
+    """
+    host = (urlsplit(profile.url).hostname or "").lower()
+    return (
+        profile.dialect == "openai_compatible"
+        and host.endswith("aiplatform.googleapis.com")
+        and profile.model_id.lower().startswith("zai-org/glm")
+    )
+
+
 def dialect_stream_payload(
     profile: GatewayWireProfile,
     provider_request: GatewayRequest,
@@ -301,6 +319,7 @@ def dialect_stream_payload(
             forwards_service_tier=profile.forwards_tier(provider_request.service_tier),
             forwards_prompt_cache_key=profile.forwards_prompt_cache_key,
             forwards_cache_control=profile.forwards_cache_control,
+            reasoning_off_via_chat_template=reasoning_off_via_chat_template(profile),
         )
         qwen_budget_payload(profile, provider_request, payload)
         return payload
