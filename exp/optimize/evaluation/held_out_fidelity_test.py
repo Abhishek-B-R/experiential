@@ -506,6 +506,12 @@ def build_report(store: ProjectStore) -> str:
     return " ".join(report.read_text(encoding="utf-8").split())
 
 
+def audit_report(store: ProjectStore) -> str:
+    """The full learning and panel output ``exp eval --audit`` wrote to its report file."""
+    report = store.artifacts.project_directory / "reports" / "audit.txt"
+    return " ".join(report.read_text(encoding="utf-8").split())
+
+
 def held_out_command(root: Path, count: int, *flags: str) -> str:
     """Invoke ``exp eval PROJECT --audit N`` and return its output."""
     result = CliRunner().invoke(
@@ -551,7 +557,9 @@ def test_audit_learns_fit_traces_then_measures_held_out_on_final_memory(
     assert head is not None
     fit = USERS - len(held_out_lineages(store))
     assert f"learned {fit}/{fit} fit traces · memory v{fit}" in output
-    assert "Learning curve exact replies by trace order:" in output
+    report = audit_report(store)
+    assert "Learning curve exact replies by trace order:" in report
+    assert "Report:" in output and "audit.txt" in output
     # Held-out lineages were reserved before learning and never consumed.
     held = held_out_lineages(store)
     assert all(is_reserved(store.artifacts, plan.lineage, lineage) for lineage in held)
@@ -578,7 +586,8 @@ def test_audit_learns_fit_traces_then_measures_held_out_on_final_memory(
 
     purchased = len(provider.requests)
     replay = held_out_command(root, 3)
-    assert "Saved results. No provider calls." in replay and "9/9 replies exact" in replay
+    assert "no new model calls (saved results)" in replay and "9/9 replies exact" in replay
+    assert audit_report(store).count("Saved results. No provider calls.") == 2
     assert len(provider.requests) == purchased, "the learned audit replays without calls"
 
 

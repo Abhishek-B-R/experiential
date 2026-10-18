@@ -44,7 +44,7 @@ def render_completed_build(
     for line in learning_lines(learning):
         console.print(line)
     if learning.outcome is not None:
-        console.print(f"[dim]Report: {_shown(report)}[/dim]")
+        console.print(f"[dim]Report: {shown(report)}[/dim]")
     console.print("[green]Complete[/green]")
     if learning.outcome is not None:
         console.print(f"next: exp eval {project} --audit N  [dim](check on held-out traces)[/dim]")
@@ -52,7 +52,7 @@ def render_completed_build(
         console.print(f"next: exp optimize router {project}")
 
 
-def learning_lines(learning: BuildLearning) -> tuple[str, ...]:
+def learning_lines(learning: BuildLearning, noun: str = "traces") -> tuple[str, ...]:
     """The learning and retest result lines, warnings included, in terminal markup."""
     outcome = learning.outcome
     if outcome is None:
@@ -63,7 +63,7 @@ def learning_lines(learning: BuildLearning) -> tuple[str, ...]:
         else f"{outcome.attempts_used:,} model attempts"
     )
     learned = (
-        f"[green]✓[/green] learned {outcome.learned}/{outcome.traces} traces · "
+        f"[green]✓[/green] learned {outcome.learned}/{outcome.traces} {noun} · "
         f"memory v{outcome.head_version} · {calls}"
     )
     curve = learning.curve
@@ -100,7 +100,7 @@ def _percent(part: int, whole: int) -> str:
     return f"{part / whole:.0%}" if whole else "-"
 
 
-def _shown(path: Path) -> str:
+def shown(path: Path) -> str:
     """A path relative to the working directory when it is inside it."""
     try:
         return str(path.resolve().relative_to(Path.cwd().resolve()))

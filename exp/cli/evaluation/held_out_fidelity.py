@@ -1,7 +1,8 @@
 """Held-out simulation fidelity in the existing evaluation terminal conventions."""
 
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from exp.cli.evaluation.fidelity_turns import render_turns, turn_marks
 from exp.cli.evaluation.view import heading
 from exp.cli.shared.consent import can_prompt, require_spend_consent
 from exp.cli.shared.options import usage_error
-from exp.cli.shared.progress import progress_display, qualified
+from exp.cli.shared.progress import Phase, pipeline_display, progress_display, qualified
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore
@@ -35,6 +36,11 @@ from exp.runtime.models.providers.transport import ProviderTransportError
 
 PANEL_CONCURRENCY = 4  # traces of a frozen panel replayed at once
 PANEL_STAGE = "Replaying traces"  # counts finished panel traces
+# The audit's single progress line: fit-only learning, then the held-out panel.
+AUDIT_PHASES = (
+    Phase("learning", "Learning fit traces", 0.6, driver="Learning from traces", unit="traces"),
+    Phase("panel", "Replaying held-out traces", 0.4, driver=PANEL_STAGE, unit="traces"),
+)
 
 
 def run_held_out_fidelity(
@@ -47,6 +53,10 @@ def run_held_out_fidelity(
     dry_run: bool,
     verbose: bool = False,
     retry_incomplete: bool = False,
+    details: Console | None = None,
+    terminal: Console | None = None,
+    progress: ProgressHook | None = None,
+    pause: Callable[[], AbstractContextManager[None]] | None = None,
 ) -> None:
     """Measure the learned simulator on held-out traces it never learned, or replay the result.
 
@@ -62,8 +72,13 @@ def run_held_out_fidelity(
         dry_run: Register the runs and stop before credentials or provider calls.
         verbose: Also print every trace, every turn, and every criterion.
         retry_incomplete: Replace interrupted runs, buying their calls again.
+        details: Where the panel's description and notes are written; defaults to the terminal.
+        terminal: The user's terminal, for results, warnings, the spend question and errors.
+        progress: The calling command's single progress line; without it, the panel owns one.
+        pause: Releases that progress line while the spend question is asked.
     """
-    console = Console(theme=EXP_THEME)
+    screen = terminal or Console(theme=EXP_THEME)
+    console = details or screen
     with usage_error(OSError, ValueError):
         store = ProjectStore(root, project)
         panel = register_held_out_fidelity(
@@ -74,7 +89,8 @@ def run_held_out_fidelity(
             clock=lambda: datetime.now(UTC),
             retry_incomplete=retry_incomplete,
         )
-        heading(console, project, "Held-out simulation fidelity")
+        if details is None:
+            heading(screen, project, "Held-out simulation fidelity")
         judge = panel.prepared[0].spec.judge_alias
         steps = sum(len(case.steps) for case in panel.cases)
         console.print(
@@ -95,7 +111,7 @@ def run_held_out_fidelity(
             )
         fit = len(fit_cases(store))
         if panel.memory_version is not None and panel.memory_version < fit:
-            console.print(
+            screen.print(
                 f"[yellow]warning[/yellow] memory v{panel.memory_version} learned "
                 f"{panel.memory_version} of {fit} fit traces; run the audit again to finish "
                 "learning and measure the fully learned simulator"
@@ -114,23 +130,27 @@ def run_held_out_fidelity(
             for prepared in panel.prepared:
                 execute_fidelity_evaluation(store, prepared)
         else:
-            interactive = not non_interactive and can_prompt(console)
-            if not require_spend_consent(
-                console,
-                root=root,
-                yes=yes,
-                estimated_cost_usd=None,
-                cost_is_upper_bound=False,
-                command=f"exp eval {project} --audit {count}",
-                non_interactive=not interactive,
-            ):
+            interactive = not non_interactive and can_prompt(screen)
+            with pause() if pause is not None else nullcontext():
+                consented = require_spend_consent(
+                    screen,
+                    root=root,
+                    yes=yes,
+                    estimated_cost_usd=None,
+                    cost_is_upper_bound=False,
+                    command=f"exp eval {project} --audit {count}",
+                    non_interactive=not interactive,
+                )
+            if not consented:
                 return
-            execute_runs(console, store, panel.prepared)
+            execute_runs(screen, store, panel.prepared, progress)
         results = saved_held_out_results(store, panel)
         if verbose:
-            render_traces(console, store, panel.prepared, results, "Held-out trace")
-        console.print()
-        console.print(Text(aggregate_line(aggregate(results), len(panel.cases))))
+            render_traces(screen, store, panel.prepared, results, "Held-out trace")
+        result = Text(aggregate_line(aggregate(results), len(panel.cases)))
+        for target in (screen, console) if console is not screen else (screen,):
+            target.print()
+            target.print(result)
         curve = learning_curve(store, "fit")
         if curve is not None:
             console.print(Text(curve.line()))
@@ -279,9 +299,10 @@ def run_audit(
         retry_incomplete: Replace interrupted runs, buying their calls again.
     """
     # Deferred: learning loads the fidelity lifecycle.
-    from exp.cli.build.learning import resolve_memory_recall, run_learning
+    from exp.cli.build.learning import BuildLearning, resolve_memory_recall, run_learning
+    from exp.cli.build.summary import learning_lines, shown
     from exp.common.models import load_model_catalog
-    from exp.optimize.evaluation.trace_learning import recorded_plan
+    from exp.optimize.evaluation.trace_learning import learning_curve, recorded_plan
 
     console = Console(theme=EXP_THEME)
     with usage_error(OSError, ValueError):
@@ -292,15 +313,36 @@ def run_audit(
                 "held-out traces on it. Run without --dry-run to see its preflight."
             )
             return
-        if not dry_run:
-            recall = resolve_memory_recall(load_model_catalog(store.model_catalog_path))
-            if recall is None:
-                raise ValueError(
-                    "the audit learns a fit-only memory and needs a native decision model to "
-                    "recall it (for example cloudflare/clef-flash); add one to the model catalog"
-                )
-            run_learning(
-                console,
+    if dry_run:
+        run_held_out_fidelity(
+            project,
+            count,
+            root=root,
+            yes=yes,
+            non_interactive=non_interactive,
+            dry_run=True,
+            verbose=verbose,
+            retry_incomplete=retry_incomplete,
+        )
+        return
+    with usage_error(OSError, ValueError):
+        recall = resolve_memory_recall(load_model_catalog(store.model_catalog_path))
+        if recall is None:
+            raise ValueError(
+                "the audit learns a fit-only memory and needs a native decision model to "
+                "recall it (for example cloudflare/clef-flash); add one to the model catalog"
+            )
+    heading(console, project, "Held-out simulation fidelity")
+    report_path = store.artifacts.project_directory / "reports" / "audit.txt"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with (
+        report_path.open("w", encoding="utf-8") as handle,
+        pipeline_display(console, AUDIT_PHASES) as pipeline,
+    ):
+        details = Console(file=handle, width=110, theme=EXP_THEME, no_color=True)
+        with usage_error(OSError, ValueError):
+            outcome = run_learning(
+                details,
                 store,
                 project=project,
                 root=root,
@@ -311,16 +353,28 @@ def run_audit(
                 code_revision=installed_release_revision(),
                 retry_incomplete=retry_incomplete,
                 hold_out=True,
+                terminal=console,
+                progress=pipeline.phase("learning"),
+                pause=pipeline.paused,
             )
-            if not recorded_plan(store, "fit"):
-                return
-    run_held_out_fidelity(
-        project,
-        count,
-        root=root,
-        yes=yes,
-        non_interactive=non_interactive,
-        dry_run=dry_run,
-        verbose=verbose,
-        retry_incomplete=retry_incomplete,
-    )
+        if outcome is None or not recorded_plan(store, "fit"):
+            return
+        pipeline.complete("learning")
+        learned = BuildLearning(recall, outcome, learning_curve(store, "fit"))
+        for line in learning_lines(learned, "fit traces"):
+            console.print(line)
+        run_held_out_fidelity(
+            project,
+            count,
+            root=root,
+            yes=yes,
+            non_interactive=non_interactive,
+            dry_run=False,
+            verbose=verbose,
+            retry_incomplete=retry_incomplete,
+            details=details,
+            terminal=console,
+            progress=pipeline.phase("panel"),
+            pause=pipeline.paused,
+        )
+    console.print(f"[dim]Report: {shown(report_path)}[/dim]")
