@@ -4,6 +4,9 @@ Learning is the build's default pipeline. It needs a native decision model to re
 the catalog's ``memory_recall`` role, or else the catalog's best SystemOne decision model.
 """
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -11,11 +14,15 @@ import typer
 from rich.console import Console
 from rich.text import Text
 
+from exp.cli.evaluation.miss_retest import RetestOutcome, run_miss_retest
 from exp.cli.shared.consent import can_prompt, require_spend_consent
-from exp.cli.shared.progress import progress_display
+from exp.cli.shared.progress import PipelineDisplay, progress_display
 from exp.common.models import ModelCatalog, load_model_catalog
+from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.trace_learning import (
+    LearningCurve,
+    LearningOutcome,
     Scope,
     learn_from_traces,
     learned_runs,
@@ -85,11 +92,15 @@ def run_learning(
     code_revision: str,
     retry_incomplete: bool = False,
     hold_out: bool = False,
-) -> None:
-    """Show the learning preflight, ask for spend consent, then learn from every trace.
+    terminal: Console | None = None,
+    progress: ProgressHook | None = None,
+    pause: Callable[[], AbstractContextManager[None]] | None = None,
+) -> LearningOutcome | None:
+    """Write the learning preflight, ask for spend consent, then learn from every trace.
 
     Args:
-        console: Build command's terminal owner.
+        console: Where the full preflight and outcome are written: the terminal, or the
+            command's report file when ``terminal`` is given.
         store: Built project.
         project: Project name, for the replay command.
         root: Local ``.exp`` root holding the consent settings.
@@ -100,10 +111,18 @@ def run_learning(
         code_revision: Exact producing implementation identity.
         retry_incomplete: Replace an interrupted trace, buying its calls again.
         hold_out: Learn fit traces only, keeping held-out traces for an independent panel.
+        terminal: The user's terminal, for the spend question and errors; defaults to
+            ``console``.
+        progress: The command's single progress line; without it, learning owns a display.
+        pause: Releases that progress line while the spend question is asked.
+
+    Returns:
+        The outcome, or None when the user declined the spend.
 
     Raises:
         typer.Exit: A provider request failed; completed traces stay saved.
     """
+    screen = terminal or console
     scope: Scope = "fit" if hold_out else "all"
     plan = learning_plan(store, recall_alias, scope)
     cases = learning_cases(store, scope)
@@ -130,18 +149,26 @@ def run_learning(
     if len(scored) == len(cases) and all(learned for *_, learned in scored):
         # Every trace is already learned: the pass replays saved runs without provider calls.
         console.print(Text("Saved results. No provider calls.", style="dim"))
-    elif not require_spend_consent(
-        console,
-        root=root,
-        yes=yes,
-        estimated_cost_usd=None,
-        cost_is_upper_bound=False,
-        command=f"exp eval {project} --audit N" if hold_out else f"exp build {project}",
-        non_interactive=non_interactive or not can_prompt(console),
-    ):
-        return
+    else:
+        with pause() if pause is not None else nullcontext():
+            if screen is not console:
+                screen.print(
+                    f"Learning {len(cases)} {'fit traces' if hold_out else 'traces'} with "
+                    f"memory recall {plan.recall.jev_alias}: at most {budget:,} model attempts"
+                )
+            consented = require_spend_consent(
+                screen,
+                root=root,
+                yes=yes,
+                estimated_cost_usd=None,
+                cost_is_upper_bound=False,
+                command=f"exp eval {project} --audit N" if hold_out else f"exp build {project}",
+                non_interactive=non_interactive or not can_prompt(screen),
+            )
+        if not consented:
+            return None
     try:
-        with progress_display(console) as progress:
+        with nullcontext(progress) if progress is not None else progress_display(console) as hook:
             outcome = learn_from_traces(
                 store,
                 recall_alias=recall_alias,
@@ -149,12 +176,12 @@ def run_learning(
                 maximum_attempts=budget,
                 code_revision=code_revision,
                 clock=lambda: datetime.now(UTC),
-                progress=progress,
+                progress=hook,
                 retry_incomplete=retry_incomplete,
             )
     except ProviderTransportError as exc:
-        console.print(f"[red]error[/red] a provider request failed: {exc}")
-        console.print(
+        screen.print(f"[red]error[/red] a provider request failed: {exc}")
+        screen.print(
             "Learned traces are saved. Run the same command again to continue; "
             "the stopped trace starts a fresh attempt."
         )
@@ -183,6 +210,24 @@ def run_learning(
                     style="dim",
                 )
             )
+    return outcome
+
+
+@dataclass(frozen=True)
+class BuildLearning:
+    """What the build's learning stage did, for the build's summary lines.
+
+    Attributes:
+        recall: Memory-recall alias, or None when the catalog has no decision model.
+        outcome: The learning pass, or None when it did not run or the spend was declined.
+        curve: Learning progress over the build's memory.
+        retest: The miss retest, or None when no learned trace had a miss.
+    """
+
+    recall: str | None = None
+    outcome: LearningOutcome | None = None
+    curve: LearningCurve | None = None
+    retest: RetestOutcome | None = None
 
 
 def learn_and_retest(
@@ -195,7 +240,9 @@ def learn_and_retest(
     non_interactive: bool,
     code_revision: str,
     retry_incomplete: bool = False,
-) -> None:
+    details: Console | None = None,
+    pipeline: PipelineDisplay | None = None,
+) -> BuildLearning:
     """The build's default pipeline: learn from every trace, then retest the misses.
 
     Args:
@@ -207,7 +254,13 @@ def learn_and_retest(
         non_interactive: Disable terminal questions.
         code_revision: Exact producing implementation identity.
         retry_incomplete: Replace an interrupted trace, buying its calls again.
+        details: Where the full learning and retest output is written; defaults to ``console``.
+        pipeline: The build's single progress line, with ``learning`` and ``retest`` phases.
+
+    Returns:
+        What ran, for the build's summary.
     """
+    details = details or console
     recall = resolve_memory_recall(load_model_catalog(store.model_catalog_path))
     if recall is None:
         console.print(
@@ -215,9 +268,9 @@ def learn_and_retest(
             "native decision model to recall memory (for example cloudflare/clef-flash on the "
             "Experiential gateway). Add one to the model catalog and run the build again."
         )
-        return
-    run_learning(
-        console,
+        return BuildLearning()
+    outcome = run_learning(
+        details,
         store,
         project=project,
         root=root,
@@ -227,15 +280,21 @@ def learn_and_retest(
         non_interactive=non_interactive,
         code_revision=code_revision,
         retry_incomplete=retry_incomplete,
+        terminal=console,
+        progress=None if pipeline is None else pipeline.phase("learning"),
+        pause=None if pipeline is None else pipeline.paused,
     )
+    if outcome is None:
+        return BuildLearning(recall=recall)
+    curve = learning_curve(store, "all")
     plan = learning_plan(store, scope="all")
     missed = [result for _, _, result in learned_runs(store, plan) if result.exact < result.steps]
     if not missed:
-        return
-    from exp.cli.evaluation.miss_retest import run_miss_retest
-
-    console.print()
-    run_miss_retest(
+        if pipeline is not None:
+            pipeline.complete("retest")
+        return BuildLearning(recall=recall, outcome=outcome, curve=curve)
+    details.print()
+    retest = run_miss_retest(
         project,
         len(missed),
         root=root,
@@ -243,4 +302,9 @@ def learn_and_retest(
         non_interactive=non_interactive,
         dry_run=False,
         retry_incomplete=retry_incomplete,
+        details=details,
+        terminal=console,
+        progress=None if pipeline is None else pipeline.phase("retest"),
+        pause=None if pipeline is None else pipeline.paused,
     )
+    return BuildLearning(recall=recall, outcome=outcome, curve=curve, retest=retest)

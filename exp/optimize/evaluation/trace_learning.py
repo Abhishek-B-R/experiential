@@ -22,7 +22,8 @@ Scope ``fit`` keeps the build's held-out lineages out instead: they are reserved
 first trace is registered, can never be learned, and remain for an independent held-out panel.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import datetime
 from typing import Literal
 
@@ -519,7 +520,9 @@ def learn_from_traces(
                         "run again with a larger budget to continue"
                     )
                     break
-                execute_fidelity_evaluation(project, prepared, clock=clock)
+                execute_fidelity_evaluation(
+                    project, prepared, clock=clock, progress=_inside(progress, index, cases)
+                )
                 used += attempts_used(project, prepared)
             else:
                 # Replay completes any interrupted publication without provider calls.
@@ -697,3 +700,13 @@ def _build(project: ProjectStore) -> ProjectBuildArtifacts:
     if build is None:
         raise ValueError("learning needs a completed build; run exp build first")
     return build
+
+
+def _inside(
+    progress: ProgressHook | None, index: int, cases: Sequence[object]
+) -> ProgressHook | None:
+    """Forward one trace's own stages, qualified by its position, to the learning display."""
+    if progress is None:
+        return None
+    detail = f"trace {index + 1}/{len(cases)}"
+    return lambda event: progress(replace(event, detail=event.detail or detail))

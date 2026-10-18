@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
@@ -18,12 +19,13 @@ from exp.cli.build.checkpoints import (
 )
 from exp.cli.build.providers import configure_build_providers
 from exp.cli.build.source import load_stored_build_import, project_for_build
+from exp.cli.build.summary import render_completed_build
 from exp.cli.build.traces import load_build_traces
 from exp.cli.providers.provider_picker import resolve_setup_providers
 from exp.cli.providers.setup import provider_setup_json_examples
 from exp.cli.shared.consent import SpendBudget, can_prompt, require_spend_consent
 from exp.cli.shared.options import ROOT_OPTION, usage_error
-from exp.cli.shared.progress import progress_display, qualified
+from exp.cli.shared.progress import Phase, PipelineDisplay, progress_display, qualified
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.core.money import exact_usd
 from exp.common.models import (
@@ -76,7 +78,16 @@ from exp.simulation.world_model.artifact import (
     persist_grounded_world_model,
 )
 
+if TYPE_CHECKING:  # learning loads the fidelity lifecycle; keep `exp --help` free of it
+    pass
+
 _console = Console(theme=EXP_THEME)
+# The build's single progress line: indexes, then learning, then the retest of misses.
+BUILD_PHASES = (
+    Phase("index", "Building indexes", 0.1),
+    Phase("learning", "Learning", 0.7, driver="Learning from traces", unit="traces"),
+    Phase("retest", "Retesting misses", 0.2, driver="Replaying traces", unit="traces"),
+)
 _PROJECT_ARGUMENT = typer.Argument(..., metavar="PROJECT", help="Local project name.")
 _LEGACY_TRACE_ARGUMENT = typer.Argument(None, metavar="TRACES", hidden=True)
 _TRACE_FILE_OPTION = typer.Option(
@@ -294,7 +305,7 @@ def build(
             selected,
         )
         _console.print("[dim]loading[/dim] Import trace evidence and mine scenarios")
-        with progress_display(_console) as progress:
+        with progress_display(_console, single_line=True) as progress:
             report(progress, "normalization")
             if import_id is not None:
                 source, normalized = load_stored_build_import(root, project, import_id)
@@ -386,7 +397,10 @@ def build(
             ),
         ):
             return
-        with progress_display(_console) as progress:
+        # One progress line from here to the end of the build: indexes, learning, retest.
+        pipeline = PipelineDisplay(_console, BUILD_PHASES)
+        pipeline.start()
+        try:
             completion = _complete_grounded_build(
                 store,
                 completed,
@@ -399,8 +413,12 @@ def build(
                 maximum_build_cost_usd=max(maximum_build_cost_usd, estimate or 0.0),
                 provider_spend_authorized=True,
                 trace_import_id=import_id,
-                progress=progress,
+                progress=pipeline.phase("index"),
             )
+        except BaseException:
+            pipeline.stop()
+            raise
+        pipeline.complete("index")
         built = completion.artifacts
     _capture_local_build_telemetry(
         completed.artifacts,
@@ -408,22 +426,35 @@ def build(
         indexed_steps=_rag_transition_count(store, built.serving_rag.artifact_id),
         duration_seconds=time.monotonic() - started,
     )
-    _render_completed_build(completed, project=project)
     # Learning is the default pipeline. It loads the fidelity lifecycle, so it is deferred to
     # dispatch: `exp --help` stays free of optimization machinery (startup-isolation gate).
     from exp.cli.build.learning import learn_and_retest
 
-    with usage_error(ArtifactStoreError, ModelCatalogError, ProjectStoreError, ValueError):
-        learn_and_retest(
-            _console,
-            store,
-            project=project,
-            root=root,
-            yes=yes,
-            non_interactive=no_interactive,
-            code_revision=code_revision,
-            retry_incomplete=retry_incomplete,
-        )
+    report_path = store.artifacts.project_directory / "reports" / "build.txt"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with (
+            usage_error(ArtifactStoreError, ModelCatalogError, ProjectStoreError, ValueError),
+            report_path.open("w", encoding="utf-8") as handle,
+        ):
+            details = Console(file=handle, width=110, theme=EXP_THEME, no_color=True)
+            learning = learn_and_retest(
+                _console,
+                store,
+                project=project,
+                root=root,
+                yes=yes,
+                non_interactive=no_interactive,
+                code_revision=code_revision,
+                retry_incomplete=retry_incomplete,
+                details=details,
+                pipeline=pipeline,
+            )
+    finally:
+        pipeline.stop()
+    render_completed_build(
+        _console, completed, project=project, learning=learning, report=report_path
+    )
 
 
 def _load_or_setup_catalog(
@@ -917,31 +948,3 @@ def _render_preflight(
     else:
         _console.print(f"  [dim]embedding[/dim]    at most ${estimate:.6f}")
     _console.print(f"  [dim]budget[/dim]       ${ceiling:.6f}")
-
-
-def _render_completed_build(
-    completed: ProjectBuild,
-    *,
-    project: str,
-) -> None:
-    """Present the compact accepted, excluded, and split summary with the next command.
-
-    Args:
-        completed: Persisted project build and mining results.
-        project: Local project identifier used in the next recommended command.
-    """
-    dataset = completed.artifacts.trace_dataset.dataset
-    tasks = completed.artifacts.mining.tasks
-    duplicate_count = len(dataset.trace_ids) - len(completed.artifacts.mining.analysis.candidates)
-    _console.print(
-        f"[green]\u2713[/green] ingested {len(dataset.trace_ids)} traces "
-        f"[dim]({dataset.invalid_trace_count} invalid, {duplicate_count} duplicate)[/dim]"
-    )
-    if len(dataset.trace_ids) < 100 or len(dataset.trace_ids) > 1_000:
-        _console.print("[yellow]guidance[/yellow] 100 to 1,000 traces is the usual starting range")
-    _console.print(
-        f"[green]\u2713[/green] split {sum(task.partition == 'fit' for task in tasks)} fit / "
-        f"{sum(task.partition == 'held_out' for task in tasks)} held out"
-    )
-    _console.print("[green]Complete[/green]")
-    _console.print(f"next: exp optimize router {project}")

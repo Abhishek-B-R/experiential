@@ -1,6 +1,7 @@
 """Held-out simulation fidelity in the existing evaluation terminal conventions."""
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from exp.cli.shared.consent import can_prompt, require_spend_consent
 from exp.cli.shared.options import usage_error
 from exp.cli.shared.progress import progress_display, qualified
 from exp.cli.shared.theme import EXP_THEME
+from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_release_revision
 from exp.optimize.evaluation.fidelity import (
@@ -32,6 +34,7 @@ from exp.optimize.evaluation.trace_replay import ReplayAggregate, ReplayResult, 
 from exp.runtime.models.providers.transport import ProviderTransportError
 
 PANEL_CONCURRENCY = 4  # traces of a frozen panel replayed at once
+PANEL_STAGE = "Replaying traces"  # counts finished panel traces
 
 
 def run_held_out_fidelity(
@@ -141,27 +144,36 @@ def run_held_out_fidelity(
 
 
 def execute_runs(
-    console: Console, store: ProjectStore, registrations: tuple[PreparedFidelity, ...]
+    console: Console,
+    store: ProjectStore,
+    registrations: tuple[PreparedFidelity, ...],
+    progress: ProgressHook | None = None,
 ) -> None:
     """Run the registered traces concurrently through the fidelity owner.
 
     Panel traces read frozen memory and never publish, so they are independent; each keeps its
-    own ledger, session and progress row.
+    own ledger and session. ``progress`` receives every trace's events qualified by ``trace
+    i/n``, plus ``Replaying traces k/n`` as traces finish; without it, the panel owns a display.
     """
     total = len(registrations)
     try:
-        with progress_display(console) as progress, ThreadPoolExecutor(PANEL_CONCURRENCY) as pool:
+        with (
+            nullcontext(progress) if progress is not None else progress_display(console) as hook,
+            ThreadPoolExecutor(PANEL_CONCURRENCY) as pool,
+        ):
+            report(hook, PANEL_STAGE, completed=0, total=total)
             futures = [
                 pool.submit(
                     execute_fidelity_evaluation,
                     store,
                     prepared,
-                    progress=qualified(progress, f"trace {index}/{total}"),
+                    progress=qualified(hook, f"trace {index}/{total}"),
                 )
                 for index, prepared in enumerate(registrations, start=1)
             ]
-            for future in futures:
+            for finished, future in enumerate(as_completed(futures), start=1):
                 future.result()
+                report(hook, PANEL_STAGE, completed=finished, total=total)
     except ProviderTransportError as exc:
         console.print(f"[red]error[/red] a provider request failed: {exc}")
         console.print(

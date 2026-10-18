@@ -500,6 +500,12 @@ def build_project(
     return root, ProjectStore(root, PROJECT), " ".join(result.output.split())
 
 
+def build_report(store: ProjectStore) -> str:
+    """The full learning and retest output ``exp build`` wrote to its report file."""
+    report = store.artifacts.project_directory / "reports" / "build.txt"
+    return " ".join(report.read_text(encoding="utf-8").split())
+
+
 def held_out_command(root: Path, count: int, *flags: str) -> str:
     """Invoke ``exp eval PROJECT --audit N`` and return its output."""
     result = CliRunner().invoke(

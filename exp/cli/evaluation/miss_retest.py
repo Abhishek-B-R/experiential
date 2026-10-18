@@ -1,5 +1,8 @@
 """Miss retest in the existing evaluation terminal conventions."""
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -16,6 +19,7 @@ from exp.cli.evaluation.view import heading
 from exp.cli.shared.consent import can_prompt, require_spend_consent
 from exp.cli.shared.options import usage_error
 from exp.cli.shared.theme import EXP_THEME
+from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_release_revision
 from exp.optimize.evaluation.fidelity import execute_fidelity_evaluation, saved_fidelity_report
@@ -26,7 +30,22 @@ from exp.optimize.evaluation.miss_retest import (
     turn_changes,
 )
 from exp.optimize.evaluation.trace_learning import learning_curve
-from exp.optimize.evaluation.trace_replay import aggregate
+from exp.optimize.evaluation.trace_replay import ReplayAggregate, aggregate
+
+
+@dataclass(frozen=True)
+class RetestOutcome:
+    """The completed miss retest, for a calling command's summary.
+
+    Attributes:
+        total: Sums over the retested traces.
+        planned: Traces in the retest panel.
+        changes: Turns fixed and regressed against their first measurement.
+    """
+
+    total: ReplayAggregate
+    planned: int
+    changes: TurnChanges
 
 
 def run_miss_retest(
@@ -39,7 +58,11 @@ def run_miss_retest(
     dry_run: bool,
     verbose: bool = False,
     retry_incomplete: bool = False,
-) -> None:
+    details: Console | None = None,
+    terminal: Console | None = None,
+    progress: ProgressHook | None = None,
+    pause: Callable[[], AbstractContextManager[None]] | None = None,
+) -> RetestOutcome | None:
     """Replay learned traces the simulator got wrong on its final memory, or replay the result.
 
     Args:
@@ -51,8 +74,16 @@ def run_miss_retest(
         dry_run: Register the runs and stop before credentials or provider calls.
         verbose: Also print every trace, every turn, and every criterion.
         retry_incomplete: Replace interrupted runs, buying their calls again.
+        details: Where the full retest output is written; defaults to the terminal.
+        terminal: The user's terminal, for the spend question and errors.
+        progress: The calling command's single progress line; without it, the retest owns one.
+        pause: Releases that progress line while the spend question is asked.
+
+    Returns:
+        The completed retest, or None for a dry run or a declined spend.
     """
-    console = Console(theme=EXP_THEME)
+    screen = terminal or Console(theme=EXP_THEME)
+    console = details or screen
     with usage_error(OSError, ValueError):
         store = ProjectStore(root, project)
         panel = register_miss_retest(
@@ -87,31 +118,34 @@ def run_miss_retest(
             console.print(
                 "Prepared without provider calls. Run the same command without --dry-run."
             )
-            return
+            return None
         pending = [p for p in panel.prepared if saved_fidelity_report(store, p) is None]
         if not pending:
             console.print(Text("Saved results. No provider calls.", style="dim"))
             for prepared in panel.prepared:
                 execute_fidelity_evaluation(store, prepared)
         else:
-            interactive = not non_interactive and can_prompt(console)
-            if not require_spend_consent(
-                console,
-                root=root,
-                yes=yes,
-                estimated_cost_usd=None,
-                cost_is_upper_bound=False,
-                command=f"exp build {project}",
-                non_interactive=not interactive,
-            ):
-                return
-            execute_runs(console, store, panel.prepared)
+            interactive = not non_interactive and can_prompt(screen)
+            with pause() if pause is not None else nullcontext():
+                consented = require_spend_consent(
+                    screen,
+                    root=root,
+                    yes=yes,
+                    estimated_cost_usd=None,
+                    cost_is_upper_bound=False,
+                    command=f"exp build {project}",
+                    non_interactive=not interactive,
+                )
+            if not consented:
+                return None
+            execute_runs(screen, store, panel.prepared, progress)
         results = saved_retest_results(store, panel)
         if verbose:
             render_traces(console, store, panel.prepared, results, "Retested trace")
         console.print()
-        console.print(Text(aggregate_line(aggregate(results), len(panel.cases), "Miss retest")))
-        console.print(Text(changes_line(turn_changes(panel, results))))
+        total, changes = aggregate(results), turn_changes(panel, results)
+        console.print(Text(aggregate_line(total, len(panel.cases), "Miss retest")))
+        console.print(Text(changes_line(changes)))
         curve = learning_curve(store, "all")
         if curve is not None:
             console.print(Text(curve.headline()))
@@ -122,6 +156,7 @@ def run_miss_retest(
                 style="dim",
             )
         )
+    return RetestOutcome(total=total, planned=len(panel.cases), changes=changes)
 
 
 def changes_line(changes: TurnChanges) -> str:

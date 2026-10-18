@@ -18,6 +18,7 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     _at,
     _obj,
     build_project,
+    build_report,
     episode,
     held_out_lineages,
 )
@@ -88,13 +89,16 @@ def test_default_learning_consumes_every_trace_and_reports_test_then_train(
     assert f"learned {USERS}/{USERS} traces · memory v{USERS}" in output
     exact = 3 * USERS - 1  # only the first trace's learnable turn is wrong
     headline = f"Learning progress (test-then-train, recorded actions) {exact}/{3 * USERS} replies"
-    assert headline in output
+    # The terminal gets the result lines; the report file keeps the full learning output.
+    assert f"replies exact while learning 97% ({exact}/{3 * USERS}), last 3 traces 100%" in output
+    assert "next: exp eval retail --audit N" in output
+    report = build_report(store)
+    assert headline in report
     # Traces 10-12 learn on nearly final memory; all their turns are exact.
     estimate = "latest unseen-task estimate 100% replies exact (9/9) over the last 3 trace(s)"
-    assert estimate in output
-    assert "run exp eval retail --audit N" in output
+    assert estimate in report
     # The build ends by retesting its one missed trace; that retest is the only judge call.
-    assert "Miss retest" in output and "fixed 1 of 1 missed turns" in output
+    assert "Miss retest" in report and "fixed 1 of 1 missed turns" in output
     judging = [r for r in provider.requests if "axes" in json.dumps(r.payload.get("tools"))]
     assert len(judging) == 1, "learning is scored by exact replies; only the retest is judged"
     audit = CliRunner().invoke(

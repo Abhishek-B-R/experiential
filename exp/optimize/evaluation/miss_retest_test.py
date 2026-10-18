@@ -14,6 +14,7 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     SimulatedProvider,
     _import_id,
     build_project,
+    build_report,
     episode,
 )
 from exp.optimize.evaluation.miss_retest import register_miss_retest
@@ -46,10 +47,16 @@ def test_the_build_retests_its_miss_on_the_final_memory_and_replays_without_call
     provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
     root, store, output = build_project(tmp_path, monkeypatch, provider, learn=True)
     own = learning_cases(store, "all")[0].task.lineage_group_id  # the trace that missed
-    assert f"1 of {USERS} learned traces had a miss · {STEPS} turns" in output
-    assert "Miss retest 3/3 replies exact (100%)" in output
-    assert "exact before learning 2/3 (67%) → after 3/3 (100%)" in output
-    assert "fixed 1 of 1 missed turns · 0 regressed" in output
+    # The terminal gets one result line; the report file keeps the full retest.
+    assert (
+        "retested 1 trace that had misses · 100% replies exact (3/3) · fixed 1 of 1 missed "
+        "turns · 0 regressed"
+    ) in output
+    report = build_report(store)
+    assert f"1 of {USERS} learned traces had a miss · {STEPS} turns" in report
+    assert "Miss retest 3/3 replies exact (100%)" in report
+    assert "exact before learning 2/3 (67%) → after 3/3 (100%)" in report
+    assert "Miss retest" not in output
     # Learning hid each trace's own task; the retest reads what memory learned from it.
     retested = provider.predictions()[STEPS * USERS :]
     assert len(retested) == STEPS
@@ -58,7 +65,9 @@ def test_the_build_retests_its_miss_on_the_final_memory_and_replays_without_call
     purchased = len(provider.requests)
     code, replay = rebuild(root, _import_id(store), "--yes")
     assert code == 0, replay
-    assert replay.count("Saved results. No provider calls.") >= 2, "learning and retest replay"
+    assert "no new model calls (saved results)" in replay
+    report = build_report(store)
+    assert report.count("Saved results. No provider calls.") >= 2, "learning and retest replay"
     assert len(provider.requests) == purchased
 
 
@@ -68,7 +77,7 @@ def test_the_build_skips_learning_without_a_recall_model_and_retest_without_a_mi
     """No decision model: a bare simulator and a clear note. No miss: no retest."""
     provider = SimulatedProvider([episode(i) for i in range(USERS)])
     _, store, output = build_project(tmp_path, monkeypatch, provider)
-    assert "built without learning" in output and "Miss retest" not in output
+    assert "built without learning" in output and "retested" not in output
     assert not recorded_plan(store, "all")
 
     other = tmp_path / "learned"
@@ -76,7 +85,7 @@ def test_the_build_skips_learning_without_a_recall_model_and_retest_without_a_mi
     provider = SimulatedProvider([episode(i) for i in range(USERS)])
     _, _, output = build_project(other, monkeypatch, provider, learn=True)
     assert f"learned {USERS}/{USERS} traces" in output
-    assert "Miss retest" not in output, "every reply was exact, so there is nothing to retest"
+    assert "retested" not in output, "every reply was exact, so there is nothing to retest"
 
 
 @pytest.mark.parametrize(

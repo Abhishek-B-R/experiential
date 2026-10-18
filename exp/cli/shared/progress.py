@@ -11,8 +11,10 @@ so piped and scripted sessions stay readable line by line.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import threading
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from time import monotonic
 
 from rich.console import Console, RenderableType
@@ -211,6 +213,152 @@ def qualified(hook: ProgressHook | None, detail: str) -> ProgressHook | None:
         )
 
     return forward
+
+
+@dataclass(frozen=True)
+class Phase:
+    """One phase of a multi-phase command, as the single progress line shows it.
+
+    Attributes:
+        key: Identity the command uses to report into this phase.
+        label: Short status prefix, such as ``Learning``.
+        weight: Share of the overall bar this phase fills.
+        driver: Stage whose exact counts measure the phase's completion; other stages only
+            update the status text.
+        unit: Plural noun for the driver counts, such as ``traces``.
+    """
+
+    key: str
+    label: str
+    weight: float
+    driver: str | None = None
+    unit: str = ""
+
+
+class PipelineDisplay:
+    """One in-place line for a whole multi-phase command: an overall bar, a status, elapsed.
+
+    An interactive terminal sees a single line that never grows: the bar fills across every
+    phase by weight, and the status names the phase, its exact counts and the latest stage of
+    the work inside it. A non-interactive stream receives one line when each phase starts and
+    nothing else, so logs stay short. Events may arrive from worker threads.
+    """
+
+    def __init__(self, console: Console, phases: Sequence[Phase]) -> None:
+        """Prepare the display without drawing anything yet."""
+        self._console = console
+        self._phases = {phase.key: phase for phase in phases}
+        self._fraction = {phase.key: 0.0 for phase in phases}
+        self._counts: dict[str, tuple[int, int]] = {}
+        self._active: str | None = None
+        self._status = ""
+        self._started = 0.0
+        self._lock = threading.Lock()
+        self._spinner = Spinner("dots")
+        self._live = (
+            Live(
+                console=console,
+                auto_refresh=True,
+                refresh_per_second=4,
+                transient=True,
+                get_renderable=self._render,
+            )
+            if console.is_interactive
+            else None
+        )
+
+    def start(self) -> None:
+        """Begin owning the in-place line."""
+        self._started = monotonic()
+        if self._live is not None:
+            self._live.start(refresh=True)
+
+    def stop(self) -> None:
+        """Release the in-place line; nothing of it stays on screen."""
+        if self._live is not None:
+            self._live.stop()
+
+    @contextmanager
+    def paused(self) -> Iterator[None]:
+        """Release the line while the command asks a question, then take it back."""
+        if self._live is not None:
+            self._live.stop()
+        try:
+            yield
+        finally:
+            if self._live is not None:
+                self._live.start(refresh=True)
+
+    def phase(self, key: str) -> ProgressHook:
+        """The hook a command hands to the services running one phase."""
+        phase = self._phases[key]
+
+        def observe(event: ProgressEvent) -> None:
+            """Fold one service event into the single line."""
+            with self._lock:
+                self._enter(key)
+                if event.stage == phase.driver and event.total:
+                    self._fraction[key] = (event.completed or 0) / event.total
+                    self._counts[key] = (event.completed or 0, event.total)
+                else:
+                    self._status = _label(event)
+
+        return observe
+
+    def complete(self, key: str) -> None:
+        """Mark one phase finished, whether or not it reported any work."""
+        with self._lock:
+            self._fraction[key] = 1.0
+
+    def _enter(self, key: str) -> None:
+        """Make ``key`` the active phase, announcing it once on a non-interactive stream."""
+        if self._active == key:
+            return
+        if self._active is not None:
+            self._fraction[self._active] = 1.0
+        self._active, self._status = key, ""
+        if self._live is None:
+            self._console.print(
+                f"{_ROW_INDENT}{self._phases[key].label}...", markup=False, highlight=False
+            )
+
+    def _render(self) -> RenderableType:
+        """The single line: spinner, overall bar, percent, status and elapsed time."""
+        with self._lock:
+            total = sum(phase.weight for phase in self._phases.values()) or 1.0
+            done = sum(self._phases[key].weight * value for key, value in self._fraction.items())
+            share = min(1.0, done / total)
+            status = ""
+            if self._active is not None:
+                phase = self._phases[self._active]
+                status = phase.label
+                if self._active in self._counts:
+                    completed, of = self._counts[self._active]
+                    status += f" {completed}/{of} {phase.unit}".rstrip()
+                if self._status:
+                    status += f" · {self._status}"
+        filled = round(_BAR_WIDTH * share)
+        line = Text(no_wrap=True, overflow="ellipsis")
+        line.append("\u2501" * filled, style="cyan")
+        line.append("\u2501" * (_BAR_WIDTH - filled), style="dim")
+        line.append(f" {share:4.0%}", style="cyan")
+        if status:
+            line.append(f" · {status}", style="cyan")
+        elapsed = max(0, int(monotonic() - self._started))
+        line.append(f" · {_duration(elapsed) if elapsed else '0s'} elapsed", style="dim")
+        self._spinner.update(text=line)
+        return self._spinner
+
+
+@contextmanager
+def pipeline_display(console: Console, phases: Sequence[Phase]) -> Iterator[PipelineDisplay]:
+    """Own one single-line progress region for a whole multi-phase command."""
+    display = PipelineDisplay(console, phases)
+    display.start()
+    try:
+        yield display
+    finally:
+        display.stop()
 
 
 def _key(event: ProgressEvent) -> tuple[str, str | None]:
