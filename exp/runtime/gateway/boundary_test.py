@@ -103,3 +103,34 @@ def test_typed_store_refusals_keep_their_own_shapes() -> None:
     """Grant and key refusals still outrank the bare store branch."""
     assert boundary_protocol_error(AliasNotGrantedError("x")).status_code == 403
     assert boundary_protocol_error(InvalidVirtualKeyError("x")).status_code == 401
+
+
+def test_an_unclassified_exception_is_a_logged_500(caplog: pytest.LogCaptureFixture) -> None:
+    """The anonymous 500 names its exception type and raising frame in the worker log.
+
+    2026-10-18: a host authorize raised OverflowError before admission; the
+    caller saw internal_error with no request id and nothing was logged.
+    """
+    try:
+        int(float("inf"))
+    except OverflowError as overflow:
+        with caplog.at_level(logging.ERROR, logger="exp.runtime.gateway.boundary"):
+            error = boundary_protocol_error(overflow)
+    assert error.status_code == 500
+    assert error.detail.code == "internal_error"
+    [record] = caplog.records
+    assert "unclassified OverflowError raised at boundary_test.py:" in record.getMessage()
+    assert record.__dict__["exception_type"] == "OverflowError"
+    assert record.__dict__["raised_at"].endswith(
+        "in test_an_unclassified_exception_is_a_logged_500"
+    )
+    # The exception's text may carry request content: never logged.
+    assert record.exc_info is None
+    assert "infinity" not in caplog.text
+
+
+def test_a_typed_refusal_is_not_logged_as_unclassified(caplog: pytest.LogCaptureFixture) -> None:
+    """Typed refusals keep their own shape and add no error log."""
+    with caplog.at_level(logging.ERROR, logger="exp.runtime.gateway.boundary"):
+        boundary_protocol_error(AliasNotGrantedError("not granted"))
+    assert not caplog.records

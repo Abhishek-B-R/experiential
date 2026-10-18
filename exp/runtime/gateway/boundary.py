@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
 from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
@@ -183,6 +184,23 @@ def boundary_protocol_error(exception: BaseException) -> OpenAIProtocolError:
             retry_after_seconds=_DRAINING_RETRY_AFTER_SECONDS,
         )
     else:
+        # Nothing typed claimed it, so the caller gets an anonymous 500 and,
+        # before admission, no request id: the log is the only witness
+        # (2026-10-18: an OverflowError in a host's authorize answered about
+        # 2,000 requests this way over 2h45m with no line naming it). The
+        # message and traceback text may carry request content, so only the
+        # type and the raising frame are logged.
+        raised_at = _raising_frame(exception)
+        _LOGGER.error(
+            "gateway boundary answered an unclassified %s raised at %s as a 500 internal_error",
+            type(exception).__name__,
+            raised_at,
+            extra={
+                "operation": "boundary",
+                "exception_type": type(exception).__name__,
+                "raised_at": raised_at,
+            },
+        )
         error = OpenAIProtocolError(
             status_code=500,
             code="internal_error",
@@ -193,3 +211,14 @@ def boundary_protocol_error(exception: BaseException) -> OpenAIProtocolError:
             error_type="api_error",
         )
     return error
+
+
+def _raising_frame(exception: BaseException) -> str:
+    """Where an exception was raised, as ``module.py:line in function``; never its message."""
+    trace = exception.__traceback__
+    if trace is None:
+        return "unknown"
+    while trace.tb_next is not None:
+        trace = trace.tb_next
+    code = trace.tb_frame.f_code
+    return f"{Path(code.co_filename).name}:{trace.tb_lineno} in {code.co_name}"
