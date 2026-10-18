@@ -190,7 +190,7 @@ pub(crate) async fn messages(
         METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
         // No ledger row exists; startup validation guarantees native
         // servability, so an escalation disposition fails closed here.
-        return messages_error_response(&escalation_error());
+        return messages_error_response(&escalation_error(reason.as_str().unwrap_or_default()));
     }
     let mut admission: Admission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,

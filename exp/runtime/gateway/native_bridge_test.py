@@ -7317,3 +7317,27 @@ def test_provider_routing_preferences_are_resolved_at_admission(tmp_path: Path) 
         body({"only": [str(admitted_provider[0]["provider"])], "sort": "price"}),
     )
     assert "provider.sort->ignored(unsupported)" in cast("list[str]", served["ignored_parameters"])
+
+
+def test_the_unavailable_at_admission_reason_matches_the_native_503_mapping() -> None:
+    """Every escalation site's literal is the exact constant the Rust plane turns into a 503.
+
+    A drifted sentence would silently put the escalation back on the anonymous 500.
+    """
+    gateway = Path(native_bridge_module.__file__).parent
+    respond = (gateway / "native" / "src" / "respond.rs").read_text()
+    reason = "every certified deployment was unavailable at admission"
+    assert f'pub(crate) const UNAVAILABLE_AT_ADMISSION: &str =\n    "{reason}";' in respond
+    sites = [
+        path.name
+        for path in gateway.glob("native_*.py")
+        if not path.name.endswith("_test.py") and reason in path.read_text()
+    ]
+    assert sorted(sites) == [
+        "native_audio.py",
+        "native_bridge.py",
+        "native_decisions.py",
+        "native_embeddings.py",
+        "native_images.py",
+        "native_openai_decisions.py",
+    ]

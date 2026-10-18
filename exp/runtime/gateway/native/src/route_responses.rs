@@ -104,7 +104,7 @@ pub(crate) async fn responses(
             METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
             // No replay claim exists; startup validation guarantees native
             // servability, so an escalation disposition fails closed here.
-            return error_response(&escalation_error());
+            return error_response(&escalation_error(reason.as_str().unwrap_or_default()));
         }
         let key: ReplayKey = match serde_json::from_value(scope_value) {
             Ok(key) => key,
@@ -161,7 +161,7 @@ pub(crate) async fn responses(
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
         }
-        return error_response(&escalation_error());
+        return error_response(&escalation_error(reason.as_str().unwrap_or_default()));
     }
     let mut admission: Admission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,

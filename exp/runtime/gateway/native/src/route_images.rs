@@ -123,7 +123,7 @@ pub(crate) async fn images(
     };
     if let Some(reason) = admission_value.get("escalate") {
         METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
-        return error_response(&escalation_error());
+        return error_response(&escalation_error(reason.as_str().unwrap_or_default()));
     }
     let admission: ImagesAdmission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,
