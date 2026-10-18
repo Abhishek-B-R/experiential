@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
 from typing import Annotated, Literal
 
 from pydantic import Field, StrictBool, StrictInt, field_validator, model_validator
@@ -81,6 +80,7 @@ from exp.runtime.gateway.stream_contracts import (
 from exp.runtime.gateway.stream_contracts import (
     TokenLogprob as TokenLogprob,
 )
+from exp.runtime.gateway.surfaces import GatewayApiSurface as GatewayApiSurface
 from exp.runtime.gateway.tool_contracts import (
     GatewayNamedToolChoice as GatewayNamedToolChoice,
 )
@@ -122,19 +122,6 @@ class ProjectTarget(ContractModel):
 
 
 GatewayTarget = Annotated[DirectTarget | ProjectTarget, Field(discriminator="kind")]
-
-
-class GatewayApiSurface(StrEnum):
-    """Public endpoint family used by one canonical request."""
-
-    CHAT_COMPLETIONS = "chat_completions"
-    RESPONSES = "responses"
-    MESSAGES = "messages"
-    EMBEDDINGS = "embeddings"
-    IMAGES = "images"
-    DECISIONS = "decisions"
-    SPEECH = "speech"
-    TRANSCRIPTION = "transcription"
 
 
 class StructuredTextFormat(ContractModel):

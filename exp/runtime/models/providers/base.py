@@ -352,6 +352,12 @@ class GatewayWireProfile:
     speech_url: str | None = None
     transcriptions_url: str | None = None
 
+    videos_url: str | None = None
+    """Full video-job creation endpoint for this connection, sharing ``headers``:
+    Veo's ``models/{model}:predictLongRunning`` on a Gemini connection, xAI's
+    ``/videos/generations`` on an xAI-origin OpenAI-compatible connection, and
+    ``None`` on every other connection, so the video surface excludes the rung."""
+
     @property
     def replays_plaintext_reasoning(self) -> bool:
         """Whether this rung forwards caller plaintext ``reasoning_content`` verbatim.

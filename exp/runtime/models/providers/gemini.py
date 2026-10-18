@@ -151,6 +151,7 @@ class GeminiClient(ProviderHttpClient):
         return GatewayWireProfile(
             dialect="gemini_generate_content",
             url=f"{self._base_url}/models/{model_id}:streamGenerateContent?alt=sse",
+            videos_url=f"{self._base_url}/models/{model_id}:predictLongRunning",
             headers=self._headers(),
             model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,

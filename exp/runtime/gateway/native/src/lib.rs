@@ -49,6 +49,7 @@ mod route_images;
 mod route_messages;
 mod route_responses;
 mod route_responses_ws;
+mod route_videos;
 mod server;
 mod service_tier;
 mod settlement;

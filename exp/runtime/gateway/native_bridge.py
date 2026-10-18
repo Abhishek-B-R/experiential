@@ -122,6 +122,7 @@ from exp.runtime.gateway.native_settlement import (
     optional_text,
 )
 from exp.runtime.gateway.native_tool_search import NativeToolSearchMixin
+from exp.runtime.gateway.native_videos import NativeVideosMixin
 from exp.runtime.gateway.provider_preferences import reorder_admitted_route as _reorder
 from exp.runtime.gateway.provider_preferences import route_by_provider_preferences
 from exp.runtime.gateway.reasoning_carrier import (
@@ -169,6 +170,7 @@ class NativeControlPlane(
     NativeEmbeddingsMixin,
     NativeImagesMixin,
     NativeAudioMixin,
+    NativeVideosMixin,
     NativeObservabilityMixin,
 ):
     """Authority and accounting callbacks for the native data plane.
@@ -231,8 +233,7 @@ class NativeControlPlane(
         self._automatic_cache = automatic_cache
         self._explicit_cache = validate_cache_hosts(explicit_cache, automatic_cache)
         self._capture = capture
-        # The optional batch lane: hosts without it leave every batch route
-        # answering the uniform not-enabled error below.
+        # Optional batch lane; without it every batch route answers not-enabled.
         self._batches = getattr(components, "batches", None)
         # Hosted compositions have no local group-commit writer; they settle
         # directly through their own synchronous ledger.
@@ -263,6 +264,7 @@ class NativeControlPlane(
             recovery_host=recovery_host,
             default_lane_bound=default_lane_bound,
         )
+        self._bind_videos()  # the optional /v1/videos engine and its settlement poller
         # Every reservation tokenizes its prompt; build the packaged BPE now so
         # a fresh process pays that once at bind time, never on its first
         # request, and a corrupt table fails startup with its own message.

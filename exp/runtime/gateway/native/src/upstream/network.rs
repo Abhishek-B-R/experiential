@@ -37,6 +37,23 @@ impl UpstreamClient {
         Ok(self.inner.patch(url))
     }
 
+    /// GET counterpart of [`Self::post`], under the same URL validation: the
+    /// video content relay downloads provider assets through it.
+    pub(crate) fn get(&self, raw: &str) -> Result<reqwest::RequestBuilder, Failure> {
+        if !self.public_only {
+            return Ok(self.inner.get(raw));
+        }
+        if raw
+            .bytes()
+            .any(|byte| byte <= 32 || byte == 127 || byte == b'\\')
+        {
+            return Err(refused());
+        }
+        let url = reqwest::Url::parse(raw).map_err(|_| refused())?;
+        validate_url(&url)?;
+        Ok(self.inner.get(url))
+    }
+
     /// Validate the canonical URL before attaching credentials or building a request.
     pub(crate) fn post(&self, raw: &str) -> Result<reqwest::RequestBuilder, Failure> {
         // Preserve reqwest's builder errors and the existing transport detail
