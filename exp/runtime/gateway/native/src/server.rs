@@ -78,6 +78,9 @@ pub struct ServeConfig {
     pub pre_first_byte_budget_seconds: f64,
     #[serde(default = "default_callback_permits")]
     pub callback_permits: usize,
+    /// Worker-wide bound on provider output retained across streams.
+    #[serde(default = "default_maximum_retained_output_bytes")]
+    pub maximum_retained_output_bytes: usize,
     #[serde(default = "default_native_usage_enabled")]
     pub native_usage_enabled: bool,
     #[serde(default = "default_graceful_timeout_seconds")]
@@ -124,6 +127,16 @@ fn default_request_timeout_seconds() -> f64 {
 
 fn default_callback_permits() -> usize {
     4
+}
+
+fn default_maximum_retained_output_bytes() -> usize {
+    crate::retained::DEFAULT_WORKER_RETAINED_OUTPUT_BYTES
+}
+
+/// The serde default the server config uses, for the retained-output tests.
+#[cfg(test)]
+pub(crate) fn default_retained_for_tests() -> usize {
+    default_maximum_retained_output_bytes()
 }
 
 fn default_native_usage_enabled() -> bool {

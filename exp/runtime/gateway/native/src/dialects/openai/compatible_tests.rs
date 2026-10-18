@@ -950,3 +950,8 @@ fn writes_within_reads_accepts_a_cache_covering_the_whole_prompt() {
         (Some(13304), Some(0), Some(13304))
     );
 }
+
+// Meta usage-less max_tokens stop tests, kept beside this module so neither
+// file crosses the repository line limit.
+#[path = "compatible_length_tests.rs"]
+mod length;

@@ -381,6 +381,9 @@ impl UpstreamRelay {
                     _ => {}
                 }
             }
+            if self.normalizer.unreported_stop_read_as_length() {
+                observation.mark_unreported_truncation();
+            }
         }
         self.pending.extend(events);
     }
@@ -453,6 +456,11 @@ impl UpstreamRelay {
         S: Into<String>,
     {
         self.normalizer.set_request_words(words);
+    }
+
+    /// Carry the caller's output cap into terminal classification.
+    pub fn set_output_token_cap(&mut self, cap: Option<u64>) {
+        self.normalizer.set_output_token_cap(cap);
     }
 
     /// Carry the rung's cache-write accounting into usage normalization.
@@ -804,12 +812,20 @@ pub async fn collect_committed(
 ) -> Result<Vec<Event>, Failure> {
     let mut events: Vec<Event> = Vec::new();
     let mut retained_bytes = 0usize;
+    let mut lease = crate::retained::RetainedLease::default();
     let mut retain = |events: &mut Vec<Event>, event: Event| -> Result<(), Failure> {
-        retained_bytes = retained_bytes.saturating_add(event_retained_bytes(&event));
+        let bytes = event_retained_bytes(&event);
+        retained_bytes = retained_bytes.saturating_add(bytes);
         if retained_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES {
             return Err(Failure::new(
                 FailureClass::ProviderInternal,
                 OUTPUT_OVERFLOW_MESSAGE,
+            ));
+        }
+        if !lease.reserve(bytes) {
+            return Err(Failure::new(
+                FailureClass::Unavailable,
+                crate::retained::WORKER_RETENTION_EXHAUSTED_MESSAGE,
             ));
         }
         events.push(event);
