@@ -76,3 +76,40 @@ fn responses_keep_writes_read_back_disjoint_for_two_gateway_hops() {
     let parsed = crate::events::openai_usage(Some(&wire)).unwrap().unwrap();
     assert_eq!(parsed.cache_creation_input_tokens, Some(10_663));
 }
+
+/// Responses reports the same estimate in `output_tokens_details`.
+#[test]
+fn responses_reports_an_estimated_reasoning_count_when_the_provider_publishes_none() {
+    let usage = Usage {
+        input_tokens: Some(48),
+        output_tokens: Some(40),
+        ..Usage::default()
+    };
+    let events = vec![
+        Event::ThinkingDelta {
+            index: 0,
+            delta: "1001 is 7 x 11 x 13.".into(),
+        },
+        Event::TextDelta("No.".into()),
+        Event::Usage(usage),
+        Event::Completed,
+    ];
+    let completed = completed_responses_body(
+        "request-1",
+        "claude",
+        1,
+        ResponsesEnvelope::default(),
+        &events,
+    )
+    .expect("completed body must encode");
+    let wire = &completed.body["usage"];
+    assert_eq!(wire["output_tokens_details"]["reasoning_tokens"], 39);
+    assert_eq!(wire["estimated_token_details"], json!(["reasoning_tokens"]));
+    assert!(wire["unreported_token_details"]
+        .as_array()
+        .is_none_or(|fields| !fields.contains(&json!("reasoning_tokens"))));
+    assert_eq!(
+        completed.usage.expect("usage aggregates").reasoning_tokens,
+        None
+    );
+}

@@ -318,6 +318,17 @@ gateway hops and SDK provider adapters restore those details to unknown before v
 Every relay hop must preserve this evidence. A downstream parser cannot recover observability
 that an older relay already discarded.
 
+Anthropic Messages and Bedrock Converse bill thinking inside `output_tokens` and publish no
+separate count, so their reasoning meter stays unknown for settlement. Chat and Responses
+callers still receive an estimate, the way OpenRouter reports one: when the provider published
+no count and the turn carried thinking in any form, `completion_tokens_details.reasoning_tokens`
+(Chat) or `output_tokens_details.reasoning_tokens` (Responses) is `output_tokens` less
+`ceil(visible_bytes / 4)` for the answer text, refusal text and client tool arguments, floored
+at zero. The usage object then names it in `usage.estimated_token_details`
+(`["reasoning_tokens"]`, its only allowed entry) instead of `unreported_token_details`. The
+estimate is display only: it never changes the settled usage, and native hops and SDK provider
+adapters read a marked count as unknown.
+
 ## Gemini usage trailers
 
 Native Gemini and Vertex Gemini routes use upstream `streamGenerateContent` SSE even when

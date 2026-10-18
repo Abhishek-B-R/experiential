@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::errors::{Failure, PublicError};
 use crate::events::{ChoiceLogprobs, Event, Usage};
 use crate::reasoning_display::{self, DisplayJoiner, ReasoningOutput};
+use crate::reasoning_estimate::ReasoningEstimate;
 use crate::tool_search::annotate_tool_search_usage_details;
 use crate::web_search::{annotate_usage_details, ChatWebSearch, WebSearchAdmission};
 
@@ -189,6 +190,8 @@ pub struct ChatSseEncoder {
     reasoning_output_exposed: bool,
     reasoning_displayed: bool,
     reasoning_display: DisplayJoiner,
+    /// Visible output and thinking for the estimated reasoning count.
+    reasoning_estimate: ReasoningEstimate,
     web_search: Option<ChatWebSearch>,
     /// Gateway-run tool-search rounds metered on the usage chunk; zero
     /// leaves every frame byte-identical.
@@ -221,6 +224,7 @@ impl ChatSseEncoder {
             reasoning_output_exposed: false,
             reasoning_displayed: false,
             reasoning_display: DisplayJoiner::default(),
+            reasoning_estimate: ReasoningEstimate::default(),
             web_search: None,
             tool_search_requests: 0,
         }
@@ -302,6 +306,7 @@ impl ChatSseEncoder {
             ));
         }
         self.reasoning.observe(event)?;
+        self.reasoning_estimate.observe(event);
         if let Some(web_search) = self.web_search.as_mut() {
             web_search.observe(event);
         }
@@ -535,7 +540,10 @@ impl ChatSseEncoder {
     }
 
     fn usage_chunk(&self, usage: &Usage) -> String {
-        let mut usage = streaming_chat_usage(usage);
+        let reported = usage;
+        let mut usage = streaming_chat_usage(reported);
+        self.reasoning_estimate
+            .annotate(&mut usage, Some(reported), "completion_tokens_details");
         annotate_usage_details(
             &mut usage,
             self.web_search.as_ref().map(ChatWebSearch::admission),
@@ -828,6 +836,12 @@ pub fn completed_chat_body_with_carrier(
                 .insert("reasoning".to_string(), Value::String(text));
         }
     }
+    let mut usage_wire = completed_chat_usage(usage.as_ref());
+    ReasoningEstimate::from_events(events).annotate(
+        &mut usage_wire,
+        usage.as_ref(),
+        "completion_tokens_details",
+    );
     let mut body = json!({
         "id": stable_public_id("chatcmpl", request_id),
         "object": "chat.completion",
@@ -841,7 +855,7 @@ pub fn completed_chat_body_with_carrier(
                 "logprobs": logprobs.as_ref().map_or(Value::Null, |value| serde_json::to_value(value).unwrap_or(Value::Null)),
             }
         ],
-        "usage": completed_chat_usage(usage.as_ref()),
+        "usage": usage_wire,
     });
     if !ignored_parameters.is_empty() {
         body.as_object_mut()
