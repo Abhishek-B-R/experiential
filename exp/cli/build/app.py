@@ -453,7 +453,12 @@ def build(
     finally:
         pipeline.stop()
     render_completed_build(
-        _console, completed, project=project, learning=learning, report=report_path
+        _console,
+        completed,
+        project=project,
+        learning=learning,
+        report=report_path,
+        duration_seconds=time.monotonic() - started,
     )
 
 

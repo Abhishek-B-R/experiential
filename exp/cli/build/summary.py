@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from rich.console import Console
 
+from exp.cli.shared.progress import duration_text
 from exp.simulation.build import ProjectBuild
 
 if TYPE_CHECKING:  # learning loads the fidelity lifecycle; keep `exp --help` free of it
@@ -20,6 +21,7 @@ def render_completed_build(
     project: str,
     learning: BuildLearning,
     report: Path,
+    duration_seconds: float,
 ) -> None:
     """Present a few result lines: traces, learning, retest, the report and the next command.
 
@@ -29,6 +31,7 @@ def render_completed_build(
         project: Local project identifier used in the next recommended command.
         learning: What the learning stage did.
         report: File holding the full learning and retest output.
+        duration_seconds: Wall-clock time the whole command took.
     """
     dataset = completed.artifacts.trace_dataset.dataset
     tasks = completed.artifacts.mining.tasks
@@ -45,7 +48,7 @@ def render_completed_build(
         console.print(line)
     if learning.outcome is not None:
         console.print(f"[dim]Report: {shown(report)}[/dim]")
-    console.print("[green]Complete[/green]")
+    console.print(f"[green]Complete[/green] [dim]in {duration_text(duration_seconds)}[/dim]")
     if learning.outcome is not None:
         console.print(f"next: exp eval {project} --audit N  [dim](check on held-out traces)[/dim]")
     else:

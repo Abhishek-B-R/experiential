@@ -412,3 +412,8 @@ def _duration(seconds: float) -> str:
         return f"{minutes}m{secs:02d}s"
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h{minutes:02d}m"
+
+
+def duration_text(seconds: float) -> str:
+    """How long a whole command took, for its final line: ``45s``, ``12m08s`` or ``1h03m``."""
+    return _duration(seconds) if seconds >= 1 else "under 1s"

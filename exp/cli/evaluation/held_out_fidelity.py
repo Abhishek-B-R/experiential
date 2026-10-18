@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import AbstractContextManager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic
 
 import typer
 from rich.console import Console
@@ -16,7 +17,13 @@ from exp.cli.evaluation.fidelity_turns import render_turns, turn_marks
 from exp.cli.evaluation.view import heading
 from exp.cli.shared.consent import can_prompt, require_spend_consent
 from exp.cli.shared.options import usage_error
-from exp.cli.shared.progress import Phase, pipeline_display, progress_display, qualified
+from exp.cli.shared.progress import (
+    Phase,
+    duration_text,
+    pipeline_display,
+    progress_display,
+    qualified,
+)
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore
@@ -304,6 +311,7 @@ def run_audit(
     from exp.common.models import load_model_catalog
     from exp.optimize.evaluation.trace_learning import learning_curve, recorded_plan
 
+    started = monotonic()
     console = Console(theme=EXP_THEME)
     with usage_error(OSError, ValueError):
         store = ProjectStore(root, project)
@@ -378,3 +386,4 @@ def run_audit(
             pause=pipeline.paused,
         )
     console.print(f"[dim]Report: {shown(report_path)}[/dim]")
+    console.print(f"[green]Complete[/green] [dim]in {duration_text(monotonic() - started)}[/dim]")

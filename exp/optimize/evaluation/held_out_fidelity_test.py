@@ -560,6 +560,7 @@ def test_audit_learns_fit_traces_then_measures_held_out_on_final_memory(
     report = audit_report(store)
     assert "Learning curve exact replies by trace order:" in report
     assert "Report:" in output and "audit.txt" in output
+    assert re.search(r"Complete in (under 1s|\d+(s|m\d\ds|h\d\dm))", output), "time taken"
     # Held-out lineages were reserved before learning and never consumed.
     held = held_out_lineages(store)
     assert all(is_reserved(store.artifacts, plan.lineage, lineage) for lineage in held)

@@ -1,6 +1,7 @@
 """The learning pass: every trace by default, measured test-then-train, budgeted and resumable."""
 
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -92,6 +93,7 @@ def test_default_learning_consumes_every_trace_and_reports_test_then_train(
     # The terminal gets the result lines; the report file keeps the full learning output.
     assert f"replies exact while learning 97% ({exact}/{3 * USERS}), last 3 traces 100%" in output
     assert "next: exp eval retail --audit N" in output
+    assert re.search(r"Complete in (under 1s|\d+(s|m\d\ds|h\d\dm))", output), "time taken"
     report = build_report(store)
     assert headline in report
     # Traces 10-12 learn on nearly final memory; all their turns are exact.
