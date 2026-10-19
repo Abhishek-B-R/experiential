@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Experiential Labs. All rights reserved.
 """Adaptive-to-budgeted thinking translation for budgeted-enabled Anthropic routes."""
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.models.providers.adaptive_thinking_budget import budgeted_enabled_config
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -14,7 +15,7 @@ _HAIKU = GatewayWireProfile(
 )
 
 
-def _request(config: dict[str, object], maximum: int | None) -> GatewayRequest:
+def _request(config: JsonObject, maximum: int | None) -> GatewayRequest:
     """Build one Messages request with a thinking config and output ceiling."""
     return GatewayRequest(
         surface=GatewayApiSurface.MESSAGES,

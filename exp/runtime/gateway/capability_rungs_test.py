@@ -1,5 +1,6 @@
 """Capability-first rung selection and sampling clamps through route admission."""
 
+from dataclasses import replace
 from typing import cast
 
 import pytest
@@ -260,14 +261,14 @@ _CLIENT = cast(NativeWireClient, object())
 
 def _wire(url: str, **reasoning: object) -> tuple[GatewayWireProfile, NativeWireClient]:
     """Build one OpenAI-compatible rung, reasoning-capable when ``reasoning`` is given."""
-    profile = GatewayWireProfile(
-        dialect="openai_compatible",
-        url=url,
-        model_id="model",
-        **({"supports_reasoning": True, "reasoning_wire_format": "reasoning_effort"} | reasoning)
-        if reasoning
-        else {},
-    )
+    profile = GatewayWireProfile(dialect="openai_compatible", url=url, model_id="model")
+    if reasoning:
+        changes: dict[str, object] = {
+            "supports_reasoning": True,
+            "reasoning_wire_format": "reasoning_effort",
+            **reasoning,
+        }
+        profile = replace(profile, **changes)
     return profile, _CLIENT
 
 
