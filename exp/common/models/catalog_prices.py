@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Self
 
@@ -146,6 +146,8 @@ class GatewayUnitPrices(ContractModel):
 MINUTES_PER_DAY = 24 * 60
 MAXIMUM_PEAK_WINDOWS = 32
 MAXIMUM_OFF_PEAK_DATES = 128
+PEAK_GUARD_BAND = timedelta(minutes=1)
+"""How far each peak window is widened on both edges against billing-clock skew."""
 
 _TOKEN_RATE_FIELDS = (
     "input_nano_usd_per_million_tokens",
@@ -198,6 +200,8 @@ class GatewayOffPeakPrices(ContractModel):
     base card stays the peak (list) price; this card replaces it whole, with its
     own long-context tier, whenever an attempt STARTS off-peak. Selection happens
     once per attempt, so reservation and settlement always use the same card.
+    Each peak window counts as peak from one minute before its start to one
+    minute after its end (:data:`PEAK_GUARD_BAND`), against billing-clock skew.
 
     Attributes:
         prices: Whole replacement card charged off-peak.
@@ -231,11 +235,18 @@ class GatewayOffPeakPrices(ContractModel):
     def applies_at(self, instant: datetime) -> bool:
         """Report whether the off-peak card prices an attempt started at ``instant``.
 
+        Each peak window is widened by :data:`PEAK_GUARD_BAND` on both edges,
+        so an attempt that starts within a minute of a boundary pays peak. Our
+        clock and the provider's billing clock can disagree by a few seconds;
+        the band means that disagreement can only overcharge the caller a
+        little near a boundary, never bill off-peak for a call the provider
+        bills at peak.
+
         Args:
             instant: Timezone-aware attempt start; any zone is normalized to UTC.
 
         Returns:
-            True on an off-peak date or outside every peak window.
+            True when no instant within the guard band of ``instant`` is peak.
 
         Raises:
             ValueError: ``instant`` is naive, so its UTC position is unknown.
@@ -243,11 +254,20 @@ class GatewayOffPeakPrices(ContractModel):
         if instant.tzinfo is None or instant.utcoffset() is None:
             raise ValueError("off-peak selection requires a timezone-aware instant")
         moment = instant.astimezone(UTC)
+        # Windows are minute-granular and at least a minute long, so the three
+        # probes cover exactly [start - band, end + band) for a one-minute band.
+        return not any(
+            self._peak(moment + offset)
+            for offset in (-PEAK_GUARD_BAND, timedelta(0), PEAK_GUARD_BAND)
+        )
+
+    def _peak(self, moment: datetime) -> bool:
+        """Whether one UTC instant falls in a peak window on a non-holiday date."""
         if moment.date() in self.off_peak_dates:
-            return True
+            return False
         weekday = moment.isoweekday()
         minute = moment.hour * 60 + moment.minute
-        return not any(window.covers(weekday, minute) for window in self.peak_windows)
+        return any(window.covers(weekday, minute) for window in self.peak_windows)
 
 
 class GatewayTokenPrices(ContractModel):

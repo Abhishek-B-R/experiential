@@ -249,12 +249,12 @@ def _assert_reserved_from(
 
 
 def test_a_stream_crossing_the_peak_end_settles_at_the_card_it_reserved(tmp_path: Path) -> None:
-    """Started at 09:59:59 UTC Monday (peak) and settled at 10:00:30 (off-peak): all peak."""
+    """Started at 09:59:59 UTC Monday (peak) and settled at 10:02:30 (off-peak): all peak."""
     clock = FakeLedgerClock()
     clock.wall = datetime(2026, 10, 19, 9, 59, 59, tzinfo=UTC)
     accounting, ledger, entry, database = _priced_request(tmp_path, clock, _deepseek())
     attempt_id = _start(accounting, entry, 0)
-    clock.advance(31)
+    clock.advance(151)
     _settle(accounting, entry, attempt_id, succeeded=True)
     peak_cost = 10_000 * 300 + 2_000 * 1_200  # tokens x nano-USD per token
     reserved = ledger.reservations[0][1]
@@ -270,9 +270,13 @@ def test_a_stream_crossing_the_peak_end_settles_at_the_card_it_reserved(tmp_path
 
 
 def test_a_retry_after_the_boundary_prices_its_own_start(tmp_path: Path) -> None:
-    """Each physical attempt is its own upstream call: the redial at 10:00:01 is off-peak."""
+    """Each physical attempt is its own upstream call: the redial at 10:01:01 is off-peak.
+
+    The first attempt starts at 10:00:58, inside the one-minute guard band after
+    the 10:00 peak end, so it still pays peak.
+    """
     clock = FakeLedgerClock()
-    clock.wall = datetime(2026, 10, 19, 9, 59, 58, tzinfo=UTC)
+    clock.wall = datetime(2026, 10, 19, 10, 0, 58, tzinfo=UTC)
     accounting, ledger, entry, database = _priced_request(tmp_path, clock, _deepseek())
     first = _start(accounting, entry, 0)
     clock.advance(2)
