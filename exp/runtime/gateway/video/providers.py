@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol, TypeGuard
@@ -55,11 +56,15 @@ class VideoSubmission:
         request: The canonical request.
         model_id: The exact provider model identifier.
         reference_image: The first-frame image bytes, when the request has one.
+        upload_url: The presigned ``PUT`` destination the provider uploads the
+            rendered video to, when the host stores outputs and the dialect
+            supports it (see :mod:`exp.runtime.gateway.video.output`).
     """
 
     request: VideoRequest
     model_id: str
     reference_image: bytes | None = field(default=None, repr=False)
+    upload_url: str | None = field(default=None, repr=False)
 
 
 class VideoProviderSnapshot(ContractModel):
@@ -284,6 +289,7 @@ class VideoProviderClient(Protocol):
     """One provider's video job protocol over a resolved wire profile."""
 
     dialect: str
+    stores_output: bool
 
     def unsupported(self, request: VideoRequest, model_id: str) -> tuple[str, str] | None:
         """Return ``(param, message)`` when this model cannot render the request."""
@@ -293,13 +299,27 @@ class VideoProviderClient(Protocol):
         """Submit one job and return the provider's job handle."""
         ...
 
-    def poll(self, profile: GatewayWireProfile, provider_job_id: str) -> VideoProviderSnapshot:
-        """Observe one job."""
+    def poll(
+        self, profile: GatewayWireProfile, provider_job_id: str, *, output_stored: bool = False
+    ) -> VideoProviderSnapshot:
+        """Observe one job; ``output_stored`` says it uploaded to host storage."""
         ...
 
     def content(self, profile: GatewayWireProfile, content_url: str) -> VideoContentFetch:
         """Describe how to download one completed job's video."""
         ...
+
+
+def _duration_milli(value: object) -> int | None:
+    """A provider-reported positive duration in seconds as thousandths, else None.
+
+    xAI reports ``video.duration`` as a JSON number, which may be fractional.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return round(value * 1000)
 
 
 def _api_root(videos_url: str) -> str:
@@ -311,6 +331,7 @@ class VeoVideoClient:
     """Google Veo over the Gemini API's long-running prediction operations."""
 
     dialect = VEO_DIALECT
+    stores_output = False
 
     def __init__(self, *, http: HttpFactory = default_http_factory) -> None:
         """Bind the HTTP client factory.
@@ -368,7 +389,7 @@ class VeoVideoClient:
             "parameters": {
                 "aspectRatio": request.aspect_ratio,
                 "resolution": request.resolution,
-                "durationSeconds": str(request.seconds),
+                "durationSeconds": request.seconds,
             },
         }
         accepted = _post_submit(self._http, url, dict(profile.headers), body)
@@ -377,12 +398,15 @@ class VeoVideoClient:
             raise VideoSubmitAmbiguous("the Veo acceptance named no operation")
         return name
 
-    def poll(self, profile: GatewayWireProfile, provider_job_id: str) -> VideoProviderSnapshot:
-        """Read one operation and normalize it.
+    def poll(
+        self, profile: GatewayWireProfile, provider_job_id: str, *, output_stored: bool = False
+    ) -> VideoProviderSnapshot:
+        """Read one operation and normalize it (Veo never uploads to host storage).
 
         Raises:
             VideoPollUnavailable: The poll failed transiently.
         """
+        del output_stored
         url = profile.videos_url
         if url is None:  # pragma: no cover - jobs are only created on rungs with one.
             raise VideoPollUnavailable("the rung has no video endpoint")
@@ -438,6 +462,7 @@ class XaiVideoClient:
     """xAI Grok Imagine video over its asynchronous generation API."""
 
     dialect = XAI_VIDEOS_DIALECT
+    stores_output = True
 
     def __init__(self, *, http: HttpFactory = default_http_factory) -> None:
         """Bind the HTTP client factory.
@@ -487,14 +512,23 @@ class XaiVideoClient:
             "aspect_ratio": request.aspect_ratio,
             "resolution": request.resolution,
         }
+        if submission.upload_url is not None:
+            # xAI PUTs the raw MP4 to this URL and keeps no copy (required for
+            # Zero Data Retention teams, honored for every team).
+            body["output"] = {"upload_url": submission.upload_url}
         accepted = _post_submit(self._http, url, dict(profile.headers), body)
         request_id = accepted.get("request_id")
         if not isinstance(request_id, str) or not request_id:
             raise VideoSubmitAmbiguous("the xAI acceptance named no request id")
         return request_id
 
-    def poll(self, profile: GatewayWireProfile, provider_job_id: str) -> VideoProviderSnapshot:
+    def poll(
+        self, profile: GatewayWireProfile, provider_job_id: str, *, output_stored: bool = False
+    ) -> VideoProviderSnapshot:
         """Read one generation and normalize it.
+
+        A ``done`` generation that uploaded to host storage completes without
+        a provider URL; the content route then serves the stored object.
 
         Raises:
             VideoPollUnavailable: The poll failed transiently.
@@ -520,6 +554,11 @@ class XaiVideoClient:
         video = body.get("video")
         video_url = video.get("url") if isinstance(video, dict) else None
         duration = video.get("duration") if isinstance(video, dict) else None
+        duration_milli = _duration_milli(duration)
+        if output_stored:
+            return VideoProviderSnapshot(
+                status=VideoStatus.COMPLETED, progress=100, duration_milli=duration_milli
+            )
         if not _asset_url(video_url):
             return VideoProviderSnapshot(
                 status=VideoStatus.FAILED,
@@ -530,9 +569,7 @@ class XaiVideoClient:
             status=VideoStatus.COMPLETED,
             progress=100,
             content_url=video_url,
-            duration_milli=(
-                duration * 1000 if isinstance(duration, int) and duration > 0 else None
-            ),
+            duration_milli=duration_milli,
         )
 
     def content(self, profile: GatewayWireProfile, content_url: str) -> VideoContentFetch:

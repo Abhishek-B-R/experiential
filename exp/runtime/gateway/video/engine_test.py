@@ -42,6 +42,7 @@ from exp.runtime.gateway.video.contracts import (
     VideoStatus,
 )
 from exp.runtime.gateway.video.engine import DISPATCH_GRACE_SECONDS, VideoEngine
+from exp.runtime.gateway.video.output import InMemoryVideoOutputStore, VideoUploadTarget
 from exp.runtime.gateway.video.providers import VeoVideoClient, XaiVideoClient
 
 _KEY = "provider-secret-canary"
@@ -66,6 +67,7 @@ class _Provider:
         poll_status: HTTP status for polls.
         xai_duration: The rendered duration xAI reports, in seconds.
         posts: Every submit URL received.
+        bodies: Every submit body received, decoded.
     """
 
     submits: list[int | type[Exception] | None] = field(default_factory=list)
@@ -73,11 +75,13 @@ class _Provider:
     poll_status: int = 200
     xai_duration: int = 5
     posts: list[str] = field(default_factory=list)
+    bodies: list[dict[str, object]] = field(default_factory=list)
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         """Answer one provider request from the script."""
         if request.method == "POST":
             self.posts.append(str(request.url))
+            self.bodies.append(json.loads(request.content))
             outcome = self.submits.pop(0) if self.submits else None
             if isinstance(outcome, type):
                 raise outcome("scripted transport failure")
@@ -458,3 +462,115 @@ def test_only_the_video_variant_is_served(setup: _Setup) -> None:
             variant="thumbnail",
         )
     assert json.loads(refused.value.public_error_json)["param"] == "variant"
+
+
+class _BrokenOutputs(InMemoryVideoOutputStore):
+    """An output store whose upload destinations cannot be minted."""
+
+    def upload_target(self, *, video_id: str, organization_id: str) -> VideoUploadTarget:
+        """Fail every mint."""
+        raise RuntimeError("bucket unavailable")
+
+
+def _stored_engine(setup: _Setup, outputs: InMemoryVideoOutputStore) -> VideoEngine:
+    """A second engine over the same seams with host output storage installed."""
+
+    def http() -> httpx.Client:
+        """Build one client over the scripted transport."""
+        return httpx.Client(transport=httpx.MockTransport(setup.provider.handle))
+
+    assert setup.components.video_jobs is not None
+    return VideoEngine(
+        components=setup.components,
+        ledger=setup.components.ledger,
+        jobs=setup.components.video_jobs,
+        clients={"veo": VeoVideoClient(http=http), "xai_videos": XaiVideoClient(http=http)},
+        clock=setup.clock,
+        poll_interval_seconds=0,
+        outputs=outputs,
+    )
+
+
+def _create_on(engine: VideoEngine, setup: _Setup, alias: str, seconds: int) -> VideoJob:
+    """Create one 720p landscape job through ``engine``."""
+    return engine.create(
+        raw_key=setup.raw_key,
+        alias=alias,
+        request=VideoRequest(prompt="a test clip", seconds=seconds, size="1280x720"),
+        reference_image=None,
+        client_headers={},
+    )
+
+
+def test_an_xai_job_uploads_to_host_storage_and_is_served_from_it(setup: _Setup) -> None:
+    """With a store installed, xAI gets ``output.upload_url`` and content streams from the store."""
+    outputs = InMemoryVideoOutputStore()
+    engine = _stored_engine(setup, outputs)
+    job = _create_on(engine, setup, "grok-video", 6)
+    assert job.output_stored and outputs.minted == [job.video_id]
+    upload = f"https://videos.invalid/upload/{job.organization_id}/{job.video_id}.mp4"
+    assert setup.provider.bodies[0]["output"] == {"upload_url": upload}
+    outputs.put(video_id=job.video_id, organization_id=job.organization_id, data=b"mp4")
+    settled = engine.refresh(job)
+    assert (settled.status, settled.content_url, settled.billed_seconds_milli) == (
+        VideoStatus.COMPLETED,
+        None,
+        5_000,
+    )
+    assert _attempts(setup)[0]["estimated_cost_nano_usd"] == 5 * _XAI_RATE
+    fetch = engine.content(
+        organization_id=job.organization_id,
+        identity_id=job.identity_id,
+        video_id=job.video_id,
+        variant="video",
+    )
+    assert fetch.url == f"https://videos.invalid/download/{job.organization_id}/{job.video_id}.mp4"
+    engine.delete(
+        organization_id=job.organization_id, identity_id=job.identity_id, video_id=job.video_id
+    )
+    assert outputs.stored(video_id=job.video_id, organization_id=job.organization_id) is None
+
+
+def test_a_done_generation_whose_upload_never_arrived_bills_zero(setup: _Setup) -> None:
+    """``done`` without the object in host storage fails the job at $0."""
+    engine = _stored_engine(setup, InMemoryVideoOutputStore())
+    job = _create_on(engine, setup, "grok-video", 6)
+    settled = engine.refresh(job)
+    assert (settled.status, settled.error_code, settled.billed_seconds_milli) == (
+        VideoStatus.FAILED,
+        "video_upload_missing",
+        0,
+    )
+    assert _attempts(setup)[0]["estimated_cost_nano_usd"] == 0
+    with pytest.raises(NativeBridgeError):
+        engine.content(
+            organization_id=job.organization_id,
+            identity_id=job.identity_id,
+            video_id=job.video_id,
+            variant="video",
+        )
+
+
+def test_veo_ignores_host_storage(setup: _Setup) -> None:
+    """Veo cannot upload to a caller URL, so its jobs keep the provider download."""
+    outputs = InMemoryVideoOutputStore()
+    job = _create_on(_stored_engine(setup, outputs), setup, "veo", 8)
+    assert not job.output_stored and outputs.minted == []
+    assert "output" not in setup.provider.bodies[0]
+
+
+def test_an_unmintable_upload_destination_settles_unsent_at_zero(setup: _Setup) -> None:
+    """A store that cannot mint fails the rung before any provider call, at $0."""
+    engine = _stored_engine(setup, _BrokenOutputs())
+    with pytest.raises(NativeBridgeError):
+        _create_on(engine, setup, "grok-video", 6)
+    assert setup.provider.posts == []
+    attempts = _attempts(setup)
+    assert len(attempts) == 1 and attempts[0]["estimated_cost_nano_usd"] == 0
+
+
+def test_without_a_store_xai_is_submitted_without_output(setup: _Setup) -> None:
+    """No host storage: the plain xAI request, served from the provider URL."""
+    job = _create(setup, alias="grok-video", seconds=6)
+    assert not job.output_stored
+    assert "output" not in setup.provider.bodies[0]
