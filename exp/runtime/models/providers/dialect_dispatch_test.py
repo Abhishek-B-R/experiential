@@ -412,13 +412,15 @@ def test_huawei_glm_5_1_takes_the_thinking_switch_never_an_effort() -> None:
     assert "reasoning_effort" not in on
 
 
-def test_huawei_deepseek_v4_turns_thinking_off_and_keeps_its_efforts() -> None:
-    """Huawei MaaS DeepSeek-V4 sends none as thinking disabled; high and max stay efforts.
+@pytest.mark.parametrize("model_id", ["deepseek-v4-flash", "deepseek-v4.1-flash"])
+def test_huawei_deepseek_v4_turns_thinking_off_and_keeps_its_efforts(model_id: str) -> None:
+    """Huawei MaaS DeepSeek-V4 / V4.1 send none as thinking disabled; efforts stay efforts.
 
     The reference documents thinking.type enabled | disabled for DeepSeek-V4-Flash
-    and reasoning_effort high | max ("takes effect only in thinking mode").
+    and DeepSeek-V4.1-Flash and reasoning_effort high | max ("takes effect only in
+    thinking mode"; V4.1 also low).
     """
-    profile = _maas_profile(_HUAWEI_URL, "deepseek-v4-flash")
+    profile = _maas_profile(_HUAWEI_URL, model_id)
     off = dialect_stream_payload(profile, _effort_request("none"))
     assert off["thinking"] == {"type": "disabled"}
     assert "reasoning_effort" not in off
