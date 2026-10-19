@@ -18,6 +18,7 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice, GatewayCustomToolChoice
 from exp.runtime.models.providers.anthropic import safeguards_for_upstream
 from exp.runtime.models.providers.anthropic_tool_compat import anthropic_rejects_forced_tool_choice
 from exp.runtime.models.providers.base import SERVICE_TIER_DIALECTS as SERVICE_TIER_DIALECTS
@@ -221,6 +222,16 @@ def reasoning_off_via_thinking_disabled(profile: GatewayWireProfile) -> bool:
     return _huawei_maas(profile) and profile.model_id.lower().startswith("deepseek-v4")
 
 
+def _forces_tool_choice(request: GatewayRequest) -> bool:
+    """Whether the request forces a tool call: required, a named tool, or required allowed tools."""
+    choice = request.tool_choice
+    if isinstance(choice, GatewayAllowedToolsChoice):
+        return choice.mode == "required"
+    return choice == "required" or isinstance(
+        choice, (GatewayNamedToolChoice, GatewayCustomToolChoice)
+    )
+
+
 def dialect_stream_payload(
     profile: GatewayWireProfile,
     provider_request: GatewayRequest,
@@ -248,6 +259,17 @@ def dialect_stream_payload(
     ):
         # The release restriction also applies through relays and Bedrock. Raising
         # here lets admission select a capable rung or disclose its auto coercion.
+        raise ProviderCapabilityError(capability="forced_tool_choice")
+    if (
+        provider_request.tools
+        and profile.deepseek_reasoning_history
+        and _forces_tool_choice(provider_request)
+        and (provider_request.reasoning_effort or profile.reasoning_effort) != "none"
+    ):
+        # DeepSeek's own origin thinks by default and refuses a forced choice
+        # while thinking ("Thinking mode does not support this tool_choice",
+        # production 2026-10-18). Like Anthropic's budgeted thinking, admission
+        # then prefers a rung that can force the tool or discloses ``auto``.
         raise ProviderCapabilityError(capability="forced_tool_choice")
     require_thinking_budget_support(profile, provider_request)
     budget = thinking_budget_value(provider_request)

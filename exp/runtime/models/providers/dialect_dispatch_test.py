@@ -447,3 +447,39 @@ def test_huawei_thinking_rules_are_scoped_to_huawei_glm_5_1_and_deepseek_v4(
     payload = dialect_stream_payload(_maas_profile(url, model_id), _effort_request("none"))
     assert "thinking" not in payload
     assert payload["reasoning_effort"] == "none"
+
+
+@pytest.mark.parametrize("choice", ("required", "named"))
+def test_deepseek_origin_declines_a_forced_tool_choice_while_thinking(choice: str) -> None:
+    """DeepSeek's own API thinks by default and answers a forced choice with
+    "Thinking mode does not support this tool_choice" (14 requests across 7
+    organizations, 2026-10-18). The rung declines it as ``forced_tool_choice`` so
+    admission prefers a capable rung or discloses ``auto``; with thinking off the
+    forced choice travels."""
+    from exp.runtime.gateway.contracts import GatewayNamedToolChoice
+
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://api.deepseek.com/v1",
+        deepseek_reasoning_history=True,
+        model_id="deepseek-flash",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("none", "low", "high", "max"),
+        reasoning_effort="high",
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"),),
+        tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+        tool_choice="required" if choice == "required" else GatewayNamedToolChoice(name="lookup"),
+    )
+    with pytest.raises(ProviderCapabilityError) as raised:
+        dialect_stream_payload(profile, request)
+    assert raised.value.capability == "forced_tool_choice"
+    off = dialect_stream_payload(profile, request.model_copy(update={"reasoning_effort": "none"}))
+    assert off["tool_choice"] is not None
+    relay = GatewayWireProfile(
+        dialect="openai_compatible", url="https://openrouter.test/v1", model_id="deepseek/flash"
+    )
+    assert dialect_stream_payload(relay, request)["tool_choice"] is not None

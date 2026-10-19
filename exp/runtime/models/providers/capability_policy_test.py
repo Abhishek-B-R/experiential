@@ -590,7 +590,13 @@ def test_disabled_thinking_is_preserved_or_refused_without_a_drop() -> None:
     assert compatible_generation_parameter_profile_indexes((budgeted, shim), request) == (0,)
     assert compatible_generation_parameter_profile_indexes((adaptive_only, shim), request) == (0,)
     assert coerce_generation_parameters((budgeted, shim), request) is None
-    assert coerce_generation_parameters((shim,), request) is None
+    # A route with no reasoning rung already serves the off switch: the config
+    # drops with disclosure instead of being refused (claude-sonnet-5 behind
+    # its non-reasoning lanes refused Claude Code side calls, 2026-10-18).
+    already_off = coerce_generation_parameters((shim,), request)
+    assert already_off is not None
+    assert already_off.request.provider_thinking_config is None
+    assert already_off.disclosures == ("thinking->dropped(no_reasoning_on_route)",)
     # An adaptive config on the same mixed route is not a ``disabled`` drop;
     # it takes the effort translation path instead.
     adaptive_mixed = coerce_generation_parameters(
@@ -1001,13 +1007,19 @@ def test_the_thinking_translation_tries_farther_tiers_when_the_nearest_cannot_se
     assert coercion.request.reasoning_effort == "high"
 
 
-def test_a_disabled_thinking_config_never_snaps_to_an_active_effort() -> None:
-    """A disabled config needs an exact off tier or a typed admission refusal."""
+def test_a_disabled_thinking_config_takes_the_off_tier_else_the_lowest() -> None:
+    """A disabled config takes an exact off tier; a route that cannot turn
+    reasoning off serves it at its lowest tier, exactly like an explicit
+    ``none`` effort, and says so (glm-5.3-flash-uncensored refused Claude Code's
+    off switch on every side call, 2026-10-18)."""
     coercion = coerce_generation_parameters(
         (_openai_reasoning_profile(efforts=("low", "medium", "high")),),
         _messages_request(provider_thinking_config={"type": "disabled"}),
     )
-    assert coercion is None
+    assert coercion is not None
+    assert coercion.disclosures == ("thinking->reasoning_effort:low(no_off_tier)",)
+    assert coercion.request.reasoning_effort == "low"
+    assert coercion.request.provider_thinking_config is None
 
     exact = coerce_generation_parameters(
         (_openai_reasoning_profile(),),
@@ -1022,13 +1034,20 @@ def test_a_disabled_thinking_config_never_snaps_to_an_active_effort() -> None:
 def test_disabled_config_cannot_be_erased_by_another_effort_channel(
     effort: ReasoningEffort | None,
 ) -> None:
-    """Neither an effort nor an empty ladder can turn an explicit off switch on."""
-    for ladder in ((), ("low", "medium", "high")):
-        request = _messages_request(
-            provider_thinking_config={"type": "disabled"}, reasoning_effort=effort
-        )
-        profile = replace(_openai_reasoning_profile(efforts=ladder), model_id="custom-reasoner")
-        assert coerce_generation_parameters((profile,), request) is None
+    """An effort beside the off switch never turns it on: on an off tier the
+    off switch wins and the effort yields with disclosure, and an empty ladder
+    (an always-reasoning rung of unknown depth) keeps the refusal."""
+    request = _messages_request(
+        provider_thinking_config={"type": "disabled"}, reasoning_effort=effort
+    )
+    unknown = replace(_openai_reasoning_profile(efforts=()), model_id="custom-reasoner")
+    assert coerce_generation_parameters((unknown,), request) is None
+    off_tier = replace(_openai_reasoning_profile(), model_id="custom-reasoner")
+    coercion = coerce_generation_parameters((off_tier,), request)
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "none"
+    yielded = ("output_config.effort->ignored(thinking_disabled)",) if effort == "high" else ()
+    assert coercion.disclosures == (*yielded, "thinking->reasoning_effort:none(disabled)")
 
 
 def test_a_mixed_route_whose_anthropic_rung_declined_translates_onto_the_foreign_ladder() -> None:
@@ -1412,3 +1431,39 @@ def test_temperature_forwards_beside_a_translated_thinking_config_on_an_effort_r
     assert payload["temperature"] == 0.3
     assert payload["reasoning_effort"] == "high"
     assert not any("temperature" in item for item in public.ignored_parameters)
+
+
+@pytest.mark.parametrize(("effort", "snapped"), (("medium", "low"), ("xhigh", "high")))
+def test_an_effort_beside_thinking_snaps_onto_the_ladder(
+    effort: ReasoningEffort, snapped: ReasoningEffort
+) -> None:
+    """Claude Code sends adaptive thinking beside ``output_config.effort``; the
+    effort wins, and on a ladder that skips it (glm-5.3: low, high, max) it now
+    snaps like a bare effort instead of refusing (16 refusals, 2026-10-18)."""
+    profile = _openai_reasoning_profile(efforts=("low", "high", "max"))
+    request = _messages_request(
+        provider_thinking_config={"type": "adaptive"},
+        reasoning_effort=effort,
+        provider_output_config={"effort": effort},
+    )
+    coercion = coerce_generation_parameters((profile,), request, admits=lambda _candidate: True)
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == snapped
+    assert coercion.request.provider_thinking_config is None
+    assert coercion.disclosures == (
+        "thinking->dropped(superseded_by_effort)",
+        f"reasoning_effort->{snapped}",
+    )
+
+
+def test_an_active_effort_never_snaps_down_to_off() -> None:
+    """glm-5.1's zai rung offers only none and high: "medium" used to snap down to
+    ``none`` and serve with no reasoning at all. It now rises to the nearest active
+    tier, disclosed."""
+    profile = _openai_reasoning_profile(efforts=("none", "high"))
+    coercion = coerce_generation_parameters(
+        (profile,), _request(reasoning_effort="medium"), admits=lambda _candidate: True
+    )
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "high"
+    assert coercion.disclosures == ("reasoning_effort->high(nearest_supported)",)
