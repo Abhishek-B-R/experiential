@@ -884,17 +884,16 @@ fn image_output_tokens_are_read_from_gemini_modalities_and_openrouter_details() 
     .unwrap();
     assert_eq!(gemini.output_tokens, Some(1278));
     assert_eq!(gemini.image_output_tokens, Some(1120));
-    // No breakdown, or a text-only one, is no image subset.
-    for usage in [
-        json!({"promptTokenCount": 3, "candidatesTokenCount": 4}),
-        json!({"candidatesTokenCount": 4, "candidatesTokensDetails": [{"modality": "TEXT", "tokenCount": 4}]}),
-    ] {
-        assert_eq!(gemini_usage(&usage).unwrap().image_output_tokens, None);
-    }
+    // No breakdown leaves the subset unknown; a text-only breakdown is a real 0.
+    let unreported = json!({"promptTokenCount": 3, "candidatesTokenCount": 4});
+    assert_eq!(gemini_usage(&unreported).unwrap().image_output_tokens, None);
+    let text = json!({"candidatesTokenCount": 4, "candidatesTokensDetails": [{"modality": "TEXT", "tokenCount": 4}]});
+    assert_eq!(gemini_usage(&text).unwrap().image_output_tokens, Some(0));
     // A malformed breakdown fails the meter.
     assert!(gemini_usage(&json!({"candidatesTokensDetails": "IMAGE"})).is_err());
 
-    // OpenRouter: completion_tokens_details.image_tokens; zero is absent.
+    // OpenRouter: completion_tokens_details.image_tokens; a reported 0 is a
+    // real count (billed at the text rate), an absent key is unknown.
     let routed = openai_compatible_usage(&json!({
         "prompt_tokens": 10,
         "completion_tokens": 1300,
@@ -908,7 +907,10 @@ fn image_output_tokens_are_read_from_gemini_modalities_and_openrouter_details() 
         "completion_tokens_details": {"image_tokens": 0},
     }))
     .unwrap();
-    assert_eq!(text_only.image_output_tokens, None);
+    assert_eq!(text_only.image_output_tokens, Some(0));
+    let absent =
+        openai_compatible_usage(&json!({"prompt_tokens": 10, "completion_tokens": 3})).unwrap();
+    assert_eq!(absent.image_output_tokens, None);
 }
 
 #[test]

@@ -298,14 +298,14 @@ impl OpenAiUsageAccumulator {
             .or(top_level_reasoning)
             .filter(|_| !unreported[3]);
         // OpenRouter reports generated-image tokens inside the completion
-        // total; zero is no image subset at all.
+        // total. A reported 0 is a real count (a text answer billed at the
+        // text rate); only an absent key leaves the subset unknown.
         let image_output_tokens = optional_usage_detail(
             object,
             output_details,
             "image_tokens",
             "OpenAI image_tokens",
-        )?
-        .filter(|count| *count > 0);
+        )?;
         let total_tokens = count_if_present(object, "total_tokens", "OpenAI usage")?;
         let (cached_input_tokens, cache_creation_input_tokens) = cache_subsets(
             object,
