@@ -158,16 +158,42 @@ from Google Veo and xAI rungs. Aliases opt in with the gateway deployment capabi
 Providers (contracts and prices verified 2026-10-18):
 
 - **Google Veo** on a `gemini` connection: `POST /v1beta/models/{model}:predictLongRunning`, then the
-  returned operation is polled until `done`. Veo renders 16:9 or 9:16 at 720p for 4, 6, or 8
+  returned operation is polled until `done` (`parameters.durationSeconds` is a JSON number;
+  `aspectRatio` and `resolution` are strings). Veo renders 16:9 or 9:16 at 720p for 4, 6, or 8
   seconds, and 1080p or 4k for 8 seconds only; Veo 3.1 Lite renders no 4k. A first-frame image is
   sent inline. Paid-tier prices per second: Veo 3.1 $0.40 (720p, 1080p) and $0.60 (4k); Veo 3.1
   Fast $0.10 (720p), $0.12 (1080p), $0.30 (4k); Veo 3.1 Lite $0.05 (720p), $0.08 (1080p). A
   blocked render is not charged by Google.
 - **xAI Grok Imagine** on an `openai-compatible` connection at `https://api.x.ai/v1`:
   `POST /videos/generations`, then `GET /videos/{request_id}` until `done`. Renders 1 to 15
-  seconds at 480p, 720p, or 1080p; xAI reports the rendered duration, which settlement bills. A
-  first-frame image is refused on xAI lanes. Prices per second: `grok-imagine-video` $0.05,
-  `grok-imagine-video-1.5` $0.08, `grok-imagine-video-1.5-lite` $0.02.
+  seconds at 480p, 720p, or 1080p; xAI reports the rendered duration (a JSON number, possibly
+  fractional), which settlement bills in thousandths of a second. A first-frame image is refused
+  on xAI lanes. Prices per second: `grok-imagine-video` $0.05, `grok-imagine-video-1.5` $0.08,
+  `grok-imagine-video-1.5-lite` $0.02.
+
+**Host output storage (xAI Zero Data Retention).** xAI refuses video generation for a Zero Data
+Retention team unless the request names `output.upload_url`; xAI then `PUT`s the rendered MP4's
+raw bytes to that URL and keeps no copy. A host enables this by installing an optional
+`components.video_outputs` (`exp.runtime.gateway.video.output.VideoOutputStore`), and then every
+xAI job takes this path whatever the team's retention setting (Veo has no upload option and is
+unaffected). The store implements three methods, each safe to call concurrently from every worker:
+
+- `upload_target(*, video_id, organization_id) -> VideoUploadTarget(url, expires_at)`: a presigned
+  `https` URL accepting one `PUT` of the raw bytes with no extra headers, valid past the job's
+  two-hour settlement bound. Called before submit; a failure settles the rung unsent at $0 and
+  the walk fails over.
+- `download(*, video_id, organization_id) -> VideoContentFetch | None`: how the data plane `GET`s
+  the stored object (headers go to that URL only), or None when it is absent.
+- `delete(*, video_id, organization_id) -> None`: removes the object when the owner deletes the
+  job; a missing object is not an error, and a failure is logged without failing the delete.
+
+A stored job completes on xAI's `done` without a provider URL, but only once `download` finds
+the object: a `done` generation whose upload never arrived fails as `video_upload_missing` and
+bills zero seconds. `GET /v1/videos/{id}/content` serves stored jobs from the store (503 when the
+store is unavailable, 404 once the object is gone). Without a store, xAI requests carry no
+`output`, and a Zero Data Retention team's provider 400 settles the attempt at $0 like any
+submit refusal. `InMemoryVideoOutputStore` is a process-local reference implementation for
+tests.
 
 A deployment that claims video generation without a video job endpoint (any connection other than
 Gemini or xAI's origin) or without a `video_second` unit card is excluded at startup. A gateway

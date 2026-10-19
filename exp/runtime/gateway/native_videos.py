@@ -4,7 +4,10 @@ The native routes call these by name. A composition that installs a video job
 store (``components.video_jobs``) gets a :class:`VideoEngine` over the same
 authority, routes, catalogs, write ledger, and guardrails as every other
 surface, plus the background poller that settles jobs nobody polls; a
-composition without one answers every video route with a uniform 404.
+composition without one answers every video route with a uniform 404. An
+optional ``components.video_outputs``
+(:class:`~exp.runtime.gateway.video.output.VideoOutputStore`) makes xAI upload
+each rendered video into host storage (required for Zero Data Retention teams).
 
 Every read authenticates the bearer key into its organization and identity
 first and is scoped to them: another identity's id answers exactly like an
@@ -24,6 +27,7 @@ from exp.runtime.gateway.native_accounting_errors import NativeBridgeError, auth
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
 from exp.runtime.gateway.video.contracts import render_deleted_object, render_video_object
 from exp.runtime.gateway.video.engine import VideoEngine
+from exp.runtime.gateway.video.output import VideoOutputStore
 from exp.runtime.gateway.video.store import ListOrder, VideoJobStore
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.video_requests import decode_video_create
@@ -98,6 +102,7 @@ class NativeVideosMixin:
             start_poller: Whether to start the background settlement poller.
         """
         jobs: VideoJobStore | None = getattr(self._components, "video_jobs", None)
+        outputs: VideoOutputStore | None = getattr(self._components, "video_outputs", None)
         self._videos = (
             None
             if jobs is None
@@ -106,6 +111,7 @@ class NativeVideosMixin:
                 ledger=self._write_ledger,
                 jobs=jobs,
                 guardrails=self._guardrails,
+                outputs=outputs,
             )
         )
         if self._videos is not None and start_poller:

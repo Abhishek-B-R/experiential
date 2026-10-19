@@ -177,7 +177,11 @@ class VideoJob(ContractModel):
         billed_seconds_milli: Settled seconds in thousandths; None until settled.
         error_code: Public failure code when the job failed.
         error_message: Public failure message when the job failed.
-        content_url: The provider's download locator once completed.
+        content_url: The provider's download locator once completed; None for
+            an ``output_stored`` job, whose video lives in host storage.
+        output_stored: Whether the provider uploads the rendered video to the
+            host's :class:`~exp.runtime.gateway.video.output.VideoOutputStore`
+            (fixed at dispatch; content is then served from that store).
         created_at: When the job was accepted.
         completed_at: When the job reached a terminal state.
         expires_at: When the provider deletes the rendered assets.
@@ -210,6 +214,7 @@ class VideoJob(ContractModel):
     error_code: str | None = None
     error_message: str | None = Field(default=None, max_length=2_048)
     content_url: str | None = None
+    output_stored: bool = False
     created_at: AwareDatetime
     completed_at: AwareDatetime | None = None
     expires_at: AwareDatetime | None = None

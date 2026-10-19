@@ -89,7 +89,7 @@ def test_veo_submit_speaks_predict_long_running_with_an_inline_frame() -> None:
                 },
             }
         ],
-        "parameters": {"aspectRatio": "9:16", "resolution": "720p", "durationSeconds": "6"},
+        "parameters": {"aspectRatio": "9:16", "resolution": "720p", "durationSeconds": 6},
     }
 
 
@@ -279,6 +279,84 @@ def test_xai_poll_shapes(payload: object, status: VideoStatus, code: str | None)
     """Pending, failed, expired, and URL-less generations normalize."""
     snapshot = XaiVideoClient(http=_http(_answer(200, payload))).poll(_XAI, "req")
     assert (snapshot.status, snapshot.error_code) == (status, code)
+
+
+def test_veo_sends_duration_seconds_as_a_json_number() -> None:
+    """Google rejects a string ``durationSeconds``; the wire carries an integer."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record the submit and accept it."""
+        seen.append(request)
+        return httpx.Response(200, json={"name": "models/veo/operations/op-1"})
+
+    client = VeoVideoClient(http=_http(handler))
+    request = VideoRequest(prompt="p", seconds=4, size="1280x720")
+    client.submit(_VEO, VideoSubmission(request=request, model_id="veo-3.1-lite-generate-preview"))
+    parameters = json.loads(seen[0].content)["parameters"]
+    assert parameters["durationSeconds"] == 4
+    assert type(parameters["durationSeconds"]) is int
+
+
+def test_xai_submit_names_the_host_upload_url_only_when_given() -> None:
+    """A host upload destination rides ``output.upload_url``; none adds no ``output``."""
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record each submit body and accept it."""
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"request_id": f"req-{len(bodies)}"})
+
+    client = XaiVideoClient(http=_http(handler))
+    request = VideoRequest(prompt="p", seconds=4, size="854x480")
+    upload = "https://bucket.example/put/video_1.mp4?sig=abc"
+    client.submit(
+        _XAI, VideoSubmission(request=request, model_id="grok-imagine-video", upload_url=upload)
+    )
+    client.submit(_XAI, VideoSubmission(request=request, model_id="grok-imagine-video"))
+    assert bodies[0]["output"] == {"upload_url": upload}
+    assert "output" not in bodies[1]
+    assert type(bodies[0]["duration"]) is int
+
+
+def test_xai_reports_a_fractional_duration_in_thousandths() -> None:
+    """xAI's ``video.duration`` is a JSON number; 4.04 s bills 4,040 milliseconds."""
+    payload = {"status": "done", "video": {"url": "https://vidgen.x.ai/a.mp4", "duration": 4.04}}
+    snapshot = XaiVideoClient(http=_http(_answer(200, payload))).poll(_XAI, "req")
+    assert (snapshot.status, snapshot.duration_milli) == (VideoStatus.COMPLETED, 4_040)
+
+
+@pytest.mark.parametrize("duration", [0, -1, True, "5", None])
+def test_xai_ignores_an_unusable_duration(duration: object) -> None:
+    """A missing, non-numeric, or non-positive duration bills the requested seconds."""
+    payload = {
+        "status": "done",
+        "video": {"url": "https://vidgen.x.ai/a.mp4", "duration": duration},
+    }
+    snapshot = XaiVideoClient(http=_http(_answer(200, payload))).poll(_XAI, "req")
+    assert snapshot.duration_milli is None
+
+
+def test_an_uploaded_xai_generation_completes_without_a_provider_url() -> None:
+    """With the video in host storage, ``done`` completes even with no ``video.url``."""
+    payload = {"status": "done", "video": {"duration": 4}}
+    client = XaiVideoClient(http=_http(_answer(200, payload)))
+    stored = client.poll(_XAI, "req", output_stored=True)
+    assert (stored.status, stored.content_url, stored.duration_milli) == (
+        VideoStatus.COMPLETED,
+        None,
+        4_000,
+    )
+    assert client.poll(_XAI, "req").status is VideoStatus.FAILED
+    failed = client.poll(_XAI, "req", output_stored=False)
+    assert failed.error_code == "content_filtered"
+    rejected = XaiVideoClient(http=_http(_answer(200, {"status": "failed", "error": "x"})))
+    assert rejected.poll(_XAI, "req", output_stored=True).status is VideoStatus.FAILED
+
+
+def test_only_xai_stores_output() -> None:
+    """Veo never uploads to a caller URL; xAI does."""
+    assert (VeoVideoClient.stores_output, XaiVideoClient.stores_output) == (False, True)
 
 
 def test_xai_refuses_a_reference_image_and_4k() -> None:

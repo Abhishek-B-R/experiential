@@ -56,6 +56,7 @@ from exp.runtime.gateway.video.contracts import (
     video_ceiling_nano_usd,
     video_unit_rate,
 )
+from exp.runtime.gateway.video.output import VideoOutputStore
 from exp.runtime.gateway.video.providers import (
     VideoContentFetch,
     VideoProviderClient,
@@ -136,6 +137,7 @@ class VideoEngine:
         clients: Mapping[str, VideoProviderClient] | None = None,
         clock: Callable[[], datetime] = _now,
         poll_interval_seconds: float = POLL_INTERVAL_SECONDS,
+        outputs: VideoOutputStore | None = None,
     ) -> None:
         """Bind the shared seams and the provider client registry.
 
@@ -147,6 +149,8 @@ class VideoEngine:
             clients: Provider clients keyed by video dialect.
             clock: Injectable wall clock.
             poll_interval_seconds: Minimum spacing between polls of one job.
+            outputs: Host storage rendered videos upload into; when set, every
+                job on a dialect that ``stores_output`` uploads there.
         """
         self._components = components
         self._ledger = ledger
@@ -155,6 +159,7 @@ class VideoEngine:
         self._clients = dict(clients) if clients is not None else default_video_clients()
         self._clock = clock
         self._poll_interval = timedelta(seconds=max(0.0, poll_interval_seconds))
+        self._outputs = outputs
 
     # -- create -----------------------------------------------------------------
 
@@ -294,17 +299,37 @@ class VideoEngine:
                     ),
                 )
                 raise authority_error(exc) from exc
-            job = self._new_job(authorization, request, deployment, attempt_id, dialect, rate)
+            stored = client.stores_output and self._outputs is not None
+            job = self._new_job(
+                authorization, request, deployment, attempt_id, dialect, rate, stored=stored
+            )
             try:
                 self._jobs.create(job=job)
             except Exception as exc:  # noqa: BLE001 - nothing reached the provider.
                 self._settle_unsent(job, _internal_failure(), finalize=True)
                 raise authority_error(exc) from exc
+            upload_url: str | None = None
+            if stored:
+                assert self._outputs is not None
+                try:
+                    upload_url = self._outputs.upload_target(
+                        video_id=job.video_id, organization_id=job.organization_id
+                    ).url
+                except Exception as exc:  # noqa: BLE001 - nothing reached the provider.
+                    _LOGGER.exception("video %s upload target unavailable", job.video_id)
+                    failover = depth < last
+                    self._settle_unsent(job, _storage_failure(), finalize=not failover)
+                    if failover:
+                        continue
+                    raise NativeBridgeError(public_failure_error(_storage_failure())) from exc
             try:
                 provider_job_id = client.submit(
                     profile,
                     VideoSubmission(
-                        request=request, model_id=profile.model_id, reference_image=reference_image
+                        request=request,
+                        model_id=profile.model_id,
+                        reference_image=reference_image,
+                        upload_url=upload_url,
                     ),
                 )
             except VideoSubmitRejected as rejected:
@@ -336,8 +361,13 @@ class VideoEngine:
         attempt_id: str,
         dialect: str,
         rate: int,
+        *,
+        stored: bool = False,
     ) -> VideoJob:
-        """Build the durable intent row for one reserved rung."""
+        """Build the durable intent row for one reserved rung.
+
+        ``stored`` marks a job whose provider uploads to host storage.
+        """
         now = self._clock()
         return VideoJob(
             video_id=f"video_{secrets.token_hex(16)}",
@@ -356,6 +386,7 @@ class VideoEngine:
             variant=request.resolution,
             rate_nano_usd=rate,
             reserved_nano_usd=video_ceiling_nano_usd(request, rate) or 0,
+            output_stored=stored,
             created_at=now,
             settle_by=now + timedelta(seconds=VIDEO_JOB_SETTLEMENT_SECONDS),
         )
@@ -442,6 +473,11 @@ class VideoEngine:
             video_id=video_id, organization_id=organization_id, identity_id=identity_id
         ):
             raise NativeBridgeError(video_not_found_error(video_id))
+        if job.output_stored and self._outputs is not None:
+            try:
+                self._outputs.delete(video_id=video_id, organization_id=organization_id)
+            except Exception:  # noqa: BLE001 - the job is hidden; storage cleanup is best effort.
+                _LOGGER.exception("video %s stored output could not be deleted", video_id)
 
     def content(
         self, *, organization_id: str, identity_id: str, video_id: str, variant: str
@@ -464,7 +500,9 @@ class VideoEngine:
         job = self.owned(
             organization_id=organization_id, identity_id=identity_id, video_id=video_id
         )
-        if job.status is not VideoStatus.COMPLETED or job.content_url is None:
+        if job.status is not VideoStatus.COMPLETED or (
+            job.content_url is None and not job.output_stored
+        ):
             raise NativeBridgeError(
                 OpenAIProtocolError(
                     status_code=400,
@@ -482,18 +520,41 @@ class VideoEngine:
                     param="video_id",
                 )
             )
+        if job.output_stored:
+            return self._stored_content(job)
         resolved = self._resolve(job)
         if resolved is None:
+            raise NativeBridgeError(_unavailable_error())
+        profile, client = resolved
+        assert job.content_url is not None
+        return client.content(profile, job.content_url)
+
+    def _stored_content(self, job: VideoJob) -> VideoContentFetch:
+        """Describe the download of one job's video from host storage.
+
+        Raises:
+            NativeBridgeError: 503 when the store is not installed or fails,
+                404 when the stored object is gone.
+        """
+        if self._outputs is None:
+            raise NativeBridgeError(_unavailable_error())
+        try:
+            fetch = self._outputs.download(
+                video_id=job.video_id, organization_id=job.organization_id
+            )
+        except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
+            _LOGGER.exception("video %s stored output unreadable", job.video_id)
+            raise NativeBridgeError(_unavailable_error()) from exc
+        if fetch is None:
             raise NativeBridgeError(
                 OpenAIProtocolError(
-                    status_code=503,
-                    code="unavailable_route",
-                    message="The provider serving this video is not available; retry shortly.",
-                    error_type="api_error",
+                    status_code=404,
+                    code="video_expired",
+                    message=f"Video {job.video_id!r} is no longer downloadable.",
+                    param="video_id",
                 )
             )
-        profile, client = resolved
-        return client.content(profile, job.content_url)
+        return fetch
 
     # -- polling and settlement -------------------------------------------------
 
@@ -541,7 +602,9 @@ class VideoEngine:
         profile, client = resolved
         assert job.provider_job_id is not None
         try:
-            snapshot = client.poll(profile, job.provider_job_id)
+            snapshot = client.poll(profile, job.provider_job_id, output_stored=job.output_stored)
+            if snapshot.status is VideoStatus.COMPLETED and job.output_stored:
+                snapshot = self._confirm_stored(job, snapshot)
         except Exception:  # noqa: BLE001 - transient; the next poll retries.
             _LOGGER.warning("video %s poll unavailable; will retry", job.video_id)
             return self._save(job.model_copy(update={"last_polled_at": now}))
@@ -555,6 +618,26 @@ class VideoEngine:
                     "last_polled_at": now,
                 }
             )
+        )
+
+    def _confirm_stored(
+        self, job: VideoJob, snapshot: VideoProviderSnapshot
+    ) -> VideoProviderSnapshot:
+        """Bill a stored-output completion only when the upload actually landed.
+
+        A provider that reports ``done`` without the object in host storage
+        failed to deliver, so the job fails and bills zero seconds. A store
+        error propagates so the next poll retries.
+        """
+        if self._outputs is None:
+            raise RuntimeError("the video output store is not installed")
+        landed = self._outputs.download(video_id=job.video_id, organization_id=job.organization_id)
+        if landed is not None:
+            return snapshot
+        return VideoProviderSnapshot(
+            status=VideoStatus.FAILED,
+            error_code="video_upload_missing",
+            error_message="the provider finished but its video upload never arrived",
         )
 
     def _save(self, job: VideoJob) -> VideoJob:
@@ -699,6 +782,25 @@ def _unsupported_failure() -> GatewayFailure:
     return GatewayFailure(
         failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
         safe_message="the model alias does not generate video",
+    )
+
+
+def _storage_failure() -> GatewayFailure:
+    """The failure for a rung whose host upload destination could not be minted."""
+    return GatewayFailure(
+        failure_class=GatewayFailureClass.INTERNAL,
+        safe_message="the video output storage is unavailable",
+        failover_eligible=True,
+    )
+
+
+def _unavailable_error() -> OpenAIProtocolError:
+    """The 503 for a video whose serving provider or storage is unreachable now."""
+    return OpenAIProtocolError(
+        status_code=503,
+        code="unavailable_route",
+        message="The provider serving this video is not available; retry shortly.",
+        error_type="api_error",
     )
 
 

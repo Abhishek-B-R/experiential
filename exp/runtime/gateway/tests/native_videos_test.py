@@ -403,7 +403,7 @@ def test_create_poll_download_and_settle_exact_seconds(engine: _VideoEngine) -> 
     assert submit.api_key == _KEY
     assert submit.body == {
         "instances": [{"prompt": "a paper boat in the rain"}],
-        "parameters": {"aspectRatio": "16:9", "resolution": "720p", "durationSeconds": "8"},
+        "parameters": {"aspectRatio": "16:9", "resolution": "720p", "durationSeconds": 8},
     }
     held = _attempt(engine)
     assert held["state"] == "dispatched"
