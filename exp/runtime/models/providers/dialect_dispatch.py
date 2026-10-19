@@ -172,6 +172,16 @@ def reasoning_off_via_chat_template(profile: GatewayWireProfile) -> bool:
 # Z.ai GLM models whose only reasoning control is thinking enabled/disabled.
 _ZAI_THINKING_SWITCH_ONLY_MODELS = frozenset({"glm-5", "glm-5.1"})
 
+# Huawei Cloud ModelArts Studio (MaaS) public inference hosts, e.g.
+# api-ap-southeast-1.modelarts-maas.com.
+_HUAWEI_MAAS_HOST_SUFFIX = ".modelarts-maas.com"
+
+
+def _huawei_maas(profile: GatewayWireProfile) -> bool:
+    """Whether the origin is Huawei Cloud MaaS's OpenAI-compatible API."""
+    host = (urlsplit(profile.url).hostname or "").lower()
+    return profile.dialect == "openai_compatible" and host.endswith(_HUAWEI_MAAS_HOST_SUFFIX)
+
 
 def reasoning_via_zai_thinking(profile: GatewayWireProfile) -> bool:
     """Return whether this origin takes Z.ai's own ``thinking`` switch instead of an effort.
@@ -181,15 +191,34 @@ def reasoning_via_zai_thinking(profile: GatewayWireProfile) -> bool:
     or minimal; 5.3 and 5.3-Flash take low, high and max), so those keep the
     effort field. GLM-5 and GLM-5.1 have no effort parameter: their only control
     is ``thinking: {"type": "enabled" | "disabled"}`` ("Thinking Mode"), on by
-    default. Scoped to the Z.ai API hosts and those two models so no other
+    default. Huawei Cloud MaaS serves GLM-5.1 with the same contract: its chat
+    completions reference (support.huaweicloud.com model-call-019 / -022, read
+    2026-10-19) lists ``thinking.type`` enabled | disabled for GLM-5.1, default
+    enabled, and names GLM-5.1 in no ``reasoning_effort`` row. Before this the
+    Huawei rung declared no effort ladder, so reasoning off was refused there.
+    Scoped to the Z.ai and Huawei MaaS hosts and those two models so no other
     origin or model changes its wire.
     """
     host = (urlsplit(profile.url).hostname or "").lower()
     return (
         profile.dialect == "openai_compatible"
-        and host in {"api.z.ai", "open.bigmodel.cn"}
+        and (host in {"api.z.ai", "open.bigmodel.cn"} or _huawei_maas(profile))
         and profile.model_id.lower() in _ZAI_THINKING_SWITCH_ONLY_MODELS
     )
+
+
+def reasoning_off_via_thinking_disabled(profile: GatewayWireProfile) -> bool:
+    """Return whether effort ``none`` is sent as ``thinking: {"type": "disabled"}`` here.
+
+    Huawei Cloud MaaS DeepSeek-V4 models think by default and document two
+    controls (support.huaweicloud.com model-call-019 / -022, read 2026-10-19):
+    ``thinking.type`` enabled | disabled turns thinking off, while
+    ``reasoning_effort`` takes only high and max ("takes effect only in thinking
+    mode"). So none becomes the thinking switch and every other effort stays a
+    ``reasoning_effort``. Scoped to the Huawei MaaS host and its DeepSeek-V4
+    models so no other origin or model changes its wire.
+    """
+    return _huawei_maas(profile) and profile.model_id.lower().startswith("deepseek-v4")
 
 
 def dialect_stream_payload(
@@ -346,6 +375,7 @@ def dialect_stream_payload(
             forwards_cache_control=profile.forwards_cache_control,
             reasoning_off_via_chat_template=reasoning_off_via_chat_template(profile),
             reasoning_via_thinking_toggle=reasoning_via_zai_thinking(profile),
+            reasoning_off_via_thinking_disabled=reasoning_off_via_thinking_disabled(profile),
         )
         qwen_budget_payload(profile, provider_request, payload)
         return payload

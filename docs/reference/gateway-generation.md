@@ -161,6 +161,14 @@ only after all eligible routes decline the forced choice and discloses `tool_cho
 This does not guarantee a tool call. See the provider's
 [Opus 5.5 contract](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide).
 
+Some origins turn thinking off with their own switch rather than `reasoning_effort: none`.
+GLM-5 and GLM-5.1 on Z.ai and on Huawei Cloud MaaS take `thinking: {type: disabled}` for
+`none` and `{type: enabled}` for any other level. Huawei MaaS DeepSeek-V4 models take
+`thinking: {type: disabled}` for `none` and keep `reasoning_effort` for `high` and `max`.
+Vertex MaaS GLM takes `chat_template_kwargs: {enable_thinking: false}`. On OpenRouter, a
+request with reasoning off also lists the upstreams seen to keep thinking anyway in
+`provider.ignore` (AtlasCloud today), so OpenRouter serves it elsewhere or refuses.
+
 A Responses `reasoning.summary` (or its deprecated alias `reasoning.generate_summary`) is
 best effort, as on OpenAI's own API. Admission prefers a rung whose wire carries summary parts over every other preference
 (native Responses, or Anthropic thinking projected onto them). A route with no such rung (for

@@ -49,6 +49,7 @@ from exp.runtime.models.providers.logprobs import (
     require_responses_logprobs,
 )
 from exp.runtime.models.providers.openrouter_routing import (
+    constrain_openrouter_reasoning_off,
     constrain_openrouter_zero_data_retention,
     forward_provider_preferences,
     openrouter_chat_wire,
@@ -149,6 +150,9 @@ def build_rung_dispatch(
         upstream_payload = forward_provider_preferences(
             upstream_payload, rung_request.provider_preferences
         )
+    if openrouter_chat_wire(deployment.provider, profile.dialect):
+        # After the caller's preferences, which replace the provider object.
+        upstream_payload = constrain_openrouter_reasoning_off(upstream_payload)
     dispatch_policy = deployment.gateway.dispatch
     if (
         dispatch_policy is not None

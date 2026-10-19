@@ -800,3 +800,46 @@ def test_upstream_priority_defaults_off_and_adds_no_identity_bytes() -> None:
     assert GatewayRungDispatchPolicy(upstream_priority=True).model_dump(exclude_defaults=True) == {
         "upstream_priority": True
     }
+
+
+def test_reasoning_off_on_an_openrouter_rung_ignores_upstreams_that_think_anyway() -> None:
+    """An OpenRouter rung asked for effort none lists the non-compliant upstreams to ignore.
+
+    Production 2026-10-19: AtlasCloud served z-ai/glm-5.1 with reasoning off and
+    still returned 129 reasoning tokens. A reasoning-on request is untouched.
+    """
+    capabilities = GatewayDeploymentCapabilities(
+        supports_streaming=True, supported_reasoning_efforts=("none", "high")
+    )
+    rung = _deployment("or-rung", "openrouter").model_copy(
+        update={
+            "capabilities": ModelCapabilities(
+                maximum_output_tokens=128_000, supports_reasoning=True
+            ),
+            "gateway": GatewayDeploymentMetadata(capabilities=capabilities),
+        }
+    )
+    profile = replace(_profile(), supports_reasoning=True, reasoning_wire_format="reasoning")
+    client: NativeWireClient = _NoSigningClient()
+
+    def payload_for(effort: str) -> JsonObject:
+        request = _request().model_copy(update={"reasoning_effort": effort})
+        dispatch = build_rung_dispatch(
+            _route((rung,)),
+            rung,
+            profile,
+            client,
+            provider_request=request,
+            public_request=request,
+            authorization=_AUTHORIZATION,
+        )
+        payload = dispatch.wire_entry["upstream_payload"]
+        assert isinstance(payload, dict)
+        return payload
+
+    off = payload_for("none")
+    assert off["reasoning"] == {"effort": "none"}
+    assert off["provider"] == {"ignore": ["atlas-cloud"]}
+    on = payload_for("high")
+    assert on["reasoning"] == {"effort": "high"}
+    assert "provider" not in on

@@ -312,6 +312,7 @@ def openai_compatible_stream_payload(
     forwards_cache_control: bool = False,
     reasoning_off_via_chat_template: bool = False,
     reasoning_via_thinking_toggle: bool = False,
+    reasoning_off_via_thinking_disabled: bool = False,
 ) -> JsonObject:
     """Translate one canonical request to streaming Chat Completions JSON.
 
@@ -333,6 +334,10 @@ def openai_compatible_stream_payload(
             Z.ai's ``thinking: {"type": "enabled" | "disabled"}`` and no effort
             levels, so effort ``none`` is sent as ``disabled``, any other effort as
             ``enabled``, and no ``reasoning_effort`` field.
+        reasoning_off_via_thinking_disabled: Whether this origin turns thinking
+            off with ``thinking: {"type": "disabled"}`` while its other efforts
+            stay ``reasoning_effort`` (Huawei MaaS DeepSeek-V4), so effort
+            ``none`` is sent as that switch and no ``reasoning_effort`` field.
         reasoning_output_exposed: Whether this rung replays the caller's plaintext
             ``reasoning_content`` history verbatim (exposure-gated Tencent/DeepSeek rung).
         deepseek_reasoning_history: Whether this rung is DeepSeek's own origin,
@@ -444,6 +449,8 @@ def openai_compatible_stream_payload(
             payload["thinking"] = {
                 "type": "disabled" if effective_reasoning_effort == "none" else "enabled"
             }
+        elif effective_reasoning_effort == "none" and reasoning_off_via_thinking_disabled:
+            payload["thinking"] = {"type": "disabled"}
         elif effective_reasoning_effort == "none" and reasoning_off_via_chat_template:
             template_kwargs = payload.get("chat_template_kwargs")
             payload["chat_template_kwargs"] = {

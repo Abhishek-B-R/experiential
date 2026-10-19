@@ -2,7 +2,9 @@
 
 OpenRouter load-balances one model id across upstream providers and accepts a
 request-level ``provider`` object that narrows the candidates. The gateway
-uses exactly one such preference: the zero-data-retention constraint, which
+sets two such preferences. The reasoning-off constraint keeps a request that
+turns reasoning off away from upstreams observed to think anyway. The
+zero-data-retention constraint
 restricts the request to OpenRouter's published ZDR endpoint list (the public
 ``GET /api/v1/endpoints/zdr``) and denies data collection, so the aggregator
 serves from a retention-free upstream or refuses. The constraint TIGHTENS only:
@@ -127,6 +129,46 @@ def constrain_openrouter_zero_data_retention(payload: JsonObject) -> JsonObject:
     preferences.update(ZDR_PROVIDER_PREFERENCES)
     tightened: JsonValue = preferences
     return {**payload, "provider": tightened}
+
+
+OPENROUTER_REASONING_OFF_IGNORED: Final[tuple[str, ...]] = ("atlas-cloud",)
+"""OpenRouter upstreams that keep thinking when the request turns reasoning off.
+
+AtlasCloud served z-ai/glm-5.1 with ``reasoning: {"effort": "none"}`` and
+returned 129 reasoning tokens (production, 2026-10-19, request
+request-83fbbf3e7d2b4ee09700226dfaecbc07, settled ``upstream_provider``
+AtlasCloud), while Novita honored the same wire with zero reasoning tokens on
+45 of 45 requests. OpenRouter's reasoning reference documents ``effort: "none"``
+as "disables reasoning entirely" without naming the upstreams that comply, so
+the upstreams seen to ignore it are excluded for that request only."""
+
+
+def constrain_openrouter_reasoning_off(payload: JsonObject) -> JsonObject:
+    """Return ``payload`` routed away from upstreams that ignore reasoning off.
+
+    Args:
+        payload: A built Chat Completions payload for an OpenRouter rung.
+
+    Returns:
+        The input unchanged unless it carries ``reasoning: {"effort": "none"}``;
+        then a new payload whose ``provider.ignore`` also lists
+        :data:`OPENROUTER_REASONING_OFF_IGNORED`. Other ``provider`` keys survive
+        and an existing ``ignore`` list keeps its names. If every remaining
+        upstream is unavailable OpenRouter refuses, which the gateway answers
+        like any rung failure instead of serving reasoning the caller turned off.
+        The input is never mutated.
+    """
+    reasoning = payload.get("reasoning")
+    if not isinstance(reasoning, dict) or reasoning.get("effort") != "none":
+        return payload
+    existing = payload.get("provider")
+    preferences: JsonObject = dict(existing) if isinstance(existing, dict) else {}
+    current = preferences.get("ignore")
+    ignored: list[JsonValue] = list(current) if isinstance(current, list) else []
+    ignored.extend(name for name in OPENROUTER_REASONING_OFF_IGNORED if name not in ignored)
+    preferences["ignore"] = ignored
+    narrowed: JsonValue = preferences
+    return {**payload, "provider": narrowed}
 
 
 def openrouter_metadata_headers(headers: dict[str, str]) -> dict[str, str]:

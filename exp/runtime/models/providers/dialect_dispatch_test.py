@@ -392,3 +392,56 @@ def test_bedrock_rung_without_a_reasoning_control_sends_no_thinking() -> None:
     """A rung the catalog does not declare reasoning on keeps today's exact Converse body."""
     payload = dialect_stream_payload(_bedrock_claude_profile(reasoning=False), _chat(top_k=None))
     assert "additionalModelRequestFields" not in payload
+
+
+_HUAWEI_URL = "https://api-ap-southeast-1.modelarts-maas.com/openai/v1/chat/completions"
+
+
+def test_huawei_glm_5_1_takes_the_thinking_switch_never_an_effort() -> None:
+    """Huawei MaaS GLM-5.1 serves effort none as thinking disabled and any other as enabled.
+
+    Huawei's chat completions reference (read 2026-10-19) lists thinking.type
+    enabled | disabled for GLM-5.1 (default enabled) and no reasoning_effort for it.
+    """
+    profile = _maas_profile(_HUAWEI_URL, "glm-5.1")
+    off = dialect_stream_payload(profile, _effort_request("none"))
+    assert off["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in off
+    on = dialect_stream_payload(profile, _effort_request("high"))
+    assert on["thinking"] == {"type": "enabled"}
+    assert "reasoning_effort" not in on
+
+
+def test_huawei_deepseek_v4_turns_thinking_off_and_keeps_its_efforts() -> None:
+    """Huawei MaaS DeepSeek-V4 sends none as thinking disabled; high and max stay efforts.
+
+    The reference documents thinking.type enabled | disabled for DeepSeek-V4-Flash
+    and reasoning_effort high | max ("takes effect only in thinking mode").
+    """
+    profile = _maas_profile(_HUAWEI_URL, "deepseek-v4-flash")
+    off = dialect_stream_payload(profile, _effort_request("none"))
+    assert off["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in off
+    for effort in ("high", "max"):
+        on = dialect_stream_payload(profile, _effort_request(effort))
+        assert on["reasoning_effort"] == effort
+        assert "thinking" not in on
+
+
+@pytest.mark.parametrize(
+    ("url", "model_id"),
+    [
+        (_HUAWEI_URL, "glm-5.2"),
+        (_HUAWEI_URL, "glm-5.3"),
+        ("https://openrouter.ai/api/v1/chat/completions", "deepseek/deepseek-v4-flash"),
+        ("https://api.deepseek.com/chat/completions", "deepseek-v4-flash"),
+        ("https://modelarts-maas.com.example.org/v1/chat/completions", "deepseek-v4-flash"),
+    ],
+)
+def test_huawei_thinking_rules_are_scoped_to_huawei_glm_5_1_and_deepseek_v4(
+    url: str, model_id: str
+) -> None:
+    """Other Huawei models (documented efforts) and other hosts keep reasoning_effort none."""
+    payload = dialect_stream_payload(_maas_profile(url, model_id), _effort_request("none"))
+    assert "thinking" not in payload
+    assert payload["reasoning_effort"] == "none"
