@@ -31,6 +31,7 @@ from exp.runtime.models.providers.dialect_dispatch import (
     TOOL_RESULT_IMAGE_FOLD_DISCLOSURE,
     WEB_SEARCH_SOURCES_DROPPED,
     WEB_SEARCH_SOURCES_DROPPED_ON_FALLBACK,
+    disclose_gemini_missing_tool_results,
     responses_origin_refuses_web_search_sources,
 )
 from exp.runtime.models.providers.dialect_dispatch import (
@@ -478,18 +479,17 @@ def route_generation_parameter_requests(
     # Every dialect carries a tool-result image: natively inside the tool
     # result on Anthropic (tool_result image blocks), native Responses (the SDK
     # function_call_output part list) and Bedrock (toolResult image blocks),
-    # and folded into a user turn that follows the tool run on Chat
-    # Completions and Gemini, whose tool results are text-only. The fold is
-    # disclosed once per route; a rung with no image input at all still
-    # rejects at preflight and the route-wide coercion applies the disclosed
-    # placeholder degrade (the block is baked into the caller's history, so a
-    # rejection would wedge the whole session).
+    # and folded into a user turn after the tool run on Chat Completions and
+    # Gemini (text-only tool results), disclosed once per route. A rung with no
+    # image input rejects at preflight and the route-wide coercion applies the
+    # disclosed placeholder degrade (a rejection would wedge the session).
     if any(message.role == "tool" and message.images for message in request.messages) and any(
         profile.dialect in TOOL_RESULT_IMAGE_FOLD_DIALECTS for profile in profiles
     ):
         if TOOL_RESULT_IMAGE_FOLD_DISCLOSURE not in ignored:
             ignored.append(TOOL_RESULT_IMAGE_FOLD_DISCLOSURE)
 
+    disclose_gemini_missing_tool_results(profiles, request.messages, ignored)
     # Only the Anthropic wire has a tool-result error flag. Every other wire
     # folds the flag into the result text at encoding (a fixed prefix, see
     # ``folded_tool_error_content``) so the model still learns the invocation

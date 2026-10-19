@@ -8,6 +8,7 @@ so import paths are unchanged, and route admission shaping stays there.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
@@ -54,6 +55,66 @@ result; see ``wire_messages.fold_tool_result_images``)."""
 TOOL_RESULT_IMAGE_FOLD_DIALECTS = frozenset({"openai_compatible", "gemini_generate_content"})
 """Dialects whose payload builders fold tool-result images into a user turn."""
 THINKING_HISTORY_DROP_DISCLOSURE = "messages.thinking->dropped(unsupported_by_provider)"
+GEMINI_MISSING_TOOL_RESULT_DISCLOSURE = "messages.tool_results.missing->placeholder"
+"""Disclosed when a Gemini rung answers an unanswered function call with a placeholder.
+
+Gemini refuses a turn whose following content does not answer every function
+call of the model turn before it; a history whose call never got a result
+(an interrupted client) is served with ``GEMINI_MISSING_TOOL_RESULT`` in that
+call's slot instead (see ``gemini_requests._CallTurn``)."""
+
+
+def disclose_gemini_missing_tool_results(
+    profiles: Sequence[GatewayWireProfile],
+    messages: tuple[GatewayMessage, ...],
+    ignored: list[str],
+) -> None:
+    """Disclose, once, the placeholder a Gemini rung sends for an unanswered call.
+
+    Args:
+        profiles: Ordered wire profiles of the route.
+        messages: The request's canonical messages.
+        ignored: The route's disclosure list, appended in place.
+    """
+    if (
+        any(profile.dialect == "gemini_generate_content" for profile in profiles)
+        and gemini_unanswered_tool_calls(messages)
+        and GEMINI_MISSING_TOOL_RESULT_DISCLOSURE not in ignored
+    ):
+        ignored.append(GEMINI_MISSING_TOOL_RESULT_DISCLOSURE)
+
+
+def gemini_unanswered_tool_calls(messages: tuple[GatewayMessage, ...]) -> bool:
+    """Whether a history leaves a function call unanswered before a later turn.
+
+    Mirrors ``gemini_requests._CallTurn`` over the canonical messages: a call
+    no tool message of its own turn answers is filled with the placeholder
+    once any message follows the model turn. A leading system or developer
+    turn never follows anything, and a trailing model turn awaiting results is
+    not a gap.
+
+    Args:
+        messages: The request's canonical messages.
+
+    Returns:
+        True when the Gemini payload will carry a placeholder function response.
+    """
+    pending: set[str] = set()
+    followed = False
+    for message in messages:
+        if message.role == "assistant":
+            if pending and followed:
+                return True
+            pending = {call.call_id for call in message.tool_calls}
+            followed = False
+            continue
+        if not pending:
+            continue
+        followed = True
+        if message.role == "tool" and message.tool_call_id is not None:
+            pending.discard(message.tool_call_id)
+    return bool(pending) and followed
+
 
 CACHE_CONTROL_NOT_FORWARDED_SUFFIX = (
     "->not_forwarded(provider_decides_caching;"

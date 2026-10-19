@@ -9,6 +9,7 @@ from exp.common.models import AssistantAction, ModelMessage, ModelRequest, ToolC
 from exp.common.models.content import DocumentContentPart, ImageContentPart, TextContentPart
 from exp.common.tasks import ToolSchema
 from exp.runtime.models.providers.gemini_requests import (
+    GEMINI_MISSING_TOOL_RESULT,
     GEMINI_THOUGHT_SIGNATURE_BYPASS,
     gemini_generate_request,
     gemini_model_path,
@@ -182,6 +183,108 @@ def test_gemini_generate_request_replays_every_function_call_with_the_bypass_sig
         assert isinstance(part, dict)
         assert "functionCall" in part
         assert part["thoughtSignature"] == "skip_thought_signature_validator"
+
+
+def _function_responses(content: JsonObject) -> list[tuple[str, object]]:
+    parts = cast("list[JsonObject]", content["parts"])
+    responses = [cast("JsonObject", part["functionResponse"]) for part in parts]
+    return [
+        (cast("str", response["name"]), cast("JsonObject", response["response"])["content"])
+        for response in responses
+    ]
+
+
+def _parallel_calls() -> AssistantAction:
+    return AssistantAction(
+        tool_calls=(
+            ToolCall(call_id="call-1", name="write", arguments={"path": "a"}),
+            ToolCall(call_id="call-2", name="read", arguments={"path": "b"}),
+            ToolCall(call_id="call-3", name="list", arguments={}),
+        )
+    )
+
+
+def test_parallel_tool_results_answer_their_model_turn_in_one_user_content() -> None:
+    """One functionResponse per functionCall, in ONE content, in call order.
+
+    Gemini refuses "the number of function response parts is equal to the
+    number of function call parts" when each tool message becomes its own
+    content (51 production requests across about 20 organizations, 2026-10-18).
+    """
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="user", content="go"),
+            ModelMessage(role="assistant", assistant_action=_parallel_calls()),
+            ModelMessage(role="tool", content="r2", tool_call_id="call-2"),
+            ModelMessage(role="tool", content="r1", tool_call_id="call-1"),
+            ModelMessage(role="tool", content="r3", tool_call_id="call-3"),
+        ),
+    )
+    contents = cast(
+        "list[JsonObject]", gemini_generate_request("gemini-3.5-flash", request)["contents"]
+    )
+
+    assert [content["role"] for content in contents] == ["user", "model", "user"]
+    assert _function_responses(contents[2]) == [("write", "r1"), ("read", "r2"), ("list", "r3")]
+
+
+def test_user_text_between_parallel_results_follows_the_grouped_responses() -> None:
+    """A client reminder between two results no longer splits the answer turn."""
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="user", content="go"),
+            ModelMessage(role="assistant", assistant_action=_parallel_calls()),
+            ModelMessage(role="tool", content="r1", tool_call_id="call-1"),
+            ModelMessage(role="user", content="reminder"),
+            ModelMessage(role="tool", content="r2", tool_call_id="call-2"),
+            ModelMessage(role="tool", content="r3", tool_call_id="call-3"),
+            ModelMessage(role="assistant", content="done"),
+        ),
+    )
+    contents = cast(
+        "list[JsonObject]", gemini_generate_request("gemini-3.5-flash", request)["contents"]
+    )
+
+    assert [content["role"] for content in contents] == ["user", "model", "user", "user", "model"]
+    assert _function_responses(contents[2]) == [("write", "r1"), ("read", "r2"), ("list", "r3")]
+    assert contents[3] == {"role": "user", "parts": [{"text": "reminder"}]}
+
+
+def test_an_unanswered_parallel_call_gets_the_placeholder_once_a_later_turn_exists() -> None:
+    """An interrupted call is answered with the placeholder so the turn stays countable."""
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="user", content="go"),
+            ModelMessage(role="assistant", assistant_action=_parallel_calls()),
+            ModelMessage(role="tool", content="r1", tool_call_id="call-1"),
+            ModelMessage(role="user", content="stop, do something else"),
+        ),
+    )
+    contents = cast(
+        "list[JsonObject]", gemini_generate_request("gemini-3.5-flash", request)["contents"]
+    )
+
+    assert [content["role"] for content in contents] == ["user", "model", "user", "user"]
+    assert _function_responses(contents[2]) == [
+        ("write", "r1"),
+        ("read", GEMINI_MISSING_TOOL_RESULT),
+        ("list", GEMINI_MISSING_TOOL_RESULT),
+    ]
+
+
+def test_a_trailing_model_turn_awaiting_results_is_left_unanswered() -> None:
+    """No later turn means nothing for Gemini to count; no placeholder is invented."""
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="user", content="go"),
+            ModelMessage(role="assistant", assistant_action=_parallel_calls()),
+        ),
+    )
+    contents = cast(
+        "list[JsonObject]", gemini_generate_request("gemini-3.5-flash", request)["contents"]
+    )
+
+    assert [content["role"] for content in contents] == ["user", "model"]
 
 
 def test_gemini_generate_request_rejects_an_unlinked_tool_result() -> None:

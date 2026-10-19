@@ -9,7 +9,7 @@ builders import it without creating a cycle through the streaming stack.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
@@ -100,13 +100,23 @@ def gemini_generate_request(
     # after conversation start rides as user text where the caller put it
     # (consecutive user contents are accepted on this wire); only the leading
     # run is hoisted.
+    turn = _CallTurn()
     for message in fold_instruction_turns_after_the_leading_run(request.messages):
         if message.role in {"system", "developer"}:
             if message.content is None:
                 raise ValueError("system messages need text content")
             system_parts.append({"text": message.content})
             continue
-        contents.append(_gemini_content(message, tool_names))
+        if message.role == "assistant":
+            turn.close(contents)
+        content = _gemini_content(message, tool_names)
+        if message.role == "assistant":
+            turn.open(message, contents, content)
+        elif turn.collects(message):
+            turn.add(message, content)
+        else:
+            contents.append(content)
+    turn.close(contents)
     if json_object_output:
         system_parts.append({"text": JSON_OBJECT_SYSTEM_INSTRUCTION})
     payload: JsonObject = {"contents": contents}
@@ -169,6 +179,88 @@ def gemini_generate_request(
         generation["maxOutputTokens"] = default_maximum_output_tokens
     payload["generationConfig"] = generation
     return payload
+
+
+GEMINI_MISSING_TOOL_RESULT = (
+    "[no result: the caller's history carries no tool result for this call]"
+)
+"""Function response sent for a parallel call the caller's history never answered.
+
+Gemini refuses a turn unless the content after a model turn answers every one
+of its function calls ("the number of function response parts is equal to
+the number of function call parts"). A history whose call went unanswered (an
+interrupted client) is served with this placeholder in the call's slot; the
+gateway discloses it as ``GEMINI_MISSING_TOOL_RESULT_DISCLOSURE``.
+"""
+
+
+class _CallTurn:
+    """Regroup the answers to one model turn's function calls into one user content.
+
+    Gemini checks that the content right after a model turn carries exactly
+    one ``functionResponse`` part per ``functionCall`` part. Chat and
+    Responses histories carry one tool message per call, sometimes split by
+    user text (folded tool-result images, client reminders), so every result
+    answering the open turn is collected and emitted as ONE user content in
+    call order, ahead of the user contents that arrived with them. A call with
+    no result gets ``GEMINI_MISSING_TOOL_RESULT`` once a later turn exists; a
+    trailing model turn awaiting results is left as it is.
+    """
+
+    def __init__(self) -> None:
+        self._calls: tuple[tuple[str, str], ...] = ()
+        self._responses: dict[str, JsonObject] = {}
+        self._others: list[JsonObject] = []
+
+    def open(self, message: ModelMessage, contents: list[JsonObject], content: JsonObject) -> None:
+        """Append a model turn and start collecting answers to its calls."""
+        contents.append(content)
+        action = message.assistant_action
+        calls = () if action is None else action.tool_calls
+        self._calls = tuple((call.call_id, call.name) for call in calls)
+
+    def collects(self, message: ModelMessage) -> bool:
+        """Whether a user or tool message belongs to the open call turn."""
+        return bool(self._calls) and message.role in {"user", "tool"}
+
+    def add(self, message: ModelMessage, content: JsonObject) -> None:
+        """Hold one message of the open call turn until the turn closes."""
+        call_id = message.tool_call_id or ""
+        if (
+            message.role == "tool"
+            and call_id not in self._responses
+            and any(call_id == known for known, _name in self._calls)
+        ):
+            self._responses[call_id] = content
+            return
+        self._others.append(content)
+
+    def close(self, contents: list[JsonObject]) -> None:
+        """Emit the open turn's answers as one user content, then the rest in order."""
+        if not self._calls:
+            return
+        if self._responses or self._others:
+            parts: list[JsonObject] = []
+            for call_id, name in self._calls:
+                response = self._responses.get(call_id)
+                if response is None:
+                    parts.append(
+                        {
+                            "functionResponse": {
+                                "name": name,
+                                "response": {"content": GEMINI_MISSING_TOOL_RESULT},
+                            }
+                        }
+                    )
+                    continue
+                response_parts = response["parts"]
+                assert isinstance(response_parts, list)
+                parts.extend(cast("list[JsonObject]", response_parts))
+            contents.append({"role": "user", "parts": parts})
+            contents.extend(self._others)
+        self._calls = ()
+        self._responses = {}
+        self._others = []
 
 
 def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonObject:
