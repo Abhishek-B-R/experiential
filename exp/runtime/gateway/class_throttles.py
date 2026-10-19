@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 
+from exp.common.models.catalog import BillingSource
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import AuthorizationSnapshot
 from exp.runtime.gateway.native_execution import InflightRequest, rung_load_key
@@ -37,9 +38,18 @@ from exp.runtime.gateway.rung_admission import RungLoadRegistry
 
 
 def is_self_hosted_rung(deployment: ExactModelDeployment) -> bool:
-    """Whether the rung is our own vLLM server (authored ``upstream_priority``)."""
+    """Whether the rung is our own vLLM server (authored ``upstream_priority``).
+
+    A platform-funded rung only: a customer's own key or endpoint is never
+    self-hosted, whatever its dispatch policy carries, so class throttles and
+    pacing are a hard no-op there.
+    """
     policy = deployment.gateway.dispatch
-    return policy is not None and policy.upstream_priority
+    return (
+        deployment.billing_source is BillingSource.HOST_MANAGED
+        and policy is not None
+        and policy.upstream_priority
+    )
 
 
 def rung_saturation(loads: RungLoadRegistry, deployment: ExactModelDeployment) -> float | None:

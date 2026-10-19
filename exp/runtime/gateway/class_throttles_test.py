@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from exp.common.models.catalog import BillingSource
 from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.class_throttles import (
@@ -31,7 +32,12 @@ def _rung(
     """A rung whose dispatch policy marks it self-hosted (``upstream_priority``) or not."""
     base = _deployment(deployment_id, "experiential_cloud" if self_hosted else "openrouter")
     policy = GatewayRungDispatchPolicy(upstream_priority=self_hosted, concurrency_bound=bound)
-    return base.model_copy(update={"gateway": base.gateway.model_copy(update={"dispatch": policy})})
+    return base.model_copy(
+        update={
+            "billing_source": BillingSource.HOST_MANAGED,
+            "gateway": base.gateway.model_copy(update={"dispatch": policy}),
+        }
+    )
 
 
 def _hold(loads: RungLoadRegistry, rung: ExactModelDeployment, count: int) -> None:
@@ -52,6 +58,12 @@ def test_only_an_upstream_priority_rung_is_self_hosted() -> None:
     assert is_self_hosted_rung(_rung())
     assert not is_self_hosted_rung(_rung(self_hosted=False))
     assert not is_self_hosted_rung(_deployment("plain", "openrouter"))
+
+
+def test_a_customer_billed_rung_is_never_self_hosted() -> None:
+    """A customer's own key or endpoint stays a hard no-op even if a policy marks it."""
+    customer = _rung().model_copy(update={"billing_source": BillingSource.CUSTOMER_MANAGED})
+    assert not is_self_hosted_rung(customer)
 
 
 def test_nothing_is_paced_or_capped_by_default() -> None:
