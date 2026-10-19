@@ -7,6 +7,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Final
 
 from exp.common.core.artifacts import JsonObject
@@ -33,6 +34,7 @@ from exp.runtime.gateway.native_accounting_errors import (
     authority_error,
     internal_protocol_error,
 )
+from exp.runtime.gateway.native_attempt_pricing import deployment_priced_at, priced_attempt
 from exp.runtime.gateway.native_components import SyncWriteLedger
 from exp.runtime.gateway.native_execution import (
     THROTTLE_BACKOFF,
@@ -42,7 +44,6 @@ from exp.runtime.gateway.native_execution import (
     ThrottleDisposition,
     claim_route_from,
     deployment_health_key,
-    deployment_priced_for_service_tier,
     dispatch_disclosure,
     rung_load_key,
 )
@@ -81,7 +82,6 @@ from exp.runtime.gateway.native_settlement import (
 )
 from exp.runtime.gateway.recovery import RecoveryHost, SessionRecoveryRegistry
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
-from exp.runtime.gateway.service_tiers import tier_admission
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 from exp.runtime.openai_protocol.errors import public_failure_error
 
@@ -110,6 +110,7 @@ class NativeAttemptAccounting:
         cache_sample_gate: Callable[[str], bool] | None = None,
         recovery_host: RecoveryHost | None = None,
         default_lane_bound: int | None = None,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         """Bind the durable ledger and start the settlement sweep.
 
@@ -117,11 +118,13 @@ class NativeAttemptAccounting:
             write_ledger: Blocking durable request and attempt ledger.
             budget_error_factory: Optional mapping for a rejected reservation.
             default_lane_bound: Per-worker cap for rungs authoring no bound (lane_saturation).
+            clock: Aware wall clock that dates each attempt's start for off-peak pricing.
             cache_sample_gate: Predicate admitting a settled attempt to the cache-priority
                 EWMA. Hosts exclude promo-funded samples so subsidized replay cannot buy
                 fair-share weight. ``None`` admits every sample; exceptions skip it.
         """
         self._write_ledger = write_ledger
+        self._clock = clock
         self.request_settlements = RequestSettlements(write_ledger)
         self._finish_attempt: Callable[..., None] = write_ledger.finish_attempt
         self._budget_error_factory = budget_error_factory
@@ -466,20 +469,13 @@ class NativeAttemptAccounting:
                 )
                 self._health.release_probe(keys[candidate])
                 break
-            tier = tier_admission(
-                route.deployments[candidate].gateway.prices,
+            priced_at = self._clock()
+            deployment, tier = priced_attempt(
+                route.deployments[candidate],
                 getattr(entry.request, "service_tier", None),
                 forwards_tier=candidate < len(entry.tier_forwarded_by_depth)
                 and entry.tier_forwarded_by_depth[candidate],
-                customer_managed=route.deployments[candidate].billing_source == "customer_managed",
-            )
-            deployment = deployment_priced_for_service_tier(
-                route.deployments[candidate],
-                getattr(entry.request, "service_tier", None),
-                forwards_tier=(
-                    candidate < len(entry.tier_forwarded_by_depth)
-                    and entry.tier_forwarded_by_depth[candidate]
-                ),
+                instant=priced_at,
             )
             reservation_request = entry.request
             if entry.reserved_output_tokens_by_depth:
@@ -550,7 +546,7 @@ class NativeAttemptAccounting:
                     and entry.recovery_reason is not None
                     and dispatch_reason in (None, "affinity", "affinity_sticky")
                     else dispatch_reason,
-                    preferred_deployment=preferred_deployment,
+                    preferred_deployment=deployment_priced_at(preferred_deployment, priced_at),
                 )
             except BudgetReservationRejected as exc:
                 if ticket is not None:

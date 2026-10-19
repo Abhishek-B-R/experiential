@@ -38,6 +38,12 @@ from exp.common.models.catalog_prices import (
     GatewayLongContextTier as GatewayLongContextTier,
 )
 from exp.common.models.catalog_prices import (
+    GatewayOffPeakPrices as GatewayOffPeakPrices,
+)
+from exp.common.models.catalog_prices import (
+    GatewayPriceWindow as GatewayPriceWindow,
+)
+from exp.common.models.catalog_prices import (
     GatewayServiceTierPrices as GatewayServiceTierPrices,
 )
 from exp.common.models.catalog_prices import (
