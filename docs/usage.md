@@ -432,7 +432,11 @@ the memory log is compressed. Memory records are recalled by a native decision m
 SystemOne decisions wire: the catalog's `memory_recall` role when set, otherwise the catalog's
 decision model, preferring Clef Flash (`cloudflare/clef-flash`), then Clef, then Jev. A catalog
 without a decision model builds the simulator without learning and says how to add one. The pass is
-resumable: completed traces replay without provider calls.
+resumable: completed traces replay without provider calls. Learning has no defined cost, so a
+build that learns asks for consent at a terminal and needs `--yes` in automation; without it,
+automation stops before any index is bought and prints the exact command to run again. The
+learning memory belongs to the exact protocol (prompts, re-asks, token limits, attempts): changing
+it learns a fresh memory trace by trace, while changing only the judge replays without calls.
 
 Learning is measured test-then-train: each trace is predicted whole on the memory pinned before
 it. None of the trace's own feedback or investigations reaches its predictions; they are

@@ -337,10 +337,12 @@ def default_judge(
 ) -> JudgeConfig:
     """Return separately versioned behavioral or comparison-style provisional criteria."""
     assets = Path(__file__).with_name("reconstruction_prompts")
-    definition = JudgeDefinition.model_validate_json((assets / (rubric + ".json")).read_text())
+    definition = JudgeDefinition.model_validate_json(
+        (assets / (rubric + ".json")).read_text(encoding="utf-8")
+    )
     prompt = (
         assets / ("judge-keyed.txt" if protocol in ("keyed-v2", "keyed-v3") else "judge.txt")
-    ).read_text()
+    ).read_text(encoding="utf-8")
     if protocol == "keyed-v3":
         prompt += (
             "\nProtocol keyed-v3: Every criterion must explicitly include score. "

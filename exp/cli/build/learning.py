@@ -96,6 +96,7 @@ def run_learning(
     terminal: Console | None = None,
     progress: ProgressHook | None = None,
     pause: Callable[[], AbstractContextManager[None]] | None = None,
+    command: str | None = None,
 ) -> LearningOutcome | None:
     """Write the learning preflight, ask for spend consent, then learn from every trace.
 
@@ -116,6 +117,7 @@ def run_learning(
             ``console``.
         progress: The command's single progress line; without it, learning owns a display.
         pause: Releases that progress line while the spend question is asked.
+        command: Exact command a refusal names; defaults to the bare command.
 
     Returns:
         The outcome, or None when the user declined the spend.
@@ -163,7 +165,8 @@ def run_learning(
                 yes=yes,
                 estimated_cost_usd=None,
                 cost_is_upper_bound=False,
-                command=f"exp eval {project} --audit N" if hold_out else f"exp build {project}",
+                command=command
+                or (f"exp eval {project} --audit N" if hold_out else f"exp build {project}"),
                 non_interactive=non_interactive or not can_prompt(screen),
             )
         if not consented:
@@ -243,6 +246,7 @@ def learn_and_retest(
     retry_incomplete: bool = False,
     details: Console | None = None,
     pipeline: ProgressDisplay | None = None,
+    command: str | None = None,
 ) -> BuildLearning:
     """The build's default pipeline: learn from every trace, then retest the misses.
 
@@ -257,6 +261,7 @@ def learn_and_retest(
         retry_incomplete: Replace an interrupted trace, buying its calls again.
         details: Where the full learning and retest output is written; defaults to ``console``.
         pipeline: The build's single progress line, with ``learning`` and ``retest`` phases.
+        command: The exact build command a refusal tells the operator to run again.
 
     Returns:
         What ran, for the build's summary.
@@ -284,6 +289,7 @@ def learn_and_retest(
         terminal=console,
         progress=None if pipeline is None else pipeline.phase("learning"),
         pause=None if pipeline is None else pipeline.paused,
+        command=command,
     )
     if outcome is None:
         return BuildLearning(recall=recall)
@@ -307,5 +313,6 @@ def learn_and_retest(
         terminal=console,
         progress=None if pipeline is None else pipeline.phase("retest"),
         pause=None if pipeline is None else pipeline.paused,
+        command=command,
     )
     return BuildLearning(recall=recall, outcome=outcome, curve=curve, retest=retest)

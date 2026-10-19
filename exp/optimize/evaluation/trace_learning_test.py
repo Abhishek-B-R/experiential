@@ -1,7 +1,9 @@
 """The learning pass: every trace by default, measured test-then-train, budgeted and resumable."""
 
+import functools
 import json
 import re
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -25,6 +27,8 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     build_report,
     episode,
     held_out_lineages,
+    package_rows,
+    write_catalog,
 )
 from exp.optimize.evaluation.trace_learning import (
     learn_from_traces,
@@ -32,6 +36,12 @@ from exp.optimize.evaluation.trace_learning import (
     learning_curve,
     learning_plan,
     learning_spec,
+)
+from exp.runtime.models import RuntimeModelCatalog
+from exp.runtime.models.providers.transport import (
+    JsonHttpResponse,
+    ProviderTransportError,
+    RecordedRequest,
 )
 from exp.simulation.world_model.experience_memory import (
     Eligibility,
@@ -291,3 +301,79 @@ def test_learning_refuses_to_predict_a_learned_trace_on_later_memory(
     with pytest.raises(ValueError, match="already learned into memory"):
         _relearn(store)
     assert len(provider.requests) == purchased, "refused before any call"
+
+
+def test_automation_without_yes_refuses_before_buying_indexes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Learning's undefined cost is accepted up front, and the refusal names the full command."""
+    provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
+    root = tmp_path / ".exp"
+    root.mkdir()
+    write_catalog(root, recall=True)
+    package = tmp_path / "package.jsonl"
+    rows = package_rows([episode(i) for i in range(USERS)])
+    package.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    monkeypatch.setenv("HELD_OUT_TEST_KEY", "fixture-only")
+    monkeypatch.setenv("EXP_RELEASE_REVISION", REVISION)
+    monkeypatch.setattr(
+        "exp.cli.build.app.RuntimeModelCatalog",
+        functools.partial(RuntimeModelCatalog, transport_factory=lambda: provider),
+    )
+    result = CliRunner().invoke(
+        app,
+        ["build", PROJECT, "-t", str(package), "--source", "otel-genai", "--root", str(root)]
+        + ["--non-interactive"],
+    )
+    output = " ".join(result.output.split())
+    assert result.exit_code == 2, result.output
+    assert not provider.requests, "no index is bought before the refusal"
+    rerun = f"exp build {PROJECT} -t {package} --source otel-genai with --yes"
+    assert "".join(rerun.split()) in "".join(output.split()), "long paths wrap in the terminal"
+
+
+class _EmbeddingOutage(SimulatedProvider):
+    """The routed fake with every embedding request rejected (a revoked key)."""
+
+    def post(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        payload: JsonObject,
+        timeout_seconds: float,
+    ) -> JsonHttpResponse:
+        """Answer 401 to embeddings; route everything else normally."""
+        if url.endswith("/embeddings"):
+            self.requests.append(RecordedRequest(url, dict(headers), payload))
+            return JsonHttpResponse(status_code=401, body={"error": {"message": "bad key"}})
+        return super().post(url, headers=headers, payload=payload, timeout_seconds=timeout_seconds)
+
+
+def test_an_embedding_failure_in_a_configured_build_stops_readably(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`exp build -t` reports a provider failure in one line and exits 1, not a traceback."""
+    provider = _EmbeddingOutage([episode(i) for i in range(USERS)], learnable=True)
+    root = tmp_path / ".exp"
+    root.mkdir()
+    write_catalog(root, recall=True)
+    package = tmp_path / "package.jsonl"
+    rows = package_rows([episode(i) for i in range(USERS)])
+    package.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    monkeypatch.setenv("HELD_OUT_TEST_KEY", "fixture-only")
+    monkeypatch.setenv("EXP_RELEASE_REVISION", REVISION)
+    monkeypatch.setattr(
+        "exp.cli.build.app.RuntimeModelCatalog",
+        functools.partial(RuntimeModelCatalog, transport_factory=lambda: provider),
+    )
+    result = CliRunner().invoke(
+        app,
+        ["build", PROJECT, "-t", str(package), "--source", "otel-genai", "--root", str(root)]
+        + ["--yes", "--non-interactive"],
+    )
+    output = " ".join(result.output.split())
+    assert result.exit_code == 1, result.output
+    assert "a provider request failed" in output
+    assert "Run the same exp build command again to resume" in output
+    assert not isinstance(result.exception, ProviderTransportError | AssertionError)

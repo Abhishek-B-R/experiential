@@ -352,7 +352,7 @@ def revise_reconstruction(
                 "role": "system",
                 "content": files("exp.simulation.reconstruction")
                 .joinpath("prompts/reconstructed-revision.txt")
-                .read_text(),
+                .read_text(encoding="utf-8"),
             },
             {
                 "role": "user",

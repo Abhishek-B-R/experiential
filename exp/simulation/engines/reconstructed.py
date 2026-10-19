@@ -126,7 +126,9 @@ class ReconstructedTextEngine:
         if self.observation_schema is not None:
             check_schema(self.observation_schema)
         self._prompt = (
-            files("exp.simulation.reconstruction").joinpath("prompts/predict.txt").read_text()
+            files("exp.simulation.reconstruction")
+            .joinpath("prompts/predict.txt")
+            .read_text(encoding="utf-8")
         )
 
     @property

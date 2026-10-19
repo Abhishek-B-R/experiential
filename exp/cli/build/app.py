@@ -20,6 +20,7 @@ from exp.cli.build.checkpoints import (
 )
 from exp.cli.build.providers import configure_build_providers
 from exp.cli.build.source import load_stored_build_import, project_for_build
+from exp.cli.build.stops import paid_work_stops, require_learning_consent, rerun_command
 from exp.cli.build.summary import render_completed_build, save_details
 from exp.cli.build.traces import load_build_traces
 from exp.cli.providers.provider_picker import resolve_setup_providers
@@ -60,9 +61,8 @@ from exp.runtime.models import (
     RuntimeModelCatalog,
 )
 from exp.runtime.models.preflight import preflight_capabilities
-from exp.runtime.models.providers.transport import ProviderTransportError, RetryPolicy
+from exp.runtime.models.providers.transport import RetryPolicy
 from exp.simulation.build import ProjectBuild, TaskSetBuild, build_project, select_completed_build
-from exp.simulation.engines.text.errors import SimulationContentionError
 from exp.simulation.retrieval import (
     RAGEmbedderBinding,
     RAGLineageBinding,
@@ -150,7 +150,10 @@ def build(
     yes: bool = typer.Option(
         False,
         "--yes",
-        help="Confirm the estimate, including any budget warning.",
+        help=(
+            "Confirm the estimate, any budget warning, and learning's undefined cost; "
+            "automation that learns needs it."
+        ),
     ),
     maximum_router_cost_usd: float | None = typer.Option(
         None,
@@ -232,48 +235,37 @@ def build(
             )
         from exp.cli.build.wizard import run_build_wizard
 
-        try:
-            run_build_wizard(
-                project,
-                source=source,
-                root=root,
-                world_model=world_model,
-                judge=judge,
-                embedder=embedder,
-                top_k=top_k,
-                maximum_build_cost_usd=maximum_build_cost_usd,
-                maximum_router_cost_usd=maximum_router_cost_usd,
-                providers=tuple(provider or ()),
-                console=_console,
-            )
-        except ArtifactStoreError as exc:
-            raise typer.BadParameter(
-                f"could not save build evidence: {exc}; check the trace file and rerun exp build"
-            ) from exc
-        except (
-            ModelCapabilityError,
-            ModelCatalogError,
-            ModelConnectionError,
-            ProjectStoreError,
-            ValueError,
-        ) as exc:
-            raise typer.BadParameter(str(exc)) from exc
-        except ProviderTransportError as exc:
-            _console.print(f"[red]error[/red] a provider request failed: {exc}")
-            _console.print(
-                "Completed embedding batches and finished steps are saved. Run exp build again "
-                "to resume; an interrupted request may be retried."
-            )
-            raise typer.Exit(code=1) from exc
-        except SimulationContentionError as exc:
-            _console.print(f"[red]error[/red] {exc}")
-            _console.print(
-                "Another process owns in-flight paid work. Completed paid work is saved; "
-                "run exp build again to resume once that process finishes."
-            )
-            raise typer.Exit(code=1) from exc
+        with paid_work_stops(_console):
+            try:
+                run_build_wizard(
+                    project,
+                    source=source,
+                    root=root,
+                    world_model=world_model,
+                    judge=judge,
+                    embedder=embedder,
+                    top_k=top_k,
+                    maximum_build_cost_usd=maximum_build_cost_usd,
+                    maximum_router_cost_usd=maximum_router_cost_usd,
+                    providers=tuple(provider or ()),
+                    console=_console,
+                )
+            except ArtifactStoreError as exc:
+                raise typer.BadParameter(
+                    f"could not save build evidence: {exc}; "
+                    "check the trace file and rerun exp build"
+                ) from exc
+            except (
+                ModelCapabilityError,
+                ModelCatalogError,
+                ModelConnectionError,
+                ProjectStoreError,
+                ValueError,
+            ) as exc:
+                raise typer.BadParameter(str(exc)) from exc
         return
     source = source or "otlp"
+    rerun = rerun_command(project, trace_file, import_id, source, identity)
     started = time.monotonic()
     with usage_error(
         ArtifactStoreError,
@@ -382,17 +374,15 @@ def build(
         if dry_run:
             _console.print("[green]dry run complete[/green] No provider calls or build selection.")
             return
+        if not (yes or reused) and (no_interactive or not can_prompt(_console)):
+            require_learning_consent(_console, catalog, root=root, command=rerun)
         remaining_estimate = 0.0 if reused else estimate
         if not require_spend_consent(
             _console,
             root=root,
             yes=yes,
             estimated_cost_usd=remaining_estimate,
-            command=(
-                f"exp build {project} --import-id {import_id}"
-                if import_id is not None
-                else f"exp build {project} {trace_file}"
-            ),
+            command=rerun,
             non_interactive=no_interactive,
             additional_budgets=(
                 SpendBudget("embedding", remaining_estimate, maximum_build_cost_usd),
@@ -402,24 +392,25 @@ def build(
         # One progress line from here to the end of the build: indexes, learning, retest.
         pipeline = ProgressDisplay(_console, BUILD_PHASES)
         pipeline.start()
-        try:
-            completion = _complete_grounded_build(
-                store,
-                completed,
-                selected=selected,
-                runtime_catalog=runtime_catalog,
-                world_snapshot=world_snapshot,
-                embedder_snapshot=embedder_snapshot,
-                top_k=top_k,
-                estimate=estimate,
-                maximum_build_cost_usd=max(maximum_build_cost_usd, estimate or 0.0),
-                provider_spend_authorized=True,
-                trace_import_id=import_id,
-                progress=pipeline.phase("index"),
-            )
-        except BaseException:
-            pipeline.abort()
-            raise
+        with paid_work_stops(_console):
+            try:
+                completion = _complete_grounded_build(
+                    store,
+                    completed,
+                    selected=selected,
+                    runtime_catalog=runtime_catalog,
+                    world_snapshot=world_snapshot,
+                    embedder_snapshot=embedder_snapshot,
+                    top_k=top_k,
+                    estimate=estimate,
+                    maximum_build_cost_usd=max(maximum_build_cost_usd, estimate or 0.0),
+                    provider_spend_authorized=True,
+                    trace_import_id=import_id,
+                    progress=pipeline.phase("index"),
+                )
+            except BaseException:
+                pipeline.abort()
+                raise
         pipeline.complete("index")
         built = completion.artifacts
     _capture_local_build_telemetry(
@@ -447,6 +438,7 @@ def build(
                 retry_incomplete=retry_incomplete,
                 details=details,
                 pipeline=pipeline,
+                command=rerun,
             )
     except BaseException:
         pipeline.abort()

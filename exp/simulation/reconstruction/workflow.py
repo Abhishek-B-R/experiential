@@ -260,7 +260,7 @@ def _call(
     prompt = (
         files("exp.simulation.reconstruction")
         .joinpath("prompts", (prompt_name or phase) + ".txt")
-        .read_text()
+        .read_text(encoding="utf-8")
     )
     request: JsonObject = {
         "messages": [

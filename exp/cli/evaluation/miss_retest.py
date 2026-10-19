@@ -62,6 +62,7 @@ def run_miss_retest(
     terminal: Console | None = None,
     progress: ProgressHook | None = None,
     pause: Callable[[], AbstractContextManager[None]] | None = None,
+    command: str | None = None,
 ) -> RetestOutcome | None:
     """Replay learned traces the simulator got wrong on its final memory, or replay the result.
 
@@ -78,6 +79,7 @@ def run_miss_retest(
         terminal: The user's terminal, for the spend question and errors.
         progress: The calling command's single progress line; without it, the retest owns one.
         pause: Releases that progress line while the spend question is asked.
+        command: Exact command a refusal names; defaults to the bare command.
 
     Returns:
         The completed retest, or None for a dry run or a declined spend.
@@ -133,7 +135,7 @@ def run_miss_retest(
                     yes=yes,
                     estimated_cost_usd=None,
                     cost_is_upper_bound=False,
-                    command=f"exp build {project}",
+                    command=command or f"exp build {project}",
                     non_interactive=not interactive,
                 )
             if not consented:

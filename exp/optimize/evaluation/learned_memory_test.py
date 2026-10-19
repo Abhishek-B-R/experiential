@@ -293,6 +293,7 @@ def test_actor_evaluation_reads_learned_memory_without_its_own_lineage(
     review, saved = output.split("Estimated $", 1)
     line = f"Simulator memory: v{head.version} ({lineage}"
     assert line in review and line in saved, "the header and the saved report name the version"
+    assert "Memory recall decisions are not in the estimate" in " ".join(saved.split())
     assert provider.world_requests and provider.recall_decisions() > 0
     lineages = lineage_by_task(store)
     observed = 0
