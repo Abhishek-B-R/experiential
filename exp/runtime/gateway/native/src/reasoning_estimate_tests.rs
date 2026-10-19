@@ -137,3 +137,20 @@ fn an_upstream_estimate_is_never_parsed_as_a_billed_reasoning_subset() {
     }));
     assert!(foreign.is_err());
 }
+
+#[test]
+fn bedrock_summarized_thinking_estimates_like_the_messages_wire() {
+    // Bedrock Converse streams Claude's summarized thinking as reasoningContent
+    // text (normalized to ReasoningTextDelta) and reports only outputTokens, so
+    // the estimate is the same output-less-visible count the Messages wire gets
+    // (live 2026-10-19, us.anthropic.claude-opus-4-8 at high: 294 output tokens).
+    let events = vec![
+        Event::ReasoningTextDelta("Head start 60 km, closing 24 km/h, so 2.5 h.".into()),
+        Event::TextDelta("6:35pm, 240 km out".into()),
+    ];
+    // 18 bytes -> ceil(18 / 4) = 5 visible tokens.
+    assert_eq!(
+        ReasoningEstimate::from_events(&events).estimate(&usage(294, None)),
+        Some(289)
+    );
+}

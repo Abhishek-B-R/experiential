@@ -1372,3 +1372,60 @@ def test_bounded_client_wire_profile_marks_the_body_for_signing() -> None:
     assert profile.model_id == "us.anthropic.claude-sonnet-4-5"
     assert profile.timeout_seconds == 600.0
     assert profile.url.endswith("/model/us.anthropic.claude-sonnet-4-5/converse-stream")
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "us.anthropic.claude-opus-4-8",
+        "us.anthropic.claude-opus-4-7",
+        "us.anthropic.claude-opus-5",
+        "us.anthropic.claude-sonnet-5",
+        "us.anthropic.claude-fable-5-1",
+    ],
+)
+def test_bounded_profile_declares_adaptive_reasoning_for_claude_when_the_catalog_does(
+    model_id: str,
+) -> None:
+    """A reasoning-declared Bedrock Claude rung carries the Anthropic effort contract."""
+    client = BedrockClient(
+        model=_snapshot(model_id),
+        region="us-east-1",
+        environment={},
+        runtime_factory=None,
+        supports_reasoning=True,
+        reasoning_effort="high",
+    )
+    profile = BoundedBedrockClient(client).gateway_wire_profile()
+    assert profile.supports_reasoning is True
+    assert profile.reasoning_wire_format == "anthropic_adaptive"
+    assert profile.reasoning_effort == "high"
+
+
+@pytest.mark.parametrize(
+    ("model_id", "declared"),
+    [
+        # The catalog has not declared reasoning: today's contract stands.
+        ("us.anthropic.claude-opus-4-8", False),
+        # Budgeted-thinking Claude and non-Claude models carry no control here.
+        ("us.anthropic.claude-sonnet-4-5", True),
+        ("us.deepseek.r1-v1:0", True),
+        ("moonshot.kimi-k2-thinking", True),
+    ],
+)
+def test_bounded_profile_keeps_reasoning_off_outside_adaptive_claude(
+    model_id: str, declared: bool
+) -> None:
+    """Only a declared adaptive-generation Claude rung gains the reasoning control."""
+    client = BedrockClient(
+        model=_snapshot(model_id),
+        region="us-east-1",
+        environment={},
+        runtime_factory=None,
+        supports_reasoning=declared,
+        reasoning_effort="high" if declared else None,
+    )
+    profile = BoundedBedrockClient(client).gateway_wire_profile()
+    assert profile.supports_reasoning is False
+    assert profile.reasoning_wire_format == "none"
+    assert profile.reasoning_effort is None

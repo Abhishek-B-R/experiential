@@ -313,3 +313,82 @@ def test_zai_thinking_switch_is_scoped_to_zai_glm(url: str, model_id: str) -> No
     payload = dialect_stream_payload(_maas_profile(url, model_id), _effort_request("none"))
     assert "thinking" not in payload
     assert payload["reasoning_effort"] == "none"
+
+
+def _bedrock_claude_profile(
+    model_id: str = "us.anthropic.claude-opus-4-8", *, reasoning: bool = True
+) -> GatewayWireProfile:
+    """Build a Bedrock Claude ConverseStream profile with or without a reasoning control."""
+    return GatewayWireProfile(
+        dialect="bedrock_converse_stream",
+        url=f"https://bedrock-runtime.us-east-1.amazonaws.com/model/{model_id}/converse-stream",
+        model_id=model_id,
+        supports_reasoning=reasoning,
+        reasoning_wire_format="anthropic_adaptive" if reasoning else "none",
+        signs_request_body=True,
+    )
+
+
+def _chat(effort: ReasoningEffort | None = None, **fields: object) -> GatewayRequest:
+    """Build one Chat request, optionally at a reasoning effort."""
+    return GatewayRequest.model_validate(
+        {
+            "surface": GatewayApiSurface.CHAT_COMPLETIONS,
+            "messages": (GatewayMessage(role="user", content="Plan the trip."),),
+            "reasoning_effort": effort,
+            **fields,
+        }
+    )
+
+
+@pytest.mark.parametrize("effort", ["low", "high", "xhigh", "max"])
+def test_bedrock_claude_effort_turns_on_adaptive_thinking_with_a_readable_display(
+    effort: ReasoningEffort,
+) -> None:
+    """A caller effort reaches Converse as the Anthropic adaptive-thinking fields.
+
+    Converse merges ``additionalModelRequestFields`` into the Anthropic body
+    (live 2026-10-19, us.anthropic.claude-opus-4-8 at high: 200, a
+    ``reasoningContent`` block with summarized text and a signature). Before
+    this the dialect sent no thinking field, so an effort could not be honored
+    on a Bedrock Claude rung at all.
+    """
+    payload = dialect_stream_payload(_bedrock_claude_profile(), _chat(effort))
+    assert payload["additionalModelRequestFields"] == {
+        "thinking": {"type": "adaptive", "display": "summarized"},
+        "output_config": {"effort": effort},
+    }
+
+
+def test_bedrock_claude_without_effort_sends_no_thinking_on_an_off_by_default_model() -> None:
+    """Opus 4.8 runs without thinking when no config is sent; no field is invented."""
+    payload = dialect_stream_payload(_bedrock_claude_profile(), _chat())
+    assert "additionalModelRequestFields" not in payload
+
+
+def test_bedrock_claude_that_thinks_by_default_is_asked_only_for_the_display() -> None:
+    """Opus 5 thinks adaptively with no config: the display is requested, the depth is not."""
+    payload = dialect_stream_payload(_bedrock_claude_profile("us.anthropic.claude-opus-5"), _chat())
+    assert payload["additionalModelRequestFields"] == {
+        "thinking": {"type": "adaptive", "display": "summarized"}
+    }
+
+
+def test_bedrock_claude_display_follows_the_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With display withheld the effort still applies and the provider default display stands."""
+    monkeypatch.setenv("EXP_GATEWAY_REASONING_DISPLAY", "0")
+    payload = dialect_stream_payload(_bedrock_claude_profile(), _chat("high"))
+    assert payload["additionalModelRequestFields"] == {
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "high"},
+    }
+    default_thinker = dialect_stream_payload(
+        _bedrock_claude_profile("us.anthropic.claude-opus-5"), _chat()
+    )
+    assert "additionalModelRequestFields" not in default_thinker
+
+
+def test_bedrock_rung_without_a_reasoning_control_sends_no_thinking() -> None:
+    """A rung the catalog does not declare reasoning on keeps today's exact Converse body."""
+    payload = dialect_stream_payload(_bedrock_claude_profile(reasoning=False), _chat(top_k=None))
+    assert "additionalModelRequestFields" not in payload
