@@ -85,6 +85,7 @@ from exp.runtime.openai_protocol.structured_text import (
     responses_json_object_output,
     responses_structured_text,
 )
+from exp.runtime.openai_protocol.tool_call_extra_content import thought_signature
 from exp.runtime.openai_protocol.tool_choice import chat_tool_choice, responses_tool_choice
 from exp.runtime.openai_protocol.tool_search import chat_tool_search, responses_tool_search
 from exp.runtime.openai_protocol.validation_errors import validation_protocol_error
@@ -800,6 +801,7 @@ def _tool_call(call: _AssistantToolCall, param: str) -> ToolCall:
             if call.cache_control is not None
             else None
         ),
+        provider_thought_signature=thought_signature(call.extra_content),
     )
 
 
@@ -962,6 +964,7 @@ def _response_input_messages(
             wire_call = _AssistantToolCall(
                 id=item.call_id,
                 function=_FunctionCall(name=item.name, arguments=item.arguments),
+                extra_content=item.extra_content,
             )
             replayed.append(
                 ReplayedFunctionCall(

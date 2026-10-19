@@ -22,7 +22,9 @@ from exp.runtime.models.providers.instruction_turns import (
     fold_instruction_turns_after_the_leading_run,
 )
 from exp.runtime.models.providers.reasoning_compat import (
+    gemini_thinking_budget,
     gemini_thinking_level,
+    gemini_thinks_by_default,
     reasoning_display_enabled,
 )
 from exp.runtime.models.providers.videos import gemini_video_part
@@ -32,9 +34,11 @@ GEMINI_THOUGHT_SIGNATURE_BYPASS = "skip_thought_signature_validator"
 
 Gemini 3 answers a function call with an opaque ``thoughtSignature`` and
 rejects the next turn with HTTP 400 unless that part comes back carrying it.
-The gateway's public OpenAI and Anthropic surfaces have no field for it, so
-no client can round-trip the real value; Google documents this literal as the
-way to replay a function call whose signature was not retained.
+A replayed call carries its real signature when the caller echoed one
+(``ToolCall.provider_thought_signature``); a turn whose calls carry none
+(history from another provider, or a client that dropped the field) uses this
+literal, which Google documents for replaying a call whose signature was not
+retained.
 """
 
 
@@ -153,20 +157,22 @@ def gemini_generate_request(
         generation["responseMimeType"] = "application/json"
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
     if supports_reasoning:
-        # Thought summaries are the readable reasoning Google returns; without
-        # includeThoughts a thinking model streams only opaque signatures.
-        thinking_config: JsonObject = (
-            {"includeThoughts": True} if reasoning_display_enabled() else {}
-        )
+        thinking_config: JsonObject = {}
+        budget: int | None = None
         if effective_reasoning_effort is not None:
             level = gemini_thinking_level(model_id, effective_reasoning_effort)
-            if level == "none":
-                # thinkingLevel has no off value; the families whose table
-                # admits "none" switch thinking off with a zero budget, and
-                # Google rejects a request that sets both fields.
-                thinking_config["thinkingBudget"] = 0
+            budget = gemini_thinking_budget(model_id, level)
+            # Google rejects a request that sets both fields.
+            if budget is not None:
+                thinking_config["thinkingBudget"] = budget
             else:
                 thinking_config["thinkingLevel"] = level.upper()
+        thinking = budget != 0 and (budget is not None or gemini_thinks_by_default(model_id))
+        # Thought summaries are the readable reasoning Google returns; without
+        # includeThoughts a thinking model streams only opaque signatures.
+        # Vertex refuses includeThoughts on a request whose thinking is off.
+        if thinking and reasoning_display_enabled():
+            thinking_config["includeThoughts"] = True
         if thinking_config:
             generation["thinkingConfig"] = thinking_config
     # The normalized gateway response has no logprob representation. Keep the
@@ -331,14 +337,18 @@ def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonOb
     elif text is not None:
         parts.append({"text": text})
     if action is not None:
+        # Gemini signs only the first call of a parallel batch, so a turn that
+        # carries any real signature replays exactly as issued (unsigned calls
+        # stay unsigned); a turn with none falls back to the placeholder.
+        signed_turn = any(call.provider_thought_signature for call in action.tool_calls)
         for call in action.tool_calls:
             tool_names[call.call_id] = call.name
-            parts.append(
-                {
-                    "functionCall": {"name": call.name, "args": call.arguments},
-                    "thoughtSignature": GEMINI_THOUGHT_SIGNATURE_BYPASS,
-                }
-            )
+            part: JsonObject = {"functionCall": {"name": call.name, "args": call.arguments}}
+            if call.provider_thought_signature is not None:
+                part["thoughtSignature"] = call.provider_thought_signature
+            elif not signed_turn:
+                part["thoughtSignature"] = GEMINI_THOUGHT_SIGNATURE_BYPASS
+            parts.append(part)
     if not parts:
         raise ValueError("assistant messages need text or tool calls")
     return {"role": "model", "parts": parts}

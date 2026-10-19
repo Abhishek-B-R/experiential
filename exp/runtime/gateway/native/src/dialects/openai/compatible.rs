@@ -351,6 +351,7 @@ impl Normalizer {
                                     name: tool.name.clone(),
                                     namespace: None,
                                     caller: None,
+                                    thought_signature: None,
                                 });
                                 if !tool.raw_arguments.is_empty() {
                                     events.push(Event::ToolArgumentsDelta {
@@ -390,6 +391,7 @@ impl Normalizer {
                                 name,
                                 namespace: None,
                                 caller: None,
+                                thought_signature: None,
                             });
                         }
                         self.tools.insert(index, tool);

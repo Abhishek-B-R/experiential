@@ -282,17 +282,25 @@ pub(crate) fn remember_argument(
         "tool_calls": retention
             .tool_calls
             .iter()
-            .map(|(output_index, call, provider_owned)| json!({
-                "output_index": provider_owned.then_some(output_index),
-                "item_id": call.provider_item_id,
-                "call_id": call.call_id,
-                "name": call.name,
-                "namespace": call.namespace,
-                "caller": call.caller,
-                "arguments": call.raw_arguments,
-                "status": call.provider_status.map(ProviderOutputItemStatus::as_str),
-                "custom": call.custom,
-            }))
+            .map(|(output_index, call, provider_owned)| {
+                let mut retained = json!({
+                    "output_index": provider_owned.then_some(output_index),
+                    "item_id": call.provider_item_id,
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "namespace": call.namespace,
+                    "caller": call.caller,
+                    "arguments": call.raw_arguments,
+                    "status": call.provider_status.map(ProviderOutputItemStatus::as_str),
+                    "custom": call.custom,
+                });
+                // Gemini's signature must return with the replayed call; it
+                // joins the record only when present.
+                if let Some(signature) = &call.thought_signature {
+                    retained["thought_signature"] = json!(signature);
+                }
+                retained
+            })
             .collect::<Vec<Value>>(),
     }))
 }
@@ -393,6 +401,7 @@ mod tests {
                     provider_status: Some(ProviderOutputItemStatus::Incomplete),
                     raw_arguments: "{}".to_string(),
                     custom: false,
+                    thought_signature: None,
                 },
             },
             Event::ProviderOutputItemStarted {
@@ -446,6 +455,7 @@ mod tests {
                     provider_status: None,
                     raw_arguments: "{}".to_string(),
                     custom: false,
+                    thought_signature: None,
                 },
             },
             Event::Completed,
@@ -459,6 +469,41 @@ mod tests {
                 .expect("retention payload is JSON");
         assert_eq!(payload["tool_calls"][0]["namespace"], "collaboration");
         assert_eq!(payload["tool_calls"][0]["name"], "spawn_agent");
+    }
+
+    #[test]
+    fn retention_carries_a_gemini_thought_signature_only_when_present() {
+        let call = |index: u32, signature: Option<&str>| Event::ToolCallCompleted {
+            index,
+            call: CompletedToolCall {
+                namespace: None,
+                caller: None,
+                call_id: format!("call-{index}"),
+                name: "get_weather".to_string(),
+                provider_item_id: None,
+                provider_status: None,
+                raw_arguments: "{}".to_string(),
+                custom: false,
+                thought_signature: signature.map(str::to_string),
+            },
+        };
+        let events = [
+            call(0, Some("c2lnbmF0dXJlLWE=")),
+            call(1, None),
+            Event::Completed,
+        ];
+        let mut retention = ResponsesRetention::default();
+        for event in &events {
+            retention.track(event);
+        }
+        let payload: Value =
+            serde_json::from_str(&remember_argument("request-sig", &retention, None))
+                .expect("retention payload is JSON");
+        assert_eq!(
+            payload["tool_calls"][0]["thought_signature"],
+            "c2lnbmF0dXJlLWE="
+        );
+        assert!(payload["tool_calls"][1].get("thought_signature").is_none());
     }
 
     #[test]
@@ -520,6 +565,7 @@ mod tests {
                     provider_status: None,
                     raw_arguments: "{}".to_string(),
                     custom: false,
+                    thought_signature: None,
                 },
             },
             Event::Completed,

@@ -38,6 +38,7 @@ from exp.runtime.openai_protocol.custom_tool_wire import (
 from exp.runtime.openai_protocol.custom_tool_wire import EchoedItemStatus as _EchoedItemStatus
 from exp.runtime.openai_protocol.native_tools import NativeResponseTool
 from exp.runtime.openai_protocol.reasoning_replay import ReasoningDetail
+from exp.runtime.openai_protocol.tool_call_extra_content import ToolCallExtraContent
 from exp.runtime.openai_protocol.web_search import ChatPlugin, WebSearchOptions
 
 
@@ -257,13 +258,15 @@ class _AssistantToolCall(_WireModel):
     OpenCode-style callers attach an Anthropic ``cache_control`` to the last
     content part of recent messages; when that part is a tool call the hint
     lands inside this entry, so the supported ephemeral form is accepted and
-    carried for the one wire that can honor it.
+    carried for the one wire that can honor it. ``extra_content`` carries
+    Gemini's thought signature back with the call it was issued for.
     """
 
     id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
     type: Literal["function"] = "function"
     function: _FunctionCall
     cache_control: EphemeralCacheControl | None = None
+    extra_content: ToolCallExtraContent | None = None
     index: int | None = Field(default=None, ge=0)
     """Streaming delta ordinal, validated and dropped.
 
@@ -679,6 +682,8 @@ class _ResponseFunctionCall(_WireModel):
         caller: Optional opaque programmatic-call attribution, preserved verbatim.
         arguments: Required JSON argument text, at most four million characters.
         status: Optional echoed lifecycle marker retained for exact replay.
+        extra_content: Optional echoed vendor block carrying Gemini's thought
+            signature, replayed with the call on Gemini wires.
     """
 
     type: Literal["function_call"]
@@ -689,6 +694,7 @@ class _ResponseFunctionCall(_WireModel):
     caller: JsonObject | None = None
     arguments: str = Field(max_length=4_000_000)
     status: _EchoedItemStatus | None = None
+    extra_content: ToolCallExtraContent | None = None
 
 
 class _ResponseFunctionOutput(_WireModel):

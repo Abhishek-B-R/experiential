@@ -379,6 +379,7 @@ impl ResponsesSseEncoder {
                 name,
                 namespace,
                 caller,
+                thought_signature,
             } => self.tool_started(
                 *index,
                 call_id,
@@ -386,6 +387,7 @@ impl ResponsesSseEncoder {
                 namespace.as_deref(),
                 caller.as_ref(),
                 *custom,
+                thought_signature.as_deref(),
             ),
             Event::ToolArgumentsDelta { index, delta } => self.tool_arguments(*index, delta),
             Event::ToolCallCompleted { index, call } => self.tool_completed(*index, call),
@@ -635,6 +637,7 @@ impl ResponsesSseEncoder {
     }
 
     /// Emit one stable function-call output item start.
+    #[allow(clippy::too_many_arguments)]
     fn tool_started(
         &mut self,
         index: u32,
@@ -643,6 +646,7 @@ impl ResponsesSseEncoder {
         namespace: Option<&str>,
         caller: Option<&Value>,
         custom: bool,
+        thought_signature: Option<&str>,
     ) -> Result<Vec<String>, PublicError> {
         if self.tools.contains_key(&index) {
             return Err(invalid_provider_stream(
@@ -689,6 +693,7 @@ impl ResponsesSseEncoder {
             name: name.to_string(),
             namespace: namespace.map(str::to_string),
             caller: caller.cloned(),
+            thought_signature: thought_signature.map(str::to_string),
             arguments: String::new(),
             status,
             done: false,
@@ -746,6 +751,7 @@ impl ResponsesSseEncoder {
             || state.name != call.name
             || state.namespace != call.namespace
             || state.caller != call.caller
+            || state.thought_signature != call.thought_signature
             || state.custom != call.custom
             || state.arguments != call.raw_arguments
             || (provider_owned_identity && call.provider_item_id != state.item_id)

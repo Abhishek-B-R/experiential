@@ -71,6 +71,7 @@ fn fireworks_tool_events() -> Vec<Event> {
             index: 0,
             call_id: "call-one".to_string(),
             name: "lookup".to_string(),
+            thought_signature: None,
         },
         Event::ToolArgumentsDelta {
             index: 0,
@@ -87,6 +88,7 @@ fn fireworks_tool_events() -> Vec<Event> {
                 provider_item_id: None,
                 provider_status: None,
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::Completed,
@@ -159,6 +161,7 @@ fn fireworks_parallel_tools_share_public_and_carrier_order() {
             index: 1,
             call_id: "call-one".to_string(),
             name: "first".to_string(),
+            thought_signature: None,
         },
         Event::ToolCallStarted {
             custom: false,
@@ -167,6 +170,7 @@ fn fireworks_parallel_tools_share_public_and_carrier_order() {
             index: 0,
             call_id: "call-zero".to_string(),
             name: "second".to_string(),
+            thought_signature: None,
         },
         Event::ToolArgumentsDelta {
             index: 0,
@@ -187,6 +191,7 @@ fn fireworks_parallel_tools_share_public_and_carrier_order() {
                 provider_item_id: None,
                 provider_status: None,
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::ToolCallCompleted {
@@ -200,6 +205,7 @@ fn fireworks_parallel_tools_share_public_and_carrier_order() {
                 provider_item_id: None,
                 provider_status: None,
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::Completed,
@@ -377,6 +383,7 @@ fn provider_item_starts_preserve_reasoning_tool_order_and_identity() {
             index: 1,
             call_id: "call-1".to_string(),
             name: "lookup".to_string(),
+            thought_signature: None,
         },
         Event::ToolArgumentsDelta {
             index: 1,
@@ -398,6 +405,7 @@ fn provider_item_starts_preserve_reasoning_tool_order_and_identity() {
                 provider_status: None,
                 raw_arguments: "{}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::Completed,
@@ -494,6 +502,7 @@ fn provider_items_preserve_multiple_messages_status_phase_and_idless_call() {
             index: 2,
             call_id: "call-required".to_string(),
             name: "lookup".to_string(),
+            thought_signature: None,
         },
         Event::ToolArgumentsDelta {
             index: 2,
@@ -517,6 +526,7 @@ fn provider_items_preserve_multiple_messages_status_phase_and_idless_call() {
                 provider_status: Some(ProviderOutputItemStatus::Incomplete),
                 raw_arguments: "{}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::ProviderOutputItemStarted {
@@ -577,121 +587,6 @@ fn provider_items_preserve_multiple_messages_status_phase_and_idless_call() {
         .any(|frame| frame.contains("response.function_call_arguments")));
 }
 
-#[test]
-fn namespaced_tool_call_items_re_emit_namespace_to_the_caller() {
-    // The caller replays the completed function_call item verbatim, so the
-    // synthesized output items must carry the namespace or the provider
-    // rejects the next turn ("Missing namespace for function_call ...").
-    let events = vec![
-        Event::ToolCallStarted {
-            custom: false,
-            index: 0,
-            call_id: "call-ns".to_string(),
-            name: "spawn_agent".to_string(),
-            namespace: Some("collaboration".to_string()),
-            caller: None,
-        },
-        Event::ToolArgumentsDelta {
-            index: 0,
-            delta: "{}".to_string(),
-        },
-        Event::ToolCallCompleted {
-            index: 0,
-            call: crate::events::CompletedToolCall {
-                call_id: "call-ns".to_string(),
-                name: "spawn_agent".to_string(),
-                namespace: Some("collaboration".to_string()),
-                caller: None,
-                provider_item_id: None,
-                provider_status: None,
-                raw_arguments: "{}".to_string(),
-                custom: false,
-            },
-        },
-        Event::Completed,
-    ];
-    let mut encoder = ResponsesSseEncoder::new(
-        "request-1",
-        "coding",
-        1_700_000_000,
-        ResponsesEnvelope::default(),
-    );
-    encoder.start().expect("stream start must encode");
-    let mut frames = Vec::new();
-    for event in &events {
-        frames.extend(encoder.feed(event).expect("events must encode"));
-    }
-    let added = frames
-        .iter()
-        .find(|frame| frame.contains("response.output_item.added"))
-        .expect("tool item start frame");
-    assert!(added.contains("\"namespace\":\"collaboration\""));
-    let done = frames
-        .iter()
-        .find(|frame| frame.contains("response.output_item.done"))
-        .expect("tool item done frame");
-    assert!(done.contains("\"namespace\":\"collaboration\""));
-
-    let completed = completed_responses_body(
-        "request-1",
-        "coding",
-        1_700_000_000,
-        ResponsesEnvelope::default(),
-        &events,
-    )
-    .expect("completed body must encode");
-    assert_eq!(
-        completed.body["output"][0]["namespace"],
-        json!("collaboration")
-    );
-
-    // A namespace-free call keeps the exact pre-existing item shape.
-    let plain = completed_responses_body(
-        "request-2",
-        "coding",
-        1_700_000_000,
-        ResponsesEnvelope::default(),
-        &[
-            Event::ToolCallStarted {
-                custom: false,
-                index: 0,
-                call_id: "call-plain".to_string(),
-                name: "lookup".to_string(),
-                namespace: None,
-                caller: None,
-            },
-            Event::ToolArgumentsDelta {
-                index: 0,
-                delta: "{}".to_string(),
-            },
-            Event::ToolCallCompleted {
-                index: 0,
-                call: crate::events::CompletedToolCall {
-                    call_id: "call-plain".to_string(),
-                    name: "lookup".to_string(),
-                    namespace: None,
-                    caller: None,
-                    provider_item_id: None,
-                    provider_status: None,
-                    raw_arguments: "{}".to_string(),
-                    custom: false,
-                },
-            },
-            Event::Completed,
-        ],
-    )
-    .expect("completed body must encode");
-    assert!(plain.body["output"][0]
-        .as_object()
-        .expect("tool item object")
-        .get("namespace")
-        .is_none());
-}
-
-/// Hosted tool items re-emit verbatim at gateway-owned indexes: the public
-/// output index and sequence number are re-stamped, everything inside the
-/// item and its progress payloads passes through untouched, and the final
-/// envelope re-serves the provider's exact item JSON.
 #[test]
 fn hosted_tool_items_reemit_verbatim_at_remapped_indexes() {
     let mut encoder = ResponsesSseEncoder::new(
@@ -927,72 +822,8 @@ fn hosted_non_call_items_never_join_the_ledger_tool_names() {
     assert_eq!(tool_names, vec!["web_search_call".to_string()]);
 }
 
-#[test]
-fn caller_attributed_tool_call_items_re_emit_caller_to_the_caller() {
-    // The caller replays the completed function_call item verbatim, so the
-    // synthesized output items must carry the SDK 3.0 `caller` attribution
-    // exactly as the provider emitted it.
-    let caller = json!({"type": "program", "id": "prog_1"});
-    let events = vec![
-        Event::ToolCallStarted {
-            custom: false,
-            index: 0,
-            call_id: "call-caller".to_string(),
-            name: "lookup".to_string(),
-            namespace: None,
-            caller: Some(caller.clone()),
-        },
-        Event::ToolArgumentsDelta {
-            index: 0,
-            delta: "{}".to_string(),
-        },
-        Event::ToolCallCompleted {
-            index: 0,
-            call: crate::events::CompletedToolCall {
-                call_id: "call-caller".to_string(),
-                name: "lookup".to_string(),
-                namespace: None,
-                caller: Some(caller.clone()),
-                provider_item_id: None,
-                provider_status: None,
-                raw_arguments: "{}".to_string(),
-                custom: false,
-            },
-        },
-        Event::Completed,
-    ];
-    let mut encoder = ResponsesSseEncoder::new(
-        "request-1",
-        "coding",
-        1_700_000_000,
-        ResponsesEnvelope::default(),
-    );
-    encoder.start().expect("stream start must encode");
-    let mut frames = Vec::new();
-    for event in &events {
-        frames.extend(encoder.feed(event).expect("events must encode"));
-    }
-    let added = frames
-        .iter()
-        .find(|frame| frame.contains("response.output_item.added"))
-        .expect("tool item start frame");
-    assert!(added.contains("\"caller\"") && added.contains("\"prog_1\""));
-    let done = frames
-        .iter()
-        .find(|frame| frame.contains("response.output_item.done"))
-        .expect("tool item done frame");
-    assert!(done.contains("\"caller\"") && done.contains("\"prog_1\""));
-
-    let completed = completed_responses_body(
-        "request-1",
-        "coding",
-        1_700_000_000,
-        ResponsesEnvelope::default(),
-        &events,
-    )
-    .expect("completed body must encode");
-    assert_eq!(completed.body["output"][0]["caller"], caller);
-}
-
 #[path = "probabilities_tests.rs"]
 mod probabilities_tests;
+
+#[path = "tool_attribution_tests.rs"]
+mod tool_attribution_tests;

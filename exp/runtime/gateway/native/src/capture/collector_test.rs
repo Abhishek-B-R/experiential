@@ -404,6 +404,7 @@ fn raw_tool_arguments_survive_projection_but_never_response_denial() {
         provider_status: None,
         raw_arguments: "{  \"x\" : \"雪\"  }".into(),
         custom: false,
+        thought_signature: None,
     };
     assert!(collector.begin(request("kept")));
     collector.tool_call("kept", &call);

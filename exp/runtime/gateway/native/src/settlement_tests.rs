@@ -447,6 +447,7 @@ fn settle_argument_preserves_upstream_provider_and_cache_ttl_usage_together() {
         reasoning_tokens: None,
         billed_units: None,
         cache_writes_read_back: false,
+        image_output_tokens: None,
     };
     let named = settle_argument(
         "req",
