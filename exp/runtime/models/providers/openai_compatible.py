@@ -233,7 +233,9 @@ def openai_embedding_request(
     return request
 
 
-def openai_images_request(model_id: str, request: ImagesRequest) -> JsonObject:
+def openai_images_request(
+    model_id: str, request: ImagesRequest, *, inline_images: bool = False
+) -> JsonObject:
     """Convert one canonical image-generation request into the OpenAI wire body.
 
     Every optional control is omitted when absent so the provider default
@@ -242,6 +244,10 @@ def openai_images_request(model_id: str, request: ImagesRequest) -> JsonObject:
     Args:
         model_id: Served image model id.
         request: Canonical image-generation request.
+        inline_images: Force ``response_format: "b64_json"`` whatever the caller
+            asked, for a provider that keeps hosted images (xAI refuses ``url``
+            output for Zero Data Retention teams). The caller then receives
+            ``b64_json`` items; the gateway hosts no images to link to.
 
     Returns:
         The OpenAI-compatible ``/images/generations`` request body.
@@ -260,6 +266,8 @@ def openai_images_request(model_id: str, request: ImagesRequest) -> JsonObject:
         value = getattr(request, field)
         if value is not None:
             body[field] = value
+    if inline_images:
+        body["response_format"] = "b64_json"
     return body
 
 

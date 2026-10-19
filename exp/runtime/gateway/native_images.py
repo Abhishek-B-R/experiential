@@ -55,6 +55,7 @@ from exp.runtime.gateway.native_settlement import gateway_updating_failure
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers import require_gateway_provider
 from exp.runtime.models.providers.openai_compatible import openai_images_request
+from exp.runtime.models.providers.xai import is_xai_images_url
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 
@@ -226,7 +227,9 @@ def _admit_accepted(
                     route,
                     deployment,
                     replace(profile, url=images_url),
-                    openai_images_request(profile.model_id, request),
+                    openai_images_request(
+                        profile.model_id, request, inline_images=is_xai_images_url(images_url)
+                    ),
                 )
             )
     except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.

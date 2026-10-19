@@ -37,8 +37,13 @@ Generations only: prompt in, images out. Served by aliases that declare
 
 An xAI connection is an `openai-compatible` connection on `https://api.x.ai/v1`. xAI takes
 `aspect_ratio` and `resolution` rather than `size`, so callers omit `size` and `quality` on its
-lanes (xAI answers a 400 the gateway relays otherwise). Published xAI prices (2026-10-18): Grok
-Imagine Image $0.02, Imagine Image Quality $0.05, Imagine Image 2.0 $0.04 per image.
+lanes (xAI answers a 400 the gateway relays otherwise). xAI refuses hosted (`url`) image output
+for Zero Data Retention teams, so every request to xAI's own `/images/generations` asks for
+`response_format: "b64_json"` whatever the caller sent, and the caller receives `b64_json` items
+even when it asked for `url` (the gateway hosts no images to link to). Other providers receive the
+caller's `response_format` unchanged. Per-image billing is the same either way. Published xAI
+prices (2026-10-18): Grok Imagine Image $0.02, Imagine Image Quality $0.05, Imagine Image 2.0
+$0.04 per image.
 
 ## Speech: `POST /v1/audio/speech`
 
