@@ -502,6 +502,10 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .get("caller")
                     .filter(|value| value.is_object())
                     .cloned(),
+                thought_signature: object
+                    .get("thought_signature")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
             },
             "tool_arguments_delta" => events::Event::ToolArgumentsDelta { index, delta: text },
             "tool_call_completed" => events::Event::ToolCallCompleted {
@@ -525,6 +529,10 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                         .get("caller")
                         .filter(|value| value.is_object())
                         .cloned(),
+                    thought_signature: object
+                        .get("thought_signature")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
                     provider_item_id: object
                         .get("item_id")
                         .and_then(serde_json::Value::as_str)

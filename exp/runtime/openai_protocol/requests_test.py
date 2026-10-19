@@ -5596,3 +5596,73 @@ def test_codex_desktop_item_metadata_and_summary_delivery_are_disclosed() -> Non
         "input.internal_chat_message_metadata_passthrough->dropped(client_annotation)",
         "stream_options.reasoning_summary_delivery->ignored(not_supported)",
     )
+
+
+def _signed_chat_history(signature: str | None) -> JsonObject:
+    """One Chat continuation echoing a Gemini tool call, optionally signed."""
+    call: JsonObject = {
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": "{}"},
+    }
+    if signature is not None:
+        call["extra_content"] = {"google": {"thought_signature": signature}}
+    return {
+        "model": "coding",
+        "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": None, "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "found"},
+        ],
+    }
+
+
+def test_gemini_thought_signatures_decode_from_chat_and_responses_extra_content() -> None:
+    """Both surfaces read Google's ``extra_content.google.thought_signature`` shape.
+
+    The signature joins replay identity (a reused operation key with a different
+    signature is a different request) and never reaches a non-Gemini wire.
+    """
+    signature = "c2lnbmF0dXJlLWE="
+    chat = decode_chat(_signed_chat_history(signature))
+    assert chat.request.messages[1].tool_calls[0].provider_thought_signature == signature
+    responses = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "message", "role": "user", "content": "go"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "{}",
+                    "extra_content": {"google": {"thought_signature": signature}},
+                },
+                {"type": "function_call_output", "call_id": "call_1", "output": "found"},
+            ],
+        }
+    )
+    call = responses.request.messages[1].tool_calls[0]
+    assert call.provider_thought_signature == signature
+
+    unsigned = decode_chat(_signed_chat_history(None))
+    assert unsigned.request.messages[1].tool_calls[0].provider_thought_signature is None
+    assert canonical_request_sha256(chat.request) != canonical_request_sha256(unsigned.request)
+    assert canonical_request_sha256(chat.request) != canonical_request_sha256(
+        decode_chat(_signed_chat_history("b3RoZXI=")).request
+    )
+
+    payload = openai_responses_stream_payload(
+        "gpt-fixture", responses.request, supports_temperature=False
+    )
+    assert "extra_content" not in json.dumps(payload)
+    assert signature not in json.dumps(payload)
+
+
+def test_a_malformed_thought_signature_is_refused_naming_its_field() -> None:
+    """A signature Google would refuse is a named 400 at the gateway instead."""
+    with pytest.raises(OpenAIProtocolError) as rejected:
+        decode_chat(_signed_chat_history("not base64!"))
+    assert rejected.value.detail.param == (
+        "messages.1.tool_calls.0.extra_content.google.thought_signature"
+    )

@@ -76,6 +76,7 @@ fn output_tokens_lead_a_turn_but_control_frames_do_not() {
         index: 0,
         call_id: "call_1".to_string(),
         name: "get".to_string(),
+        thought_signature: None,
     }
     .is_output_token());
     // Usage, terminals, and opaque reasoning-carrier frames never lead.

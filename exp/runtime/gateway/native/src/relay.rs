@@ -52,9 +52,11 @@ pub fn event_retained_bytes(event: &Event) -> usize {
         Event::ToolArgumentsDelta { delta, .. } | Event::ServerToolArgumentsDelta { delta, .. } => {
             delta.len()
         }
-        Event::ToolCallCompleted { call, .. } | Event::ServerToolUseCompleted { call, .. } => {
-            call.raw_arguments.len().max(64)
-        }
+        Event::ToolCallCompleted { call, .. } | Event::ServerToolUseCompleted { call, .. } => call
+            .raw_arguments
+            .len()
+            .max(64)
+            .saturating_add(call.thought_signature.as_deref().map_or(0, str::len)),
         Event::ServerToolResult { block, .. } => block.len(),
         Event::CitationDelta { citation, .. } => citation.len(),
         Event::HostedToolItemStarted { item, .. } | Event::HostedToolItemCompleted { item, .. } => {

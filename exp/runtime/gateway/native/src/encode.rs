@@ -385,6 +385,7 @@ impl ChatSseEncoder {
                 call_id,
                 name,
                 custom,
+                thought_signature,
                 ..
             } => {
                 if self.tool_indices.contains_key(index) {
@@ -411,6 +412,7 @@ impl ChatSseEncoder {
                         "function": {"name": name, "arguments": ""},
                     })
                 };
+                let call = with_thought_signature(call, thought_signature.as_deref());
                 Ok(vec![self.chunk(json!({ "tool_calls": [call] }), None)])
             }
             Event::ToolArgumentsDelta { index, delta } => {
@@ -559,6 +561,20 @@ impl ChatSseEncoder {
         });
         chat_data(&payload)
     }
+}
+
+/// Attach Gemini's thought signature to one public tool call in the shape
+/// Google's own OpenAI-compatible endpoint uses,
+/// `extra_content.google.thought_signature`, so clients built for that
+/// endpoint echo it back unchanged. A call without one is left as it was.
+pub fn with_thought_signature(mut call: Value, thought_signature: Option<&str>) -> Value {
+    if let (Some(signature), Some(object)) = (thought_signature, call.as_object_mut()) {
+        object.insert(
+            "extra_content".to_string(),
+            json!({"google": {"thought_signature": signature}}),
+        );
+    }
+    call
 }
 
 /// Frame one compact UTF-8-preserving Chat SSE data event.
@@ -739,11 +755,14 @@ pub fn completed_chat_body_with_carrier(
                 "type": "custom",
                 "custom": {"name": call.name, "input": call.raw_arguments},
             })),
-            Event::ToolCallCompleted { call, .. } => Some(json!({
-                "id": call.call_id,
-                "type": "function",
-                "function": {"name": call.name, "arguments": call.raw_arguments},
-            })),
+            Event::ToolCallCompleted { call, .. } => Some(with_thought_signature(
+                json!({
+                    "id": call.call_id,
+                    "type": "function",
+                    "function": {"name": call.name, "arguments": call.raw_arguments},
+                }),
+                call.thought_signature.as_deref(),
+            )),
             _ => None,
         })
         .collect();

@@ -151,8 +151,9 @@ def test_gemini_generate_request_replays_every_function_call_with_the_bypass_sig
     """Each replayed function call carries Gemini's documented placeholder signature.
 
     Gemini 3 rejects a follow-up turn (HTTP 400, ``missing a thought_signature``)
-    when a replayed ``functionCall`` part has no signature, and the gateway's
-    public surfaces cannot carry the real one back from the client.
+    when a replayed ``functionCall`` part has no signature, so a turn whose
+    calls carry none (the caller dropped them, or the history came from another
+    provider) replays every call on the placeholder.
     """
     calls = (
         ToolCall(call_id="call-1", name="write", arguments={"path": "a"}),
@@ -285,6 +286,45 @@ def test_a_trailing_model_turn_awaiting_results_is_left_unanswered() -> None:
     )
 
     assert [content["role"] for content in contents] == ["user", "model"]
+
+
+def test_gemini_generate_request_replays_a_signed_turn_exactly_as_issued() -> None:
+    """A carried signature returns on its call; Gemini's unsigned sibling stays unsigned.
+
+    Gemini signs only the first call of a parallel batch, so the turn replays
+    in the shape Google issued it rather than mixing in the placeholder.
+    """
+    calls = (
+        ToolCall(
+            call_id="call-1",
+            name="get_weather",
+            arguments={"city": "Paris"},
+            provider_thought_signature="c2lnbmF0dXJlLWE=",
+        ),
+        ToolCall(call_id="call-2", name="get_weather", arguments={"city": "Tokyo"}),
+    )
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="user", content="go"),
+            ModelMessage(role="assistant", assistant_action=AssistantAction(tool_calls=calls)),
+            ModelMessage(role="tool", content="sunny", tool_call_id="call-1"),
+            ModelMessage(role="tool", content="sunny", tool_call_id="call-2"),
+        ),
+    )
+    payload = gemini_generate_request("gemini-3-flash-preview", request)
+
+    contents = payload["contents"]
+    assert isinstance(contents, list)
+    assert contents[1] == {
+        "role": "model",
+        "parts": [
+            {
+                "functionCall": {"name": "get_weather", "args": {"city": "Paris"}},
+                "thoughtSignature": "c2lnbmF0dXJlLWE=",
+            },
+            {"functionCall": {"name": "get_weather", "args": {"city": "Tokyo"}}},
+        ],
+    }
 
 
 def test_gemini_generate_request_rejects_an_unlinked_tool_result() -> None:

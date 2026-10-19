@@ -294,7 +294,17 @@ honoring the selector is impossible and accepting it would be silent."""
 RESPONSES_INPUT_ITEM_FIELDS_ACCEPTED: dict[str, frozenset[str]] = {
     "message": frozenset({"type", "role", "content", "id", "status", "phase"}),
     "function_call": frozenset(
-        {"type", "call_id", "name", "namespace", "caller", "arguments", "id", "status"}
+        {
+            "type",
+            "call_id",
+            "name",
+            "namespace",
+            "caller",
+            "arguments",
+            "id",
+            "status",
+            "extra_content",
+        }
     ),
     "function_call_output": frozenset(
         {"type", "call_id", "output", "name", "namespace", "caller", "id", "status"}
@@ -316,7 +326,9 @@ replayed without it ("Missing namespace for function_call ..."), which
 wedges every later turn of the session. ``caller`` is SDK 3.0's opaque
 programmatic tool-calling attribution (``{"type": "program", "id": ...}``);
 its internal shape is an evolving provider surface, so it is validated only
-as an object and round-trips verbatim like ``namespace``.
+as an object and round-trips verbatim like ``namespace``. ``extra_content``
+carries Gemini's thought signature (``extra_content.google.thought_signature``,
+the shape this gateway emits on Gemini calls) back with its call.
 """
 
 CHAT_CACHE_CONTROL_PLACEMENTS: dict[str, str] = {

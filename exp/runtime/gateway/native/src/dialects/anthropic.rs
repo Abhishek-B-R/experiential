@@ -129,6 +129,7 @@ impl Normalizer {
                             name,
                             namespace: None,
                             caller: None,
+                            thought_signature: None,
                         });
                     }
                     Some("server_tool_use") => {

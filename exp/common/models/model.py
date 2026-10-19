@@ -37,6 +37,9 @@ ChatMaxTokensField = Literal["max_tokens", "max_completion_tokens"]
 MAXIMUM_TOOL_CALL_ID_CHARACTERS: Final = 65_536
 """Bound opaque tool identifiers, including provider-carried reasoning signatures."""
 
+MAXIMUM_THOUGHT_SIGNATURE_CHARACTERS: Final = 1_048_576
+"""Bound one Gemini thought signature, matching the gateway's 1 MiB evidence bound."""
+
 DEFAULT_REASONING_EFFORT: Final[ReasoningEffort] = "medium"
 """Reasoning effort pinned by default for models known to accept the parameter.
 
@@ -317,6 +320,23 @@ class ToolCall(ContractModel):
     caller replays an item carrying ``caller`` or when the provider emits
     one. Excluded from serialization like the other replay fields, and joins
     gateway replay identity explicitly.
+    """
+    provider_thought_signature: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAXIMUM_THOUGHT_SIGNATURE_CHARACTERS,
+        exclude=True,
+    )
+    """Gemini's opaque ``thoughtSignature`` for this call.
+
+    Gemini signs a function call (the first one of a parallel batch) and
+    expects the signature back with that call on the next turn; without it,
+    the replayed call carries Google's documented placeholder, which Google
+    warns may degrade reasoning. Chat and Responses callers round-trip it as
+    ``extra_content.google.thought_signature``, the shape Google's own
+    OpenAI-compatible endpoint uses. Only the Gemini and Vertex wires read it;
+    every other wire ignores it. Excluded from serialization like the other
+    replay fields, and joins gateway replay identity explicitly.
     """
 
     @model_validator(mode="after")

@@ -32,9 +32,11 @@ GEMINI_THOUGHT_SIGNATURE_BYPASS = "skip_thought_signature_validator"
 
 Gemini 3 answers a function call with an opaque ``thoughtSignature`` and
 rejects the next turn with HTTP 400 unless that part comes back carrying it.
-The gateway's public OpenAI and Anthropic surfaces have no field for it, so
-no client can round-trip the real value; Google documents this literal as the
-way to replay a function call whose signature was not retained.
+A replayed call carries its real signature when the caller echoed one
+(``ToolCall.provider_thought_signature``); a turn whose calls carry none
+(history from another provider, or a client that dropped the field) uses this
+literal, which Google documents for replaying a call whose signature was not
+retained.
 """
 
 
@@ -331,14 +333,18 @@ def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonOb
     elif text is not None:
         parts.append({"text": text})
     if action is not None:
+        # Gemini signs only the first call of a parallel batch, so a turn that
+        # carries any real signature replays exactly as issued (unsigned calls
+        # stay unsigned); a turn with none falls back to the placeholder.
+        signed_turn = any(call.provider_thought_signature for call in action.tool_calls)
         for call in action.tool_calls:
             tool_names[call.call_id] = call.name
-            parts.append(
-                {
-                    "functionCall": {"name": call.name, "args": call.arguments},
-                    "thoughtSignature": GEMINI_THOUGHT_SIGNATURE_BYPASS,
-                }
-            )
+            part: JsonObject = {"functionCall": {"name": call.name, "args": call.arguments}}
+            if call.provider_thought_signature is not None:
+                part["thoughtSignature"] = call.provider_thought_signature
+            elif not signed_turn:
+                part["thoughtSignature"] = GEMINI_THOUGHT_SIGNATURE_BYPASS
+            parts.append(part)
     if not parts:
         raise ValueError("assistant messages need text or tool calls")
     return {"role": "model", "parts": parts}

@@ -361,6 +361,7 @@ pub fn messages_prelude_events(rounds: &[ToolSearchRound], request_id: &str) -> 
                 provider_status: None,
                 raw_arguments: input,
                 custom: false,
+                thought_signature: None,
             },
         });
         events.push(Event::ServerToolResult {

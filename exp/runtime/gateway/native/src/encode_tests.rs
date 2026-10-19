@@ -81,6 +81,7 @@ fn fireworks_tool_events() -> Vec<Event> {
             index: 0,
             call_id: "call-one".to_string(),
             name: "lookup".to_string(),
+            thought_signature: None,
         },
         Event::ToolArgumentsDelta {
             index: 0,
@@ -97,6 +98,7 @@ fn fireworks_tool_events() -> Vec<Event> {
                 provider_item_id: None,
                 provider_status: None,
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::Completed,
@@ -209,6 +211,7 @@ fn reasoning_carrier_preserves_provider_tool_start_order() {
             index: 1,
             call_id: "call-one".to_string(),
             name: "first".to_string(),
+            thought_signature: None,
         },
         Event::ToolCallStarted {
             custom: false,
@@ -217,6 +220,7 @@ fn reasoning_carrier_preserves_provider_tool_start_order() {
             index: 0,
             call_id: "call-zero".to_string(),
             name: "second".to_string(),
+            thought_signature: None,
         },
         Event::ToolCallCompleted {
             index: 0,
@@ -229,6 +233,7 @@ fn reasoning_carrier_preserves_provider_tool_start_order() {
                 provider_item_id: None,
                 provider_status: None,
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::ToolCallCompleted {
@@ -242,6 +247,7 @@ fn reasoning_carrier_preserves_provider_tool_start_order() {
                 provider_item_id: None,
                 provider_status: None,
                 custom: false,
+                thought_signature: None,
             },
         },
     ];
@@ -538,6 +544,7 @@ fn custom_tool_events(custom: bool, name: &str, deltas: &[&str], raw: &str) -> V
         index: 0,
         call_id: "call-custom".to_string(),
         name: name.to_string(),
+        thought_signature: None,
     }];
     events.extend(deltas.iter().map(|delta| Event::ToolArgumentsDelta {
         index: 0,
@@ -554,6 +561,7 @@ fn custom_tool_events(custom: bool, name: &str, deltas: &[&str], raw: &str) -> V
             provider_item_id: None,
             provider_status: None,
             custom,
+            thought_signature: None,
         },
     });
     events.push(Event::Completed);
@@ -782,4 +790,72 @@ fn chat_reports_an_estimated_reasoning_count_when_the_provider_publishes_none() 
         completed.usage.expect("usage aggregates").reasoning_tokens,
         None
     );
+}
+
+#[test]
+fn gemini_thought_signatures_ride_chat_tool_calls_as_extra_content() {
+    // Google's OpenAI-compatible shape, on the first streamed chunk of the
+    // signed call and on the completed message; the unsigned call has none.
+    let mut events = Vec::new();
+    for (index, signature) in [(0u32, Some("c2lnbmF0dXJlLWE=")), (1, None)] {
+        let call_id = format!("call-{index}");
+        events.push(Event::ToolCallStarted {
+            custom: false,
+            index,
+            call_id: call_id.clone(),
+            name: "get_weather".to_string(),
+            namespace: None,
+            caller: None,
+            thought_signature: signature.map(str::to_string),
+        });
+        events.push(Event::ToolArgumentsDelta {
+            index,
+            delta: "{}".to_string(),
+        });
+        events.push(Event::ToolCallCompleted {
+            index,
+            call: crate::events::CompletedToolCall {
+                call_id,
+                name: "get_weather".to_string(),
+                namespace: None,
+                caller: None,
+                thought_signature: signature.map(str::to_string),
+                provider_item_id: None,
+                provider_status: None,
+                raw_arguments: "{}".to_string(),
+                custom: false,
+            },
+        });
+    }
+    events.push(Event::Completed);
+    let signed = json!({"google": {"thought_signature": "c2lnbmF0dXJlLWE="}});
+
+    let mut stream =
+        ChatSseEncoder::new_with_ignored("request-1", "gemini", 1_700_000_000, false, Vec::new());
+    let mut frames = stream.start().expect("stream start must encode");
+    for event in &events {
+        frames.extend(stream.feed(event).expect("event must encode"));
+    }
+    let starts: Vec<Value> = frames
+        .iter()
+        .filter_map(|frame| frame.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+        .filter_map(|chunk| {
+            chunk["choices"][0]["delta"]["tool_calls"][0]
+                .as_object()
+                .cloned()
+        })
+        .filter(|call| call.contains_key("id"))
+        .map(Value::Object)
+        .collect();
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[0]["extra_content"], signed);
+    assert!(starts[1].get("extra_content").is_none());
+
+    let completed =
+        completed_chat_body_with_ignored("request-1", "gemini", 1_700_000_000, &events, &[], false)
+            .expect("completed body must encode");
+    let calls = &completed.body["choices"][0]["message"]["tool_calls"];
+    assert_eq!(calls[0]["extra_content"], signed);
+    assert!(calls[1].get("extra_content").is_none());
 }
