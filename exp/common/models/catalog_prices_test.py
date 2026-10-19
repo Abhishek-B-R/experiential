@@ -137,15 +137,16 @@ def _utc(day: int, hour: int, minute: int = 0, second: int = 0, micro: int = 0) 
 @pytest.mark.parametrize(
     ("instant", "peak"),
     [
-        (_utc(19, 0, 58, 59, 999_999), False),
-        (_utc(19, 0, 59), True),  # guard band: one minute before 01:00 is peak
+        (_utc(19, 0, 44, 59, 999_999), False),
+        (_utc(19, 0, 45), True),  # lead band: fifteen minutes before 01:00 is peak
+        (_utc(19, 0, 59), True),
         (_utc(19, 1), True),
         (_utc(19, 3, 59, 59, 999_999), True),
         (_utc(19, 4), True),  # guard band: the first minute after 04:00 is peak
         (_utc(19, 4, 0, 59, 999_999), True),
         (_utc(19, 4, 1), False),
-        (_utc(19, 5, 58, 59, 999_999), False),
-        (_utc(19, 5, 59), True),
+        (_utc(19, 5, 44, 59, 999_999), False),
+        (_utc(19, 5, 45), True),
         (_utc(19, 6), True),
         (_utc(19, 9, 59, 59, 999_999), True),
         (_utc(19, 10, 0, 59, 999_999), True),
@@ -155,12 +156,13 @@ def _utc(day: int, hour: int, minute: int = 0, second: int = 0, micro: int = 0) 
         (_utc(24, 1, 30), False),  # Saturday
         (_utc(25, 7), False),  # Sunday
         (_utc(25, 23, 59, 59, 999_999), False),  # Sunday into Monday (00:00 is off-peak)
-        (datetime(2026, 10, 26, 0, 59, tzinfo=UTC), True),  # Monday guard band
+        (datetime(2026, 10, 26, 0, 44, 59, tzinfo=UTC), False),
+        (datetime(2026, 10, 26, 0, 45, tzinfo=UTC), True),  # Monday lead band
         (datetime(2026, 10, 26, 1, tzinfo=UTC), True),  # Monday again
     ],
 )
 def test_off_peak_window_boundaries_are_half_open_utc(instant: datetime, peak: bool) -> None:
-    """Peak is [01:00, 04:00) and [06:00, 10:00) UTC on weekdays, plus one minute each side."""
+    """Weekday peak [01:00, 04:00) and [06:00, 10:00) UTC, from 15 min before to 1 min after."""
     prices = _deepseek_flash()
     effective = prices.effective_at(instant)
     assert effective.off_peak is None
