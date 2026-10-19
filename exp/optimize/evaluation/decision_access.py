@@ -6,6 +6,7 @@ from datetime import datetime
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
+from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.models.registry import ResolvedModel
 
 
@@ -33,7 +34,10 @@ def decision_caller(
             timeout_seconds=max(min(remaining, 120.0), 0.001),
         )
         if response.status_code != 200 or not isinstance(response.body, dict):
-            raise RuntimeError(f"JEV decision returned HTTP {response.status_code}")
+            raise ProviderTransportError(
+                f"memory-recall decision returned HTTP {response.status_code}",
+                status_code=response.status_code,
+            )
         return response.body
 
     return decide

@@ -41,6 +41,7 @@ from exp.optimize.evaluation.held_out_fidelity import (
 from exp.optimize.evaluation.trace_learning import fit_cases, learning_curve
 from exp.optimize.evaluation.trace_replay import ReplayAggregate, ReplayResult, aggregate
 from exp.runtime.models.providers.transport import ProviderTransportError
+from exp.runtime.models.structured_completion import CompletionNotDispatched
 
 PANEL_CONCURRENCY = 4  # traces of a frozen panel replayed at once
 PANEL_STAGE = "Replaying traces"  # counts finished panel traces
@@ -202,11 +203,11 @@ def execute_runs(
             for finished, future in enumerate(as_completed(futures), start=1):
                 future.result()
                 report(hook, PANEL_STAGE, completed=finished, total=total)
-    except ProviderTransportError as exc:
+    except (ProviderTransportError, CompletionNotDispatched) as exc:
         console.print(f"[red]error[/red] a provider request failed: {exc}")
         console.print(
-            "Completed traces are saved. Run the same command again to continue; "
-            "the stopped trace starts a fresh attempt."
+            "Completed traces are saved. The stopped trace is never bought again silently: "
+            "run the same command with --retry-incomplete to replace it."
         )
         raise typer.Exit(code=1) from exc
 

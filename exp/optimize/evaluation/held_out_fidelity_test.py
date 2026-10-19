@@ -713,3 +713,49 @@ def test_run_ids_follow_content_and_retire_attempts_that_cannot_finish(
     changed = register(later)
     assert not changed.retired
     assert changed.prepared[0].spec.run_id.split("-")[-1] != run_id.split("-")[-1]
+
+
+class Outage(SimulatedProvider):
+    """The routed fake, with simulator predictions rejected while ``down`` (a revoked key)."""
+
+    down = False
+
+    def post(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        payload: JsonObject,
+        timeout_seconds: float,
+    ) -> JsonHttpResponse:
+        """Answer 401 to predictions while down; route everything else normally."""
+        choice = payload.get("tool_choice")
+        function = choice.get("function") if isinstance(choice, dict) else None
+        named = function.get("name") if isinstance(function, dict) else None
+        if self.down and named == "submit_transition":
+            self.requests.append(RecordedRequest(url, dict(headers), payload))
+            return JsonHttpResponse(status_code=401, body={"error": {"message": "bad key"}})
+        return super().post(url, headers=headers, payload=payload, timeout_seconds=timeout_seconds)
+
+
+def test_a_provider_outage_stops_visibly_and_never_becomes_a_score(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rejected key stops the command non-zero; no score is saved; a retry measures for real."""
+    provider = Outage([episode(i) for i in range(USERS)], learnable=True)
+    root, store, _ = build_project(tmp_path, monkeypatch, provider)
+    provider.down = True
+    command = ["eval", PROJECT, "--root", str(root), "--audit", "3", "--yes", "--non-interactive"]
+    failed = CliRunner().invoke(app, command)
+    output = " ".join(failed.output.split())
+    assert failed.exit_code == 1, failed.output
+    assert "a provider request failed" in output and "--retry-incomplete" in output
+    assert "Held-out fidelity" not in output and "learned" not in output
+    assert learning_curve(store, "fit") is None, "a failed prediction is never a measurement"
+
+    provider.down = False
+    stopped = CliRunner().invoke(app, command)
+    assert stopped.exit_code != 0, "an interrupted trace is never bought again silently"
+    assert "--retry-incomplete" in " ".join(stopped.output.split())
+    output = held_out_command(root, 3, "--retry-incomplete")
+    assert "9/9 replies exact (100%)" in output

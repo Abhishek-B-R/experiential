@@ -34,6 +34,7 @@ from exp.optimize.evaluation.trace_learning import (
 )
 from exp.optimize.evaluation.trace_replay import DEADLINE
 from exp.runtime.models.providers.transport import ProviderTransportError
+from exp.runtime.models.structured_completion import CompletionNotDispatched
 
 # Preferred native decision models for memory recall, best first.
 _RECALL_PREFERENCE = ("clef-flash", "clef", "jev")
@@ -179,11 +180,11 @@ def run_learning(
                 progress=hook,
                 retry_incomplete=retry_incomplete,
             )
-    except ProviderTransportError as exc:
+    except (ProviderTransportError, CompletionNotDispatched) as exc:
         screen.print(f"[red]error[/red] a provider request failed: {exc}")
         screen.print(
-            "Learned traces are saved. Run the same command again to continue; "
-            "the stopped trace starts a fresh attempt."
+            "Learned traces are saved. The stopped trace is never bought again silently: "
+            "run the same command with --retry-incomplete to replace it."
         )
         raise typer.Exit(code=1) from exc
     console.print(

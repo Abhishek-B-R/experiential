@@ -21,6 +21,8 @@ from exp.common.models.client import RequestCapacityExceeded
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ArtifactStore
 from exp.runtime.models.budget import SpendLimitReached
+from exp.runtime.models.providers.transport import ProviderTransportError
+from exp.runtime.models.structured_completion import CompletionNotDispatched
 from exp.simulation.engines.transition import Completion
 from exp.simulation.world_model.durable import DurableWorldModelSession
 
@@ -111,6 +113,10 @@ def evaluate_workflow(
                     error_type="budget_exhausted",
                 )
             )
+        except (ProviderTransportError, CompletionNotDispatched):
+            # Infrastructure, not simulator behavior: no result is saved, so the run stays
+            # incomplete (shown, exit non-zero) instead of scoring the rest as misses.
+            raise
         except Exception as error:  # noqa: BLE001 - execution failures retain planned suffixes.
             stopped = True
             steps.append(
