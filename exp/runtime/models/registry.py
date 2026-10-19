@@ -380,6 +380,8 @@ class RuntimeModelCatalog:
                 supports_top_p=_supports_top_p(capabilities),
                 supports_top_k=_supports_flag(capabilities, "supports_top_k"),
                 supports_logprobs=_supports_flag(capabilities, "supports_logprobs"),
+                supports_reasoning=capabilities.supports_reasoning is True,
+                reasoning_effort=capabilities.reasoning_effort,
             )
             client = BoundedBedrockClient(bedrock_client)
             return ResolvedModel(

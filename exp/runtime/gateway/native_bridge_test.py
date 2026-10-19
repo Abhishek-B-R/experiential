@@ -2239,6 +2239,101 @@ def test_abandoned_inflight_attempts_are_swept_after_the_deadline(
             )
 
 
+def test_admit_sends_adaptive_thinking_to_a_reasoning_bedrock_claude_rung(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Chat effort on a reasoning-declared Bedrock Claude rung reaches Converse.
+
+    The deployment declares the same reasoning contract the direct Anthropic
+    lane carries (effort ladder, no required default). Before Bedrock carried
+    adaptive thinking such a declaration contradicted the client profile and
+    the rung could not serve; now the frozen Converse body asks for summarized
+    adaptive thinking at the caller's effort, which is what returns readable
+    reasoning and an estimated reasoning count on the Chat reply.
+    """
+    from exp.common.models import (
+        GatewayDeploymentCapabilities,
+        GatewayTokenPrices,
+        ModelCapabilities,
+    )
+    from exp.runtime.gateway.catalog_authority import (
+        ConnectionConfig,
+        upsert_connection,
+        upsert_singleton_deployment,
+    )
+
+    for name in ("AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "AWS_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "sigv4-secret-canary")
+    manager, raw_key = _configured_gateway(tmp_path)
+    upsert_connection(
+        tmp_path,
+        name="bedrock-main",
+        connection=ConnectionConfig(provider="bedrock", region="us-east-1"),
+        replace=False,
+    )
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="opus",
+        connection_name="bedrock-main",
+        provider_model="us.anthropic.claude-opus-4-8",
+        exact_model_id="bedrock-opus-exact",
+        revision=None,
+        capabilities=ModelCapabilities(
+            supports_reasoning=True,
+            supports_temperature=True,
+            minimum_temperature=1.0,
+            maximum_temperature=1.0,
+            maximum_output_tokens=128_000,
+        ),
+        gateway_capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+            supported_reasoning_efforts=("low", "medium", "high", "xhigh", "max"),
+        ),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="opus",
+        alias_name="opus",
+        revision_id="revision-opus",
+        pool_id="opus",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="opus")
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret"})
+    )
+    admission = _admit(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "opus",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 6000,
+                "reasoning_effort": "high",
+            }
+        ),
+    )
+    assert "escalate" not in admission
+    started = _flatten_started(control, admission)
+    assert started["dialect"] == "bedrock_converse_stream"
+    body = started["upstream_body"]
+    assert isinstance(body, str)
+    payload = json.loads(body)
+    assert payload["additionalModelRequestFields"] == {
+        "thinking": {"type": "adaptive", "display": "summarized"},
+        "output_config": {"effort": "high"},
+    }
+    assert payload["inferenceConfig"]["maxTokens"] == 6000
+
+
 @pytest.mark.parametrize(
     "auth_mode",
     ("ambient_pair", "ambient_bearer", "explicit_bearer", "explicit_pair"),

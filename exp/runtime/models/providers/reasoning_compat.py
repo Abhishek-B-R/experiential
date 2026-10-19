@@ -231,6 +231,26 @@ def anthropic_adaptive_only_thinking(model_id: str) -> bool:
     return any(family in normalized for family in _ANTHROPIC_ADAPTIVE_ONLY_FAMILIES)
 
 
+def bedrock_adaptive_thinking_model(model_id: str) -> bool:
+    """Return whether a Bedrock model id is Claude of the adaptive-thinking generation.
+
+    Converse forwards ``additionalModelRequestFields`` into the Anthropic
+    request body, so these families take ``thinking: {type: adaptive,
+    display}`` and ``output_config.effort`` exactly as the Messages wire does
+    (verified live 2026-10-19 on us.anthropic opus-4-7, opus-4-8, opus-5,
+    sonnet-5, fable-5 and fable-5-1 at high and max). Older Claude releases
+    on Bedrock (budgeted thinking, no effort ladder) and every non-Claude
+    Bedrock model keep no reasoning control on this wire.
+
+    Args:
+        model_id: Exact Bedrock model or inference-profile identifier.
+
+    Returns:
+        ``True`` for a Claude inference profile of an adaptive-only family.
+    """
+    return "anthropic.claude" in model_id.lower() and anthropic_adaptive_only_thinking(model_id)
+
+
 def anthropic_thinks_without_config(model_id: str) -> bool:
     """Return whether a request with no thinking config still runs adaptive thinking.
 

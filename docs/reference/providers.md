@@ -460,6 +460,19 @@ supports_embeddings = true
 input_cost_per_million_tokens_usd = 0
 ```
 
+Claude of the adaptive-thinking generation (Fable 5, Mythos 5, Opus 4.7, Opus 4.8, Opus 5
+and Sonnet 5 inference profiles) takes a reasoning effort on the gateway's ConverseStream wire
+when its capabilities declare `supports_reasoning = true`. A caller effort is sent as
+`additionalModelRequestFields.thinking = {"type": "adaptive", "display": "summarized"}` with
+`output_config.effort`, which Converse forwards into the Anthropic request body. A model that
+thinks without a config (Opus 5, Sonnet 5, Fable 5) is asked only for the readable display.
+The summarized thinking streams back as display reasoning, and the reply carries the
+estimated reasoning count described in the gateway generation reference, because Converse
+reports thinking only inside `outputTokens`. The thinking signature is not returned: Converse
+has no replay path for it here, and adaptive thinking does not require replayed thinking on a
+tool turn. Older Claude releases and non-Claude Bedrock models keep no reasoning control on this
+wire, whatever their capabilities declare.
+
 ## Anthropic inference geography
 
 For a reviewed first-party Claude 4.6+ route, set `inference_geo = "us"`

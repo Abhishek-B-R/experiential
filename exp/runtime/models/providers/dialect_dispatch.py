@@ -308,6 +308,8 @@ def dialect_stream_payload(
             ),
             supports_top_k=profile.supports_top_k,
             supports_logprobs=profile.supports_logprobs,
+            supports_reasoning=profile.supports_reasoning,
+            reasoning_effort=required_reasoning_effort,
         )
     if profile.dialect == "openai_compatible":
         if profile.fireworks_reasoning_route_sha256 is not None:
