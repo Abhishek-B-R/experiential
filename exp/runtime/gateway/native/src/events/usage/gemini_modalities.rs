@@ -4,9 +4,10 @@ use serde_json::{Map, Value};
 
 use super::{bounded_ledger_sum, count_or_zero};
 
-/// The IMAGE entry of Gemini's `candidatesTokensDetails` (per-modality
-/// counts inside `candidatesTokenCount`), when nonzero. An absent breakdown
-/// or modality is no image subset; a malformed entry fails the meter.
+/// The IMAGE entries of Gemini's `candidatesTokensDetails` (per-modality
+/// output counts). A reported breakdown without an IMAGE entry is a real 0;
+/// only an absent breakdown leaves the subset unknown. A malformed entry
+/// fails the meter.
 pub(super) fn gemini_image_candidates(object: &Map<String, Value>) -> Result<Option<u64>, String> {
     let details = match object.get("candidatesTokensDetails") {
         None | Some(Value::Null) => return Ok(None),
@@ -23,7 +24,7 @@ pub(super) fn gemini_image_candidates(object: &Map<String, Value>) -> Result<Opt
             image = bounded_ledger_sum(&[image, count], "Gemini image output")?;
         }
     }
-    Ok((image > 0).then_some(image))
+    Ok(Some(image))
 }
 
 /// The output total with the image subset inside it.

@@ -206,3 +206,8 @@ def test_an_unset_image_rate_leaves_the_card_identity_unchanged() -> None:
         flex=GatewayServiceTierPrices(image_output_nano_usd_per_million_tokens=7)
     ).for_service_tier("flex")
     assert flex.image_output_nano_usd_per_million_tokens == 7
+
+
+def test_a_reported_zero_image_count_prices_all_output_at_the_output_rate() -> None:
+    """A text answer on an image lane is billed as text, never at the image rate."""
+    assert _image_cost(0, 120_000_000_000) == (1_334 * 12_000_000_000 + 500_000) // 1_000_000
