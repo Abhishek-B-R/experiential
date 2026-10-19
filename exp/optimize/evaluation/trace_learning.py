@@ -33,6 +33,7 @@ from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
     ContractModel,
+    JsonObject,
     sha256_json,
     stable_id,
 )
@@ -49,22 +50,37 @@ from exp.optimize.evaluation.fidelity import (
     execute_fidelity_evaluation,
     saved_fidelity_report,
 )
-from exp.optimize.evaluation.fidelity_memory import DUPLICATE, INCOMPLETE, saved_memory_receipt
+from exp.optimize.evaluation.fidelity_memory import (
+    DUPLICATE,
+    INCOMPLETE,
+    saved_memory_receipt,
+    trajectory_record,
+)
 from exp.optimize.evaluation.trace_replay import (
     DEADLINE,
+    INVESTIGATION_TOKENS,
+    PREDICTION_TOKENS,
+    PROPOSAL_REASKS,
+    REQUEST_RESERVATION_USD,
     ReplayCase,
     ReplayResult,
     attempts_used,
     content_run_id,
+    protocol_prompts_sha256,
     recorded_exchanges,
     register_replay,
     replay_case,
     replay_result,
     replay_spec,
 )
+from exp.runtime.models.providers.transport import RetryPolicy
 from exp.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings
 from exp.simulation.retrieval.jev import JEVCueSelector, JEVPolicy
-from exp.simulation.world_model.experience_memory import memory_head, reserve_task_lineage
+from exp.simulation.world_model.experience_memory import (
+    consumed_trajectory_digest,
+    memory_head,
+    reserve_task_lineage,
+)
 from exp.simulation.world_model.runtime import persist_fit_only_world_model
 from exp.simulation.world_model.session_research import OnlineResearchPolicy
 
@@ -309,9 +325,27 @@ def _plan_identity(project: ProjectStore, scope: Scope) -> tuple[ArtifactInput, 
 
 
 def _lineage(world_model: ArtifactInput, scope: Scope) -> str:
-    """Memory lineage of one learning simulator under the test-then-train protocol."""
+    """Memory lineage of one learning simulator under the test-then-train protocol.
+
+    The lineage covers everything that decides a learning run besides its trace, simulator
+    and memory, so changing any of it (a prompt, an allowance) starts a fresh memory that is
+    learned trace by trace again, instead of predicting already-learned traces on a memory
+    that has seen every later trace.
+    """
     key = {"world_model": world_model.model_dump(mode="json"), "scope": scope}
-    return "learn-" + sha256_json({**key, "protocol": "test-then-train"})[:16]
+    return "learn-" + sha256_json({**key, "protocol": "test-then-train", **_protocol()})[:16]
+
+
+def _protocol() -> JsonObject:
+    """The learning run inputs shared by every trace of a lineage."""
+    return {
+        "prompts": protocol_prompts_sha256(),
+        "proposal_reasks": PROPOSAL_REASKS,
+        "output_tokens": {"prediction": PREDICTION_TOKENS, "investigation": INVESTIGATION_TOKENS},
+        "attempts_per_request": RetryPolicy().maximum_attempts,
+        "request_reservation_usd": REQUEST_RESERVATION_USD,
+        "feedback_source": FEEDBACK_SOURCE,
+    }
 
 
 def learning_cases(project: ProjectStore, scope: Scope) -> tuple[ReplayCase, ...]:
@@ -514,6 +548,7 @@ def learn_from_traces(
                 break  # attempts exhausted: the latest one stays the trace's result
             attempted.add(prepared.id)
             if saved_fidelity_report(project, prepared) is None:
+                _require_unlearned(project, plan, spec)
                 if used + spec.maximum_physical_attempts > maximum_attempts:
                     stopped = (
                         f"attempt budget reached after {learned} of {len(cases)} traces; "
@@ -710,3 +745,20 @@ def _inside(
         return None
     detail = f"trace {index + 1}/{len(cases)}"
     return lambda event: progress(replace(event, detail=event.detail or detail))
+
+
+def _require_unlearned(project: ProjectStore, plan: LearningPlan, spec: FidelitySpec) -> None:
+    """Refuse to predict a trace this memory already learned, on memory that has seen later traces.
+
+    Raises:
+        ValueError: The trace is already in the lineage under different run inputs.
+    """
+    head = memory_head(project.artifacts, plan.lineage)
+    digest = consumed_trajectory_digest(trajectory_record(spec))
+    if head is not None and digest in head.consumed:
+        raise ValueError(
+            f"trace {spec.task.task_id} is already learned into memory {plan.lineage} "
+            f"v{head.version}, but its learning run inputs changed; predicting it again would "
+            "read memory that has seen every later trace. This is a learning-identity defect: "
+            "report it with the project's runtime/learning report"
+        )

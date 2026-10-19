@@ -10,7 +10,10 @@ from typer.testing import CliRunner
 
 from exp.cli.app import app
 from exp.common.core.artifacts import JsonObject
-from exp.optimize.evaluation.fidelity import FidelityMemory
+from exp.common.models import load_model_catalog, write_model_catalog
+from exp.common.project import ProjectStore
+from exp.optimize.evaluation import trace_learning, trace_replay
+from exp.optimize.evaluation.fidelity import FidelityMemory, FidelitySpec
 from exp.optimize.evaluation.held_out_fidelity_test import (
     PROJECT,
     REVISION,
@@ -208,3 +211,83 @@ def test_a_trace_is_predicted_whole_before_its_own_feedback_is_used(
     for prediction in provider.predictions():
         assert not _obj(prediction.get("research_history") or {}).get("session")
     assert f"learned {USERS}/{USERS} traces" in output
+
+
+def _relearn(store: ProjectStore) -> None:
+    """Run the build's learning pass again, as a rebuild does."""
+    learn_from_traces(
+        store,
+        recall_alias="jev",
+        scope="all",
+        maximum_attempts=10_000,
+        code_revision=REVISION,
+        clock=lambda: datetime.now(UTC),
+    )
+
+
+def test_a_judge_change_replays_learning_without_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Learning never judges, so another judge leaves its runs and memory as they are."""
+    provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
+    _, store, _ = build_project(tmp_path, monkeypatch, provider, learn=True)
+    lineage, purchased = learning_plan(store, scope="all").lineage, len(provider.requests)
+    catalog = load_model_catalog(store.model_catalog_path)
+    judge = catalog.models["judge"]
+    assert judge.capabilities is not None
+    smaller = judge.capabilities.model_copy(update={"maximum_output_tokens": 8_192})
+    write_model_catalog(
+        store.model_catalog_path,
+        catalog.model_copy(
+            update={
+                "models": {
+                    **catalog.models,
+                    "judge": judge.model_copy(update={"capabilities": smaller}),
+                }
+            }
+        ),
+    )
+    _relearn(store)
+    assert len(provider.requests) == purchased, "no learning run was bought again"
+    assert learning_plan(store, scope="all").lineage == lineage
+
+
+def test_a_protocol_change_learns_a_fresh_memory_trace_by_trace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A changed prompt starts a new memory; no trace is predicted on memory of later traces."""
+    provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
+    _, store, _ = build_project(tmp_path, monkeypatch, provider, learn=True)
+    before = learning_plan(store, scope="all").lineage
+    changed = lambda: "changed-prompts"  # noqa: E731 - one stand-in for an edited prompt
+    monkeypatch.setattr(trace_learning, "protocol_prompts_sha256", changed)
+    monkeypatch.setattr(trace_replay, "protocol_prompts_sha256", changed)
+    _relearn(store)
+    plan = learning_plan(store, scope="all")
+    assert plan.lineage != before, "the edited protocol learns into a new memory"
+    head = memory_head(store.artifacts, plan.lineage)
+    assert head is not None and head.version == USERS
+    curve = learning_curve(store, "all")
+    assert curve is not None and len(curve.points) == USERS
+    # The first trace is predicted on empty memory again, so it misses the learnable reply,
+    # exactly as in the first pass; on the final memory it would have been exact.
+    assert curve.points[0].exact == 2
+
+
+def test_learning_refuses_to_predict_a_learned_trace_on_later_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run input that drifts without a new lineage stops learning before any call."""
+    provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
+    _, store, _ = build_project(tmp_path, monkeypatch, provider, learn=True)
+    purchased = len(provider.requests)
+    content_run_id = trace_replay.content_run_id
+
+    def drifted(spec: FidelitySpec, label: str, trace: str, generation: int = 1) -> str:
+        """Every run ID changes while the lineage stays the same."""
+        return content_run_id(spec, label, trace + "-drift", generation)
+
+    monkeypatch.setattr(trace_replay, "content_run_id", drifted)
+    with pytest.raises(ValueError, match="already learned into memory"):
+        _relearn(store)
+    assert len(provider.requests) == purchased, "refused before any call"

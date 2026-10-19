@@ -426,9 +426,16 @@ def content_run_id(spec: FidelitySpec, label: str, trace: str, generation: int =
     Returns:
         A valid run ID: ``<label>-<trace>-<digest>[-r<generation>]``.
     """
+    # An unjudged run (learning) never calls the judge, so the judge is not one of its inputs:
+    # configuring another judge must not re-address it.
+    unjudged: dict[str, object] = (
+        {} if spec.judged else {"judge": True, "judge_alias": True, "roles": {"judging"}}
+    )
     digest = sha256_json(
         {
-            "spec": spec.model_dump(mode="json", exclude={"run_id", "deadline"}),
+            "spec": spec.model_dump(
+                mode="json", exclude={"run_id": True, "deadline": True, **unjudged}
+            ),
             "prompts": protocol_prompts_sha256(),
         }
     )[:12]
