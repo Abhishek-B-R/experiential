@@ -123,20 +123,25 @@ CHAT_MANIFEST = CompatibilityManifest(
         # is admitted per route; ``audio`` and ``modalities`` request audio
         # OUTPUT, which no route serves.
         # Explicit prompt-cache boundaries: Chat callers can name cache
-        # breakpoints and retention. No rung honors those selectors yet, so
-        # both stay refused rather than silently dropped. The
-        # ``prompt_cache_boundaries`` capability records that decision for
-        # catalog metadata; implicit prefix caching is a different fact.
+        # breakpoints. No rung honors those selectors yet, so they stay
+        # refused rather than silently dropped. The ``prompt_cache_boundaries``
+        # capability records that decision for catalog metadata; implicit
+        # prefix caching is a different fact.
         _field(
             "prompt_cache_options",
             CompatibilityDisposition.UNSUPPORTED,
             "prompt_cache_boundaries",
         ),
+        # Retention only sets how long a provider keeps a cached prefix and
+        # ``seed`` is a best-effort determinism hint: neither changes what a
+        # correct answer is, so both are removed with disclosure
+        # (``client_field_repairs.drop_unforwarded_hints``) instead of refused.
         _field(
             "prompt_cache_retention",
-            CompatibilityDisposition.UNSUPPORTED,
+            CompatibilityDisposition.IGNORED,
             "prompt_cache_boundaries",
         ),
+        _field("seed", CompatibilityDisposition.IGNORED),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
@@ -147,7 +152,6 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "modalities",
                 "moderation",
                 "prediction",
-                "seed",
             )
         ),
     ),
@@ -224,9 +228,11 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "conversation",
                 "moderation",
                 "prompt",
-                "prompt_cache_retention",
             )
         ),
+        # Same hints and the same disclosed removal as the Chat surface.
+        _field("prompt_cache_retention", CompatibilityDisposition.IGNORED),
+        _field("seed", CompatibilityDisposition.IGNORED),
     ),
 )
 

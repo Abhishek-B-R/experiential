@@ -36,6 +36,7 @@ from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.bedrock_requests import converse_body
 from exp.runtime.models.providers.dialect_dispatch import (
     CACHE_CONTROL_NOT_FORWARDED_SUFFIX,
+    GEMINI_MISSING_TOOL_RESULT_DISCLOSURE,
     THINKING_HISTORY_DROP_DISCLOSURE,
     TOOL_RESULT_IMAGE_FOLD_DISCLOSURE,
     WEB_SEARCH_SOURCES_DROPPED,
@@ -982,6 +983,37 @@ def test_a_gemini_route_folds_tool_result_images_into_a_following_user_content()
     folded = cast("list[JsonObject]", contents[3]["parts"])
     assert folded[0] == {"text": TOOL_RESULT_IMAGE_FOLD_HEADER}
     assert folded[2] == {"inline_data": {"mime_type": "image/png", "data": "aGk="}}
+
+
+def test_a_gemini_route_discloses_the_placeholder_for_an_unanswered_call() -> None:
+    """An unanswered call is served on Gemini with a placeholder, disclosed once."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="go"),
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(
+                    ToolCall(call_id="call-1", name="a", arguments={}),
+                    ToolCall(call_id="call-2", name="b", arguments={}),
+                ),
+            ),
+            GatewayMessage(role="tool", content="r1", tool_call_id="call-1"),
+            GatewayMessage(role="user", content="next"),
+        ),
+    )
+    gemini = GatewayWireProfile(dialect="gemini_generate_content", url="https://g.test")
+    chat = GatewayWireProfile(dialect="openai_compatible", url="https://c.test")
+
+    public_request, provider_request = route_generation_parameter_requests((gemini,), request)
+    payload = dialect_stream_payload(gemini, provider_request)
+
+    assert GEMINI_MISSING_TOOL_RESULT_DISCLOSURE in public_request.ignored_parameters
+    contents = cast("list[JsonObject]", payload["contents"])
+    assert [content["role"] for content in contents] == ["user", "model", "user", "user"]
+    assert len(cast("list[JsonObject]", contents[2]["parts"])) == 2
+    chat_public, _ = route_generation_parameter_requests((chat,), request)
+    assert GEMINI_MISSING_TOOL_RESULT_DISCLOSURE not in chat_public.ignored_parameters
 
 
 def test_a_bedrock_route_carries_tool_result_images_inside_the_tool_result() -> None:

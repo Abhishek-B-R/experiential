@@ -10,12 +10,27 @@ schema-enforcing rung does not take, 2026-10-17). A hard feature therefore
 narrows the route FIRST, to the rungs that declare it, in route order; the
 soft preferences are judged among those rungs only.
 
-Only structured output (``response_format`` / ``text.format`` json_schema) is
-handled here: its requirement is decided by the decoded request alone, so no
-later shaping or coercion can remove it. When no rung declares it the route is
-left whole and the existing per-rung check refuses the request by field. A
-reasoning-pinned continuation whose issuing rung is still on the route, and a
-caller-pinned route, never move.
+Two hard features are handled here, both decided by the decoded request alone:
+
+- Structured output (``response_format`` / ``text.format`` json_schema): no
+  later shaping or coercion can remove it.
+- Explicit thinking (an active ``thinking`` config, an enable-thinking toggle,
+  or an effort above ``none``): a rung that cannot reason would otherwise lead
+  the per-rung ranking and the route-wide shaping would refuse a request the
+  reasoning rungs serve (claude-sonnet-5 behind a non-reasoning Novita lead,
+  deepseek-v4-flash with a rung whose effort ladder is undeclared, production
+  2026-10-18). The route narrows to the reasoning rungs; when their ladders
+  share no tier for a level-less enable, it narrows further to the rungs that
+  declare one. Structured output narrows first, and thinking narrows only
+  among the rungs it kept.
+- A thinking off switch (``thinking: {type: disabled}``): it narrows to the
+  rungs that honor it exactly (a rung that never reasons, one with a ``none``
+  tier, or Anthropic's native wire), so a rung that cannot stop reasoning is
+  only used when no rung can.
+
+When no rung carries a feature the route is left whole and the existing
+checks and disclosed coercions decide. A reasoning-pinned continuation whose
+issuing rung is still on the route, and a caller-pinned route, never move.
 """
 
 from __future__ import annotations
@@ -25,10 +40,21 @@ from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
 from exp.runtime.gateway.native_execution import select_route_deployments
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.errors import ProviderParameterError
+from exp.runtime.models.providers.generation_parameter_validation import (
+    profile_reasoning_efforts,
+    resolve_level_less_enable,
+)
 from exp.runtime.models.providers.protocol import NativeWireClient
 
 STRUCTURED_OUTPUT_RUNG_SUFFIX = "->routed(structured_output_rung)"
 """Disclosure suffix recorded when structured output moves the request off the lead rung."""
+
+REASONING_RUNG_SUFFIX = "->routed(reasoning_rung)"
+"""Disclosure suffix recorded when explicit thinking moves the request off the lead rung."""
+
+REASONING_OFF_RUNG_DISCLOSURE = "thinking->routed(reasoning_off_rung)"
+"""Disclosure recorded when a thinking off switch moves the request off the lead rung."""
 
 _ResolvedWires = tuple[tuple[GatewayWireProfile, NativeWireClient], ...]
 
@@ -46,10 +72,81 @@ def serves_structured_output(deployment: ExactModelDeployment) -> bool:
     )
 
 
+def requests_thinking(request: GatewayRequest) -> bool:
+    """Whether the caller explicitly asked the model to reason.
+
+    An active ``thinking`` config (``enabled`` or ``adaptive``), a level-less
+    enable toggle, or an effort above ``none``. An off switch and an absent
+    signal ask for nothing a non-reasoning rung cannot give; a numeric budget
+    (``budget_tokens`` or the Chat ``thinking_budget``) already narrows to the
+    budget-capable rungs in the per-rung check.
+    """
+    config = request.provider_thinking_config
+    if config is not None and config.get("type") in ("enabled", "adaptive"):
+        return "budget_tokens" not in config
+    if request.reasoning_effort is not None:
+        return request.reasoning_effort != "none"
+    return request.thinking_default_enable
+
+
+def _honors_thinking_off(profile: GatewayWireProfile) -> bool:
+    """Whether one rung serves a thinking off switch without reasoning."""
+    return (
+        profile.dialect == "anthropic_messages"
+        or not profile.supports_reasoning
+        or "none" in profile_reasoning_efforts(profile)
+    )
+
+
+def _thinking_parameter(request: GatewayRequest) -> str:
+    """The public field that asked for thinking, named in the reorder disclosure."""
+    if request.provider_thinking_config is not None:
+        return "thinking"
+    if request.reasoning_effort is None and request.thinking_default_enable:
+        return "enable_thinking"
+    return request.caller_effort_parameter
+
+
+def _reasoning_indexes(
+    profiles: tuple[GatewayWireProfile, ...], request: GatewayRequest
+) -> tuple[int, ...]:
+    """Route positions that can carry the caller's explicit thinking, in route order.
+
+    Every reasoning rung qualifies. A level-less enable additionally needs
+    the kept rungs to share a tier it can pin (the route-wide shaping pins
+    one effort for every rung): when the reasoning rungs share none because
+    some declare no ladder at all, only the rungs that declare one are kept,
+    and when even those share none the reasoning set stands and the shaping
+    names the refusal.
+    """
+    reasoning = tuple(index for index, profile in enumerate(profiles) if profile.supports_reasoning)
+    if not request.thinking_default_enable or request.reasoning_effort is not None:
+        return reasoning
+    for candidate in (
+        reasoning,
+        tuple(
+            index
+            for index in reasoning
+            if set(profile_reasoning_efforts(profiles[index])) - {"none"}
+        ),
+    ):
+        if not candidate:
+            continue
+        try:
+            resolve_level_less_enable(
+                tuple(profiles[index] for index in candidate),
+                effort_path=request.caller_effort_parameter,
+            )
+        except ProviderParameterError:
+            continue
+        return candidate
+    return reasoning
+
+
 def narrow_to_capable_rungs(
     route: GatewayRoute, resolved_wires: _ResolvedWires, request: GatewayRequest
 ) -> tuple[GatewayRoute, _ResolvedWires, tuple[str, ...]]:
-    """Keep only the rungs that can carry the request's structured output.
+    """Keep only the rungs that can carry the request's hard features.
 
     Args:
         route: Frozen ordered route aligned with ``resolved_wires``.
@@ -57,29 +154,64 @@ def narrow_to_capable_rungs(
         request: Decoded public request.
 
     Returns:
-        The narrowed route and wires plus the reorder disclosure, which is
-        recorded only when the lead rung was passed over. The inputs come back
-        unchanged when the request asks for no structured output, every rung
-        or no rung carries it, or the route is pinned to a live rung.
+        The narrowed route and wires plus the reorder disclosures, each
+        recorded only when its feature passed over the lead rung. The inputs
+        come back unchanged when the request asks for neither feature, every
+        rung or no rung carries it, or the route is pinned to a live rung.
     """
     pinned = route.reasoning_pinned_deployment_id
-    if (
-        request.structured_text is None
-        or route.resolved_route_id is not None
-        or any(deployment.deployment_id == pinned for deployment in route.deployments)
+    if route.resolved_route_id is not None or any(
+        deployment.deployment_id == pinned for deployment in route.deployments
     ):
         return route, resolved_wires, ()
-    indexes = tuple(
-        index
-        for index, deployment in enumerate(route.deployments)
-        if serves_structured_output(deployment)
-    )
+    disclosures: list[str] = []
+    if request.structured_text is not None:
+        route, resolved_wires = _narrow(
+            route,
+            resolved_wires,
+            tuple(
+                index
+                for index, deployment in enumerate(route.deployments)
+                if serves_structured_output(deployment)
+            ),
+            ("text.format" if request.surface == GatewayApiSurface.RESPONSES else "response_format")
+            + STRUCTURED_OUTPUT_RUNG_SUFFIX,
+            disclosures,
+        )
+    if requests_thinking(request):
+        route, resolved_wires = _narrow(
+            route,
+            resolved_wires,
+            _reasoning_indexes(tuple(profile for profile, _client in resolved_wires), request),
+            _thinking_parameter(request) + REASONING_RUNG_SUFFIX,
+            disclosures,
+        )
+    config = request.provider_thinking_config
+    if config is not None and config.get("type") == "disabled":
+        profiles = tuple(profile for profile, _client in resolved_wires)
+        route, resolved_wires = _narrow(
+            route,
+            resolved_wires,
+            tuple(index for index, profile in enumerate(profiles) if _honors_thinking_off(profile)),
+            REASONING_OFF_RUNG_DISCLOSURE,
+            disclosures,
+        )
+    return route, resolved_wires, tuple(disclosures)
+
+
+def _narrow(
+    route: GatewayRoute,
+    resolved_wires: _ResolvedWires,
+    indexes: tuple[int, ...],
+    disclosure: str,
+    disclosures: list[str],
+) -> tuple[GatewayRoute, _ResolvedWires]:
+    """Select ``indexes`` unless they keep every rung or none, disclosing a moved lead."""
     if not indexes or len(indexes) == len(route.deployments):
-        return route, resolved_wires, ()
-    field = "text.format" if request.surface == GatewayApiSurface.RESPONSES else "response_format"
-    disclosures = () if indexes[0] == 0 else (f"{field}{STRUCTURED_OUTPUT_RUNG_SUFFIX}",)
+        return route, resolved_wires
+    if indexes[0] != 0:
+        disclosures.append(disclosure)
     return (
         select_route_deployments(route, indexes),
         tuple(resolved_wires[index] for index in indexes),
-        disclosures,
     )

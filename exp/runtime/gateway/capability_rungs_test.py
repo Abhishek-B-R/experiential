@@ -1,5 +1,6 @@
 """Capability-first rung selection and sampling clamps through route admission."""
 
+from dataclasses import replace
 from typing import cast
 
 import pytest
@@ -253,3 +254,217 @@ def test_a_locked_temperature_route_clamps_instead_of_refusing() -> None:
     assert provider.temperature == 1.0
     assert public.ignored_parameters == ("temperature->1.0(route_minimum)",)
     assert recorded == 1
+
+
+_CLIENT = cast(NativeWireClient, object())
+
+
+def _wire(url: str, **reasoning: object) -> tuple[GatewayWireProfile, NativeWireClient]:
+    """Build one OpenAI-compatible rung, reasoning-capable when ``reasoning`` is given."""
+    profile = GatewayWireProfile(dialect="openai_compatible", url=url, model_id="model")
+    if reasoning:
+        changes: dict[str, object] = {
+            "supports_reasoning": True,
+            "reasoning_wire_format": "reasoning_effort",
+            **reasoning,
+        }
+        profile = replace(profile, **changes)
+    return profile, _CLIENT
+
+
+def _messages(thinking: JsonObject, **extra: object) -> GatewayRequest:
+    """Decode one Messages request carrying a thinking config."""
+    # Imported here: loading the Messages decoder before the gateway contracts
+    # closes an import cycle through the reasoning carrier.
+    from exp.runtime.anthropic_protocol.requests import decode_messages
+
+    body: JsonObject = {
+        "model": "public-model",
+        "max_tokens": 4_096,
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": thinking,
+    }
+    body.update(cast(JsonObject, extra))
+    return decode_messages(body).request
+
+
+def _ids(route: GatewayRoute) -> tuple[str, ...]:
+    """Return the route's deployment ids in order."""
+    return tuple(item.deployment_id for item in route.deployments)
+
+
+def test_thinking_off_serves_on_a_route_with_no_reasoning_rung() -> None:
+    """claude-sonnet-5 for an unpaid organization is novita and bedrock, neither
+    of which reasons; Claude Code's side calls send ``thinking: disabled`` and
+    were refused as "thinking is not supported" (17 requests, 2026-10-18). The
+    off switch is already honored, so the config drops with disclosure."""
+    route = _route(
+        (_deployment("novita", structured=True), _deployment("bedrock", structured=True)),
+        GatewayApiSurface.MESSAGES,
+    )
+    wires = (_wire("https://novita.test"), _wire("https://bedrock.test"))
+    narrowed, public, provider, _recorded = _admit(
+        route, wires, _messages({"type": "disabled"}, stop_sequences=["</severity>"])
+    )
+    assert _ids(narrowed) == ("novita", "bedrock")
+    assert provider.provider_thinking_config is None
+    assert provider.reasoning_effort is None
+    assert public.ignored_parameters == ("thinking->dropped(no_reasoning_on_route)",)
+
+
+def test_thinking_off_routes_past_a_lead_that_cannot_stop_reasoning() -> None:
+    """A reasoning lead with no ``none`` tier cannot honor the off switch while a
+    later rung that never reasons can: the request moves to that rung, disclosed."""
+    route = _route(
+        (_deployment("glm", structured=True), _deployment("plain", structured=True)),
+        GatewayApiSurface.MESSAGES,
+    )
+    wires = (
+        _wire("https://glm.test", supported_reasoning_efforts=("low", "high", "max")),
+        _wire("https://plain.test"),
+    )
+    narrowed, public, _provider, _recorded = _admit(route, wires, _messages({"type": "disabled"}))
+    assert _ids(narrowed) == ("plain",)
+    assert public.ignored_parameters == (
+        "thinking->routed(reasoning_off_rung)",
+        "thinking->dropped(no_reasoning_on_route)",
+    )
+
+
+def test_thinking_off_on_an_always_reasoning_route_serves_at_the_lowest_tier() -> None:
+    """glm-5.3-flash-uncensored reasons on every rung and offers no ``none``: the
+    off switch serves at the lowest tier exactly as an explicit ``none`` effort does,
+    instead of the 32 refusals of 2026-10-18."""
+    profile = _wire(
+        "https://glm.test",
+        supported_reasoning_efforts=("low", "high", "max"),
+        reasoning_effort="max",
+    )
+    route = _route(
+        (_deployment("a", structured=True), _deployment("b", structured=True)),
+        GatewayApiSurface.MESSAGES,
+    )
+    _narrowed, public, provider, _recorded = _admit(
+        route, (profile, profile), _messages({"type": "disabled"})
+    )
+    assert provider.reasoning_effort == "low"
+    assert public.ignored_parameters == ("thinking->reasoning_effort:low(no_off_tier)",)
+
+
+def test_explicit_thinking_routes_past_a_lead_that_cannot_reason() -> None:
+    """Explicit thinking narrows to the reasoning rungs in route order and says
+    the lead was passed over."""
+    route = _route(
+        (_deployment("novita", structured=True), _deployment("reasoner", structured=True)),
+        GatewayApiSurface.MESSAGES,
+    )
+    wires = (
+        _wire("https://novita.test"),
+        _wire("https://reasoner.test", supported_reasoning_efforts=("low", "medium", "high")),
+    )
+    narrowed, public, provider, _recorded = _admit(route, wires, _messages({"type": "adaptive"}))
+    assert _ids(narrowed) == ("reasoner",)
+    assert provider.reasoning_effort == "medium"
+    assert public.ignored_parameters[0] == "thinking->routed(reasoning_rung)"
+
+
+def test_level_less_enable_skips_a_rung_with_no_declared_ladder() -> None:
+    """deepseek-v4-flash: Azure and OpenRouter declare effort ladders, Huawei
+    reasons but declares none, so the three shared no tier and every
+    ``enable_thinking`` request was refused as "no rung on its route offers a
+    reasoning mode" (59 requests, 2026-10-18). The enable now pins its tier on the
+    rungs that declare one."""
+    route = _route(
+        tuple(_deployment(name, structured=True) for name in ("azure", "huawei", "openrouter"))
+    )
+    wires = (
+        _wire(
+            "https://azure.test",
+            supported_reasoning_efforts=("none", "low", "medium", "high", "xhigh", "max"),
+            reasoning_effort="none",
+        ),
+        _wire("https://huawei.test", supports_reasoning=True),
+        _wire(
+            "https://openrouter.test",
+            supported_reasoning_efforts=("none", "minimal", "low", "medium", "high", "xhigh"),
+            reasoning_effort="high",
+            reasoning_wire_format="reasoning",
+        ),
+    )
+    request = decode_chat(
+        {
+            "model": "public-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "temperature": 0,
+            "max_tokens": 100,
+            "enable_thinking": True,
+        }
+    ).request
+    narrowed, _public, provider, _recorded = _admit(route, wires, request)
+    assert _ids(narrowed) == ("azure", "openrouter")
+    assert provider.reasoning_effort == "high"
+
+
+def test_thinking_narrowing_never_moves_a_live_reasoning_pin() -> None:
+    """A continuation pinned to its issuing rung keeps the route whole."""
+    route = _route(
+        (_deployment("novita", structured=True), _deployment("reasoner", structured=True)),
+        GatewayApiSurface.MESSAGES,
+    )
+    wires = (
+        _wire("https://novita.test"),
+        _wire("https://reasoner.test", supported_reasoning_efforts=("low", "high")),
+    )
+    pinned = route.model_copy(update={"reasoning_pinned_deployment_id": "novita"})
+    kept, _wires, disclosures = narrow_to_capable_rungs(
+        pinned, wires, _messages({"type": "adaptive"})
+    )
+    assert kept is pinned
+    assert disclosures == ()
+
+
+def test_deepseek_origin_relaxes_a_forced_tool_choice_while_thinking() -> None:
+    """deepseek-v4.1-flash-1017 has one rung, DeepSeek's own API, which refuses a
+    forced tool choice in thinking mode: the request serves with ``auto``,
+    disclosed, instead of the provider's 400."""
+    deployment = _deployment("deepseek", structured=True).model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                capabilities=GatewayDeploymentCapabilities(
+                    supports_streaming=True,
+                    supports_streaming_tool_arguments=True,
+                    supports_parallel_tool_calls=True,
+                )
+            )
+        }
+    )
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://api.deepseek.com/v1",
+        model_id="deepseek-flash",
+        deepseek_reasoning_history=True,
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("none", "low", "high", "max"),
+        reasoning_effort="high",
+    )
+    request = decode_chat(
+        {
+            "model": "public-model",
+            "messages": [{"role": "user", "content": "look it up"}],
+            "stream": True,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "lookup", "parameters": {"type": "object"}},
+                }
+            ],
+            "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+        }
+    ).request
+    _narrowed, public, provider, _recorded = _admit(
+        _route((deployment,)), ((profile, _CLIENT),), request
+    )
+    assert provider.tool_choice == "auto"
+    assert "tool_choice->auto" in public.ignored_parameters

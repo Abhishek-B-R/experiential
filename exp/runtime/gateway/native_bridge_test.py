@@ -7436,3 +7436,38 @@ def test_the_unavailable_at_admission_reason_matches_the_native_503_mapping() ->
         "native_images.py",
         "native_openai_decisions.py",
     ]
+
+
+def test_chat_client_hints_serve_disclosed_instead_of_refusing(tmp_path: Path) -> None:
+    """``seed``, retention, stray ``stream_options`` and ``agent`` admit, disclosed.
+
+    Production 2026-10-18: each was a named 400 (seed and prompt_cache_retention
+    "not supported by this gateway profile", stream_options "requires
+    stream=true", WorkBuddy's messages.N.agent "Invalid value"), although none
+    of them can change a correct answer.
+    """
+    root = tmp_path / "gateway"
+    root.mkdir()
+    control, raw_key = _control_plane(root)
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi", "agent": "build"}],
+            "seed": 7,
+            "prompt_cache_retention": "24h",
+            "stream_options": {"include_usage": True},
+        }
+    )
+    admission = _flatten_started(control, _admit(control, raw_key, body))
+    assert admission["ignored_parameters"] == [
+        "messages.agent->dropped(client_annotation)",
+        "seed->ignored(determinism_hint_not_forwarded)",
+        "prompt_cache_retention->ignored(not_forwarded)",
+        "stream_options->ignored(stream_false)",
+    ]
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    assert "seed" not in upstream
+    assert "prompt_cache_retention" not in upstream
+    messages = cast("list[JsonObject]", upstream["messages"])
+    assert all("agent" not in message for message in messages)

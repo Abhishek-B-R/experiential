@@ -31,6 +31,7 @@ from exp.runtime.models.providers.dialect_dispatch import (
     TOOL_RESULT_IMAGE_FOLD_DISCLOSURE,
     WEB_SEARCH_SOURCES_DROPPED,
     WEB_SEARCH_SOURCES_DROPPED_ON_FALLBACK,
+    disclose_gemini_missing_tool_results,
     responses_origin_refuses_web_search_sources,
 )
 from exp.runtime.models.providers.dialect_dispatch import (
@@ -55,9 +56,7 @@ from exp.runtime.models.providers.errors import (
     ProviderParameterError,
     UnsupportedReasoningEffortError,
 )
-from exp.runtime.models.providers.fireworks import (
-    require_responses_continuation_channel,
-)
+from exp.runtime.models.providers.fireworks import require_responses_continuation_channel
 from exp.runtime.models.providers.generation_parameter_validation import (
     anthropic_reasoning_disengaged,
     disclose_anthropic_tool_schemas,
@@ -86,6 +85,7 @@ from exp.runtime.models.providers.messages_payloads import (
 from exp.runtime.models.providers.messages_payloads import (
     gemini_generate_content_stream_payload as gemini_generate_content_stream_payload,
 )
+from exp.runtime.models.providers.mistral import pin_greedy_top_p
 from exp.runtime.models.providers.openai_payloads import (
     openai_compatible_stream_payload as openai_compatible_stream_payload,
 )
@@ -328,6 +328,7 @@ def route_generation_parameter_requests(
                 minimum=lambda profile: profile.minimum_top_p,
                 maximum=lambda profile: profile.maximum_top_p,
             )
+            pin_greedy_top_p(profiles, request, provider_updates, ignored)
     if request.top_k is not None:
 
         def top_k_supported(profile: GatewayWireProfile) -> bool:
@@ -478,18 +479,17 @@ def route_generation_parameter_requests(
     # Every dialect carries a tool-result image: natively inside the tool
     # result on Anthropic (tool_result image blocks), native Responses (the SDK
     # function_call_output part list) and Bedrock (toolResult image blocks),
-    # and folded into a user turn that follows the tool run on Chat
-    # Completions and Gemini, whose tool results are text-only. The fold is
-    # disclosed once per route; a rung with no image input at all still
-    # rejects at preflight and the route-wide coercion applies the disclosed
-    # placeholder degrade (the block is baked into the caller's history, so a
-    # rejection would wedge the whole session).
+    # and folded into a user turn after the tool run on Chat Completions and
+    # Gemini (text-only tool results), disclosed once per route. A rung with no
+    # image input rejects at preflight and the route-wide coercion applies the
+    # disclosed placeholder degrade (a rejection would wedge the session).
     if any(message.role == "tool" and message.images for message in request.messages) and any(
         profile.dialect in TOOL_RESULT_IMAGE_FOLD_DIALECTS for profile in profiles
     ):
         if TOOL_RESULT_IMAGE_FOLD_DISCLOSURE not in ignored:
             ignored.append(TOOL_RESULT_IMAGE_FOLD_DISCLOSURE)
 
+    disclose_gemini_missing_tool_results(profiles, request.messages, ignored)
     # Only the Anthropic wire has a tool-result error flag. Every other wire
     # folds the flag into the result text at encoding (a fixed prefix, see
     # ``folded_tool_error_content``) so the model still learns the invocation
