@@ -56,9 +56,7 @@ from exp.runtime.models.providers.errors import (
     ProviderParameterError,
     UnsupportedReasoningEffortError,
 )
-from exp.runtime.models.providers.fireworks import (
-    require_responses_continuation_channel,
-)
+from exp.runtime.models.providers.fireworks import require_responses_continuation_channel
 from exp.runtime.models.providers.generation_parameter_validation import (
     anthropic_reasoning_disengaged,
     disclose_anthropic_tool_schemas,
@@ -87,6 +85,7 @@ from exp.runtime.models.providers.messages_payloads import (
 from exp.runtime.models.providers.messages_payloads import (
     gemini_generate_content_stream_payload as gemini_generate_content_stream_payload,
 )
+from exp.runtime.models.providers.mistral import pin_greedy_top_p
 from exp.runtime.models.providers.openai_payloads import (
     openai_compatible_stream_payload as openai_compatible_stream_payload,
 )
@@ -329,6 +328,7 @@ def route_generation_parameter_requests(
                 minimum=lambda profile: profile.minimum_top_p,
                 maximum=lambda profile: profile.maximum_top_p,
             )
+            pin_greedy_top_p(profiles, request, provider_updates, ignored)
     if request.top_k is not None:
 
         def top_k_supported(profile: GatewayWireProfile) -> bool:

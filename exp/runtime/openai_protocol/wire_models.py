@@ -628,7 +628,10 @@ class _ChatRequest(_WireModel):
 
     @model_validator(mode="after")
     def _require_coherent_options(self) -> _ChatRequest:
-        """Reject conflicting token ceilings and non-stream usage options."""
+        """Reject conflicting token ceilings and orphaned logprob options.
+
+        ``stream_options`` on a non-streaming call is removed with disclosure
+        before validation (``client_field_repairs``)."""
         if (
             sum(
                 v is not None
@@ -639,8 +642,6 @@ class _ChatRequest(_WireModel):
             raise ValueError(
                 "max_tokens, max_completion_tokens and max_output_tokens are mutually exclusive"
             )
-        if self.stream_options is not None and not self.stream:
-            raise ValueError("stream_options requires stream=true")
         if self.top_logprobs is not None and self.logprobs is not True:
             raise ValueError("top_logprobs requires logprobs=true")
         return self

@@ -6,8 +6,11 @@ Chat messages with its own ``cot_id`` and ``cot_summary``, other agents stamp
 ``timestamp`` or ``startsNewUserRequest`` on them, LiteLLM echoes assistant
 output items with a lifecycle ``status`` or ``phase`` but without the item
 ``id`` those markers belong to, Codex Desktop tags Responses input items with
-``internal_chat_message_metadata_passthrough``, and the OpenAI SDK sends
-Responses ``stream_options``. A
+``internal_chat_message_metadata_passthrough``, the OpenAI SDK sends
+Responses ``stream_options``, OpenCode sends Anthropic's ``output_config`` on
+Chat, WorkBuddy CLI tags Chat messages with ``agent``, and agents attach
+determinism and cache-retention hints (``seed``, ``prompt_cache_retention``) no
+route forwards. A
 named 400 for any of them fails every request the client makes, so each is
 removed here, before the compatibility manifest and the wire models read the
 body, and every removal that changes what the caller asked for is named in
@@ -16,8 +19,11 @@ body, and every removal that changes what the caller asked for is named in
 
 from __future__ import annotations
 
+import json
+
 from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.runtime.openai_protocol.errors import invalid_field
+from exp.runtime.openai_protocol.manifest import RESPONSES_REASONING_EFFORTS_ACCEPTED
 from exp.runtime.openai_protocol.responses_probe import drop_gateway_web_search_items
 
 CHAT_COT_ID_DROPPED = "messages.cot_id->dropped(client_annotation)"
@@ -73,12 +79,62 @@ OUTPUT_PHASE_DROPPED = "input.phase->dropped(no_item_id)"
 """Disclosure recorded when an id-less message item loses its ``phase``."""
 
 STREAM_OPTIONS_NOT_STREAMING = "stream_options->ignored(stream_false)"
-"""Disclosure recorded when Responses ``stream_options`` arrive on a non-streaming call."""
+"""Disclosure recorded when ``stream_options`` arrive on a non-streaming call (either surface)."""
 
 STREAM_OBFUSCATION_IGNORED = "stream_options.include_obfuscation->ignored(not_emitted)"
 """Disclosure recorded when stream obfuscation padding is requested but never emitted."""
 
 _STREAM_OPTION_FIELDS = frozenset({"include_obfuscation", "reasoning_summary_delivery"})
+
+CHAT_AGENT_DROPPED = "messages.agent->dropped(client_annotation)"
+"""Disclosure recorded when WorkBuddy CLI's per-message ``agent`` tag is removed."""
+
+CHAT_IMAGE_DIMENSIONS_DROPPED = "messages.content.image_url.dimensions->dropped(client_annotation)"
+"""Disclosure recorded when an image part's client-side ``dimensions`` hint is removed.
+
+The image bytes or URL define the picture; no provider wire takes a caller
+size hint on an image part, so removing it changes nothing sent."""
+
+THINKING_DISPLAY_DROPPED = "thinking.display->dropped(not_carried)"
+"""Disclosure recorded when a Chat ``thinking.display`` preference is removed.
+
+``display`` chooses how Anthropic renders thinking text in its own response;
+the Chat surface returns reasoning through its own channel, so the preference
+has nothing to configure."""
+
+OUTPUT_CONFIG_EFFORT_TRANSLATED = "output_config.effort->translated(reasoning_effort)"
+"""Disclosure recorded when a Chat ``output_config.effort`` becomes ``reasoning_effort``."""
+
+OUTPUT_CONFIG_EFFORT_IGNORED = "output_config.effort->ignored(explicit_reasoning_effort)"
+"""Disclosure recorded when ``output_config.effort`` yields to an explicit ``reasoning_effort``."""
+
+OUTPUT_CONFIG_DROPPED = "output_config->dropped(not_carried)"
+"""Disclosure recorded when the rest of a Chat ``output_config`` is removed."""
+
+SEED_IGNORED = "seed->ignored(determinism_hint_not_forwarded)"
+"""Disclosure recorded when ``seed`` is removed.
+
+``seed`` asks for best-effort determinism, which no provider guarantees and
+no route on this gateway forwards; every answer stays a valid sample without
+it, so it is ignored rather than refused."""
+
+PROMPT_CACHE_RETENTION_IGNORED = "prompt_cache_retention->ignored(not_forwarded)"
+"""Disclosure recorded when an explicit prompt-cache retention hint is removed.
+
+Retention changes only how long a provider keeps a cached prefix; served
+routes cache implicitly at their own retention, so the answer is unchanged."""
+
+RESPONSES_ARGUMENTS_SERIALIZED = "input.arguments->serialized(json_object)"
+"""Disclosure recorded when a ``function_call`` item's ``arguments`` arrive as an object."""
+
+RESPONSES_ARGUMENTS_DECODED = "input.arguments->decoded(double_encoded_json)"
+"""Disclosure recorded when ``arguments`` carry a JSON string that itself encodes the object."""
+
+_UNFORWARDED_HINTS: tuple[tuple[str, str], ...] = (
+    ("seed", SEED_IGNORED),
+    ("prompt_cache_retention", PROMPT_CACHE_RETENTION_IGNORED),
+)
+"""Top-level hints both OpenAI surfaces accept and drop, in disclosure order."""
 
 
 def drop_chat_message_client_annotations(
@@ -281,12 +337,240 @@ def accept_responses_stream_options(payload: JsonObject) -> tuple[JsonObject, tu
     return remaining, disclosures
 
 
+def drop_unforwarded_hints(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
+    """Remove the top-level ``seed`` and ``prompt_cache_retention`` hints.
+
+    Neither changes what a correct answer is: ``seed`` is a best-effort
+    determinism hint and retention only sets how long a provider keeps a cached
+    prefix. A present value of any shape is removed and disclosed; ``null`` is
+    removed silently, since it asked for nothing.
+
+    Args:
+        payload: Parsed Chat Completions or Responses body.
+
+    Returns:
+        The payload without either hint, plus one disclosure per removed hint.
+    """
+    present = [(key, disclosure) for key, disclosure in _UNFORWARDED_HINTS if key in payload]
+    if not present:
+        return payload, ()
+    removed = {key for key, _ in present}
+    disclosures = tuple(disclosure for key, disclosure in present if payload.get(key) is not None)
+    return {key: value for key, value in payload.items() if key not in removed}, disclosures
+
+
+def translate_chat_output_config(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
+    """Consume Anthropic's ``output_config`` sent on a Chat request.
+
+    OpenCode attaches ``output_config: {"effort": ...}`` to Chat calls. A
+    recognized effort becomes ``reasoning_effort`` when the caller set none
+    (an explicit ``reasoning_effort`` wins and the effort is disclosed as
+    ignored); every other key, and an unrecognized effort, has no Chat reading
+    and is removed with disclosure.
+
+    Args:
+        payload: Parsed Chat Completions body.
+
+    Returns:
+        The payload without ``output_config`` (and with ``reasoning_effort``
+        when translated), plus its disclosures.
+    """
+    if "output_config" not in payload:
+        return payload, ()
+    config = payload["output_config"]
+    remaining = {key: value for key, value in payload.items() if key != "output_config"}
+    if config is None:
+        return remaining, ()
+    if not isinstance(config, dict):
+        return remaining, (OUTPUT_CONFIG_DROPPED,)
+    disclosures: list[str] = []
+    effort = config.get("effort")
+    if isinstance(effort, str) and effort in RESPONSES_REASONING_EFFORTS_ACCEPTED:
+        if remaining.get("reasoning_effort") is None:
+            remaining["reasoning_effort"] = effort
+            disclosures.append(OUTPUT_CONFIG_EFFORT_TRANSLATED)
+        else:
+            disclosures.append(OUTPUT_CONFIG_EFFORT_IGNORED)
+    elif effort is not None:
+        disclosures.append(OUTPUT_CONFIG_DROPPED)
+    if any(key != "effort" for key in config) and OUTPUT_CONFIG_DROPPED not in disclosures:
+        disclosures.append(OUTPUT_CONFIG_DROPPED)
+    return remaining, tuple(disclosures)
+
+
+def drop_chat_stream_options_without_stream(
+    payload: JsonObject,
+) -> tuple[JsonObject, tuple[str, ...]]:
+    """Ignore Chat ``stream_options`` on a call that does not stream.
+
+    The object configures stream chunks; a non-streaming call has none, so the
+    answer is the same with or without it.
+
+    Args:
+        payload: Parsed Chat Completions body.
+
+    Returns:
+        The payload without ``stream_options`` when ``stream`` is not true,
+        plus a disclosure when a non-null object was removed.
+    """
+    if "stream_options" not in payload or payload.get("stream") is True:
+        return payload, ()
+    options = payload["stream_options"]
+    remaining = {key: value for key, value in payload.items() if key != "stream_options"}
+    return remaining, () if options is None else (STREAM_OPTIONS_NOT_STREAMING,)
+
+
+def drop_chat_thinking_display(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
+    """Remove ``display`` from a Chat ``thinking`` config.
+
+    Args:
+        payload: Parsed Chat Completions body.
+
+    Returns:
+        The payload with ``thinking.display`` removed, plus its disclosure.
+    """
+    thinking = payload.get("thinking")
+    if not isinstance(thinking, dict) or "display" not in thinking:
+        return payload, ()
+    stripped = {key: value for key, value in thinking.items() if key != "display"}
+    disclosures = () if thinking["display"] is None else (THINKING_DISPLAY_DROPPED,)
+    return {**payload, "thinking": stripped}, disclosures
+
+
+def drop_chat_message_agent_and_image_dimensions(
+    payload: JsonObject,
+) -> tuple[JsonObject, tuple[str, ...]]:
+    """Remove WorkBuddy's message ``agent`` tag and image-part ``dimensions`` hints.
+
+    Args:
+        payload: Parsed Chat Completions body.
+
+    Returns:
+        The original payload when neither appears; otherwise a copy without
+        them plus one disclosure per removed kind.
+    """
+    raw_messages = payload.get("messages")
+    if not isinstance(raw_messages, list):
+        return payload, ()
+    dropped_agent = False
+    dropped_dimensions = False
+    messages: list[JsonValue] = []
+    for message in raw_messages:
+        if not isinstance(message, dict):
+            messages.append(message)
+            continue
+        if "agent" in message:
+            dropped_agent = True
+            message = {key: value for key, value in message.items() if key != "agent"}
+        content = message.get("content")
+        if isinstance(content, list):
+            parts: list[JsonValue] = []
+            changed = False
+            for part in content:
+                image = part.get("image_url") if isinstance(part, dict) else None
+                if isinstance(part, dict) and isinstance(image, dict) and "dimensions" in image:
+                    part = {
+                        **part,
+                        "image_url": {k: v for k, v in image.items() if k != "dimensions"},
+                    }
+                    changed = True
+                parts.append(part)
+            if changed:
+                dropped_dimensions = True
+                message = {**message, "content": parts}
+        messages.append(message)
+    if not dropped_agent and not dropped_dimensions:
+        return payload, ()
+    disclosures = (
+        *((CHAT_AGENT_DROPPED,) if dropped_agent else ()),
+        *((CHAT_IMAGE_DIMENSIONS_DROPPED,) if dropped_dimensions else ()),
+    )
+    return {**payload, "messages": messages}, disclosures
+
+
+def normalize_responses_call_arguments(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
+    """Repair ``function_call`` items whose ``arguments`` are not a JSON-object string.
+
+    Responses carries call arguments as a string encoding one JSON object.
+    Some replaying clients send the object itself, or a string whose JSON
+    value is again a string encoding the object (double-encoded). Both name
+    the same arguments unambiguously, so they are re-encoded as the one
+    canonical string with disclosure. Anything else (a non-JSON string, an
+    array, a number) keeps the decoder's named refusal.
+
+    Args:
+        payload: Parsed Responses body.
+
+    Returns:
+        The original payload when nothing needs repair; otherwise a copy plus
+        one disclosure per repair kind.
+    """
+    raw_input = payload.get("input")
+    if not isinstance(raw_input, list):
+        return payload, ()
+    serialized = False
+    decoded = False
+    items: list[JsonValue] = []
+    for item in raw_input:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            items.append(item)
+            continue
+        arguments = item.get("arguments")
+        if isinstance(arguments, dict):
+            items.append({**item, "arguments": json.dumps(arguments, ensure_ascii=False)})
+            serialized = True
+            continue
+        inner = _double_encoded_object(arguments)
+        if inner is not None:
+            items.append({**item, "arguments": inner})
+            decoded = True
+            continue
+        items.append(item)
+    if not serialized and not decoded:
+        return payload, ()
+    disclosures = (
+        *((RESPONSES_ARGUMENTS_SERIALIZED,) if serialized else ()),
+        *((RESPONSES_ARGUMENTS_DECODED,) if decoded else ()),
+    )
+    return {**payload, "input": items}, disclosures
+
+
+def _double_encoded_object(arguments: JsonValue) -> str | None:
+    """Return the inner object string when ``arguments`` is a JSON string of one."""
+    if not isinstance(arguments, str):
+        return None
+    try:
+        outer = json.loads(arguments)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(outer, str):
+        return None
+    try:
+        inner = json.loads(outer)
+    except json.JSONDecodeError:
+        return None
+    return outer if isinstance(inner, dict) else None
+
+
 def repair_chat(
     payload: JsonObject, disclosures: tuple[str, ...]
 ) -> tuple[JsonObject, tuple[str, ...]]:
     """Apply every Chat repair, appending its disclosures to ``disclosures``."""
     payload, annotations = drop_chat_message_client_annotations(payload)
-    return payload, (*disclosures, *annotations)
+    payload, message_parts = drop_chat_message_agent_and_image_dimensions(payload)
+    payload, output_config = translate_chat_output_config(payload)
+    payload, hints = drop_unforwarded_hints(payload)
+    payload, stream = drop_chat_stream_options_without_stream(payload)
+    payload, display = drop_chat_thinking_display(payload)
+    return payload, (
+        *disclosures,
+        *annotations,
+        *message_parts,
+        *output_config,
+        *hints,
+        *stream,
+        *display,
+    )
 
 
 def repair_responses(
@@ -302,5 +586,7 @@ def repair_responses(
     """
     payload, items = drop_responses_client_items(drop_gateway_web_search_items(payload))
     payload, markers = drop_unanchored_output_markers(payload)
+    payload, arguments = normalize_responses_call_arguments(payload)
+    payload, hints = drop_unforwarded_hints(payload)
     payload, stream = accept_responses_stream_options(payload)
-    return payload, (*disclosures, *items, *markers, *stream)
+    return payload, (*disclosures, *items, *markers, *arguments, *hints, *stream)
