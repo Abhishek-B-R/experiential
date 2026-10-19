@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import math
 import sys
-import weakref
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
@@ -57,8 +58,23 @@ def can_prompt(console: Console) -> bool:
     return console.is_terminal and _stdin_is_terminal()
 
 
-# Consoles that already showed an authorized command its undefined-cost warning.
-_WARNED_UNDEFINED: weakref.WeakSet[Console] = weakref.WeakSet()
+# Inside one_cost_warning(): whether this command already stated its undefined cost.
+_COST_WARNING: ContextVar[list[bool] | None] = ContextVar("cost_warning", default=None)
+
+
+@contextmanager
+def one_cost_warning() -> Iterator[None]:
+    """Scope one command that authorizes spend at several stages (indexes, learning, retest).
+
+    Inside the scope an already authorized run states its undefined cost once; every
+    interactive question still shows it. Outside any scope, every call warns, so state never
+    carries from one command to the next.
+    """
+    token = _COST_WARNING.set([False])
+    try:
+        yield
+    finally:
+        _COST_WARNING.reset(token)
 
 
 def require_spend_consent(
@@ -220,14 +236,14 @@ def _confirm_undefined_cost(
             input ended before an answer.
     """
     authorized = yes or previously_confirmed
-    if not authorized or console not in _WARNED_UNDEFINED:
-        # One command can authorize several stages (indexes, learning, retest); an already
-        # authorized run states the undefined cost once, while every question repeats it.
+    warned = _COST_WARNING.get()
+    if not authorized or warned is None or not warned[0]:
         console.print(
             "[yellow]warning[/yellow] the cost of this command is undefined: a selected model has "
             "no catalog pricing, so EXP cannot estimate the spend or enforce the configured budget."
         )
-        _WARNED_UNDEFINED.add(console)
+        if warned is not None:
+            warned[0] = True
     if authorized:
         return True
     if non_interactive or not can_prompt(console):

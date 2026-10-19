@@ -95,19 +95,24 @@ def grounded_world_model_content(
         knowledge: Frozen reconstruction and investigation context.
         selection_policy_sha256: Optional explicit reranker identity.
         original_evidence: ``retrieved`` grounds each prediction in nearest recorded
-            transitions; ``none`` predicts from task, history and learned memory only. The
-            default adds nothing, so existing identities are unchanged.
+            transitions; ``none`` predicts from task, history and learned memory only.
 
     Returns:
         Canonical content mapping used to derive the artifact identity.
     """
-    extra: dict[str, object] = (
-        {} if original_evidence == "retrieved" else {"original_evidence": original_evidence}
-    )
+    # Optional inputs at their defaults add nothing, so a world model persisted before they
+    # existed keeps the identity it was saved under.
+    extra: dict[str, object] = {
+        **({} if original_evidence == "retrieved" else {"original_evidence": original_evidence}),
+        **(
+            {}
+            if selection_policy_sha256 is None
+            else {"selection_policy_sha256": selection_policy_sha256}
+        ),
+        **({} if knowledge is None else {"knowledge": knowledge.model_dump(mode="json")}),
+    }
     return {
         **extra,
-        "selection_policy_sha256": selection_policy_sha256,
-        "knowledge": knowledge.model_dump(mode="json") if knowledge is not None else None,
         "serving_rag": serving_rag.model_dump(mode="json"),
         "model_alias": model_alias,
         "model": model.model_dump(mode="json"),

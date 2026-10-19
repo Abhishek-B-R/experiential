@@ -24,7 +24,7 @@ from exp.cli.build.summary import render_completed_build, save_details
 from exp.cli.build.traces import load_build_traces
 from exp.cli.providers.provider_picker import resolve_setup_providers
 from exp.cli.providers.setup import provider_setup_json_examples
-from exp.cli.shared.consent import SpendBudget, can_prompt, require_spend_consent
+from exp.cli.shared.consent import SpendBudget, can_prompt, one_cost_warning, require_spend_consent
 from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.cli.shared.progress import Phase, ProgressDisplay, progress_display, qualified
 from exp.cli.shared.theme import EXP_THEME
@@ -120,6 +120,7 @@ class GroundedBuildCompletion:
     reused: bool
 
 
+@one_cost_warning()
 def build(
     project: str = _PROJECT_ARGUMENT,
     legacy_trace_file: Path | None = _LEGACY_TRACE_ARGUMENT,

@@ -16,7 +16,7 @@ from rich.text import Text
 from exp.cli.evaluation.fidelity import render_fidelity
 from exp.cli.evaluation.fidelity_turns import render_turns, turn_marks
 from exp.cli.evaluation.view import heading
-from exp.cli.shared.consent import can_prompt, require_spend_consent
+from exp.cli.shared.consent import can_prompt, one_cost_warning, require_spend_consent
 from exp.cli.shared.options import usage_error
 from exp.cli.shared.progress import (
     Phase,
@@ -279,6 +279,7 @@ def share(part: int, whole: int) -> str:
     return f"{part / whole:.0%}" if whole else "-"
 
 
+@one_cost_warning()
 def run_audit(
     project: str,
     count: int,
