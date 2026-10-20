@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Protocol
 
@@ -96,6 +97,14 @@ def no_image_decisions_error(alias: str) -> OpenAIProtocolError:
     )
 
 
+def rung_headers(provider: str, static: Mapping[str, str], *, images: bool) -> dict[str, str]:
+    """Copy a rung's static headers, adding TypeSafe's image opt-in on TypeSafe rungs."""
+    headers = dict(static)
+    if images and provider == "typesafe":
+        headers[TYPESAFE_IMAGES_HEADER] = "true"
+    return headers
+
+
 def _decisions_rung(profile: GatewayWireProfile, supports_decisions: bool) -> bool:
     """Require positive deployment evidence and the exact unsigned SystemOne wire."""
     return (
@@ -142,7 +151,10 @@ class NativeDecisionsMixin:
         except Exception as exc:  # noqa: BLE001 - sanitize the authority boundary.
             raise authority_error(exc) from exc
         try:
-            decoded = decode_decision_request(str(data["body"]))
+            byte_length = data.get("body_bytes")
+            decoded = decode_decision_request(
+                str(data["body"]), byte_length if isinstance(byte_length, int) else None
+            )
         except (ValueError, TypeError, RecursionError) as exc:
             # Pydantic and JSON errors may include state, instructions, or key
             # names; only field locations and fixed refusal text become public.
@@ -266,9 +278,7 @@ def _admit_accepted(
         decisions_url = profile.decisions_url
         if decisions_url is None:  # pragma: no cover - filtered above.
             raise GatewayRoutingError("decision rung lost its wire endpoint")
-        headers = dict(profile.headers)
-        if request.has_images:
-            headers[TYPESAFE_IMAGES_HEADER] = "true"
+        headers = rung_headers(deployment.provider, profile.headers, images=request.has_images)
         tagged = tagged_headers(
             headers,
             profile.organization_tag_key,

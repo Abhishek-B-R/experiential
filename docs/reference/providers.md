@@ -249,9 +249,14 @@ present, so callers do not send it. A request with assets is served only by depl
 `unsupported_capability` on `assets` before dispatch. `box` questions are not served.
 
 The gateway bounds at most 256 assets, 1,024 UTF-8 bytes per reference, 65,536 reference bytes in
-total, and 33,554,432 decoded image bytes per request. TypeSafe enforces its own format, file-size,
-and pixel limits. Each image use reserves a fixed 4,096-token planning allowance (an image in the
-state counts once per question); settlement still bills only TypeSafe's reported input tokens.
+total, 16,777,216 decoded bytes per image (TypeSafe's per-file limit), and 33,554,432 decoded image
+bytes per request; sizes are computed from the base64 text without decoding it. TypeSafe enforces
+its own format and pixel limits. Each image reserves a fixed 4,096-token planning allowance once per
+question that references it (a state image counts for every question), however often its reference
+repeats; settlement still bills only TypeSafe's reported input tokens. The TypeSafe opt-in header
+is sent only to `typesafe` deployments. Decision bodies over 1 MiB first take one unit per started
+MiB from a 256 MiB per-worker budget, held for the whole request, so concurrent large bodies wait
+rather than multiplying memory; the native front passes the body's byte length to admission.
 
 Limits are 1 through 32 questions, 1 through 256 UTF-8 bytes per question ID or choice category
 name, and at most 262,144 bytes for the normalized request excluding image assets. The raw body

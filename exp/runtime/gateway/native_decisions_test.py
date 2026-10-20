@@ -44,7 +44,7 @@ from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_accounting import NativeBridgeError
 from exp.runtime.gateway.native_bridge import NativeControlPlane
-from exp.runtime.gateway.native_decisions import _admit_accepted
+from exp.runtime.gateway.native_decisions import _admit_accepted, rung_headers
 from exp.runtime.gateway.organization_tag import (
     ORGANIZATION_TAG_HEADER,
     organization_tag,
@@ -660,4 +660,27 @@ def test_invalid_decision_bodies_name_the_field_without_echoing_content(
     )
     assert phrase in str(error["message"])
     assert "canary" not in json.dumps(error)
+    assert _rows(control) == []
+
+
+def test_only_typesafe_rungs_receive_the_image_opt_in_header() -> None:
+    """Another SystemOne-wire provider never sees TypeSafe's vendor header."""
+    static = {"Authorization": "Bearer key"}
+    assert rung_headers("typesafe", static, images=True) == {
+        **static,
+        TYPESAFE_IMAGES_HEADER: "true",
+    }
+    assert rung_headers("experiential_cloud", static, images=True) == static
+    assert rung_headers("typesafe", static, images=False) == static
+    assert rung_headers("typesafe", static, images=True) is not static
+
+
+def test_admission_uses_the_native_fronts_measured_body_length(tmp_path: Path) -> None:
+    """A body_bytes over the raw ceiling is refused before acceptance without re-encoding."""
+    control, raw_key = _control_plane(tmp_path)
+    argument = {"raw_key": raw_key, "body": json.dumps(_body()), "body_bytes": 10**12}
+    with pytest.raises(NativeBridgeError) as raised:
+        control.admit_decisions(json.dumps(argument))
+    error = _public_error(raised.value)
+    assert (error["status_code"], error["param"]) == (400, "body")
     assert _rows(control) == []

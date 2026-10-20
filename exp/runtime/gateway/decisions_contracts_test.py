@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import tracemalloc
 from typing import cast
 
 import pytest
@@ -14,6 +16,7 @@ from exp.runtime.gateway import decisions_contracts
 from exp.runtime.gateway.contracts import GatewayApiSurface
 from exp.runtime.gateway.decisions_contracts import (
     DECISION_IMAGE_TOKEN_RESERVATION,
+    MAX_DECISION_BODY_BYTES,
     MAX_DECISION_INPUT_BYTES,
     MAX_DECISION_JSON_DEPTH,
     ChoiceQuestion,
@@ -467,3 +470,59 @@ def test_public_errors_never_echo_caller_content(raw: str) -> None:
         decode_decision_request(raw)
     param, message = public_decision_error(raised.value)
     assert "secret" not in param + message
+
+
+def test_a_one_character_reference_in_a_large_state_reserves_once_per_question() -> None:
+    """Repeated substring matches cannot multiply the reservation past assets x questions."""
+    question: JsonObject = {"type": "noul", "instructions": "Is `photo` a dog? a a a"}
+    questions = {f"q{index}": question for index in range(32)}
+    state = "a" * 200_000
+    body: JsonObject = {
+        "model": "jev-latest",
+        "state": state,
+        "questions": cast("JsonObject", questions),
+        "assets": {"a": _png()},
+    }
+    request = decode_decision_request(json.dumps(body)).request
+    text_only = DecisionRequest(state=state, questions=request.questions)
+    assert request.input_token_reservation == (
+        text_only.input_token_reservation + 32 * DECISION_IMAGE_TOKEN_RESERVATION
+    )
+
+
+@pytest.mark.parametrize(("data", "size"), [("AAAA", 3), ("AAA=", 2), ("AA==", 1)])
+def test_decoded_size_is_computed_from_the_base64_text(data: str, size: int) -> None:
+    """Padding is subtracted arithmetically; the image is never decoded to measure it."""
+    request = decode_decision_request(json.dumps(_image_body(assets=_poster(data_base64=data))))
+    assert request.request.assets is not None
+    assert request.request.assets[_REF].decoded_bytes() == size
+
+
+def test_each_image_is_held_to_typesafes_per_file_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A single oversized image is a gateway 400 on assets, not an upstream 413."""
+    monkeypatch.setattr(decisions_contracts, "MAX_DECISION_ASSET_BYTES", 2)
+    assert _refusal(_image_body()) == (
+        "assets",
+        "each image must be at most 16777216 bytes after base64 decoding",
+    )
+
+
+def test_a_caller_measured_byte_length_bounds_the_raw_body() -> None:
+    """The native front's measured length is trusted, so the body is not re-encoded."""
+    with pytest.raises(DecisionRequestError, match="request size limit"):
+        decode_decision_request(json.dumps(_body()), MAX_DECISION_BODY_BYTES + 1)
+
+
+def test_decoding_a_large_image_body_does_not_multiply_memory() -> None:
+    """Validation, reservation, and the provider body share the parsed base64 text."""
+    data = base64.b64encode(os.urandom(6 * 1024 * 1024)).decode()
+    body = json.dumps(_image_body(assets=_poster(data_base64=data)))
+    tracemalloc.start()
+    try:
+        request = decode_decision_request(body, len(body)).request
+        request.provider_body("jev-latest")
+        assert request.input_token_reservation > 0
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 1.5 * len(body)

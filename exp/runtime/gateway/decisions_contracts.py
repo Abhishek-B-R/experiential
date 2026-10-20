@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
 import json
 import math
+import re
 from collections.abc import Iterator
 from typing import Annotated, Literal
 
@@ -22,16 +21,19 @@ MAX_DECISION_INPUT_BYTES = 262_144
 MAX_DECISION_JSON_DEPTH = 64
 MAX_DECISION_IMAGE_BYTES = 33_554_432
 """Decoded image bytes across every asset of one request."""
+MAX_DECISION_ASSET_BYTES = 16_777_216
+"""Decoded bytes of one image file, TypeSafe's documented per-file limit."""
 MAX_DECISION_ASSETS = 256
 MAX_DECISION_REFERENCE_BYTES = 1_024
 MAX_DECISION_REFERENCES_BYTES = 65_536
 DECISION_IMAGE_TOKEN_RESERVATION = 4_096
-"""Planning tokens per image use; settlement bills the provider's own count."""
+"""Planning tokens per image per question; settlement bills the provider's own count."""
 MAX_DECISION_BODY_BYTES = (
     MAX_DECISION_INPUT_BYTES + 4 * math.ceil(MAX_DECISION_IMAGE_BYTES / 3) + 4 * 1024 * 1024
 )
 """Raw body ceiling: the text budget, base64 image data, and bounded asset framing."""
 DECISION_FIELDS = frozenset({"model", "state", "questions", "assets"})
+_STANDARD_BASE64 = re.compile(r"[A-Za-z0-9+/]*={0,2}")
 _CHAT_CONTROLS = frozenset(
     {
         "messages",
@@ -79,6 +81,8 @@ def _native_json(value: JsonValue) -> None:
         if depth > MAX_DECISION_JSON_DEPTH:
             raise DecisionRequestError("body", "decision JSON nesting exceeds the 64-level limit")
         if isinstance(item, str):
+            if item.isascii():
+                continue
             try:
                 item.encode("utf-8")
             except UnicodeEncodeError as exc:
@@ -201,15 +205,20 @@ class ImageAsset(ContractModel):
     data_base64: str = Field(min_length=1)
 
     def decoded_bytes(self) -> int:
-        """Return the decoded size after strict standard-alphabet validation."""
-        try:
-            return len(base64.b64decode(self.data_base64, validate=True))
-        except (binascii.Error, ValueError) as exc:
+        """Return the decoded size from the validated text, without decoding it."""
+        data = self.data_base64
+        if len(data) % 4 or _STANDARD_BASE64.fullmatch(data) is None:
             raise DecisionRequestError(
                 "assets",
                 "asset data_base64 must be standard base64 with = padding, no whitespace, "
                 "and no data: prefix",
-            ) from exc
+            )
+        size = len(data) // 4 * 3 - (len(data) - len(data.rstrip("=")))
+        if size > MAX_DECISION_ASSET_BYTES:
+            raise DecisionRequestError(
+                "assets", "each image must be at most 16777216 bytes after base64 decoding"
+            )
+        return size
 
 
 def _strings(value: JsonValue) -> Iterator[str]:
@@ -301,11 +310,14 @@ class DecisionRequest(ContractModel):
                 texts.extend(_strings(question.model_dump(mode="python")["criteria"]))
         return texts
 
-    def _image_uses(self, value: JsonValue) -> int:
-        """Count reference occurrences in one value; each adds the image again."""
+    def _referenced_assets(self, value: JsonValue) -> frozenset[str]:
+        """Return the asset references that appear anywhere in one value's strings."""
         if not self.assets:
-            return 0
-        return sum(text.count(reference) for text in _strings(value) for reference in self.assets)
+            return frozenset()
+        texts = list(_strings(value))
+        return frozenset(
+            reference for reference in self.assets if any(reference in text for text in texts)
+        )
 
     @property
     def attribution_label(self) -> None:
@@ -316,11 +328,13 @@ class DecisionRequest(ContractModel):
     def input_token_reservation(self) -> int:
         """Reserve every question's repeated state, its images, and protocol overhead."""
         state_bytes = _json_bytes(self.state)
-        state_images = self._image_uses(self.state)
+        state_images = self._referenced_assets(self.state)
         total = 0
         for question in self.questions.values():
             definition = question.model_dump(mode="json", exclude_none=True)
-            images = state_images + self._image_uses(definition)
+            # Each image counts once per question however often its reference
+            # repeats, bounding the estimate by assets x questions.
+            images = len(state_images | self._referenced_assets(definition))
             total += (
                 state_bytes
                 + _json_bytes(definition)
@@ -354,8 +368,14 @@ class DecisionRequest(ContractModel):
             },
         }
         if self.assets:
+            # Built by hand so the base64 text is shared, not copied, per rung.
             body["assets"] = {
-                reference: asset.model_dump(mode="json") for reference, asset in self.assets.items()
+                reference: {
+                    "type": asset.type,
+                    "format": asset.format,
+                    "data_base64": asset.data_base64,
+                }
+                for reference, asset in self.assets.items()
             }
         return body
 
@@ -386,8 +406,14 @@ class DecodedDecisionRequest(ContractModel):
     request: DecisionRequest
 
 
-def decode_decision_request(body: str) -> DecodedDecisionRequest:
-    """Decode strict JSON and reject duplicate keys before request admission."""
+def decode_decision_request(body: str, byte_length: int | None = None) -> DecodedDecisionRequest:
+    """Decode strict JSON and reject duplicate keys before request admission.
+
+    Args:
+        body: The raw request body text.
+        byte_length: Its UTF-8 length when the caller already measured it, so a
+            large image body is not re-encoded only to be counted.
+    """
 
     def unique(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
         """Reject duplicate identifiers rather than silently losing a question."""
@@ -403,7 +429,7 @@ def decode_decision_request(body: str) -> DecodedDecisionRequest:
         raise DecisionRequestError("body", f"non-finite JSON value {value} is not allowed")
 
     try:
-        raw_bytes = len(body.encode("utf-8"))
+        raw_bytes = byte_length if byte_length is not None else len(body.encode("utf-8"))
     except UnicodeEncodeError as exc:
         raise DecisionRequestError("body", "decision JSON must contain valid UTF-8 text") from exc
     if raw_bytes > MAX_DECISION_BODY_BYTES:
