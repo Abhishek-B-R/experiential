@@ -575,10 +575,10 @@ def _affinity_ordered_rungs(
     pin a conversation to a dead lane. The cache-marker guarantee composes: a
     cache-marked request on a route mixing marker-honoring and marker-dropping
     wires still dispatches the marker-honoring group first, ordered within
-    each group. The other two failover modes are untouched, and an organization
-    with prompt caching off keeps the certified order on every pool.
+    each group. The other failover modes are untouched; prompt caching off, or a
+    ``:fast`` request (host-ordered, least-loaded first), keeps the certified order.
     """
-    if authorization.prompt_caching_disabled:
+    if authorization.prompt_caching_disabled or authorization.fast:
         return route, resolved_wires, AffinityPlacement()
     if route.snapshot.model_stages or accounting.recovery_host is not None:
         return stage_affinity_ordered_rungs(

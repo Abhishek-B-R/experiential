@@ -2584,6 +2584,23 @@ def test_reasoning_summary_serves_without_summaries_on_chat_wire_lanes() -> None
     )
 
 
+def test_fast_keeps_the_host_order_on_an_affinity_pool() -> None:
+    """A :fast request dispatches in the host's (least-loaded first) order, never rendezvous."""
+    route, wires = _affinity_fixture()
+    authorization = route.snapshot.authorization.model_copy(update={"fast": True})
+    for session in ("session-1", "session-2", "session-3"):
+        ordered, _wires_out, placement = _affinity_ordered_rungs(
+            route,
+            wires,
+            _session_request(session),
+            accounting=_affinity_accounting(),
+            authorization=authorization,
+            continuation=None,
+        )
+        assert _order(ordered) == ("dep-house", "dep-fireworks", "dep-openrouter")
+        assert placement.fingerprint is None
+
+
 def test_prompt_caching_off_keeps_certified_order_and_adds_no_cache_state() -> None:
     """An organization with caching off gets no affinity placement, key or marker.
 
