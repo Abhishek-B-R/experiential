@@ -816,7 +816,7 @@ fn settle_argument_carries_the_twelve_hour_write_subset_only_when_observed() {
             None,
             None,
             None,
-            0,
+            WebSearchMeter::default(),
             0,
         );
         serde_json::from_str::<Value>(&argument).expect("valid json")["usage"].clone()
