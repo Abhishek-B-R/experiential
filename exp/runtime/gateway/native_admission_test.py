@@ -2682,21 +2682,24 @@ def test_reasoning_summary_serves_without_summaries_on_chat_wire_lanes() -> None
     )
 
 
-def test_fast_keeps_the_host_order_on_an_affinity_pool() -> None:
-    """A :fast request dispatches in the host's (least-loaded first) order, never rendezvous."""
+def test_fast_is_placed_by_conversation_like_any_request() -> None:
+    """A :fast conversation keeps its affinity placement (its replica's prefix cache stays warm)."""
     route, wires = _affinity_fixture()
-    authorization = route.snapshot.authorization.model_copy(update={"fast": True})
+    fast = route.snapshot.authorization.model_copy(update={"fast": True})
     for session in ("session-1", "session-2", "session-3"):
-        ordered, _wires_out, placement = _affinity_ordered_rungs(
-            route,
-            wires,
-            _session_request(session),
-            accounting=_affinity_accounting(),
-            authorization=authorization,
-            continuation=None,
-        )
-        assert _order(ordered) == ("dep-house", "dep-fireworks", "dep-openrouter")
-        assert placement.fingerprint is None
+        placed = [
+            _affinity_ordered_rungs(
+                route,
+                wires,
+                _session_request(session),
+                accounting=_affinity_accounting(),
+                authorization=authorization,
+                continuation=None,
+            )
+            for authorization in (route.snapshot.authorization, fast)
+        ]
+        assert _order(placed[1][0]) == _order(placed[0][0])
+        assert placed[1][2].fingerprint is not None
 
 
 def test_prompt_caching_off_keeps_certified_order_and_adds_no_cache_state() -> None:
@@ -2935,3 +2938,54 @@ def test_plaintext_reasoning_history_leads_on_its_carrier_and_keeps_every_fallba
         authorization=route.snapshot.authorization,
     )
     assert narrowed.snapshot.deployment_ids == ("plain", "carrier", "later")
+
+
+def test_a_prompt_cap_moves_a_long_prompt_to_the_main_lane_but_never_refuses() -> None:
+    """Applied after the tier filter: with no uncapped carded rung left, the capped one serves."""
+    from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
+
+    capped = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        dispatch=GatewayRungDispatchPolicy(max_prompt_tokens=100),
+    )
+    plain = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    route = _mixed_route(
+        "maximize_availability",
+        (_deployment("fast", gateway=capped), _deployment("main", gateway=plain)),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    client = cast(NativeWireClient, object())
+    carded = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://lane.test",
+        service_tier_pricing_enabled=True,
+        service_tier_cards=frozenset({"priority"}),
+    )
+    uncarded = GatewayWireProfile(dialect="openai_compatible", url="https://main.test")
+    long_prompt = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="x" * 8_000),),
+    )
+    fast = route.snapshot.authorization.model_copy(update={"fast": True})
+    # A carded main lane: the long :fast prompt leaves the capped replica.
+    narrowed, _, _, provider, _ = admitted_route_requests(
+        route,
+        ((carded, client), (carded, client)),
+        long_prompt,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=fast,
+    )
+    assert tuple(d.deployment_id for d in narrowed.deployments) == ("main",)
+    assert provider.service_tier == "priority"
+    # An uncarded main lane: the tier filter leaves only the replica, which serves.
+    narrowed, _, _, provider, _ = admitted_route_requests(
+        route,
+        ((carded, client), (uncarded, client)),
+        long_prompt,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=fast,
+    )
+    assert tuple(d.deployment_id for d in narrowed.deployments) == ("fast",)
+    assert provider.service_tier == "priority"
