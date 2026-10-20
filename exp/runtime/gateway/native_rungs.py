@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 from exp.common.core.artifacts import JsonObject, sha256_bytes
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.runtime.gateway.class_throttles import fast_on_rung, upstream_priority
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayApiSurface, GatewayRequest
 from exp.runtime.gateway.native_admission import shape_parallel_tool_calls
 from exp.runtime.gateway.native_dispatch import frozen_dispatch
@@ -69,14 +70,6 @@ UPSTREAM_PRIORITY = {2: 0, 1: 1, 0: 2}
 
 Pro 0, paying 1, free 2: vLLM's priority scheduler runs the lowest value
 first and, when KV runs out, preempts the highest value first.
-"""
-
-TOP_PRIORITY_CLASS = 8
-"""The highest ``AuthorizationSnapshot.priority_class``; vLLM gets ``8 - class``.
-
-A host that sends a request class (0 free account .. 8 top plan paid)
-replaces the three-level map, so the top class runs at vLLM priority 0 and a
-free account at 8. Without a class the admission-level map above applies.
 """
 
 
@@ -171,10 +164,12 @@ def build_rung_dispatch(
         # provider would receive an unknown field.
         upstream_payload = {
             **upstream_payload,
-            "priority": UPSTREAM_PRIORITY[authorization.priority_admission]
-            if authorization.priority_class is None
-            else TOP_PRIORITY_CLASS - authorization.priority_class,
+            "priority": upstream_priority(authorization, deployment, UPSTREAM_PRIORITY),
         }
+        if fast_on_rung(authorization, deployment):
+            # vLLM bills no processing tier: a :fast request's tier is ours
+            # to serve (class_throttles), so the field never reaches it.
+            upstream_payload.pop("service_tier", None)
     request_headers = (
         anthropic_request_headers(dict(profile.headers), rung_request)
         if profile.dialect == "anthropic_messages"

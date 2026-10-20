@@ -24,6 +24,7 @@ from exp.runtime.gateway.affinity import (
     rendezvous_order,
 )
 from exp.runtime.gateway.capability_rungs import narrow_to_capable_rungs
+from exp.runtime.gateway.class_throttles import fast_request, require_fast_path
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, GatewayRequest
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_components import NativeGatewayComponents
@@ -101,9 +102,8 @@ def admitted_route_requests(
         request: Canonical request produced by the public protocol decoder.
         accounting: Shared accounting owning the coercion counter.
         authorization: Frozen authority for the accepted request.
-        continuation: Responses continuation context when this request
-            continues a stored response; its original episode key keeps the
-            conversation's cache-affinity placement.
+        continuation: Responses continuation context for a stored response; its
+            original episode key keeps the conversation's cache-affinity placement.
 
     Returns:
         The narrowed route and wires, the public request (carrying any
@@ -114,15 +114,16 @@ def admitted_route_requests(
         ProviderParameterError: No rung preserves a generation control and no
             disclosed coercion applies, or rungs declined for different
             field-specific reasons.
-        ProviderCapabilityError: The first rung's capability rejection when
-            no rung is protocol-compatible; the shared admit handler scopes
-            it to the exact public request field.
+        ProviderCapabilityError: The first rung's capability rejection when no rung
+            is protocol-compatible, or a ``:fast`` request no rung serves fast.
         GatewayRoutingError: No rung is protocol-compatible and none named a
             rejection.
     """
+    request = fast_request(without_prompt_caching(request, authorization), authorization)
     route, resolved_wires, public_request, provider_request, disclosures = prepare_route_requests(
-        route, resolved_wires, without_prompt_caching(request, authorization)
+        route, resolved_wires, request, authorization.fast
     )
+    require_fast_path(provider_request, authorization)
     if disclosures:
         record_admission_coercions(accounting, authorization, disclosures)
     provider_request = with_cache_affinity(provider_request, authorization)
@@ -208,10 +209,12 @@ def select_single_route_before_search(
         resolved_wires = tuple(resolved_wires[index] for index in root_indexes)
     if route.resolved_route_id is not None:
         return restrict_fallbacks(request, route), resolved_wires[:1], None
-    preview = without_prompt_caching(request, authorization)
+    preview = fast_request(without_prompt_caching(request, authorization), authorization)
     preview = strip_search_carriers(preview) if preview.web_search is not None else preview
     preview = plan_tool_search(preview, [profile.dialect for profile, _ in resolved_wires]).request
-    route, resolved_wires, _, prepared, _ = prepare_route_requests(route, resolved_wires, preview)
+    route, resolved_wires, _, prepared, _ = prepare_route_requests(
+        route, resolved_wires, preview, authorization.fast
+    )
     route, resolved_wires = _prefer_cache_capable_rungs(route, resolved_wires, prepared)
     route, resolved_wires, placement = _affinity_ordered_rungs(
         route,
@@ -235,6 +238,7 @@ def prepare_route_requests(
     route: GatewayRoute,
     resolved_wires: _ResolvedWires,
     request: GatewayRequest,
+    fast: bool = False,
 ) -> tuple[GatewayRoute, _ResolvedWires, GatewayRequest, GatewayRequest, tuple[str, ...]]:
     """Pure capability filtering and shaping, with disclosures returned but never recorded.
 
@@ -244,8 +248,9 @@ def prepare_route_requests(
     """
     require_native_model_stage_contract(route)
     # Priced house tiers require a card for that exact tier; BYOK needs only
-    # wire support. Explicit priority keeps those candidates ahead of standard
-    # lanes. Flex and BYOK-only routes retain their disclosed coercion policy.
+    # wire support (``fast``, our card, never takes a BYOK rung). Explicit
+    # priority keeps those candidates ahead of standard lanes. Flex and
+    # BYOK-only routes retain their disclosed coercion policy.
     # Narrow impossible context windows before reserving or calling a provider.
     chat_indexes = tuple(
         index
@@ -272,15 +277,12 @@ def prepare_route_requests(
         tier_indexes = tuple(
             index
             for index, (profile, _client) in enumerate(resolved_wires)
-            if profile.forwards_tier(tier)
+            if profile.forwards_tier(tier) and not (fast and profile.billing_customer_managed)
         )
         if not tier_indexes and tier == "priority":
-            # Priority asks for faster processing at a higher price; the
-            # standard tier is what OpenAI itself serves when priority is
-            # unavailable, and it never costs the caller more, so the request
-            # dispatches at standard with disclosure. Flex asks for a CHEAPER
-            # tier: serving it at the standard price would bill more than the
-            # caller chose, so flex keeps the typed refusal below.
+            # Priority unavailable dispatches at standard with disclosure (what
+            # OpenAI serves; never costs more; ``:fast`` refuses later). Flex
+            # asks for a CHEAPER tier, so it keeps the typed refusal below.
             request = request.model_copy(update={"service_tier": None})
             admission_disclosures = (*admission_disclosures, PRIORITY_TIER_UNAVAILABLE_DISCLOSURE)
         elif not tier_indexes:
@@ -293,8 +295,7 @@ def prepare_route_requests(
             )
 
         if tier == "priority" and any(
-            not profile.billing_customer_managed and profile.forwards_tier(tier)
-            for profile, _client in resolved_wires
+            not resolved_wires[i][0].billing_customer_managed for i in tier_indexes
         ):
             route = select_route_deployments(route, tier_indexes)
             resolved_wires = tuple(resolved_wires[index] for index in tier_indexes)
@@ -574,10 +575,10 @@ def _affinity_ordered_rungs(
     pin a conversation to a dead lane. The cache-marker guarantee composes: a
     cache-marked request on a route mixing marker-honoring and marker-dropping
     wires still dispatches the marker-honoring group first, ordered within
-    each group. The other two failover modes are untouched, and an organization
-    with prompt caching off keeps the certified order on every pool.
+    each group. The other failover modes are untouched; prompt caching off, or a
+    ``:fast`` request (host-ordered, least-loaded first), keeps the certified order.
     """
-    if authorization.prompt_caching_disabled:
+    if authorization.prompt_caching_disabled or authorization.fast:
         return route, resolved_wires, AffinityPlacement()
     if route.snapshot.model_stages or accounting.recovery_host is not None:
         return stage_affinity_ordered_rungs(

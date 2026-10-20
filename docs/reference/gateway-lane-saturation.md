@@ -108,7 +108,7 @@ acts ONLY on a self-hosted rung: one whose dispatch policy authors `upstream_pri
 Third-party, BYOK and tenant rungs never author it, so on them every lever below is a no-op.
 
 - **vLLM priority by class** (frees capacity). With a class, an opted-in rung gets vLLM
-  priority `8 - priority_class` (`native_rungs.TOP_PRIORITY_CLASS`) instead of the
+  priority `8 - priority_class` (`class_throttles.TOP_PRIORITY_CLASS`) instead of the
   Pro/paying/free map, so the server schedules and preempts by class.
 - **Per-class in-flight cap** (frees capacity). `self_hosted_class_concurrency` caps how many
   dispatches of the request's class one worker holds on a self-hosted rung; past it the rung
@@ -128,6 +128,30 @@ Third-party, BYOK and tenant rungs never author it, so on them every lever below
   starves (`permit_queue.rs`). Absent, the permits stay the FIFO semaphore.
 
 The class changes no admission bound, overflow factor or fair-share weight.
+
+### The `:fast` request (`AuthorizationSnapshot.fast`)
+
+A host sets `fast` for a request a caller asked to run faster at the priority card. Admission
+asks for the priority processing tier (`class_throttles.fast_request`) and narrows to rungs that
+carry a priority card; when none does it refuses (`require_fast_path`), never serving it at the
+standard tier. On a third-party rung that is the provider's own priority tier, settled only on
+witnessed evidence (a downgrade settles at standard). On a self-hosted rung (`upstream_priority`)
+the tier is ours, so the request gets more of the GPU:
+
+- vLLM priority `-1` (`FAST_UPSTREAM_PRIORITY`), ahead of every class, and no `service_tier`
+  field on the vLLM wire;
+- permit class `9` (`FAST_PRIORITY_CLASS`) in a configured permit queue;
+- no class cap and no pace;
+- a split bound: fast reservations may hold the upper half of the rung's bound (at least one),
+  outside fair share; while any is held, every other reservation may hold only the lower half
+  (at least one), hard, even for a priority overflow. A fast request that finds the rung full
+  still admits, so the rung exceeds its bound by at most that one. Like every registry bound
+  this is per gateway worker, and rate windows still apply;
+- settlement confirmed at the requested card (`tier_settlement`): our server reports no tier.
+
+Every self-hosted lever needs the rung's priority card (`fast_on_rung`), so a fast request
+never gets more of the GPU at the standard price. A caller's plain `service_tier=priority` on a
+self-hosted rung (not `:fast`) keeps the evidence rule and gets none of these levers.
 
 The default bound is already half the worker's permits, so its Pro factor stays below
 `1 / DEFAULT_LANE_SHARE` and one lane's priority traffic never holds every permit. A rung whose

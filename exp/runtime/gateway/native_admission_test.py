@@ -1176,6 +1176,92 @@ def test_priority_house_card_excludes_standard_only_lead(mode: str) -> None:
     assert provider.service_tier == "priority"
 
 
+def test_fast_asks_for_the_priority_tier_and_never_falls_back_to_standard() -> None:
+    """``:fast`` narrows to priority-carded rungs; with none it refuses (never billed standard)."""
+    gateway = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    route = _mixed_route(
+        "maximize_availability",
+        (_deployment("standard", gateway=gateway), _deployment("priority", gateway=gateway)),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    client = cast(NativeWireClient, object())
+    standard = (
+        GatewayWireProfile(dialect="openai_compatible", url="https://standard.test"),
+        client,
+    )
+    priority = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://priority.test",
+            service_tier_pricing_enabled=True,
+            service_tier_cards=frozenset({"priority"}),
+        ),
+        client,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"),),
+    )
+    fast = route.snapshot.authorization.model_copy(update={"fast": True})
+    narrowed, _, _, provider, _ = admitted_route_requests(
+        route,
+        (standard, priority),
+        request,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=fast,
+    )
+    assert tuple(deployment.deployment_id for deployment in narrowed.deployments) == ("priority",)
+    assert provider.service_tier == "priority"
+    standard_only = _mixed_route(
+        "maximize_availability",
+        (_deployment("standard", gateway=gateway),),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    with pytest.raises(ProviderCapabilityError) as refused:
+        admitted_route_requests(
+            standard_only,
+            (standard,),
+            request,
+            accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+            authorization=standard_only.snapshot.authorization.model_copy(update={"fast": True}),
+        )
+    assert refused.value.capability == "service_tier"
+    assert refused.value.detail is not None and "no fast path" in refused.value.detail
+    # A customer's own rung forwards priority but is never our fast path: a
+    # BYOK rung beside an uncarded house rung refuses rather than letting the
+    # house rung serve :fast at the standard card.
+    byok = (
+        GatewayWireProfile(
+            dialect="openai_compatible", url="https://byok.test", billing_customer_managed=True
+        ),
+        client,
+    )
+    mixed = _mixed_route(
+        "maximize_availability",
+        (_deployment("byok", gateway=gateway), _deployment("standard", gateway=gateway)),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    with pytest.raises(ProviderCapabilityError):
+        admitted_route_requests(
+            mixed,
+            (byok, standard),
+            request,
+            accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+            authorization=mixed.snapshot.authorization.model_copy(update={"fast": True}),
+        )
+    # Without :fast the same request runs untiered, exactly as before.
+    _, _, _, plain, _ = admitted_route_requests(
+        standard_only,
+        (standard,),
+        request,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=standard_only.snapshot.authorization,
+    )
+    assert plain.service_tier is None
+
+
 def test_tier_priced_host_lane_admits_the_named_tier() -> None:
     """A host rung whose model carries per-tier pricing forwards the tier, so a
     flex request is admitted (not rejected)."""
@@ -2518,6 +2604,23 @@ def test_reasoning_summary_serves_without_summaries_on_chat_wire_lanes() -> None
     assert public.ignored_parameters == (
         "reasoning.generate_summary->dropped(unsupported_by_provider)",
     )
+
+
+def test_fast_keeps_the_host_order_on_an_affinity_pool() -> None:
+    """A :fast request dispatches in the host's (least-loaded first) order, never rendezvous."""
+    route, wires = _affinity_fixture()
+    authorization = route.snapshot.authorization.model_copy(update={"fast": True})
+    for session in ("session-1", "session-2", "session-3"):
+        ordered, _wires_out, placement = _affinity_ordered_rungs(
+            route,
+            wires,
+            _session_request(session),
+            accounting=_affinity_accounting(),
+            authorization=authorization,
+            continuation=None,
+        )
+        assert _order(ordered) == ("dep-house", "dep-fireworks", "dep-openrouter")
+        assert placement.fingerprint is None
 
 
 def test_prompt_caching_off_keeps_certified_order_and_adds_no_cache_state() -> None:

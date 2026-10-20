@@ -10,6 +10,7 @@ from collections.abc import Callable
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import BillingSource
 from exp.runtime.gateway.attempt_tokens import counted_input_tokens
+from exp.runtime.gateway.class_throttles import admission_priority_class, tier_authorization
 from exp.runtime.gateway.client_apps import with_client_identity
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -576,6 +577,7 @@ class NativeControlPlane(
                 )
             )
             placement = selected_placement or placement
+            rung_authorization = tier_authorization(authorization, provider_request)
             route, resolved_wires = _reorder(route, resolved_wires, request, self._components)
             require_route_authority(authorization, request, route)
             require_unmodified_probability_output(
@@ -598,11 +600,10 @@ class NativeControlPlane(
             for deployment, (profile, client), budget in zip(
                 route.deployments, resolved_wires, redial_budgets, strict=True
             ):
-                # A reasoning-pinned route's fallback rung is frozen WITHOUT
-                # the pinned provider's sealed reasoning (it cannot unseal
-                # it), so a failover past the issuing rung dispatches the
-                # conversation minus that turn's thinking, never a foreign
-                # sealed block.
+                # A reasoning-pinned route's fallback rung is frozen WITHOUT the
+                # pinned provider's sealed reasoning (it cannot unseal it), so a
+                # failover past the issuing rung dispatches the conversation
+                # minus that turn's thinking, never a foreign sealed block.
                 dispatch = build_rung_dispatch(
                     route,
                     deployment,
@@ -610,7 +611,7 @@ class NativeControlPlane(
                     client,
                     provider_request=rung_provider_request(route, deployment, provider_request),
                     public_request=public_request,
-                    authorization=authorization,
+                    authorization=rung_authorization,
                     throttle_redial_budget=budget,
                 )
                 if dispatch.parallel_disclosure is not None:
@@ -743,7 +744,7 @@ class NativeControlPlane(
         plan = None if guardrails is None else guardrails.output_plan()
         self._accounting.register(
             InflightRequest(
-                authorization=authorization,
+                authorization=rung_authorization,
                 route=route,
                 request=provider_request,
                 deadline_monotonic=deadline,
@@ -819,14 +820,13 @@ class NativeControlPlane(
         if tool_search_admission is not None:
             response["tool_search"] = tool_search_admission
         if request.surface == GatewayApiSurface.MESSAGES:
-            # Display-only `message_start` input when the upstream reports
-            # nothing before its final chunk; the ledger never reads it.
+            # Display-only `message_start` input; the ledger never reads it.
             response["input_token_estimate"] = counted_input_tokens(public_request)
         if public_request.maximum_output_tokens is not None:
             # The caller's cap: classifies an output-less, usage-less `stop` (capped -> length).
             response["maximum_output_tokens"] = public_request.maximum_output_tokens
-        if authorization.priority_class is not None:
-            response["priority_class"] = authorization.priority_class  # the permit queue's order
+        if (permit_class := admission_priority_class(authorization)) is not None:
+            response["priority_class"] = permit_class  # the permit queue's order
         if request.surface == GatewayApiSurface.RESPONSES:
             response["surface"] = "responses"
             response["envelope"] = responses_envelope(public_request)
