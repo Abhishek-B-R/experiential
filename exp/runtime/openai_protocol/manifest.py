@@ -123,20 +123,25 @@ CHAT_MANIFEST = CompatibilityManifest(
         # is admitted per route; ``audio`` and ``modalities`` request audio
         # OUTPUT, which no route serves.
         # Explicit prompt-cache boundaries: Chat callers can name cache
-        # breakpoints and retention. No rung honors those selectors yet, so
-        # both stay refused rather than silently dropped. The
-        # ``prompt_cache_boundaries`` capability records that decision for
-        # catalog metadata; implicit prefix caching is a different fact.
+        # breakpoints. No rung honors those selectors yet, so they stay
+        # refused rather than silently dropped. The ``prompt_cache_boundaries``
+        # capability records that decision for catalog metadata; implicit
+        # prefix caching is a different fact.
         _field(
             "prompt_cache_options",
             CompatibilityDisposition.UNSUPPORTED,
             "prompt_cache_boundaries",
         ),
+        # Retention only sets how long a provider keeps a cached prefix and
+        # ``seed`` is a best-effort determinism hint: neither changes what a
+        # correct answer is, so both are removed with disclosure
+        # (``client_field_repairs.drop_unforwarded_hints``) instead of refused.
         _field(
             "prompt_cache_retention",
-            CompatibilityDisposition.UNSUPPORTED,
+            CompatibilityDisposition.IGNORED,
             "prompt_cache_boundaries",
         ),
+        _field("seed", CompatibilityDisposition.IGNORED),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
@@ -147,7 +152,6 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "modalities",
                 "moderation",
                 "prediction",
-                "seed",
             )
         ),
     ),
@@ -197,6 +201,10 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         # (context is never truncated; served routes cache implicitly).
         _field("truncation", CompatibilityDisposition.SUPPORTED),
         _field("prompt_cache_options", CompatibilityDisposition.SUPPORTED),
+        # ``include_obfuscation`` padding is never emitted, so ``false`` is
+        # honored and ``true`` is disclosed as ignored
+        # (``client_field_repairs.accept_responses_stream_options``).
+        _field("stream_options", CompatibilityDisposition.SUPPORTED),
         # The Responses tool-call cap is refused until a route can honor it.
         # ``tool_call_limit`` is the catalog vocabulary for that decision.
         _field("max_tool_calls", CompatibilityDisposition.UNSUPPORTED, "tool_call_limit"),
@@ -220,10 +228,11 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "conversation",
                 "moderation",
                 "prompt",
-                "prompt_cache_retention",
-                "stream_options",
             )
         ),
+        # Same hints and the same disclosed removal as the Chat surface.
+        _field("prompt_cache_retention", CompatibilityDisposition.IGNORED),
+        _field("seed", CompatibilityDisposition.IGNORED),
     ),
 )
 
@@ -285,7 +294,17 @@ honoring the selector is impossible and accepting it would be silent."""
 RESPONSES_INPUT_ITEM_FIELDS_ACCEPTED: dict[str, frozenset[str]] = {
     "message": frozenset({"type", "role", "content", "id", "status", "phase"}),
     "function_call": frozenset(
-        {"type", "call_id", "name", "namespace", "caller", "arguments", "id", "status"}
+        {
+            "type",
+            "call_id",
+            "name",
+            "namespace",
+            "caller",
+            "arguments",
+            "id",
+            "status",
+            "extra_content",
+        }
     ),
     "function_call_output": frozenset(
         {"type", "call_id", "output", "name", "namespace", "caller", "id", "status"}
@@ -307,7 +326,9 @@ replayed without it ("Missing namespace for function_call ..."), which
 wedges every later turn of the session. ``caller`` is SDK 3.0's opaque
 programmatic tool-calling attribution (``{"type": "program", "id": ...}``);
 its internal shape is an evolving provider surface, so it is validated only
-as an object and round-trips verbatim like ``namespace``.
+as an object and round-trips verbatim like ``namespace``. ``extra_content``
+carries Gemini's thought signature (``extra_content.google.thought_signature``,
+the shape this gateway emits on Gemini calls) back with its call.
 """
 
 CHAT_CACHE_CONTROL_PLACEMENTS: dict[str, str] = {
@@ -454,5 +475,19 @@ TRANSCRIPTION_MANIFEST = CompatibilityManifest(
                 "languages",
             )
         ),
+    ),
+)
+
+VIDEO_MANIFEST = CompatibilityManifest(
+    schema_version=1,
+    surface=GatewayApiSurface.VIDEO,
+    fields=(
+        *(
+            _field(path, CompatibilityDisposition.SUPPORTED)
+            for path in ("model", "prompt", "seconds", "size", "input_reference")
+        ),
+        # Sora character references have no equivalent on any served video
+        # provider; the field is refused by name rather than silently dropped.
+        _field("characters", CompatibilityDisposition.UNSUPPORTED),
     ),
 )

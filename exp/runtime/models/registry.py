@@ -157,6 +157,8 @@ class ResolvedModel:
             and the capability identity. It never changes a provider's wire dialect.
         credential_receipt: Private receipt resolved atomically with authentication, or None
             when the credential source cannot establish recovery or cache evidence scope.
+        tenant_origin: The alias's connection is a customer-addressed origin
+            (``ConnectionConfig.tenant_origin``), held to the tenant dispatch policy.
     """
 
     alias: str
@@ -167,6 +169,7 @@ class ResolvedModel:
     served_model_id: str | None = None
     token_prices: GatewayTokenPrices | None = None
     credential_receipt: DispatchCredentialReceipt | None = field(default=None, repr=False)
+    tenant_origin: bool = False
 
 
 class RuntimeModelCatalog:
@@ -277,9 +280,14 @@ class RuntimeModelCatalog:
         )
 
     def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
-        """Resolve the client and bind the same catalog's complete pricing schedule."""
+        """Resolve the client and bind the catalog's pricing schedule and origin policy."""
         resolved = self._resolve(alias, role=role)
-        return replace(resolved, token_prices=self._catalog.models[alias].token_prices)
+        record = self._catalog.models[alias]
+        return replace(
+            resolved,
+            token_prices=record.token_prices,
+            tenant_origin=self._catalog.connections[record.connection].tenant_origin,
+        )
 
     def _resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
         """Build the one approved client shape named by an alias.
@@ -372,6 +380,8 @@ class RuntimeModelCatalog:
                 supports_top_p=_supports_top_p(capabilities),
                 supports_top_k=_supports_flag(capabilities, "supports_top_k"),
                 supports_logprobs=_supports_flag(capabilities, "supports_logprobs"),
+                supports_reasoning=capabilities.supports_reasoning is True,
+                reasoning_effort=capabilities.reasoning_effort,
             )
             client = BoundedBedrockClient(bedrock_client)
             return ResolvedModel(

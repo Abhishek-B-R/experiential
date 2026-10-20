@@ -43,6 +43,7 @@ impl Normalizer {
             reasoning_tokens: None,
             billed_units: None,
             cache_writes_read_back: false,
+            image_output_tokens: None,
         })
     }
 
@@ -129,6 +130,7 @@ impl Normalizer {
                             name,
                             namespace: None,
                             caller: None,
+                            thought_signature: None,
                         });
                     }
                     Some("server_tool_use") => {

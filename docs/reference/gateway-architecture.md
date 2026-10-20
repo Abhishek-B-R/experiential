@@ -23,9 +23,9 @@ It serves:
   (the Anthropic provider client does not forward `count_tokens`), so every answer is an
   estimate and the body says so through the shared `x-experiential-ignored-parameters`
   disclosure (`input_tokens->estimated(gateway_tokenizer)`).
-- `POST /v1/embeddings`, `POST /v1/images/generations`, `POST /v1/audio/speech`, and
-  `POST /v1/audio/transcriptions` (the OpenAI media APIs, buffered and never streamed; see
-  [gateway-media-surfaces.md](gateway-media-surfaces.md))
+- `POST /v1/embeddings`, `/v1/images/generations`, `/v1/audio/speech`, `/v1/audio/transcriptions`
+  (OpenAI media APIs, buffered), and OpenAI's asynchronous `/v1/videos` jobs (create, list,
+  retrieve, delete, `/content`); see [gateway-media-surfaces.md](gateway-media-surfaces.md)
 - `POST /v1/systemone` (TypeSafe native decisions: typed `noul`, `choice`, and `score`
   questions, buffered answers, provider-reported usage, and explicit decision capability and
   pricing admission; no chat, streaming, continuation, or idempotency replay); and `POST /v1/decisions`, its OpenAI Decisions API wire
@@ -103,13 +103,13 @@ signatures. The bounded immediate open retry reuses that signature; later retrie
 
 ### Native decisions
 
-`POST /v1/systemone` accepts only `model`, `state`, and named `questions`; see
+`POST /v1/systemone` accepts `model`, `state`, named `questions`, and optional image `assets`; see
 [TypeSafe SystemOne decisions](providers.md#typesafe-systemone-decisions) for all three typed
 question and answer shapes. Authentication precedes decoding; authorization and durable acceptance
 precede direct-route resolution. Admission requires `deployment.gateway.capabilities.supports_decisions`
 and the `typesafe_systemone` endpoint, plus a known nonnegative input rate and output rate exactly
 zero. Missing capability, a project target, or unsupported pricing fails closed before dispatch.
-The decoder bounds requests to 32 questions, 64 choice or 10 score criteria, and 262,144 bytes.
+The decoder bounds 32 questions, 64 choice/10 score criteria, 262,144 bytes plus 33,554,432 image bytes.
 Reservations count repeated state and per-question protocol allowances, not the chat tokenizer.
 They are bounded estimates, never provider-enforced token ceilings. Only reported usage settles.
 Only HTTP 400/401/403/404/422 release a known-rejection hold; 401 may use a certified fallback.
@@ -301,19 +301,19 @@ call, visible text or prefix; OpenCode echoes a schema-invalid call as its `inva
 unrevealed, disclosed as `messages.reasoning_content->dropped(assistant_turn_changed)`, as does one
 whose issuing rung left the route (a lane closed on exhausted credit): `issuing_route_unavailable`.
 A later carrier sealed over a dropped turn fails its prefix binding and drops too; an earlier intact
-one still pins. Authentication or authority failures (tamper, rotation) are still refused.
+one still pins. Tamper or rotation failures are still refused; a custom tool call turn serves unsealed.
 
 First-party CLI compatibility is capture-driven: the fields real Claude Code and Codex send by
 default are accepted and preserved. On the Messages surface, `output_config` forwards verbatim on
 Anthropic rungs (a canonical `effort` also rides `reasoning_effort`, caller keys always win over
 engine-derived ones); OpenRouter's `reasoning` object supplies an alternate effort or enable
 channel. On Messages, a numeric `max_tokens` reasoning budget becomes an exact budgeted
-`thinking` configuration on budget-capable wires; it cannot become an advisory effort or
-replace another explicit numeric budget. Unsupported hard constraints are refused before
-dispatch. `exclude` retains its disclosed omission policy. The Chat surface accepts effort
-and enable controls beside `thinking`, `chat_template_kwargs`, and DashScope's top-level
-`enable_thinking`; numeric budgets travel unchanged on qualified Anthropic, Gemini 2.5 and Qwen Cloud
-routes. Unsupported budgets are refused; see [generation controls](gateway-generation.md). Chat also
+`thinking` configuration on budget-capable wires and never replaces another explicit numeric
+budget. Unsupported hard constraints are refused before dispatch. `exclude` retains its disclosed
+omission policy. The Chat surface accepts effort and enable controls beside `thinking`,
+`chat_template_kwargs`, and DashScope's top-level `enable_thinking`; numeric budgets travel
+unchanged on qualified Anthropic, Gemini 2.5 and Qwen Cloud routes, and elsewhere snap to the route's
+nearest effort tier (`route_effort_ladder`, see [generation controls](gateway-generation.md)). Chat also
 replays OpenRouter's `reasoning` / `reasoning_details` (the `reasoning.text` blocks) as the
 same caller-owned plaintext history a `reasoning_content` echo is; mid-conversation `system` turns keep their position on wires that express
 them (instruction-hoisting rungs narrow out), and `thinking.display` rides the verbatim thinking
@@ -506,30 +506,30 @@ convert to one canonical gateway request without conflating their wire contracts
 owns headers, response assembly, SSE framing, tool-call reconstruction, and official SDK
 compatibility.
 Chat image references accept Copilot's optional `image_url.media_type` MIME hint
-(`image/png`, `image/jpeg`, `image/gif`, or `image/webp`). The hint is validated and
-discarded before provider dispatch and canonical replay identity; the `url` and
-`detail` remain authoritative. A data URL keeps its embedded MIME type, and a
-remote URL is forwarded for the provider to fetch. Unknown image fields and
-malformed URLs or base64 remain rejected.
+(`image/png`, `image/jpeg`, `image/gif`, or `image/webp`): validated and discarded
+before dispatch and replay identity, while the `url` and `detail` stay
+authoritative. A data URL keeps its embedded MIME type and a remote URL is fetched
+by the provider; unknown image fields and malformed URLs or base64 stay rejected.
 A Chat `role: "tool"` message accepts `image_url` parts beside its text (GitHub Copilot Chat,
-Codex Desktop and node agents report a screenshot inside the tool message that took it; the
-old `valid only for user messages` 400 refused ~1,000 such requests a week and wedged every
-later turn of those sessions, because the block is baked into the caller's history). The
-result decodes as the canonical tool message with text and image parts, the same shape the
-Anthropic `tool_result` image block and the Responses `function_call_output` part list
-produce; video, audio and file parts inside a tool message stay a named 400, and every other
-non-user role stays text-only. Each wire then carries the image: natively inside the tool
-result on Anthropic, native Responses and Bedrock (`ToolResultContentBlock.image`), and on Chat
-Completions and Gemini, whose tool results are text-only, folded into ONE user message that
-follows the last tool message of the contiguous run (a user message between two results of a
-parallel batch breaks the provider's tool-call linkage): each tool message keeps its text with
-a numbered `[image N: attached in the next user message]` marker where the image stood, the
-user message opens with a fixed header and introduces each image by number and
-`tool_call_id`, and the route discloses
-`messages.content.tool_result.image->following_user_message`. Only a rung with no image input
-at all still degrades the tool image to placeholder text with the
-`messages.content.tool_result.image->placeholder` disclosure (`capability_policy`); a top-level
-user image keeps the fail-closed contract because the caller can re-send it.
+Codex Desktop and node agents report a screenshot inside the tool message that took it), and a
+Messages `tool_result` accepts image and PDF `document` sub-blocks (Claude Code's Read tool
+returns both). The old 400s refused ~1,000 screenshot requests a week and every PDF read, and
+wedged every later turn, because the block is baked into the caller's history. Each decodes as
+the canonical tool message with text, image and document parts, the shape the Responses
+`function_call_output` part list also produces; video, audio and file parts inside a Chat tool
+message stay a named 400, and every other non-user role stays text-only. Images ride natively
+inside the tool result on Anthropic, Responses and Bedrock (`ToolResultContentBlock.image`),
+documents on Anthropic alone. Everywhere else the attachment folds into ONE user message after
+the last result of the contiguous run (a user message between two results of a parallel batch
+breaks the tool-call linkage): the tool message keeps a numbered
+`[image N: attached in the next user message]` (or `[document N: ...]`) marker where it stood,
+the user message introduces each attachment by number and `tool_call_id` under a fixed header,
+and the route discloses `messages.content.tool_result.image->following_user_message` or
+`messages.content.tool_result.document->following_user_message`; the attachment ceilings and
+size bounds apply as for top-level user attachments. A route with no image (or PDF) input at
+all degrades the attachment to placeholder text, disclosed as
+`messages.content.tool_result.image->placeholder` (or `messages.content.tool_result.document->placeholder`);
+a top-level user attachment keeps the fail-closed contract because the caller can re-send it.
 Both OpenAI surfaces accept the Vercel AI SDK's camelCase `promptCacheKey` (sent verbatim by
 opencode and other `ai-sdk` coding clients) as an alias of `prompt_cache_key`: it is renamed
 before manifest validation and decodes exactly as the documented field. When both spellings
@@ -552,8 +552,8 @@ opaque provider-reasoning carrier with byte-exact signatures, and a caller `thin
 configuration is forwarded verbatim on models that honor it, overriding the catalog's
 adaptive default. Budgeted-thinking support and support for disabling thinking are separate
 model capabilities: a valid explicit off setting is preserved, and an unsupported off setting
-is refused before dispatch. A numeric thinking budget is never silently replaced with an
-advisory effort. A bare `{type: enabled}` without a numeric budget can use a disclosed derived
+is refused before dispatch. A numeric thinking budget no rung carries takes the disclosed
+`route_effort_ladder` snap. A bare `{type: enabled}` without a numeric budget can use a disclosed derived
 budget that fits the effective per-rung output cap, or an admissible effort on an effort wire;
 an impossible requested configuration is refused instead of disabling thinking. An explicit
 budget at or above `max_tokens` is refused on `thinking.budget_tokens`. See
@@ -819,15 +819,16 @@ is what keeps agent loops alive; stamped, the caller replays the real text and t
 covers turns minted elsewhere.
 
 Route admission preserves caller capabilities in three verbatim-preference layers before any
-coercion: operationally dead rungs are skipped (`dispatchable_route_profiles`), generation
+coercion: operationally dead rungs are skipped (`dispatchable_route_profiles`; all-dead re-resolves once), generation
 controls narrow the waterfall to the rungs that preserve every exact value
 (`compatible_generation_parameter_profile_indexes`), falling back to the rungs that can serve the
 request only through a disclosed drop when no rung preserves it, and each remaining deployment
 passes the capability preflight plus payload build. Only when zero rungs survive does the
 capability-preservation policy (`exp/runtime/models/providers/capability_policy.py`) attempt one
-minimal COERCE-WITH-DISCLOSURE: a reasoning effort may snap downward to the nearest supported
-level that can serve the complete request, never upward. Explicit `none` remains off and is
-refused when the route cannot honor it; it cannot become `minimal`. Any effort on a route with no reasoning
+minimal COERCE-WITH-DISCLOSURE: a reasoning effort snaps downward to the nearest supported
+level that can serve the complete request; only when none at or below it serves does it rise to
+the nearest level above (`reasoning_effort->high(nearest_supported)` for `medium` on a `high`-only
+route; `(lowest_supported)` for `none`/`minimal` below the whole ladder). Any effort on a route with no reasoning
 support at all drops (first-party clients pin effort globally, so a named rejection made whole
 sessions unusable against non-reasoning models the provider itself serves fine without the
 parameter; the Messages surface's verbatim `output_config.effort` is stripped with it so the
@@ -854,9 +855,9 @@ while the third-party servers behind that dialect enumerate only the classic rol
 (`sampling_requires_reasoning_none`, e.g. gpt-5.6-sol/luna), a `temperature`/`top_p` sent with
 reasoning on is dropped and disclosed as `temperature->dropped(set_reasoning_effort_none)` rather
 than rejected — the model accepts sampling, just not at that effort, so the request serves and the
-caller is told how to keep the value (set `reasoning_effort=none`); a route that never declares the
-control at all (Anthropic constrained `[1,1]` sampling) still hard-rejects it, since there is
-nothing to honor at any effort. `top_k` prefers a carrying rung; when no rung supports it,
+caller is told how to keep the value (set `reasoning_effort=none`); a value outside every declaring
+rung's range (a Claude thinking lane accepts only `1.0`) is clamped onto the lead rung's range,
+e.g. `temperature->1.0(route_minimum)` ([gateway-generation.md](gateway-generation.md)). `top_k` prefers a carrying rung; when no rung supports it,
 admission drops it with `top_k->dropped(unsupported_by_provider)` because defaults still serve.
 `frequency_penalty` and `presence_penalty` follow their per-rung capability truth and otherwise
 drop with `<parameter>->dropped(unsupported_by_provider)`. These are soft preferences.
@@ -898,9 +899,9 @@ unrelated to the coerced field), admission carries the unprobed coercion forward
 that actually refuses names the caller's remedy: an image on a text-only reasoning route is
 refused on `messages`, never as an unsupported `thinking` field that merely rode along.
 Thinking disclosures name an applied translation, not consent to drop a cost constraint.
-A numeric thinking budget and an explicit off setting must be enforceable on the selected
-wire; otherwise admission refuses the named field before dispatch. A budget-less enable can
-translate onto an admissible effort ladder with a `thinking->reasoning_effort` disclosure.
+An explicit off setting must be enforceable on the selected wire; otherwise admission refuses
+the named field before dispatch. A budget-less enable can translate onto an admissible effort
+ladder with a `thinking->reasoning_effort` disclosure.
 A valid native thinking configuration is kept by narrowing the route before considering a
 translation. A route that offers reasoning but cannot honor the requested control is not
 silently served at its default depth. See [generation controls](gateway-generation.md).

@@ -272,7 +272,7 @@ async fn serve(
     };
     if let Some(reason) = admission_value.get("escalate") {
         METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
-        return error_response(&escalation_error());
+        return error_response(&escalation_error(reason.as_str().unwrap_or_default()));
     }
     let admission = match serde_json::from_value::<AudioAdmission>(admission_value.clone()) {
         Ok(admission) if admission.billing_modes.len() == admission.route.len() => admission,
@@ -426,6 +426,7 @@ async fn run_ladder(
                     failure =
                         crate::stream_errors::customer_credential_failure(failure, &wire.provider);
                 }
+                failure = failure.with_tenant_origin(wire.tenant_origin);
                 if opened {
                     guard.mark_opened();
                 }
@@ -472,7 +473,7 @@ async fn dispatch_speech(
     // From here the provider may execute and bill even if no header arrives.
     guard.mark_dispatched();
     let response = open_stream(
-        &state.http,
+        state.http.for_origin(wire.tenant_origin),
         &wire.url,
         &wire.headers,
         &wire.idempotency_key,
@@ -662,7 +663,7 @@ async fn dispatch_transcription(
     let body = encode_multipart(&boundary, &wire.upstream_payload, upload);
     guard.mark_dispatched();
     let response = open_upload(
-        &state.http,
+        state.http.for_origin(wire.tenant_origin),
         &wire.url,
         &wire.headers,
         &wire.idempotency_key,

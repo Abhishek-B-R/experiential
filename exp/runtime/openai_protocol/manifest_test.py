@@ -76,9 +76,11 @@ def test_manifests_classify_explicit_exclusions() -> None:
     assert responses["top_k"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert responses["top_logprobs"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["prompt_cache_options"] == CompatibilityDisposition.UNSUPPORTED
-    assert chat["prompt_cache_retention"] == CompatibilityDisposition.UNSUPPORTED
     assert responses["max_tool_calls"] == CompatibilityDisposition.UNSUPPORTED
-    assert responses["prompt_cache_retention"] == CompatibilityDisposition.UNSUPPORTED
+    # Hints that cannot change a correct answer are removed with disclosure.
+    for hint in ("prompt_cache_retention", "seed"):
+        assert chat[hint] == CompatibilityDisposition.IGNORED
+        assert responses[hint] == CompatibilityDisposition.IGNORED
 
 
 def test_schema_drift_fields_carry_capability_vocabulary() -> None:

@@ -37,6 +37,11 @@ from exp.runtime.openai_protocol.cache_control import (
     drop_opencode_cache_control,
     restore_chat_cache_control,
 )
+from exp.runtime.openai_protocol.client_field_repairs import (
+    chat_output_cap,
+    repair_chat,
+    repair_responses,
+)
 from exp.runtime.openai_protocol.custom_tool_wire import (
     ChatCustomToolCall,
     CustomToolCallItem,
@@ -49,8 +54,15 @@ from exp.runtime.openai_protocol.custom_tools import (
     custom_turn_cache_disclosures,
     expand_chat_custom_calls,
 )
-from exp.runtime.openai_protocol.enable_thinking import translate_enable_thinking
-from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
+from exp.runtime.openai_protocol.enable_thinking import (
+    CHAT_TEMPLATE_PRESERVE_THINKING_IGNORED,
+    translate_enable_thinking,
+)
+from exp.runtime.openai_protocol.errors import (
+    invalid_field,
+    unsupported_field,
+    validated_operation_headers,
+)
 from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
     EMBEDDINGS_MANIFEST,
@@ -74,7 +86,6 @@ from exp.runtime.openai_protocol.responses_input import (
     responses_input_messages,
 )
 from exp.runtime.openai_protocol.responses_probe import (
-    drop_gateway_web_search_items,
     official_responses_probe,
     require_responses_input,
     require_responses_text_spelling,
@@ -82,8 +93,10 @@ from exp.runtime.openai_protocol.responses_probe import (
 from exp.runtime.openai_protocol.structured_text import (
     chat_json_object_output,
     chat_structured_text,
+    responses_json_object_output,
     responses_structured_text,
 )
+from exp.runtime.openai_protocol.tool_call_extra_content import thought_signature
 from exp.runtime.openai_protocol.tool_choice import chat_tool_choice, responses_tool_choice
 from exp.runtime.openai_protocol.tool_search import chat_tool_search, responses_tool_search
 from exp.runtime.openai_protocol.validation_errors import validation_protocol_error
@@ -259,7 +272,7 @@ def decode_chat(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
-    payload, alias_disclosures = fold_prompt_cache_key_alias(payload)
+    payload, alias_disclosures = repair_chat(*fold_prompt_cache_key_alias(payload))
     cache_payload = payload
     payload = drop_opencode_cache_control(payload)
     validate_manifest(payload, CHAT_MANIFEST)
@@ -281,10 +294,12 @@ def decode_chat(
     )
     request = _validate_wire(_ChatRequest, payload)
     alias, online_suffix = split_online_suffix(request.model)
-    idempotency_key, client_request_id = _validated_operation_headers(
+    idempotency_key, client_request_id = validated_operation_headers(
         idempotency_key, client_request_id
     )
-    maximum = request.max_completion_tokens or request.max_tokens or request.max_output_tokens
+    maximum, maximum_parameter, cap_disclosures = chat_output_cap(
+        request.max_completion_tokens, request.max_tokens, request.max_output_tokens
+    )
     stop = (
         ()
         if request.stop is None
@@ -321,9 +336,16 @@ def decode_chat(
             json_object_output=chat_json_object_output(request.response_format),
             ignored_parameters=(
                 *alias_disclosures,
+                *cap_disclosures,
                 *cache_disclosures,
                 *custom_turn_cache_disclosures(cache_payload.get("messages")),
                 *thinking.disclosures,
+                *(
+                    (CHAT_TEMPLATE_PRESERVE_THINKING_IGNORED,)
+                    if request.chat_template_kwargs is not None
+                    and request.chat_template_kwargs.preserve_thinking is not None
+                    else ()
+                ),
                 *_replayed_reasoning_disclosures(request.messages),
             ),
             zdr_requested=request.provider is not None and request.provider.demands_zdr,
@@ -335,15 +357,7 @@ def decode_chat(
                 online_suffix=online_suffix,
             ),
             maximum_output_tokens=maximum,
-            maximum_output_tokens_parameter=(
-                "max_completion_tokens"
-                if request.max_completion_tokens is not None
-                else "max_tokens"
-                if request.max_tokens is not None
-                else "max_output_tokens"
-                if request.max_output_tokens is not None
-                else None
-            ),
+            maximum_output_tokens_parameter=maximum_parameter,
             thinking_budget=request.thinking_budget,
             provider_thinking_config=thinking.thinking_config,
             stop=stop,
@@ -426,7 +440,7 @@ def decode_responses(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
-    payload, alias_disclosures = fold_prompt_cache_key_alias(drop_gateway_web_search_items(payload))
+    payload, alias_disclosures = repair_responses(*fold_prompt_cache_key_alias(payload))
     validate_manifest(payload, RESPONSES_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
@@ -448,7 +462,7 @@ def decode_responses(
         include_output_text_logprobs,
         include_web_search_sources,
     ) = _responses_include_options(request.include)
-    idempotency_key, client_request_id = _validated_operation_headers(
+    idempotency_key, client_request_id = validated_operation_headers(
         idempotency_key, client_request_id
     )
     raw_input = payload.get("input")
@@ -495,6 +509,7 @@ def decode_responses(
             tool_choice=responses_tool_choice(request.tool_choice, native_tools=native_tools),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=responses_structured_text(request.text),
+            json_object_output=responses_json_object_output(request.text),
             ignored_parameters=(
                 *alias_disclosures,
                 *_replayed_reasoning_disclosures(
@@ -617,31 +632,6 @@ def _validate_wire[ModelT: BaseModel](model: type[ModelT], payload: JsonObject) 
         return model.model_validate(payload)
     except ValidationError as exc:
         raise validation_protocol_error(exc) from exc
-
-
-def _validated_operation_headers(
-    idempotency_key: str | None, client_request_id: str | None
-) -> tuple[str | None, str | None]:
-    """Validate the two caller identity headers as independent concepts.
-
-    ``Idempotency-Key`` names one retriable operation and is the only header
-    that keys replay and duplicate detection. ``X-Client-Request-Id`` is a
-    caller correlation identity: Codex sends its session id there on every
-    request of a session (captured live 2026-08-29), and the provider serves
-    those requests without deduplication, so treating it as an operation key
-    would reject the second request of every real session as a conflict. It
-    is echoed on responses and scopes route affinity only, and the two
-    headers may therefore carry different values.
-    """
-    for name, value in (
-        ("Idempotency-Key", idempotency_key),
-        ("X-Client-Request-Id", client_request_id),
-    ):
-        if value is not None and (
-            not value or len(value) > 512 or any(ord(char) < 32 for char in value)
-        ):
-            raise invalid_field(name, f"{name} must be a non-empty display-safe value.")
-    return idempotency_key, client_request_id
 
 
 def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessage, ...]:
@@ -782,6 +772,7 @@ def _tool_call(call: _AssistantToolCall, param: str) -> ToolCall:
             if call.cache_control is not None
             else None
         ),
+        provider_thought_signature=thought_signature(call.extra_content),
     )
 
 
@@ -944,6 +935,7 @@ def _response_input_messages(
             wire_call = _AssistantToolCall(
                 id=item.call_id,
                 function=_FunctionCall(name=item.name, arguments=item.arguments),
+                extra_content=item.extra_content,
             )
             replayed.append(
                 ReplayedFunctionCall(

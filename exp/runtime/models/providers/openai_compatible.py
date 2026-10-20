@@ -74,6 +74,7 @@ from exp.runtime.models.providers.reasoning_compat import (
     require_sampling_reasoning_compatibility,
 )
 from exp.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
+from exp.runtime.models.providers.xai import xai_videos_url
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_REFERER = "https://github.com/experientiallabs/experiential"
@@ -233,7 +234,9 @@ def openai_embedding_request(
     return request
 
 
-def openai_images_request(model_id: str, request: ImagesRequest) -> JsonObject:
+def openai_images_request(
+    model_id: str, request: ImagesRequest, *, inline_images: bool = False
+) -> JsonObject:
     """Convert one canonical image-generation request into the OpenAI wire body.
 
     Every optional control is omitted when absent so the provider default
@@ -242,6 +245,10 @@ def openai_images_request(model_id: str, request: ImagesRequest) -> JsonObject:
     Args:
         model_id: Served image model id.
         request: Canonical image-generation request.
+        inline_images: Force ``response_format: "b64_json"`` whatever the caller
+            asked, for a provider that keeps hosted images (xAI refuses ``url``
+            output for Zero Data Retention teams). The caller then receives
+            ``b64_json`` items; the gateway hosts no images to link to.
 
     Returns:
         The OpenAI-compatible ``/images/generations`` request body.
@@ -260,6 +267,8 @@ def openai_images_request(model_id: str, request: ImagesRequest) -> JsonObject:
         value = getattr(request, field)
         if value is not None:
             body[field] = value
+    if inline_images:
+        body["response_format"] = "b64_json"
     return body
 
 
@@ -614,6 +623,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             images_url=f"{self._base_url}/{self._request_path('images/generations')}",
             speech_url=f"{self._base_url}/{self._request_path('audio/speech')}",
             transcriptions_url=f"{self._base_url}/{self._request_path('audio/transcriptions')}",
+            videos_url=xai_videos_url(self._base_url),
             headers=self._headers(),
             model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,

@@ -105,7 +105,7 @@ def run_fidelity(
                 result = execute_fidelity_evaluation(store, prepared, progress=progress)
         else:
             console.print("Saved result. No provider calls.")
-            result = previous
+            result = execute_fidelity_evaluation(store, prepared)
         render_fidelity(console, result, spec.judge)
         render_memory(console, store, prepared)
         console.print(Text(f"Report artifact: {prepared.id}-report"))

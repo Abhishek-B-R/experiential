@@ -377,12 +377,13 @@ def execute_fidelity_evaluation(
             record = _receipt_recorder(project, prepared, now)
             if artifact.selection_policy_sha256 is not None:
                 originals = JEVSelector(policy=spec.retrieval.jev, decide=decide, record=record)
-            research_selection = JEVCueSelector(
-                policy=spec.retrieval.jev,
-                top_k=spec.retrieval.memory_top_k,
-                decide=decide,
-                record=record,
-            )
+            if spec.memory is not None or spec.online_research is not None:
+                research_selection = JEVCueSelector(
+                    policy=spec.retrieval.jev,
+                    top_k=spec.retrieval.memory_top_k,
+                    decide=decide,
+                    record=record,
+                )
         if spec.memory is not None:
             prior = (
                 memory_head(project.artifacts, spec.memory.lineage)

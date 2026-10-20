@@ -104,7 +104,7 @@ pub(crate) async fn responses(
             METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
             // No replay claim exists; startup validation guarantees native
             // servability, so an escalation disposition fails closed here.
-            return error_response(&escalation_error());
+            return error_response(&escalation_error(reason.as_str().unwrap_or_default()));
         }
         let key: ReplayKey = match serde_json::from_value(scope_value) {
             Ok(key) => key,
@@ -161,7 +161,7 @@ pub(crate) async fn responses(
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
         }
-        return error_response(&escalation_error());
+        return error_response(&escalation_error(reason.as_str().unwrap_or_default()));
     }
     let mut admission: Admission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,
@@ -199,7 +199,7 @@ pub(crate) async fn responses(
         return error_response(&error);
     }
 
-    let permit = match acquire_permit(&state, &mut guard, deadline).await {
+    let permit = match acquire_permit(&state, &mut guard, deadline, admission.class).await {
         Ok(permit) => permit,
         Err(response) => {
             if let Some(mut owner) = lease.take() {
@@ -746,7 +746,7 @@ async fn stream_responses(
         let mut guard = guard;
         let mut committed = committed;
         let mut lease = lease;
-        let mut delivery = Delivery::new(sender.clone(), lease.is_some());
+        let mut delivery = Delivery::new(sender.clone(), lease.is_some()).paced(committed.pace);
         // Keyed streams retain exact public frames through the publication tail.
         let mut capture: Vec<u8> = Vec::new();
         let mut replayable = lease.is_some();
@@ -904,7 +904,7 @@ async fn stream_responses(
                     }
                 }
             }
-            for outward in outward_events {
+            for outward in delivery.pace(outward_events, deadline).await {
                 let encoded = match encoder.feed(&outward) {
                     Ok(encoded) => encoded,
                     Err(_) => {
