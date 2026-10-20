@@ -25,6 +25,7 @@ from exp.runtime.gateway.class_throttles import (
     require_fast_path,
     rung_saturation,
     started_attempt_payload,
+    tier_authorization,
     tier_settlement,
     upstream_priority,
 )
@@ -354,7 +355,10 @@ def _entry(authorization: AuthorizationSnapshot, rung: ExactModelDeployment) -> 
 
 
 def test_tier_settlement_self_serves_only_a_fast_request_on_our_carded_gpu() -> None:
-    """A non-fast service_tier=priority keeps the evidence rule; so does a third-party rung."""
+    """A non-fast entry keeps the evidence rule; so does a third-party rung.
+
+    An admitted explicit priority tier reaches here as fast (tier_authorization).
+    """
     assert tier_settlement(_entry(_FAST, _carded(_rung())), "attempt-1")["self_served"]
     assert not tier_settlement(_entry(_AUTHORIZATION, _carded(_rung())), "attempt-1")["self_served"]
     assert not tier_settlement(_entry(_FAST, _carded(_rung(self_hosted=False))), "attempt-1")[
@@ -362,3 +366,22 @@ def test_tier_settlement_self_serves_only_a_fast_request_on_our_carded_gpu() -> 
     ]
     untiered = tier_settlement(_entry(_FAST, _carded(_rung())), "attempt-unknown")
     assert untiered == {"service_tier": None, "self_served": False}
+
+
+def test_an_admitted_explicit_priority_tier_is_fast() -> None:
+    """``service_tier`` priority (or fast, its alias) left standing by admission is ``:fast``.
+
+    Without it, our GPU (no tier evidence) would hold the request at the card
+    and never settle; with it, the request runs fast and settles at the card.
+    """
+    plain = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"),),
+    )
+    assert tier_authorization(_AUTHORIZATION, plain) is _AUTHORIZATION
+    flex = plain.model_copy(update={"service_tier": "flex"})
+    assert tier_authorization(_AUTHORIZATION, flex) is _AUTHORIZATION
+    # The wire models normalize ``fast`` to ``priority`` (service_tiers.ServiceTier).
+    tiered = plain.model_copy(update={"service_tier": "priority"})
+    assert tier_authorization(_AUTHORIZATION, tiered).fast
+    assert tier_authorization(_FAST, plain) is _FAST

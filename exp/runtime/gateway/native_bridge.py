@@ -10,7 +10,7 @@ from collections.abc import Callable
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import BillingSource
 from exp.runtime.gateway.attempt_tokens import counted_input_tokens
-from exp.runtime.gateway.class_throttles import admission_priority_class
+from exp.runtime.gateway.class_throttles import admission_priority_class, tier_authorization
 from exp.runtime.gateway.client_apps import with_client_identity
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -577,6 +577,7 @@ class NativeControlPlane(
                 )
             )
             placement = selected_placement or placement
+            authorization = tier_authorization(authorization, provider_request)
             route, resolved_wires = _reorder(route, resolved_wires, request, self._components)
             require_route_authority(authorization, request, route)
             require_unmodified_probability_output(
@@ -599,11 +600,10 @@ class NativeControlPlane(
             for deployment, (profile, client), budget in zip(
                 route.deployments, resolved_wires, redial_budgets, strict=True
             ):
-                # A reasoning-pinned route's fallback rung is frozen WITHOUT
-                # the pinned provider's sealed reasoning (it cannot unseal
-                # it), so a failover past the issuing rung dispatches the
-                # conversation minus that turn's thinking, never a foreign
-                # sealed block.
+                # A reasoning-pinned route's fallback rung is frozen WITHOUT the
+                # pinned provider's sealed reasoning (it cannot unseal it), so a
+                # failover past the issuing rung dispatches the conversation
+                # minus that turn's thinking, never a foreign sealed block.
                 dispatch = build_rung_dispatch(
                     route,
                     deployment,

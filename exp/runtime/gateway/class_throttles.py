@@ -191,6 +191,21 @@ def fast_request(request: GatewayRequest, authorization: AuthorizationSnapshot) 
     return request.model_copy(update={"service_tier": "priority"})
 
 
+def tier_authorization(
+    authorization: AuthorizationSnapshot, request: GatewayRequest
+) -> AuthorizationSnapshot:
+    """An admitted explicit priority tier (``service_tier`` priority or fast) is ``:fast``.
+
+    On our own carded GPU it then runs with the fast levers and settles at the
+    priority card it was held at: vLLM reports no tier, so without this it
+    would hold at the card and never settle. Elsewhere ``fast_on_rung`` keeps
+    the flag inert.
+    """
+    if authorization.fast or request.service_tier != "priority":
+        return authorization
+    return authorization.model_copy(update={"fast": True})
+
+
 def require_fast_path(request: GatewayRequest, authorization: AuthorizationSnapshot) -> None:
     """Refuse a ``:fast`` request no rung serves at the priority tier (never bill it at standard).
 
