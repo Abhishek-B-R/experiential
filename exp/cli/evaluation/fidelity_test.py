@@ -15,7 +15,7 @@ from exp.optimize.evaluation.fidelity import (
     prepare_fidelity_evaluation,
     saved_memory_receipt,
 )
-from exp.optimize.evaluation.fidelity_memory_test import (
+from exp.optimize.evaluation.tests.fidelity_memory_test import (
     RoutedTransport,
     judged,
     memory_project,
