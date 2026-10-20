@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Protocol
 
@@ -21,7 +22,11 @@ from exp.runtime.gateway.contracts import (
     GatewayFailure,
     GatewayFailureClass,
 )
-from exp.runtime.gateway.decisions_contracts import DecisionRequest, decode_decision_request
+from exp.runtime.gateway.decisions_contracts import (
+    DecisionRequest,
+    decode_decision_request,
+    public_decision_error,
+)
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import require_unguarded_surface
@@ -48,6 +53,7 @@ from exp.runtime.gateway.native_settlement import gateway_updating_failure, opti
 from exp.runtime.gateway.organization_tag import tagged_headers
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.typesafe import TYPESAFE_IMAGES_HEADER
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field
 
 
@@ -76,6 +82,27 @@ def not_a_decision_model_error(alias: str) -> OpenAIProtocolError:
         ),
         param="model",
     )
+
+
+def no_image_decisions_error(alias: str) -> OpenAIProtocolError:
+    """Return the refusal for image assets sent to a model with no image-capable rung."""
+    return OpenAIProtocolError(
+        status_code=400,
+        code="unsupported_capability",
+        message=(
+            f"The model {alias!r} does not accept images in decision requests. Remove assets, "
+            "or choose a decision model with image input from GET /v1/models."
+        ),
+        param="assets",
+    )
+
+
+def rung_headers(provider: str, static: Mapping[str, str], *, images: bool) -> dict[str, str]:
+    """Copy a rung's static headers, adding TypeSafe's image opt-in on TypeSafe rungs."""
+    headers = dict(static)
+    if images and provider == "typesafe":
+        headers[TYPESAFE_IMAGES_HEADER] = "true"
+    return headers
 
 
 def _decisions_rung(profile: GatewayWireProfile, supports_decisions: bool) -> bool:
@@ -124,17 +151,15 @@ class NativeDecisionsMixin:
         except Exception as exc:  # noqa: BLE001 - sanitize the authority boundary.
             raise authority_error(exc) from exc
         try:
-            decoded = decode_decision_request(str(data["body"]))
+            byte_length = data.get("body_bytes")
+            decoded = decode_decision_request(
+                str(data["body"]), byte_length if isinstance(byte_length, int) else None
+            )
         except (ValueError, TypeError, RecursionError) as exc:
             # Pydantic and JSON errors may include state, instructions, or key
-            # names. Never copy their text into a public error or ledger row.
-            raise NativeBridgeError(
-                invalid_field(
-                    "body",
-                    "Invalid decision request. Send only model, state, and bounded typed "
-                    "questions; chat, streaming, tools, and generation controls are not supported.",
-                )
-            ) from exc
+            # names; only field locations and fixed refusal text become public.
+            param, message = public_decision_error(exc)
+            raise NativeBridgeError(invalid_field(param, message)) from exc
         deadline = time.monotonic() + self._request_timeout_seconds
         try:
             authorization = self._components.store.authorize_request(
@@ -216,6 +241,15 @@ def _admit_accepted(
     if not capable:
         _finish_unsupported(plane, authorization)
         raise NativeBridgeError(not_a_decision_model_error(authorization.alias))
+    if request.has_images:
+        capable = tuple(
+            index
+            for index in capable
+            if route.deployments[index].gateway.capabilities.supports_image_input
+        )
+        if not capable:
+            _finish_unsupported(plane, authorization, "no decision deployment accepts images")
+            raise NativeBridgeError(no_image_decisions_error(authorization.alias))
     serving = tuple(
         index for index in capable if _priced_decision_rung(route.deployments[index].gateway.prices)
     )[:MAXIMUM_TOTAL_ATTEMPTS]
@@ -244,19 +278,21 @@ def _admit_accepted(
         decisions_url = profile.decisions_url
         if decisions_url is None:  # pragma: no cover - filtered above.
             raise GatewayRoutingError("decision rung lost its wire endpoint")
+        headers = rung_headers(deployment.provider, profile.headers, images=request.has_images)
+        tagged = tagged_headers(
+            headers,
+            profile.organization_tag_key,
+            str(authorization.organization_id),
+            billing_customer_managed=profile.billing_customer_managed,
+            tenant_origin=profile.tenant_origin,
+        )
         wire_route.append(
             deployment_wire_entry(
                 route,
                 deployment,
                 replace(profile, url=decisions_url),
                 request.provider_body(profile.model_id),
-                headers=tagged_headers(
-                    dict(profile.headers),
-                    profile.organization_tag_key,
-                    str(authorization.organization_id),
-                    billing_customer_managed=profile.billing_customer_managed,
-                    tenant_origin=profile.tenant_origin,
-                ),
+                headers=tagged if tagged is not None else headers,
             )
         )
     depth = len(route.deployments)
@@ -292,12 +328,16 @@ def _admit_accepted(
     return serialized
 
 
-def _finish_unsupported(plane: _DecisionsPlane, authorization: AuthorizationSnapshot) -> None:
-    """Finish an accepted request naming an alias that cannot serve decisions."""
+def _finish_unsupported(
+    plane: _DecisionsPlane,
+    authorization: AuthorizationSnapshot,
+    reason: str = "the model alias does not serve native decisions",
+) -> None:
+    """Finish an accepted request naming an alias that cannot serve this decision."""
     plane._accounting.finish_request_quietly(  # noqa: SLF001
         authorization,
         GatewayFailure(
             failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
-            safe_message="the model alias does not serve native decisions",
+            safe_message=reason,
         ),
     )

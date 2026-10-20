@@ -12,6 +12,8 @@ from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.transport import JsonHttpTransport
 
 TYPESAFE_BASE_URL = "https://api.typesafe.ai/v1"
+TYPESAFE_IMAGES_HEADER = "TypeSafe-Danger-Zone-Images"
+"""Opt-in header TypeSafe requires on every request that carries an image asset."""
 
 
 class TypeSafeClient:

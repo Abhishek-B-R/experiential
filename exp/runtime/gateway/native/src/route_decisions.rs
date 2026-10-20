@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::admission::{acquire_permit, new_guard, wire_drift_response};
@@ -36,6 +36,7 @@ use crate::server::AppState;
 use crate::settlement::AttemptGuard;
 use crate::upstream::open_decision_stream;
 use crate::waterfall::{successor_possible, DeploymentWire, RoutePolicy, StartResponse};
+use body_budget::reserve_body;
 use openai::{openai_decision_usage, public_openai_decisions};
 
 const PROBABILITY_TOLERANCE: f64 = 1e-6;
@@ -129,6 +130,12 @@ async fn serve(
         Ok(Err(error)) => return error_response(&error),
         Err(_) => return error_response(&timeout_failure().public_error()),
     };
+    // Held for the whole request: the body and its admitted payloads stay
+    // resident until the provider answer is relayed.
+    let _body_budget = match reserve_body(body.len(), deadline).await {
+        Ok(permit) => permit,
+        Err(error) => return error_response(&error),
+    };
     let raw_key = match bearer_key(&headers) {
         Ok(key) => key,
         Err(error) => return error_response(&error),
@@ -137,28 +144,26 @@ async fn serve(
     if let Err(error) = state.bridge.call("authenticate", authenticate).await {
         return error_response(&error);
     }
-    let body_text = match String::from_utf8(body.to_vec()) {
-        Ok(text) => text,
-        Err(_) => return error_response(&PublicError::invalid_json()),
+    let Ok(body_text) = std::str::from_utf8(&body) else {
+        return error_response(&PublicError::invalid_json());
     };
     let client_request_id = latin1_header(&headers, "x-client-request-id");
-    let argument = admission_argument(&raw_key, &body_text, &headers);
+    let argument = admission_argument(&raw_key, body_text, &headers);
+    drop(body);
     let admission_text = match state.bridge.call(admission_method, argument).await {
         Ok(text) => text,
         Err(error) => return error_response(&error),
     };
-    let admission_value: Value = match serde_json::from_str(&admission_text) {
-        Ok(value) => value,
-        Err(_) => return error_response(&PublicError::internal()),
+    let admission = match parse_admission(&admission_text, expected_wire) {
+        Ok(admission) => admission,
+        Err(Parsed::Escalate(reason)) => {
+            METRICS.record_escalation(classify_escalation(&reason));
+            return error_response(&escalation_error(&reason));
+        }
+        Err(Parsed::Drift(value)) => return wire_drift_response(&state, &value, started).await,
+        Err(Parsed::Malformed) => return error_response(&PublicError::internal()),
     };
-    if let Some(reason) = admission_value.get("escalate") {
-        METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
-        return error_response(&escalation_error(reason.as_str().unwrap_or_default()));
-    }
-    let admission = match serde_json::from_value::<DecisionsAdmission>(admission_value.clone()) {
-        Ok(admission) if admission.wire == expected_wire => admission,
-        _ => return wire_drift_response(&state, &admission_value, started).await,
-    };
+    drop(admission_text);
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
     let _permit = match acquire_permit(&state, &mut guard, deadline, None).await {
         Ok(permit) => permit,
@@ -182,15 +187,63 @@ async fn serve(
     }
 }
 
+/// An admission bridge answer that is not a dispatchable decision route.
+enum Parsed {
+    Escalate(String),
+    Drift(Value),
+    Malformed,
+}
+
+#[derive(Deserialize)]
+struct EscalationProbe {
+    #[serde(default)]
+    escalate: Option<Value>,
+}
+
+/// Decode the admission straight from its text: the route carries every
+/// rung's provider payload, so no intermediate `Value` copy is kept.
+fn parse_admission(text: &str, expected_wire: DecisionWire) -> Result<DecisionsAdmission, Parsed> {
+    let Ok(probe) = serde_json::from_str::<EscalationProbe>(text) else {
+        return Err(Parsed::Malformed);
+    };
+    if let Some(reason) = probe.escalate {
+        return Err(Parsed::Escalate(
+            reason.as_str().unwrap_or_default().to_string(),
+        ));
+    }
+    match serde_json::from_str::<DecisionsAdmission>(text) {
+        Ok(admission) if admission.wire == expected_wire => Ok(admission),
+        _ => Err(Parsed::Drift(
+            serde_json::from_str(text).unwrap_or(Value::Null),
+        )),
+    }
+}
+
+#[derive(Serialize)]
+struct AdmissionArgument<'a> {
+    body: &'a str,
+    /// UTF-8 length of `body`, so admission bounds it without re-encoding.
+    body_bytes: usize,
+    #[serde(flatten)]
+    fields: Map<String, Value>,
+}
+
 /// Forward authority, app identity, and trusted proxy IP without caller idempotency.
 fn admission_argument(raw_key: &str, body: &str, headers: &HeaderMap) -> String {
-    let mut argument = json!({
+    let mut fields = json!({
         "raw_key": raw_key,
-        "body": body,
         "client_ip": client_ip(headers),
     });
-    with_app_identity(&mut argument, headers);
-    compact_json(&argument)
+    with_app_identity(&mut fields, headers);
+    let Value::Object(fields) = fields else {
+        unreachable!("the admission fields are built as an object")
+    };
+    serde_json::to_string(&AdmissionArgument {
+        body,
+        body_bytes: body.len(),
+        fields,
+    })
+    .unwrap_or_else(|_| "null".to_string())
 }
 
 /// Reserve every physical dispatch through the same authority as other routes.
@@ -904,6 +957,11 @@ fn served_headers(
     headers
 }
 
+#[cfg(test)]
+#[path = "route_decisions/admission_tests.rs"]
+mod admission_tests;
+#[path = "route_decisions/body_budget.rs"]
+mod body_budget;
 #[path = "route_decisions/openai.rs"]
 mod openai;
 #[cfg(test)]

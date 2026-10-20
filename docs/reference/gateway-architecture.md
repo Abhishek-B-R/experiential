@@ -103,13 +103,13 @@ signatures. The bounded immediate open retry reuses that signature; later retrie
 
 ### Native decisions
 
-`POST /v1/systemone` accepts only `model`, `state`, and named `questions`; see
+`POST /v1/systemone` accepts `model`, `state`, named `questions`, and optional image `assets`; see
 [TypeSafe SystemOne decisions](providers.md#typesafe-systemone-decisions) for all three typed
 question and answer shapes. Authentication precedes decoding; authorization and durable acceptance
 precede direct-route resolution. Admission requires `deployment.gateway.capabilities.supports_decisions`
 and the `typesafe_systemone` endpoint, plus a known nonnegative input rate and output rate exactly
 zero. Missing capability, a project target, or unsupported pricing fails closed before dispatch.
-The decoder bounds requests to 32 questions, 64 choice or 10 score criteria, and 262,144 bytes.
+The decoder bounds 32 questions, 64 choice/10 score criteria, 262,144 bytes plus 33,554,432 image bytes.
 Reservations count repeated state and per-question protocol allowances, not the chat tokenizer.
 They are bounded estimates, never provider-enforced token ceilings. Only reported usage settles.
 Only HTTP 400/401/403/404/422 release a known-rejection hold; 401 may use a certified fallback.

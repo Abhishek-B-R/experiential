@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -43,7 +44,7 @@ from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_accounting import NativeBridgeError
 from exp.runtime.gateway.native_bridge import NativeControlPlane
-from exp.runtime.gateway.native_decisions import _admit_accepted
+from exp.runtime.gateway.native_decisions import _admit_accepted, rung_headers
 from exp.runtime.gateway.organization_tag import (
     ORGANIZATION_TAG_HEADER,
     organization_tag,
@@ -56,7 +57,7 @@ from exp.runtime.gateway.tests.chain_authority_fixture_test import (
 )
 from exp.runtime.gateway.tests.parallel_input_guardrails_test import _Classifier, _engine
 from exp.runtime.models.providers.base import GatewayWireProfile
-from exp.runtime.models.providers.typesafe import TypeSafeClient
+from exp.runtime.models.providers.typesafe import TYPESAFE_IMAGES_HEADER, TypeSafeClient
 
 _PRICES = GatewayTokenPrices(
     input_nano_usd_per_million_tokens=50_000_000,
@@ -68,6 +69,7 @@ def _control_plane(
     root: Path,
     *,
     supports_decisions: bool = True,
+    supports_image_input: bool = False,
     prices: GatewayTokenPrices = _PRICES,
     rungs: int = 1,
     base_url: str | None = None,
@@ -97,7 +99,7 @@ def _control_plane(
             revision=None,
             capabilities=ModelCapabilities(supports_completions=False, supports_embeddings=False),
             gateway_capabilities=GatewayDeploymentCapabilities(
-                supports_decisions=supports_decisions
+                supports_decisions=supports_decisions, supports_image_input=supports_image_input
             ),
             prices=prices,
             pricing_source="test-fixture",
@@ -554,3 +556,131 @@ def test_customer_credential_on_a_self_hosted_origin_gets_no_tag(tmp_path: Path)
         "Authorization": "Bearer provider-secret-canary",
         "Content-Type": "application/json",
     }
+
+
+_IMAGE_REFERENCE = "a3f1c2e8-private-reference-canary"
+
+
+def _image_body() -> JsonObject:
+    """Return the canonical body with one base64 image placed in the state."""
+    body = _body()
+    body["state"] = {"description": "private-state-canary", "photo": _IMAGE_REFERENCE}
+    body["assets"] = {_IMAGE_REFERENCE: {"type": "image", "format": "png", "data_base64": "AAAA"}}
+    return body
+
+
+def test_image_assets_reach_an_image_capable_rung_with_the_opt_in_header(tmp_path: Path) -> None:
+    """Assets pass through unchanged and only image requests carry TypeSafe's opt-in header."""
+    control, raw_key = _control_plane(tmp_path, supports_image_input=True)
+    route = _admit(control, raw_key, _image_body())["route"]
+    assert isinstance(route, list)
+    wire = route[0]
+    assert isinstance(wire, dict)
+    assert wire["headers"] == {
+        "Authorization": "Bearer provider-secret-canary",
+        "Content-Type": "application/json",
+        TYPESAFE_IMAGES_HEADER: "true",
+    }
+    expected = _image_body()
+    expected["model"] = "systemone"
+    assert wire["upstream_payload"] == expected
+    text_route = _admit(control, raw_key)["route"]
+    assert isinstance(text_route, list) and isinstance(text_route[0], dict)
+    assert TYPESAFE_IMAGES_HEADER not in text_route[0]["headers"]
+
+
+def test_image_header_joins_the_organization_tag_on_a_house_self_hosted_rung(
+    tmp_path: Path,
+) -> None:
+    """The opt-in header survives the tagged-header path rather than being replaced."""
+    control, raw_key = _control_plane(
+        tmp_path,
+        supports_image_input=True,
+        base_url="https://clef.example.test/v1",
+        billing_source=BillingSource.HOST_MANAGED,
+    )
+    route = _admit(control, raw_key, _image_body())["route"]
+    assert isinstance(route, list) and isinstance(route[0], dict)
+    headers = route[0]["headers"]
+    assert isinstance(headers, dict)
+    assert headers[TYPESAFE_IMAGES_HEADER] == "true"
+    assert ORGANIZATION_TAG_HEADER in headers
+
+
+def test_images_to_a_text_only_decision_model_are_refused_before_dispatch(tmp_path: Path) -> None:
+    """A rung without image input never receives assets; the caller learns which field."""
+    control, raw_key = _control_plane(tmp_path)
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit(control, raw_key, _image_body())
+    error = _public_error(raised.value)
+    assert error["status_code"] == 400
+    assert error["code"] == "unsupported_capability"
+    assert error["param"] == "assets"
+    assert "does not accept images" in str(error["message"])
+    assert _IMAGE_REFERENCE not in json.dumps(error)
+    assert _rows(control) == [("decisions", "failed")]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "param", "phrase"),
+    [
+        (lambda body: body.update(stream=True), "stream", "stream is not supported"),
+        (lambda body: body.pop("questions"), "questions", "questions is missing"),
+        (
+            lambda body: body["assets"][_IMAGE_REFERENCE].update(part="door-photo"),
+            "assets",
+            "multipart image uploads",
+        ),
+        (
+            lambda body: body["assets"].update({"unused-canary": body["assets"][_IMAGE_REFERENCE]}),
+            "assets",
+            "must appear in state",
+        ),
+        (
+            lambda body: body["questions"]["safe"].update(type="private-type-canary"),
+            "questions",
+            "noul, choice, or score",
+        ),
+    ],
+)
+def test_invalid_decision_bodies_name_the_field_without_echoing_content(
+    tmp_path: Path, mutate: Callable[[JsonObject], object], param: str, phrase: str
+) -> None:
+    """Refusals are field-specific, written before acceptance, and quote no caller content."""
+    control, raw_key = _control_plane(tmp_path, supports_image_input=True)
+    body = _image_body()
+    mutate(body)
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit(control, raw_key, body)
+    error = _public_error(raised.value)
+    assert (error["status_code"], error["code"], error["param"]) == (
+        400,
+        "invalid_parameter",
+        param,
+    )
+    assert phrase in str(error["message"])
+    assert "canary" not in json.dumps(error)
+    assert _rows(control) == []
+
+
+def test_only_typesafe_rungs_receive_the_image_opt_in_header() -> None:
+    """Another SystemOne-wire provider never sees TypeSafe's vendor header."""
+    static = {"Authorization": "Bearer key"}
+    assert rung_headers("typesafe", static, images=True) == {
+        **static,
+        TYPESAFE_IMAGES_HEADER: "true",
+    }
+    assert rung_headers("experiential_cloud", static, images=True) == static
+    assert rung_headers("typesafe", static, images=False) == static
+    assert rung_headers("typesafe", static, images=True) is not static
+
+
+def test_admission_uses_the_native_fronts_measured_body_length(tmp_path: Path) -> None:
+    """A body_bytes over the raw ceiling is refused before acceptance without re-encoding."""
+    control, raw_key = _control_plane(tmp_path)
+    argument = {"raw_key": raw_key, "body": json.dumps(_body()), "body_bytes": 10**12}
+    with pytest.raises(NativeBridgeError) as raised:
+        control.admit_decisions(json.dumps(argument))
+    error = _public_error(raised.value)
+    assert (error["status_code"], error["param"]) == (400, "body")
+    assert _rows(control) == []
