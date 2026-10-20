@@ -16,7 +16,7 @@ use crate::errors::{Failure, FailureClass, PublicError};
 pub(crate) const LARGE_BODY_BYTES: usize = 1024 * 1024;
 /// Per-worker MiB of large decision bodies admitted at once; above the
 /// 64 MiB shared request cap so any single accepted body fits.
-const LARGE_BODY_BUDGET_MIB: usize = 256;
+const LARGE_BODY_BUDGET_MIB: usize = 128;
 
 static LARGE_BODY_BUDGET: Semaphore = Semaphore::const_new(LARGE_BODY_BUDGET_MIB);
 
@@ -69,7 +69,7 @@ mod tests {
         assert_eq!(body_weight(LARGE_BODY_BYTES), 0);
         assert_eq!(body_weight(LARGE_BODY_BYTES + 1), 2);
         assert_eq!(body_weight(64 * LARGE_BODY_BYTES), 64);
-        assert_eq!(body_weight(usize::MAX), 256);
+        assert_eq!(body_weight(usize::MAX), 128);
     }
 
     #[tokio::test]

@@ -255,7 +255,7 @@ its own format and pixel limits. Each image reserves a fixed 4,096-token plannin
 question that references it (a state image counts for every question), however often its reference
 repeats; settlement still bills only TypeSafe's reported input tokens. The TypeSafe opt-in header
 is sent only to `typesafe` deployments. Decision bodies over 1 MiB first take one unit per started
-MiB from a 256 MiB per-worker budget, held for the whole request, so concurrent large bodies wait
+MiB from a 128 MiB per-worker budget, held for the whole request, so concurrent large bodies wait
 rather than multiplying memory; the native front passes the body's byte length to admission.
 
 Limits are 1 through 32 questions, 1 through 256 UTF-8 bytes per question ID or choice category
