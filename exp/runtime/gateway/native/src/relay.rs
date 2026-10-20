@@ -287,9 +287,7 @@ impl UpstreamRelay {
             stall_bound_armed: true,
             committed: false,
             provider_tools: progress::ProviderTools::default(),
-            tool_arguments: progress::BufferedToolArguments::new(
-                dialect == Dialect::AnthropicMessages,
-            ),
+            tool_arguments: progress::BufferedToolArguments::default(),
             last_progress_at: None,
             yielded_at: None,
             first_token_deadline,
