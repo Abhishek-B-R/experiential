@@ -41,6 +41,9 @@ impl RetainedOutputBudget {
         }
     }
 
+    // `fetch_update` is renamed `try_update` in newer toolchains; keep the stable
+    // name so every supported toolchain builds with warnings denied.
+    #[allow(deprecated)]
     fn reserve(&self, bytes: usize) -> bool {
         let limit = self.limit.load(Ordering::Acquire);
         self.held

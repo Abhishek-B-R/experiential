@@ -32,7 +32,8 @@ without rules would run in every pipeline.
 It mirrors the Linux jobs of `.github/workflows/gate.yml`: `gate-rust` (cargo
 fmt, clippy with `-D warnings`, cargo test, the real-bridge cache test, and the
 native parity tests), `gate-lint` (ruff check, ruff format, ty, and the Tinker
-adapter tests), and five `gate-tests` shards of the non-live pytest suite. Two
+adapter tests), and five `gate-tests` shards of the non-live pytest suite, one
+xdist worker per runner CPU. Two
 known-red tests are deselected by node id in the `rest` shard, each with a
 comment naming why; every other test is strict. Run it on a branch before
 handing off a change that has no other test pipeline.

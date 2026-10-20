@@ -104,5 +104,7 @@ gate-tests:
         *)
           echo "unknown shard: $SHARD" >&2; exit 1 ;;
       esac
+      # One worker per CPU: the small runner has two, and oversubscribing it
+      # trips the suite's deadline- and garbage-collection-timed tests.
       # Word splitting of $paths is intended: it holds paths and pytest flags.
-      uv run pytest -n 4 --dist worksteal -q -k "not live" $paths --ignore=exp/optimize/router/tests/composition_evidence_test.py
+      uv run pytest -n "$(nproc)" --dist worksteal -q -k "not live" $paths --ignore=exp/optimize/router/tests/composition_evidence_test.py
