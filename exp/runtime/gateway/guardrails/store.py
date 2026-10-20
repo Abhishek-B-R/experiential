@@ -5,16 +5,19 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Protocol
 
-from exp.runtime.gateway.contracts import IdentityId, OrganizationId
+from exp.runtime.gateway.contracts import AuthorizationSnapshot
 from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy
 
 
 class GuardrailPolicyStore(Protocol):
-    """Resolve a frozen ordered policy set for authenticated authority."""
+    """Resolve a frozen ordered policy set for one authorized request.
 
-    def policies_for(
-        self, organization_id: OrganizationId, identity_id: IdentityId
-    ) -> tuple[GuardrailPolicy, ...]:
+    The authorization carries the authenticated organization and identity plus
+    the alias and its frozen target, so a store may scope a policy to an
+    identity, an alias, or an exact-model pool.
+    """
+
+    def policies_for(self, authorization: AuthorizationSnapshot) -> tuple[GuardrailPolicy, ...]:
         """Return every applicable policy, with authenticated decision metadata."""
         ...
 
@@ -39,10 +42,14 @@ class MappingGuardrailStore:
                 raise ValueError("guardrail policies must be unique per organization and identity")
             self._identities[key] = policy
 
-    def policies_for(
-        self, organization_id: OrganizationId, identity_id: IdentityId
-    ) -> tuple[GuardrailPolicy, ...]:
-        """Apply platform policies first, followed by this identity's optional policy."""
+    def policies_for(self, authorization: AuthorizationSnapshot) -> tuple[GuardrailPolicy, ...]:
+        """Apply platform policies first, followed by this identity's optional policy.
+
+        Resolution reads only the authorization's organization and identity; every
+        alias target receives the same policies.
+        """
+        organization_id = authorization.organization_id
+        identity_id = authorization.identity_id
         assigned = self._identities.get((organization_id, identity_id))
         return tuple(p.bind(organization_id, identity_id) for p in self._platform) + (
             () if assigned is None else (assigned,)

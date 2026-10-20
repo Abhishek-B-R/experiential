@@ -59,6 +59,7 @@ from exp.runtime.gateway.guardrails.regex import (
     RegexClassifier,
 )
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
+from exp.runtime.gateway.guardrails.store_test import _authorization
 from exp.runtime.gateway.guardrails.subjects import ObservedSubjects, observation_subject_bytes
 
 
@@ -645,7 +646,7 @@ def test_input_chain_runs_once_and_can_transform_the_request() -> None:
         ),
         checks=(_check("input-one", action=GuardrailAction.MODIFY),),
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     result = _awaited(
@@ -696,7 +697,7 @@ def test_input_modifier_rejects_carrier_removal_with_bound_tool_history() -> Non
         ),
         checks=(_check("input-modify", action=GuardrailAction.MODIFY),),
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
     request = GatewayRequest(
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
@@ -739,7 +740,7 @@ def test_input_modifier_may_redact_after_an_exact_sealed_turn() -> None:
         ),
         checks=(_check("input-modify", action=GuardrailAction.MODIFY),),
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     result = _awaited(
@@ -778,7 +779,7 @@ def test_input_modifier_may_fully_redact_carrier_bound_history() -> None:
         ),
         checks=(_check("input-modify", action=GuardrailAction.MODIFY),),
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     result = _awaited(
@@ -840,7 +841,7 @@ def test_input_modify_can_redact_only_history_after_authenticated_reasoning() ->
         ),
         checks=(_check("input-one", action=GuardrailAction.MODIFY),),
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     result = _awaited(
@@ -859,7 +860,7 @@ def test_input_modify_rejects_removing_provider_reasoning_with_bound_history() -
         ),
         checks=(_check("input-one", action=GuardrailAction.MODIFY),),
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     with pytest.raises(GuardrailRejected):
@@ -936,7 +937,7 @@ def test_input_modify_restores_carrier_omitted_from_classifier_projection() -> N
         ),
         checks=(_check("input-one", action=GuardrailAction.MODIFY),),
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     result = _awaited(
@@ -991,7 +992,7 @@ def test_input_modify_restores_hidden_tool_authority_without_reasoning() -> None
         ),
         checks=(_check("input-one", action=GuardrailAction.MODIFY),),
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     result = _awaited(
@@ -1006,7 +1007,7 @@ def test_input_block_is_terminal_and_content_free() -> None:
         classifier=ScriptedClassifier(input_verdict=ClassifierVerdict(flagged=True)),
         checks=(_check("input-one"),),
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     with pytest.raises(GuardrailRejected) as raised:
@@ -1030,7 +1031,7 @@ def test_protected_identity_fail_closes_on_adapter_error() -> None:
         checks=(_check("input-one"),),
         protected=True,
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     with pytest.raises(GuardrailRejected) as raised:
@@ -1053,7 +1054,7 @@ def test_unprotected_identity_skips_a_failed_check() -> None:
         checks=(_check("input-one"),),
         protected=False,
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     result = _awaited(
@@ -1077,7 +1078,7 @@ def test_expired_deadline_fail_closes_for_protected_identities() -> None:
         protected=True,
         clock=clock,
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     with pytest.raises(GuardrailRejected):
@@ -1104,7 +1105,7 @@ def test_output_modify_never_rewrites_tool_call_arguments() -> None:
             ),
         ),
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
     completion = GuardrailCompletion(
         text="call a tool",
@@ -1130,7 +1131,7 @@ def test_oversized_payload_is_a_terminal_error() -> None:
         checks=(_check("input-one"),),
         max_request_bytes=4,
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     with pytest.raises(GuardrailRejected):
@@ -1143,8 +1144,8 @@ def test_oversized_payload_is_a_terminal_error() -> None:
         )
 
     assert classifier.input_calls == 0
-    assert engine.policies_for("organization-one", "identity-two") == ()
-    assert engine.policies_for("organization-two", "identity-one") == ()
+    assert engine.policies_for(_authorization("organization-one", "identity-two")) == ()
+    assert engine.policies_for(_authorization("organization-two", "identity-one")) == ()
 
 
 def test_oversized_tool_schema_is_rejected_without_calling_the_adapter() -> None:
@@ -1170,7 +1171,7 @@ def test_oversized_tool_schema_is_rejected_without_calling_the_adapter() -> None
         checks=(_check("input-one"),),
         max_request_bytes=subject_bytes - 1,
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     with pytest.raises(GuardrailRejected):
@@ -1194,7 +1195,7 @@ def test_blocking_classifier_times_out_without_waiting_for_return() -> None:
         protected=True,
         clock=_Clock(),
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     started = time.monotonic()
@@ -1224,7 +1225,7 @@ def test_blocking_classifier_leaves_the_event_loop_free() -> None:
             protected=True,
             clock=_Clock(),
         )
-        policy = engine.policies_for("organization-one", "identity-one")[0]
+        policy = engine.policies_for(_authorization())[0]
         assert policy is not None
         progressed = False
 
@@ -1256,7 +1257,7 @@ def test_blocking_before_await_classifier_times_out_without_freezing_enforcement
         protected=True,
         clock=_Clock(),
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     try:
@@ -1467,7 +1468,7 @@ def test_signed_tool_ids_count_toward_output_subject_limit(limit_offset: int) ->
         checks=(_check("output-one", stage=GuardrailCheckStage.OUTPUT),),
         max_response_bytes=subject_bytes + limit_offset,
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
     if limit_offset < 0:
         with pytest.raises(GuardrailRejected):
@@ -1517,7 +1518,7 @@ def _regex_engine(
         ),
         max_response_bytes=max_response_bytes,
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
     return engine, policy
 
@@ -1545,7 +1546,7 @@ def test_an_authored_regex_chain_keeps_the_buffered_path() -> None:
         classifier=detector,
         checks=(_check("output-one", stage=GuardrailCheckStage.OUTPUT),),
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert (
         engine.output_mode(
             policy,
@@ -1605,7 +1606,7 @@ def test_nondeterministic_adapter_keeps_the_buffered_path() -> None:
             ),
         ),
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
     assert (
         engine.output_mode(
@@ -1643,7 +1644,7 @@ def test_second_output_check_keeps_the_buffered_path() -> None:
 def test_unguarded_identity_reports_no_output_work() -> None:
     """An identity with no output check runs neither path."""
     engine, _ = _engine(classifier=ScriptedClassifier(), checks=(_check("input-one"),))
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert (
         engine.output_mode(
             policy,
@@ -1716,7 +1717,7 @@ def test_adapter_failure_mid_stream_fails_closed() -> None:
         classifier=detector,
         checks=(_check("output-one", stage=GuardrailCheckStage.OUTPUT),),
     )
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
     with pytest.raises(GuardrailRejected):
         engine.release_output_segment(
