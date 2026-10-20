@@ -68,39 +68,41 @@ gate-tests:
   # Balanced as in .github/workflows/gate.yml. A path a shard ignores must be
   # another shard's path, or run elsewhere: Tinker in gate-lint, and the two
   # evidence suites (comparison_evidence, composition_evidence) in the macOS
-  # evidence job, which GitLab does not run.
+  # evidence job, which GitLab does not run. The matrix carries only the shard
+  # name, because GitLab writes matrix values into the job name.
   parallel:
     matrix:
-      - SHARD: rest
-        # Two known-red tests are deselected by node id; every other test is strict.
-        # - repo_layout_test.py::test_non_test_hand_authored_files_stay_below_one_thousand_lines:
-        #   four hand-authored files on main are over the 999-line cap
-        #   (exp/runtime/gateway/contracts.py, exp/runtime/models/providers/bedrock.py,
-        #   exp/runtime/models/providers/openai_compatible.py,
-        #   exp/runtime/openai_protocol/requests.py). Remove once they are split.
-        # - release_test.py::test_installed_wheel_no_spend_release_evidence: installs
-        #   freshly built wheels plus git-pinned capture dependencies into a new
-        #   environment and fails in this setup; .github/workflows/gate.yml deselects
-        #   it from the Linux shards too.
-        PATHS: >-
-          exp
-          --ignore=exp/optimize/router --ignore=exp/runtime/gateway
-          --ignore=exp/optimize/evaluation --ignore=exp/optimize/model/sft/tinker_test.py
-          --ignore=exp/simulation/tests/comparison_evidence_test.py
-          --deselect=exp/tests/repo_layout_test.py::test_non_test_hand_authored_files_stay_below_one_thousand_lines
-          --deselect=exp/tests/release_test.py::test_installed_wheel_no_spend_release_evidence
-      - SHARD: router-hosted
-        PATHS: exp/optimize/router/hosted_test.py exp/optimize/router/automatic
-      - SHARD: router
-        PATHS: >-
-          exp/optimize/router
-          --ignore=exp/optimize/router/hosted_test.py --ignore=exp/optimize/router/automatic
-      - SHARD: gateway
-        PATHS: exp/runtime/gateway
-      - SHARD: evaluation
-        PATHS: exp/optimize/evaluation
+      - SHARD: [rest, router-hosted, router, gateway, evaluation]
   script:
-    - >-
-      uv run pytest -n 4 --dist worksteal -q -k "not live"
-      $PATHS
-      --ignore=exp/optimize/router/tests/composition_evidence_test.py
+    - |
+      case "$SHARD" in
+        rest)
+          # Two known-red tests are deselected by node id; every other test is strict.
+          # - repo_layout_test.py::test_non_test_hand_authored_files_stay_below_one_thousand_lines:
+          #   four hand-authored files on main are over the 999-line cap
+          #   (exp/runtime/gateway/contracts.py, exp/runtime/models/providers/bedrock.py,
+          #   exp/runtime/models/providers/openai_compatible.py,
+          #   exp/runtime/openai_protocol/requests.py). Remove once they are split.
+          # - release_test.py::test_installed_wheel_no_spend_release_evidence: installs
+          #   freshly built wheels plus git-pinned capture dependencies into a new
+          #   environment and fails in this setup; .github/workflows/gate.yml deselects
+          #   it from the Linux shards too.
+          paths="exp --ignore=exp/optimize/router --ignore=exp/runtime/gateway
+            --ignore=exp/optimize/evaluation --ignore=exp/optimize/model/sft/tinker_test.py
+            --ignore=exp/simulation/tests/comparison_evidence_test.py
+            --deselect=exp/tests/repo_layout_test.py::test_non_test_hand_authored_files_stay_below_one_thousand_lines
+            --deselect=exp/tests/release_test.py::test_installed_wheel_no_spend_release_evidence" ;;
+        router-hosted)
+          paths="exp/optimize/router/hosted_test.py exp/optimize/router/automatic" ;;
+        router)
+          paths="exp/optimize/router --ignore=exp/optimize/router/hosted_test.py
+            --ignore=exp/optimize/router/automatic" ;;
+        gateway)
+          paths="exp/runtime/gateway" ;;
+        evaluation)
+          paths="exp/optimize/evaluation" ;;
+        *)
+          echo "unknown shard: $SHARD" >&2; exit 1 ;;
+      esac
+      # Word splitting of $paths is intended: it holds paths and pytest flags.
+      uv run pytest -n 4 --dist worksteal -q -k "not live" $paths --ignore=exp/optimize/router/tests/composition_evidence_test.py
