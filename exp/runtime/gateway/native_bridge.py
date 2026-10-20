@@ -577,7 +577,7 @@ class NativeControlPlane(
                 )
             )
             placement = selected_placement or placement
-            authorization = tier_authorization(authorization, provider_request)
+            rung_authorization = tier_authorization(authorization, provider_request)
             route, resolved_wires = _reorder(route, resolved_wires, request, self._components)
             require_route_authority(authorization, request, route)
             require_unmodified_probability_output(
@@ -611,7 +611,7 @@ class NativeControlPlane(
                     client,
                     provider_request=rung_provider_request(route, deployment, provider_request),
                     public_request=public_request,
-                    authorization=authorization,
+                    authorization=rung_authorization,
                     throttle_redial_budget=budget,
                 )
                 if dispatch.parallel_disclosure is not None:
@@ -744,7 +744,7 @@ class NativeControlPlane(
         plan = None if guardrails is None else guardrails.output_plan()
         self._accounting.register(
             InflightRequest(
-                authorization=authorization,
+                authorization=rung_authorization,
                 route=route,
                 request=provider_request,
                 deadline_monotonic=deadline,

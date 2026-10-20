@@ -422,6 +422,20 @@ def test_request_class_reaches_the_admission_only_when_the_host_sets_one(
     assert classed["priority_class"] == 6
 
 
+def test_a_plain_priority_tier_never_jumps_the_permit_queue(tmp_path: Path) -> None:
+    """``service_tier`` priority without ``:fast`` keeps the caller's own permit class.
+
+    Only the per-rung entry treats an admitted priority tier as fast
+    (class_throttles.tier_authorization); the worker-wide permit queue reads
+    the authorization the host vouched for.
+    """
+    control, raw_key = _control_plane(tmp_path)
+    body = json.loads(_chat_body(stream=True))
+    for tier in ("priority", "fast"):
+        admitted = _admit(control, raw_key, json.dumps({**body, "service_tier": tier}))
+        assert "priority_class" not in admitted, admitted
+
+
 @pytest.mark.parametrize("provider", ("anthropic", "openai-compatible"))
 @pytest.mark.parametrize("maximum", (2_048, 128_000))
 def test_omitted_cap_admission_freezes_provider_maximum_without_public_rewrite(

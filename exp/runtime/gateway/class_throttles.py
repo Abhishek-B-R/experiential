@@ -122,7 +122,9 @@ def output_pace(
     set a saturation threshold, the rung at or above it.
     """
     pace = authorization.output_tokens_per_second
-    if pace is None or authorization.fast or not is_self_hosted_rung(deployment):
+    if pace is None or fast_on_rung(authorization, deployment):
+        return None
+    if not is_self_hosted_rung(deployment):
         return None
     threshold = authorization.output_pace_saturation
     if threshold is None:
@@ -140,7 +142,7 @@ def class_concurrency_cap(
     if (
         cap is None
         or request_class is None
-        or authorization.fast
+        or fast_on_rung(authorization, deployment)
         or not is_self_hosted_rung(deployment)
     ):
         return None

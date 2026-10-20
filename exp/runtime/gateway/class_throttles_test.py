@@ -228,7 +228,10 @@ def test_upstream_priority_puts_fast_ahead_only_with_the_priority_card() -> None
 
 
 def test_fast_is_exempt_from_the_class_pace_and_cap() -> None:
-    """A :fast request on our GPU is never paced or class-capped, whatever the host sent."""
+    """A :fast request on our carded GPU is never paced or class-capped.
+
+    On an uncarded GPU it is billed at standard, so it keeps every throttle.
+    """
     throttled = _FAST.model_copy(
         update={
             "priority_class": 1,
@@ -236,8 +239,10 @@ def test_fast_is_exempt_from_the_class_pace_and_cap() -> None:
             "self_hosted_class_concurrency": 1,
         }
     )
-    assert output_pace(throttled, _rung(), RungLoadRegistry()) is None
-    assert class_concurrency_cap(throttled, _rung()) is None
+    assert output_pace(throttled, _carded(_rung()), RungLoadRegistry()) is None
+    assert class_concurrency_cap(throttled, _carded(_rung())) is None
+    assert output_pace(throttled, _rung(), RungLoadRegistry()) == 10.0
+    assert class_concurrency_cap(throttled, _rung()) == (1, 1)
 
 
 def test_fast_resource_levers_apply_only_on_our_carded_gpus() -> None:
