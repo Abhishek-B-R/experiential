@@ -29,6 +29,10 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice, GatewayCustomToolChoice
 from exp.runtime.models.providers.adaptive_thinking_budget import budgeted_enabled_config
+from exp.runtime.models.providers.dialect_dispatch import (
+    TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE,
+    strip_tool_result_documents,
+)
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
@@ -52,6 +56,7 @@ from exp.runtime.models.providers.streaming_requests import (
     route_generation_parameter_requests,
     strip_tool_result_images,
 )
+from exp.runtime.models.providers.thinking_budget_coercion import coerce_budget_to_effort
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
@@ -564,6 +569,9 @@ def _coerce_generation_semantics(
         or request.top_logprobs is not None
     ):
         return None
+    budgeted = coerce_budget_to_effort(profiles, request, admits=admits)
+    if budgeted is not None:
+        return RequestCoercion(request=budgeted[0], disclosures=(budgeted[1],))
     if (
         request.provider_thinking_config is not None
         and request.provider_thinking_config.get("type") == "between_tools"
@@ -653,8 +661,9 @@ def _coerce_generation_semantics(
     # their own reason: the route cannot turn reasoning off or go that
     # shallow (pinned clients send "none" to every model; the gateway
     # refused 925 such requests a day). Any other effort between or below
-    # the ladder's tiers is ``nearest_supported`` (gemini-3.8-flash serves
-    # only "high"; "medium" was refused, production 2026-10-17).
+    # the ladder's tiers is ``nearest_supported`` (a lane whose ladder was
+    # only "high" refused "medium" by name, gemini-3.8-flash in production
+    # 2026-10-17, before its real low/medium/high ladder was recorded).
     above = tuple(
         effort
         for effort in REASONING_EFFORTS[REASONING_EFFORTS.index(request.reasoning_effort) + 1 :]
@@ -750,8 +759,10 @@ def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoerci
     into the caller's history and a rejection wedges the whole session; a
     top-level user image keeps the fail-closed contract (the caller can
     re-send it), so ``image_input`` coerces only when every image in the
-    request lives in a tool message. Every other capability names a feature
-    with no approximation and stays fail-closed.
+    request lives in a tool message; ``pdf_input`` and ``pdf_url_input``
+    follow the same rule for documents a tool returned (Claude Code's Read on
+    a PDF). Every other capability names a feature with no approximation and
+    stays fail-closed.
 
     Args:
         capability: Stable capability literal from the preflight rejection.
@@ -770,6 +781,16 @@ def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoerci
         return RequestCoercion(
             request=request.model_copy(update={"messages": stripped}),
             disclosures=(TOOL_RESULT_IMAGE_DROP_DISCLOSURE,),
+        )
+    if capability in ("pdf_input", "pdf_url_input"):
+        if any(message.role != "tool" and message.documents for message in request.messages):
+            return None
+        stripped = strip_tool_result_documents(request.messages)
+        if stripped is None:
+            return None
+        return RequestCoercion(
+            request=request.model_copy(update={"messages": stripped}),
+            disclosures=(TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE,),
         )
     if capability == "service_tier":
         if request.service_tier is None:

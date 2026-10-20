@@ -27,11 +27,10 @@ from exp.runtime.models.providers.codex_tools import (
 from exp.runtime.models.providers.dialect_dispatch import (
     CACHE_CONTROL_NOT_FORWARDED_SUFFIX,
     THINKING_HISTORY_DROP_DISCLOSURE,
-    TOOL_RESULT_IMAGE_FOLD_DIALECTS,
-    TOOL_RESULT_IMAGE_FOLD_DISCLOSURE,
     WEB_SEARCH_SOURCES_DROPPED,
     WEB_SEARCH_SOURCES_DROPPED_ON_FALLBACK,
     disclose_gemini_missing_tool_results,
+    disclose_tool_result_attachment_folds,
     responses_origin_refuses_web_search_sources,
 )
 from exp.runtime.models.providers.dialect_dispatch import (
@@ -61,6 +60,7 @@ from exp.runtime.models.providers.generation_parameter_validation import (
     anthropic_reasoning_disengaged,
     disclose_anthropic_tool_schemas,
     require_assistant_prefill_supported,
+    require_route_reasoning_effort,
     require_tool_names_supported,
     resolve_level_less_enable,
     serves_reasoning_summary,
@@ -93,7 +93,6 @@ from exp.runtime.models.providers.openai_payloads import (
     openai_responses_stream_payload as openai_responses_stream_payload,
 )
 from exp.runtime.models.providers.reasoning_compat import (
-    REASONING_EFFORTS,
     require_between_tools_support,
     shape_anthropic_thinking_config,
 )
@@ -383,17 +382,7 @@ def route_generation_parameter_requests(
         else:
             provider_updates["reasoning_effort"] = resolved_default
     if request.reasoning_effort is not None:
-        portable_efforts = set(REASONING_EFFORTS)
-        for profile in profiles:
-            portable_efforts.intersection_update(_profile_reasoning_efforts(profile))
-        if request.reasoning_effort not in portable_efforts:
-            raise UnsupportedReasoningEffortError(
-                effort=request.reasoning_effort,
-                supported_efforts=tuple(
-                    effort for effort in REASONING_EFFORTS if effort in portable_efforts
-                ),
-                param=effort_path,
-            )
+        require_route_reasoning_effort(profiles, request, provider_updates, ignored)
     elif budget is None:
         # An omitted caller value remains omitted on the shared request. Each
         # dialect payload injects only its own provider-required default, so a
@@ -476,18 +465,11 @@ def route_generation_parameter_requests(
         if disclosure not in ignored:
             ignored.append(disclosure)
 
-    # Every dialect carries a tool-result image: natively inside the tool
-    # result on Anthropic (tool_result image blocks), native Responses (the SDK
-    # function_call_output part list) and Bedrock (toolResult image blocks),
-    # and folded into a user turn after the tool run on Chat Completions and
-    # Gemini (text-only tool results), disclosed once per route. A rung with no
-    # image input rejects at preflight and the route-wide coercion applies the
-    # disclosed placeholder degrade (a rejection would wedge the session).
-    if any(message.role == "tool" and message.images for message in request.messages) and any(
-        profile.dialect in TOOL_RESULT_IMAGE_FOLD_DIALECTS for profile in profiles
-    ):
-        if TOOL_RESULT_IMAGE_FOLD_DISCLOSURE not in ignored:
-            ignored.append(TOOL_RESULT_IMAGE_FOLD_DISCLOSURE)
+    # A tool-result attachment rides every route: images natively on
+    # Anthropic, Responses and Bedrock, documents natively on Anthropic
+    # alone, and every other combination folded into a user turn after the
+    # tool run, each disclosed once per route (dialect_dispatch).
+    disclose_tool_result_attachment_folds(profiles, request.messages, ignored)
 
     disclose_gemini_missing_tool_results(profiles, request.messages, ignored)
     # Only the Anthropic wire has a tool-result error flag. Every other wire

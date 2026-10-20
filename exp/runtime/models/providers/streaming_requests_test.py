@@ -12,6 +12,7 @@ from exp.common.models.content import (
     DocumentContentPart,
     ImageContentPart,
     MediaHandle,
+    MessageContentPart,
     TextContentPart,
     VideoContentPart,
 )
@@ -38,6 +39,7 @@ from exp.runtime.models.providers.dialect_dispatch import (
     CACHE_CONTROL_NOT_FORWARDED_SUFFIX,
     GEMINI_MISSING_TOOL_RESULT_DISCLOSURE,
     THINKING_HISTORY_DROP_DISCLOSURE,
+    TOOL_RESULT_DOCUMENT_FOLD_DISCLOSURE,
     TOOL_RESULT_IMAGE_FOLD_DISCLOSURE,
     WEB_SEARCH_SOURCES_DROPPED,
     WEB_SEARCH_SOURCES_DROPPED_ON_FALLBACK,
@@ -67,7 +69,9 @@ from exp.runtime.models.providers.streaming_requests import (
     route_generation_parameter_requests,
 )
 from exp.runtime.models.providers.wire_messages import (
+    TOOL_RESULT_DOCUMENT_FOLD_HEADER,
     TOOL_RESULT_IMAGE_FOLD_HEADER,
+    tool_result_document_marker,
     tool_result_image_marker,
 )
 from exp.runtime.openai_protocol.model_adapter import model_request
@@ -983,6 +987,216 @@ def test_a_gemini_route_folds_tool_result_images_into_a_following_user_content()
     folded = cast("list[JsonObject]", contents[3]["parts"])
     assert folded[0] == {"text": TOOL_RESULT_IMAGE_FOLD_HEADER}
     assert folded[2] == {"inline_data": {"mime_type": "image/png", "data": "aGk="}}
+
+
+def _tool_document_message(*, with_image: bool = False) -> GatewayMessage:
+    """One tool message carrying a returned PDF beside its text.
+
+    ``with_image`` adds a screenshot ahead of the document, the shape a
+    fold dialect that carries tool-result images but not documents (native
+    Responses, Bedrock) must keep while folding the document alone.
+    """
+    parts: list[MessageContentPart] = [TextContentPart(text="tool said:")]
+    if with_image:
+        parts.append(ImageContentPart(media_type="image/png", data="aGk="))
+    parts.append(DocumentContentPart(data="aGk=", name="report.pdf"))
+    return GatewayMessage(
+        role="tool",
+        tool_call_id="call-1",
+        content="tool said:",
+        content_parts=tuple(parts),
+    )
+
+
+def test_an_anthropic_route_carries_tool_result_documents_inside_the_tool_result() -> None:
+    """Anthropic Messages serves a document inside a tool_result natively: the
+    PDF re-emits as the caller's exact block run with nothing disclosed."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="user", content="read the file"),
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(ToolCall(call_id="call-1", name="Read", arguments={}),),
+            ),
+            _tool_document_message(),
+        ),
+    )
+    profile = GatewayWireProfile(
+        dialect="anthropic_messages", url="https://a.test", maximum_output_tokens=128_000
+    )
+
+    public_request, provider_request = route_generation_parameter_requests((profile,), request)
+    payload = dialect_stream_payload(profile, provider_request)
+
+    assert public_request.ignored_parameters == ()
+    assert provider_request.messages[-1].documents
+    messages = cast("list[JsonObject]", payload["messages"])
+    result_block = cast("list[JsonObject]", messages[-1]["content"])[-1]
+    assert result_block["type"] == "tool_result"
+    assert cast("list[JsonObject]", result_block["content"]) == [
+        {"type": "text", "text": "tool said:"},
+        {
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": "aGk="},
+            "title": "report.pdf",
+        },
+    ]
+
+
+def test_a_chat_route_folds_tool_result_documents_into_a_following_user_message() -> None:
+    """Chat tool messages are text-only, so a tool-returned PDF rides the next
+    user turn as a ``file`` part with the fold disclosed."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="user", content="read the file"),
+            _tool_document_message(),
+        ),
+    )
+    profile = GatewayWireProfile(dialect="openai_compatible", url="https://c.test")
+
+    public_request, provider_request = route_generation_parameter_requests((profile,), request)
+    payload = dialect_stream_payload(profile, provider_request)
+
+    assert TOOL_RESULT_DOCUMENT_FOLD_DISCLOSURE in public_request.ignored_parameters
+    messages = cast("list[JsonObject]", payload["messages"])
+    assert [message["role"] for message in messages] == ["user", "tool", "user"]
+    assert messages[1]["content"] == "tool said:" + tool_result_document_marker(1)
+    folded = cast("list[JsonObject]", messages[2]["content"])
+    assert folded[0] == {"type": "text", "text": TOOL_RESULT_DOCUMENT_FOLD_HEADER}
+    assert folded[1] == {"type": "text", "text": "\nDocument 1 (tool_call_id call-1):"}
+    assert folded[2] == {
+        "type": "file",
+        "file": {"file_data": "data:application/pdf;base64,aGk=", "filename": "report.pdf"},
+    }
+
+
+def test_a_responses_route_folds_documents_but_keeps_tool_result_images() -> None:
+    """The Responses function_call_output list carries text and image parts
+    only, so a tool-returned PDF folds into the next user turn while the
+    screenshot stays inside the tool output."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            GatewayMessage(role="user", content="read the file"),
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(ToolCall(call_id="call-1", name="Read", arguments={}),),
+            ),
+            _tool_document_message(with_image=True),
+        ),
+    )
+    profile = GatewayWireProfile(dialect="openai_responses", url="https://r.test")
+
+    public_request, provider_request = route_generation_parameter_requests((profile,), request)
+    payload = dialect_stream_payload(profile, provider_request)
+
+    assert TOOL_RESULT_DOCUMENT_FOLD_DISCLOSURE in public_request.ignored_parameters
+    assert TOOL_RESULT_IMAGE_FOLD_DISCLOSURE not in public_request.ignored_parameters
+    input_items = cast("list[JsonObject]", payload["input"])
+    assert [item.get("type", "message") for item in input_items] == [
+        "message",
+        "function_call",
+        "function_call_output",
+        "message",
+    ]
+    output = cast("list[JsonObject]", input_items[2]["output"])
+    assert output == [
+        {"type": "input_text", "text": "tool said:"},
+        {"type": "input_image", "image_url": "data:image/png;base64,aGk="},
+        {"type": "input_text", "text": tool_result_document_marker(1)},
+    ]
+    folded = cast("list[JsonObject]", input_items[3]["content"])
+    assert folded[0] == {"type": "input_text", "text": TOOL_RESULT_DOCUMENT_FOLD_HEADER}
+    assert folded[1] == {
+        "type": "input_text",
+        "text": "\nDocument 1 (tool_call_id call-1):",
+    }
+    assert folded[2] == {
+        "type": "input_file",
+        "filename": "report.pdf",
+        "file_data": "data:application/pdf;base64,aGk=",
+    }
+
+
+def test_a_bedrock_route_folds_documents_but_keeps_tool_result_images() -> None:
+    """Converse carries a screenshot inside the toolResult natively, while a
+    tool-returned PDF folds into the following user content as a document
+    block (the same Converse user message, merged block order)."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="user", content="read the file"),
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(ToolCall(call_id="call-1", name="Read", arguments={}),),
+            ),
+            _tool_document_message(with_image=True),
+        ),
+    )
+    profile = GatewayWireProfile(dialect="bedrock_converse_stream", url="https://b.test")
+
+    public_request, provider_request = route_generation_parameter_requests((profile,), request)
+    payload = dialect_stream_payload(profile, provider_request)
+
+    assert TOOL_RESULT_DOCUMENT_FOLD_DISCLOSURE in public_request.ignored_parameters
+    assert TOOL_RESULT_IMAGE_FOLD_DISCLOSURE not in public_request.ignored_parameters
+    messages = cast("list[JsonObject]", payload["messages"])
+    assert [message["role"] for message in messages] == ["user", "assistant", "user"]
+    blocks = cast("list[JsonObject]", messages[2]["content"])
+    assert [set(block) for block in blocks] == [
+        {"toolResult"},
+        {"text"},
+        {"text"},
+        {"document"},
+    ]
+    result = cast("JsonObject", blocks[0]["toolResult"])
+    assert result["content"] == [
+        {"text": "tool said:"},
+        {"image": {"format": "png", "source": {"bytes": "aGk="}}},
+        {"text": tool_result_document_marker(1)},
+    ]
+    assert blocks[1] == {"text": TOOL_RESULT_DOCUMENT_FOLD_HEADER}
+    assert blocks[2] == {"text": "\nDocument 1 (tool_call_id call-1):"}
+    assert blocks[3] == {
+        "document": {
+            "name": "report-pdf",
+            "format": "pdf",
+            "source": {"bytes": "aGk="},
+        }
+    }
+
+
+def test_a_gemini_route_folds_tool_result_documents_into_a_following_user_content() -> None:
+    """Gemini's functionResponse is JSON text; a tool-returned PDF rides the
+    next user content as inline_data and the route discloses the fold."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="user", content="read the file"),
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(ToolCall(call_id="call-1", name="Read", arguments={}),),
+            ),
+            _tool_document_message(),
+        ),
+    )
+    profile = GatewayWireProfile(dialect="gemini_generate_content", url="https://g.test")
+
+    public_request, provider_request = route_generation_parameter_requests((profile,), request)
+    payload = dialect_stream_payload(profile, provider_request)
+
+    assert TOOL_RESULT_DOCUMENT_FOLD_DISCLOSURE in public_request.ignored_parameters
+    contents = cast("list[JsonObject]", payload["contents"])
+    assert [content["role"] for content in contents] == ["user", "model", "user", "user"]
+    response = cast("list[JsonObject]", contents[2]["parts"])[0]["functionResponse"]
+    assert cast("JsonObject", response)["response"] == {
+        "content": "tool said:" + tool_result_document_marker(1)
+    }
+    folded = cast("list[JsonObject]", contents[3]["parts"])
+    assert folded[0] == {"text": TOOL_RESULT_DOCUMENT_FOLD_HEADER}
+    assert folded[2] == {"inline_data": {"mime_type": "application/pdf", "data": "aGk="}}
 
 
 def test_a_gemini_route_discloses_the_placeholder_for_an_unanswered_call() -> None:
@@ -6074,3 +6288,139 @@ def test_web_search_sources_selector_stays_off_non_native_provider_payloads() ->
     assert not any("web_search_call" in path for path in public.ignored_parameters)
     payload = openai_responses_stream_payload("exact-model", provider, supports_temperature=True)
     assert "web_search_call.action.sources" not in cast("list[str]", payload.get("include", []))
+
+
+def _gemini_profile(model_id: str) -> GatewayWireProfile:
+    """Build one native Gemini reasoning rung for ``model_id``."""
+    return GatewayWireProfile(
+        dialect="gemini_generate_content",
+        url="https://gemini.test",
+        model_id=model_id,
+        supports_reasoning=True,
+        reasoning_wire_format="gemini_thinking",
+    )
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    (
+        "gemini-3.1-flash-lite",
+        "gemini-3.6-flash",
+        "gemini-3-flash-preview",
+        "publishers/google/models/gemini-3.5-flash-lite",
+    ),
+)
+def test_gemini_3_flash_dispatches_none_as_disclosed_minimal(model_id: str) -> None:
+    """Gemini 3 Flash has no off level: ``none`` rides MINIMAL, disclosed.
+
+    The public request keeps the caller's ``none``; only the provider copy
+    carries ``minimal``, and the payload asks for MINIMAL thinking with no
+    zero budget (minimal still thinks, so the rewrite is disclosed).
+    """
+    profile = _gemini_profile(model_id)
+    request = _chat_request().model_copy(update={"reasoning_effort": "none"})
+
+    public, provider = route_generation_parameter_requests((profile,), request)
+
+    assert public.reasoning_effort == "none"
+    assert provider.reasoning_effort == "minimal"
+    assert "reasoning_effort->minimal" in public.ignored_parameters
+    generation = cast(
+        "dict[str, object]", dialect_stream_payload(profile, provider)["generationConfig"]
+    )
+    assert generation["thinkingConfig"] == {"thinkingLevel": "MINIMAL", "includeThoughts": True}
+
+
+def test_responses_none_on_gemini_3_flash_names_the_responses_field() -> None:
+    """The disclosure names the effort field the caller actually sent."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        reasoning_effort="none",
+        stream=True,
+    )
+
+    public, provider = route_generation_parameter_requests(
+        (_gemini_profile("gemini-3.1-flash-lite"),), request
+    )
+
+    assert provider.reasoning_effort == "minimal"
+    assert f"{request.caller_effort_parameter}->minimal" in public.ignored_parameters
+
+
+@pytest.mark.parametrize(
+    ("model_id", "effort"),
+    (
+        # No minimal level: the off switch keeps its typed refusal.
+        ("gemini-3.7-flash", "none"),
+        ("gemini-3.8-flash", "none"),
+        ("gemini-3-pro-preview", "none"),
+    ),
+)
+def test_gemini_without_minimal_keeps_the_none_refusal(
+    model_id: str, effort: ReasoningEffort
+) -> None:
+    """Only flash families that serve MINIMAL substitute it for ``none``."""
+    request = _chat_request().model_copy(update={"reasoning_effort": effort})
+
+    with pytest.raises(UnsupportedReasoningEffortError):
+        route_generation_parameter_requests((_gemini_profile(model_id),), request)
+
+
+def test_gemini_rung_that_honors_none_and_other_efforts_are_untouched() -> None:
+    """Argon's real off switch and every other effort pass through unchanged."""
+    argon = _gemini_profile("gemini-4-argon")
+    none_request = _chat_request().model_copy(update={"reasoning_effort": "none"})
+    public, provider = route_generation_parameter_requests((argon,), none_request)
+    assert provider.reasoning_effort == "none"
+    assert not any("->minimal" in path for path in public.ignored_parameters)
+
+    flash = _gemini_profile("gemini-3.1-flash-lite")
+    low_request = _chat_request().model_copy(update={"reasoning_effort": "low"})
+    public, provider = route_generation_parameter_requests((flash,), low_request)
+    assert provider.reasoning_effort == "low"
+    assert not any("->minimal" in path for path in public.ignored_parameters)
+
+
+def test_none_keeps_a_gemini_flash_house_rung_ahead_of_an_openrouter_rung() -> None:
+    """A house Gemini rung is no longer narrowed out by an OpenRouter ``none``.
+
+    OpenRouter publishes ``none`` for these models (it serves it as minimal);
+    before the substitution only that rung admitted the request, so every
+    pinned-``none`` caller left the house lanes.
+    """
+    house = _gemini_profile("gemini-3.1-flash-lite")
+    openrouter = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://openrouter.test",
+        model_id="google/gemini-3.1-flash-lite",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        supported_reasoning_efforts=("none", "minimal", "low", "medium", "high"),
+    )
+    request = _chat_request().model_copy(update={"reasoning_effort": "none"})
+
+    assert compatible_generation_parameter_profile_indexes((house, openrouter), request) == (
+        0,
+        1,
+    )
+    public, provider = route_generation_parameter_requests((house, openrouter), request)
+    assert provider.reasoning_effort == "minimal"
+    assert "reasoning_effort->minimal" in public.ignored_parameters
+
+
+def test_none_on_a_mixed_route_with_a_non_gemini_rung_keeps_the_refusal() -> None:
+    """A rung of another family that cannot honor ``none`` is never rewritten."""
+    flash = _gemini_profile("gemini-3.1-flash-lite")
+    other = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://other.test",
+        model_id="vendor/reasoner",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("minimal", "low"),
+    )
+    request = _chat_request().model_copy(update={"reasoning_effort": "none"})
+
+    with pytest.raises(UnsupportedReasoningEffortError):
+        route_generation_parameter_requests((flash, other), request)

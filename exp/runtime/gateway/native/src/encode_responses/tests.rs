@@ -147,6 +147,76 @@ fn fireworks_responses_reasoning_fails_closed_without_a_sealed_carrier() {
     .is_err());
 }
 
+/// The provider events of a Codex `apply_patch` turn after the native-tool
+/// inverter restored the custom call: freeform input, no JSON object.
+fn fireworks_custom_tool_events() -> Vec<Event> {
+    let patch = "*** Begin Patch\n*** End Patch\n";
+    vec![
+        Event::ReasoningContentDelta {
+            route_sha256: "a".repeat(64),
+            delta: "hidden provider reasoning".to_string(),
+        },
+        Event::ToolCallStarted {
+            custom: true,
+            namespace: None,
+            caller: None,
+            index: 0,
+            call_id: "call-patch".to_string(),
+            name: "apply_patch".to_string(),
+            thought_signature: None,
+        },
+        Event::ToolArgumentsDelta {
+            index: 0,
+            delta: patch.to_string(),
+        },
+        Event::ToolCallCompleted {
+            index: 0,
+            call: CompletedToolCall {
+                namespace: None,
+                caller: None,
+                call_id: "call-patch".to_string(),
+                name: "apply_patch".to_string(),
+                raw_arguments: patch.to_string(),
+                provider_item_id: None,
+                provider_status: None,
+                custom: true,
+                thought_signature: None,
+            },
+        },
+        Event::Completed,
+    ]
+}
+
+#[test]
+fn fireworks_custom_tool_turn_serves_without_a_carrier() {
+    // Production 2026-10-19: every completed Codex apply_patch turn on an
+    // Experiential Cloud reasoning lane failed at the terminal because the
+    // carrier sealer tried to digest the freeform patch as JSON arguments.
+    let events = fireworks_custom_tool_events();
+    assert!(reasoning_carrier_candidate(&events)
+        .expect("provider events must validate")
+        .is_none());
+    let envelope = ResponsesEnvelope {
+        include_encrypted_reasoning: true,
+        ..ResponsesEnvelope::default()
+    };
+    let mut encoder =
+        ResponsesSseEncoder::new("request-1", "coding", 1_700_000_000, envelope.clone());
+    encoder.start().expect("stream start must encode");
+    let mut frames = Vec::new();
+    for event in &events {
+        frames.extend(encoder.feed(event).expect("Responses event must encode"));
+    }
+    let public = frames.join("");
+    assert!(public.contains("response.completed"));
+    assert!(public.contains("response.custom_tool_call_input.done"));
+    assert!(!public.contains("hidden provider reasoning"));
+    assert!(!public.contains("encrypted_content\":\""));
+    assert!(
+        completed_responses_body("request-1", "coding", 1_700_000_000, envelope, &events).is_ok()
+    );
+}
+
 #[test]
 fn fireworks_parallel_tools_share_public_and_carrier_order() {
     let events = vec![
@@ -827,3 +897,73 @@ mod probabilities_tests;
 
 #[path = "tool_attribution_tests.rs"]
 mod tool_attribution_tests;
+
+/// Azure Foundry's DeepSeek output filter streams text and then ends the
+/// turn with `finish_reason: "content_filter"`, which the compatible dialect
+/// reads as an empty refusal after the text (live 2026-10-20). The Responses
+/// surface serves it as chat does, the text part then a refusal part, never
+/// as a malformed-stream 502.
+#[test]
+fn refusal_after_text_opens_a_second_content_part() {
+    let mut events = vec![
+        Event::TextDelta("{\"page_type\": \"st".to_string()),
+        Event::RefusalDelta(String::new()),
+        Event::Failed(crate::errors::Failure::refusal(
+            crate::errors::RefusalReason::ContentPolicy,
+        )),
+    ];
+    let mut encoder = ResponsesSseEncoder::new(
+        "request-1",
+        "coding",
+        1_700_000_000,
+        ResponsesEnvelope::default(),
+    );
+    encoder.start().expect("stream start must encode");
+    encoder.feed(&events[0]).expect("text delta encodes");
+    let frames = encoder
+        .feed(&events[1])
+        .expect("a refusal after text is served, not refused");
+    assert!(frames
+        .iter()
+        .any(|frame| frame.contains("response.content_part.added")
+            && frame.contains("\"content_index\":1")
+            && frame.contains("\"type\":\"refusal\"")));
+    assert!(frames
+        .iter()
+        .any(|frame| frame.contains("response.refusal.delta")
+            && frame.contains("\"content_index\":1")));
+
+    let refusal = crate::respond::complete_visible_refusal(&mut events);
+    assert!(refusal.is_some(), "the ledger still records the refusal");
+    let completed = completed_responses_body(
+        "request-1",
+        "coding",
+        1_700_000_000,
+        ResponsesEnvelope::default(),
+        &events,
+    )
+    .expect("completed body must encode");
+    assert!(completed.failure.is_none());
+    assert_eq!(
+        completed.body["output"][0]["content"],
+        json!([
+            {"type": "output_text", "text": "{\"page_type\": \"st", "annotations": []},
+            {"type": "refusal", "refusal": ""},
+        ])
+    );
+}
+
+#[test]
+fn text_after_a_refusal_still_fails_closed() {
+    let mut encoder = ResponsesSseEncoder::new(
+        "request-1",
+        "coding",
+        1_700_000_000,
+        ResponsesEnvelope::default(),
+    );
+    encoder.start().expect("stream start must encode");
+    encoder
+        .feed(&Event::RefusalDelta("I can't help with that.".to_string()))
+        .expect("refusal delta encodes");
+    assert!(encoder.feed(&Event::TextDelta("Sure".to_string())).is_err());
+}

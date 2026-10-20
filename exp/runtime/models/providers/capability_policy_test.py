@@ -98,9 +98,10 @@ def test_efforts_order_by_nearness_and_prefer_the_lower_level_on_ties() -> None:
 def test_an_effort_below_every_tier_rises_to_the_nearest_one(effort: ReasoningEffort) -> None:
     """A high-only route serves an explicit lower effort at ``high``, disclosed.
 
-    gemini-3.8-flash serves only ``high``; ``medium`` was refused by name
-    (production 2026-10-17). Raising happens only when no tier at or below
-    the request serves, so it never replaces a lower tier that would.
+    A lane whose ladder is only ``high`` refused ``medium`` by name
+    (gemini-3.8-flash under a high-only ladder, production 2026-10-17).
+    Raising happens only when no tier at or below the request serves, so it
+    never replaces a lower tier that would.
     """
     coercion = coerce_generation_parameters(
         (_reasoning_profile("gpt-5-pro"),), _request(reasoning_effort=effort)
@@ -835,6 +836,74 @@ def test_top_level_user_images_keep_the_fail_closed_contract() -> None:
     )
 
 
+def _tool_document_request(*, user_document: bool = False) -> GatewayRequest:
+    """Decode a Claude Code turn whose Read tool returned a PDF beside a screenshot."""
+    pdf: JsonObject = {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQK"},
+        "title": "r.pdf",
+    }
+    user: list[JsonObject] = [{"type": "text", "text": "go"}]
+    if user_document:
+        user.append(pdf)
+    image: JsonObject = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+    }
+    return decode_messages(
+        {
+            "model": "m",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": user},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "call-1", "name": "Read", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": [{"type": "text", "text": "read:"}, pdf, image],
+                        }
+                    ],
+                },
+            ],
+        }
+    ).request
+
+
+@pytest.mark.parametrize("capability", ["pdf_input", "pdf_url_input"])
+def test_tool_result_documents_degrade_with_placeholder_on_a_pdf_incapable_route(
+    capability: str,
+) -> None:
+    """A tool-returned PDF is baked into history like a screenshot: a route with
+    no PDF input serves it as a disclosed placeholder instead of refusing the
+    request (which would wedge the session), and the screenshot beside it stays."""
+    from exp.runtime.models.providers.dialect_dispatch import (
+        TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE,
+    )
+
+    request = _tool_document_request()
+    assert request.documents
+    coercion = coerce_capability(capability, request)
+    assert coercion is not None
+    assert coercion.disclosures == (TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE,)
+    assert coercion.request.documents == ()
+    tool_message = next(m for m in coercion.request.messages if m.role == "tool")
+    assert [part.kind for part in tool_message.content_parts] == ["text", "text", "image"]
+    assert tool_message.content == (
+        "read:[document 'r.pdf' omitted: this model route cannot carry documents]"
+    )
+
+
+def test_top_level_user_documents_keep_the_fail_closed_contract() -> None:
+    """A user document the caller can re-send never degrades silently."""
+    assert coerce_capability("pdf_input", _tool_document_request(user_document=True)) is None
+
+
 def _openai_reasoning_profile(
     efforts: tuple[ReasoningEffort, ...] = ("none", "low", "medium", "high"),
 ) -> GatewayWireProfile:
@@ -851,11 +920,16 @@ def _openai_reasoning_profile(
 
 @pytest.mark.parametrize("extension", (False, True))
 @pytest.mark.parametrize("effort", (None, "high"))
-def test_public_messages_numeric_budget_never_becomes_advisory_effort(
+def test_public_messages_numeric_budget_snaps_onto_the_effort_ladder_disclosed(
     extension: bool,
     effort: ReasoningEffort | None,
 ) -> None:
-    """A public 1024-token budget cannot become high or a default-on request."""
+    """A budget no rung carries verbatim serves at the nearest route tier.
+
+    Owner decision 2026-10-19 (qwen3.8-flash-next-uncensored refused 27 budgets
+    in two hours): the 1024-token budget asks for ``low``, the route serves only
+    ``high``, so it serves at ``high`` and says so, instead of refusing.
+    """
     body: JsonObject = {
         "model": "reasoner",
         "messages": [{"role": "user", "content": "Solve this."}],
@@ -872,7 +946,17 @@ def test_public_messages_numeric_budget_never_becomes_advisory_effort(
     profile = _openai_reasoning_profile(efforts=("high",))
     with pytest.raises(ProviderParameterError):
         route_generation_parameter_requests((profile,), request)
-    assert coerce_generation_parameters((profile,), request) is None
+    coercion = coerce_generation_parameters((profile,), request)
+    if request.reasoning_effort is not None or (request.provider_output_config or {}).get("effort"):
+        # Two depth controls at once stay the caller's contradiction to resolve.
+        assert coercion is None
+        return
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "high"
+    assert coercion.request.provider_thinking_config is None
+    assert coercion.disclosures == (
+        "thinking.budget_tokens->reasoning_effort:high(route_effort_ladder)",
+    )
 
 
 def test_a_thinking_config_translates_to_an_effort_on_an_openai_route() -> None:

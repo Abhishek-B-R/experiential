@@ -21,6 +21,8 @@ from exp.runtime.gateway import prompt_size
 from exp.runtime.gateway.affinity import (
     affinity_fingerprint,
     affinity_seed_material,
+    affinity_weighted_rungs,
+    house_aggregator_last,
     rendezvous_order,
 )
 from exp.runtime.gateway.capability_rungs import narrow_to_capable_rungs
@@ -28,8 +30,8 @@ from exp.runtime.gateway.class_throttles import fast_request, require_fast_path
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, GatewayRequest
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_components import NativeGatewayComponents
+from exp.runtime.gateway.native_dead_rungs import DeadRung, log_dead_rungs
 from exp.runtime.gateway.native_execution import (
-    DeadRung,
     deployment_health_key,
     reorder_route_deployments,
     request_carries_cache_markers,
@@ -603,19 +605,7 @@ def _affinity_ordered_rungs(
     )
     if len(resolved_wires) < 2 or _keeps_issuing_rung_first(route):
         return route, resolved_wires, AffinityPlacement(fingerprint=fingerprint)
-    weighted_rungs = tuple(
-        (
-            deployment.deployment_id,
-            (
-                1.0
-                if deployment.gateway.dispatch is None
-                or deployment.gateway.dispatch.affinity_weight is None
-                else deployment.gateway.dispatch.affinity_weight
-            ),
-        )
-        for deployment in route.deployments
-    )
-    order = rendezvous_order(fingerprint, weighted_rungs)
+    order = rendezvous_order(fingerprint, affinity_weighted_rungs(route.deployments))
     order, sticky_index, sticky_deployment_id = sticky_first_order(
         order,
         route,
@@ -635,6 +625,8 @@ def _affinity_ordered_rungs(
                 *(index for index in order if index in marker_capable),
                 *(index for index in order if index not in marker_capable),
             )
+    # Last, so neither a sticky binding nor the marker grouping can lead with it.
+    order = house_aggregator_last(order, route.deployments, [p for p, _ in resolved_wires])
     placement = AffinityPlacement(
         fingerprint=fingerprint,
         sticky_preferred=sticky_index is not None and order[0] == sticky_index,
@@ -960,17 +952,9 @@ def record_dead_admission_rungs(
             deployment_health_key(authorization, rung.deployment),
             rung.failure,
         )
-    lead = next((rung for rung in dead if rung.index == 0), None)
-    lead_masked = lead is not None and fallback_available
+    lead_masked = fallback_available and any(rung.index == 0 for rung in dead)
     accounting.record_admission_rung_skips(len(dead), lead_skipped=lead_masked)
-    if lead is not None and fallback_available:
-        _logger.warning(
-            "gateway admission skipped the lead rung for alias %r: served off a "
-            "fallback because deployment %r (provider %r) was dead at admission",
-            authorization.alias,
-            lead.deployment.deployment_id,
-            lead.deployment.provider,
-        )
+    log_dead_rungs(authorization, dead, fallback_available=fallback_available)
 
 
 def log_reasoning_continuation_rejection(

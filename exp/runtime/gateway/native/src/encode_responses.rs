@@ -461,8 +461,7 @@ impl ResponsesSseEncoder {
     ) -> Result<Vec<String>, PublicError> {
         let mut frames: Vec<String> = Vec::new();
         self.ensure_message(key, provider_item_id, &mut frames)?;
-        let content_index = 0;
-        let (item_id, output_index, start_part) = {
+        let (item_id, output_index, content_index, start_part) = {
             let state = self.messages.get_mut(&key).expect("message just ensured");
             if state.done {
                 return Err(invalid_provider_stream(
@@ -474,11 +473,13 @@ impl ResponsesSseEncoder {
                     "Responses output cannot mix text and refusal deltas.",
                 ));
             }
-            if !is_text && state.text_started {
-                return Err(invalid_provider_stream(
-                    "Responses output cannot mix text and refusal deltas.",
-                ));
-            }
+            // A refusal after text is the provider cutting its own answer
+            // (Azure Foundry's DeepSeek output filter streams text, then a
+            // `content_filter` finish, live 2026-10-20: ~6.9k Responses 502s
+            // for one org). It opens a second part after the text, the
+            // layout `close_message` and the item already render; chat
+            // serves the same turn as content plus refusal.
+            let content_index = usize::from(!is_text && state.text_started);
             let start_part = if is_text {
                 let start = !state.text_started;
                 state.text_started = true;
@@ -490,7 +491,12 @@ impl ResponsesSseEncoder {
                 state.refusal.push_str(delta);
                 start
             };
-            (state.item_id.clone(), state.output_index, start_part)
+            (
+                state.item_id.clone(),
+                state.output_index,
+                content_index,
+                start_part,
+            )
         };
         if is_text {
             if start_part {
@@ -839,7 +845,11 @@ impl ResponsesSseEncoder {
         status: &str,
         failure: Option<&Failure>,
     ) -> Result<Vec<String>, PublicError> {
-        if status == "completed" && !self.tools.is_empty() {
+        // A turn holding a custom (freeform) call is never sealed (see
+        // `ReasoningCarrierState::candidate`); its reasoning item serves without
+        // an encrypted carrier, exactly like a tool-free turn.
+        let sealable = !self.tools.values().any(|state| state.custom);
+        if status == "completed" && !self.tools.is_empty() && sealable {
             if let Some(reasoning) = self.fireworks_reasoning.as_mut() {
                 let carrier = self.reasoning_content_carrier.clone().ok_or_else(|| {
                     invalid_provider_stream(

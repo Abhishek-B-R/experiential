@@ -7,6 +7,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.catalog import (
+    BillingSource,
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
     GatewayRungDispatchPolicy,
@@ -23,6 +24,12 @@ from exp.common.models.content import (
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
 from exp.common.models.gateway_chains import ModelExecutionStage
 from exp.common.models.model import ModelCapabilities, ToolCall
+from exp.runtime.gateway.affinity import (
+    affinity_fingerprint,
+    affinity_seed_material,
+    affinity_weighted_rungs,
+    rendezvous_order,
+)
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -949,6 +956,73 @@ def test_tool_result_image_degrades_with_disclosure_on_a_non_vision_route(stream
 
 
 @pytest.mark.parametrize("stream", [True, False])
+def test_tool_result_pdf_degrades_with_disclosure_on_a_pdf_incapable_route(stream: bool) -> None:
+    """Claude Code's Read on a PDF serves on a route with no PDF input.
+
+    The document is baked into the caller's history like a screenshot, so a
+    ``pdf_input`` refusal would wedge every later turn; the route answers with a
+    placeholder naming the document and discloses the drop.
+    """
+    from exp.runtime.anthropic_protocol.requests import decode_messages
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+    from exp.runtime.models.providers.dialect_dispatch import (
+        TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE,
+    )
+
+    pdf: JsonObject = {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQK"},
+        "title": "spec.pdf",
+    }
+    body: JsonObject = {
+        "model": "coding",
+        "max_tokens": 128,
+        "stream": stream,
+        "messages": [
+            {"role": "user", "content": "read the spec"},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "call-1", "name": "Read", "input": {}}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "call-1", "content": [pdf]}],
+            },
+        ],
+    }
+    request = decode_messages(body).request.model_copy(update={"include_usage": True})
+    text_only = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+        )
+    )
+    deployments = (_deployment("claude", provider="anthropic", gateway=text_only),)
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.MESSAGES)
+    client = cast(NativeWireClient, object())
+    wires = (
+        (GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test"), client),
+    )
+    accounting = _AdmissionCoercionCounter()
+
+    _narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+
+    tool_message = provider.messages[-1]
+    assert tool_message.content_parts == ()
+    assert tool_message.content == (
+        "[document 'spec.pdf' omitted: this model route cannot carry documents]"
+    )
+    assert TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE in public.ignored_parameters
+    assert accounting.recorded == 1
+
+
+@pytest.mark.parametrize("stream", [True, False])
 def test_a_chat_tool_screenshot_is_admitted_and_folded_on_a_vision_chat_route(stream: bool) -> None:
     """The Copilot/Codex repro (an ``image_url`` part inside a ``role: "tool"``
     message on /v1/chat/completions) decodes, admits on an image-capable Chat
@@ -1018,8 +1092,9 @@ def test_a_chat_tool_screenshot_is_admitted_and_folded_on_a_vision_chat_route(st
     assert accounting.recorded == 0
 
 
-def test_an_explicit_thinking_budget_is_not_replaced_with_advisory_effort() -> None:
-    """The full admit loop refuses a budget an OpenAI effort dial cannot enforce."""
+def test_an_explicit_thinking_budget_snaps_onto_an_effort_dial_disclosed() -> None:
+    """The full admit loop serves a budget an OpenAI effort dial cannot carry at the
+    nearest tier, disclosed (owner decision 2026-10-19: refusing it ended sessions)."""
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 
     request = GatewayRequest(
@@ -1052,17 +1127,18 @@ def test_an_explicit_thinking_budget_is_not_replaced_with_advisory_effort() -> N
             client,
         ),
     )
-    with pytest.raises(ProviderParameterError) as rejected:
-        admitted_route_requests(
-            route,
-            wires,
-            request,
-            accounting=cast(NativeAttemptAccounting, accounting),
-            authorization=route.snapshot.authorization,
-        )
-    assert rejected.value.param == "thinking.budget_tokens"
-    assert request.provider_thinking_config == {"type": "enabled", "budget_tokens": 8192}
-    assert accounting.recorded == 0
+    _route, _wires, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert provider.reasoning_effort == "high"
+    assert provider.provider_thinking_config is None
+    assert "thinking.budget_tokens->reasoning_effort:high(route_effort_ladder)" in (
+        public.ignored_parameters
+    )
 
 
 def test_named_processing_tier_fails_closed_when_no_rung_offers_it() -> None:
@@ -2488,7 +2564,6 @@ def test_chat_nested_budget_narrows_to_budget_capable_anthropic_rung(stream: boo
     "dialect,model,reasoning",
     (
         ("openai_compatible", "kimi-k2-thinking", True),
-        ("anthropic_messages", "claude-sonnet-5", True),
         ("anthropic_messages", "claude-haiku-3-5", False),
     ),
 )
@@ -2692,3 +2767,111 @@ def test_prompt_caching_off_keeps_certified_order_and_adds_no_cache_state() -> N
         f"prompt_cache_key{PROMPT_CACHING_OFF_SUFFIX}",
         PROMPT_CACHING_BEST_EFFORT,
     )
+
+
+def _aggregator_fixture(
+    *,
+    billing_source: BillingSource,
+    provider: str = "openrouter",
+    url: str = "https://openrouter.ai/api/v1",
+    others: tuple[str, ...] = ("dep-a", "dep-b"),
+) -> tuple[GatewayRoute, tuple[tuple[GatewayWireProfile, NativeWireClient], ...]]:
+    """Build an affinity route whose FIRST rung is an OpenRouter rung of overwhelming weight.
+
+    The weight makes plain rendezvous rank the OpenRouter rung first for every
+    fingerprint, so a test can tell the demotion from the rendezvous draw.
+    """
+    aggregator = _deployment(
+        "dep-openrouter",
+        provider=provider,
+        gateway=GatewayDeploymentMetadata(dispatch=GatewayRungDispatchPolicy(affinity_weight=1e9)),
+    ).model_copy(update={"billing_source": billing_source})
+    deployments = (aggregator, *(_deployment(name) for name in others))
+    route = _mixed_route("maximize_cache_affinity", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    client = cast(NativeWireClient, object())
+    wires = (
+        (GatewayWireProfile(dialect="openai_compatible", url=url), client),
+        *(
+            (GatewayWireProfile(dialect="openai_compatible", url=f"https://{name}.test"), client)
+            for name in others
+        ),
+    )
+    return route, wires
+
+
+def _rendezvous_names(route: GatewayRoute, request: GatewayRequest) -> tuple[str, ...]:
+    """The plain rendezvous order the route's rungs would take for ``request``."""
+    authorization = route.snapshot.authorization
+    fingerprint = affinity_fingerprint(
+        organization_id=authorization.organization_id,
+        identity_id=authorization.identity_id,
+        material=affinity_seed_material(
+            request, continuation_episode_key=None, request_id=authorization.request_id
+        ),
+    )
+    order = rendezvous_order(fingerprint, affinity_weighted_rungs(route.deployments))
+    return tuple(route.deployments[index].deployment_id for index in order)
+
+
+class TestHouseOpenRouterNeverLeadsAnAffinityPool:
+    """OpenRouter is never the first lane, whatever the rendezvous draw says."""
+
+    @pytest.mark.parametrize(
+        ("provider", "url"),
+        (
+            ("openrouter", "https://openrouter.ai/api/v1"),
+            # The Responses-wire rung: an ``openai`` connection on OpenRouter's origin.
+            ("openai", "https://openrouter.ai/api/v1"),
+        ),
+    )
+    def test_house_openrouter_moves_behind_the_rendezvous_order(
+        self, provider: str, url: str
+    ) -> None:
+        """[openrouter-house, a, b] with OpenRouter drawn first dispatches a/b first."""
+        for index in range(16):
+            route, wires = _aggregator_fixture(
+                billing_source=BillingSource.HOST_MANAGED, provider=provider, url=url
+            )
+            request = _session_request(f"session-{index}")
+            drawn = _rendezvous_names(route, request)
+            assert drawn[0] == "dep-openrouter"
+            ordered, ordered_wires, _placement = _affinity_ordered_rungs(
+                route,
+                wires,
+                request,
+                accounting=_affinity_accounting(),
+                authorization=route.snapshot.authorization,
+                continuation=None,
+            )
+            # The others keep their rendezvous order; OpenRouter goes last.
+            assert _order(ordered) == (*drawn[1:], "dep-openrouter")
+            assert ordered_wires[-1][0].url == url
+
+    def test_customer_managed_openrouter_keeps_its_rendezvous_place(self) -> None:
+        """A customer's own OpenRouter key may lead: their account, their choice."""
+        route, wires = _aggregator_fixture(billing_source=BillingSource.CUSTOMER_MANAGED)
+        request = _session_request("session-1")
+        ordered, _wires_out, _placement = _affinity_ordered_rungs(
+            route,
+            wires,
+            request,
+            accounting=_affinity_accounting(),
+            authorization=route.snapshot.authorization,
+            continuation=None,
+        )
+        assert _order(ordered) == _rendezvous_names(route, request)
+        assert _order(ordered)[0] == "dep-openrouter"
+
+    def test_a_single_openrouter_rung_still_serves(self) -> None:
+        """With nothing else on the pool the OpenRouter rung remains the route."""
+        route, wires = _aggregator_fixture(billing_source=BillingSource.HOST_MANAGED, others=())
+        ordered, ordered_wires, _placement = _affinity_ordered_rungs(
+            route,
+            wires,
+            _session_request("session-1"),
+            accounting=_affinity_accounting(),
+            authorization=route.snapshot.authorization,
+            continuation=None,
+        )
+        assert _order(ordered) == ("dep-openrouter",)
+        assert len(ordered_wires) == 1
