@@ -314,15 +314,17 @@ class RungLoadRegistry:
             # The :fast split (class_throttles): fast reservations hold at most
             # the upper half of the bound and skip fair share; while any is
             # held, everyone else holds at most the lower half. Both are hard
-            # (a hit overflow ceiling), so the rung never exceeds its bound by
-            # more than the one fast request that found it full.
+            # (a hit overflow ceiling: no overflow retries the rung). Fast
+            # ignores the total, so a full rung can hold bound + ceil(bound/2)
+            # until the requests already on it finish.
             if bound is not None and (fast or rung.fast):
                 if fast and rung.fast >= max(1, bound - bound // 2):
                     return RungShed("queue_bound", overflow_ceiling=True)
                 if not fast and rung.total - rung.fast >= max(1, bound // 2):
                     return RungShed("queue_bound", overflow_ceiling=True)
+            # ``force`` stays: a forced retry must skip the window it shed on.
             if fast:
-                force, bound, fair_share = False, None, False
+                bound, fair_share = None, False
             if hard_bound and bound is not None and rung.total >= bound:
                 return RungShed("queue_bound")
             # A class cap is hard: marked as a hit overflow ceiling so no

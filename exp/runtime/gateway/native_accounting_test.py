@@ -1405,6 +1405,7 @@ def _admit(
     cache_placed_deployment_id: str | None = None,
     catalog_sha256: str = _DIGEST,
     no_paid_prework: bool = True,
+    fast: bool = False,
 ) -> InflightRequest:
     """Register one admitted request over the given rung ladder.
 
@@ -1421,6 +1422,7 @@ def _admit(
             "fair_share_weight": weight,
             "priority_admission": priority_admission,
             "deadline_monotonic": time.monotonic() + 30,
+            "fast": fast,
         }
     )
     route = GatewayRoute(
@@ -1468,6 +1470,64 @@ def _bounded_pair(
         ),
         _deployment("deployment-b", connection_sha256="c" * 64),
     )
+
+
+def _fast_lane(dispatch: GatewayRungDispatchPolicy) -> ExactModelDeployment:
+    """One self-hosted rung carrying a priority card (class_throttles.fast_on_rung)."""
+    from exp.common.models import BillingSource
+    from exp.common.models.catalog import GatewayServiceTierPrices
+
+    deployment = _deployment(
+        "deployment-a",
+        connection_sha256="b" * 64,
+        dispatch=dispatch.model_copy(update={"upstream_priority": True}),
+    )
+    card = GatewayServiceTierPrices(
+        input_nano_usd_per_million_tokens=2_000_000,
+        output_nano_usd_per_million_tokens=8_000_000,
+    )
+    return deployment.model_copy(
+        update={
+            "billing_source": BillingSource.HOST_MANAGED,
+            "gateway": deployment.gateway.model_copy(
+                update={"prices": GatewayTokenPrices(priority=card)}
+            ),
+        }
+    )
+
+
+class TestFastSplitTerminates:
+    """The :fast hard sheds end the ladder walk; they never spin to the deadline."""
+
+    def test_a_free_caller_shed_by_the_split_is_refused_at_once(self) -> None:
+        """A soft rung's lower half is full while fast is in flight: refused, not re-forced."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        only = (_fast_lane(GatewayRungDispatchPolicy(concurrency_bound=2)),)
+        _admit(registry, only, request_id="request-fast", fast=True)
+        for request_id in ("request-1", "request-2"):
+            _admit(registry, only, request_id=request_id)
+        assert _start(registry, ordinal=0, request_id="request-fast")["route_depth"] == 0
+        assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
+        started = time.monotonic()
+        refused = _start(registry, ordinal=0, request_id="request-2")
+        assert time.monotonic() - started < 5
+        assert refused["exhausted"] is True
+        assert cast("JsonObject", refused["failure"])["failure_class"] == "throttled"
+
+    def test_a_fast_request_shed_on_a_rate_window_overflows_once(self) -> None:
+        """A forced fast retry skips the window it shed on, like any forced overflow."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        only = (_fast_lane(GatewayRungDispatchPolicy(concurrency_bound=4, requests_per_minute=1)),)
+        for request_id in ("request-fast-1", "request-fast-2"):
+            _admit(registry, only, request_id=request_id, fast=True)
+        assert _start(registry, ordinal=0, request_id="request-fast-1")["route_depth"] == 0
+        started = time.monotonic()
+        second = _start(registry, ordinal=0, request_id="request-fast-2")
+        assert time.monotonic() - started < 5
+        assert second["route_depth"] == 0
+        assert ledger.started[-1]["dispatch_reason"] == "saturated_overflow"
 
 
 class TestLaneSaturation:

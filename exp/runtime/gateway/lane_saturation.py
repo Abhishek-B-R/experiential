@@ -225,7 +225,9 @@ def _historical_target(route: GatewayRoute, depth: int, shed: RungShed | None) -
     Returns:
         ``depth`` to force-admit, or ``None`` when the rung's bound refuses.
     """
-    if shed is not None and shed.default_bound:
+    # A hard shed (a class cap, the :fast split) sheds a forced retry the
+    # same way, so overflowing it would walk the ladder until the deadline.
+    if shed is not None and (shed.default_bound or shed.overflow_ceiling):
         return None
     policy = route.deployments[depth].gateway.dispatch
     if policy is not None and policy.saturation == "refuse":
