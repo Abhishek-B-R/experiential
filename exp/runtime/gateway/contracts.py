@@ -962,8 +962,7 @@ class ExecutionSnapshot(ContractModel):
     # the admission can hand the data plane its frozen retry facts and the
     # per-attempt decision can honor a post-backoff redial.
     throttle_redial: GatewayThrottleRedialPolicy | None = None
-    # Rungs the host flagged for OpenRouter's per-request ZDR constraint; the
-    # dispatch builder tightens each and fails closed on a wire that cannot.
+    # Dispatch enforces OpenRouter ZDR on each flagged rung or fails closed.
     zdr_constrained_deployment_ids: tuple[DeploymentId, ...] = ()
     model_stages: tuple[ModelExecutionStage, ...] = ()
     traversal_events: tuple[ModelTraversalEvent, ...] = ()

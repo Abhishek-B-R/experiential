@@ -106,28 +106,20 @@ def openai_compatible_request(
     Args:
         model_id: Provider model identifier to place on the wire.
         request: Typed EXP request.
-        token_limit_key: Wire field carrying the output-token ceiling. Azure OpenAI
-            reasoning deployments reject ``max_tokens`` and require
-            ``max_completion_tokens``.
+        token_limit_key: Output-token ceiling field; Azure reasoning deployments require
+            ``max_completion_tokens`` instead of ``max_tokens``.
         supports_temperature: Whether this exact model accepts explicit sampling controls.
         supports_top_p: Whether this exact model accepts nucleus sampling. ``None`` follows
             ``supports_temperature`` for older catalog records.
         supports_top_k: Whether this exact route accepts top-k sampling.
-        supports_logprobs: Reserved route capability retained for contract parity. Chat
-            logprob controls are currently ignored because the normalized gateway response
-            cannot return provider logprob details.
+        supports_logprobs: Reserved capability; ignored until normalized responses carry logprobs.
         supports_reasoning: Whether this exact model accepts a reasoning control.
         reasoning_effort: Optional catalog-pinned reasoning effort.
         reasoning_wire_format: Provider field used for normalized reasoning effort.
-        deepseek_reasoning_history: Whether this is DeepSeek's own origin, whose
-            thinking mode requires ``reasoning_content`` on every assistant message
-            of the current turn; every assistant message is backfilled with an
-            empty one (the typed request carries no reasoning to forward), the
-            same rule the streaming builder applies in ``openai_chat_message``.
-        system_messages_leading_only: Whether this rung's chat template accepts a
-            system message only as the very first message; every other
-            instruction turn is folded into user text, the same rule as the
-            streaming builder (``fold_instruction_turns_after_the_first``).
+        deepseek_reasoning_history: Backfill assistant messages with empty reasoning content
+            for DeepSeek thinking, matching ``openai_chat_message`` in the streaming builder.
+        system_messages_leading_only: Fold non-leading instruction turns into user text,
+            matching ``fold_instruction_turns_after_the_first`` in the streaming builder.
 
     Returns:
         A JSON object for ``/chat/completions``.
