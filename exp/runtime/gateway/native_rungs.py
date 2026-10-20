@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 from exp.common.core.artifacts import JsonObject, sha256_bytes
 from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.runtime.gateway.class_throttles import upstream_priority
+from exp.runtime.gateway.class_throttles import fast_on_rung, upstream_priority
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayApiSurface, GatewayRequest
 from exp.runtime.gateway.native_admission import shape_parallel_tool_calls
 from exp.runtime.gateway.native_dispatch import frozen_dispatch
@@ -164,11 +164,12 @@ def build_rung_dispatch(
         # provider would receive an unknown field.
         upstream_payload = {
             **upstream_payload,
-            "priority": upstream_priority(authorization, UPSTREAM_PRIORITY),
+            "priority": upstream_priority(authorization, deployment, UPSTREAM_PRIORITY),
         }
-        # vLLM bills no processing tier: a :fast request's tier is ours to
-        # serve (class_throttles), so the field never reaches the server.
-        upstream_payload.pop("service_tier", None)
+        if fast_on_rung(authorization, deployment):
+            # vLLM bills no processing tier: a :fast request's tier is ours
+            # to serve (class_throttles), so the field never reaches it.
+            upstream_payload.pop("service_tier", None)
     request_headers = (
         anthropic_request_headers(dict(profile.headers), rung_request)
         if profile.dialect == "anthropic_messages"

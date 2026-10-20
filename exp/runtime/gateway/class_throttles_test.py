@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 from exp.common.models.catalog import BillingSource
-from exp.common.models.catalog_prices import GatewayTokenPrices
+from exp.common.models.catalog_prices import GatewayServiceTierPrices, GatewayTokenPrices
 from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.class_throttles import (
@@ -23,10 +25,16 @@ from exp.runtime.gateway.class_throttles import (
     require_fast_path,
     rung_saturation,
     started_attempt_payload,
+    tier_settlement,
     upstream_priority,
 )
-from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
-from exp.runtime.gateway.native_execution import rung_load_key
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
+    GatewayApiSurface,
+    GatewayMessage,
+    GatewayRequest,
+)
+from exp.runtime.gateway.native_execution import InflightRequest, rung_load_key
 from exp.runtime.gateway.native_rungs_test import _AUTHORIZATION, _deployment
 from exp.runtime.gateway.native_service_tiers import settlement_kwarg
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
@@ -182,6 +190,21 @@ def test_class_cap_needs_a_class() -> None:
 
 
 _FAST = _AUTHORIZATION.model_copy(update={"fast": True})
+_STANDARD = GatewayTokenPrices(
+    input_nano_usd_per_million_tokens=1_000, output_nano_usd_per_million_tokens=2_000
+)
+_CARDED = _STANDARD.model_copy(
+    update={
+        "priority": GatewayServiceTierPrices(
+            input_nano_usd_per_million_tokens=2_000, output_nano_usd_per_million_tokens=4_000
+        )
+    }
+)
+
+
+def _carded(rung: ExactModelDeployment) -> ExactModelDeployment:
+    """The rung with a priority card (2x), the price every fast lever comes with."""
+    return rung.model_copy(update={"gateway": rung.gateway.model_copy(update={"prices": _CARDED})})
 
 
 def test_fast_is_off_by_default_and_orders_above_every_class() -> None:
@@ -192,13 +215,15 @@ def test_fast_is_off_by_default_and_orders_above_every_class() -> None:
     assert admission_priority_class(_FAST) == FAST_PRIORITY_CLASS == TOP_PRIORITY_CLASS + 1
 
 
-def test_upstream_priority_puts_fast_ahead_of_every_class() -> None:
-    """vLLM runs the lowest value first: fast -1, top class 0, the level map otherwise."""
+def test_upstream_priority_puts_fast_ahead_only_with_the_priority_card() -> None:
+    """vLLM runs the lowest value first: fast -1 on a carded rung, else the class or level map."""
     by_level = {2: 0, 1: 1, 0: 2}
-    assert upstream_priority(_FAST, by_level) == FAST_UPSTREAM_PRIORITY == -1
+    assert upstream_priority(_FAST, _carded(_rung()), by_level) == FAST_UPSTREAM_PRIORITY == -1
+    # Without the card a fast request gets no lever at the standard price.
+    assert upstream_priority(_FAST, _rung(), by_level) == 2
     classed = _AUTHORIZATION.model_copy(update={"priority_class": 8})
-    assert upstream_priority(classed, by_level) == 0
-    assert upstream_priority(_AUTHORIZATION, by_level) == 2
+    assert upstream_priority(classed, _carded(_rung()), by_level) == 0
+    assert upstream_priority(_AUTHORIZATION, _carded(_rung()), by_level) == 2
 
 
 def test_fast_is_exempt_from_the_class_pace_and_cap() -> None:
@@ -214,11 +239,12 @@ def test_fast_is_exempt_from_the_class_pace_and_cap() -> None:
     assert class_concurrency_cap(throttled, _rung()) is None
 
 
-def test_fast_resource_levers_apply_only_on_our_gpus() -> None:
-    """fast_on_rung is the self-hosted predicate: a third-party rung gets only the tier."""
-    assert fast_on_rung(_FAST, _rung())
-    assert not fast_on_rung(_FAST, _rung(self_hosted=False))
-    assert not fast_on_rung(_AUTHORIZATION, _rung())
+def test_fast_resource_levers_apply_only_on_our_carded_gpus() -> None:
+    """fast_on_rung needs a self-hosted rung AND its priority card."""
+    assert fast_on_rung(_FAST, _carded(_rung()))
+    assert not fast_on_rung(_FAST, _rung())
+    assert not fast_on_rung(_FAST, _carded(_rung(self_hosted=False)))
+    assert not fast_on_rung(_AUTHORIZATION, _carded(_rung()))
 
 
 def test_fast_requests_the_priority_tier_and_refuses_without_one() -> None:
@@ -236,61 +262,62 @@ def test_fast_requests_the_priority_tier_and_refuses_without_one() -> None:
     assert refused.value.capability == "service_tier"
 
 
-def test_fast_halves_other_traffics_bound_while_in_flight() -> None:
-    """While a :fast reservation is held, others see half the bound; release restores it."""
+def _reserve(
+    loads: RungLoadRegistry,
+    *,
+    fast: bool = False,
+    force: bool = False,
+    ceiling: float | None = None,
+) -> str | RungShed:
+    return loads.reserve(
+        rung_load_key(_rung()),
+        organization_id="org",
+        weight=1,
+        bound=4,
+        fair_share=False,
+        fast=fast,
+        force=force,
+        overflow_ceiling=ceiling,
+    )
+
+
+def test_fast_splits_the_bound_while_in_flight() -> None:
+    """Fast holds the upper half (2 of 4); while it is held others hold the lower half (2)."""
     loads = RungLoadRegistry()
-    key = rung_load_key(_rung())
-
-    def reserve(*, fast: bool = False) -> str | RungShed:
-        return loads.reserve(
-            key, organization_id="org", weight=1, bound=4, fair_share=False, fast=fast
-        )
-
-    first = reserve()
-    assert isinstance(first, str)
-    fast_ticket = reserve(fast=True)
+    assert isinstance(_reserve(loads), str)
+    fast_ticket = _reserve(loads, fast=True)
     assert isinstance(fast_ticket, str)
-    # Two held (one fast): half of 4 is 2, so ordinary traffic sheds.
-    assert isinstance(reserve(), RungShed)
-    # A second fast request still sees the full bound.
-    assert isinstance(reserve(fast=True), str)
+    assert isinstance(_reserve(loads), str)
+    # Two ordinary held: the lower half is full, even for a forced priority overflow.
+    shed = _reserve(loads, force=True, ceiling=6.0)
+    assert shed == RungShed("queue_bound", overflow_ceiling=True)
+    assert isinstance(_reserve(loads, fast=True), str)
+    # The fast half is full too: a third fast request sheds.
+    assert _reserve(loads, fast=True) == RungShed("queue_bound", overflow_ceiling=True)
     loads.release_ticket(fast_ticket)
-    assert isinstance(reserve(), RungShed)  # the other fast ticket is still held
+    assert isinstance(_reserve(loads, fast=True), str)
 
 
-def test_fast_count_drops_with_its_ticket() -> None:
-    """Releasing the last fast ticket gives ordinary traffic the whole bound back."""
+def test_fast_found_a_full_rung_and_ordinary_traffic_returns_when_it_leaves() -> None:
+    """A fast request admits on a full rung; others wait for the lower half, then regain all."""
     loads = RungLoadRegistry()
-    key = rung_load_key(_rung())
-    fast_ticket = loads.reserve(
-        key, organization_id="o", weight=1, bound=4, fair_share=False, fast=True
-    )
+    tickets = [_reserve(loads) for _ in range(4)]
+    assert all(isinstance(ticket, str) for ticket in tickets)
+    fast_ticket = _reserve(loads, fast=True)
     assert isinstance(fast_ticket, str)
-    held = loads.reserve(key, organization_id="o", weight=1, bound=4, fair_share=False)
-    assert isinstance(held, str)
-    assert isinstance(
-        loads.reserve(key, organization_id="o", weight=1, bound=4, fair_share=False), RungShed
-    )
-    loads.release_ticket(fast_ticket)
-    assert isinstance(
-        loads.reserve(key, organization_id="o", weight=1, bound=4, fair_share=False), str
-    )
+    loads.release_ticket(str(tickets.pop()))
+    assert isinstance(_reserve(loads), RungShed)  # 3 ordinary held >= the lower half (2)
+    loads.bind(fast_ticket, "attempt-fast")
+    loads.release_attempt("attempt-fast")
+    assert isinstance(_reserve(loads), str)  # no fast left: the whole bound again
 
 
 def test_self_served_tier_settles_confirmed_only_on_our_gpu() -> None:
     """Our server reports no tier: missing evidence confirms the admitted card there only."""
-    standard = GatewayTokenPrices(
-        input_nano_usd_per_million_tokens=1_000, output_nano_usd_per_million_tokens=2_000
-    )
     admission = GatewayServiceTierAdmission(
         requested="priority",
-        standard_prices=standard,
-        requested_prices=standard.model_copy(
-            update={
-                "input_nano_usd_per_million_tokens": 2_000,
-                "output_nano_usd_per_million_tokens": 4_000,
-            }
-        ),
+        standard_prices=_STANDARD,
+        requested_prices=_CARDED.for_service_tier("priority"),
     )
     served = settlement_kwarg(admission, {}, self_served=True)["service_tier"]
     assert served.resolution == "confirmed"
@@ -306,3 +333,32 @@ def test_self_served_tier_settles_confirmed_only_on_our_gpu() -> None:
         self_served=True,
     )["service_tier"]
     assert downgraded.prices == admission.standard_prices
+
+
+def _entry(authorization: AuthorizationSnapshot, rung: ExactModelDeployment) -> InflightRequest:
+    """The two fields tier_settlement reads, on one reserved attempt at depth 0."""
+    admission = GatewayServiceTierAdmission(
+        requested="priority",
+        standard_prices=_STANDARD,
+        requested_prices=_CARDED.for_service_tier("priority"),
+    )
+    return cast(
+        "InflightRequest",
+        SimpleNamespace(
+            authorization=authorization,
+            route=SimpleNamespace(deployments=(rung,)),
+            attempt_service_tiers={"attempt-1": admission},
+            attempt_depths={"attempt-1": 0},
+        ),
+    )
+
+
+def test_tier_settlement_self_serves_only_a_fast_request_on_our_carded_gpu() -> None:
+    """A non-fast service_tier=priority keeps the evidence rule; so does a third-party rung."""
+    assert tier_settlement(_entry(_FAST, _carded(_rung())), "attempt-1")["self_served"]
+    assert not tier_settlement(_entry(_AUTHORIZATION, _carded(_rung())), "attempt-1")["self_served"]
+    assert not tier_settlement(_entry(_FAST, _carded(_rung(self_hosted=False))), "attempt-1")[
+        "self_served"
+    ]
+    untiered = tier_settlement(_entry(_FAST, _carded(_rung())), "attempt-unknown")
+    assert untiered == {"service_tier": None, "self_served": False}

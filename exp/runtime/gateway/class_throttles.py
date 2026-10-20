@@ -27,10 +27,11 @@ processing tier at the frozen priority card (``fast_request``): a request no
 rung can serve at that tier is refused, never served at standard
 (``require_fast_path``). On a self-hosted rung it runs above every class (vLLM
 priority ``FAST_UPSTREAM_PRIORITY``, permit class ``FAST_PRIORITY_CLASS``), is
-exempt from class caps, the pace and fair-share bounds, and while it is in
-flight other traffic sees half the rung's bound (``rung_admission``), so the
-decode batch it shares stays small. We serve that tier ourselves, so its
-settlement is confirmed at the requested card (``tier_settlement``).
+exempt from class caps and the pace, holds the upper half of the rung's bound
+outside fair share, and while it is in flight other traffic holds only the
+lower half (``rung_admission``), so the decode batch it shares stays small.
+We serve that tier ourselves, so its settlement is confirmed at the requested
+card (``tier_settlement``). Every lever needs the rung's priority card.
 
 Nothing is set by default, and an attempt with no pace serializes exactly as
 before (``started_attempt_payload``).
@@ -59,9 +60,6 @@ priority 0 and a free account at 8.
 
 FAST_PRIORITY_CLASS = TOP_PRIORITY_CLASS + 1
 """The permit-queue class of a ``:fast`` request, above the top request class."""
-
-FAST_ADMISSION_LEVEL = 2
-"""The ``priority_admission`` level a ``:fast`` request reserves our GPU at: Pro's overflow."""
 
 FAST_UPSTREAM_PRIORITY = -1
 """vLLM ``priority`` for a ``:fast`` request: below every ``8 - class`` (lowest runs first)."""
@@ -162,9 +160,11 @@ def admission_priority_class(authorization: AuthorizationSnapshot) -> int | None
     return FAST_PRIORITY_CLASS if authorization.fast else authorization.priority_class
 
 
-def upstream_priority(authorization: AuthorizationSnapshot, by_level: dict[int, int]) -> int:
+def upstream_priority(
+    authorization: AuthorizationSnapshot, deployment: ExactModelDeployment, by_level: dict[int, int]
+) -> int:
     """vLLM ``priority`` on a self-hosted rung: fast, else ``8 - class``, else the level map."""
-    if authorization.fast:
+    if fast_on_rung(authorization, deployment):
         return FAST_UPSTREAM_PRIORITY
     if authorization.priority_class is not None:
         return TOP_PRIORITY_CLASS - authorization.priority_class
@@ -172,8 +172,16 @@ def upstream_priority(authorization: AuthorizationSnapshot, by_level: dict[int, 
 
 
 def fast_on_rung(authorization: AuthorizationSnapshot, deployment: ExactModelDeployment) -> bool:
-    """Whether a ``:fast`` request is reserving our own GPU (the resource levers apply)."""
-    return authorization.fast and is_self_hosted_rung(deployment)
+    """Whether a ``:fast`` request is reserving our own GPU at its priority card.
+
+    Only a self-hosted rung that carries a priority card: the resource levers
+    always come with the priority price, never at the standard one.
+    """
+    return (
+        authorization.fast
+        and is_self_hosted_rung(deployment)
+        and deployment.gateway.prices.priority is not None
+    )
 
 
 def fast_request(request: GatewayRequest, authorization: AuthorizationSnapshot) -> GatewayRequest:
@@ -204,7 +212,8 @@ def tier_settlement(entry: InflightRequest, attempt_id: str) -> TierSettlementIn
     depth = entry.attempt_depths.get(attempt_id)
     self_served = (
         admission is not None
+        and admission.requested == "priority"
         and depth is not None
-        and is_self_hosted_rung(entry.route.deployments[depth])
+        and fast_on_rung(entry.authorization, entry.route.deployments[depth])
     )
     return {"service_tier": admission, "self_served": self_served}

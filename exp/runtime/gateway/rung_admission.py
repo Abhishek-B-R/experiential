@@ -292,10 +292,11 @@ class RungLoadRegistry:
             class_cap: ``(request class, cap)``: shed once this rung holds ``cap``
                 in-flight reservations of that class, even on a forced overflow
                 (``class_throttles.class_concurrency_cap``); ``None`` = no cap.
-            fast: A ``:fast`` reservation. Counted per rung; while one is held
-                every other reservation on the rung sees half its bound and
-                half its overflow ceiling (at least one), so the shared decode
-                batch stays small.
+            fast: A ``:fast`` reservation: it may hold the upper half of
+                ``bound`` (at least one) and skips fair share; while one is
+                held, every other reservation may hold only the lower half (at
+                least one), so the shared decode batch stays small. Rate
+                windows still apply to both.
 
         Returns:
             An opaque ticket on admission, else the shed disclosure.
@@ -310,10 +311,18 @@ class RungLoadRegistry:
             organization.weight = weight
             self._prune(key, rung, now)
             self._prune_window(rung, now)
-            if rung.fast and not fast:
-                bound = None if bound is None else max(1, bound // 2)
-                if overflow_ceiling is not None:
-                    overflow_ceiling = max(1.0, overflow_ceiling / 2)
+            # The :fast split (class_throttles): fast reservations hold at most
+            # the upper half of the bound and skip fair share; while any is
+            # held, everyone else holds at most the lower half. Both are hard
+            # (a hit overflow ceiling), so the rung never exceeds its bound by
+            # more than the one fast request that found it full.
+            if bound is not None and (fast or rung.fast):
+                if fast and rung.fast >= max(1, bound - bound // 2):
+                    return RungShed("queue_bound", overflow_ceiling=True)
+                if not fast and rung.total - rung.fast >= max(1, bound // 2):
+                    return RungShed("queue_bound", overflow_ceiling=True)
+            if fast:
+                force, bound, fair_share = False, None, False
             if hard_bound and bound is not None and rung.total >= bound:
                 return RungShed("queue_bound")
             # A class cap is hard: marked as a hit overflow ceiling so no

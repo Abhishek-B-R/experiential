@@ -141,11 +141,17 @@ the tier is ours, so the request gets more of the GPU:
 - vLLM priority `-1` (`FAST_UPSTREAM_PRIORITY`), ahead of every class, and no `service_tier`
   field on the vLLM wire;
 - permit class `9` (`FAST_PRIORITY_CLASS`) in a configured permit queue;
-- no class cap, no pace, no fair-share weighting, and Pro's overflow ceiling at reservation;
-- while it is in flight, every other reservation on that rung sees half the bound and half the
-  overflow ceiling (at least one), so the decode batch it shares stays small. Like every
-  registry bound this is per gateway worker;
+- no class cap and no pace;
+- a split bound: fast reservations may hold the upper half of the rung's bound (at least one),
+  outside fair share; while any is held, every other reservation may hold only the lower half
+  (at least one), hard, even for a priority overflow. A fast request that finds the rung full
+  still admits, so the rung exceeds its bound by at most that one. Like every registry bound
+  this is per gateway worker, and rate windows still apply;
 - settlement confirmed at the requested card (`tier_settlement`): our server reports no tier.
+
+Every self-hosted lever needs the rung's priority card (`fast_on_rung`), so a fast request
+never gets more of the GPU at the standard price. A caller's plain `service_tier=priority` on a
+self-hosted rung (not `:fast`) keeps the evidence rule and gets none of these levers.
 
 The default bound is already half the worker's permits, so its Pro factor stays below
 `1 / DEFAULT_LANE_SHARE` and one lane's priority traffic never holds every permit. A rung whose

@@ -12,10 +12,12 @@ from pydantic import ValidationError
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelCapabilities
 from exp.common.models.catalog import (
+    BillingSource,
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
     GatewayTokenPrices,
 )
+from exp.common.models.catalog_prices import GatewayServiceTierPrices
 from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.anthropic_protocol.requests import decode_messages
@@ -796,7 +798,20 @@ def test_request_class_and_pace_default_to_none() -> None:
 
 def test_fast_runs_first_on_vllm_and_keeps_the_tier_off_its_wire() -> None:
     """:fast on our vLLM rung: priority -1 and no service_tier; a third-party rung gets neither."""
-    vllm = _priority_rung("vllm", upstream_priority=True)
+    base = _priority_rung("vllm", upstream_priority=True)
+    carded = base.gateway.prices.model_copy(
+        update={
+            "priority": GatewayServiceTierPrices(
+                input_nano_usd_per_million_tokens=2, output_nano_usd_per_million_tokens=4
+            )
+        }
+    )
+    vllm = base.model_copy(
+        update={
+            "gateway": base.gateway.model_copy(update={"prices": carded}),
+            "billing_source": BillingSource.HOST_MANAGED,
+        }
+    )
     third_party = _deployment("third-party", "openrouter")
     route = _route((vllm, third_party))
     request = _request().model_copy(update={"service_tier": "priority"})
