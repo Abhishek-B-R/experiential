@@ -296,7 +296,8 @@ class RungLoadRegistry:
                 ``bound`` (at least one) and skips fair share; while one is
                 held, every other reservation may hold only the lower half (at
                 least one), so the shared decode batch stays small. Rate
-                windows still apply to both.
+                windows apply to both, except on a forced retry (which skips
+                the window it shed on).
 
         Returns:
             An opaque ticket on admission, else the shed disclosure.
@@ -324,7 +325,7 @@ class RungLoadRegistry:
                     return RungShed("queue_bound", overflow_ceiling=True)
             # ``force`` stays: a forced retry must skip the window it shed on.
             if fast:
-                bound, fair_share = None, False
+                bound, fair_share, overflow_ceiling = None, False, None
             if hard_bound and bound is not None and rung.total >= bound:
                 return RungShed("queue_bound")
             # A class cap is hard: marked as a hit overflow ceiling so no

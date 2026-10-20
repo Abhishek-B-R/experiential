@@ -1229,6 +1229,28 @@ def test_fast_asks_for_the_priority_tier_and_never_falls_back_to_standard() -> N
         )
     assert refused.value.capability == "service_tier"
     assert refused.value.detail is not None and "no fast path" in refused.value.detail
+    # A customer's own rung forwards priority but is never our fast path: a
+    # BYOK rung beside an uncarded house rung refuses rather than letting the
+    # house rung serve :fast at the standard card.
+    byok = (
+        GatewayWireProfile(
+            dialect="openai_compatible", url="https://byok.test", billing_customer_managed=True
+        ),
+        client,
+    )
+    mixed = _mixed_route(
+        "maximize_availability",
+        (_deployment("byok", gateway=gateway), _deployment("standard", gateway=gateway)),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    with pytest.raises(ProviderCapabilityError):
+        admitted_route_requests(
+            mixed,
+            (byok, standard),
+            request,
+            accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+            authorization=mixed.snapshot.authorization.model_copy(update={"fast": True}),
+        )
     # Without :fast the same request runs untiered, exactly as before.
     _, _, _, plain, _ = admitted_route_requests(
         standard_only,
