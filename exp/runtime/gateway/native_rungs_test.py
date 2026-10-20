@@ -794,6 +794,32 @@ def test_request_class_and_pace_default_to_none() -> None:
             AuthorizationSnapshot.model_validate(_AUTHORIZATION.model_dump() | invalid)
 
 
+def test_fast_runs_first_on_vllm_and_keeps_the_tier_off_its_wire() -> None:
+    """:fast on our vLLM rung: priority -1 and no service_tier; a third-party rung gets neither."""
+    vllm = _priority_rung("vllm", upstream_priority=True)
+    third_party = _deployment("third-party", "openrouter")
+    route = _route((vllm, third_party))
+    request = _request().model_copy(update={"service_tier": "priority"})
+    fast = _AUTHORIZATION.model_copy(update={"fast": True, "priority_class": 8})
+
+    def payload(deployment: ExactModelDeployment) -> JsonObject:
+        result = build_rung_dispatch(
+            route,
+            deployment,
+            _profile(),
+            _NoSigningClient(),
+            provider_request=request,
+            public_request=request,
+            authorization=fast,
+        ).wire_entry["upstream_payload"]
+        assert isinstance(result, dict)
+        return result
+
+    assert payload(vllm)["priority"] == -1
+    assert "service_tier" not in payload(vllm)
+    assert "priority" not in payload(third_party)
+
+
 @pytest.mark.parametrize("dispatch", [None, GatewayRungDispatchPolicy()])
 def test_upstream_priority_absent_without_opt_in(
     dispatch: GatewayRungDispatchPolicy | None,

@@ -108,7 +108,7 @@ acts ONLY on a self-hosted rung: one whose dispatch policy authors `upstream_pri
 Third-party, BYOK and tenant rungs never author it, so on them every lever below is a no-op.
 
 - **vLLM priority by class** (frees capacity). With a class, an opted-in rung gets vLLM
-  priority `8 - priority_class` (`native_rungs.TOP_PRIORITY_CLASS`) instead of the
+  priority `8 - priority_class` (`class_throttles.TOP_PRIORITY_CLASS`) instead of the
   Pro/paying/free map, so the server schedules and preempts by class.
 - **Per-class in-flight cap** (frees capacity). `self_hosted_class_concurrency` caps how many
   dispatches of the request's class one worker holds on a self-hosted rung; past it the rung
@@ -128,6 +128,24 @@ Third-party, BYOK and tenant rungs never author it, so on them every lever below
   starves (`permit_queue.rs`). Absent, the permits stay the FIFO semaphore.
 
 The class changes no admission bound, overflow factor or fair-share weight.
+
+### The `:fast` request (`AuthorizationSnapshot.fast`)
+
+A host sets `fast` for a request a caller asked to run faster at the priority card. Admission
+asks for the priority processing tier (`class_throttles.fast_request`) and narrows to rungs that
+carry a priority card; when none does it refuses (`require_fast_path`), never serving it at the
+standard tier. On a third-party rung that is the provider's own priority tier, settled only on
+witnessed evidence (a downgrade settles at standard). On a self-hosted rung (`upstream_priority`)
+the tier is ours, so the request gets more of the GPU:
+
+- vLLM priority `-1` (`FAST_UPSTREAM_PRIORITY`), ahead of every class, and no `service_tier`
+  field on the vLLM wire;
+- permit class `9` (`FAST_PRIORITY_CLASS`) in a configured permit queue;
+- no class cap, no pace, no fair-share weighting, and Pro's overflow ceiling at reservation;
+- while it is in flight, every other reservation on that rung sees half the bound and half the
+  overflow ceiling (at least one), so the decode batch it shares stays small. Like every
+  registry bound this is per gateway worker;
+- settlement confirmed at the requested card (`tier_settlement`): our server reports no tier.
 
 The default bound is already half the worker's permits, so its Pro factor stays below
 `1 / DEFAULT_LANE_SHARE` and one lane's priority traffic never holds every permit. A rung whose

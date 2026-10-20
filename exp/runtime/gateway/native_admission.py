@@ -24,6 +24,7 @@ from exp.runtime.gateway.affinity import (
     rendezvous_order,
 )
 from exp.runtime.gateway.capability_rungs import narrow_to_capable_rungs
+from exp.runtime.gateway.class_throttles import fast_request, require_fast_path
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, GatewayRequest
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_components import NativeGatewayComponents
@@ -101,9 +102,8 @@ def admitted_route_requests(
         request: Canonical request produced by the public protocol decoder.
         accounting: Shared accounting owning the coercion counter.
         authorization: Frozen authority for the accepted request.
-        continuation: Responses continuation context when this request
-            continues a stored response; its original episode key keeps the
-            conversation's cache-affinity placement.
+        continuation: Responses continuation context for a stored response; its
+            original episode key keeps the conversation's cache-affinity placement.
 
     Returns:
         The narrowed route and wires, the public request (carrying any
@@ -114,15 +114,16 @@ def admitted_route_requests(
         ProviderParameterError: No rung preserves a generation control and no
             disclosed coercion applies, or rungs declined for different
             field-specific reasons.
-        ProviderCapabilityError: The first rung's capability rejection when
-            no rung is protocol-compatible; the shared admit handler scopes
-            it to the exact public request field.
+        ProviderCapabilityError: The first rung's capability rejection when no rung
+            is protocol-compatible, or a ``:fast`` request no rung serves fast.
         GatewayRoutingError: No rung is protocol-compatible and none named a
             rejection.
     """
+    request = fast_request(without_prompt_caching(request, authorization), authorization)
     route, resolved_wires, public_request, provider_request, disclosures = prepare_route_requests(
-        route, resolved_wires, without_prompt_caching(request, authorization)
+        route, resolved_wires, request
     )
+    require_fast_path(provider_request, authorization)
     if disclosures:
         record_admission_coercions(accounting, authorization, disclosures)
     provider_request = with_cache_affinity(provider_request, authorization)
@@ -208,7 +209,7 @@ def select_single_route_before_search(
         resolved_wires = tuple(resolved_wires[index] for index in root_indexes)
     if route.resolved_route_id is not None:
         return restrict_fallbacks(request, route), resolved_wires[:1], None
-    preview = without_prompt_caching(request, authorization)
+    preview = fast_request(without_prompt_caching(request, authorization), authorization)
     preview = strip_search_carriers(preview) if preview.web_search is not None else preview
     preview = plan_tool_search(preview, [profile.dialect for profile, _ in resolved_wires]).request
     route, resolved_wires, _, prepared, _ = prepare_route_requests(route, resolved_wires, preview)

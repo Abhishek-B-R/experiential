@@ -22,6 +22,16 @@ Which lever frees capacity:
   than the rate. With ``output_pace_saturation`` set it applies only while the
   rung's in-flight load is at or above that fraction of its bound.
 
+The ``:fast`` spelling (``AuthorizationSnapshot.fast``) asks for the priority
+processing tier at the frozen priority card (``fast_request``): a request no
+rung can serve at that tier is refused, never served at standard
+(``require_fast_path``). On a self-hosted rung it runs above every class (vLLM
+priority ``FAST_UPSTREAM_PRIORITY``, permit class ``FAST_PRIORITY_CLASS``), is
+exempt from class caps, the pace and fair-share bounds, and while it is in
+flight other traffic sees half the rung's bound (``rung_admission``), so the
+decode batch it shares stays small. We serve that tier ourselves, so its
+settlement is confirmed at the requested card (``tier_settlement``).
+
 Nothing is set by default, and an attempt with no pace serializes exactly as
 before (``started_attempt_payload``).
 """
@@ -32,9 +42,34 @@ import json
 
 from exp.common.models.catalog import BillingSource
 from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.runtime.gateway.contracts import AuthorizationSnapshot
+from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
 from exp.runtime.gateway.native_execution import InflightRequest, rung_load_key
+from exp.runtime.gateway.native_service_tiers import TierSettlementInputs
 from exp.runtime.gateway.rung_admission import RungLoadRegistry
+from exp.runtime.gateway.service_tiers import GatewayServiceTierAdmission
+from exp.runtime.models.providers.errors import ProviderCapabilityError
+
+TOP_PRIORITY_CLASS = 8
+"""The highest ``AuthorizationSnapshot.priority_class``; vLLM gets ``8 - class``.
+
+A host that sends a request class (0 free account .. 8 top plan paid)
+replaces the three-level admission map, so the top class runs at vLLM
+priority 0 and a free account at 8.
+"""
+
+FAST_PRIORITY_CLASS = TOP_PRIORITY_CLASS + 1
+"""The permit-queue class of a ``:fast`` request, above the top request class."""
+
+FAST_ADMISSION_LEVEL = 2
+"""The ``priority_admission`` level a ``:fast`` request reserves our GPU at: Pro's overflow."""
+
+FAST_UPSTREAM_PRIORITY = -1
+"""vLLM ``priority`` for a ``:fast`` request: below every ``8 - class`` (lowest runs first)."""
+
+NO_FAST_PATH_DETAIL = (
+    "This model has no fast path: none of its lanes offers a faster processing tier. "
+    "Remove the :fast suffix, or choose a model that lists a :fast variant."
+)
 
 
 def is_self_hosted_rung(deployment: ExactModelDeployment) -> bool:
@@ -89,7 +124,7 @@ def output_pace(
     set a saturation threshold, the rung at or above it.
     """
     pace = authorization.output_tokens_per_second
-    if pace is None or not is_self_hosted_rung(deployment):
+    if pace is None or authorization.fast or not is_self_hosted_rung(deployment):
         return None
     threshold = authorization.output_pace_saturation
     if threshold is None:
@@ -104,7 +139,12 @@ def class_concurrency_cap(
     """``(class, cap)`` for a self-hosted rung under a host-set class cap, else ``None``."""
     cap = authorization.self_hosted_class_concurrency
     request_class = authorization.priority_class
-    if cap is None or request_class is None or not is_self_hosted_rung(deployment):
+    if (
+        cap is None
+        or request_class is None
+        or authorization.fast
+        or not is_self_hosted_rung(deployment)
+    ):
         return None
     return request_class, cap
 
@@ -115,3 +155,56 @@ def started_attempt_payload(attempt_id: str, route_depth: int, pace: float | Non
     if pace is not None:
         payload["output_tokens_per_second"] = pace
     return json.dumps(payload, separators=(",", ":"))
+
+
+def admission_priority_class(authorization: AuthorizationSnapshot) -> int | None:
+    """The class the permit queue orders by: ``FAST_PRIORITY_CLASS`` for ``:fast``."""
+    return FAST_PRIORITY_CLASS if authorization.fast else authorization.priority_class
+
+
+def upstream_priority(authorization: AuthorizationSnapshot, by_level: dict[int, int]) -> int:
+    """vLLM ``priority`` on a self-hosted rung: fast, else ``8 - class``, else the level map."""
+    if authorization.fast:
+        return FAST_UPSTREAM_PRIORITY
+    if authorization.priority_class is not None:
+        return TOP_PRIORITY_CLASS - authorization.priority_class
+    return by_level[authorization.priority_admission]
+
+
+def fast_on_rung(authorization: AuthorizationSnapshot, deployment: ExactModelDeployment) -> bool:
+    """Whether a ``:fast`` request is reserving our own GPU (the resource levers apply)."""
+    return authorization.fast and is_self_hosted_rung(deployment)
+
+
+def fast_request(request: GatewayRequest, authorization: AuthorizationSnapshot) -> GatewayRequest:
+    """A ``:fast`` request asks for the priority processing tier; others pass unchanged."""
+    if not authorization.fast:
+        return request
+    return request.model_copy(update={"service_tier": "priority"})
+
+
+def require_fast_path(request: GatewayRequest, authorization: AuthorizationSnapshot) -> None:
+    """Refuse a ``:fast`` request no rung serves at the priority tier (never bill it at standard).
+
+    Raises:
+        ProviderCapabilityError: Admission dropped the priority tier for lack of a rung.
+    """
+    if authorization.fast and request.service_tier != "priority":
+        raise ProviderCapabilityError(capability="service_tier", detail=NO_FAST_PATH_DETAIL)
+
+
+def tier_settlement(entry: InflightRequest, attempt_id: str) -> TierSettlementInputs:
+    """The settlement's tier keywords: the frozen admission, and whether we served it.
+
+    A self-hosted rung is our own server: it reports no processing tier, and the
+    tier it ran at is ours to state, so its settlement is confirmed at the
+    admitted card (``native_service_tiers.settlement_kwarg``).
+    """
+    admission: GatewayServiceTierAdmission | None = entry.attempt_service_tiers.get(attempt_id)
+    depth = entry.attempt_depths.get(attempt_id)
+    self_served = (
+        admission is not None
+        and depth is not None
+        and is_self_hosted_rung(entry.route.deployments[depth])
+    )
+    return {"service_tier": admission, "self_served": self_served}

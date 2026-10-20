@@ -889,6 +889,7 @@ class AuthorizationSnapshot(ClientAttribution):
         output_tokens_per_second: Class stream pace on self-hosted rungs; None never paces.
         output_pace_saturation: Pace only at or above this rung load fraction; None = always.
         self_hosted_class_concurrency: Per-worker in-flight cap for the class on a self-hosted rung.
+        fast: The ``:fast`` spelling: priority tier, above every class (class_throttles.py).
         descendant_start_authorized: False unless the host proves root funding
             and policy gates before allowing a request to start at a child.
         zdr_requested: Caller demand for stricter ZDR filtering, default False.
@@ -930,6 +931,7 @@ class AuthorizationSnapshot(ClientAttribution):
     output_tokens_per_second: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     output_pace_saturation: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     self_hosted_class_concurrency: int | None = Field(default=None, ge=1)
+    fast: bool = False
     descendant_start_authorized: bool = False
     zdr_requested: bool = False
     prompt_caching_disabled: bool = False

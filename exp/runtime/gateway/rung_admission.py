@@ -196,6 +196,9 @@ class _RungLoad:
     # In-flight reservations per request class, kept only for reservations
     # that named one (a host class cap on a self-hosted rung, class_throttles).
     classes: dict[int, int] = field(default_factory=dict)
+    # In-flight :fast reservations (class_throttles.fast_on_rung); while any
+    # is held, every other reservation sees half the rung's bound.
+    fast: int = 0
 
 
 class RungLoadRegistry:
@@ -236,6 +239,7 @@ class RungLoadRegistry:
         self._rungs: dict[RungLoadKey, _RungLoad] = {}
         self._tickets: dict[str, tuple[RungLoadKey, str]] = {}
         self._ticket_classes: dict[str, int] = {}
+        self._fast_tickets: set[str] = set()
         self._attempts: dict[str, str] = {}
         self._lock = threading.Lock()
 
@@ -258,6 +262,7 @@ class RungLoadRegistry:
         overflow_ceiling: float | None = None,
         rate_retry: bool = False,
         class_cap: tuple[int, int] | None = None,
+        fast: bool = False,
     ) -> str | RungShed:
         """Reserve one slot on a policy-bounded rung, or shed with a reason.
 
@@ -287,6 +292,10 @@ class RungLoadRegistry:
             class_cap: ``(request class, cap)``: shed once this rung holds ``cap``
                 in-flight reservations of that class, even on a forced overflow
                 (``class_throttles.class_concurrency_cap``); ``None`` = no cap.
+            fast: A ``:fast`` reservation. Counted per rung; while one is held
+                every other reservation on the rung sees half its bound and
+                half its overflow ceiling (at least one), so the shared decode
+                batch stays small.
 
         Returns:
             An opaque ticket on admission, else the shed disclosure.
@@ -301,6 +310,10 @@ class RungLoadRegistry:
             organization.weight = weight
             self._prune(key, rung, now)
             self._prune_window(rung, now)
+            if rung.fast and not fast:
+                bound = None if bound is None else max(1, bound // 2)
+                if overflow_ceiling is not None:
+                    overflow_ceiling = max(1.0, overflow_ceiling / 2)
             if hard_bound and bound is not None and rung.total >= bound:
                 return RungShed("queue_bound")
             # A class cap is hard: marked as a hit overflow ceiling so no
@@ -347,6 +360,9 @@ class RungLoadRegistry:
             if class_cap is not None:
                 rung.classes[class_cap[0]] = rung.classes.get(class_cap[0], 0) + 1
                 self._ticket_classes[ticket] = class_cap[0]
+            if fast:
+                rung.fast += 1
+                self._fast_tickets.add(ticket)
             return ticket
 
     def can_admit(
@@ -694,11 +710,15 @@ class RungLoadRegistry:
             return
         key, organization_id = entry
         request_class = self._ticket_classes.pop(ticket, None)
+        was_fast = ticket in self._fast_tickets
+        self._fast_tickets.discard(ticket)
         rung = self._rungs.get(key)
         if rung is None:
             return
         if request_class is not None and rung.classes.get(request_class, 0) > 0:
             rung.classes[request_class] -= 1
+        if was_fast and rung.fast > 0:
+            rung.fast -= 1
         organization = rung.organizations.get(organization_id)
         if organization is not None and organization.inflight > 0:
             organization.inflight -= 1

@@ -1176,6 +1176,70 @@ def test_priority_house_card_excludes_standard_only_lead(mode: str) -> None:
     assert provider.service_tier == "priority"
 
 
+def test_fast_asks_for_the_priority_tier_and_never_falls_back_to_standard() -> None:
+    """``:fast`` narrows to priority-carded rungs; with none it refuses (never billed standard)."""
+    gateway = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    route = _mixed_route(
+        "maximize_availability",
+        (_deployment("standard", gateway=gateway), _deployment("priority", gateway=gateway)),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    client = cast(NativeWireClient, object())
+    standard = (
+        GatewayWireProfile(dialect="openai_compatible", url="https://standard.test"),
+        client,
+    )
+    priority = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://priority.test",
+            service_tier_pricing_enabled=True,
+            service_tier_cards=frozenset({"priority"}),
+        ),
+        client,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"),),
+    )
+    fast = route.snapshot.authorization.model_copy(update={"fast": True})
+    narrowed, _, _, provider, _ = admitted_route_requests(
+        route,
+        (standard, priority),
+        request,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=fast,
+    )
+    assert tuple(deployment.deployment_id for deployment in narrowed.deployments) == ("priority",)
+    assert provider.service_tier == "priority"
+    standard_only = _mixed_route(
+        "maximize_availability",
+        (_deployment("standard", gateway=gateway),),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    with pytest.raises(ProviderCapabilityError) as refused:
+        admitted_route_requests(
+            standard_only,
+            (standard,),
+            request,
+            accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+            authorization=standard_only.snapshot.authorization.model_copy(update={"fast": True}),
+        )
+    assert refused.value.capability == "service_tier"
+    assert refused.value.detail is not None and "no fast path" in refused.value.detail
+    # Without :fast the same request runs untiered, exactly as before.
+    _, _, _, plain, _ = admitted_route_requests(
+        standard_only,
+        (standard,),
+        request,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=standard_only.snapshot.authorization,
+    )
+    assert plain.service_tier is None
+
+
 def test_tier_priced_host_lane_admits_the_named_tier() -> None:
     """A host rung whose model carries per-tier pricing forwards the tier, so a
     flex request is admitted (not rejected)."""

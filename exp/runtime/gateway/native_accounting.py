@@ -15,7 +15,11 @@ from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
 from exp.runtime.gateway.budget_continuation import denied_destination_pool
 from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
-from exp.runtime.gateway.class_throttles import attempt_output_pace, started_attempt_payload
+from exp.runtime.gateway.class_throttles import (
+    attempt_output_pace,
+    started_attempt_payload,
+    tier_settlement,
+)
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayEvent,
@@ -686,7 +690,7 @@ class NativeAttemptAccounting:
                 **settlement_metadata(
                     data,
                     self._finish_attempt,
-                    service_tier=entry.attempt_service_tiers.get(attempt_id),
+                    **tier_settlement(entry, attempt_id),
                 ),
                 **web_search_requests_kwarg(
                     self._finish_attempt, web_search_requests_from_terminal(terminal)
@@ -959,7 +963,7 @@ class NativeAttemptAccounting:
                 **settlement_metadata(
                     settlement,
                     self._finish_attempt,
-                    service_tier=entry.attempt_service_tiers.get(attempt_id),
+                    **tier_settlement(entry, attempt_id),
                 ),
                 **web_search_requests_kwarg(
                     self._finish_attempt, web_search_requests_from_terminal(terminal)

@@ -24,7 +24,11 @@ import time
 from collections.abc import Callable
 
 from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.runtime.gateway.class_throttles import class_concurrency_cap
+from exp.runtime.gateway.class_throttles import (
+    FAST_ADMISSION_LEVEL,
+    class_concurrency_cap,
+    fast_on_rung,
+)
 from exp.runtime.gateway.contracts import (
     GatewayEvent,
     GatewayFailure,
@@ -135,14 +139,17 @@ def reserve_rung_slot(
     tokens_per_minute = None if policy is None else policy.tokens_per_minute
     refusing = applies_default or (policy is not None and policy.saturation == "refuse")
     selected_first = entry.route.resolved_route_id is not None and entry.total_attempts == 0
-    priority = entry.authorization.priority_admission
+    # A :fast request on our GPU (class_throttles.fast_on_rung) skips fair
+    # share, overflows like Pro, and halves the rung's bound for everyone else.
+    fast = fast_on_rung(entry.authorization, deployment)
+    priority = FAST_ADMISSION_LEVEL if fast else entry.authorization.priority_admission
     result = loads.reserve(
         rung_load_key(deployment),
         organization_id=entry.authorization.organization_id,
         weight=entry.authorization.fair_share_weight,
         bound=bound,
         # Weighted fairness is on for every bounded rung (dispatch_policy.fair_share).
-        fair_share=True,
+        fair_share=not fast,
         requests_per_minute=None if policy is None else policy.requests_per_minute,
         tokens_per_minute=tokens_per_minute,
         cache_priority_alpha=None if policy is None else policy.cache_priority_alpha,
@@ -167,6 +174,7 @@ def reserve_rung_slot(
         else None,
         rate_retry=rate_retry,
         class_cap=class_cap,
+        fast=fast,
     )
     if isinstance(result, RungShed) and applies_default and result.reason == "queue_bound":
         result = dataclasses.replace(result, default_bound=True)

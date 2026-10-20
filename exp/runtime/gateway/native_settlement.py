@@ -526,6 +526,7 @@ def settlement_metadata(
     settle: Callable[..., object],
     *,
     service_tier: GatewayServiceTierAdmission | None = None,
+    self_served: bool = False,
 ) -> SettlementMetadata:
     """Project original observations while withholding unsupported host keywords."""
     observed = settlement_rate_limit(data)
@@ -539,7 +540,9 @@ def settlement_metadata(
     }
     if accepts_keyword(settle, "upstream_provider"):
         fields["upstream_provider"] = upstream_provider_from_settlement(data)
-    fields.update(settlement_kwarg(service_tier, {} if data is None else data))
+    fields.update(
+        settlement_kwarg(service_tier, {} if data is None else data, self_served=self_served)
+    )
     return fields
 
 
