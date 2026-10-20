@@ -32,7 +32,10 @@ engine = GuardrailEngine(
 control = NativeControlPlane(components, guardrails=engine)
 ```
 
-The gateway resolves `policies_for(organization_id, identity_id)` once for admission.
+The gateway resolves `policies_for(authorization)` once for admission. The
+`AuthorizationSnapshot` carries the organization, identity, alias, and frozen alias
+target, so a host store can scope a policy to exact-model pools as well as identities.
+`MappingGuardrailStore` reads only the organization and identity.
 The session captures every applicable policy, the original deadline, approval state,
 and output requirements. Continuation expansion, rewrites, gateway search rounds,
 response delivery, cancellation, and settlement all use that session. No later

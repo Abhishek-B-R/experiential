@@ -77,7 +77,7 @@ class GuardrailEngine:
         """Bind lookup, the internal client, and the deadline clock.
 
         Args:
-            store: Applicable platform and identity policy lookup.
+            store: Applicable policy lookup for each request authorization.
             client: Injected adapter seam that cannot use the public route.
             monotonic: Process-local clock in seconds.
             inspects: Optional async inflight limiter. ``None`` uses the
@@ -110,15 +110,15 @@ class GuardrailEngine:
         self.output_invocations = 0
         self.classifier_calls = 0
 
-    def policies_for(self, organization_id: str, identity_id: str) -> tuple[GuardrailPolicy, ...]:
+    def policies_for(self, authorization: AuthorizationSnapshot) -> tuple[GuardrailPolicy, ...]:
         """Resolve all applicable scopes through the single policy store contract."""
-        return self._store.policies_for(organization_id, identity_id)
+        return self._store.policies_for(authorization)
 
     def open_request(
         self, authorization: AuthorizationSnapshot, *, deadline_monotonic: float
     ) -> GuardrailSession | None:
         """Freeze all applicable policies into one request-owned execution session."""
-        policies = self.policies_for(authorization.organization_id, authorization.identity_id)
+        policies = self.policies_for(authorization)
         if not policies:
             return None
         return GuardrailSession(
@@ -127,9 +127,7 @@ class GuardrailEngine:
 
     def revision_for(self, authorization: AuthorizationSnapshot) -> str | None:
         """Bind replay to enforcing policy, adapter, and execution configuration."""
-        return self.policy_revision(
-            self.policies_for(authorization.organization_id, authorization.identity_id)
-        )
+        return self.policy_revision(self.policies_for(authorization))
 
     def policy_revision(self, policies: tuple[GuardrailPolicy, ...]) -> str | None:
         """Hash the enforcing snapshot; observation cannot alter response replay identity."""
