@@ -7,14 +7,17 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelCapabilities
 from exp.common.models.catalog import (
+    BillingSource,
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
     GatewayTokenPrices,
 )
+from exp.common.models.catalog_prices import GatewayServiceTierPrices
 from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.anthropic_protocol.requests import decode_messages
@@ -343,12 +346,21 @@ def test_a_flagged_rung_on_another_wire_fails_closed() -> None:
 
 
 def test_caller_provider_preferences_forward_to_openrouter_and_tighten_under_the_flag() -> None:
-    """The caller object reaches OpenRouter verbatim; a flagged rung tightens it, never loosens."""
+    """Only the caller's data-policy keys reach OpenRouter; routing keys never do.
+
+    llama-4-maverick (2026-10-16): a caller's ``order`` naming our own provider
+    label reached OpenRouter verbatim and OpenRouter answered 404 for a provider
+    it does not have. Routing keys are resolved against our rungs at admission.
+    """
     rung = _deployment("or-rung", "openrouter")
     preferences: JsonObject = {
         "zdr": False,
         "data_collection": "allow",
-        "order": ["Azure"],
+        "order": ["experiential_cloud"],
+        "only": ["openrouter"],
+        "ignore": ["bedrock"],
+        "allow_fallbacks": False,
+        "sort": "price",
     }
 
     plain = _dispatch(_route((rung,)), rung, preferences).wire_entry
@@ -356,14 +368,14 @@ def test_caller_provider_preferences_forward_to_openrouter_and_tighten_under_the
 
     plain_payload = plain["upstream_payload"]
     assert isinstance(plain_payload, dict)
-    assert plain_payload["provider"] == preferences
+    assert plain_payload["provider"] == {"zdr": False, "data_collection": "allow"}
     tight_payload = tight["upstream_payload"]
     assert isinstance(tight_payload, dict)
-    assert tight_payload["provider"] == {
-        "zdr": True,
-        "data_collection": "deny",
-        "order": ["Azure"],
-    }
+    assert tight_payload["provider"] == {"zdr": True, "data_collection": "deny"}
+    routing_only = _dispatch(_route((rung,)), rung, {"order": ["x"]}).wire_entry
+    routing_payload = routing_only["upstream_payload"]
+    assert isinstance(routing_payload, dict)
+    assert "provider" not in routing_payload
 
 
 def test_caller_provider_preferences_are_dropped_on_wires_without_the_field() -> None:
@@ -744,6 +756,85 @@ def test_upstream_priority_maps_admission_level_on_opted_in_rung_only(
     assert "priority" not in payload(third_party)
 
 
+@pytest.mark.parametrize(("level", "request_class", "priority"), [(2, 8, 0), (2, 2, 6), (0, 0, 8)])
+def test_upstream_priority_follows_request_class_when_host_sends_one(
+    level: int, request_class: int, priority: int
+) -> None:
+    """A request class replaces the admission-level map: vLLM priority is 8 minus the class."""
+    vllm = _priority_rung("vllm", upstream_priority=True)
+    authorization = _AUTHORIZATION.model_copy(
+        update={"priority_admission": level, "priority_class": request_class}
+    )
+    request = _request()
+    payload = build_rung_dispatch(
+        _route((vllm,)),
+        vllm,
+        _profile(),
+        _NoSigningClient(),
+        provider_request=request,
+        public_request=request,
+        authorization=authorization,
+    ).wire_entry["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert payload["priority"] == priority
+
+
+def test_request_class_and_pace_default_to_none() -> None:
+    """An unset class and pace keep every existing snapshot and payload unchanged."""
+    assert _AUTHORIZATION.priority_class is None
+    assert _AUTHORIZATION.output_tokens_per_second is None
+    assert _AUTHORIZATION.output_pace_saturation is None
+    assert _AUTHORIZATION.self_hosted_class_concurrency is None
+    for invalid in (
+        {"priority_class": 9},
+        {"priority_class": -1},
+        {"output_tokens_per_second": 0},
+        {"output_pace_saturation": 0},
+        {"self_hosted_class_concurrency": 0},
+    ):
+        with pytest.raises(ValidationError):
+            AuthorizationSnapshot.model_validate(_AUTHORIZATION.model_dump() | invalid)
+
+
+def test_fast_runs_first_on_vllm_and_keeps_the_tier_off_its_wire() -> None:
+    """:fast on our vLLM rung: priority -1 and no service_tier; a third-party rung gets neither."""
+    base = _priority_rung("vllm", upstream_priority=True)
+    carded = base.gateway.prices.model_copy(
+        update={
+            "priority": GatewayServiceTierPrices(
+                input_nano_usd_per_million_tokens=2, output_nano_usd_per_million_tokens=4
+            )
+        }
+    )
+    vllm = base.model_copy(
+        update={
+            "gateway": base.gateway.model_copy(update={"prices": carded}),
+            "billing_source": BillingSource.HOST_MANAGED,
+        }
+    )
+    third_party = _deployment("third-party", "openrouter")
+    route = _route((vllm, third_party))
+    request = _request().model_copy(update={"service_tier": "priority"})
+    fast = _AUTHORIZATION.model_copy(update={"fast": True, "priority_class": 8})
+
+    def payload(deployment: ExactModelDeployment) -> JsonObject:
+        result = build_rung_dispatch(
+            route,
+            deployment,
+            _profile(),
+            _NoSigningClient(),
+            provider_request=request,
+            public_request=request,
+            authorization=fast,
+        ).wire_entry["upstream_payload"]
+        assert isinstance(result, dict)
+        return result
+
+    assert payload(vllm)["priority"] == -1
+    assert "service_tier" not in payload(vllm)
+    assert "priority" not in payload(third_party)
+
+
 @pytest.mark.parametrize("dispatch", [None, GatewayRungDispatchPolicy()])
 def test_upstream_priority_absent_without_opt_in(
     dispatch: GatewayRungDispatchPolicy | None,
@@ -791,3 +882,46 @@ def test_upstream_priority_defaults_off_and_adds_no_identity_bytes() -> None:
     assert GatewayRungDispatchPolicy(upstream_priority=True).model_dump(exclude_defaults=True) == {
         "upstream_priority": True
     }
+
+
+def test_reasoning_off_on_an_openrouter_rung_ignores_upstreams_that_think_anyway() -> None:
+    """An OpenRouter rung asked for effort none lists the non-compliant upstreams to ignore.
+
+    Production 2026-10-19: AtlasCloud served z-ai/glm-5.1 with reasoning off and
+    still returned 129 reasoning tokens. A reasoning-on request is untouched.
+    """
+    capabilities = GatewayDeploymentCapabilities(
+        supports_streaming=True, supported_reasoning_efforts=("none", "high")
+    )
+    rung = _deployment("or-rung", "openrouter").model_copy(
+        update={
+            "capabilities": ModelCapabilities(
+                maximum_output_tokens=128_000, supports_reasoning=True
+            ),
+            "gateway": GatewayDeploymentMetadata(capabilities=capabilities),
+        }
+    )
+    profile = replace(_profile(), supports_reasoning=True, reasoning_wire_format="reasoning")
+    client: NativeWireClient = _NoSigningClient()
+
+    def payload_for(effort: str) -> JsonObject:
+        request = _request().model_copy(update={"reasoning_effort": effort})
+        dispatch = build_rung_dispatch(
+            _route((rung,)),
+            rung,
+            profile,
+            client,
+            provider_request=request,
+            public_request=request,
+            authorization=_AUTHORIZATION,
+        )
+        payload = dispatch.wire_entry["upstream_payload"]
+        assert isinstance(payload, dict)
+        return payload
+
+    off = payload_for("none")
+    assert off["reasoning"] == {"effort": "none"}
+    assert off["provider"] == {"ignore": ["atlas-cloud"]}
+    on = payload_for("high")
+    assert on["reasoning"] == {"effort": "high"}
+    assert "provider" not in on

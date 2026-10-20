@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 from exp.common.core.artifacts import JsonObject, sha256_bytes
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.runtime.gateway.class_throttles import fast_on_rung, upstream_priority
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayApiSurface, GatewayRequest
 from exp.runtime.gateway.native_admission import shape_parallel_tool_calls
 from exp.runtime.gateway.native_dispatch import frozen_dispatch
@@ -49,12 +50,17 @@ from exp.runtime.models.providers.logprobs import (
     require_responses_logprobs,
 )
 from exp.runtime.models.providers.openrouter_routing import (
+    constrain_openrouter_reasoning_off,
     constrain_openrouter_zero_data_retention,
     forward_provider_preferences,
     openrouter_chat_wire,
     openrouter_metadata_headers,
 )
-from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
+from exp.runtime.models.providers.protocol import (
+    GatewayDispatchSigner,
+    NativeWireClient,
+    developer_role_rewrite_disclosure,
+)
 from exp.runtime.models.providers.wire_messages import anthropic_request_headers
 
 ZDR_CONSTRAINT_CAPABILITY = "zero_data_retention_constraint"
@@ -81,7 +87,21 @@ class RungDispatch:
     carrier_authority: ReasoningCarrierAuthority | None
     parallel_disclosure: str | None
     output_disclosure: str | None
+    developer_disclosure: str | None
     reserved_output_tokens: int
+
+    @property
+    def disclosures(self) -> tuple[str, ...]:
+        """Every per-rung shaping disclosure this dispatch publishes."""
+        return tuple(
+            disclosure
+            for disclosure in (
+                self.parallel_disclosure,
+                self.output_disclosure,
+                self.developer_disclosure,
+            )
+            if disclosure is not None
+        )
 
 
 def build_rung_dispatch(
@@ -115,6 +135,9 @@ def build_rung_dispatch(
     rung_request, parallel_disclosure = shape_parallel_tool_calls(
         provider_request, deployment.gateway.capabilities
     )
+    developer_disclosure = developer_role_rewrite_disclosure(
+        profile.dialect, provider_request, deployment.gateway.capabilities
+    )
     capabilities = deployment.capabilities
     rung_request, output_bound = bounded_output_request(
         profile,
@@ -144,11 +167,14 @@ def build_rung_dispatch(
     if rung_request.provider_preferences is not None and openrouter_chat_wire(
         deployment.provider, profile.dialect
     ):
-        # The caller's routing preferences reach the one wire that defines
-        # them; every other dialect's builder never emits the field.
+        # Only the caller's data-policy keys reach OpenRouter; routing keys
+        # were resolved against our own rungs at admission.
         upstream_payload = forward_provider_preferences(
             upstream_payload, rung_request.provider_preferences
         )
+    if openrouter_chat_wire(deployment.provider, profile.dialect):
+        # After the caller's preferences, which replace the provider object.
+        upstream_payload = constrain_openrouter_reasoning_off(upstream_payload)
     dispatch_policy = deployment.gateway.dispatch
     if (
         dispatch_policy is not None
@@ -159,8 +185,12 @@ def build_rung_dispatch(
         # provider would receive an unknown field.
         upstream_payload = {
             **upstream_payload,
-            "priority": UPSTREAM_PRIORITY[authorization.priority_admission],
+            "priority": upstream_priority(authorization, deployment, UPSTREAM_PRIORITY),
         }
+        if fast_on_rung(authorization, deployment):
+            # vLLM bills no processing tier: a :fast request's tier is ours
+            # to serve (class_throttles), so the field never reaches it.
+            upstream_payload.pop("service_tier", None)
     request_headers = (
         anthropic_request_headers(dict(profile.headers), rung_request)
         if profile.dialect == "anthropic_messages"
@@ -216,6 +246,7 @@ def build_rung_dispatch(
         carrier_authority=carrier_authority,
         parallel_disclosure=parallel_disclosure,
         output_disclosure=output_disclosure,
+        developer_disclosure=developer_disclosure,
         reserved_output_tokens=output_bound,
     )
 

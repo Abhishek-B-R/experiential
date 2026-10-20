@@ -23,6 +23,7 @@ from exp.common.models import (
 from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.optimize.evaluation import fidelity
 from exp.optimize.evaluation.fidelity import (
+    FidelityRetrieval,
     FidelitySpec,
     execute_fidelity_evaluation,
     prepare_fidelity_evaluation,
@@ -111,6 +112,33 @@ def memory_project(root: Path) -> tuple[ProjectStore, FidelitySpec]:
     )
     write_model_catalog(project.model_catalog_path, catalog)
     return project, spec
+
+
+def test_retrieval_without_memory_has_no_research_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retrieval-only runs predict and judge without an unbound memory selector."""
+    project, base = memory_project(tmp_path)
+    spec = FidelitySpec.model_validate(
+        {
+            **base.model_dump(mode="json"),
+            "output_protocol": "json-tool",
+            "retrieval": FidelityRetrieval(
+                jev_alias="jev", jev=JEVPolicy(candidate_limit=4), memory_top_k=4
+            ).model_dump(mode="json"),
+        }
+    )
+    wire = RoutedTransport(
+        [predicted("call-0", "reply-0"), predicted("call-1", "reply-1"), judged(spec)]
+    )
+    monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
+    monkeypatch.setattr(fidelity, "HttpxJsonTransport", lambda: wire)
+    result = execute_fidelity_evaluation(
+        project, prepare_fidelity_evaluation(project, spec, code_revision="fixture")
+    )
+    assert result.mechanical["valid_steps"] == 2
+    assert result.judge_status == "completed"
+    assert wire.decisions == []
 
 
 def trajectory(

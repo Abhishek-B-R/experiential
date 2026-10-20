@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from exp.common.core.artifacts import ArtifactInput
 from exp.common.models import (
@@ -42,12 +43,10 @@ from exp.simulation.world_model.experience_memory import (
     Eligibility,
     MemoryVersion,
     is_reserved,
-    knowledge_identity,
     load_source,
     memory_catalog,
     memory_head,
     provenance_gaps,
-    require_memory_scope,
 )
 from exp.simulation.world_model.memory_tree import overview, read_summary
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
@@ -147,7 +146,7 @@ def test_rebinding_the_model_continues_memory_but_new_knowledge_does_not(
 def test_prediction_guidance_is_serving_policy_but_rules_are_knowledge(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Tuning only prediction guidance reuses learned memory; older versions keep scheme 1."""
+    """Tuning only prediction guidance reuses learned memory; obsolete checkpoints are rejected."""
     project, base = memory_project(tmp_path)
     monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
     known = SimulationKnowledge(rules="Retain observed identity and state.", authored=True)
@@ -179,21 +178,22 @@ def test_prediction_guidance_is_serving_policy_but_rules_are_knowledge(
     head = memory_head(project.artifacts, "fixture-memory")
     assert head is not None and head.knowledge_identity_scheme == 2
     assert head.serving_policy is not None and "prediction_guidance_sha256" in head.serving_policy
-    learned = load_grounded_world_model_artifact(project.artifacts, base.world_model)
-    retuned = load_grounded_world_model_artifact(project.artifacts, reuse.world_model)
-    legacy = head.model_copy(
-        update={
-            "knowledge_identity_scheme": 1,
-            "knowledge_identity": knowledge_identity(learned, 1),
-        }
-    )
-    scope = {
-        "world_model": base.world_model,
-        "selection_policy_sha256": head.selection_policy_sha256,
-    }
-    require_memory_scope(legacy, artifact=learned, **scope)
-    with pytest.raises(ValueError, match="different knowledge"):
-        require_memory_scope(legacy, artifact=retuned, **scope)
+    legacy = head.model_dump(mode="json")
+    legacy["knowledge_identity_scheme"] = 1
+    with pytest.raises(ValidationError, match="knowledge_identity_scheme"):
+        MemoryVersion.model_validate(legacy)
+    for field in (
+        "knowledge_identity",
+        "knowledge_identity_scheme",
+        "publisher",
+        "serving_policy",
+        "log_length",
+        "appended",
+    ):
+        incomplete = head.model_dump(mode="json")
+        del incomplete[field]
+        with pytest.raises(ValidationError, match=field):
+            MemoryVersion.model_validate(incomplete)
 
 
 def test_reserved_partition_is_declared_and_enforced_both_ways(

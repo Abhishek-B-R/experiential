@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
 from typing import Annotated, Literal
 
 from pydantic import Field, StrictBool, StrictInt, field_validator, model_validator
@@ -81,6 +80,7 @@ from exp.runtime.gateway.stream_contracts import (
 from exp.runtime.gateway.stream_contracts import (
     TokenLogprob as TokenLogprob,
 )
+from exp.runtime.gateway.surfaces import GatewayApiSurface as GatewayApiSurface
 from exp.runtime.gateway.tool_contracts import (
     GatewayNamedToolChoice as GatewayNamedToolChoice,
 )
@@ -122,19 +122,6 @@ class ProjectTarget(ContractModel):
 
 
 GatewayTarget = Annotated[DirectTarget | ProjectTarget, Field(discriminator="kind")]
-
-
-class GatewayApiSurface(StrEnum):
-    """Public endpoint family used by one canonical request."""
-
-    CHAT_COMPLETIONS = "chat_completions"
-    RESPONSES = "responses"
-    MESSAGES = "messages"
-    EMBEDDINGS = "embeddings"
-    IMAGES = "images"
-    DECISIONS = "decisions"
-    SPEECH = "speech"
-    TRANSCRIPTION = "transcription"
 
 
 class StructuredTextFormat(ContractModel):
@@ -393,10 +380,14 @@ class GatewayMessage(ContractModel):
                 )
             if all(part.kind == "text" for part in self.content_parts):
                 raise ValueError("content parts are retained only for multimodal messages")
-            if self.role in ("tool", "assistant") and any(
+            if self.role == "tool" and any(
+                part.kind not in ("text", "image", "document") for part in self.content_parts
+            ):
+                raise ValueError("tool messages carry only text, image, and document parts")
+            if self.role == "assistant" and any(
                 part.kind not in ("text", "image") for part in self.content_parts
             ):
-                raise ValueError(f"{self.role} messages carry only text and image parts")
+                raise ValueError("assistant messages carry only text and image parts")
             texts = [part.text for part in self.content_parts if part.kind == "text"]
             if (self.content or "") != "".join(texts):
                 raise ValueError("content parts must flatten to the message content")
@@ -801,8 +792,8 @@ class GatewayRequest(ContractModel):
             raise ValueError("include_usage is valid only for streaming requests")
         if self.json_object_output and self.structured_text is not None:
             raise ValueError("json_object_output and structured_text are mutually exclusive")
-        if self.json_object_output and self.surface != GatewayApiSurface.CHAT_COMPLETIONS:
-            raise ValueError("json_object_output is valid only for Chat Completions requests")
+        if self.json_object_output and self.surface not in ("chat_completions", "responses"):
+            raise ValueError("json_object_output is valid only for Chat and Responses requests")
         parts = (part for message in self.messages for part in message.content_parts)
         require_attachment_ceilings(parts)
         if len({handle.provider for handle in self.media_handles}) > 1:
@@ -898,6 +889,11 @@ class AuthorizationSnapshot(ClientAttribution):
         model_chain_authority: Optional backend binding, revalidated at acceptance and reservation.
         fair_share_weight: Organization weight in [1, 1,000,000], default 1.
         priority_admission: Host-vouched 0 free, 1 paying, 2 Pro (lane_saturation caps).
+        priority_class: Host-vouched request class 0..8, higher first (class_throttles.py).
+        output_tokens_per_second: Class stream pace on self-hosted rungs; None never paces.
+        output_pace_saturation: Pace only at or above this rung load fraction; None = always.
+        self_hosted_class_concurrency: Per-worker in-flight cap for the class on a self-hosted rung.
+        fast: The ``:fast`` spelling: priority tier, above every class (class_throttles.py).
         descendant_start_authorized: False unless the host proves root funding
             and policy gates before allowing a request to start at a child.
         zdr_requested: Caller demand for stricter ZDR filtering, default False.
@@ -935,6 +931,11 @@ class AuthorizationSnapshot(ClientAttribution):
     allowlist then fails closed, a denylist open). 45 chars fits any IPv6 form."""
     fair_share_weight: int = Field(default=1, ge=1, le=1_000_000)
     priority_admission: int = Field(default=0, ge=0, le=2)
+    priority_class: int | None = Field(default=None, ge=0, le=8)
+    output_tokens_per_second: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    output_pace_saturation: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    self_hosted_class_concurrency: int | None = Field(default=None, ge=1)
+    fast: bool = False
     descendant_start_authorized: bool = False
     zdr_requested: bool = False
     prompt_caching_disabled: bool = False

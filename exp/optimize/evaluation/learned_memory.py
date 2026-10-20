@@ -17,6 +17,7 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 
+from filelock import FileLock
 from pydantic import Field
 
 from exp.common.core.artifacts import (
@@ -28,7 +29,7 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.models import ModelCatalog, ModelSnapshot
-from exp.common.project import ArtifactAlreadyExistsError, ProjectStore
+from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
 from exp.optimize.evaluation.fidelity import FidelityRetrieval
 from exp.optimize.evaluation.trace_learning import learning_plan, recorded_plan
@@ -202,8 +203,8 @@ def _recorded_decisions(
 ) -> Callable[[DecisionRequest], JsonObject]:
     """Native recall decisions, each saved once and replayed for an identical request.
 
-    Recall depends only on the memory version and the request, so a resumed or repeated
-    rollout replays saved decisions without another call.
+    Recall is bound to the complete pinned memory, model, request and code revision.
+    Saved outcomes replay; retained intents prevent repeating interrupted purchases.
     """
     if catalog.snapshot(memory.recall.jev_alias)[0] != memory.recall_model:
         raise ValueError(f"recall model {memory.recall.jev_alias!r} changed; prepare again")
@@ -214,6 +215,11 @@ def _recorded_decisions(
         raise ValueError("the recall alias does not expose the native decision wire")
     url = profile.decisions_url
     transport = HttpxJsonTransport()
+    retry_policy = RetryPolicy()
+    request_timeout = 120.0
+    lock_timeout = retry_policy.maximum_attempts * (
+        request_timeout + retry_policy.maximum_delay_seconds
+    )
 
     def post(request: DecisionRequest) -> JsonObject:
         """One decision attempt; transport failures are retried, refusals are not."""
@@ -221,7 +227,7 @@ def _recorded_decisions(
             url,
             headers=profile.headers,
             payload=request.provider_body(profile.model_id),
-            timeout_seconds=120.0,
+            timeout_seconds=request_timeout,
         )
         if response.status_code != 200 or not isinstance(response.body, dict):
             raise ProviderTransportError(
@@ -235,19 +241,43 @@ def _recorded_decisions(
         request_sha256 = sha256_json(request.model_dump(mode="json"))
         identity = stable_id(
             _DECISION,
-            {"lineage": memory.lineage, "version": memory.version, "request": request_sha256},
+            {"memory": sha256_json(memory), "request": request_sha256, "code": code_revision},
         )
-        if not project.artifacts.exists(identity):
-            started = time.monotonic()
-            body = run_with_retry(lambda: post(request), policy=RetryPolicy())
-            try:
-                project.artifacts.write_json(
+        store = project.artifacts
+        with FileLock(store.project_directory / (identity + ".lock"), timeout=lock_timeout):
+            if not store.exists(identity):
+                intent = identity + "-intent"
+                if store.exists(intent):
+                    raise ValueError(
+                        "recall decision has an unknown outcome; "
+                        f"inspect retained intent {intent}; "
+                        "automatic replay cannot purchase it again"
+                    )
+                envelope = ArtifactEnvelope(
+                    schema_version=1,
+                    created_at=datetime.now(UTC),
+                    code_revision=code_revision,
+                    inputs=(memory.world_model,),
+                )
+                store.write_json(
+                    artifact_id=intent,
+                    artifact_type="evaluation-recall-intent",
+                    envelope=envelope,
+                    files={
+                        "request.json": {
+                            "memory": memory.model_dump(mode="json"),
+                            "request_sha256": request_sha256,
+                            "request": request.model_dump(mode="json"),
+                        }
+                    },
+                )
+                started = time.monotonic()
+                body = run_with_retry(lambda: post(request), policy=retry_policy)
+                store.write_json(
                     artifact_id=identity,
                     artifact_type=_DECISION,
-                    envelope=ArtifactEnvelope(
-                        schema_version=1,
-                        created_at=datetime.now(UTC),
-                        code_revision=code_revision,
+                    envelope=envelope.model_copy(
+                        update={"inputs": (artifact_input(store.read(intent).manifest),)}
                     ),
                     files={
                         "decision.json": {
@@ -258,8 +288,7 @@ def _recorded_decisions(
                         }
                     },
                 )
-            except ArtifactAlreadyExistsError:
-                pass  # a concurrent rollout saved the same decision first; replay that one
+
         saved = json.loads(project.artifacts.read_bytes(identity, "decision.json"))
         return saved["response"]
 

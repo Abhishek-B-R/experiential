@@ -103,8 +103,8 @@ class PreparedModelEvaluation(ContractModel):
         redacted_field_names: Project privacy fields pinned before execution.
         cost: Engine-owned immutable stage estimates and maximum provider spend.
         memory: The build's learned simulator memory, frozen at the version every simulated
-            turn reads; None (omitted from records) when the build learned nothing, which
-            also keeps evaluations saved without this field memory-free on resume.
+            turn reads; explicit None when the build learned nothing. Records missing this
+            field require a new preparation.
     """
 
     setup: EvaluationSetup
@@ -114,7 +114,7 @@ class PreparedModelEvaluation(ContractModel):
     agent_factory_sha256: Sha256
     redacted_field_names: tuple[str, ...]
     cost: EvaluationCostPlan
-    memory: EvaluationMemory | None = Field(default=None, exclude_if=lambda value: value is None)
+    memory: EvaluationMemory | None
 
 
 def read_evaluation_judge(project: ProjectStore, pointer: ArtifactInput) -> JudgeSetupArtifact:

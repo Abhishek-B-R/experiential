@@ -59,6 +59,8 @@ def run_prepared_model_evaluation(
         budget: Optional total provider allowance and finite judgment count. Changing only the
             allowance resumes the same plan and replays completed provider responses for free.
             None removes the aggregate cap while preserving finite request reservations.
+            Learned-memory evaluations require None, including replay and judging revisions,
+            until native recall has a frozen price bound.
         provider_spend_consented: Explicit consent after the host's atomic credit reservation.
         created_at: Stable run timestamp.
         code_revision: Exact engine revision.
@@ -114,6 +116,11 @@ def run_prepared_model_evaluation(
     if judging_revision is not None:
         selected, judge_request, judging_protocol = revised_judge_setup(
             project, prepared, judging_revision
+        )
+    if budget.maximum_cost_usd is not None and prepared.memory is not None:
+        raise ValueError(
+            "a finite spending limit cannot cover unpriced memory recall; "
+            "prepare and approve maximum_cost_usd=None for uncapped execution"
         )
     if budget.maximum_cost_usd is not None and (
         not quote.maximum_is_upper_bound or not judge_request.maximum_is_upper_bound()

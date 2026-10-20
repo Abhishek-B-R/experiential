@@ -21,6 +21,9 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.prompt_size import (
     MAXIMUM_BYTES_PER_TOKEN,
+    TEMPLATE_RESERVE_TOKENS,
+    TYPICAL_BYTES_PER_TOKEN,
+    clamp_output_to_context_window,
     context_window_compatible_indexes,
     minimum_prompt_tokens,
     prompt_text_bytes,
@@ -224,3 +227,57 @@ def test_the_responses_surface_names_its_input_field() -> None:
     with pytest.raises(ProviderParameterError) as caught:
         context_window_compatible_indexes(route, request)
     assert caught.value.param == "input"
+
+
+def test_an_oversized_ceiling_is_lowered_to_what_the_largest_window_leaves() -> None:
+    """Production 2026-10-17: max_tokens=10,000,000 beside a two-token prompt on a 131k route."""
+    route = _route(_deployment("small", 32_768), _deployment("large", 131_072))
+    request = _request("hi there", max_tokens=10_000_000)
+
+    clamped, disclosures = clamp_output_to_context_window(route, request)
+
+    target = 131_072 - len(b"hi there") - TEMPLATE_RESERVE_TOKENS
+    assert clamped.maximum_output_tokens == target
+    assert disclosures == (f"max_tokens->{target}(context_window)",)
+    # The lowered request now fits the large rung and narrows to it.
+    assert context_window_compatible_indexes(route, clamped) == (1,)
+    # The caller's own spelling is named.
+    responses = request.model_copy(update={"maximum_output_tokens_parameter": "max_output_tokens"})
+    assert clamp_output_to_context_window(route, responses)[1] == (
+        f"max_output_tokens->{target}(context_window)",
+    )
+
+
+def test_a_large_prompt_is_sized_at_typical_bytes_when_one_per_byte_leaves_nothing() -> None:
+    """The strict bound cannot fit 3,000 bytes in 2,000; the typical estimate can."""
+    route = _route(_deployment("large", 2_000))
+    request = _request("x" * 3_000, max_tokens=5_000)
+
+    clamped, _ = clamp_output_to_context_window(route, request)
+
+    typical = 3_000 // TYPICAL_BYTES_PER_TOKEN
+    assert clamped.maximum_output_tokens == 2_000 - typical - TEMPLATE_RESERVE_TOKENS
+
+
+def test_the_window_clamp_leaves_fitting_permissive_and_hopeless_requests_alone() -> None:
+    """Only the ceiling ever changes, and only when it alone is the blocker."""
+    route = _route(_deployment("box", 1_000), _deployment("large", 2_000))
+    for request in (
+        # Some rung already holds it verbatim.
+        _request(_tokens(10), max_tokens=1_500),
+        # No ceiling to lower.
+        _request(_tokens(10)),
+        # The prompt alone overflows every window: the refusal stands.
+        _request(_tokens(2_001), max_tokens=10_000_000),
+    ):
+        assert clamp_output_to_context_window(route, request) == (request, ())
+    with pytest.raises(ProviderParameterError) as caught:
+        context_window_compatible_indexes(
+            route,
+            clamp_output_to_context_window(route, _request(_tokens(2_001), max_tokens=10))[0],
+        )
+    assert caught.value.param == "messages"
+    # A rung that declares no window is permissive: the provider decides.
+    permissive = _route(_deployment("open", None), _deployment("large", 2_000))
+    request = _request("hi", max_tokens=10_000_000)
+    assert clamp_output_to_context_window(permissive, request) == (request, ())

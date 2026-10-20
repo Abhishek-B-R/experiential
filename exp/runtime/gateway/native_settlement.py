@@ -208,6 +208,27 @@ class NativeSettlementPayload(BaseModel):
     dispatched: bool = Field(default=False, strict=True)
     finalize: bool = Field(default=True, strict=True)
     usage_incomplete_due_to_disconnect: bool = Field(default=False, strict=True)
+    usage_unreported_truncation: bool = Field(default=False, strict=True)
+
+    def validate_truncation(self, failure: GatewayFailure | None, kind: GatewayEventKind) -> bool:
+        """Reject inconsistent unreported-truncation evidence and return the trusted marker.
+
+        Args:
+            failure: Normalized failure attached to this settlement.
+            kind: Normalized terminal event kind.
+
+        Returns:
+            Whether a dispatched budget truncation arrived without a usage meter.
+
+        Raises:
+            ValueError: The marker accompanies undispatched or failed work, or
+                any terminal but an incomplete one.
+        """
+        if self.usage_unreported_truncation and (
+            not self.dispatched or failure is not None or kind is not GatewayEventKind.INCOMPLETE
+        ):
+            raise ValueError("an unreported truncation requires a dispatched incomplete terminal")
+        return self.usage_unreported_truncation
 
     def validate_disconnect(self, failure: GatewayFailure | None, kind: GatewayEventKind) -> bool:
         """Reject inconsistent hold evidence and return the trusted marker.
@@ -260,8 +281,9 @@ class StreamedOutput(BaseModel):
 def streamed_output_from_settlement(data: JsonObject | None) -> StreamedOutput | None:
     """Parse the settlement's optional generated-output evidence.
 
-    Only a dispatched cancellation without a provider terminal carries it,
-    and the data plane always sends it then (an empty object when nothing was
+    A dispatched cancellation without a provider terminal carries it, and so
+    does a budget truncation the provider reported without a usage meter;
+    the data plane always sends it then (an empty object when nothing was
     generated). A malformed object is dropped rather than estimated from, and
     an absent one means a data plane predating the field: either way the
     settlement keeps its unknown meter.
@@ -351,6 +373,7 @@ def terminal_from_settlement(
         usage=_credible_usage(kind, usage),
         failure=failure if kind == GatewayEventKind.FAILED else None,
         usage_incomplete_due_to_disconnect=provenance.validate_disconnect(failure, kind),
+        usage_unreported_truncation=provenance.validate_truncation(failure, kind),
         decision_provider_rejected=(
             surface is GatewayApiSurface.DECISIONS
             and kind is GatewayEventKind.FAILED
@@ -503,6 +526,7 @@ def settlement_metadata(
     settle: Callable[..., object],
     *,
     service_tier: GatewayServiceTierAdmission | None = None,
+    self_served: bool = False,
 ) -> SettlementMetadata:
     """Project original observations while withholding unsupported host keywords."""
     observed = settlement_rate_limit(data)
@@ -516,7 +540,9 @@ def settlement_metadata(
     }
     if accepts_keyword(settle, "upstream_provider"):
         fields["upstream_provider"] = upstream_provider_from_settlement(data)
-    fields.update(settlement_kwarg(service_tier, {} if data is None else data))
+    fields.update(
+        settlement_kwarg(service_tier, {} if data is None else data, self_served=self_served)
+    )
     return fields
 
 
@@ -652,6 +678,7 @@ def _usage_from_payload(
             payload.get("cache_creation_1h_input_tokens")
         ),
         reasoning_tokens=_optional_count(payload.get("reasoning_tokens")),
+        image_output_tokens=_optional_count(payload.get("image_output_tokens")),
         tool_names=names,
         web_search_requests=web_search_requests,
         tool_search_requests=tool_search_requests,

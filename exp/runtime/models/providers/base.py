@@ -122,6 +122,11 @@ class GatewayWireProfile:
             None when the connection speaks no speech wire.
         transcriptions_url: Full OpenAI-wire ``/audio/transcriptions`` endpoint
             sharing ``headers``; None when the connection speaks no transcription wire.
+        organization_tag_key: Private HMAC key for the opaque per-organization
+            scheduling tag a self-hosted SystemOne origin receives
+            (``exp.runtime.gateway.organization_tag``); None sends no tag. Excluded
+            from diagnostics. The tag is only ever attached on a host-funded,
+            non-tenant rung, whatever this field holds.
     """
 
     dialect: str
@@ -151,6 +156,9 @@ class GatewayWireProfile:
     """Whether the exact model accepts explicit sampling temperature."""
 
     billing_customer_managed: bool = False
+    tenant_origin: bool = False
+    """A customer-addressed origin: the data plane answers its failures opaquely and holds its
+    socket to the tenant destination policy (ports and platform infrastructure)."""
     service_tier_pricing_enabled: bool = False
     """Whether this HOST-funded rung may still forward ``service_tier``.
 
@@ -340,6 +348,8 @@ class GatewayWireProfile:
     decisions_url: str | None = None
     """Full TypeSafe SystemOne endpoint, absent on non-decision connections."""
 
+    organization_tag_key: bytes | None = field(default=None, repr=False)
+
     openai_decisions_url: str | None = None
     """Full OpenAI Decisions API ``/decisions`` endpoint, present only on direct
     OpenAI connections and sharing ``headers``; ``None`` keeps the OpenAI-shaped
@@ -351,6 +361,12 @@ class GatewayWireProfile:
 
     speech_url: str | None = None
     transcriptions_url: str | None = None
+
+    videos_url: str | None = None
+    """Full video-job creation endpoint for this connection, sharing ``headers``:
+    Veo's ``models/{model}:predictLongRunning`` on a Gemini connection, xAI's
+    ``/videos/generations`` on an xAI-origin OpenAI-compatible connection, and
+    ``None`` on every other connection, so the video surface excludes the rung."""
 
     @property
     def replays_plaintext_reasoning(self) -> bool:

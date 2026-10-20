@@ -104,14 +104,21 @@ fn settle_argument(
         "request_id": request_id,
         "attempt_id": attempt_id,
         "outcome": outcome,
-        "usage": usage.map(|usage| json!({
-            "input_tokens": usage.input_tokens,
-            "output_tokens": usage.output_tokens,
-            "cached_input_tokens": usage.cached_input_tokens,
-            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-            "cache_creation_1h_input_tokens": usage.cache_creation_1h_input_tokens,
-            "reasoning_tokens": usage.reasoning_tokens,
-        })),
+        "usage": usage.map(|usage| {
+            let mut wire = json!({
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cached_input_tokens": usage.cached_input_tokens,
+                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                "cache_creation_1h_input_tokens": usage.cache_creation_1h_input_tokens,
+                "reasoning_tokens": usage.reasoning_tokens,
+            });
+            // The generated-image subset joins only when the provider reported one.
+            if let Some(image) = usage.image_output_tokens {
+                wire["image_output_tokens"] = json!(image);
+            }
+            wire
+        }),
         "tool_names": tool_names,
         "failure": failure.map(|failure| json!({
             "failure_class": failure.failure_class.as_str(),
@@ -512,6 +519,15 @@ impl AttemptGuard {
                     .is_some_and(|failure| failure.failure_class == FailureClass::Cancelled),
             &observed.streamed_output,
         );
+        let argument = unreported_truncation_provenance(
+            argument,
+            self.dispatched
+                && meter_failure.is_none()
+                && outcome == "incomplete"
+                && observed.unreported_truncation
+                && !usage.is_some_and(Usage::has_token_counts),
+            &observed,
+        );
         if finalize {
             let cancelled = failure.map(|failure| failure.failure_class == FailureClass::Cancelled)
                 == Some(true);
@@ -638,6 +654,34 @@ fn disconnect_provenance(
             "images": streamed.images,
         });
     }
+    compact_json(&payload)
+}
+
+/// Stamp a capped request's budget truncation the provider reported without
+/// a usage meter (a usage-less `stop` read as `length`, or an output-less one).
+///
+/// The generated output observed rides along so the control plane meters the
+/// whole output budget the provider billed, with its own tokenizer for the
+/// prompt, instead of settling provider work as an unknown $0.
+fn unreported_truncation_provenance(
+    argument: String,
+    unreported: bool,
+    observed: &observation::Observed,
+) -> String {
+    if !unreported {
+        return argument;
+    }
+    let mut payload: Value =
+        serde_json::from_str(&argument).expect("settlement JSON was encoded locally");
+    let streamed = &observed.streamed_output;
+    payload["usage_unreported_truncation"] = json!(true);
+    payload["streamed_output"] = json!({
+        "text": streamed.text,
+        "reasoning": streamed.reasoning,
+        "text_overflow_chars": streamed.text_overflow_chars,
+        "reasoning_overflow_chars": streamed.reasoning_overflow_chars,
+        "images": streamed.images,
+    });
     compact_json(&payload)
 }
 

@@ -47,6 +47,7 @@ def serve_native_gateway(
     time_to_first_token_seconds: float = 120.0,
     pre_first_byte_budget_seconds: float = 90.0,
     native_usage_enabled: bool = True,
+    maximum_retained_output_bytes: int | None = None,
     capture: CaptureCollector | None = None,
     shutdown: ShutdownHandle | None = None,
     on_listening: Callable[[], None] | None = None,
@@ -102,6 +103,15 @@ def serve_native_gateway(
         native_usage_enabled: Whether Rust owns ``/usage.json``. Hosted,
             multi-tenant callers should disable it so their own surface owns
             usage.
+        maximum_retained_output_bytes: Worker-wide bound on provider output
+            retained across all in-flight streams (tool arguments, buffered
+            Messages blocks, non-streaming aggregations, Responses
+            continuations). A stream that would cross it fails with a
+            retryable 503 instead of growing worker memory; a continuation
+            that would cross it is simply not retained. None (the default)
+            leaves the budget off, which is the behavior before this
+            setting existed; 1 GiB (a quarter of a 4 GiB worker) is the
+            suggested value when enabling it.
         capture: The collector shared with the admission controller; None retains no content.
         shutdown: Optional embedder-owned stop handle from
             ``exp_gateway_native.shutdown_handle()``. A host serving on a
@@ -138,6 +148,8 @@ def serve_native_gateway(
         "pre_first_byte_budget_seconds": pre_first_byte_budget_seconds,
         "native_usage_enabled": native_usage_enabled,
     }
+    if maximum_retained_output_bytes is not None:
+        config["maximum_retained_output_bytes"] = maximum_retained_output_bytes
     try:
         native.serve(
             cast("NativeControlPlane", control_plane),

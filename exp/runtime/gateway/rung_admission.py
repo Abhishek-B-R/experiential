@@ -193,6 +193,12 @@ class _RungLoad:
     learned_rpm: float | None = None
     learned_throttled_at: float = 0.0
     learned_crept_at: float = 0.0
+    # In-flight reservations per request class, kept only for reservations
+    # that named one (a host class cap on a self-hosted rung, class_throttles).
+    classes: dict[int, int] = field(default_factory=dict)
+    # In-flight :fast reservations (class_throttles.fast_on_rung); while any
+    # is held, every other reservation sees half the rung's bound.
+    fast: int = 0
 
 
 class RungLoadRegistry:
@@ -232,6 +238,8 @@ class RungLoadRegistry:
         self._clock = clock
         self._rungs: dict[RungLoadKey, _RungLoad] = {}
         self._tickets: dict[str, tuple[RungLoadKey, str]] = {}
+        self._ticket_classes: dict[str, int] = {}
+        self._fast_tickets: set[str] = set()
         self._attempts: dict[str, str] = {}
         self._lock = threading.Lock()
 
@@ -253,6 +261,8 @@ class RungLoadRegistry:
         hard_bound: bool = False,
         overflow_ceiling: float | None = None,
         rate_retry: bool = False,
+        class_cap: tuple[int, int] | None = None,
+        fast: bool = False,
     ) -> str | RungShed:
         """Reserve one slot on a policy-bounded rung, or shed with a reason.
 
@@ -279,6 +289,15 @@ class RungLoadRegistry:
             overflow_ceiling: In-flight cap a forced admission may not exceed
                 (a priority caller overflowing a refusing bound); ``None`` = none.
             rate_retry: Skip rate windows, not capacity, fairness or fresh-session checks.
+            class_cap: ``(request class, cap)``: shed once this rung holds ``cap``
+                in-flight reservations of that class, even on a forced overflow
+                (``class_throttles.class_concurrency_cap``); ``None`` = no cap.
+            fast: A ``:fast`` reservation: it may hold the upper half of
+                ``bound`` (at least one) and skips fair share; while one is
+                held, every other reservation may hold only the lower half (at
+                least one), so the shared decode batch stays small. Rate
+                windows apply to both, except on a forced retry (which skips
+                the window it shed on).
 
         Returns:
             An opaque ticket on admission, else the shed disclosure.
@@ -293,8 +312,26 @@ class RungLoadRegistry:
             organization.weight = weight
             self._prune(key, rung, now)
             self._prune_window(rung, now)
+            # The :fast split (class_throttles): fast reservations hold at most
+            # the upper half of the bound and skip fair share; while any is
+            # held, everyone else holds at most the lower half. Both are hard
+            # (a hit overflow ceiling: no overflow retries the rung). Fast
+            # ignores the total, so a full rung can hold bound + ceil(bound/2)
+            # until the requests already on it finish.
+            if bound is not None and (fast or rung.fast):
+                if fast and rung.fast >= max(1, bound - bound // 2):
+                    return RungShed("queue_bound", overflow_ceiling=True)
+                if not fast and rung.total - rung.fast >= max(1, bound // 2):
+                    return RungShed("queue_bound", overflow_ceiling=True)
+            # ``force`` stays: a forced retry must skip the window it shed on.
+            if fast:
+                bound, fair_share, overflow_ceiling = None, False, None
             if hard_bound and bound is not None and rung.total >= bound:
                 return RungShed("queue_bound")
+            # A class cap is hard: marked as a hit overflow ceiling so no
+            # priority overflow retries the rung (lane_saturation.overflow_target).
+            if class_cap is not None and rung.classes.get(class_cap[0], 0) >= class_cap[1]:
+                return RungShed("queue_bound", overflow_ceiling=True)
             # The admitted count itself must stay within the ceiling, so a
             # fractional ceiling floors: 1.5x a bound of 5 holds 7, never 8.
             if force and overflow_ceiling is not None and rung.total + 1 > overflow_ceiling:
@@ -332,6 +369,12 @@ class RungLoadRegistry:
             rung.window_tokens += reserved_tokens
             ticket = f"rung-{uuid.uuid4().hex}"
             self._tickets[ticket] = (key, organization_id)
+            if class_cap is not None:
+                rung.classes[class_cap[0]] = rung.classes.get(class_cap[0], 0) + 1
+                self._ticket_classes[ticket] = class_cap[0]
+            if fast:
+                rung.fast += 1
+                self._fast_tickets.add(ticket)
             return ticket
 
     def can_admit(
@@ -678,9 +721,16 @@ class RungLoadRegistry:
         if entry is None:
             return
         key, organization_id = entry
+        request_class = self._ticket_classes.pop(ticket, None)
+        was_fast = ticket in self._fast_tickets
+        self._fast_tickets.discard(ticket)
         rung = self._rungs.get(key)
         if rung is None:
             return
+        if request_class is not None and rung.classes.get(request_class, 0) > 0:
+            rung.classes[request_class] -= 1
+        if was_fast and rung.fast > 0:
+            rung.fast -= 1
         organization = rung.organizations.get(organization_id)
         if organization is not None and organization.inflight > 0:
             organization.inflight -= 1

@@ -159,7 +159,7 @@ pub(super) async fn run_attempt(
             .flatten();
         let logprobs_injected = injected_payload.is_some();
         let opened = open_stream(
-            ctx.http,
+            ctx.http.for_origin(wire.tenant_origin),
             &wire.url,
             &headers,
             if logprobs_injected {
@@ -239,6 +239,7 @@ pub(super) async fn run_attempt(
         }
         relay.set_observation(observation);
         relay.set_stop_sequences(wire.stop_sequences.iter().cloned());
+        relay.set_output_token_cap(ctx.output_token_cap);
         relay.set_probability_output(ctx.chat_logprobs, &wire.upstream_payload);
         if logprobs_injected {
             relay.enable_logprobs_capture();
@@ -256,6 +257,7 @@ pub(super) async fn run_attempt(
             // so a committed stream's late credential error is the customer's too.
             relay.set_customer_managed_provider(Some(wire.provider.clone()));
         }
+        relay.set_tenant_origin(wire.tenant_origin);
         // Refusal deltas are withheld when the alias revision opted into
         // refusal failover, or when a failover-only rung downstream accepts
         // an unnamed refusal (`fallback_rules`); the ladder decision below
@@ -335,7 +337,28 @@ pub(super) async fn run_attempt(
             if matches!(event, Event::GeminiThoughtPart(_))
                 || crate::logprobs::withhold_before_commit(&event, refusal_failover)
             {
-                let event_bytes = crate::relay::event_retained_bytes(&event);
+                // Gemini thought evidence is already charged to the normalizer's
+                // retained-output and worker budgets; an image model signs each
+                // image with 1 to 2 MB (live 2026-10-19), far past the
+                // refusal-delta byte bound. The event-count bound still applies.
+                // A reasoning model streams `"logprobs": null` beside every
+                // private reasoning chunk; one held empty delta stands for a
+                // run of identical ones (aggregation is unchanged), so a long
+                // think no longer overflows the withheld bound (deepseek-v4-flash
+                // on Azure, 25 logprob requests failed in a day, 2026-10-19).
+                if let (
+                    Event::ChoiceLogprobsDelta(update),
+                    Some(Event::ChoiceLogprobsDelta(held)),
+                ) = (&event, withheld.last())
+                {
+                    if crate::logprobs::is_empty_delta(update) && update == held {
+                        continue;
+                    }
+                }
+                let event_bytes = match event {
+                    Event::GeminiThoughtPart(_) => 0,
+                    _ => crate::relay::event_retained_bytes(&event),
+                };
                 if withheld_bytes.saturating_add(event_bytes) > MAXIMUM_WITHHELD_REFUSAL_BYTES
                     || withheld.len() + 1 > MAXIMUM_WITHHELD_REFUSAL_EVENTS
                 {
@@ -371,6 +394,7 @@ pub(super) async fn run_attempt(
                         encrypted_reasoning_stripped,
                         tool_search_rounds: Vec::new(),
                         tool_search_dropped_after_output,
+                        pace: None,
                     }));
                 }
                 withheld_bytes += event_bytes;
@@ -400,6 +424,7 @@ pub(super) async fn run_attempt(
                     encrypted_reasoning_stripped,
                     tool_search_rounds: Vec::new(),
                     tool_search_dropped_after_output,
+                    pace: None,
                 }));
             }
             if !event.is_terminal() {
@@ -527,7 +552,9 @@ pub(super) async fn run_attempt(
                             // plain stop (Meta muse-spark under a small
                             // `max_tokens`, 2026-09-15). Answer `Incomplete` so
                             // the caller sees `length` and raises the cap,
-                            // instead of an empty completed answer.
+                            // instead of an empty completed answer, and
+                            // meter the budget the provider billed.
+                            guard.capture_observation().mark_unreported_truncation();
                             return settle_output_less(
                                 ctx,
                                 guard,

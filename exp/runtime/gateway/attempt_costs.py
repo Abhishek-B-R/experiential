@@ -22,8 +22,17 @@ from exp.runtime.gateway.embeddings_contracts import (
     ServingRequest,
     embeddings_input_ceiling_nano_usd,
 )
-from exp.runtime.gateway.images_contracts import ImagesRequest, images_ceiling_nano_usd
+from exp.runtime.gateway.images_contracts import (
+    ImagesRequest,
+    images_ceiling_nano_usd,
+    per_image_rate,
+)
 from exp.runtime.gateway.ledger_valuation import require_representable_nano_usd
+from exp.runtime.gateway.video.contracts import (
+    VideoRequest,
+    video_ceiling_nano_usd,
+    video_unit_rate,
+)
 
 LONG_CONTEXT_TIER_MARGIN_PERCENT = 20
 """How far below a long-context threshold the input estimate may sit and still
@@ -68,6 +77,7 @@ def maximum_attempt_cost_nano_usd(
                 input_tokens=input_tokens,
                 input_rate=deployment.gateway.prices.input_nano_usd_per_million_tokens,
                 output_rate=deployment.gateway.prices.output_nano_usd_per_million_tokens,
+                image_rate=per_image_rate(deployment.gateway.prices, request),
             )
         case SpeechRequest():
             prices = deployment.gateway.prices
@@ -98,6 +108,11 @@ def maximum_attempt_cost_nano_usd(
                     if deployment.capabilities is None
                     else deployment.capabilities.maximum_output_tokens
                 ),
+            )
+        case VideoRequest():
+            # Billed per second of output at the resolution's rate; tokens are moot.
+            return video_ceiling_nano_usd(
+                request, video_unit_rate(deployment.gateway.prices, request.resolution)
             )
         case GatewayRequest() | DecisionRequest():
             return _token_attempt_cost_nano_usd(request, deployment, input_tokens)
@@ -170,6 +185,8 @@ def _token_attempt_cost_nano_usd(
         for rate in (
             schedule.output_nano_usd_per_million_tokens,
             schedule.reasoning_nano_usd_per_million_tokens,
+            # An image lane may spend its whole output on images.
+            schedule.image_output_nano_usd_per_million_tokens,
         )
         if rate is not None
     )

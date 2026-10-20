@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Literal
 
 from filelock import FileLock
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
@@ -56,20 +56,16 @@ class MemoryVersion(ArtifactEnvelope):
         lineage: Caller-named memory sequence within one project.
         version: Number of consumed distinct trajectories; 0 is never persisted.
         world_model: Serving simulator whose predictions produced this version's research.
-        knowledge_scope: Legacy combined knowledge-and-serving identity, kept only to verify
-            versions written before ``knowledge_identity`` existed.
         knowledge_identity: What the simulator knows (knowledge and serving corpus). This is
             the only compatibility gate: any model, top-k, reranker, prompt, prediction
             guidance or memory selector may read or extend the lineage, so serving
             treatments compare on one bank.
-        knowledge_identity_scheme: How ``knowledge_identity`` was computed. Scheme 1 (older
-            versions) also hashed prediction guidance; scheme 2 treats it as serving policy.
+        knowledge_identity_scheme: Current scheme 2 treats prediction guidance as serving policy.
         serving_policy: How this version's trajectory was served; provenance, never a gate.
-        log_length: Memory log lines covered by this version; absent on older versions.
+        log_length: Memory log lines covered by this version.
         appended: The log lines this version adds, ending at ``log_length``. The version is
             the commit point: positional line artifacts are materialized from it afterwards,
-            so an interrupted publication leaves no line behind. None on older versions,
-            whose lines were written before their commit.
+            so an interrupted publication leaves no line behind.
         selection_policy_sha256: Memory selector used to deliver these records.
         library: Experience library snapshot holding every admitted entry.
         consumed: Ordered digests of consumed trajectories, one per version.
@@ -88,13 +84,12 @@ class MemoryVersion(ArtifactEnvelope):
     selection_policy_sha256: Sha256
     library: ArtifactInput
     consumed: tuple[Sha256, ...]
-    publisher: str | None = None
-    knowledge_scope: Sha256 | None = None
-    knowledge_identity: Sha256 | None = None
-    knowledge_identity_scheme: Literal[1, 2] = 1
-    serving_policy: JsonObject | None = None
-    log_length: int | None = Field(default=None, ge=0)
-    appended: tuple[LineDraft, ...] | None = None
+    publisher: str
+    knowledge_identity: Sha256
+    knowledge_identity_scheme: Literal[2]
+    serving_policy: JsonObject
+    log_length: int = Field(ge=0)
+    appended: tuple[LineDraft, ...]
     summary_generations: dict[str, int] | None = Field(
         default=None, exclude_if=lambda value: not value
     )
@@ -231,7 +226,13 @@ def read_memory_version(store: ArtifactStore, lineage: str, version: int) -> Mem
     identity = memory_version_id(lineage, version)
     if not store.exists(identity):
         raise ValueError(f"memory lineage {lineage!r} has no version {version}")
-    saved = MemoryVersion.model_validate_json(store.read_bytes(identity, "memory.json"))
+    try:
+        saved = MemoryVersion.model_validate_json(store.read_bytes(identity, "memory.json"))
+    except ValidationError as exc:
+        raise ValueError(
+            "memory checkpoint does not match the current format; build into a fresh "
+            "project ID to learn new memory while retaining existing artifacts"
+        ) from exc
     if saved.lineage != lineage or saved.version != version:
         raise ValueError("memory version artifact differs from its lineage position")
     return saved
@@ -248,14 +249,13 @@ def memory_head(store: ArtifactStore, lineage: str) -> MemoryVersion | None:
 KNOWLEDGE_IDENTITY_SCHEME: Literal[2] = 2
 
 
-def knowledge_identity(artifact: GroundedWorldModelArtifact, scheme: Literal[1, 2] = 2) -> Sha256:
+def knowledge_identity(artifact: GroundedWorldModelArtifact) -> Sha256:
     """Identify what a simulator knows: its behavioral knowledge and serving evidence corpus.
 
     A memory-first simulator (``original_evidence == "none"``) is identified apart from a
     retrieving one over the same corpus.
 
-    Prediction guidance is tunable serving text, not knowledge, so scheme 2 leaves it out;
-    scheme 1 reproduces the identity older versions recorded.
+    Prediction guidance is tunable serving text, so the identity leaves it out.
     """
     knowledge = artifact.knowledge
     # A memory-first simulator never reads the corpus, so it knows something different; the
@@ -268,9 +268,7 @@ def knowledge_identity(artifact: GroundedWorldModelArtifact, scheme: Literal[1, 
             **profile,
             "knowledge": None
             if knowledge is None
-            else knowledge.model_dump(
-                mode="json", exclude={"prediction_guidance"} if scheme == 2 else None
-            ),
+            else knowledge.model_dump(mode="json", exclude={"prediction_guidance"}),
             "serving_rag": artifact.serving_rag.model_dump(mode="json"),
         }
     )
@@ -294,22 +292,6 @@ def serving_policy(
     }
 
 
-def knowledge_scope(artifact: GroundedWorldModelArtifact) -> Sha256:
-    """Legacy combined identity, used only to verify versions written before the split."""
-    return sha256_json(
-        {
-            "knowledge": None
-            if artifact.knowledge is None
-            else artifact.knowledge.model_dump(mode="json"),
-            "serving_rag": artifact.serving_rag.model_dump(mode="json"),
-            "top_k": artifact.top_k,
-            "selection_policy_sha256": artifact.selection_policy_sha256,
-            "prompt_version": artifact.prompt_version,
-            "prompt_sha256": artifact.prompt_sha256,
-        }
-    )
-
-
 def require_memory_scope(
     version: MemoryVersion | None,
     *,
@@ -317,28 +299,9 @@ def require_memory_scope(
     artifact: GroundedWorldModelArtifact,
     selection_policy_sha256: str,
 ) -> None:
-    """Refuse experience built on different knowledge.
-
-    Current versions compare only ``knowledge_identity``, under the scheme they recorded.
-    Older versions keep the checks they were written under (combined scope, or exact
-    simulator), plus the same selector.
-    """
-    if version is None:
-        return
-    if version.knowledge_identity is not None:
-        same = version.knowledge_identity == knowledge_identity(
-            artifact, version.knowledge_identity_scheme
-        )
-    elif version.knowledge_scope is not None:
-        same = version.knowledge_scope == knowledge_scope(artifact) and (
-            version.selection_policy_sha256 == selection_policy_sha256
-        )
-    else:
-        same = version.world_model == world_model and (
-            version.selection_policy_sha256 == selection_policy_sha256
-        )
-    if not same:
-        raise ValueError("memory lineage belongs to different knowledge or selector")
+    """Refuse experience built on different knowledge under the current identity scheme."""
+    if version is not None and version.knowledge_identity != knowledge_identity(artifact):
+        raise ValueError("memory lineage belongs to different knowledge")
 
 
 def memory_lock(store: ArtifactStore, lineage: str) -> FileLock:
@@ -362,7 +325,7 @@ def _materialize(store: ArtifactStore, version: MemoryVersion) -> None:
     so the walk stops at the first version whose lines all exist.
     """
     current: MemoryVersion | None = version
-    while current is not None and current.appended is not None and current.log_length:
+    while current is not None and current.log_length:
         start = current.log_length - len(current.appended)
         if all(
             store.exists(line_id(current.lineage, start + i)) for i in range(len(current.appended))

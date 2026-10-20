@@ -20,6 +20,7 @@ from exp.common.models import (
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    ReasoningEffort,
     ToolCall,
     Usage,
 )
@@ -41,6 +42,7 @@ from exp.runtime.models.providers.errors import (
 )
 from exp.runtime.models.providers.openai_compatible import normalize_embedding_vector
 from exp.runtime.models.providers.protocol import BoundedSyncModelClientAdapter
+from exp.runtime.models.providers.reasoning_compat import bedrock_adaptive_thinking_model
 from exp.runtime.models.providers.transport import (
     ProviderTransportError,
     RetryPolicy,
@@ -389,6 +391,8 @@ class BedrockClient:
         supports_top_p: bool = True,
         supports_top_k: bool = False,
         supports_logprobs: bool = False,
+        supports_reasoning: bool = False,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
         """Create a lazy Bedrock client that does not import boto or open a session.
 
@@ -401,6 +405,10 @@ class BedrockClient:
             bearer_token: Optional bearer resolved from the credential seam.
             runtime_factory: Optional deterministic factory used by tests.
             retry_policy: Bounded same-region retry policy applied outside botocore.
+            supports_reasoning: Whether the catalog declares a reasoning control
+                for this deployment. Only Claude of the adaptive-thinking
+                generation carries one on the ConverseStream wire.
+            reasoning_effort: The deployment's configured default effort.
         """
         self._model = model
         self._configured_region = region
@@ -421,6 +429,10 @@ class BedrockClient:
         self._supports_top_p = supports_top_p
         self._supports_top_k = supports_top_k
         self._supports_logprobs = supports_logprobs
+        self._supports_reasoning = supports_reasoning and bedrock_adaptive_thinking_model(
+            model.model_id
+        )
+        self._reasoning_effort = reasoning_effort if self._supports_reasoning else None
         self._client: BedrockRuntime | None = None
         self._region: str | None = None
         self._signing_credentials: _ResolvableCredentials | None = None
@@ -588,6 +600,16 @@ class BedrockClient:
         """Return whether this Bedrock route accepts logprob controls."""
         return self._supports_logprobs
 
+    @property
+    def supports_reasoning(self) -> bool:
+        """Return whether this route carries a Claude adaptive-thinking control."""
+        return self._supports_reasoning
+
+    @property
+    def reasoning_effort(self) -> ReasoningEffort | None:
+        """Return the deployment's configured default effort, if it reasons."""
+        return self._reasoning_effort
+
     def converse_stream_url(self) -> str:
         """Return the regional ConverseStream REST endpoint for this model.
 
@@ -724,6 +746,11 @@ class BoundedBedrockClient(BoundedSyncModelClientAdapter):
             supports_top_p=self._bedrock_client.supports_top_p,
             supports_top_k=self._bedrock_client.supports_top_k,
             supports_logprobs=self._bedrock_client.supports_logprobs,
+            supports_reasoning=self._bedrock_client.supports_reasoning,
+            reasoning_wire_format=(
+                "anthropic_adaptive" if self._bedrock_client.supports_reasoning else "none"
+            ),
+            reasoning_effort=self._bedrock_client.reasoning_effort,
             signs_request_body=True,
         )
 

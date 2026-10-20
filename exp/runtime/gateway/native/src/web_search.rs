@@ -300,6 +300,7 @@ pub fn web_search_prelude_events(web_search: &WebSearchAdmission, request_id: &s
                 provider_status: None,
                 raw_arguments: input,
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::ServerToolResult {

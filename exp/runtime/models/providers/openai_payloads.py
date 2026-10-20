@@ -8,9 +8,11 @@ OpenAI-compatible Chat builders live here; ``dialect_stream_payload`` in
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.common.models import ChatMaxTokensField
-from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
 from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.models.providers.deepseek import is_deepseek_model_id
 from exp.runtime.models.providers.errors import (
@@ -21,14 +23,16 @@ from exp.runtime.models.providers.instruction_turns import (
     fold_instruction_turns_after_the_first,
     fold_trailing_instruction_turns,
 )
+from exp.runtime.models.providers.openai_item_ids import openai_issued_item_id
 from exp.runtime.models.providers.reasoning_compat import (
+    anthropic_reasoning_effort,
     openai_reasoning_effort,
     reasoning_display_enabled,
     require_sampling_reasoning_compatibility,
 )
 from exp.runtime.models.providers.wire_messages import (
     add_openai_tools,
-    fold_tool_result_images,
+    fold_tool_result_attachments,
     openai_chat_message,
     responses_items,
 )
@@ -67,7 +71,13 @@ def _replayable_native_item(item: JsonObject) -> JsonObject | None:
     """
     shaped = _without_probability_metadata(item)
     item_id = shaped.get("id")
-    if isinstance(item_id, str) and item_id.startswith(_FOREIGN_ITEM_ID_PREFIX):
+    item_type = shaped.get("type")
+    if isinstance(item_id, str) and (
+        item_id.startswith(_FOREIGN_ITEM_ID_PREFIX)
+        or not openai_issued_item_id(
+            item_id, item_type if isinstance(item_type, str) else "message"
+        )
+    ):
         if shaped.get("type") == "reasoning" and "encrypted_content" not in shaped:
             return None
         shaped = {key: value for key, value in shaped.items() if key != "id"}
@@ -131,6 +141,12 @@ def openai_responses_stream_payload(
     instructions: list[str] = []
     instruction_roles: list[str] = []
     items: list[JsonObject] = []
+    # A tool-returned document rides a following user turn: this wire's
+    # function_call_output list carries text and image parts only, while a
+    # user turn carries the document natively (see the fold's docstring).
+    request = request.model_copy(
+        update={"messages": fold_tool_result_attachments(request.messages, kinds=("document",))}
+    )
     for message in request.messages:
         if message.provider_native_item is not None:
             # Codex-native input items (tool namespaces, freeform tool
@@ -303,6 +319,10 @@ def openai_compatible_stream_payload(
     forwards_service_tier: bool = False,
     forwards_prompt_cache_key: bool = False,
     forwards_cache_control: bool = False,
+    reasoning_off_via_chat_template: bool = False,
+    reasoning_via_thinking_toggle: bool = False,
+    reasoning_off_via_thinking_disabled: bool = False,
+    anthropic_thinking_model: str | None = None,
 ) -> JsonObject:
     """Translate one canonical request to streaming Chat Completions JSON.
 
@@ -316,6 +336,25 @@ def openai_compatible_stream_payload(
         supports_reasoning: Whether this exact model accepts a reasoning control.
         reasoning_wire_format: Provider field used for normalized reasoning effort.
         reasoning_effort: Optional catalog-pinned reasoning effort.
+        reasoning_off_via_chat_template: Whether this origin turns thinking off only
+            through ``chat_template_kwargs`` (Vertex MaaS GLM rejects
+            ``reasoning_effort: "none"``), so effort ``none`` is sent as
+            ``{"enable_thinking": false}`` and no ``reasoning_effort`` field.
+        reasoning_via_thinking_toggle: Whether this origin controls reasoning with
+            Z.ai's ``thinking: {"type": "enabled" | "disabled"}`` and no effort
+            levels, so effort ``none`` is sent as ``disabled``, any other effort as
+            ``enabled``, and no ``reasoning_effort`` field.
+        reasoning_off_via_thinking_disabled: Whether this origin turns thinking
+            off with ``thinking: {"type": "disabled"}`` while its other efforts
+            stay ``reasoning_effort`` (Huawei MaaS DeepSeek-V4), so effort
+            ``none`` is sent as that switch and no ``reasoning_effort`` field.
+        anthropic_thinking_model: The Anthropic model id when this origin is a
+            Claude passthrough that takes Anthropic's own thinking fields
+            (Novita ``pa/claude-*-hs``): an effort other than ``none`` is sent as
+            ``thinking: {type: adaptive}`` (with ``display: summarized`` unless
+            the display kill switch is off) and ``output_config.effort``, and
+            no ``reasoning_effort`` field. See ``anthropic_thinking_fields`` for
+            the requests that keep thinking off.
         reasoning_output_exposed: Whether this rung replays the caller's plaintext
             ``reasoning_content`` history verbatim (exposure-gated Tencent/DeepSeek rung).
         deepseek_reasoning_history: Whether this rung is DeepSeek's own origin,
@@ -344,8 +383,9 @@ def openai_compatible_stream_payload(
         # ends on an instruction; see fold_trailing_instruction_turns.
         messages = fold_trailing_instruction_turns(messages)
     # Chat tool messages are text-only on every server behind this wire, so a
-    # tool screenshot rides a following user turn (see the fold's docstring).
-    messages = fold_tool_result_images(messages)
+    # tool screenshot or tool-returned document rides a following user turn
+    # (see the fold's docstring).
+    messages = fold_tool_result_attachments(messages, kinds=("image", "document"))
     if system_messages_leading_only:
         # The rung's template 400s on any system turn past the first; the
         # text stays where the caller put it, as user text.
@@ -423,13 +463,89 @@ def openai_compatible_stream_payload(
         # Cache-affinity key, matching the native Responses lane.
         payload["prompt_cache_key"] = request.provider_prompt_cache_key
     if supports_reasoning and effective_reasoning_effort is not None:
-        if reasoning_wire_format == "reasoning":
+        if reasoning_via_thinking_toggle:
+            payload["thinking"] = {
+                "type": "disabled" if effective_reasoning_effort == "none" else "enabled"
+            }
+        elif effective_reasoning_effort == "none" and reasoning_off_via_thinking_disabled:
+            payload["thinking"] = {"type": "disabled"}
+        elif effective_reasoning_effort == "none" and reasoning_off_via_chat_template:
+            template_kwargs = payload.get("chat_template_kwargs")
+            payload["chat_template_kwargs"] = {
+                **(template_kwargs if isinstance(template_kwargs, dict) else {}),
+                "enable_thinking": False,
+            }
+        elif anthropic_thinking_model is not None:
+            payload.update(
+                anthropic_thinking_fields(
+                    anthropic_thinking_model, effective_reasoning_effort, request
+                )
+            )
+        elif reasoning_wire_format == "reasoning":
             payload["reasoning"] = {"effort": effective_reasoning_effort}
         elif reasoning_wire_format == "reasoning_effort":
             payload["reasoning_effort"] = openai_reasoning_effort(
                 model_id, effective_reasoning_effort
             )
     return payload
+
+
+def anthropic_thinking_fields(model_id: str, effort: str, request: GatewayRequest) -> JsonObject:
+    """Return the Anthropic thinking fields one Claude-passthrough chat request carries.
+
+    ``none`` sends nothing: the adaptive generations served this way run
+    without thinking when no config is sent. Any other effort turns adaptive
+    thinking on at that effort, validated against the model's own ladder.
+
+    Two requests keep today's shape (no thinking) rather than fail, because
+    Anthropic refuses them with thinking on and the provider error is not one
+    a failover recovers from:
+
+    * an open tool loop: Anthropic requires the signed thinking block that
+      preceded a tool call on the last assistant turn, and a chat history has
+      no place to carry it back to this host, so the turns after the first
+      tool call of a user turn send no thinking;
+    * sampling Anthropic forbids beside thinking: ``temperature`` other than
+      1, any ``top_k``, or ``top_p`` below 0.95.
+
+    Args:
+        model_id: Exact Anthropic model identifier behind the lane.
+        effort: The effective canonical effort.
+        request: The canonical request.
+
+    Returns:
+        The top-level fields to merge into the chat payload, possibly empty.
+    """
+    if (
+        effort == "none"
+        or _in_open_tool_loop(request.messages)
+        or _sampling_forbids_thinking(request)
+    ):
+        return {}
+    display = {"display": "summarized"} if reasoning_display_enabled() else {}
+    return {
+        "thinking": {"type": "adaptive", **display},
+        "output_config": {"effort": anthropic_reasoning_effort(model_id, effort)},
+    }
+
+
+def _sampling_forbids_thinking(request: GatewayRequest) -> bool:
+    """Whether the request samples in a way Anthropic refuses beside thinking."""
+    return (
+        (request.temperature is not None and request.temperature != 1)
+        or request.top_k is not None
+        or (request.top_p is not None and request.top_p < 0.95)
+    )
+
+
+def _in_open_tool_loop(messages: Sequence[GatewayMessage]) -> bool:
+    """Whether an assistant tool call follows the conversation's last user message."""
+    for message in reversed(messages):
+        if message.role == "user":
+            return False
+        if message.role == "assistant" and message.tool_calls:
+            return True
+    return False
 
 
 def _instruct_json_object(messages: list[JsonObject]) -> None:

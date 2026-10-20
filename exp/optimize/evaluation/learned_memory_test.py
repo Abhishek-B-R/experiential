@@ -7,8 +7,10 @@ answer two worker models, the text world model and the actor judge.
 import functools
 import json
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 
 import pytest
 from typer.testing import CliRunner
@@ -26,6 +28,7 @@ from exp.common.project import ProjectStore
 from exp.common.tasks.store import load_task_set
 from exp.optimize.evaluation import held_out_fidelity_test, learned_memory
 from exp.optimize.evaluation.contracts import EvaluationBudget
+from exp.optimize.evaluation.fidelity import FidelityRetrieval
 from exp.optimize.evaluation.held_out_fidelity_test import (
     PROJECT,
     REVISION,
@@ -38,22 +41,25 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     build_project,
     episode,
 )
-from exp.optimize.evaluation.learned_memory import NO_MEMORY_NOTE
+from exp.optimize.evaluation.learned_memory import NO_MEMORY_NOTE, EvaluationMemory
 from exp.optimize.evaluation.prepare import ModelEvaluationOptions
 from exp.optimize.evaluation.runs import (
     EvaluationDefaults,
+    EvaluationPreparationOutdated,
     _run_records,
-    execute_run,
     load_run,
     prepare_run,
     run_directory,
     save_defaults,
 )
 from exp.optimize.evaluation.runtime import run_prepared_model_evaluation
+from exp.optimize.evaluation.tests.fidelity_memory_test import memory_project
 from exp.optimize.evaluation.trace_learning import learning_plan
 from exp.optimize.router.automatic.provisional import prepare_hosted_provisional_judge
+from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models import RuntimeModelCatalog
-from exp.runtime.models.providers.transport import JsonHttpResponse
+from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
+from exp.simulation.retrieval.jev import JEVPolicy
 from exp.simulation.world_model.experience_memory import memory_head
 
 WORKERS = ("worker", "helper")
@@ -369,14 +375,17 @@ def test_a_project_without_learned_memory_evaluates_as_before_and_says_so(
     assert provider.recall_decisions() == 0
     run_id = next(iter(_run_records(store).list_ids()))
     assert load_run(store, run_id).prepared.memory is None
+    payload = _run_records(store).read(run_id)
+    assert payload is not None
+    assert json.loads(payload)["prepared"]["memory"] is None
     report = json.loads((run_directory(store, run_id) / "report.json").read_text())
     assert report["memory"] is None and report["simulator_memory"] == NO_MEMORY_NOTE
 
 
-def test_an_evaluation_saved_without_memory_resumes_without_memory(
+def test_an_evaluation_missing_memory_requires_new_preparation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A run saved before evaluations read memory keeps its identity and stays memory-free."""
+    """A missing memory contract requires new preparation before any provider dispatch."""
     _, store, provider = built_project(tmp_path, monkeypatch, learn=True)
     catalog = load_model_catalog(store.model_catalog_path)
     run = prepare_run(
@@ -391,16 +400,174 @@ def test_an_evaluation_saved_without_memory_resumes_without_memory(
     old = canonical_json_bytes(record)
     _run_records(store).write(run.run_id, old)
 
-    saved = load_run(store, run.run_id)
-    assert saved.prepared.memory is None
-    assert canonical_json_bytes(saved) == old, "an old plan keeps its exact identity"
-    decisions = provider.recall_decisions()
-    execute_run(
+    purchased = len(provider.requests)
+    with pytest.raises(EvaluationPreparationOutdated, match="choose New evaluation"):
+        load_run(store, run.run_id)
+    assert len(provider.requests) == purchased
+
+
+def test_finite_budget_refuses_unpriced_recall_before_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A numeric ceiling cannot authorize native recall with no frozen price bound."""
+    _, store, provider = built_project(tmp_path, monkeypatch, learn=True)
+    catalog = load_model_catalog(store.model_catalog_path)
+    run = prepare_run(
         store,
-        saved,
-        RuntimeModelCatalog(catalog, transport_factory=lambda: provider),
-        provider_spend_consented=True,
+        catalog,
+        EvaluationDefaults(models=WORKERS, minimum_scenarios=1, options=OPTIONS),
+        code_revision=REVISION,
     )
-    assert provider.world_requests
-    assert all("research_history" not in request for request in provider.world_requests)
-    assert provider.recall_decisions() == decisions, "no memory is recalled"
+    assert run.prepared.memory is not None
+    purchased = len(provider.requests)
+    with pytest.raises(ValueError, match="finite spending limit.*memory recall"):
+        run_prepared_model_evaluation(
+            store,
+            run.prepared,
+            RuntimeModelCatalog(catalog, transport_factory=lambda: provider),
+            budget=EvaluationBudget(maximum_cost_usd=100, maximum_judgments=100),
+            provider_spend_consented=True,
+            created_at=run.created_at,
+            code_revision=REVISION,
+        )
+    assert len(provider.requests) == purchased
+
+
+def test_recall_cache_binds_model_and_replays_identical_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A newly pinned recall model cannot receive the previous model's cached answer."""
+    store, base = memory_project(tmp_path)
+    monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
+    wire = ScriptedJsonTransport(
+        [
+            JsonHttpResponse(status_code=200, body={"answer": "first"}),
+            JsonHttpResponse(status_code=200, body={"answer": "second"}),
+        ]
+    )
+    monkeypatch.setattr(learned_memory, "HttpxJsonTransport", lambda: wire)
+    catalog = load_model_catalog(store.model_catalog_path)
+    runtime = RuntimeModelCatalog(catalog, transport_factory=lambda: wire)
+    memory = EvaluationMemory(
+        lineage="cache-test",
+        version=1,
+        world_model=base.world_model,
+        recall=FidelityRetrieval(jev_alias="jev", jev=JEVPolicy(candidate_limit=4)),
+        recall_model=runtime.snapshot("jev")[0],
+    )
+    request = DecisionRequest.model_validate(
+        {
+            "state": "fixture",
+            "questions": {"relevant": {"type": "noul", "instructions": "Relevant?"}},
+        }
+    )
+    decide = learned_memory._recorded_decisions(store, memory, runtime, REVISION)
+    assert decide(request) == {"answer": "first"}
+    assert decide(request) == {"answer": "first"}
+    assert len(wire.requests) == 1
+    record = catalog.models["jev"].model_copy(update={"model": "new-recall-model"})
+    changed = catalog.model_copy(update={"models": {**catalog.models, "jev": record}})
+    runtime = RuntimeModelCatalog(changed, transport_factory=lambda: wire)
+    memory = memory.model_copy(update={"recall_model": runtime.snapshot("jev")[0]})
+    assert learned_memory._recorded_decisions(store, memory, runtime, REVISION)(request) == {
+        "answer": "second"
+    }
+    assert len(wire.requests) == 2
+
+
+def test_unknown_recall_outcome_is_not_bought_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interruption after dispatch retains intent and prevents an implicit repurchase."""
+    store, base = memory_project(tmp_path)
+    monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
+    wire = ScriptedJsonTransport([JsonHttpResponse(status_code=200, body={"answer": "lost"})])
+    original_post = wire.post
+
+    def interrupted_post(
+        url: str, *, headers: Mapping[str, str], payload: JsonObject, timeout_seconds: float
+    ) -> JsonHttpResponse:
+        """Record a dispatched request, then interrupt before the caller saves its result."""
+        original_post(url, headers=headers, payload=payload, timeout_seconds=timeout_seconds)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(wire, "post", interrupted_post)
+    monkeypatch.setattr(learned_memory, "HttpxJsonTransport", lambda: wire)
+    runtime = RuntimeModelCatalog(load_model_catalog(store.model_catalog_path))
+    memory = EvaluationMemory(
+        lineage="interrupted-recall",
+        version=1,
+        world_model=base.world_model,
+        recall=FidelityRetrieval(jev_alias="jev", jev=JEVPolicy(candidate_limit=4)),
+        recall_model=runtime.snapshot("jev")[0],
+    )
+    request = DecisionRequest.model_validate(
+        {
+            "state": "fixture",
+            "questions": {"relevant": {"type": "noul", "instructions": "Relevant?"}},
+        }
+    )
+    decide = learned_memory._recorded_decisions(store, memory, runtime, REVISION)
+    with pytest.raises(KeyboardInterrupt):
+        decide(request)
+    with pytest.raises(ValueError, match="unknown outcome"):
+        decide(request)
+    assert len(wire.requests) == 1
+
+
+def test_concurrent_recall_waits_for_one_saved_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Overlapping identical recalls share one purchase and both receive its response."""
+    store, base = memory_project(tmp_path)
+    monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
+    wire = ScriptedJsonTransport([JsonHttpResponse(status_code=200, body={"answer": "shared"})])
+    original_post = wire.post
+    dispatched, release, second_started = Event(), Event(), Event()
+
+    def blocked_post(
+        url: str, *, headers: Mapping[str, str], payload: JsonObject, timeout_seconds: float
+    ) -> JsonHttpResponse:
+        """Hold the first purchase open while another caller asks for its answer."""
+        response = original_post(
+            url, headers=headers, payload=payload, timeout_seconds=timeout_seconds
+        )
+        dispatched.set()
+        assert release.wait(timeout=5)
+        return response
+
+    monkeypatch.setattr(wire, "post", blocked_post)
+    monkeypatch.setattr(learned_memory, "HttpxJsonTransport", lambda: wire)
+    runtime = RuntimeModelCatalog(load_model_catalog(store.model_catalog_path))
+    memory = EvaluationMemory(
+        lineage="concurrent-recall",
+        version=1,
+        world_model=base.world_model,
+        recall=FidelityRetrieval(jev_alias="jev", jev=JEVPolicy(candidate_limit=4)),
+        recall_model=runtime.snapshot("jev")[0],
+    )
+    request = DecisionRequest.model_validate(
+        {
+            "state": "fixture",
+            "questions": {"relevant": {"type": "noul", "instructions": "Relevant?"}},
+        }
+    )
+    decide = learned_memory._recorded_decisions(store, memory, runtime, REVISION)
+
+    def second_call() -> JsonObject:
+        """Signal the overlapping caller before entering the shared request lock."""
+        second_started.set()
+        return decide(request)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(decide, request)
+        try:
+            assert dispatched.wait(timeout=5)
+            second = pool.submit(second_call)
+            assert second_started.wait(timeout=5)
+            with pytest.raises(TimeoutError):
+                second.result(timeout=0.1)
+        finally:
+            release.set()
+        assert first.result(timeout=5) == second.result(timeout=5) == {"answer": "shared"}
+    assert len(wire.requests) == 1
