@@ -4166,9 +4166,11 @@ def test_metrics_snapshot_counts_a_replayed_retained_settlement(tmp_path: Path) 
 
 def test_metrics_snapshot_counts_a_swept_abandoned_attempt(tmp_path: Path) -> None:
     """An abandoned admission closed by the sweep moves the cancellation counter."""
-    control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.01)
+    # The deadline must outlast admission itself (a 10 ms budget raced local
+    # snapshot preparation on a loaded CI runner) and then lapse before the sweep.
+    control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.5)
     _admit(control, raw_key, _chat_body())
-    time.sleep(0.05)
+    time.sleep(0.6)
     with mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0):
         control._accounting.sweep_expired()  # noqa: SLF001 - the timer normally drives this.
 
