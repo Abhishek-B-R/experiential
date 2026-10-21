@@ -14,12 +14,12 @@ from exp.common.models.model import ModelCapabilities, ToolCall
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayMessage,
     GatewayRequest,
     GatewayToolDefinition,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.prompt_size import (
     MAXIMUM_BYTES_PER_TOKEN,
     TEMPLATE_RESERVE_TOKENS,

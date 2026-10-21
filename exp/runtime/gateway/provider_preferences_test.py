@@ -13,11 +13,11 @@ from exp.common.models.model import ModelCapabilities
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayMessage,
     GatewayRequest,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.provider_preferences import (
     apply_provider_preferences,
     reorder_admitted_route,
