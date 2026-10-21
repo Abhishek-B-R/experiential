@@ -811,6 +811,12 @@ e.g. `temperature->1.0(route_minimum)` ([gateway-generation.md](gateway-generati
 admission drops it with `top_k->dropped(unsupported_by_provider)` because defaults still serve.
 `frequency_penalty` and `presence_penalty` follow their per-rung capability truth and otherwise
 drop with `<parameter>->dropped(unsupported_by_provider)`. These are soft preferences.
+OpenRouter's Chat sampling extras `repetition_penalty` (0 to 2, exclusive of 0), `min_p` and
+`top_a` (0 to 1) are accepted on every Chat request, as OpenRouter accepts them: each rung whose
+wire carries a field receives it (OpenRouter all three; a generic OpenAI-compatible vLLM server,
+such as an Experiential Cloud lane, `repetition_penalty` and `min_p`), and every other rung
+dispatches without it, disclosed as `<parameter>->dropped(unsupported_by_provider)`. A value of
+the wrong type or outside its range is still a 400 naming the field.
 Chat token probabilities are opt-in on verified compatible rungs; see [Chat token probabilities](chat-logprobs.md).
 Native Responses probabilities use their own capability and selector; see [Responses output probabilities](responses-logprobs.md).
 A caller

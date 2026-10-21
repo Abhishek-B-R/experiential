@@ -62,6 +62,9 @@ def test_manifests_classify_explicit_exclusions() -> None:
     assert chat["verbosity"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["top_logprobs"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["top_k"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
+    # OpenRouter's sampling extras: forwarded or dropped per rung, never refused.
+    for extra in ("repetition_penalty", "min_p", "top_a"):
+        assert chat[extra] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["top_p"] == CompatibilityDisposition.SUPPORTED
     # Every enable-thinking spelling is admitted and translated, never dropped.
     for spelling in ("reasoning", "thinking", "chat_template_kwargs", "enable_thinking"):

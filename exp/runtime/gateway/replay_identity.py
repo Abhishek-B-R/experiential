@@ -145,6 +145,7 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
         and request.speed is None
         and request.inference_geo is None
         and request.service_tier is None
+        and request.sampling_extras is None
         and not request.include_output_text_logprobs
         and not request.include_web_search_sources
         and not request.json_object_output
@@ -178,6 +179,11 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
     if request.service_tier is not None:
         # A provider tier changes pricing and scheduling for the same body.
         envelope["service_tier"] = request.service_tier
+    if request.sampling_extras is not None:
+        # Sampling extras change the answer distribution for the same body.
+        envelope["sampling_extras"] = request.sampling_extras.model_dump(
+            mode="json", exclude_none=True
+        )
     if request.provider_preferences is not None:
         # The caller's OpenRouter routing preferences change which upstream
         # serves the same body, so a reused operation key with a different

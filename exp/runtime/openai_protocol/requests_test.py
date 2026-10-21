@@ -164,6 +164,52 @@ def test_chat_decoder_admits_sampling_penalties() -> None:
     assert request.presence_penalty == -0.25
 
 
+def test_chat_decoder_admits_openrouter_sampling_extras_off_request_identity() -> None:
+    """repetition_penalty/min_p/top_a decode onto the excluded carrier.
+
+    A request without them keeps its exact digest; a request with them joins
+    replay identity, so a reused operation key with different extras conflicts.
+    """
+    base: JsonObject = {"model": "coding", "messages": [{"role": "user", "content": "hi"}]}
+    plain = decode_chat(base).request
+    assert plain.sampling_extras is None
+    assert provider_replay_authority(plain) is None
+    extras = decode_chat({**base, "repetition_penalty": 1, "min_p": 0.05, "top_a": 0.2}).request
+    assert extras.sampling_extras is not None
+    assert extras.sampling_extras.present() == (
+        ("repetition_penalty", 1.0),
+        ("min_p", 0.05),
+        ("top_a", 0.2),
+    )
+    assert "repetition_penalty" not in extras.model_dump()
+    other = decode_chat({**base, "repetition_penalty": 1.2}).request
+    digests = {canonical_request_sha256(item) for item in (plain, extras, other)}
+    assert len(digests) == 3
+    assert canonical_request_sha256(plain) == sha256_json(plain)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("repetition_penalty", 0),
+        ("repetition_penalty", 2.01),
+        ("min_p", 1.5),
+        ("min_p", "0.1"),
+        ("top_a", True),
+    ),
+)
+def test_chat_decoder_refuses_an_invalid_sampling_extra_by_name(
+    field: str, value: JsonValue
+) -> None:
+    """Each extra keeps its type and OpenRouter's range: a bad value is a named 400."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {"model": "coding", "messages": [{"role": "user", "content": "hi"}], field: value}
+        )
+    assert captured.value.detail.code == "invalid_parameter"
+    assert captured.value.detail.param == field
+
+
 def test_chat_legacy_max_tokens_reaches_native_responses_as_max_output_tokens() -> None:
     """A Chat request using legacy max_tokens serves a native Responses max_output_tokens.
 
