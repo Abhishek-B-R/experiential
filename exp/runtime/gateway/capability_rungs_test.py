@@ -16,11 +16,11 @@ from exp.runtime.gateway.capability_rungs import (
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayMessage,
     GatewayRequest,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_admission import admitted_route_requests
 from exp.runtime.gateway.native_bridge_errors import public_capability_error

@@ -28,11 +28,11 @@ from exp.runtime.gateway.budgets_test import _accepted_chain, _activate_chain, _
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayMessage,
     GatewayRequest,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.model_plan import model_execution_snapshot, project_stage_selection
 from exp.runtime.gateway.model_plan_test import catalog as staged_catalog
 from exp.runtime.gateway.native_execution import select_route_deployments
