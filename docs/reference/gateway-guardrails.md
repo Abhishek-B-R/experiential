@@ -200,6 +200,11 @@ Built-in adapter kinds:
   a dedicated classifier endpoint. It never calls `POST /v1/chat/completions`
   or `POST /v1/responses`. Operators bind replaceable hosted adapters,
   including a hosted PII redactor, by `adapter_id`.
+- `decision_model`: input classification with a decision model on the SystemOne
+  wire. It sends a bounded window of the conversation, scores operator categories
+  against thresholds, and caches verdicts. A policy whose input checks are all
+  windowed is not refused for its total request size. See
+  [Classification guardrails](gateway-classification-guardrails.md).
 
 Other adapters may still be injected in code when composing a `GuardrailEngine`.
 
