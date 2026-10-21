@@ -130,25 +130,54 @@ class GuardrailEngine:
         return self.policy_revision(self.policies_for(authorization))
 
     def policy_revision(self, policies: tuple[GuardrailPolicy, ...]) -> str | None:
-        """Hash the enforcing snapshot; observation cannot alter response replay identity."""
+        """Hash the enforcing snapshot; observation cannot alter response replay identity.
+
+        Windowed adapters keep verdict settings, such as model, questions,
+        thresholds, and window bounds, outside the policy, so their configuration
+        digests join the hash and any change to them yields a new revision.
+        """
         policies = tuple(policy for policy in policies if policy.mode == "enforce")
+        if not policies:
+            return None
         adapters = {check.adapter_id for policy in policies for check in policy.checks}
-        return (
-            None
-            if not policies
-            else sha256(
-                canonical_json_bytes(
-                    {
-                        "policies": [p.model_dump(mode="json") for p in policies],
-                        "detectors": {
-                            key: value
-                            for key, value in self.deterministic_specifications.items()
-                            if key in adapters
-                        },
-                    }
-                )
-            ).hexdigest()
-        )
+        windows = {
+            check.adapter_id: digest
+            for policy in policies
+            for check in policy.input_checks
+            if (digest := self._input_window_digest(check)) is not None
+        }
+        return sha256(
+            canonical_json_bytes(
+                {
+                    "policies": [p.model_dump(mode="json") for p in policies],
+                    "detectors": {
+                        key: value
+                        for key, value in self.deterministic_specifications.items()
+                        if key in adapters
+                    },
+                    **({"windows": windows} if windows else {}),
+                }
+            )
+        ).hexdigest()
+
+    def _input_window_digest(self, check: GuardrailCheck) -> str | None:
+        """Return the check adapter's window configuration digest, or ``None``."""
+        try:
+            return self._client.input_window_digest(check=check)
+        except Exception:  # noqa: BLE001 - an unresolvable adapter receives the complete bound.
+            return None
+
+    def _input_limit(self, policy: GuardrailPolicy) -> int | None:
+        """Return the complete-request bound, or ``None`` when every input check is windowed.
+
+        ``max_request_bytes`` bounds the subject an adapter receives in full. A
+        windowed adapter builds and bounds its own subject, so a large agent
+        request is not refused for total size when every input check is windowed.
+        """
+        checks = policy.input_checks
+        if checks and all(self._input_window_digest(check) is not None for check in checks):
+            return None
+        return policy.max_request_bytes
 
     async def enforce_input(
         self,
@@ -189,7 +218,8 @@ class GuardrailEngine:
     ) -> GatewayRequest:
         """Evaluate the same bounded checks while granting actions only to enforcing policies."""
         self.input_invocations += 1
-        if request_exceeds_inspection_limit(request, policy.max_request_bytes):
+        limit = self._input_limit(policy)
+        if limit is not None and request_exceeds_inspection_limit(request, limit):
             self._decision(policy, None, GuardrailAction.ERROR, GuardrailOutcome.UNSUPPORTED, 0.0)
             if policy.mode == "observe":
                 return request
@@ -287,16 +317,15 @@ class GuardrailEngine:
         observed: ObservedSubjects | None,
     ) -> None:
         """Release every projection/hash temporary before returning the preparation permit."""
-        limit = min(
-            self._observations.max_subject_bytes,
-            max(policy.max_request_bytes for policy in policies),
-        )
+        retained = self._observations.max_subject_bytes
+        bounds = tuple(self._input_limit(policy) for policy in policies)
+        limit = min(retained, max(retained if bound is None else bound for bound in bounds))
         if observation_subject_exceeds(request, limit):
             outcomes = tuple(
                 GuardrailOutcome.UNSUPPORTED
-                if observation_subject_exceeds(request, policy.max_request_bytes)
+                if bound is not None and observation_subject_exceeds(request, bound)
                 else GuardrailOutcome.SKIPPED
-                for policy in policies
+                for bound in bounds
             )
             if observed is not None and not observed.close("subject_oversized"):
                 return
@@ -341,7 +370,8 @@ class GuardrailEngine:
         size: int,
     ) -> None:
         """Reserve one policy's subject using the exact shared encoded size."""
-        if size > policy.max_request_bytes:
+        bound = self._input_limit(policy)
+        if bound is not None and size > bound:
             self._emit_observation(policy, None, GuardrailOutcome.UNSUPPORTED, 0.0)
             return
         if deadline_monotonic <= self._monotonic():

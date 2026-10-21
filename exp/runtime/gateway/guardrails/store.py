@@ -27,7 +27,7 @@ class MappingGuardrailStore:
 
     def __init__(self, policies: Iterable[GuardrailPolicy] = ()) -> None:
         """Index global policies and one assignment per identity, rejecting duplicates."""
-        self._platform: list[GuardrailPolicy] = []
+        self._global: list[GuardrailPolicy] = []
         self._identities: dict[tuple[str, str], GuardrailPolicy] = {}
         ids: set[str] = set()
         for policy in policies:
@@ -35,7 +35,7 @@ class MappingGuardrailStore:
                 raise ValueError("guardrail policy IDs must be unique")
             ids.add(policy.policy_id)
             if policy.organization_id is None or policy.identity_id is None:
-                self._platform.append(policy)
+                self._global.append(policy)
                 continue
             key = (policy.organization_id, policy.identity_id)
             if key in self._identities:
@@ -43,14 +43,16 @@ class MappingGuardrailStore:
             self._identities[key] = policy
 
     def policies_for(self, authorization: AuthorizationSnapshot) -> tuple[GuardrailPolicy, ...]:
-        """Apply platform policies first, followed by this identity's optional policy.
+        """Apply global policies first, followed by this identity's optional policy.
 
-        Resolution reads only the authorization's organization and identity; every
-        alias target receives the same policies.
+        Each policy also applies only to the alias targets it covers: a policy
+        with ``target_pool_ids`` skips direct aliases of other exact-model pools,
+        so those requests get no classifier call from it.
         """
         organization_id = authorization.organization_id
         identity_id = authorization.identity_id
+        target = authorization.target
         assigned = self._identities.get((organization_id, identity_id))
-        return tuple(p.bind(organization_id, identity_id) for p in self._platform) + (
-            () if assigned is None else (assigned,)
-        )
+        return tuple(
+            p.bind(organization_id, identity_id) for p in self._global if p.applies_to(target)
+        ) + (() if assigned is None or not assigned.applies_to(target) else (assigned,))

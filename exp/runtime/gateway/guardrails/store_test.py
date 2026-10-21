@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, GatewayApiSurface
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
+    DirectTarget,
+    GatewayApiSurface,
+    ProjectTarget,
+)
 from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 
@@ -71,3 +76,33 @@ def test_store_rejects_duplicate_organization_identity_pairs() -> None:
                 _policy(organization_id="organization-one", identity_id="identity-one"),
             )
         )
+
+
+def test_pool_scoped_policies_skip_requests_to_other_models() -> None:
+    """A scoped policy covers listed pools and router aliases; other pools get no policy."""
+    scoped_global = GuardrailPolicy(
+        policy_id="classify-pool-one", protected=True, target_pool_ids=("pool-one",)
+    )
+    scoped_identity = GuardrailPolicy(
+        policy_id="classify-pool-two",
+        organization_id="organization-one",
+        identity_id="identity-one",
+        target_pool_ids=("pool-two",),
+    )
+    store = MappingGuardrailStore((scoped_global, scoped_identity))
+    routed = _authorization().model_copy(
+        update={
+            "target": ProjectTarget(
+                project_ref="router-one", activation_ref="activation-one", catalog_sha256="c" * 64
+            )
+        }
+    )
+
+    def ids(authorization: AuthorizationSnapshot) -> list[str]:
+        """Return resolved policy identities in order."""
+        return [policy.policy_id for policy in store.policies_for(authorization)]
+
+    assert ids(_authorization(pool_id="pool-one")) == ["classify-pool-one"]
+    assert ids(_authorization(pool_id="pool-two")) == ["classify-pool-two"]
+    assert ids(_authorization(pool_id="pool-three")) == []
+    assert ids(routed) == ["classify-pool-one", "classify-pool-two"]

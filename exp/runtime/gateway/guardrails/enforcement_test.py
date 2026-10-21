@@ -1148,6 +1148,124 @@ def test_oversized_payload_is_a_terminal_error() -> None:
     assert engine.policies_for(_authorization("organization-two", "identity-one")) == ()
 
 
+class _WindowedClassifier(ScriptedClassifier):
+    """Scripted adapter that declares it sends only its own bounded request window."""
+
+    def __init__(self, digest: str = "a" * 64) -> None:
+        """Bind one configuration digest.
+
+        Args:
+            digest: Content-free digest of the adapter's verdict settings.
+        """
+        super().__init__()
+        self._digest = digest
+
+    @property
+    def configuration_digest(self) -> str:
+        """Return the bound configuration digest."""
+        return self._digest
+
+
+def test_windowed_checks_inspect_requests_beyond_the_complete_request_bound() -> None:
+    """Only adapters that receive the complete request are refused for its total size."""
+    windowed, window_adapter = _engine(
+        classifier=_WindowedClassifier(),
+        checks=(_check("classify"),),
+        protected=True,
+        max_request_bytes=4,
+    )
+    complete, complete_adapter = _engine(
+        classifier=ScriptedClassifier(),
+        checks=(_check("classify"),),
+        protected=True,
+        max_request_bytes=4,
+    )
+    request = _request("a long agent transcript")
+
+    allowed = _awaited(
+        windowed.enforce_input(
+            policy=windowed.policies_for(_authorization())[0],
+            request=request,
+            deadline_monotonic=200.0,
+        )
+    )
+    with pytest.raises(GuardrailRejected):
+        _awaited(
+            complete.enforce_input(
+                policy=complete.policies_for(_authorization())[0],
+                request=request,
+                deadline_monotonic=200.0,
+            )
+        )
+
+    assert allowed == request
+    assert window_adapter.input_calls == 1
+    assert complete_adapter.input_calls == 0
+
+
+def test_window_configuration_digests_join_the_replay_revision() -> None:
+    """Changing a windowed adapter's verdict settings changes the policy revision."""
+    revisions = {
+        _engine(classifier=classifier, checks=(_check("classify"),))[0].revision_for(
+            _authorization()
+        )
+        for classifier in (
+            _WindowedClassifier("a" * 64),
+            _WindowedClassifier("b" * 64),
+            ScriptedClassifier(),
+        )
+    }
+
+    assert len(revisions) == 3
+
+
+def test_windowed_observation_records_large_requests_instead_of_unsupported() -> None:
+    """Observe mode measures large agent requests when the check sends a bounded window."""
+    recorded = threading.Event()
+    outcomes: list[GuardrailOutcome] = []
+
+    class Recording(GuardrailEngine):
+        """Capture observation outcomes off the request path."""
+
+        def _record_observation(
+            self,
+            policy: GuardrailPolicy,
+            check: GuardrailCheck | None,
+            outcome: GuardrailOutcome,
+            latency_seconds: float,
+        ) -> None:
+            """Keep the content-free outcome for assertions."""
+            del policy, check, latency_seconds
+            outcomes.append(outcome)
+            recorded.set()
+
+    policy = GuardrailPolicy(
+        policy_id="observer",
+        protected=True,
+        mode="observe",
+        max_request_bytes=4,
+        checks=(_check("classify", timeout_ms=1000),),
+    )
+    adapter = _WindowedClassifier()
+    engine = Recording(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({"scripted": adapter})),
+        monotonic=time.monotonic,
+    )
+    try:
+        engine.observe_inputs(
+            policies=(policy,),
+            request=_request("a long agent transcript"),
+            deadline_monotonic=time.monotonic() + 5,
+        )
+        assert recorded.wait(2)
+    finally:
+        engine.close(timeout_seconds=2)
+
+    assert outcomes == [GuardrailOutcome.ALLOW]
+    assert adapter.input_calls == 1
+
+
 def test_oversized_tool_schema_is_rejected_without_calling_the_adapter() -> None:
     """Tool descriptions and schemas count toward the request subject bound."""
     request = GatewayRequest(
