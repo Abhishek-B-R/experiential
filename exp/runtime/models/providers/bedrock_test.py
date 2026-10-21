@@ -39,10 +39,10 @@ from exp.runtime.models.providers.bedrock import (
     BedrockRegionError,
     BedrockRuntime,
     BoundedBedrockClient,
-    converse_response,
     create_bedrock_runtime_client,
     resolve_bedrock_region,
 )
+from exp.runtime.models.providers.bedrock_responses import converse_response
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
