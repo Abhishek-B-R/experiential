@@ -8,10 +8,11 @@ drop is disclosed in ``ignored_parameters``. A request is never refused for
 asking, but its values stay validated, so an out-of-range value is a named 400.
 
 Which wire accepts which field is decided once per rung in ``native_rungs``:
-OpenRouter carries all three, a vLLM-family OpenAI-compatible server carries
-``repetition_penalty`` and ``min_p`` (vLLM has no ``top_a``), and every other
-wire (OpenAI, Azure, Anthropic, Gemini, Bedrock, the native Responses dialect)
-carries none.
+OpenRouter carries all three, a self-hosted vLLM rung (``upstream_priority``
+authored) carries ``repetition_penalty`` and ``min_p`` (vLLM has no ``top_a``),
+and every other wire carries none: OpenAI, Azure, Anthropic, Gemini, Bedrock,
+the native Responses dialect, and the generic OpenAI-compatible resellers,
+some of which refuse unknown body fields.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ OPENROUTER_SAMPLING_EXTRAS: frozenset[SamplingExtraName] = frozenset(SAMPLING_EX
 """The extras OpenRouter's Chat Completions wire documents and forwards."""
 
 VLLM_SAMPLING_EXTRAS: frozenset[SamplingExtraName] = frozenset({"repetition_penalty", "min_p"})
-"""The extras a vLLM-family OpenAI-compatible server's sampling parameters carry."""
+"""The extras a self-hosted vLLM server's sampling parameters carry."""
 
 
 class SamplingExtraFields(BaseModel):

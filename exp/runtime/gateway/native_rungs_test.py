@@ -977,8 +977,12 @@ def test_the_session_header_reaches_the_frozen_wire_entry() -> None:
     assert entry["headers"] == {"Authorization": "Bearer k", NOVITA_SESSION_HEADER: "xpls-abc"}
 
 
-def _extras_dispatch(provider: str, dialect: str) -> RungDispatch:
-    """Freeze one rung for a decoded Chat request carrying all three sampling extras."""
+def _extras_dispatch(provider: str, dialect: str, *, self_hosted: bool = False) -> RungDispatch:
+    """Freeze one rung for a decoded Chat request carrying all three sampling extras.
+
+    ``self_hosted`` authors ``upstream_priority`` on the rung, the host's mark
+    of a self-hosted vLLM server.
+    """
     request = decode_chat(
         {
             "model": "public-model",
@@ -990,6 +994,14 @@ def _extras_dispatch(provider: str, dialect: str) -> RungDispatch:
         }
     ).request.model_copy(update={"include_usage": True})
     rung = _deployment(f"{provider}-rung", provider)
+    if self_hosted:
+        rung = rung.model_copy(
+            update={
+                "gateway": rung.gateway.model_copy(
+                    update={"dispatch": GatewayRungDispatchPolicy(upstream_priority=True)}
+                )
+            }
+        )
     route = _route((rung,))
     return build_rung_dispatch(
         route,
@@ -1003,8 +1015,8 @@ def _extras_dispatch(provider: str, dialect: str) -> RungDispatch:
 
 
 def test_a_vllm_rung_receives_repetition_penalty_and_min_p() -> None:
-    """An Experiential Cloud (generic OpenAI-compatible) rung forwards vLLM's extras."""
-    dispatch = _extras_dispatch("openai-compatible", "openai_compatible")
+    """A self-hosted vLLM rung (upstream_priority authored) forwards vLLM's extras."""
+    dispatch = _extras_dispatch("openai-compatible", "openai_compatible", self_hosted=True)
     payload = dispatch.wire_entry["upstream_payload"]
     assert isinstance(payload, dict)
     assert payload["repetition_penalty"] == 1.1
@@ -1029,6 +1041,9 @@ def test_an_openrouter_rung_receives_every_sampling_extra() -> None:
         ("openai", "openai_responses"),
         ("anthropic", "anthropic_messages"),
         ("openrouter", "openai_responses"),
+        # A generic OpenAI-compatible reseller (Groq, Mistral, xAI) is not a
+        # self-hosted vLLM server and may refuse unknown fields.
+        ("openai-compatible", "openai_compatible"),
     ),
 )
 def test_a_strict_rung_drops_every_sampling_extra_with_disclosure(

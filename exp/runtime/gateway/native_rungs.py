@@ -18,7 +18,7 @@ vLLM lane) carries the caller's admission level as vLLM's ``priority`` field.
 OpenRouter's sampling extras (``repetition_penalty``, ``min_p``, ``top_a``) are
 set on each rung whose wire carries them and disclosed as dropped on the rest
 (``rung_sampling_extras``), so the same request is honored on an OpenRouter or
-vLLM rung and served without them on a strict one.
+self-hosted vLLM rung and served without them on a strict one.
 """
 
 from __future__ import annotations
@@ -86,9 +86,6 @@ ZDR_CONSTRAINT_CAPABILITY = "zero_data_retention_constraint"
 
 UPSTREAM_PRIORITY_DIALECTS = frozenset({"openai_compatible", "openai_responses"})
 """The wires a vLLM server answers, where its ``priority`` body field exists."""
-
-OPENAI_COMPATIBLE_PROVIDER = "openai-compatible"
-"""Catalog provider id of a generic OpenAI-compatible server (vLLM and its kin)."""
 
 UPSTREAM_PRIORITY = {2: 0, 1: 1, 0: 2}
 """vLLM ``priority`` per ``AuthorizationSnapshot.priority_admission`` level.
@@ -190,7 +187,7 @@ def build_rung_dispatch(
     upstream_payload, sampling_disclosures = forward_sampling_extras(
         upstream_payload,
         rung_request.sampling_extras,
-        rung_sampling_extras(deployment.provider, profile.dialect),
+        rung_sampling_extras(deployment, profile.dialect),
     )
     if rung_request.provider_preferences is not None and openrouter_chat_wire(
         deployment.provider, profile.dialect
@@ -281,27 +278,31 @@ def build_rung_dispatch(
     )
 
 
-def rung_sampling_extras(provider: str, dialect: str) -> frozenset[SamplingExtraName]:
+def rung_sampling_extras(
+    deployment: ExactModelDeployment, dialect: str
+) -> frozenset[SamplingExtraName]:
     """The OpenRouter sampling extras one rung's wire carries.
 
-    OpenRouter's Chat Completions wire documents all three. A generic
-    OpenAI-compatible server is the vLLM family (Experiential Cloud lanes, a
-    customer's own server), whose sampling parameters take ``repetition_penalty``
-    and ``min_p`` but have no ``top_a``. Every other wire (OpenAI, Azure,
-    Anthropic, Gemini, Bedrock, any native Responses dialect) carries none, so
-    the extras are dropped there with disclosure rather than sent to a strict
-    endpoint that would refuse them.
+    OpenRouter's Chat Completions wire documents all three. A self-hosted vLLM
+    rung (the host authored ``upstream_priority`` on it, the same signal that
+    sends vLLM's ``priority`` field) takes ``repetition_penalty`` and ``min_p``
+    but has no ``top_a``. Every other wire carries none: the catalog's generic
+    ``openai-compatible`` provider also covers resellers (Groq, Mistral, xAI,
+    Cerebras and others) that refuse unknown body fields with a 400, and a
+    provider 400 does not fail over, so the extras are dropped there with
+    disclosure rather than sent.
 
     Args:
-        provider: The rung's catalog provider id.
+        deployment: The rung.
         dialect: The rung's resolved wire dialect.
 
     Returns:
         The extras to set on this rung's payload.
     """
-    if openrouter_chat_wire(provider, dialect):
+    if openrouter_chat_wire(deployment.provider, dialect):
         return OPENROUTER_SAMPLING_EXTRAS
-    if provider == OPENAI_COMPATIBLE_PROVIDER and dialect == "openai_compatible":
+    policy = deployment.gateway.dispatch
+    if dialect == "openai_compatible" and policy is not None and policy.upstream_priority:
         return VLLM_SAMPLING_EXTRAS
     return frozenset()
 

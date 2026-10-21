@@ -431,9 +431,11 @@ def test_openrouter_sampling_extras_forward_or_drop_per_rung_never_refuse(
 ) -> None:
     """``repetition_penalty`` / ``min_p`` / ``top_a`` are admitted on every rung.
 
-    The real admission bridge sets vLLM's extras on a generic OpenAI-compatible
-    rung (an Experiential Cloud lane) and discloses ``top_a``; an Anthropic rung
-    dispatches without any of them and names each drop in ``ignored_parameters``.
+    Neither an Anthropic rung nor a generic OpenAI-compatible rung that is not
+    marked self-hosted (a reseller that may refuse unknown fields) carries
+    them: the real admission bridge dispatches without any of them and names
+    each drop in ``ignored_parameters``. A self-hosted vLLM rung's forwarding
+    is covered in native_rungs_test.
     """
     _manager, key = _configured_gateway(
         tmp_path,
@@ -451,15 +453,9 @@ def test_openrouter_sampling_extras_forward_or_drop_per_rung_never_refuse(
     assert isinstance(payload, dict)
     ignored = admission["ignored_parameters"]
     assert isinstance(ignored, list)
-    if provider == "openai-compatible":
-        assert (payload["repetition_penalty"], payload["min_p"]) == (1.1, 0.05)
-        assert "top_a" not in payload
-        assert "top_a->dropped(unsupported_by_provider)" in ignored
-        assert "repetition_penalty->dropped(unsupported_by_provider)" not in ignored
-    else:
-        assert not {"repetition_penalty", "min_p", "top_a"} & set(payload)
-        for name in ("repetition_penalty", "min_p", "top_a"):
-            assert f"{name}->dropped(unsupported_by_provider)" in ignored
+    assert not {"repetition_penalty", "min_p", "top_a"} & set(payload)
+    for name in ("repetition_penalty", "min_p", "top_a"):
+        assert f"{name}->dropped(unsupported_by_provider)" in ignored
     assert "attempt_id" in _start_first(control, admission)
 
 
