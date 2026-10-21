@@ -14,6 +14,11 @@ wire fails closed here, never dispatching unconstrained.
 
 A rung whose authored dispatch policy sets ``upstream_priority`` (a self-hosted
 vLLM lane) carries the caller's admission level as vLLM's ``priority`` field.
+
+OpenRouter's sampling extras (``repetition_penalty``, ``min_p``, ``top_a``) are
+set on each rung whose wire carries them and disclosed as dropped on the rest
+(``rung_sampling_extras``), so the same request is honored on an OpenRouter or
+self-hosted vLLM rung and served without them on a strict one.
 """
 
 from __future__ import annotations
@@ -35,6 +40,12 @@ from exp.runtime.gateway.reasoning_carrier import (
     scheme_for_profile,
 )
 from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.sampling_extras import (
+    OPENROUTER_SAMPLING_EXTRAS,
+    VLLM_SAMPLING_EXTRAS,
+    SamplingExtraName,
+    forward_sampling_extras,
+)
 from exp.runtime.models.providers import (
     emulated_gateway_capabilities,
     emulated_stop_sequences,
@@ -96,6 +107,7 @@ class RungDispatch:
     output_disclosure: str | None
     developer_disclosure: str | None
     reserved_output_tokens: int
+    sampling_disclosures: tuple[str, ...] = ()
 
     @property
     def disclosures(self) -> tuple[str, ...]:
@@ -106,6 +118,7 @@ class RungDispatch:
                 self.parallel_disclosure,
                 self.output_disclosure,
                 self.developer_disclosure,
+                *self.sampling_disclosures,
             )
             if disclosure is not None
         )
@@ -170,6 +183,11 @@ def build_rung_dispatch(
     rung_request = safeguards_for_upstream(profile.url, rung_request)
     upstream_payload = image_aware_stream_payload(
         profile, rung_request, capabilities, deployment.provider
+    )
+    upstream_payload, sampling_disclosures = forward_sampling_extras(
+        upstream_payload,
+        rung_request.sampling_extras,
+        rung_sampling_extras(deployment, profile.dialect),
     )
     if rung_request.provider_preferences is not None and openrouter_chat_wire(
         deployment.provider, profile.dialect
@@ -256,7 +274,37 @@ def build_rung_dispatch(
         output_disclosure=output_disclosure,
         developer_disclosure=developer_disclosure,
         reserved_output_tokens=output_bound,
+        sampling_disclosures=sampling_disclosures,
     )
+
+
+def rung_sampling_extras(
+    deployment: ExactModelDeployment, dialect: str
+) -> frozenset[SamplingExtraName]:
+    """The OpenRouter sampling extras one rung's wire carries.
+
+    OpenRouter's Chat Completions wire documents all three. A self-hosted vLLM
+    rung (the host authored ``upstream_priority`` on it, the same signal that
+    sends vLLM's ``priority`` field) takes ``repetition_penalty`` and ``min_p``
+    but has no ``top_a``. Every other wire carries none: the catalog's generic
+    ``openai-compatible`` provider also covers resellers (Groq, Mistral, xAI,
+    Cerebras and others) that refuse unknown body fields with a 400, and a
+    provider 400 does not fail over, so the extras are dropped there with
+    disclosure rather than sent.
+
+    Args:
+        deployment: The rung.
+        dialect: The rung's resolved wire dialect.
+
+    Returns:
+        The extras to set on this rung's payload.
+    """
+    if openrouter_chat_wire(deployment.provider, dialect):
+        return OPENROUTER_SAMPLING_EXTRAS
+    policy = deployment.gateway.dispatch
+    if dialect == "openai_compatible" and policy is not None and policy.upstream_priority:
+        return VLLM_SAMPLING_EXTRAS
+    return frozenset()
 
 
 def zdr_constrained_dispatch(

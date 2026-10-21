@@ -27,6 +27,7 @@ from exp.common.models.content import (
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort
 from exp.runtime.gateway.reasoning_carrier import MAXIMUM_REASONING_CARRIER_BYTES
 from exp.runtime.gateway.request_policy import GatewayRequestPolicy
+from exp.runtime.gateway.sampling_extras import SamplingExtraFields
 from exp.runtime.gateway.service_tiers import ServiceTier
 from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.cache_control import EphemeralCacheControl
@@ -548,7 +549,7 @@ class _ChatTemplateKwargs(_WireModel):
     preserve_thinking: bool | None = None
 
 
-class _ChatRequest(_WireModel):
+class _ChatRequest(SamplingExtraFields, _WireModel):
     """Closed gateway Chat Completions request profile.
 
     Attributes:

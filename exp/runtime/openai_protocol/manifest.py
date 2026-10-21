@@ -9,6 +9,7 @@ from exp.runtime.gateway.compatibility import (
     CompatibilityManifest,
 )
 from exp.runtime.gateway.contracts import GatewayApiSurface
+from exp.runtime.gateway.sampling_extras import SAMPLING_EXTRA_FIELDS
 from exp.runtime.openai_protocol.errors import unsupported_field
 
 
@@ -78,6 +79,14 @@ CHAT_MANIFEST = CompatibilityManifest(
         # soft preference whose absence still returns a valid answer).
         _field("frequency_penalty", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "penalties"),
         _field("presence_penalty", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "penalties"),
+        # OpenRouter's open-weight sampling extras, matching its behavior: sent
+        # to rungs whose wire carries them (OpenRouter; vLLM-family servers take
+        # repetition_penalty and min_p), dropped with disclosure on every other
+        # rung, never refused. Values stay validated (gateway/sampling_extras).
+        *(
+            _field(path, CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "sampling_extras")
+            for path in SAMPLING_EXTRA_FIELDS
+        ),
         # Accepted only at its no-op default of 1 (the wire model enforces
         # the value): Copilot hardcodes n:1 on every Chat request.
         _field("n", CompatibilityDisposition.SUPPORTED),

@@ -40,6 +40,7 @@ from exp.runtime.gateway.reasoning_blocks import (
 from exp.runtime.gateway.reasoning_blocks import ThinkingBlock as ThinkingBlock
 from exp.runtime.gateway.request_policy import GatewayRequestPolicy, RequestedRouteId
 from exp.runtime.gateway.request_surface_fields import require_no_responses_only_fields
+from exp.runtime.gateway.sampling_extras import SamplingExtras
 from exp.runtime.gateway.service_tiers import (
     GatewayServiceTierAdmission as GatewayServiceTierAdmission,
 )
@@ -459,6 +460,11 @@ class GatewayRequest(ContractModel):
     top_k: int | None = Field(default=None, ge=0)
     frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
     presence_penalty: float | None = Field(default=None, ge=-2, le=2)
+    sampling_extras: SamplingExtras | None = Field(default=None, exclude=True)
+    """OpenRouter's ``repetition_penalty`` / ``min_p`` / ``top_a``, forwarded per rung.
+
+    Excluded from serialization so extra-free digests are unchanged; a present
+    value joins replay identity through ``canonical_request_sha256``."""
     logprobs: StrictBool | None = None
     top_logprobs: StrictInt | None = Field(default=None, ge=0, le=20)
     include_output_text_logprobs: bool = Field(default=False, exclude=True)
