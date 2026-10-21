@@ -523,6 +523,67 @@ def test_azure_non_anthropic_model_keeps_the_openai_deployments_wire() -> None:
     assert isinstance(runtime.resolve("glm").client, AzureClient)
 
 
+def _foundry_deployment_catalog(
+    deployment: str, served_model_id: str | None
+) -> RuntimeModelCatalog:
+    """One customer Foundry deployment, named by the operator, on a resource root."""
+    catalog = ModelCatalog(
+        connections={
+            "primary": ConnectionConfig(
+                provider="azure",
+                base_url="https://silen-resource.services.ai.azure.com",
+                api_key_env="FIXTURE_API_KEY",
+                api_version="2024-10-21",
+            )
+        },
+        models={
+            "opus": ModelRecord(
+                connection="primary",
+                model=deployment,
+                served_model_id=served_model_id,
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=ModelCapabilities(supports_completions=True),
+            )
+        },
+        roles=ModelRoles(candidates=("opus",), incumbent="opus"),
+    )
+    return RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "foundry-secret"},
+        transport_factory=ScriptedJsonTransport,
+    )
+
+
+def test_azure_claude_deployment_under_any_name_routes_by_its_served_model() -> None:
+    """A Claude deployment named by the operator still rides the Anthropic Messages wire.
+
+    Foundry deployment names are free text (a customer deployed claude-opus-5-5
+    as ``claude-opus-5-5-fast``); keyed on the name alone, the client fell to the
+    OpenAI-deployments wire, which never serves Claude, and every request failed.
+    The served model names the model; the request still addresses the deployment.
+    """
+    resolved = _foundry_deployment_catalog("claude-opus-5-5-fast", "claude-opus-5-5").resolve(
+        "opus"
+    )
+
+    assert isinstance(resolved.client, AnthropicClient)
+    profile = resolved.client.gateway_wire_profile()
+    assert profile.dialect == "anthropic_messages"
+    assert profile.url == "https://silen-resource.services.ai.azure.com/anthropic/v1/messages"
+    assert profile.model_id == "claude-opus-5-5-fast"
+    assert resolved.served_model_id == "claude-opus-5-5"
+
+
+def test_azure_deployment_without_an_anthropic_identity_keeps_the_openai_wire() -> None:
+    """Neither the deployment name nor a served model names Claude: the Azure wire stays."""
+    assert isinstance(
+        _foundry_deployment_catalog("my-opus", None).resolve("opus").client, AzureClient
+    )
+    assert isinstance(
+        _foundry_deployment_catalog("my-gpt", "gpt-5.5").resolve("opus").client, AzureClient
+    )
+
+
 def test_snapshots_preserve_per_model_billing_source_on_one_connection() -> None:
     """Do not infer one credential owner from a connection shared by two model aliases."""
     catalog = _catalog(billing_source=BillingSource.HOST_MANAGED)

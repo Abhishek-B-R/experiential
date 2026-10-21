@@ -408,6 +408,12 @@ The model record `model` field is the exact Azure deployment identifier sent on 
 derives a deployment from an alias or a base-model name. Use a separate alias for an embedding
 deployment.
 
+Foundry serves Claude only on the native Anthropic Messages API at `{resource}/anthropic/v1`, with
+the key as a Bearer token. A deployment routes there when its `model` (the deployment name) or its
+`served_model_id` is a Claude model id Experiential knows; set `served_model_id` to that id when the
+deployment carries a name of your own (`model = "my-opus"`, `served_model_id = "claude-opus-4-6"`).
+The request still names the deployment. Every other deployment uses the Azure OpenAI wire.
+
 `AZURE_OPENAI_API_KEY` is paired with `AZURE_OPENAI_ENDPOINT` when that endpoint variable is set.
 A catalog endpoint that is not the same resource cannot use that key. Comparison lowercases the
 scheme and host, treats default HTTPS and HTTP ports as equivalent to an omitted port, keeps path
