@@ -16,6 +16,7 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
 )
+from exp.runtime.gateway.guardrails.classification_test import _document as _decision_adapter
 from exp.runtime.gateway.guardrails.config import engine_from_document, load_guardrail_engine
 from exp.runtime.gateway.guardrails.contracts import (
     GuardrailAction,
@@ -152,7 +153,7 @@ def test_standard_preset_never_enables_a_global_policy() -> None:
 
 def test_unknown_adapter_kind_is_rejected() -> None:
     """Unknown adapter kinds cannot become silently unconfigured checks."""
-    with pytest.raises(ValueError, match="keyword, regex, or http_json"):
+    with pytest.raises(ValueError, match="keyword, regex, http_json, or decision_model"):
         engine_from_document(
             {
                 "adapters": [{"adapter_id": "hosted", "kind": "hosted", "needles": ["x"]}],
@@ -423,3 +424,56 @@ def test_replay_hashes_only_rules_referenced_by_applicable_enforcement(change: s
     finally:
         original.close(timeout_seconds=0)
         reloaded.close(timeout_seconds=0)
+
+
+def _classification_document(*, stage: str = "input", action: str = "block") -> JsonObject:
+    """Return one pool-scoped global classification policy over a decision-model adapter."""
+    return {
+        "adapters": [_decision_adapter()],
+        "policies": [
+            {
+                "policy_id": "classify-requests",
+                "protected": True,
+                "input_execution": "parallel",
+                "target_pool_ids": ["pool-one"],
+                "checks": [
+                    {
+                        "check_id": "classify-input",
+                        "capability": "content_safety",
+                        "stage": stage,
+                        "action": action,
+                        "adapter_id": "request-classifier",
+                        "timeout_ms": 2000,
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_decision_model_policy_applies_only_to_its_scoped_pool() -> None:
+    """A file-configured classification policy guards its pool and leaves others unguarded."""
+    engine = engine_from_document(_classification_document())
+    try:
+        assert [p.policy_id for p in engine.policies_for(_authorization())] == ["classify-requests"]
+        assert engine.policies_for(_authorization(pool_id="pool-two")) == ()
+    finally:
+        engine.close(timeout_seconds=0)
+
+
+@pytest.mark.parametrize(("stage", "action"), [("output", "block"), ("input", "modify")])
+def test_decision_model_adapters_bind_only_to_read_only_input_checks(
+    stage: str, action: str
+) -> None:
+    """Output and modify bindings fail at load instead of failing every request."""
+    with pytest.raises(ValueError, match="classify input only"):
+        engine_from_document(_classification_document(stage=stage, action=action))
+
+
+def test_malformed_decision_model_adapter_names_the_invalid_field() -> None:
+    """Load errors point at the field to fix without echoing authored values."""
+    document = _classification_document()
+    document["adapters"] = [_decision_adapter(window={"prior_messages": 9})]
+
+    with pytest.raises(ValueError, match=r"window\.prior_messages"):
+        engine_from_document(document)
