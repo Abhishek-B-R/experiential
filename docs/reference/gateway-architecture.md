@@ -227,32 +227,44 @@ at its bound on the first dial, or passed over by affinity order) is revisited b
 a rung already dispatched is never dialed again except by the same-deployment redial, and only rungs
 of this request's own route are ever considered. Both halves agree: the data plane's
 `successor_possible` counts any untried rung, and the control plane's `untried_depths` claims it. A
-sibling's saturation bound does not end a failover: a successor that sheds spills sideways to the
-other untried rungs, and only when every one of them shed is the first shed rung admitted as a forced
-pass (`saturated_overflow`). Forced failover passes are counted per rung and capped at half its bound
+sibling's saturation bound does not end a dead-lane failover: a successor that sheds spills sideways
+to the other untried rungs, and only when every one of them shed, and only when the failure being
+walked from is a dead lane (`transport` or `provider_internal`: refused, 5xx), is the first shed rung
+admitted as a forced pass (`saturated_overflow`, after a fresh health claim). A throttle or a timeout
+fails over as usual but never forces past a refusing bound, so a GPU-bound sibling is not
+over-queued for a rung that is alive. Forced failover passes are counted per rung and capped at half its bound
 in flight on top of it (at least one), so one dead lane cannot move its whole load onto the backup at
 once; a rung at that cap, a hard class cap or `:fast` reserve, or a rate-window shed is skipped. When
 every untried rung refuses, the request ends with the fast retryable `lane_saturated` 429
-(`Retry-After: 5`), never the dead rung's 502. A first dial keeps the refusing-bound 429.
+(`Retry-After: 5`), never the dead rung's 502; a throttle or timeout that found nothing keeps its
+own failure. A first dial keeps the refusing-bound 429.
 
 **Pre-first-byte budget.** The budget (`pre_first_byte_budget_seconds`, 90 s by default for a plane
 whose host sets nothing) bounds everything before the caller's first byte and caps every dial's header
 wait. A request's budget is raised to the longest AUTHORED first-byte allowance on its route (base
 plus the input slope for this prompt) plus a 15 s reserve
 (`EXP_GATEWAY_PRE_FIRST_BYTE_RESERVE_SECONDS` overrides it), so a self-hosted lane authoring 300 s
-for long prompts is never cut at the default; routes of lanes that author nothing keep the configured budget.
+for long prompts is never cut at the default; routes of lanes that author nothing keep the configured
+budget. The raise stops at a ceiling (600 s, `EXP_GATEWAY_PRE_FIRST_BYTE_MAX_SECONDS`, 0 removes it)
+and never lowers the configured budget; the prompt approximation behind the input slope is the body's
+bytes over four with base64 data-URL media left out (large tool schemas still count).
 Fast failures (refused, 5xx, transport) fail over at once as before; a header timeout fails over only
 while budget remains.
 
 **Dead-lane ejection.** Each worker ejects a dead lane on its own: three transport failures or
-provider 5xx (refused, 500, 502, 503, 504) on one lane within 10 s, keyed on the deployment id exactly
-as the route carries it (`mp-<uuid>`; a BYOK variant `mp-<row>-c-<connection>` is its own key) across
-catalog revisions, order that lane LAST in every claim walk for 30 s. It is never removed, so a
+provider 5xx (refused, 500, 502, 503, 504) on one lane within 10 s, or two header timeouts within
+10 min (a hung box that accepts connections and never answers), keyed on the physical lane
+`(deployment_id, connection_sha256)` (the deployment id is the one the route carries, `mp-<uuid>`; a
+BYOK variant `mp-<row>-c-<connection>` is its own key) across catalog revisions, order that lane LAST
+in every claim walk for 30 s. It is never removed, so a
 single-rung route still dials it; after the cooldown one request probes it, a success restores its
-order and a dead-lane failure re-ejects it. Client 4xx, throttles and timeouts neither count nor reset
-the streak. An attempt dialed in an ejected lane's place records `dispatch_reason: lane_ejected` with
+order and a dead-lane failure or header timeout re-ejects it (two requests may race to probe;
+harmless). Client 4xx, throttles and other timeouts neither count nor reset a streak, and leave no
+state behind. An attempt dialed in an ejected lane's place records `dispatch_reason: lane_ejected` with
 the ejected lane as its `preferred_deployment`. `EXP_GATEWAY_LANE_EJECTION_FAILURES` (0 disables),
-`EXP_GATEWAY_LANE_EJECTION_WINDOW_SECONDS` and `EXP_GATEWAY_LANE_EJECTION_COOLDOWN_SECONDS` override
+`EXP_GATEWAY_LANE_EJECTION_WINDOW_SECONDS`, `EXP_GATEWAY_LANE_EJECTION_HEADER_TIMEOUTS` (0 disables
+that streak), `EXP_GATEWAY_LANE_EJECTION_HEADER_WINDOW_SECONDS` and
+`EXP_GATEWAY_LANE_EJECTION_COOLDOWN_SECONDS` override
 the thresholds; nothing is published to the catalog.
 
 **DeepSeek DSML markup is never relayed as text.** On the OpenAI-compatible wire, content that

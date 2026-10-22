@@ -5,19 +5,24 @@ an instant 502) for twenty minutes, and every request on the route dialed it
 first: 7,000+ wasted dials. The revision-scoped health circuit
 (``DeploymentHealthRegistry``) keys on the authorization's catalog digest, so
 its memory restarts per revision view, and it counts timeouts and malformed
-streams alike. This tracker keys on the lane's deployment id exactly as the
-plan carries it (``mp-<model_provider uuid>`` for a host lane), across every
-revision view, so every request on the worker learns from every other one. A
+streams alike. This tracker keys on the physical lane, the ``rung_load_key``
+convention ``(deployment_id, connection_sha256)``, across every revision view,
+so every request on the worker learns from every other one. The deployment id
+is the one the plan carries (``mp-<model_provider uuid>`` for a host lane); a
 BYOK variant carries its own id (``mp-<row>-c-<connection>``) and so never
 inherits its host lane's ejection, nor the host lane a variant's. It counts
 only the failures that say the box itself is down: transport failures
 (refused, reset, unreachable) and provider 5xx (``provider_internal``: 500,
-502, 503, 504). A client 4xx, a throttle, or a timeout says nothing here (each
-has its own handling) and neither extends nor resets a streak; a success, or
-an open stream, closes it.
+502, 503, 504), and, on a separate and slower streak, header timeouts (a box
+that accepts connections and never answers its headers holds every request
+for its whole authored allowance, which can be minutes). A client 4xx, a
+throttle, or any other timeout says nothing here (each has its own handling):
+it neither extends nor resets a streak and never allocates state; a success,
+or an open stream, closes both streaks.
 
-``failures`` such failures inside ``window_seconds`` (no success between them)
-eject the lane for ``cooldown_seconds``. An ejected lane is never removed:
+``failures`` dead-lane failures inside ``window_seconds``, or
+``header_timeouts`` header timeouts inside ``header_window_seconds`` (no
+success between them), eject the lane for ``cooldown_seconds``. An ejected lane is never removed:
 the claim walk orders it LAST among a route's candidates, so a single-rung
 route still dials it and fails fast, and a route whose other rungs are all
 unclaimable still reaches it. After the cooldown the lane is half-open: the
@@ -37,23 +42,42 @@ from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from exp.runtime.gateway.contracts import GatewayFailureClass
+from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
 
-LaneKey = str
-"""A deployment id exactly as the route carries it: one lane on this worker."""
+LaneKey = tuple[str, str]
+"""``(deployment_id, connection_sha256)``: one physical lane on this worker."""
 
 DEAD_LANE_FAILURES = frozenset(
     {GatewayFailureClass.TRANSPORT, GatewayFailureClass.PROVIDER_INTERNAL}
 )
 """The failure classes that count toward an ejection: the box itself is down."""
 
+HEADER_TIMEOUT_MESSAGE = "provider did not send response headers in time"
+"""The data plane's header-phase timeout (``upstream.rs::open_timeout_failure``).
+
+The failure crosses the bridge as its class and message only, so the message
+is the discriminator; ``lane_ejection_test`` pins it to the Rust source.
+"""
+
 DEFAULT_EJECTION_FAILURES = 3
 DEFAULT_EJECTION_WINDOW_SECONDS = 10.0
+DEFAULT_EJECTION_HEADER_TIMEOUTS = 2
+DEFAULT_EJECTION_HEADER_WINDOW_SECONDS = 600.0
 DEFAULT_EJECTION_COOLDOWN_SECONDS = 30.0
 
 EJECTION_FAILURES_ENV = "EXP_GATEWAY_LANE_EJECTION_FAILURES"
 EJECTION_WINDOW_ENV = "EXP_GATEWAY_LANE_EJECTION_WINDOW_SECONDS"
+EJECTION_HEADER_TIMEOUTS_ENV = "EXP_GATEWAY_LANE_EJECTION_HEADER_TIMEOUTS"
+EJECTION_HEADER_WINDOW_ENV = "EXP_GATEWAY_LANE_EJECTION_HEADER_WINDOW_SECONDS"
 EJECTION_COOLDOWN_ENV = "EXP_GATEWAY_LANE_EJECTION_COOLDOWN_SECONDS"
+
+
+def is_header_timeout(failure: GatewayFailure) -> bool:
+    """Whether ``failure`` is the data plane's header-phase timeout."""
+    return (
+        failure.failure_class == GatewayFailureClass.TIMEOUT
+        and failure.safe_message == HEADER_TIMEOUT_MESSAGE
+    )
 
 
 @dataclass(frozen=True)
@@ -62,26 +86,31 @@ class LaneEjectionPolicy:
 
     Attributes:
         failures: Consecutive dead-lane failures that eject the lane; zero
-            disables ejection entirely.
+            disables ejection entirely (header timeouts included).
         window_seconds: The span those failures must fall inside.
+        header_timeouts: Consecutive header timeouts that eject the lane;
+            zero disables only this streak.
+        header_window_seconds: The span those header timeouts must fall inside.
         cooldown_seconds: How long an ejected lane is ordered last before
             one request may probe it.
     """
 
     failures: int = DEFAULT_EJECTION_FAILURES
     window_seconds: float = DEFAULT_EJECTION_WINDOW_SECONDS
+    header_timeouts: int = DEFAULT_EJECTION_HEADER_TIMEOUTS
+    header_window_seconds: float = DEFAULT_EJECTION_HEADER_WINDOW_SECONDS
     cooldown_seconds: float = DEFAULT_EJECTION_COOLDOWN_SECONDS
 
     def __post_init__(self) -> None:
         """Reject a policy that could never eject or never recover.
 
         Raises:
-            ValueError: A negative failure count or a non-positive duration.
+            ValueError: A negative count or a non-positive duration.
         """
-        if self.failures < 0:
-            raise ValueError("lane ejection failures must not be negative")
-        if self.window_seconds <= 0 or self.cooldown_seconds <= 0:
-            raise ValueError("lane ejection window and cooldown must be positive")
+        if self.failures < 0 or self.header_timeouts < 0:
+            raise ValueError("lane ejection counts must not be negative")
+        if min(self.window_seconds, self.header_window_seconds, self.cooldown_seconds) <= 0:
+            raise ValueError("lane ejection windows and cooldown must be positive")
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str] | None = None) -> LaneEjectionPolicy:
@@ -97,30 +126,49 @@ class LaneEjectionPolicy:
             ValueError: An override does not parse or is out of range.
         """
         mapping = os.environ if environ is None else environ
-        failures = mapping.get(EJECTION_FAILURES_ENV)
-        window = mapping.get(EJECTION_WINDOW_ENV)
-        cooldown = mapping.get(EJECTION_COOLDOWN_ENV)
+
+        def read(name: str, default: float) -> float:
+            """One override as a number, or the default when unset."""
+            raw = mapping.get(name)
+            return default if not raw else float(raw)
+
         return cls(
-            failures=DEFAULT_EJECTION_FAILURES if not failures else int(failures),
-            window_seconds=DEFAULT_EJECTION_WINDOW_SECONDS if not window else float(window),
-            cooldown_seconds=DEFAULT_EJECTION_COOLDOWN_SECONDS if not cooldown else float(cooldown),
+            failures=int(read(EJECTION_FAILURES_ENV, DEFAULT_EJECTION_FAILURES)),
+            window_seconds=read(EJECTION_WINDOW_ENV, DEFAULT_EJECTION_WINDOW_SECONDS),
+            header_timeouts=int(
+                read(EJECTION_HEADER_TIMEOUTS_ENV, DEFAULT_EJECTION_HEADER_TIMEOUTS)
+            ),
+            header_window_seconds=read(
+                EJECTION_HEADER_WINDOW_ENV, DEFAULT_EJECTION_HEADER_WINDOW_SECONDS
+            ),
+            cooldown_seconds=read(EJECTION_COOLDOWN_ENV, DEFAULT_EJECTION_COOLDOWN_SECONDS),
         )
 
 
 @dataclass
 class _LaneState:
-    """One lane's streak and ejection, mutated only under the owner's lock.
+    """One lane's streaks and ejection, mutated only under the owner's lock.
 
     Attributes:
-        failures: Monotonic times of the current streak's counted failures.
+        failures: Monotonic times of the current dead-lane streak.
+        header_timeouts: Monotonic times of the current header-timeout streak.
         ejected_until: Monotonic instant the cooldown ends; 0 when not ejected.
         probe_started: Monotonic instant a half-open probe was claimed, or
             ``None`` when no probe is in flight.
     """
 
     failures: deque[float] = field(default_factory=deque)
+    header_timeouts: deque[float] = field(default_factory=deque)
     ejected_until: float = 0.0
     probe_started: float | None = None
+
+
+def _streak_full(streak: deque[float], threshold: int, window: float, now: float) -> bool:
+    """Append ``now`` and report whether the last ``threshold`` entries fit ``window``."""
+    streak.append(now)
+    while len(streak) > threshold:
+        streak.popleft()
+    return len(streak) == threshold and now - streak[0] <= window
 
 
 class LaneEjections:
@@ -138,6 +186,10 @@ class LaneEjections:
         """
         self._policy = policy
         self._lanes: dict[LaneKey, _LaneState] = {}
+
+    def tracked(self) -> int:
+        """How many lanes hold state (a streak or an ejection)."""
+        return len(self._lanes)
 
     def ejected(self, lane: LaneKey, now: float) -> bool:
         """Whether a claim walk should order the lane last right now.
@@ -165,6 +217,12 @@ class LaneEjections:
     def claimed(self, lane: LaneKey, now: float) -> None:
         """Note that a request claimed the lane, making it the probe when half-open.
 
+        Two claim walks that read a half-open lane at the same moment may both
+        order it normally and both dial it: two probes instead of one. That is
+        harmless (the second probe is one more request on a lane that is
+        either back, or dead and failing fast, and either outcome settles the
+        lane the same way), so the walk does not serialize on it.
+
         Args:
             lane: The physical lane.
             now: The current monotonic time.
@@ -189,41 +247,50 @@ class LaneEjections:
             state.probe_started = None
 
     def succeeded(self, lane: LaneKey) -> None:
-        """Close the lane's streak and ejection: the box answered.
+        """Close the lane's streaks and ejection: the box answered.
 
         Args:
             lane: The physical lane.
         """
         self._lanes.pop(lane, None)
 
-    def failed(self, lane: LaneKey, failure_class: GatewayFailureClass, now: float) -> None:
+    def failed(self, lane: LaneKey, failure: GatewayFailure, now: float) -> None:
         """Apply one settled failure to the lane.
 
-        A dead-lane failure extends the streak, ejects at the threshold, and
-        re-ejects a half-open lane at once; any other class only frees the
-        probe slot so the next request may probe.
+        A dead-lane failure or a header timeout extends its own streak, ejects
+        at that streak's threshold, and re-ejects a half-open lane at once.
+        Any other failure only frees a tracked lane's probe slot so the next
+        request may probe; it never allocates state for an untracked lane.
 
         Args:
             lane: The physical lane.
-            failure_class: The settled attempt's failure class.
+            failure: The settled attempt's failure.
             now: The current monotonic time.
         """
         if self._policy.failures == 0:
             return
+        dead = failure.failure_class in DEAD_LANE_FAILURES
+        hung = self._policy.header_timeouts > 0 and is_header_timeout(failure)
+        if not (dead or hung):
+            self.released(lane)
+            return
         state = self._lanes.setdefault(lane, _LaneState())
         probing = bool(state.ejected_until) and now >= state.ejected_until
         state.probe_started = None
-        if failure_class not in DEAD_LANE_FAILURES:
-            return
         if probing:
             state.ejected_until = now + self._policy.cooldown_seconds
             return
-        state.failures.append(now)
-        while len(state.failures) > self._policy.failures:
-            state.failures.popleft()
-        if (
-            len(state.failures) == self._policy.failures
-            and now - state.failures[0] <= self._policy.window_seconds
-        ):
+        full = (
+            _streak_full(state.failures, self._policy.failures, self._policy.window_seconds, now)
+            if dead
+            else _streak_full(
+                state.header_timeouts,
+                self._policy.header_timeouts,
+                self._policy.header_window_seconds,
+                now,
+            )
+        )
+        if full:
             state.ejected_until = now + self._policy.cooldown_seconds
             state.failures.clear()
+            state.header_timeouts.clear()

@@ -799,6 +799,12 @@ class RungLoadRegistry:
             rung = self._rungs.get(key)
             return 0 if rung is None else rung.fast
 
+    def failover_inflight(self, key: RungLoadKey) -> int:
+        """Return one rung's in-flight forced FAILOVER pass count."""
+        with self._lock:
+            rung = self._rungs.get(key)
+            return 0 if rung is None else rung.failover_forced
+
     def _release_locked(self, ticket: str) -> None:
         """Return one reserved slot to its rung under the registry lock."""
         entry = self._tickets.pop(ticket, None)

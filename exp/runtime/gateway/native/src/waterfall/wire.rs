@@ -332,10 +332,14 @@ pub(crate) const PRE_FIRST_BYTE_RESERVE: Duration = Duration::from_secs(15);
 /// slow rung reached by failover deserves its allowance too. A rung that
 /// authors neither its base nor its slope adds nothing, so a route of
 /// unauthored lanes keeps the configured budget exactly. `None` (budget
-/// disabled) stays disabled.
+/// disabled) stays disabled. `ceiling` (`ServeConfig::pre_first_byte_max_seconds`)
+/// bounds how far an authored allowance may raise the budget, so one rung
+/// authoring an hour cannot hold every request before its first byte that
+/// long; it never lowers the configured budget itself.
 pub(crate) fn pre_first_byte_budget(
     configured: Option<Duration>,
     reserve: Duration,
+    ceiling: Option<Duration>,
     route: &[DeploymentWire],
     default_base: Duration,
     default_slope_seconds_per_million: f64,
@@ -359,7 +363,42 @@ pub(crate) fn pre_first_byte_budget(
             ) + reserve
         })
         .max();
-    Some(authored.map_or(configured, |floor| configured.max(floor)))
+    let floor = authored.map(|floor| ceiling.map_or(floor, |ceiling| floor.min(ceiling)));
+    Some(floor.map_or(configured, |floor| configured.max(floor)))
+}
+
+/// The default `ceiling` of `pre_first_byte_budget`.
+pub(crate) const PRE_FIRST_BYTE_MAX: Duration = Duration::from_secs(600);
+
+/// Approximate input tokens of a raw request body for the budget floor:
+/// bytes over four, with base64 data-URL payloads (inline images, audio,
+/// files) left out.
+///
+/// Bytes over four overestimates a body carrying base64 media (a 4 MB image
+/// reads as a million tokens, raising the floor by the full input slope) and,
+/// more mildly, large tool schemas (JSON punctuation tokenizes densely). Media
+/// is cheap and safe to exclude: the payload runs from `;base64,` inside a
+/// `data:` URL to the string's closing quote, and base64 has no quote. Tool
+/// schemas stay counted; the ceiling bounds what they can add.
+pub(crate) fn budget_input_tokens(body: &str) -> f64 {
+    const MARK: &str = ";base64,";
+    let mut excluded = 0usize;
+    let mut rest = body;
+    while let Some(at) = rest.find(MARK) {
+        let head = &rest[..at];
+        let start = at + MARK.len();
+        let in_data_url = head
+            .rfind("data:")
+            .is_some_and(|data| at - data <= 128 && !head[data..].contains('"'));
+        let end = rest[start..]
+            .find('"')
+            .map_or(rest.len(), |end| start + end);
+        if in_data_url {
+            excluded += end - start;
+        }
+        rest = &rest[end..];
+    }
+    (body.len().saturating_sub(excluded) as f64) / 4.0
 }
 
 /// The effective first-TOKEN allowance for one attempt: the deployment's (or

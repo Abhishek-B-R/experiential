@@ -84,6 +84,10 @@ pub struct ServeConfig {
     /// (`waterfall::pre_first_byte_budget`).
     #[serde(default = "default_pre_first_byte_reserve_seconds")]
     pub pre_first_byte_reserve_seconds: f64,
+    /// The most an authored allowance may raise a request's budget to; zero
+    /// or negative removes the ceiling.
+    #[serde(default = "default_pre_first_byte_max_seconds")]
+    pub pre_first_byte_max_seconds: f64,
     #[serde(default = "default_callback_permits")]
     pub callback_permits: usize,
     /// Worker-wide bound on provider output retained across streams.
@@ -128,6 +132,10 @@ fn default_time_to_first_token_seconds() -> f64 {
 /// within 100 s; stopping new attempts at 90 s keeps our retryable error.
 fn default_pre_first_byte_budget_seconds() -> f64 {
     90.0
+}
+
+fn default_pre_first_byte_max_seconds() -> f64 {
+    crate::waterfall::PRE_FIRST_BYTE_MAX.as_secs_f64()
 }
 
 fn default_pre_first_byte_reserve_seconds() -> f64 {
@@ -183,6 +191,8 @@ pub(crate) struct AppState {
     pub(crate) pre_first_byte_budget: Option<Duration>,
     /// The reserve kept past the longest authored first-byte allowance.
     pub(crate) pre_first_byte_reserve: Duration,
+    /// The ceiling on a raised budget (`None`: no ceiling).
+    pub(crate) pre_first_byte_max: Option<Duration>,
     /// Settlement writes still in flight, held open through graceful shutdown.
     pub(crate) pending_settlements: Arc<AtomicUsize>,
     /// Requests handled since start; the idle reclaim loop trims the
@@ -239,6 +249,8 @@ pub async fn run(
         pre_first_byte_reserve: Duration::from_secs_f64(
             config.pre_first_byte_reserve_seconds.max(0.0),
         ),
+        pre_first_byte_max: (config.pre_first_byte_max_seconds > 0.0)
+            .then(|| Duration::from_secs_f64(config.pre_first_byte_max_seconds)),
         pending_settlements: pending_settlements.clone(),
         handled_requests: handled_requests.clone(),
         replays: Arc::new(ReplayStore::new()),
@@ -523,8 +535,9 @@ impl AppState {
     /// request deadline minus the request budget) plus its budget
     /// (`waterfall::pre_first_byte_budget`: the configured budget raised to
     /// the route's longest authored header allowance plus a reserve), never
-    /// past the request deadline itself. `body` is the raw request body; its
-    /// length over four is the same input approximation the dials use.
+    /// past the request deadline itself, and never raised past the ceiling.
+    /// `body` is the raw request body, approximated without its base64 media
+    /// (`waterfall::budget_input_tokens`).
     pub(crate) fn first_byte_budget(
         &self,
         deadline: Instant,
@@ -534,10 +547,11 @@ impl AppState {
         let budget = crate::waterfall::pre_first_byte_budget(
             self.pre_first_byte_budget,
             self.pre_first_byte_reserve,
+            self.pre_first_byte_max,
             route,
             self.time_to_first_byte,
             self.time_to_first_byte_slope_seconds_per_million_input_tokens,
-            (body.len() as f64) / 4.0,
+            crate::waterfall::budget_input_tokens(body),
         )?;
         let start = deadline.checked_sub(self.request_timeout)?;
         Some((start + budget).min(deadline))

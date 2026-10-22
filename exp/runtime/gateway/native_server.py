@@ -64,6 +64,36 @@ def pre_first_byte_reserve_seconds(environ: Mapping[str, str] | None = None) -> 
     return seconds
 
 
+PRE_FIRST_BYTE_MAX_ENV = "EXP_GATEWAY_PRE_FIRST_BYTE_MAX_SECONDS"
+"""Operator override of the ceiling on a pre-first-byte budget an authored allowance raised."""
+
+
+def pre_first_byte_max_seconds(environ: Mapping[str, str] | None = None) -> float | None:
+    """Read the operator's ceiling on a raised pre-first-byte budget, if one is set.
+
+    An authored first-byte allowance raises a request's budget (see
+    ``pre_first_byte_reserve_seconds``) to at most this many seconds (the data
+    plane's default is 600 s); it never lowers the configured budget. Zero
+    removes the ceiling.
+
+    Args:
+        environ: The environment to read; ``None`` reads ``os.environ``.
+
+    Returns:
+        The override in seconds, or ``None`` to keep the data plane's default.
+
+    Raises:
+        ValueError: The override does not parse or is negative.
+    """
+    raw = (os.environ if environ is None else environ).get(PRE_FIRST_BYTE_MAX_ENV)
+    if not raw:
+        return None
+    seconds = float(raw)
+    if seconds < 0:
+        raise ValueError(f"{PRE_FIRST_BYTE_MAX_ENV} must not be negative")
+    return seconds
+
+
 def serve_native_gateway(
     control_plane: NativeServerControlPlane,
     *,
@@ -184,6 +214,9 @@ def serve_native_gateway(
     }
     if maximum_retained_output_bytes is not None:
         config["maximum_retained_output_bytes"] = maximum_retained_output_bytes
+    ceiling = pre_first_byte_max_seconds()
+    if ceiling is not None:
+        config["pre_first_byte_max_seconds"] = ceiling
     reserve = pre_first_byte_reserve_seconds()
     if reserve is not None:
         config["pre_first_byte_reserve_seconds"] = reserve
