@@ -3029,3 +3029,26 @@ def test_marker_grouping_never_leads_with_the_house_openrouter_rung() -> None:
     route = _mixed_route("maximize_cache", (_deployment("box"), byok))
     ordered, _ = _prefer_cache_capable_rungs(route, (box, openrouter), _marked_request())
     assert _order(ordered) == ("byok-openrouter", "box")
+
+
+def test_an_authored_route_the_grouping_leaves_unmoved_stays_as_written() -> None:
+    """quality-review !119: an org-authored [openrouter, X] route is never rewritten.
+
+    The grouping already leads with the marker-forwarding OpenRouter rung, so
+    it moves nothing, and the aggregator rule rides only an actual reorder
+    (as on the stage path): the org's own order stands.
+    """
+    client = cast(NativeWireClient, object())
+    openrouter = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://openrouter.ai/api/v1",
+            forwards_cache_control=True,
+        ),
+        client,
+    )
+    box = (GatewayWireProfile(dialect="openai_compatible", url="https://box.test"), client)
+    route = _mixed_route("maximize_cache", (_house_openrouter(), _deployment("box")))
+    ordered, wires = _prefer_cache_capable_rungs(route, (openrouter, box), _marked_request())
+    assert _order(ordered) == ("house-openrouter", "box")
+    assert ordered is route
