@@ -1,0 +1,18 @@
+# OSV-Scanner configuration for the gate's dependency audit (gate.yml,
+# gate-dependency-audit). Every override names the package, why the locked
+# version stays, and the date it stops applying, after which the gate fails
+# again until the version moves.
+
+[[PackageOverrides]]
+name = "pillow"
+ecosystem = "PyPI"
+effectiveUntil = 2026-10-24
+vulnerability.ignore = true
+reason = "Only the sft extra installs it (via tinker-cookbook). The fix, pillow 13.0.0, was published 2026-10-16 and clears the 7-day release cooldown on 2026-10-23; then run uv lock -P pillow==13.0.0."
+
+[[PackageOverrides]]
+name = "transformers"
+ecosystem = "PyPI"
+effectiveUntil = 2026-11-21
+vulnerability.ignore = true
+reason = "Only the sft extra installs it. The pinned tinker-cookbook 0.4.3 caps transformers at 5.5.4, so the fix (5.10.0+) needs the tinker-cookbook 0.5 upgrade."

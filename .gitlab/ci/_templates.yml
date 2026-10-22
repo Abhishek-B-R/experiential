@@ -8,6 +8,9 @@
     UV_VERSION: "0.12.18"
     MATURIN_VERSION: "1.14.1"
     RUST_TOOLCHAIN: "1.99.1"
+    # The gate's dependency audit; the digest is the release's published SHA-256.
+    OSV_SCANNER_VERSION: "2.7.0"
+    OSV_SCANNER_SHA256: "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b"
 
 .snippets:
   # Installs the pinned uv into an official python image's interpreter.
