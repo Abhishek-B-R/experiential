@@ -200,9 +200,15 @@ def execute_runs(
                 )
                 for index, prepared in enumerate(registrations, start=1)
             ]
-            for finished, future in enumerate(as_completed(futures), start=1):
-                future.result()
-                report(hook, PANEL_STAGE, completed=finished, total=total)
+            try:
+                for finished, future in enumerate(as_completed(futures), start=1):
+                    future.result()
+                    report(hook, PANEL_STAGE, completed=finished, total=total)
+            except BaseException:
+                # A failed or interrupted panel starts no queued trace; running traces finish.
+                for future in futures:
+                    future.cancel()
+                raise
     except (ProviderTransportError, CompletionNotDispatched) as exc:
         console.print(f"[red]error[/red] a provider request failed: {exc}")
         console.print(

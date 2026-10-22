@@ -167,6 +167,19 @@ def test_learning_hides_earlier_traces_of_the_same_task(
         assert "user_01" not in json.dumps(contexts), "retrieval also excludes the task"
 
 
+def test_an_identical_repeat_trace_learns_as_an_already_consumed_trajectory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second trace with exactly the same content is predicted, then adds no memory version."""
+    episodes = [*(episode(i) for i in range(USERS)), {**episode(1), "repeat": "-again"}]
+    provider = SimulatedProvider(episodes, learnable=True)
+    _, store, output = build_project(tmp_path, monkeypatch, provider, episodes=episodes, learn=True)
+    assert len(learning_cases(store, "all")) == USERS + 1
+    head = memory_head(store.artifacts, learning_plan(store).lineage)
+    assert head is not None and head.version == USERS
+    assert f"learned {USERS + 1}/{USERS + 1} traces · memory v{USERS}" in output
+
+
 def memory_delivered(prediction: JsonObject) -> str:
     """Everything memory delivered to one prediction: recalled records and the overview."""
     return json.dumps([prediction.get("memory_observations"), prediction.get("research_history")])

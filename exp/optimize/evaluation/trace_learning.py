@@ -529,6 +529,7 @@ def learn_from_traces(
         reserve_held_out(project, plan, code_revision=code_revision)
     cases = learning_cases(project, scope)
     used, learned, incomplete, stopped = 0, 0, 0, None
+    earlier: set[str] = set()  # trajectories of the traces before this one in the pass
     for index, case in enumerate(cases):
         report(progress, "Learning from traces", completed=index, total=len(cases))
         attempted: set[str] = set()
@@ -548,7 +549,7 @@ def learn_from_traces(
                 break  # attempts exhausted: the latest one stays the trace's result
             attempted.add(prepared.id)
             if saved_fidelity_report(project, prepared) is None:
-                _require_unlearned(project, plan, spec)
+                _require_unlearned(project, plan, spec, earlier)
                 if used + spec.maximum_physical_attempts > maximum_attempts:
                     stopped = (
                         f"attempt budget reached after {learned} of {len(cases)} traces; "
@@ -567,6 +568,7 @@ def learn_from_traces(
                 break
         if stopped is not None:
             break
+        earlier.add(consumed_trajectory_digest(trajectory_record(spec)))
         receipt = saved_memory_receipt(project, prepared)
         if receipt is not None and receipt.get("reason") in ("consumed", DUPLICATE):
             learned += 1
@@ -747,15 +749,26 @@ def _inside(
     return lambda event: progress(replace(event, detail=event.detail or detail))
 
 
-def _require_unlearned(project: ProjectStore, plan: LearningPlan, spec: FidelitySpec) -> None:
+def _require_unlearned(
+    project: ProjectStore, plan: LearningPlan, spec: FidelitySpec, earlier: set[str]
+) -> None:
     """Refuse to predict a trace this memory already learned, on memory that has seen later traces.
+
+    A trajectory that an earlier trace of the pass consumed belongs to an identical repeat, which
+    is predicted like any trace and then publishes nothing.
+
+    Args:
+        project: Project holding the memory lineage.
+        plan: The learning plan being run.
+        spec: This trace's learning run.
+        earlier: Trajectory digests of the traces before this one in the pass.
 
     Raises:
         ValueError: The trace is already in the lineage under different run inputs.
     """
     head = memory_head(project.artifacts, plan.lineage)
     digest = consumed_trajectory_digest(trajectory_record(spec))
-    if head is not None and digest in head.consumed:
+    if head is not None and digest in head.consumed and digest not in earlier:
         raise ValueError(
             f"trace {spec.task.task_id} is already learned into memory {plan.lineage} "
             f"v{head.version}, but its learning run inputs changed; predicting it again would "
