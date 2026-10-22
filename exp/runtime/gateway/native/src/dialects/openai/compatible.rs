@@ -269,7 +269,7 @@ impl Normalizer {
         };
         match delta.get("content") {
             Some(Value::String(content)) if !content.is_empty() => {
-                events.push(Event::TextDelta(content.clone()));
+                self.push_content(content, &mut events)?;
             }
             Some(Value::Array(parts)) => self.content_part_events(parts, &mut events)?,
             _ => {}
@@ -434,6 +434,64 @@ impl Normalizer {
         Ok(events)
     }
 
+    /// Route one answer-text fragment through the DSML guard (`super::dsml`):
+    /// text that cannot be tool-call markup becomes `TextDelta`, a complete
+    /// DSML block becomes ordinary tool calls, and markup that does not parse
+    /// fails the stream as malformed without ever reaching the caller.
+    fn push_content(&mut self, text: &str, events: &mut Vec<Event>) -> Result<(), Failure> {
+        let released = self.dsml.push(text).map_err(malformed)?;
+        self.release_dsml(released, events)
+    }
+
+    /// Emit what the DSML guard released, in order.
+    fn release_dsml(
+        &mut self,
+        released: super::dsml::Released,
+        events: &mut Vec<Event>,
+    ) -> Result<(), Failure> {
+        if !released.text.is_empty() {
+            events.push(Event::TextDelta(released.text));
+        }
+        for call in released.calls {
+            let index = self.tools.keys().next_back().map_or(0, |last| last + 1);
+            self.reserve_tool_entry(index)?;
+            let arguments = Value::Object(call.arguments).to_string();
+            self.reserve_tool_bytes(arguments.len())?;
+            let call_id = synthesized_call_id(index);
+            let mut tool = ToolAccumulator::new(call_id.clone(), call.name.clone());
+            tool.id_synthesized = true;
+            let delta = tool.push_arguments(&arguments);
+            events.push(Event::ToolCallStarted {
+                custom: false,
+                index,
+                call_id,
+                name: call.name,
+                namespace: None,
+                caller: None,
+                thought_signature: None,
+            });
+            if let Some(delta) = delta {
+                events.push(Event::ToolArgumentsDelta { index, delta });
+            }
+            self.tools.insert(index, tool);
+        }
+        if !released.trailing_text.is_empty() {
+            events.push(Event::TextDelta(released.trailing_text));
+        }
+        Ok(())
+    }
+
+    /// End the DSML guard with the content: a held `<` that never became
+    /// markup is released as text; an open span must parse or fail.
+    pub(in crate::dialects) fn finish_dsml(&mut self) -> Result<Vec<Event>, Failure> {
+        let mut events = Vec::new();
+        if self.dsml.holding() {
+            let released = self.dsml.finish().map_err(malformed)?;
+            self.release_dsml(released, &mut events)?;
+        }
+        Ok(events)
+    }
+
     /// Emit one reasoning fragment. On a replay route (Fireworks, Hunyuan)
     /// it is the sealed `reasoning_content` carrier; otherwise the plaintext
     /// is display copy only: encoders render it on rungs whose reasoning
@@ -474,7 +532,7 @@ impl Normalizer {
                 Some("text") => {
                     let text = wire_text(part.get("text"), "OpenAI-compatible text part")?;
                     if let Some(text) = text.filter(|text| !text.is_empty()) {
-                        events.push(Event::TextDelta(text));
+                        self.push_content(&text, events)?;
                     }
                 }
                 Some("thinking") => match part.get("thinking") {
@@ -514,7 +572,6 @@ impl Normalizer {
     /// finish reason is the provider's declared end of the choice, and both
     /// paths settle it identically.
     fn finish_openai_compatible_stream(&mut self) -> Result<Vec<Event>, Failure> {
-        let finish = self.finish_reason.as_deref();
         // A tool call cut off by the output budget (finish_reason=length,
         // arguments still an open JSON fragment) is the provider's honest
         // truncation, not a malformed stream: it surfaces as Incomplete
@@ -527,11 +584,14 @@ impl Normalizer {
         // settles Incomplete too; a syntax error inside the arguments
         // keeps the strict contract and stays malformed.
         let unreported = self.usage.is_none();
-        let (mut events, cut_mid_fragment) = if finish == Some("length") {
+        let mut events = self.finish_dsml()?;
+        let finish = self.finish_reason.as_deref();
+        let (tool_events, cut_mid_fragment) = if finish == Some("length") {
             (finish_open_tools_truncated(&mut self.tools)?, false)
         } else {
             finish_open_tools_relay(&mut self.tools, finish.unwrap_or("none"))?
         };
+        events.extend(tool_events);
         if let Some(usage) = self.usage.take() {
             events.push(Event::Usage(usage));
         }

@@ -221,6 +221,50 @@ applies the same rule after commitment, when every committed event was one it ca
 Provider-internal retry layers are disabled so every
 possible billable dispatch is visible to the gateway ledger.
 
+**Which rung a failover reaches.** A pre-commit failover-eligible failure advances to the first
+claimable rung this request has NOT dispatched yet, in route order, so a rung skipped earlier (shed
+at its bound on the first dial, or passed over by affinity order) is revisited before later ones;
+a rung already dispatched is never dialed again except by the same-deployment redial, and only rungs
+of this request's own route are ever considered. Both halves agree: the data plane's
+`successor_possible` counts any untried rung, and the control plane's `untried_depths` claims it. A
+sibling's saturation bound does not end a failover: a successor that sheds spills sideways to the
+other untried rungs, and only when every one of them shed is the first shed rung admitted as a forced
+pass (`saturated_overflow`). Forced failover passes are counted per rung and capped at half its bound
+in flight on top of it (at least one), so one dead lane cannot move its whole load onto the backup at
+once; a rung at that cap, a hard class cap or `:fast` reserve, or a rate-window shed is skipped. When
+every untried rung refuses, the request ends with the fast retryable `lane_saturated` 429
+(`Retry-After: 5`), never the dead rung's 502. A first dial keeps the refusing-bound 429.
+
+**Pre-first-byte budget.** The budget (`pre_first_byte_budget_seconds`, 90 s by default for a plane
+whose host sets nothing) bounds everything before the caller's first byte and caps every dial's header
+wait. A request's budget is raised to the longest AUTHORED first-byte allowance on its route (base
+plus the input slope for this prompt) plus a 15 s reserve
+(`EXP_GATEWAY_PRE_FIRST_BYTE_RESERVE_SECONDS` overrides it), so a self-hosted lane authoring 300 s
+for long prompts is never cut at the default; routes of lanes that author nothing keep the configured budget.
+Fast failures (refused, 5xx, transport) fail over at once as before; a header timeout fails over only
+while budget remains.
+
+**Dead-lane ejection.** Each worker ejects a dead lane on its own: three transport failures or
+provider 5xx (refused, 500, 502, 503, 504) on one lane within 10 s, keyed on the deployment id exactly
+as the route carries it (`mp-<uuid>`; a BYOK variant `mp-<row>-c-<connection>` is its own key) across
+catalog revisions, order that lane LAST in every claim walk for 30 s. It is never removed, so a
+single-rung route still dials it; after the cooldown one request probes it, a success restores its
+order and a dead-lane failure re-ejects it. Client 4xx, throttles and timeouts neither count nor reset
+the streak. An attempt dialed in an ejected lane's place records `dispatch_reason: lane_ejected` with
+the ejected lane as its `preferred_deployment`. `EXP_GATEWAY_LANE_EJECTION_FAILURES` (0 disables),
+`EXP_GATEWAY_LANE_EJECTION_WINDOW_SECONDS` and `EXP_GATEWAY_LANE_EJECTION_COOLDOWN_SECONDS` override
+the thresholds; nothing is published to the catalog.
+
+**DeepSeek DSML markup is never relayed as text.** On the OpenAI-compatible wire, content that
+could open a DeepSeek DSML tool-call tag (`<｜DSML｜…`, U+FF5C bars, optionally closing, after
+duplicated `<` or whitespace) is held back; any other `<` is released as soon as the next characters
+rule the marker out. A confirmed DSML block is parsed leniently (a space after `｜DSML｜`, `calls`
+for `function_calls`, `string="true|false"` typing): complete invokes become ordinary tool calls,
+and anything else (a lost opening, a stray closing tag) fails the attempt as `malformed_response`
+("the model emitted a malformed tool call; retry the request"), failover-eligible before
+commitment, with the markup dropped. Every caller surface encodes from these events, so Chat,
+Responses, Messages and non-streaming answers share the guard.
+
 **Per-rung conditional failover (`failover_only_on`).** A deployment may restrict itself to
 failover duty for a named set of failures (a customer's trusted-access OpenAI key taking only the
 house rung's `refusal:cyber_policy`); see [gateway-failover-rules.md](gateway-failover-rules.md).

@@ -203,6 +203,9 @@ class _RungLoad:
     # is held, every other reservation sees half the rung's bound, unless the
     # rung keeps an always-on reserve (``reserve(fast_reserve=)``).
     fast: int = 0
+    # In-flight forced FAILOVER passes (``reserve(failover_cap=)``), counted
+    # apart so one dead sibling cannot move its whole load onto this rung.
+    failover_forced: int = 0
 
 
 class RungLoadRegistry:
@@ -244,6 +247,7 @@ class RungLoadRegistry:
         self._tickets: dict[str, tuple[RungLoadKey, str]] = {}
         self._ticket_classes: dict[str, int] = {}
         self._fast_tickets: set[str] = set()
+        self._failover_tickets: set[str] = set()
         self._attempts: dict[str, str] = {}
         self._lock = threading.Lock()
 
@@ -269,6 +273,7 @@ class RungLoadRegistry:
         fast: bool = False,
         fast_reserve: int | None = None,
         fast_reserve_hard: bool = True,
+        failover_cap: int | None = None,
     ) -> str | RungShed:
         """Reserve one slot on a policy-bounded rung, or shed with a reason.
 
@@ -314,6 +319,10 @@ class RungLoadRegistry:
                 ``False`` (an ``overflow`` lane) keeps them soft: a regular
                 request past its share spills first, so :fast has first claim
                 on the reserved slots, and its forced pass admits as today.
+            failover_cap: A forced FAILOVER pass (``force`` set): the most
+                such passes this rung may hold in flight on top of its bound
+                (``lane_saturation.failover_overflow_cap``); at the cap the
+                pass sheds as a hit overflow ceiling. ``None`` = not a failover.
 
         Returns:
             An opaque ticket on admission, else the shed disclosure.
@@ -371,6 +380,8 @@ class RungLoadRegistry:
             # priority overflow retries the rung (lane_saturation.overflow_target).
             if class_cap is not None and rung.classes.get(class_cap[0], 0) >= class_cap[1]:
                 return RungShed("queue_bound", overflow_ceiling=True)
+            if force and failover_cap is not None and rung.failover_forced >= failover_cap:
+                return RungShed("queue_bound", overflow_ceiling=True)
             # The admitted count itself must stay within the ceiling, so a
             # fractional ceiling floors: 1.5x a bound of 5 holds 7, never 8.
             if force and overflow_ceiling is not None and rung.total + 1 > overflow_ceiling:
@@ -417,6 +428,9 @@ class RungLoadRegistry:
                 rung.fast += 1
                 organization.fast += 1
                 self._fast_tickets.add(ticket)
+            if force and failover_cap is not None:
+                rung.failover_forced += 1
+                self._failover_tickets.add(ticket)
             return ticket
 
     def can_admit(
@@ -794,9 +808,13 @@ class RungLoadRegistry:
         request_class = self._ticket_classes.pop(ticket, None)
         was_fast = ticket in self._fast_tickets
         self._fast_tickets.discard(ticket)
+        was_failover = ticket in self._failover_tickets
+        self._failover_tickets.discard(ticket)
         rung = self._rungs.get(key)
         if rung is None:
             return
+        if was_failover and rung.failover_forced > 0:
+            rung.failover_forced -= 1
         if request_class is not None and rung.classes.get(request_class, 0) > 0:
             rung.classes[request_class] -= 1
         if was_fast and rung.fast > 0:

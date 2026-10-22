@@ -914,6 +914,7 @@ fn error_code_text(value: &Value) -> Option<String> {
 }
 
 mod compatible;
+pub(super) mod dsml;
 
 #[cfg(test)]
 #[path = "openai/normalizer_tests.rs"]

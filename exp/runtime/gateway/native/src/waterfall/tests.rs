@@ -121,6 +121,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
         1,
         1,
         0,
+        &[1],
         &retryable,
         false,
     ));
@@ -132,6 +133,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
         2,
         2,
         0,
+        &[1],
         &retryable,
         false,
     ));
@@ -143,6 +145,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
         2,
         2,
         0,
+        &[1],
         &retryable,
         false,
     ));
@@ -154,6 +157,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
         8,
         1,
         0,
+        &[1],
         &retryable,
         false,
     ));
@@ -165,6 +169,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
         1,
         1,
         0,
+        &[1],
         &retryable,
         false,
     ));
@@ -180,6 +185,7 @@ fn ineligible_classes_never_advance_without_refusal_opt_in() {
         1,
         1,
         0,
+        &[1],
         &invalid,
         false,
     ));
@@ -191,6 +197,7 @@ fn ineligible_classes_never_advance_without_refusal_opt_in() {
         1,
         1,
         0,
+        &[1],
         &refusal,
         false,
     ));
@@ -202,6 +209,7 @@ fn ineligible_classes_never_advance_without_refusal_opt_in() {
         1,
         1,
         0,
+        &[1],
         &refusal,
         true,
     ));
@@ -213,6 +221,7 @@ fn ineligible_classes_never_advance_without_refusal_opt_in() {
         1,
         1,
         0,
+        &[1],
         &refusal,
         true,
     ));
@@ -228,6 +237,7 @@ fn failover_only_classes_skip_the_redial_and_advance() {
         1,
         1,
         0,
+        &[1],
         &throttled,
         false,
     ));
@@ -238,6 +248,7 @@ fn failover_only_classes_skip_the_redial_and_advance() {
         1,
         1,
         0,
+        &[1],
         &throttled,
         false,
     ));
@@ -364,4 +375,112 @@ fn first_token_allowance_has_its_own_base_and_shares_the_input_slope() {
     // The header allowance is untouched by the token base.
     let header = first_byte_allowance(&overridden, Duration::from_secs(15), 240.0, 0.0);
     assert_eq!(header, Duration::from_secs_f64(15.0));
+}
+
+#[test]
+fn failover_eligibility_matrix_by_upstream_status() {
+    // Dead-lane answers fail over to an untried rung (a skipped earlier one
+    // included); the caller's own 4xx never does. 401/403, 402 and a
+    // provider 404 keep their classifier's rule: operator deadness advances.
+    let route = plain(2);
+    let advances = |failure: &Failure| {
+        successor_possible(
+            policy(false),
+            &route,
+            far_deadline(),
+            1,
+            2,
+            1,
+            &[0, 1],
+            failure,
+            false,
+        )
+    };
+    for status in [500, 502, 503, 504, 401, 402, 403, 404, 408, 429] {
+        let failure = crate::upstream::transport_failure(Some(status));
+        assert!(failure.failover_eligible, "{status}");
+        assert!(advances(&failure), "{status}");
+    }
+    let refused = crate::upstream::transport_failure(None);
+    assert!(refused.failover_eligible && advances(&refused));
+    for status in [400, 413, 422] {
+        let failure = crate::upstream::transport_failure(Some(status));
+        assert!(!failure.failover_eligible, "{status}");
+        assert!(!advances(&failure), "{status}");
+    }
+}
+
+#[test]
+fn an_authored_header_allowance_raises_the_pre_first_byte_budget() {
+    let configured = Some(Duration::from_secs(90));
+    let default_base = Duration::from_secs(15);
+    // A ~200k-token prompt on a self-hosted lead authoring 300 s: the budget
+    // covers the lead's whole allowance (300 + 240 x 0.2 = 348 s) plus the
+    // reserve, so the header wait is never cut at the 90 s default.
+    let mut lead = wire(Some(300.0), None);
+    lead.deployment_id = "lead".to_string();
+    let route = [lead, wire(None, None)];
+    let budget = pre_first_byte_budget(
+        configured,
+        wire::PRE_FIRST_BYTE_RESERVE,
+        &route,
+        default_base,
+        240.0,
+        200_000.0,
+    )
+    .expect("budget stays enabled");
+    assert_eq!(
+        budget,
+        Duration::from_secs(348) + wire::PRE_FIRST_BYTE_RESERVE
+    );
+    // A slow backup reached by failover counts as much as the lead.
+    let backup_slow = [wire(None, None), wire(Some(300.0), Some(0.0))];
+    assert_eq!(
+        pre_first_byte_budget(
+            configured,
+            wire::PRE_FIRST_BYTE_RESERVE,
+            &backup_slow,
+            default_base,
+            240.0,
+            1.0
+        ),
+        Some(Duration::from_secs(300) + wire::PRE_FIRST_BYTE_RESERVE)
+    );
+    // Lanes that author nothing keep the configured budget, however large the prompt.
+    assert_eq!(
+        pre_first_byte_budget(
+            configured,
+            wire::PRE_FIRST_BYTE_RESERVE,
+            &plain(2),
+            default_base,
+            240.0,
+            900_000.0
+        ),
+        configured
+    );
+    // An authored allowance below the budget never shrinks it.
+    let short = [wire(Some(20.0), Some(0.0))];
+    assert_eq!(
+        pre_first_byte_budget(
+            configured,
+            wire::PRE_FIRST_BYTE_RESERVE,
+            &short,
+            default_base,
+            240.0,
+            1.0
+        ),
+        configured
+    );
+    // A disabled budget stays disabled.
+    assert_eq!(
+        pre_first_byte_budget(
+            None,
+            wire::PRE_FIRST_BYTE_RESERVE,
+            &route,
+            default_base,
+            240.0,
+            200_000.0
+        ),
+        None
+    );
 }
