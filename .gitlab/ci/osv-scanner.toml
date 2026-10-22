@@ -195,6 +195,11 @@ ignoreUntil = 2026-10-24
 reason = "pillow 12.3.0, sft extra only (via tinker-cookbook). The fix, pillow 13.0.0, was published 2026-10-16 and clears the 7-day release cooldown on 2026-10-23; then run uv lock -P pillow==13.0.0 and delete these entries."
 
 [[IgnoredVulns]]
+id = "GHSA-78g4-xqwv-q3g8"
+ignoreUntil = 2026-10-24
+reason = "pillow 12.3.0, sft extra only (via tinker-cookbook). The fix, pillow 13.0.0, was published 2026-10-16 and clears the 7-day release cooldown on 2026-10-23; then run uv lock -P pillow==13.0.0 and delete these entries."
+
+[[IgnoredVulns]]
 id = "GHSA-xrqw-3rrv-vx5w"
 ignoreUntil = 2026-11-21
 reason = "transformers 5.5.4, sft extra only. The pinned tinker-cookbook 0.4.3 caps transformers at 5.5.4, so the fix (5.10.0+) waits on the tinker-cookbook 0.5 upgrade."
