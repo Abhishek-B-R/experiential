@@ -71,11 +71,14 @@ impl Normalizer {
                 events.push(Event::Usage(usage));
             }
             // The block reason names the category the same way a candidate
-            // finishReason does.
+            // finishReason does. Google's raw token also rides the ledger
+            // detail: `OTHER` (and any reason newer than the vocabulary)
+            // maps to the unnamed category, and without the token the
+            // ledger read a bare "provider refused the request" that no one
+            // could tell apart from any other refusal (2026-10-22,
+            // gemini-4-argon under Claude Code).
             let reason = gemini_block_reason(&payload).unwrap_or_default();
-            events.push(Event::Failed(Failure::refusal(
-                crate::stream_errors::refusal_reason(Some(&reason), None),
-            )));
+            events.push(Event::Failed(gemini_refusal("blockReason", &reason)));
             return Ok(events);
         }
         let candidates = match payload.get("candidates") {
@@ -224,9 +227,7 @@ impl Normalizer {
             | "SPII"
             | "IMAGE_SAFETY"
             | "IMAGE_PROHIBITED_CONTENT"
-            | "IMAGE_RECITATION" => Event::Failed(Failure::refusal(
-                crate::stream_errors::refusal_reason(Some(&finish_reason), None),
-            )),
+            | "IMAGE_RECITATION" => Event::Failed(gemini_refusal("finishReason", &finish_reason)),
             // The model produced an unparsable call or answer. It is a
             // sampling failure, not a verdict on the request: Gemini 3.1 Pro
             // ends about half of fresh tool prompts this way when called
@@ -317,6 +318,16 @@ fn gemini_part_without_inline_data(part: &Value) -> Value {
         }
     }
     retained
+}
+
+/// The content-free refusal for one Gemini verdict token (a candidate
+/// `finishReason` or a `promptFeedback.blockReason`). The caller sees only the
+/// bounded category; the token itself, screened to an identifier, rides
+/// `provider_detail` into the ledger, which refusals never relay to callers.
+fn gemini_refusal(field: &str, token: &str) -> Failure {
+    Failure::refusal(crate::stream_errors::refusal_reason(Some(token), None)).with_provider_detail(
+        Some(format!("{field} {}", super::bounded_wire_token(token))),
+    )
 }
 
 /// Whether `promptFeedback` reports a prompt-level block: any `blockReason`

@@ -2,6 +2,7 @@
 
 use super::super::{drain_stream_fixture, Dialect};
 use super::*;
+use crate::errors::RefusalReason;
 use serde_json::json;
 
 fn run_stream(dialect: Dialect, chunks: &[&[u8]]) -> (Vec<Value>, Option<Failure>) {
@@ -383,6 +384,71 @@ fn gemini_prompt_block_is_a_content_free_refusal_with_its_usage() {
             "{reason}"
         );
     }
+}
+
+#[test]
+fn gemini_refusals_keep_the_raw_verdict_token_for_the_ledger_only() {
+    // gemini-4-argon, 2026-10-22: Claude Code turns blocked on the prompt
+    // settled as a bare "provider refused the request" with no category and
+    // no detail. The block reason Google named must reach the ledger (as the
+    // provider detail) while the caller still sees only the bounded category.
+    for (frame, category, detail) in [
+        (
+            json!({"promptFeedback": {"blockReason": "OTHER"}}),
+            RefusalReason::Unspecified,
+            "blockReason OTHER",
+        ),
+        (
+            json!({"promptFeedback": {"blockReason": "JAILBREAK"}}),
+            RefusalReason::Unspecified,
+            "blockReason JAILBREAK",
+        ),
+        (
+            json!({"promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}}),
+            RefusalReason::ContentPolicy,
+            "blockReason PROHIBITED_CONTENT",
+        ),
+        (
+            json!({"promptFeedback": {"blockReason": "not a token, with prose"}}),
+            RefusalReason::Unspecified,
+            "blockReason non-identifier",
+        ),
+    ] {
+        let mut normalizer = super::super::Normalizer::new(Dialect::GeminiGenerateContent);
+        let events = normalizer
+            .feed(&crate::sse::SseEvent {
+                event: None,
+                data: frame.to_string(),
+            })
+            .expect("a prompt block is a terminal event");
+        let [Event::Failed(failure)] = events.as_slice() else {
+            panic!("{frame}: expected one refusal, got {events:?}");
+        };
+        assert_eq!(failure.failure_class, FailureClass::Refusal, "{frame}");
+        assert_eq!(failure.refusal_reason, Some(category), "{frame}");
+        assert_eq!(failure.provider_detail.as_deref(), Some(detail), "{frame}");
+        let body = failure.public_error().json_body();
+        assert!(!body.to_string().contains(detail), "{frame}: {body}");
+        assert!(!failure.retryable_same_deployment && !failure.failover_eligible);
+    }
+    // A candidate-level refusal finish keeps its token the same way; it is
+    // emitted once transport ends.
+    let mut normalizer = super::super::Normalizer::new(Dialect::GeminiGenerateContent);
+    normalizer
+        .feed(&crate::sse::SseEvent {
+            event: None,
+            data: json!({"candidates": [{"finishReason": "SAFETY"}]}).to_string(),
+        })
+        .expect("terminal candidate");
+    let events = normalizer.on_stream_end().expect("terminal");
+    let [Event::Failed(failure)] = events.as_slice() else {
+        panic!("expected one refusal, got {events:?}");
+    };
+    assert_eq!(failure.refusal_reason, Some(RefusalReason::ContentPolicy));
+    assert_eq!(
+        failure.provider_detail.as_deref(),
+        Some("finishReason SAFETY")
+    );
 }
 
 #[test]
