@@ -38,6 +38,10 @@ from exp.runtime.openai_protocol.custom_tool_wire import (
 )
 from exp.runtime.openai_protocol.custom_tool_wire import EchoedItemStatus as _EchoedItemStatus
 from exp.runtime.openai_protocol.native_tools import NativeResponseTool
+from exp.runtime.openai_protocol.prompt_cache_controls import (
+    ChatPromptCacheOptions,
+    ResponsesPromptCacheOptions,
+)
 from exp.runtime.openai_protocol.reasoning_replay import ReasoningDetail
 from exp.runtime.openai_protocol.tool_call_extra_content import ToolCallExtraContent
 from exp.runtime.openai_protocol.web_search import ChatPlugin, WebSearchOptions
@@ -617,6 +621,7 @@ class _ChatRequest(SamplingExtraFields, _WireModel):
     safety_identifier: str | None = Field(default=None, max_length=1024)
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
+    prompt_cache_options: ChatPromptCacheOptions | None = None
     service_tier: ServiceTier | None = None
     provider: ProviderRoutingPreferences | None = None
     gateway: GatewayRequestPolicy | None = None
@@ -914,28 +919,6 @@ _ResponsesOutputItem = Annotated[
 _ResponsesInputItem = _ResponseMessage | _ResponsesOutputItem
 
 
-class _PromptCacheOptions(_WireModel):
-    """Responses prompt-cache selector: implicit mode and a minimum cache lifetime.
-
-    VS Code Copilot's custom-endpoint provider hardcodes
-    ``{"mode": "implicit"}`` on every Responses request (wire-captured
-    2026-09-02). Implicit prefix caching is exactly what served routes
-    already do, so the value is accepted as already satisfied; any other
-    mode names behavior this gateway does not provide and stays a closed
-    rejection.
-
-    Attributes:
-        mode: ``"implicit"`` or omitted (OpenAI's default for GPT-5.6 and later).
-        ttl: OpenAI's minimum cache lifetime. ``"30m"`` is the provider default
-            and is accepted as already satisfied. ``"12h"`` is forwarded only to
-            rungs that declare ``supports_prompt_cache_ttl_12h``, and is refused
-            when none does. Any other value is refused here, as OpenAI refuses it.
-    """
-
-    mode: Literal["implicit"] | None = None
-    ttl: Literal["30m", "12h"] | None = None
-
-
 class _ResponsesRequest(_WireModel):
     """Closed gateway Responses request profile.
 
@@ -970,7 +953,7 @@ class _ResponsesRequest(_WireModel):
             raise ValueError("supported only as 'disabled': this gateway never truncates context")
         return value
 
-    prompt_cache_options: _PromptCacheOptions | None = None
+    prompt_cache_options: ResponsesPromptCacheOptions | None = None
     stream: bool = False
     client_metadata: JsonObject | None = None
     metadata: JsonObject = Field(default_factory=dict)

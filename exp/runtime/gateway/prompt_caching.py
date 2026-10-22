@@ -11,7 +11,8 @@ three promises on every route:
   so the route keeps its certified order.
 * Every caller cache marker is removed before any payload is built: Anthropic
   ``cache_control`` on the top level, content blocks, tool results, tool calls
-  and tool definitions (Bedrock would translate these to ``cachePoint``), and
+  and tool definitions (Bedrock would translate these to ``cachePoint``; OpenAI
+  ``prompt_cache_breakpoint`` markers ride the same carriers), and
   OpenAI's 12-hour ``prompt_cache_options.ttl``. The caller's
   ``prompt_cache_key`` stays in request identity but reaches no provider.
   Each removed path is disclosed in ``ignored_parameters``.
@@ -184,7 +185,9 @@ def _marker_paths(request: GatewayRequest) -> tuple[str, ...]:
     if any(call.cache_control is not None for m in request.messages for call in m.tool_calls):
         paths.append(f"messages.tool_calls.{_MARKER}")
     if any(_content_marked(message) for message in request.messages):
-        paths.append(f"messages.content.{_MARKER}")
+        # OpenAI breakpoints ride the same carriers; name them as the caller did.
+        spelling = "prompt_cache_breakpoint" if request.prompt_cache_breakpoints else _MARKER
+        paths.append(f"messages.content.{spelling}")
     if request.prompt_cache_key is not None:
         paths.append("prompt_cache_key")
     if request.prompt_cache_ttl is not None:

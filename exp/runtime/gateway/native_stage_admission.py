@@ -30,6 +30,7 @@ from exp.runtime.gateway.recovery_binding import validated_recovery_binding
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.sticky_affinity import AffinityPlacement
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.prompt_cache_options import honors_markers
 from exp.runtime.models.providers.protocol import NativeWireClient
 
 _logger = logging.getLogger(__name__)
@@ -112,8 +113,9 @@ def stage_affinity_ordered_rungs(
         if stage.failover_mode != "maximize_availability" and request_carries_cache_markers(
             request
         ):
-            indexes = tuple(i for i in indexes if wires[i][0].preserves_cache_control) + tuple(
-                i for i in indexes if not wires[i][0].preserves_cache_control
+            honors = {i for i in indexes if honors_markers(wires[i][0], request)}
+            indexes = tuple(i for i in indexes if i in honors) + tuple(
+                i for i in indexes if i not in honors
             )
         order.extend(indexes)
         offset += len(stage.deployment_ids)
@@ -218,8 +220,8 @@ def stage_affinity_ordered_rungs(
         for deployment_id, _scope in candidates:
             depth = route.snapshot.deployment_ids.index(deployment_id)
             stage = route.snapshot.stage_for_depth(depth)
-            if wires[depth][0].preserves_cache_control or not any(
-                wires[prior][0].preserves_cache_control
+            if honors_markers(wires[depth][0], request) or not any(
+                honors_markers(wires[prior][0], request)
                 and route.snapshot.stage_for_depth(prior).stage_index == stage.stage_index
                 and eligible(route.deployments[prior].deployment_id)
                 and headroom(route.deployments[prior].deployment_id)

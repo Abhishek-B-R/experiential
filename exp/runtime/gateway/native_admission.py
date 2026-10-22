@@ -79,6 +79,7 @@ from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
     plaintext_reasoning_lead_order,
 )
+from exp.runtime.models.providers.prompt_cache_options import honors_markers
 from exp.runtime.models.providers.protocol import NativeWireClient
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 from exp.runtime.openai_protocol.state import ProtocolNamespace, episode_namespace
@@ -537,7 +538,7 @@ def _prefer_cache_capable_rungs(
     marker_capable = tuple(
         index
         for index, (profile, _client) in enumerate(resolved_wires)
-        if profile.preserves_cache_control
+        if honors_markers(profile, provider_request)
     )
     if not marker_capable or len(marker_capable) == len(resolved_wires):
         return route, resolved_wires
@@ -633,7 +634,7 @@ def _affinity_ordered_rungs(
         marker_capable = frozenset(
             index
             for index, (profile, _client) in enumerate(resolved_wires)
-            if profile.preserves_cache_control
+            if honors_markers(profile, provider_request)
         )
         if marker_capable and len(marker_capable) < len(resolved_wires):
             order = (

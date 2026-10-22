@@ -92,6 +92,10 @@ from exp.runtime.models.providers.openai_payloads import (
 from exp.runtime.models.providers.openai_payloads import (
     openai_responses_stream_payload as openai_responses_stream_payload,
 )
+from exp.runtime.models.providers.prompt_cache_options import (
+    cache_marker_spelling,
+    prompt_cache_disclosures,
+)
 from exp.runtime.models.providers.reasoning_compat import (
     require_between_tools_support,
     shape_anthropic_thinking_config,
@@ -591,10 +595,15 @@ def route_generation_parameter_requests(
             if part.kind == "text" or part.kind == "image" or part.kind == "document"
         )
         for message in request.messages
-    ) and not any(profile.preserves_cache_control for profile in profiles):
-        content_marker = f"messages.content.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}"
+    ) and not any(
+        profile.honors_cache_markers(openai_breakpoints=request.prompt_cache_breakpoints)
+        for profile in profiles
+    ):
+        marker = cache_marker_spelling(request)
+        content_marker = f"messages.content.{marker}{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}"
         if content_marker not in ignored:
             ignored.append(content_marker)
+    ignored.extend(d for d in prompt_cache_disclosures(profiles, request) if d not in ignored)
 
     # LiteLLM's echoed provider_specific_fields: no wire takes it; dropped with disclosure.
     if any(message.provider_specific_fields for message in request.messages):

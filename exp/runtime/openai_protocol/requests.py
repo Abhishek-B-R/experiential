@@ -67,11 +67,16 @@ from exp.runtime.openai_protocol.errors import (
 from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
     EMBEDDINGS_MANIFEST,
-    RESPONSES_INCLUDE_PATHS_ACCEPTED,
     RESPONSES_MANIFEST,
+    responses_include_options,
     validate_manifest,
 )
 from exp.runtime.openai_protocol.media_parts import message_content
+from exp.runtime.openai_protocol.prompt_cache_controls import (
+    extract_prompt_cache_breakpoints,
+    prompt_cache_fields,
+    restore_responses_breakpoints,
+)
 from exp.runtime.openai_protocol.prompt_cache_key_alias import fold_prompt_cache_key_alias
 from exp.runtime.openai_protocol.reasoning_replay import (
     ReplayedReasoningTooLong,
@@ -274,7 +279,8 @@ def decode_chat(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
     payload, alias_disclosures = repair_chat(*fold_prompt_cache_key_alias(payload))
-    cache_payload = payload
+    breakpoints = extract_prompt_cache_breakpoints(payload, container="messages")
+    payload = cache_payload = breakpoints.marked  # Breakpoints ride the cache_control path.
     payload = drop_opencode_cache_control(payload)
     validate_manifest(payload, CHAT_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
@@ -295,6 +301,7 @@ def decode_chat(
         },
     )
     request = _validate_wire(_ChatRequest, payload)
+    cache = prompt_cache_fields(breakpoints, request.prompt_cache_options)
     alias, online_suffix = split_online_suffix(request.model)
     idempotency_key, client_request_id = validated_operation_headers(
         idempotency_key, client_request_id
@@ -339,6 +346,7 @@ def decode_chat(
             ignored_parameters=(
                 *alias_disclosures,
                 *cap_disclosures,
+                *breakpoints.disclosures,
                 *cache_disclosures,
                 *custom_turn_cache_disclosures(cache_payload.get("messages")),
                 *thinking.disclosures,
@@ -381,6 +389,8 @@ def decode_chat(
             safety_identifier=request.safety_identifier,
             user=request.user,
             prompt_cache_key=request.prompt_cache_key,
+            prompt_cache_mode=cache.mode,
+            prompt_cache_breakpoints=cache.breakpoints,
             service_tier=request.service_tier,
             text_verbosity=request.verbosity,
             idempotency_key=idempotency_key,
@@ -444,10 +454,13 @@ def decode_responses(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
     payload, alias_disclosures = repair_responses(*fold_prompt_cache_key_alias(payload))
+    breakpoints = extract_prompt_cache_breakpoints(payload, container="input")
+    payload = breakpoints.payload
     validate_manifest(payload, RESPONSES_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
     request = _validate_wire(_ResponsesRequest, payload)
+    cache = prompt_cache_fields(breakpoints, request.prompt_cache_options)
     alias, online_suffix = split_online_suffix(request.model)
     require_responses_input(request)
     if not isinstance(request.input, str):
@@ -464,7 +477,7 @@ def decode_responses(
         include_encrypted_reasoning,
         include_output_text_logprobs,
         include_web_search_sources,
-    ) = _responses_include_options(request.include)
+    ) = responses_include_options(request.include)
     idempotency_key, client_request_id = validated_operation_headers(
         idempotency_key, client_request_id
     )
@@ -486,8 +499,17 @@ def decode_responses(
                 )
             )
     replayed_items = cast("list[JsonObject]", raw_input) if isinstance(raw_input, list) else ()
+    marked = breakpoints.marked.get("input") if breakpoints.present else None
+    cache_disclosures: list[str] = []
     try:
-        messages = list(_response_input_messages(request.input, raw_items=replayed_items))
+        messages = list(
+            _response_input_messages(
+                request.input,
+                raw_items=replayed_items,
+                marked_items=cast("list[JsonObject]", marked) if isinstance(marked, list) else (),
+                cache_disclosures=cache_disclosures,
+            )
+        )
     except ValidationError as exc:
         # History reconstruction folds echoed items into canonical messages,
         # so a canonical-contract violation (such as duplicate call_ids in one
@@ -515,6 +537,8 @@ def decode_responses(
             json_object_output=responses_json_object_output(request.text),
             ignored_parameters=(
                 *alias_disclosures,
+                *breakpoints.disclosures,
+                *cache_disclosures,
                 *_replayed_reasoning_disclosures(
                     ()
                     if isinstance(request.input, str)
@@ -566,13 +590,10 @@ def decode_responses(
             safety_identifier=request.safety_identifier,
             user=request.user,
             prompt_cache_key=request.prompt_cache_key,
-            # "30m" is OpenAI's default lifetime, already satisfied; only "12h" routes.
-            prompt_cache_ttl=(
-                "12h"
-                if request.prompt_cache_options is not None
-                and request.prompt_cache_options.ttl == "12h"
-                else None
-            ),
+            # The provider defaults ("implicit", "30m") are already satisfied.
+            prompt_cache_ttl=cache.ttl,
+            prompt_cache_mode=cache.mode,
+            prompt_cache_breakpoints=cache.breakpoints,
             service_tier=request.service_tier,
             idempotency_key=idempotency_key,
             client_request_id=client_request_id,
@@ -809,42 +830,18 @@ def _response_tool(tool: _ResponseTool) -> GatewayToolDefinition:
     )
 
 
-def _responses_include_options(include: tuple[str, ...] | None) -> tuple[bool, bool, bool]:
-    """Validate the closed ``include`` selector list.
-
-    Args:
-        include: Raw caller include paths.
-
-    Returns:
-        The encrypted-reasoning, output-text-logprobs and web-search-sources
-        selectors.
-
-    Raises:
-        OpenAIProtocolError: An include path is not supported by this gateway.
-    """
-    if include is None:
-        return False, False, False
-    for path in include:
-        if path not in RESPONSES_INCLUDE_PATHS_ACCEPTED:
-            raise invalid_field(
-                "include",
-                f"The include path {path!r} is not supported by this gateway. "
-                "Only 'reasoning.encrypted_content', 'message.output_text.logprobs' "
-                "and 'web_search_call.action.sources' are available.",
-            )
-    return (
-        "reasoning.encrypted_content" in include,
-        "message.output_text.logprobs" in include,
-        "web_search_call.action.sources" in include,
-    )
-
-
 def _response_input_messages(
     value: str | tuple[_ResponsesInputItem, ...],
     *,
     raw_items: Sequence[JsonObject] = (),
+    marked_items: Sequence[JsonObject] = (),
+    cache_disclosures: list[str],
 ) -> tuple[GatewayMessage, ...]:
-    """Validate replay details and reconstruct OpenAI or Fireworks history."""
+    """Validate replay details and reconstruct OpenAI or Fireworks history.
+
+    ``marked_items`` carry text-block breakpoints as ``cache_control`` (see
+    ``prompt_cache_controls``); restore disclosures land in ``cache_disclosures``.
+    """
     if isinstance(value, str):
         return responses_input_messages(value)
     replayed: list[ReplayedInput] = []
@@ -927,7 +924,9 @@ def _response_input_messages(
                 ) from exc
             replayed.append(ReplayedReasoning(index=index, block=block, visible=visible))
         elif isinstance(item, _ResponseMessage):
-            converted = _messages((item,), f"input.{index}")
+            converted = restore_responses_breakpoints(
+                _messages((item,), f"input.{index}"), marked_items, index, cache_disclosures
+            )
             if converted and item.role == "assistant":
                 converted = (
                     converted[0].model_copy(
