@@ -645,6 +645,7 @@ def execute_fidelity_evaluation(
                 client=resolved.client,
                 plan=CompletionPlan(
                     model=resolved.snapshot,
+                    served_model_id=resolved.served_model_id,
                     capabilities=resolved.capabilities,
                     deadline=spec.deadline,
                     output_tokens=spec.budget(role).output_tokens,

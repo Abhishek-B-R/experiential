@@ -45,7 +45,6 @@ class WorldModelSessionError(ValueError):
 class WorldModelSessionLimits:
     """Explicit resource limits for one in-memory public world-model runtime."""
 
-    maximum_output_tokens: int = 1_024
     maximum_sessions: int = 256
     session_ttl_seconds: float = 3_600.0
     maximum_messages_per_session: int = 128
@@ -53,6 +52,7 @@ class WorldModelSessionLimits:
     maximum_observation_bytes: int = 65_536
     maximum_task_bytes: int = 65_536
     maximum_initial_context_bytes: int = 262_144
+    maximum_output_tokens: int = 1_024
 
     def __post_init__(self) -> None:
         """Validate every count, time, and byte ceiling.
