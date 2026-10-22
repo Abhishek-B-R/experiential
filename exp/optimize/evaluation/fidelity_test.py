@@ -276,7 +276,7 @@ def test_predictions_references_and_completed_replay(
             "output_protocol": output_protocol,
         }
     )
-    axes = {
+    axes: JsonObject = {
         d.dimension_id: {
             "status": "assessed",
             "score": 5,
