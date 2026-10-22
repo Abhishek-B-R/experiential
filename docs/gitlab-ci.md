@@ -54,8 +54,10 @@ for `python-package`, the area's inputs in the **Run pipeline** form:
 
 - **Images.** Linux and macOS jobs set `image:`. The hosted Windows runner
   cannot: it runs a fixed Windows Server 2022 VM with PowerShell.
-- **Tools.** uv and maturin come from `UV_VERSION` and `MATURIN_VERSION` in
-  `.tools`. Rust follows the stable channel through rustup.
+- **Tools.** uv, maturin and the Rust toolchain come from `UV_VERSION`,
+  `MATURIN_VERSION` and `RUST_TOOLCHAIN` in `.tools`. Container images are
+  pinned by digest, and every install reads `uv.lock` and `Cargo.lock` as
+  committed (`--locked`).
 - **Ordering.** Jobs order with `needs:`; a job without dependencies sets
   `needs: []` so it starts at once. Values pass between jobs through
   `artifacts:reports:dotenv`, and files through `artifacts:`.
