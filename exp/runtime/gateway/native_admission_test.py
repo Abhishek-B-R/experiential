@@ -2989,3 +2989,43 @@ def test_a_prompt_cap_moves_a_long_prompt_to_the_main_lane_but_never_refuses() -
     )
     assert tuple(d.deployment_id for d in narrowed.deployments) == ("fast",)
     assert provider.service_tier == "priority"
+
+
+def _house_openrouter(deployment_id: str = "house-openrouter") -> ExactModelDeployment:
+    """A host-funded OpenRouter rung: the house aggregator of last resort."""
+    return _deployment(deployment_id, provider="openrouter").model_copy(
+        update={"billing_source": BillingSource.HOST_MANAGED}
+    )
+
+
+def test_marker_grouping_never_leads_with_the_house_openrouter_rung() -> None:
+    """GLM-5.3-Flash-uncensored 2026-10-22: the marker grouping put house OpenRouter first.
+
+    The house box drops cache markers and OpenRouter forwards them, so the
+    ``maximize_cache`` grouping moved OpenRouter ahead of the box for every
+    cache-marked request although the platform had ordered it last. The
+    aggregator stays behind the box (owner rule: OpenRouter is never the first
+    lane); a customer's own OpenRouter key keeps the grouping's order.
+    """
+    client = cast(NativeWireClient, object())
+    box = (GatewayWireProfile(dialect="openai_compatible", url="https://box.test"), client)
+    openrouter = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://openrouter.ai/api/v1",
+            forwards_cache_control=True,
+        ),
+        client,
+    )
+    route = _mixed_route("maximize_cache", (_deployment("box"), _house_openrouter()))
+    ordered, wires = _prefer_cache_capable_rungs(route, (box, openrouter), _marked_request())
+    assert _order(ordered) == ("box", "house-openrouter")
+    assert [profile.url for profile, _ in wires] == [
+        "https://box.test",
+        "https://openrouter.ai/api/v1",
+    ]
+
+    byok = _deployment("byok-openrouter", provider="openrouter")
+    route = _mixed_route("maximize_cache", (_deployment("box"), byok))
+    ordered, _ = _prefer_cache_capable_rungs(route, (box, openrouter), _marked_request())
+    assert _order(ordered) == ("byok-openrouter", "box")

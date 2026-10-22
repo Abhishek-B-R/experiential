@@ -9,6 +9,7 @@ import time
 from exp.runtime.gateway.affinity import (
     affinity_fingerprint,
     affinity_seed_material,
+    house_aggregator_last,
     rendezvous_order,
 )
 from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
@@ -94,8 +95,10 @@ def stage_affinity_ordered_rungs(
     order: list[int] = []
     offset = 0
     stages = route.snapshot.model_stages or (route.snapshot.stage_for_depth(0),)
+    profiles = [profile for profile, _client in wires]
     for stage in stages:
-        indexes = tuple(range(offset, offset + len(stage.deployment_ids)))
+        authored = tuple(range(offset, offset + len(stage.deployment_ids)))
+        indexes = authored
         if stage.failover_mode == "maximize_cache_affinity":
             weighted = tuple(
                 (
@@ -115,6 +118,12 @@ def stage_affinity_ordered_rungs(
             indexes = tuple(i for i in indexes if wires[i][0].preserves_cache_control) + tuple(
                 i for i in indexes if not wires[i][0].preserves_cache_control
             )
+        if indexes != authored:
+            # Neither the rendezvous nor the marker grouping may lead a stage
+            # with a host-funded OpenRouter rung (owner rule: OpenRouter is
+            # never the first lane). A stage this scheduler did not reorder
+            # keeps its authored order, so an org's own chain stays as written.
+            indexes = house_aggregator_last(indexes, route.deployments, profiles)
         order.extend(indexes)
         offset += len(stage.deployment_ids)
     route = reorder_route_deployments(route, tuple(order))

@@ -545,6 +545,9 @@ def _prefer_cache_capable_rungs(
         *marker_capable,
         *(index for index in range(len(resolved_wires)) if index not in marker_capable),
     )
+    # The grouping never leads with a host-funded OpenRouter rung (owner rule:
+    # OpenRouter is never the first lane), as on affinity pools.
+    order = house_aggregator_last(order, route.deployments, [p for p, _ in resolved_wires])
     return (
         reorder_route_deployments(route, order),
         tuple(resolved_wires[index] for index in order),
