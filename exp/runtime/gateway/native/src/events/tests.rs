@@ -848,26 +848,71 @@ fn openai_cache_write_subsets_survive_normalization() {
 }
 
 #[test]
-fn cache_subsets_cannot_exceed_openai_total_input() {
-    for (reads, writes) in [(0, 11), (6, 5), (11, 0)] {
-        assert!(openai_compatible_usage(&json!({
+fn cache_subsets_above_openai_total_input_raise_the_input_total() {
+    // Reads plus writes above the reported input keep every reported cache
+    // token in its own leg and raise the input total to cover them, with no
+    // fresh remainder, so nothing the provider reported is dropped.
+    for (reads, writes, settled) in [(0, 11, 11), (6, 5, 11), (11, 0, 11)] {
+        let chat = openai_compatible_usage(&json!({
             "prompt_tokens": 10, "completion_tokens": 1,
             "prompt_tokens_details": {"cached_tokens": reads, "cache_write_tokens": writes}
         }))
-        .is_err());
-        assert!(openai_usage(Some(&json!({
+        .expect("an overlapping report settles");
+        let responses = openai_usage(Some(&json!({
             "input_tokens": 10, "output_tokens": 1,
             "input_tokens_details": {"cached_tokens": reads, "cache_write_tokens": writes}
         })))
-        .is_err());
+        .expect("an overlapping report settles")
+        .expect("usage");
+        for usage in [chat, responses] {
+            assert_eq!(usage.input_tokens, Some(settled));
+            assert_eq!(usage.cached_input_tokens, Some(reads));
+            assert_eq!(usage.cache_creation_input_tokens, Some(writes));
+            assert_eq!(usage.output_tokens, Some(1));
+        }
     }
     let usage = openai_compatible_usage(&json!({
         "prompt_tokens": 10, "completion_tokens": 1,
         "prompt_tokens_details": {"cached_tokens": 6, "cache_write_tokens": 4}
     }))
     .unwrap();
+    assert_eq!(usage.input_tokens, Some(10));
     assert_eq!(usage.cached_input_tokens, Some(6));
     assert_eq!(usage.cache_creation_input_tokens, Some(4));
+    // An unpersistable subset sum stays a contract violation.
+    assert!(openai_compatible_usage(&json!({
+        "prompt_tokens": 10, "completion_tokens": 1,
+        "prompt_tokens_details": {"cached_tokens": i64::MAX as u64, "cache_write_tokens": 1}
+    }))
+    .is_err());
+}
+
+#[test]
+fn novita_kimi_cache_legs_above_the_prompt_total_settle_instead_of_failing() {
+    // The Moonshot-style Kimi report Novita relays: `prompt_tokens` is
+    // inclusive of both cache legs, and on some prompts the read and write
+    // pages together overshoot it (kimi-k3, 2026-10-22, 37 malformed
+    // attempts). The generation is finished and billed, so it settles.
+    let usage = openai_compatible_usage(&json!({
+        "prompt_tokens": 7588, "completion_tokens": 320, "total_tokens": 7908,
+        "prompt_tokens_details": {"cached_tokens": 7398, "cache_write_tokens": 462},
+        "completion_tokens_details": {"reasoning_tokens": 180}
+    }))
+    .expect("a finished generation settles");
+    assert_eq!(usage.input_tokens, Some(7860));
+    assert_eq!(usage.cached_input_tokens, Some(7398));
+    assert_eq!(usage.cache_creation_input_tokens, Some(462));
+    assert_eq!(usage.output_tokens, Some(320));
+    assert_eq!(usage.reasoning_tokens, Some(180));
+    // The ordinary inclusive Novita shape is untouched.
+    let usage = openai_compatible_usage(&json!({
+        "prompt_tokens": 2259, "completion_tokens": 134, "total_tokens": 2393,
+        "prompt_tokens_details": {"cached_tokens": 974, "cache_write_tokens": 1230}
+    }))
+    .unwrap();
+    assert_eq!(usage.input_tokens, Some(2259));
+    assert_eq!(usage.cached_input_tokens, Some(974));
+    assert_eq!(usage.cache_creation_input_tokens, Some(1230));
 }
 
 #[test]
