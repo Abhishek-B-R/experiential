@@ -27,6 +27,7 @@ class _Client:
     def __init__(self, model: ModelSnapshot, output: AssistantAction) -> None:
         """Retain the response and each request independently of accounting."""
         self.model, self.output = model, output
+        self.served_model_id: str | None = None
         self.requests: list[ModelRequest] = []
 
     def complete(self, request: ModelRequest) -> ModelResponse:
@@ -35,7 +36,7 @@ class _Client:
         return ModelResponse.completed(
             output=self.output,
             configured_model=self.model,
-            served_model_id=None,
+            served_model_id=self.served_model_id,
             usage=None,
             latency_seconds=0,
         )
@@ -170,7 +171,19 @@ def test_named_tool_output_uses_actual_schema_and_validates_response(tmp_path: P
             ToolCall(call_id="invalid", name="submit_proposal", arguments={"invented": True}),
         )
     )
-    from jsonschema import ValidationError
-
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValueError, match="violates its schema"):
         complete(body, "tool-invalid")
+
+
+def test_response_under_the_catalog_served_model_id_is_admitted(tmp_path: Path) -> None:
+    """A provider may answer under its pinned served model ID, and under no other ID."""
+    complete, client, _ = setup(tmp_path, AssistantAction(content="{}"))
+    client.served_model_id = "fixture-2026-10-01"
+    body: JsonObject = {"messages": [{"role": "user", "content": "return JSON"}]}
+    with pytest.raises(ValueError, match="model identity differs"):
+        complete(body, "unpinned")
+    complete.plan = complete.plan.model_copy(update={"served_model_id": "fixture-2026-10-01"})
+    assert complete(body, "pinned") == {}
+    complete.plan = complete.plan.model_copy(update={"served_model_id": "another-model"})
+    with pytest.raises(ValueError, match="model identity differs"):
+        complete(body, "other-pin")

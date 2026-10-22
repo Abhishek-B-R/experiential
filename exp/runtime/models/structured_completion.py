@@ -41,6 +41,8 @@ class CompletionPlan(ContractModel):
 
     Attributes:
         model: Expected configured and returned model identity.
+        served_model_id: Catalog pin for an alternate provider-reported model ID; a response
+            under it must keep the model's provider, revision, capability and connection digests.
         capabilities: Context and output limits belonging to that model.
         deadline: Latest time a returned proposal can be admitted.
         output_tokens: Output reservation for every call.
@@ -53,6 +55,9 @@ class CompletionPlan(ContractModel):
     """
 
     model: ModelSnapshot
+    served_model_id: str | None = Field(
+        default=None, min_length=1, exclude_if=lambda value: value is None
+    )
     capabilities: ModelCapabilities
     deadline: AwareDatetime
     output_tokens: int = Field(gt=0, strict=True)
@@ -113,9 +118,13 @@ class StructuredCompletion:
             if len(calls) != 1 or calls[0].name != "submit_proposal":
                 raise ValueError("Expected exactly one named structured proposal")
             from jsonschema import Draft202012Validator
+            from jsonschema.exceptions import ValidationError
 
             assert isinstance(schema, dict)
-            Draft202012Validator(schema).validate(calls[0].arguments)
+            try:
+                Draft202012Validator(schema).validate(calls[0].arguments)
+            except ValidationError as exc:
+                raise ValueError(f"structured proposal violates its schema: {exc.message}") from exc
             return copy.deepcopy(calls[0].arguments)
         if response.output.tool_calls:
             raise ValueError("structured proposals cannot execute provider tools")
@@ -249,11 +258,17 @@ class StructuredCompletion:
                 charge=_charge,
                 cost_is_upper_bound=self.plan.cost_is_upper_bound,
             )
-        if response.model != self.plan.model:
+        if response.model != self.plan.model and response.model != self._served_model():
             raise ValueError("model identity differs; raw response retained")
         if self._clock() >= self.plan.deadline:
             raise TimeoutError("late model response retained without admission")
         return response
+
+    def _served_model(self) -> ModelSnapshot | None:
+        """Return the pinned identity a provider may report under the catalog's served model ID."""
+        if self.plan.served_model_id is None:
+            return None
+        return self.plan.model.model_copy(update={"model_id": self.plan.served_model_id})
 
     def as_model_client(self, episode_id: str) -> ModelClient:
         """Bind one sequential actor episode to the same request and budget boundary."""

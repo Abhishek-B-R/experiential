@@ -96,9 +96,7 @@ def grounded_world_model_content(
     Returns:
         Canonical content mapping used to derive the artifact identity.
     """
-    return {
-        "selection_policy_sha256": selection_policy_sha256,
-        "knowledge": knowledge.model_dump(mode="json") if knowledge is not None else None,
+    content: dict[str, object] = {
         "serving_rag": serving_rag.model_dump(mode="json"),
         "model_alias": model_alias,
         "model": model.model_dump(mode="json"),
@@ -107,6 +105,13 @@ def grounded_world_model_content(
         "top_k": top_k,
         "code_revision": code_revision,
     }
+    # Reconstruction fields join the identity only when set, so a baseline grounded world
+    # model keeps the same ID whether or not this build can reconstruct.
+    if selection_policy_sha256 is not None:
+        content["selection_policy_sha256"] = selection_policy_sha256
+    if knowledge is not None:
+        content["knowledge"] = knowledge.model_dump(mode="json")
+    return content
 
 
 class GroundedWorldModelArtifact(ArtifactEnvelope):
