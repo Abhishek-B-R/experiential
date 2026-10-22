@@ -901,7 +901,10 @@ The rest of the object (`data_collection`, `order`, `only`, ...) forwards to Ope
 marker-honoring (Anthropic Messages) rungs before marker-dropping wires, stably within each
 group, so a shim rung can no longer silently bill every turn's full context uncached while the
 native rung stands ready; routes narrowing to only marker-dropping wires keep disclosing the
-dropped markers. On `maximize_cache_affinity` pools the certified initial order is replaced per
+dropped markers. The grouping (single-route and per model-chain stage alike) never leads with a
+host-funded OpenRouter rung: after it, every such rung moves behind the stage's other rungs
+(`house_aggregator_last`), and a stage the scheduler did not reorder keeps its authored order. On
+`maximize_cache_affinity` pools the certified initial order is replaced per
 request by a weighted rendezvous hash of the request's stable conversation identity (the caller's
 `prompt_cache_key`, else a Responses continuation's original episode key, else the session-scoped
 `X-Client-Request-Id`, else the idempotency key, else the request id) over the pool's rungs, with
