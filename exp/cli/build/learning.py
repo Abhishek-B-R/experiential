@@ -4,6 +4,7 @@ Learning is the build's default pipeline. It needs a native decision model to re
 the catalog's ``memory_recall`` role, or else the catalog's best SystemOne decision model.
 """
 
+import io
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -14,9 +15,11 @@ import typer
 from rich.console import Console
 from rich.text import Text
 
+from exp.cli.build.summary import save_details
 from exp.cli.evaluation.miss_retest import RetestOutcome, run_miss_retest
 from exp.cli.shared.consent import can_prompt, require_spend_consent
 from exp.cli.shared.progress import ProgressDisplay, progress_display
+from exp.cli.shared.theme import EXP_THEME
 from exp.common.models import ModelCatalog, load_model_catalog
 from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore
@@ -33,8 +36,10 @@ from exp.optimize.evaluation.trace_learning import (
     learning_spec,
 )
 from exp.optimize.evaluation.trace_replay import DEADLINE
+from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.models.structured_completion import CompletionNotDispatched
+from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
 # Preferred native decision models for memory recall, best first.
 _RECALL_PREFERENCE = ("clef-flash", "clef", "jev")
@@ -267,7 +272,8 @@ def learn_and_retest(
         What ran, for the build's summary.
     """
     details = details or console
-    recall = resolve_memory_recall(load_model_catalog(store.model_catalog_path))
+    catalog = load_model_catalog(store.model_catalog_path)
+    recall = resolve_memory_recall(catalog)
     if recall is None:
         console.print(
             "[yellow]note[/yellow] the simulator was built without learning: learning needs a "
@@ -275,6 +281,14 @@ def learn_and_retest(
             "Experiential gateway). Add one to the model catalog and run the build again."
         )
         return BuildLearning()
+    tool_less = _tool_less_world_model(store, catalog, recall)
+    if tool_less is not None:
+        console.print(
+            f"[yellow]note[/yellow] the simulator was built without learning: learning needs a "
+            f"tool-capable world model, and {tool_less!r} declares no tool support. Choose a "
+            "world model with tool support and run the build again."
+        )
+        return BuildLearning(recall=recall)
     outcome = run_learning(
         details,
         store,
@@ -316,3 +330,63 @@ def learn_and_retest(
         command=command,
     )
     return BuildLearning(recall=recall, outcome=outcome, curve=curve, retest=retest)
+
+
+def learn_with_report(
+    console: Console,
+    store: ProjectStore,
+    *,
+    project: str,
+    root: Path,
+    yes: bool,
+    non_interactive: bool,
+    code_revision: str,
+    retry_incomplete: bool = False,
+    pipeline: ProgressDisplay | None = None,
+    command: str | None = None,
+) -> tuple[BuildLearning, Path | None]:
+    """Run the build's learning stage and save its full output as the learning report.
+
+    Args:
+        console: Build command's terminal owner.
+        store: Built project.
+        project: Project name.
+        root: Local ``.exp`` root holding the consent settings.
+        yes: Explicit authorization of the undefined-cost warning.
+        non_interactive: Disable terminal questions.
+        code_revision: Exact producing implementation identity.
+        retry_incomplete: Replace an interrupted trace, buying its calls again.
+        pipeline: The build's single progress line, with ``learning`` and ``retest`` phases.
+        command: The exact build command a refusal tells the operator to run again.
+
+    Returns:
+        What ran, and ``runtime/learning/<lineage>/report.txt`` when learning ran.
+    """
+    buffer = io.StringIO()
+    details = Console(file=buffer, width=110, theme=EXP_THEME, no_color=True)
+    learning = learn_and_retest(
+        console,
+        store,
+        project=project,
+        root=root,
+        yes=yes,
+        non_interactive=non_interactive,
+        code_revision=code_revision,
+        retry_incomplete=retry_incomplete,
+        details=details,
+        pipeline=pipeline,
+        command=command,
+    )
+    if learning.outcome is None:
+        return learning, None
+    return learning, save_details(
+        store, "learning", learning.outcome.plan.lineage, buffer.getvalue()
+    )
+
+
+def _tool_less_world_model(store: ProjectStore, catalog: ModelCatalog, recall: str) -> str | None:
+    """The build's world-model alias when it declares no tool support, which trace replay needs."""
+    plan = learning_plan(store, recall, "all")
+    alias = load_grounded_world_model_artifact(store.artifacts, plan.world_model).model_alias
+    _, capabilities = RuntimeModelCatalog(catalog).snapshot(alias)
+    return None if capabilities.supports_tools else alias

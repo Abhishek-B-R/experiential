@@ -14,7 +14,7 @@ from exp.cli.app import app
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation import trace_learning, trace_replay
+from exp.optimize.evaluation import held_out_fidelity_test, trace_learning, trace_replay
 from exp.optimize.evaluation.fidelity import FidelityMemory, FidelitySpec
 from exp.optimize.evaluation.held_out_fidelity_test import (
     PROJECT,
@@ -314,6 +314,31 @@ def test_learning_refuses_to_predict_a_learned_trace_on_later_memory(
     with pytest.raises(ValueError, match="already learned into memory"):
         _relearn(store)
     assert len(provider.requests) == purchased, "refused before any call"
+
+
+def test_a_world_model_without_tools_builds_without_learning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Learning needs a tool-capable world model; without one the build completes unlearned."""
+    original = held_out_fidelity_test.write_catalog
+
+    def tool_less(root: Path, *, recall: bool = True) -> None:
+        """Write the fixture catalog with a world model that declares no tool support."""
+        original(root, recall=recall)
+        path = root / "models.toml"
+        catalog = load_model_catalog(path)
+        world = catalog.models["world"]
+        assert world.capabilities is not None
+        caps = world.capabilities.model_copy(update={"supports_tools": False})
+        models = {**catalog.models, "world": world.model_copy(update={"capabilities": caps})}
+        write_model_catalog(path, catalog.model_copy(update={"models": models}))
+
+    monkeypatch.setattr(held_out_fidelity_test, "write_catalog", tool_less)
+    provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
+    _, store, output = build_project(tmp_path, monkeypatch, provider, learn=True)
+    assert "built without learning" in output and "'world' declares no tool support" in output
+    assert not provider.predictions(), "no learning call was made"
+    assert store.load_project().build is not None
 
 
 def test_automation_without_yes_refuses_before_buying_indexes(

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,7 +20,7 @@ from exp.cli.build.checkpoints import (
 from exp.cli.build.providers import configure_build_providers
 from exp.cli.build.source import load_stored_build_import, project_for_build
 from exp.cli.build.stops import paid_work_stops, require_learning_consent, rerun_command
-from exp.cli.build.summary import render_completed_build, save_details
+from exp.cli.build.summary import render_completed_build
 from exp.cli.build.traces import load_build_traces
 from exp.cli.providers.provider_picker import resolve_setup_providers
 from exp.cli.providers.setup import provider_setup_json_examples
@@ -249,6 +248,7 @@ def build(
                     maximum_router_cost_usd=maximum_router_cost_usd,
                     providers=tuple(provider or ()),
                     console=_console,
+                    retry_incomplete=retry_incomplete,
                 )
             except ArtifactStoreError as exc:
                 raise typer.BadParameter(
@@ -421,13 +421,11 @@ def build(
     )
     # Learning is the default pipeline. It loads the fidelity lifecycle, so it is deferred to
     # dispatch: `exp --help` stays free of optimization machinery (startup-isolation gate).
-    from exp.cli.build.learning import learn_and_retest
+    from exp.cli.build.learning import learn_with_report
 
-    buffer = io.StringIO()
-    details = Console(file=buffer, width=110, theme=EXP_THEME, no_color=True)
     try:
         with usage_error(ArtifactStoreError, ModelCatalogError, ProjectStoreError, ValueError):
-            learning = learn_and_retest(
+            learning, report_path = learn_with_report(
                 _console,
                 store,
                 project=project,
@@ -436,7 +434,6 @@ def build(
                 non_interactive=no_interactive,
                 code_revision=code_revision,
                 retry_incomplete=retry_incomplete,
-                details=details,
                 pipeline=pipeline,
                 command=rerun,
             )
@@ -444,11 +441,6 @@ def build(
         pipeline.abort()
         raise
     pipeline.stop()
-    report_path = (
-        None
-        if learning.outcome is None
-        else save_details(store, "learning", learning.outcome.plan.lineage, buffer.getvalue())
-    )
     render_completed_build(
         _console,
         completed,
