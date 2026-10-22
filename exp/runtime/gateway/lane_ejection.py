@@ -15,7 +15,8 @@ only the failures that say the box itself is down: transport failures
 (refused, reset, unreachable) and provider 5xx (``provider_internal``: 500,
 502, 503, 504), and, on a separate and slower streak, header timeouts (a box
 that accepts connections and never answers its headers holds every request
-for its whole authored allowance, which can be minutes). A client 4xx, a
+for its whole authored allowance, which can be minutes; only a timeout on the
+lane's own allowance counts, never one the request's shared budget cut). A client 4xx, a
 throttle, or any other timeout says nothing here (each has its own handling):
 it neither extends nor resets a streak and never allocates state; a success,
 or an open stream, closes both streaks.
@@ -42,7 +43,11 @@ from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.gateway.contracts import (
+    GatewayFailure,
+    GatewayFailureClass,
+    GatewayHeaderTimeout,
+)
 
 LaneKey = tuple[str, str]
 """``(deployment_id, connection_sha256)``: one physical lane on this worker."""
@@ -51,13 +56,6 @@ DEAD_LANE_FAILURES = frozenset(
     {GatewayFailureClass.TRANSPORT, GatewayFailureClass.PROVIDER_INTERNAL}
 )
 """The failure classes that count toward an ejection: the box itself is down."""
-
-HEADER_TIMEOUT_MESSAGE = "provider did not send response headers in time"
-"""The data plane's header-phase timeout (``upstream.rs::open_timeout_failure``).
-
-The failure crosses the bridge as its class and message only, so the message
-is the discriminator; ``lane_ejection_test`` pins it to the Rust source.
-"""
 
 DEFAULT_EJECTION_FAILURES = 3
 DEFAULT_EJECTION_WINDOW_SECONDS = 10.0
@@ -73,11 +71,14 @@ EJECTION_COOLDOWN_ENV = "EXP_GATEWAY_LANE_EJECTION_COOLDOWN_SECONDS"
 
 
 def is_header_timeout(failure: GatewayFailure) -> bool:
-    """Whether ``failure`` is the data plane's header-phase timeout."""
-    return (
-        failure.failure_class == GatewayFailureClass.TIMEOUT
-        and failure.safe_message == HEADER_TIMEOUT_MESSAGE
-    )
+    """Whether ``failure`` is a header timeout on the lane's OWN allowance.
+
+    The data plane types every header-phase timeout (``header_timeout``) and
+    marks the ones the request's shared budget cut as ``budget``: a healthy
+    fallback dialed after a hung lead gets only the budget's remainder, and
+    must not be struck for running out of someone else's time.
+    """
+    return failure.header_timeout is GatewayHeaderTimeout.ALLOWANCE
 
 
 @dataclass(frozen=True)

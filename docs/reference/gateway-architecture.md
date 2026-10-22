@@ -246,14 +246,19 @@ plus the input slope for this prompt) plus a 15 s reserve
 (`EXP_GATEWAY_PRE_FIRST_BYTE_RESERVE_SECONDS` overrides it), so a self-hosted lane authoring 300 s
 for long prompts is never cut at the default; routes of lanes that author nothing keep the configured
 budget. The raise stops at a ceiling (600 s, `EXP_GATEWAY_PRE_FIRST_BYTE_MAX_SECONDS`, 0 removes it)
-and never lowers the configured budget; the prompt approximation behind the input slope is the body's
-bytes over four with base64 data-URL media left out (large tool schemas still count).
+and never lowers the configured budget; the prompt approximation behind the input slope (for the
+budget and for every dial's own first-byte and first-token allowance) is the body's bytes over four
+with base64 data-URL media left out (large tool schemas still count). Release note: an authored
+first-byte allowance above 600 s no longer raises the budget past 600 s; raise
+`EXP_GATEWAY_PRE_FIRST_BYTE_MAX_SECONDS` (or set it to 0) for a lane that genuinely needs longer.
 Fast failures (refused, 5xx, transport) fail over at once as before; a header timeout fails over only
 while budget remains.
 
 **Dead-lane ejection.** Each worker ejects a dead lane on its own: three transport failures or
 provider 5xx (refused, 500, 502, 503, 504) on one lane within 10 s, or two header timeouts within
-10 min (a hung box that accepts connections and never answers), keyed on the physical lane
+10 min on the lane's OWN allowance (a hung box that accepts connections and never answers; a
+timeout the request's shared budget cut, typed `header_timeout: budget` on the failure, is no
+strike), keyed on the physical lane
 `(deployment_id, connection_sha256)` (the deployment id is the one the route carries, `mp-<uuid>`; a
 BYOK variant `mp-<row>-c-<connection>` is its own key) across catalog revisions, order that lane LAST
 in every claim walk for 30 s. It is never removed, so a

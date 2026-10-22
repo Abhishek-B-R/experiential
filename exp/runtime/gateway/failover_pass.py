@@ -144,7 +144,10 @@ class FailoverPass:
 
         The shed released the rung's health claim, so a forced pass claims it
         again (healthy, probe, or forced through an open circuit, never
-        through a provider throttle window) before dialing.
+        through a provider throttle window) before dialing. A depth whose
+        claim fails is marked forced and NOT retried in this walk: it sits in
+        a provider throttle window, and the walk moves on to the next shed
+        rung (or ends) rather than waiting it out.
 
         Args:
             policy_sheds: ``(depth, reason)`` for every policy bypass this

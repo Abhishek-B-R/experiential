@@ -537,7 +537,7 @@ impl AppState {
     /// the route's longest authored header allowance plus a reserve), never
     /// past the request deadline itself, and never raised past the ceiling.
     /// `body` is the raw request body, approximated without its base64 media
-    /// (`waterfall::budget_input_tokens`).
+    /// (`waterfall::approximate_input_tokens`, the same estimate the dials use).
     pub(crate) fn first_byte_budget(
         &self,
         deadline: Instant,
@@ -551,7 +551,7 @@ impl AppState {
             route,
             self.time_to_first_byte,
             self.time_to_first_byte_slope_seconds_per_million_input_tokens,
-            crate::waterfall::budget_input_tokens(body),
+            crate::waterfall::approximate_input_tokens(body),
         )?;
         let start = deadline.checked_sub(self.request_timeout)?;
         Some((start + budget).min(deadline))

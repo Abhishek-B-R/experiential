@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
-from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.gateway.contracts import (
+    GatewayFailure,
+    GatewayFailureClass,
+    GatewayHeaderTimeout,
+)
 from exp.runtime.gateway.lane_ejection import (
     EJECTION_COOLDOWN_ENV,
     EJECTION_FAILURES_ENV,
     EJECTION_HEADER_TIMEOUTS_ENV,
     EJECTION_HEADER_WINDOW_ENV,
     EJECTION_WINDOW_ENV,
-    HEADER_TIMEOUT_MESSAGE,
     LaneEjectionPolicy,
     LaneEjections,
     LaneKey,
@@ -29,7 +30,12 @@ def _failure(failure_class: GatewayFailureClass, message: str = "scripted") -> G
 
 
 _DEAD = _failure(GatewayFailureClass.PROVIDER_INTERNAL)
-_HUNG = _failure(GatewayFailureClass.TIMEOUT, HEADER_TIMEOUT_MESSAGE)
+_HUNG = GatewayFailure(
+    failure_class=GatewayFailureClass.TIMEOUT,
+    safe_message="provider did not send response headers in time",
+    header_timeout=GatewayHeaderTimeout.ALLOWANCE,
+)
+_CUT = _HUNG.model_copy(update={"header_timeout": GatewayHeaderTimeout.BUDGET})
 
 
 def _ejected_after_three(tracker: LaneEjections, lane: LaneKey, start: float) -> None:
@@ -207,8 +213,14 @@ def test_only_counted_failures_allocate_lane_state() -> None:
     assert tracker.tracked() == 0
 
 
-def test_the_header_timeout_message_is_the_data_planes_own() -> None:
-    """The discriminator crosses the bridge as text: pin it to the Rust classifier."""
-    source = (Path(__file__).parent / "native" / "src" / "upstream.rs").read_text()
-    start = source.index("fn open_timeout_failure()")
-    assert f'"{HEADER_TIMEOUT_MESSAGE}"' in source[start : start + 400]
+def test_a_budget_cut_header_timeout_is_no_strike() -> None:
+    """[A hung, B healthy but cut by the shared budget]: only A is ejected."""
+    tracker = LaneEjections(LaneEjectionPolicy())
+    hung: LaneKey = ("mp-glm-a", "a" * 64)
+    cut: LaneKey = ("mp-glm-b", "a" * 64)
+    for at in (0.0, 300.0):
+        tracker.failed(hung, _HUNG, at)
+        tracker.failed(cut, _CUT, at + 15.0)
+    assert tracker.ejected(hung, 316.0)
+    assert not tracker.ejected(cut, 316.0)
+    assert tracker.tracked() == 1

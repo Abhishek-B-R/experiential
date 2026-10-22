@@ -530,7 +530,7 @@ fn a_large_body_raises_the_budget_by_its_text_not_its_base64_media() {
     let body = format!(
         r#"{{"messages":[{{"role":"user","content":[{{"type":"text","text":"{prompt}"}},{{"type":"image_url","image_url":{{"url":"data:image/png;base64,{image}"}}}}]}}]}}"#
     );
-    let tokens = budget_input_tokens(&body);
+    let tokens = approximate_input_tokens(&body);
     let text_only = (body.len() - image.len()) as f64 / 4.0;
     assert!((tokens - text_only).abs() < 1.0, "{tokens} vs {text_only}");
     // The lead authors a 240 s/M slope: ~100k tokens add ~24 s, not ~264 s.
@@ -558,5 +558,8 @@ fn a_large_body_raises_the_budget_by_its_text_not_its_base64_media() {
     );
     assert_eq!(whole, Some(wire::PRE_FIRST_BYTE_MAX));
     // Text that merely mentions base64 is counted.
-    assert_eq!(budget_input_tokens(r#"{"a":";base64,abcd"}"#), 20.0 / 4.0);
+    assert_eq!(
+        approximate_input_tokens(r#"{"a":";base64,abcd"}"#),
+        20.0 / 4.0
+    );
 }

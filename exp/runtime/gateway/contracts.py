@@ -66,6 +66,9 @@ from exp.runtime.gateway.stream_contracts import (
     GatewayFailureClass as GatewayFailureClass,
 )
 from exp.runtime.gateway.stream_contracts import (
+    GatewayHeaderTimeout as GatewayHeaderTimeout,
+)
+from exp.runtime.gateway.stream_contracts import (
     GatewayRefusalReason as GatewayRefusalReason,
 )
 from exp.runtime.gateway.stream_contracts import (

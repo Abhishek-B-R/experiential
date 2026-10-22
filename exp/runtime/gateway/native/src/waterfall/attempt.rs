@@ -1,10 +1,11 @@
 //! One physical provider generation dispatch, returning before any successor reservation.
 
 use super::{
-    billed_empty_completion, commit, customer_owned, dispatch_headers, empty_completion_failure,
-    fallback_rules, first_byte_allowance, first_token_allowance, is_semantic, open_phase_bound,
-    settle_output_less, unreported_empty_completion, AttemptEnd, CommittedAttempt, DeploymentWire,
-    WaterfallContext, MAXIMUM_WITHHELD_REFUSAL_BYTES, MAXIMUM_WITHHELD_REFUSAL_EVENTS,
+    attribute_header_timeout, billed_empty_completion, commit, customer_owned, dispatch_headers,
+    empty_completion_failure, fallback_rules, first_byte_allowance, first_token_allowance,
+    is_semantic, open_phase_bound, settle_output_less, unreported_empty_completion, AttemptEnd,
+    CommittedAttempt, DeploymentWire, WaterfallContext, MAXIMUM_WITHHELD_REFUSAL_BYTES,
+    MAXIMUM_WITHHELD_REFUSAL_EVENTS,
 };
 use crate::dialects::Dialect;
 use crate::errors::{Failure, FailureClass};
@@ -204,7 +205,7 @@ pub(super) async fn run_attempt(
                     };
                 }
                 return AttemptEnd::Ladder {
-                    failure: customer_owned(failure, wire),
+                    failure: customer_owned(attribute_header_timeout(ctx, failure), wire),
                     refusal_eligible: false,
                     exhaustion_flush: Vec::new(),
                     usage: None,

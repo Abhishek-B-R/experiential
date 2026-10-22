@@ -871,6 +871,12 @@ fn header_phase_timeout_fails_over_without_a_same_deployment_redial() {
     // the same stalled deployment for another full header-timeout window.
     let failure = open_timeout_failure();
     assert_eq!(failure.failure_class, FailureClass::Timeout);
+    // Typed for lane ejection: the rung's own allowance until the waterfall
+    // attributes a budget cut.
+    assert_eq!(
+        failure.header_timeout,
+        Some(crate::errors::HeaderTimeout::Allowance)
+    );
     assert!(
         !failure.retryable_same_deployment,
         "a header-phase stall must not redial the same deployment"

@@ -26,6 +26,7 @@ from exp.runtime.gateway.contracts import (
     GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
+    GatewayHeaderTimeout,
     GatewayRefusalReason,
     GatewayServiceTierAdmission,
     GatewayServiceTierSettlement,
@@ -163,7 +164,22 @@ def failure_from_boundary_payload(payload: object) -> GatewayFailure | None:
             else None
         ),
         refusal_reason=refusal_reason_from_payload(data.get("refusal_reason")),
+        header_timeout=header_timeout_from_payload(data.get("header_timeout")),
     )
+
+
+def header_timeout_from_payload(value: object) -> GatewayHeaderTimeout | None:
+    """Parse the optional typed header-timeout phase from a boundary payload.
+
+    An unknown token fails closed to ``None`` (no hung-lane strike) rather
+    than raising, like ``refusal_reason_from_payload``.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return GatewayHeaderTimeout(value)
+    except ValueError:
+        return None
 
 
 def refusal_reason_from_payload(value: object) -> GatewayRefusalReason | None:
@@ -345,6 +361,7 @@ def terminal_from_settlement(
             # The bounded refusal category rides the settlement argument so the
             # control plane counts refusals by reason without parsing detail.
             refusal_reason=refusal_reason_from_payload(failure_payload.get("refusal_reason")),
+            header_timeout=header_timeout_from_payload(failure_payload.get("header_timeout")),
         )
         if (
             failure.failure_class == GatewayFailureClass.THROTTLED

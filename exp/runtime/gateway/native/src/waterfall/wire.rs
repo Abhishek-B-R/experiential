@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::bridge::Bridge;
+use crate::errors::{Failure, HeaderTimeout};
 use crate::throttle_backoff::ThrottleRedial;
 use crate::tool_search::ToolSearchAdmission;
 
@@ -367,12 +368,33 @@ pub(crate) fn pre_first_byte_budget(
     Some(floor.map_or(configured, |floor| configured.max(floor)))
 }
 
+/// Attribute a header-phase timeout to the bound that actually expired.
+///
+/// The open phase waits until the nearer of the rung's own allowance and the
+/// request's shared budget (`WaterfallContext::capped`, and the request
+/// deadline). When the shared bound is already spent at the failure, the
+/// budget cut the wait and the timeout is no strike against the lane: a
+/// healthy fallback dialed after a hung lead gets only the reserve, and must
+/// not be ejected for running out of someone else's time.
+pub(crate) fn attribute_header_timeout(
+    ctx: &WaterfallContext<'_>,
+    mut failure: Failure,
+) -> Failure {
+    if failure.header_timeout == Some(HeaderTimeout::Allowance)
+        && crate::relay::remaining(ctx.pre_commit_deadline()).is_zero()
+    {
+        failure.header_timeout = Some(HeaderTimeout::Budget);
+    }
+    failure
+}
+
 /// The default `ceiling` of `pre_first_byte_budget`.
 pub(crate) const PRE_FIRST_BYTE_MAX: Duration = Duration::from_secs(600);
 
-/// Approximate input tokens of a raw request body for the budget floor:
-/// bytes over four, with base64 data-URL payloads (inline images, audio,
-/// files) left out.
+/// Approximate input tokens of a raw request body, for every first-byte and
+/// first-token allowance and for the budget floor: bytes over four, with
+/// base64 data-URL payloads (inline images, audio, files) left out. A timeout
+/// heuristic only, never a billing quantity.
 ///
 /// Bytes over four overestimates a body carrying base64 media (a 4 MB image
 /// reads as a million tokens, raising the floor by the full input slope) and,
@@ -380,7 +402,7 @@ pub(crate) const PRE_FIRST_BYTE_MAX: Duration = Duration::from_secs(600);
 /// is cheap and safe to exclude: the payload runs from `;base64,` inside a
 /// `data:` URL to the string's closing quote, and base64 has no quote. Tool
 /// schemas stay counted; the ceiling bounds what they can add.
-pub(crate) fn budget_input_tokens(body: &str) -> f64 {
+pub(crate) fn approximate_input_tokens(body: &str) -> f64 {
     const MARK: &str = ";base64,";
     let mut excluded = 0usize;
     let mut rest = body;

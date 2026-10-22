@@ -163,11 +163,15 @@ pub(crate) fn decision_http_failure(mut failure: Failure, status: u16) -> Failur
 /// keeps a stalled lead's cost near one fail-fast window. It stays a
 /// `FailureClass::Timeout`, so it feeds the health circuit like other timeouts.
 fn open_timeout_failure() -> Failure {
-    Failure::new(
+    let mut failure = Failure::new(
         FailureClass::Timeout,
         "provider did not send response headers in time",
     )
-    .with_retry(false, true)
+    .with_retry(false, true);
+    // The rung's own allowance until the waterfall learns the shared budget
+    // cut the wait (`waterfall::attribute_header_timeout`).
+    failure.header_timeout = Some(crate::errors::HeaderTimeout::Allowance);
+    failure
 }
 
 /// Open one streaming POST and return the response on HTTP success. The

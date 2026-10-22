@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass, GatewayHeaderTimeout
 from exp.runtime.gateway.health import (
     PLAN_WINDOW_MAXIMUM_SECONDS,
     DeploymentHealthKey,
     DeploymentHealthRegistry,
     health_failure_cause,
 )
-from exp.runtime.gateway.lane_ejection import HEADER_TIMEOUT_MESSAGE, LaneEjectionPolicy
+from exp.runtime.gateway.lane_ejection import LaneEjectionPolicy
 from exp.runtime.gateway.native_execution import claim_route_from
 
 _KEY: DeploymentHealthKey = ("catalog", "deployment", "connection")
@@ -388,7 +388,9 @@ def test_a_hung_lane_is_ejected_on_header_timeouts_and_a_byok_variant_is_not() -
     variant = ("revision-one", "mp-hung-c-connection-one", "connection-byok")
     live = ("revision-one", "mp-live", "connection-house")
     timeout = GatewayFailure(
-        failure_class=GatewayFailureClass.TIMEOUT, safe_message=HEADER_TIMEOUT_MESSAGE
+        failure_class=GatewayFailureClass.TIMEOUT,
+        safe_message="provider did not send response headers in time",
+        header_timeout=GatewayHeaderTimeout.ALLOWANCE,
     )
     health.failed(hung, timeout)
     clock[0] = 300.0

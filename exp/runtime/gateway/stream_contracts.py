@@ -444,6 +444,19 @@ class GatewayRefusalReason(StrEnum):
     UNSPECIFIED = "unspecified"
 
 
+class GatewayHeaderTimeout(StrEnum):
+    """Which bound ended a dial waiting for response headers, mirroring the
+    native ``HeaderTimeout``.
+
+    ``allowance``: the rung's own first-byte allowance expired, a hung-lane
+    strike. ``budget``: the request's shared pre-first-byte budget (or its
+    deadline) expired first, so a fallback dialed late is not blamed.
+    """
+
+    ALLOWANCE = "allowance"
+    BUDGET = "budget"
+
+
 class GatewayFailure(ContractModel):
     """Sanitized failure with retry and failover eligibility already classified."""
 
@@ -474,6 +487,9 @@ class GatewayFailure(ContractModel):
     Set from the provider's own code and sentence and carried on the public
     error and the settlement argument, so the caller reads the category and
     the control plane counts refusals by reason without parsing detail."""
+    header_timeout: GatewayHeaderTimeout | None = None
+    """Set only on a header-phase timeout: which bound expired (lane ejection
+    counts only ``allowance``)."""
 
 
 def _validate_responses_probability_records(
