@@ -133,18 +133,123 @@ fn bytes(value: Option<&Value>) -> Result<Option<Vec<u8>>, Failure> {
     }
 }
 
-fn number(value: Option<&Value>) -> Result<f64, Failure> {
-    let value = value
-        .and_then(Value::as_f64)
-        .ok_or_else(|| malformed("logprob must be a number"))?;
-    if value.is_finite() {
-        Ok(value)
-    } else {
-        Err(malformed("logprob must be finite"))
+/// The logprob OpenAI reports for a token whose probability is effectively
+/// zero; every unrepresentable provider value is mapped onto it.
+pub const NEGLIGIBLE_LOGPROB: f64 = -9999.0;
+
+/// Counts of provider logprob values that were not usable verbatim, by kind
+/// (never by value), reported once per parsed frame on the operator log.
+#[derive(Debug, Default)]
+pub(crate) struct Coercions(std::collections::BTreeMap<&'static str, usize>);
+
+impl Coercions {
+    fn note(&mut self, kind: &'static str) {
+        *self.0.entry(kind).or_default() += 1;
+    }
+
+    fn report(&self, surface: &'static str) {
+        if self.0.is_empty() {
+            return;
+        }
+        let line = serde_json::json!({
+            "event": "logprob_value_coerced",
+            "surface": surface,
+            "kinds": self.0,
+        });
+        eprintln!("exp-gateway-native: {line}");
     }
 }
 
-fn candidate(value: &Value) -> Result<LogprobCandidate, Failure> {
+/// Read one logprob value leniently: the probability is metadata about a token
+/// the provider already generated, so its value never fails the answer.
+///
+/// A finite number is kept, floored at [`NEGLIGIBLE_LOGPROB`] as OpenAI does.
+/// Everything else (`null`, which a pydantic-serialized vLLM/SGLang server
+/// writes for -inf and NaN; the texts "-inf", "-Infinity", "NaN"; an absent
+/// key; any other JSON type) becomes [`NEGLIGIBLE_LOGPROB`], the contract's
+/// own spelling of "effectively impossible", because the re-encoded OpenAI
+/// shape requires a number. A numeric text ("-0.25") is read as its number.
+/// Novita's deepseek-v4.1-flash lane failed ~7% of logprob requests on this
+/// (227 billed generations discarded in an hour, 2026-10-22).
+pub(crate) fn logprob_value(value: Option<&Value>, coercions: &mut Coercions) -> f64 {
+    let floored = |number: f64| number.max(NEGLIGIBLE_LOGPROB);
+    let parsed = match value {
+        Some(Value::Number(number)) => number.as_f64().ok_or("number_out_of_range"),
+        None => Err("missing"),
+        Some(Value::Null) => Err("null"),
+        Some(Value::String(text)) => match text.trim().parse::<f64>() {
+            Ok(number) if number.is_finite() => {
+                coercions.note("numeric_text");
+                Ok(number)
+            }
+            Ok(number) if number == f64::NEG_INFINITY => Err("negative_infinity_text"),
+            Ok(number) if number.is_nan() => Err("nan_text"),
+            Ok(_) => Err("positive_infinity_text"),
+            Err(_) => Err("text"),
+        },
+        Some(_) => Err("non_numeric"),
+    };
+    match parsed {
+        Ok(number) if number.is_finite() => floored(number),
+        Ok(_) => {
+            coercions.note("non_finite");
+            NEGLIGIBLE_LOGPROB
+        }
+        Err(kind) => {
+            coercions.note(kind);
+            NEGLIGIBLE_LOGPROB
+        }
+    }
+}
+
+/// Apply [`logprob_value`] in place to raw Responses probability records
+/// (`[{token, logprob, bytes?, top_logprobs?}]`), which are relayed as the
+/// provider's JSON rather than typed. A record's `logprob` is required, so any
+/// unusable value becomes [`NEGLIGIBLE_LOGPROB`]; an alternative's `null` is
+/// kept where its phase admits an absent alternative value. Shapes that are not
+/// record arrays are left for the caller's structural validation.
+pub(crate) fn normalize_records_value(
+    records: &mut Value,
+    keep_null_alternatives: bool,
+    surface: &'static str,
+) {
+    let mut coercions = Coercions::default();
+    let Some(records) = records.as_array_mut() else {
+        return;
+    };
+    for record in records.iter_mut().filter_map(Value::as_object_mut) {
+        normalize_object(record, false, &mut coercions);
+        if let Some(alternatives) = record.get_mut("top_logprobs").and_then(Value::as_array_mut) {
+            for alternative in alternatives.iter_mut().filter_map(Value::as_object_mut) {
+                normalize_object(alternative, keep_null_alternatives, &mut coercions);
+            }
+        }
+    }
+    coercions.report(surface);
+}
+
+fn normalize_object(
+    object: &mut serde_json::Map<String, Value>,
+    keep_null: bool,
+    coercions: &mut Coercions,
+) {
+    let current = object.get("logprob");
+    let usable = |value: &Value| {
+        value
+            .as_f64()
+            .is_some_and(|number| number.is_finite() && number >= NEGLIGIBLE_LOGPROB)
+    };
+    // An optional alternative may leave its value absent or null.
+    if (keep_null && current.is_none_or(Value::is_null)) || current.is_some_and(usable) {
+        return;
+    }
+    let number = logprob_value(current, coercions);
+    if let Some(number) = serde_json::Number::from_f64(number) {
+        object.insert("logprob".to_string(), Value::Number(number));
+    }
+}
+
+fn candidate(value: &Value, coercions: &mut Coercions) -> Result<LogprobCandidate, Failure> {
     let object = value
         .as_object()
         .ok_or_else(|| malformed("logprob candidate must be an object"))?;
@@ -154,12 +259,15 @@ fn candidate(value: &Value) -> Result<LogprobCandidate, Failure> {
             .and_then(Value::as_str)
             .ok_or_else(|| malformed("logprob token must be text"))?
             .to_string(),
-        logprob: number(object.get("logprob"))?,
+        logprob: logprob_value(object.get("logprob"), coercions),
         bytes: bytes(object.get("bytes"))?,
     })
 }
 
-fn records(value: Option<&Value>) -> Result<Option<Vec<TokenLogprob>>, Failure> {
+fn records(
+    value: Option<&Value>,
+    coercions: &mut Coercions,
+) -> Result<Option<Vec<TokenLogprob>>, Failure> {
     let Some(value) = value else { return Ok(None) };
     if value.is_null() {
         return Ok(None);
@@ -189,11 +297,11 @@ fn records(value: Option<&Value>) -> Result<Option<Vec<TokenLogprob>>, Failure> 
                     .and_then(Value::as_str)
                     .ok_or_else(|| malformed("logprob token must be text"))?
                     .to_string(),
-                logprob: number(object.get("logprob"))?,
+                logprob: logprob_value(object.get("logprob"), coercions),
                 bytes: bytes(object.get("bytes"))?,
                 top_logprobs: alternatives
                     .iter()
-                    .map(candidate)
+                    .map(|alternative| candidate(alternative, coercions))
                     .collect::<Result<_, _>>()?,
             })
         })
@@ -202,7 +310,8 @@ fn records(value: Option<&Value>) -> Result<Option<Vec<TokenLogprob>>, Failure> 
 }
 
 /// Parse the OpenAI Chat choice-level `logprobs` object, preserving null and
-/// empty channels while rejecting malformed populated records.
+/// empty channels while rejecting structurally malformed populated records.
+/// Individual logprob values never fail the parse (see [`logprob_value`]).
 pub fn parse(
     value: Option<&Value>,
     choice_index: u32,
@@ -217,8 +326,11 @@ pub fn parse(
     let object = value
         .as_object()
         .ok_or_else(|| malformed("choice logprobs must be an object"))?;
-    let content = records(object.get("content"))?;
-    let refusal = records(object.get("refusal"))?;
+    let mut coercions = Coercions::default();
+    let content = records(object.get("content"), &mut coercions);
+    let refusal = records(object.get("refusal"), &mut coercions);
+    coercions.report("chat");
+    let (content, refusal) = (content?, refusal?);
     if content.as_ref().map_or(0, Vec::len) + refusal.as_ref().map_or(0, Vec::len)
         > MAX_LOGPROB_RECORDS
     {
