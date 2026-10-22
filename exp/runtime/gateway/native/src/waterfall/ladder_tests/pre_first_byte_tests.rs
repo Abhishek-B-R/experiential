@@ -101,100 +101,49 @@ fn without_a_budget_each_stalled_dial_gets_its_own_window() {
     });
 }
 
-/// A rung whose authored header allowance is far longer than the budget.
-fn slow_header_wire(deployment_id: &str, url: &str) -> DeploymentWire {
-    let mut slow = wire(deployment_id, url, 0);
-    slow.time_to_first_byte_base_seconds = Some(300.0);
-    slow
-}
-
-#[test]
-fn a_long_header_allowance_still_leaves_room_to_fail_over() {
-    block_on(async {
-        // The 2026-10-21 shape: a lane authoring 300 s of header wait ahead
-        // of a live sibling. Capped at the budget minus the reserve, the
-        // stall ends at 1.5 s and the sibling serves inside the budget.
-        let harness = Harness::new();
-        let healthy = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
-        let route = [
-            slow_header_wire("a", &spawn_stalled_rung().await),
-            wire("b", &healthy.url, 0),
-        ];
-        let budget =
-            super::super::successor::FAILOVER_FIRST_BYTE_RESERVE + Duration::from_millis(1_500);
-        let started = Instant::now();
-        let (won, guard) = run_budgeted(&harness, &route, Some(budget)).await;
-        let elapsed = started.elapsed();
-        let Won::Committed(committed) = finish(guard, won).await else {
-            panic!("the header timeout must fail over to the live sibling");
-        };
-        assert_eq!(committed.depth, 1);
-        assert!(elapsed >= Duration::from_millis(1_400), "{elapsed:?}");
-        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+/// A rung that holds its response headers for `delay`, then streams one frame.
+async fn spawn_slow_header_rung(delay: Duration) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let _ = read_request(&mut socket).await;
+        tokio::time::sleep(delay).await;
+        let answer = render(&Answer::Stream(&[TEXT_FRAME]));
+        socket.write_all(answer.as_bytes()).await.expect("write");
+        let _ = socket.shutdown().await;
     });
-}
-
-/// A context over `route` whose pre-first-byte budget ends `budget` after `start`.
-fn cap_context<'a>(
-    harness: &'a Harness,
-    route: &'a [DeploymentWire],
-    start: Instant,
-    budget: Duration,
-    maximum_total_attempts: u32,
-) -> WaterfallContext<'a> {
-    WaterfallContext {
-        pre_first_byte_deadline: Some(start + budget),
-        bridge: &harness.bridge,
-        http: &harness.http,
-        request_id: "request-cap",
-        raw_key: "key",
-        caller_scope: None,
-        route,
-        policy: RoutePolicy {
-            maximum_total_attempts,
-            maximum_same_deployment_attempts: 1,
-            refusal_failover: false,
-            throttle_redial: None,
-            physical_route_cap: None,
-            backoff: None,
-        },
-        deadline: start + Duration::from_secs(600),
-        time_to_first_byte: Duration::from_secs(2),
-        time_to_first_byte_slope_seconds_per_million_input_tokens: 0.0,
-        time_to_first_token: Duration::from_secs(120),
-        approximate_input_tokens: 1.0,
-        chat_logprobs: false,
-        capture_logprobs: false,
-        output_less_retention: None,
-        output_token_cap: None,
-        tool_search: None,
-        output_guardrails: None,
-    }
+    format!("http://{address}/v1/chat/completions")
 }
 
 #[test]
-fn only_a_dial_with_an_untried_successor_gives_up_its_allowance() {
-    let harness = Harness::new();
-    let pair = [wire("a", "http://a.test", 0), wire("b", "http://b.test", 0)];
-    let single = [wire("a", "http://a.test", 0)];
-    let reserve = super::super::successor::FAILOVER_FIRST_BYTE_RESERVE;
-    let budget = Duration::from_secs(90);
-    let now = Instant::now();
-    let context = cap_context(&harness, &pair, now, budget, 8);
-    // Depth 0 with depth 1 untried, and depth 1 revisiting a skipped depth
-    // 0: both stop waiting for headers at the budget minus the reserve.
-    let capped = Some(now + budget - reserve);
-    assert_eq!(failover_first_byte_cap(&context, 0, &[1, 0], 1), capped);
-    assert_eq!(failover_first_byte_cap(&context, 1, &[0, 1], 1), capped);
-    // The last untried rung keeps its full allowance.
-    assert_eq!(failover_first_byte_cap(&context, 1, &[1, 1], 2), None);
-    // A single-rung route keeps it too.
-    let context = cap_context(&harness, &single, now, budget, 8);
-    assert_eq!(failover_first_byte_cap(&context, 0, &[1], 1), None);
-    // No attempt left after this one: nothing to save the budget for.
-    let context = cap_context(&harness, &pair, now, budget, 1);
-    assert_eq!(failover_first_byte_cap(&context, 0, &[1, 0], 1), None);
-    // A budget already inside the reserve is left alone, never cut to nothing.
-    let context = cap_context(&harness, &pair, now, reserve - Duration::from_secs(1), 8);
-    assert_eq!(failover_first_byte_cap(&context, 0, &[1, 0], 1), None);
+fn an_authored_header_allowance_is_not_cut_at_the_configured_budget() {
+    block_on(async {
+        // Scaled down from the GLM lane: the lead authors a header allowance
+        // (3 s) longer than the configured budget (1 s) and answers its
+        // headers at 2 s. The budget is raised to the authored allowance
+        // plus the reserve, so the lead serves instead of timing out.
+        let harness = Harness::new();
+        let mut lead = wire(
+            "lead",
+            &spawn_slow_header_rung(Duration::from_secs(2)).await,
+            0,
+        );
+        lead.time_to_first_byte_base_seconds = Some(3.0);
+        let route = [lead, wire("backup", &spawn_stalled_rung().await, 0)];
+        let budget = super::super::pre_first_byte_budget(
+            Some(Duration::from_secs(1)),
+            &route,
+            Duration::from_secs(2),
+            0.0,
+            1.0,
+        );
+        let (won, guard) = run_budgeted(&harness, &route, budget).await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("the lead's authored allowance must outlast the configured budget");
+        };
+        assert_eq!(committed.depth, 0);
+    });
 }

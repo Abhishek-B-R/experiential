@@ -12,12 +12,14 @@ this walk:
   request; a request whose rung already failed has nowhere else to go. So a
   failover first spills sideways to every other untried rung like any shed,
   and only when every one of them shed does it FORCE a pass on the first shed
-  rung, at the overflow ceiling a Pro caller gets on that rung
-  (``lane_saturation.priority_overflow_ceiling``). A rung at that ceiling, a
-  hard class cap or ``:fast`` reserve, or a rate-window shed (pacing the
-  operator authored to stay under the provider's own limit) is skipped for the
-  next shed rung, and only when every shed rung refuses does the walk end
-  with the original failure.
+  rung. Forced failover passes are counted per rung and capped
+  (``lane_saturation.failover_overflow_cap``: half the bound in flight on top
+  of it), so one dead lane cannot shift its whole load onto the backup at
+  once. A rung at that cap, a hard class cap or ``:fast`` reserve, or a
+  rate-window shed (pacing the operator authored to stay under the provider's
+  own limit) is skipped for the next shed rung. When every shed rung refuses,
+  the request ends with the fast retryable ``lane_saturated`` 429, never the
+  dead rung's 502: live capacity exists and a retry in seconds lands on it.
 - A rung skipped at the request's first dial (its bound was full) was never
   revisited when the rung dialed instead failed: successors were only later
   rungs. The ladder is every depth this request has not dispatched, earlier
@@ -33,8 +35,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
+    GatewayFailure,
+    GatewayFailureClass,
+)
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
+from exp.runtime.gateway.lane_saturation import lane_saturated_failure
 from exp.runtime.gateway.native_execution import InflightRequest, claim_route_from
 from exp.runtime.gateway.native_fallback_rules import route_fallback_rules, untried_depths
 from exp.runtime.gateway.rung_admission import RungShed
@@ -143,6 +150,29 @@ class FailoverPass:
             self.forcing = True
             return depth
         return None
+
+
+def failover_refusal(
+    failover: FailoverPass | None,
+    authorization: AuthorizationSnapshot,
+    shed_records: dict[int, RungShed],
+) -> GatewayFailure | None:
+    """The failure a failover walk ends with once nothing more can be forced.
+
+    Args:
+        failover: The failover walk, or ``None`` when this is not a failover.
+        authorization: The caller, whose priority level picks the 429's copy.
+        shed_records: The registry's shed per bypassed depth.
+
+    Returns:
+        The retryable ``lane_saturated`` 429 when an untried rung was there
+        but refused (full past its failover cap, a hard cap, or a rate
+        window); ``None`` when nothing untried remained, so the original
+        failure stands.
+    """
+    if failover is None or not any(depth in shed_records for depth in failover.untried):
+        return None
+    return lane_saturated_failure(authorization)
 
 
 def forced_failover_target(

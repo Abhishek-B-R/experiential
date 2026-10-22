@@ -504,14 +504,27 @@ async fn model_detail(
     }
 }
 
-/// The request's absolute pre-first-byte deadline: its start (the request
-/// deadline minus the request budget) plus the configured budget, never past
-/// the request deadline itself.
-pub(crate) fn pre_first_byte_deadline(
-    state: &AppState,
-    deadline: std::time::Instant,
-) -> Option<std::time::Instant> {
-    let budget = state.pre_first_byte_budget?;
-    let start = deadline.checked_sub(state.request_timeout)?;
-    Some((start + budget).min(deadline))
+impl AppState {
+    /// The request's absolute pre-first-byte deadline: its start (the
+    /// request deadline minus the request budget) plus its budget
+    /// (`waterfall::pre_first_byte_budget`: the configured budget raised to
+    /// the route's longest authored header allowance plus a reserve), never
+    /// past the request deadline itself. `body` is the raw request body; its
+    /// length over four is the same input approximation the dials use.
+    pub(crate) fn first_byte_budget(
+        &self,
+        deadline: Instant,
+        route: &[crate::waterfall::DeploymentWire],
+        body: &str,
+    ) -> Option<Instant> {
+        let budget = crate::waterfall::pre_first_byte_budget(
+            self.pre_first_byte_budget,
+            route,
+            self.time_to_first_byte,
+            self.time_to_first_byte_slope_seconds_per_million_input_tokens,
+            (body.len() as f64) / 4.0,
+        )?;
+        let start = deadline.checked_sub(self.request_timeout)?;
+        Some((start + budget).min(deadline))
+    }
 }

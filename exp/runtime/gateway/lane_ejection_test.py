@@ -13,12 +13,12 @@ from exp.runtime.gateway.lane_ejection import (
     LaneEjections,
 )
 
-_LANE = ("deployment-a", "connection-a")
-_OTHER = ("deployment-b", "connection-b")
+_LANE = "mp-lane-a"
+_OTHER = "mp-lane-a-c-connection-one"
 _DEAD = GatewayFailureClass.PROVIDER_INTERNAL
 
 
-def _ejected_after_three(tracker: LaneEjections, lane: tuple[str, str], start: float) -> None:
+def _ejected_after_three(tracker: LaneEjections, lane: str, start: float) -> None:
     """Feed three dead-lane failures one second apart starting at ``start``."""
     for offset in (0.0, 1.0, 2.0):
         tracker.failed(lane, _DEAD, start + offset)
@@ -44,7 +44,7 @@ def test_three_dead_lane_failures_inside_the_window_eject_for_the_cooldown() -> 
     tracker.failed(_LANE, _DEAD, 2.0)
     assert tracker.ejected(_LANE, 2.0)
     assert tracker.ejected(_LANE, 31.9)
-    # Per lane: the sibling on the same worker is untouched.
+    # Per lane: a BYOK variant of the same host lane is its own key, untouched.
     assert not tracker.ejected(_OTHER, 2.0)
 
 

@@ -409,3 +409,43 @@ fn failover_eligibility_matrix_by_upstream_status() {
         assert!(!advances(&failure), "{status}");
     }
 }
+
+#[test]
+fn an_authored_header_allowance_raises_the_pre_first_byte_budget() {
+    let configured = Some(Duration::from_secs(90));
+    let default_base = Duration::from_secs(15);
+    // A ~200k-token prompt on a self-hosted lead authoring 300 s: the budget
+    // covers the lead's whole allowance (300 + 240 x 0.2 = 348 s) plus the
+    // reserve, so the header wait is never cut at the 90 s default.
+    let mut lead = wire(Some(300.0), None);
+    lead.deployment_id = "lead".to_string();
+    let route = [lead, wire(None, None)];
+    let budget = pre_first_byte_budget(configured, &route, default_base, 240.0, 200_000.0)
+        .expect("budget stays enabled");
+    assert_eq!(
+        budget,
+        Duration::from_secs(348) + wire::PRE_FIRST_BYTE_RESERVE
+    );
+    // A slow backup reached by failover counts as much as the lead.
+    let backup_slow = [wire(None, None), wire(Some(300.0), Some(0.0))];
+    assert_eq!(
+        pre_first_byte_budget(configured, &backup_slow, default_base, 240.0, 1.0),
+        Some(Duration::from_secs(300) + wire::PRE_FIRST_BYTE_RESERVE)
+    );
+    // Lanes that author nothing keep the configured budget, however large the prompt.
+    assert_eq!(
+        pre_first_byte_budget(configured, &plain(2), default_base, 240.0, 900_000.0),
+        configured
+    );
+    // An authored allowance below the budget never shrinks it.
+    let short = [wire(Some(20.0), Some(0.0))];
+    assert_eq!(
+        pre_first_byte_budget(configured, &short, default_base, 240.0, 1.0),
+        configured
+    );
+    // A disabled budget stays disabled.
+    assert_eq!(
+        pre_first_byte_budget(None, &route, default_base, 240.0, 200_000.0),
+        None
+    );
+}

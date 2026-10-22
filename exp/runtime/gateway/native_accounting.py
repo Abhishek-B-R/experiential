@@ -30,6 +30,7 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.disconnect_estimate import settled_terminal
 from exp.runtime.gateway.failover_pass import (
     FailoverPass,
+    failover_refusal,
     forced_failover_target,
     sideways_claim,
 )
@@ -66,6 +67,7 @@ from exp.runtime.gateway.native_recovery import (
 from exp.runtime.gateway.native_request_settlement import RequestSettlements
 from exp.runtime.gateway.native_rung_policy import (
     bind_sticky_dispatch,
+    ejection_disclosure,
     failed_dispatch_candidate,
     record_attempt_health,
     record_cache_fraction,
@@ -464,6 +466,11 @@ class NativeAttemptAccounting:
                     # A failover is never ended by a sibling's bound (failover_pass).
                     candidate = forced_failover_target(failover, policy_sheds, shed_records)
                     if candidate is None:
+                        refusal = failover_refusal(failover, entry.authorization, shed_records)
+                        if refusal is not None:
+                            last_failure = refusal
+                            with self._lock:
+                                self._rung_saturation_refusals += 1
                         break
                     forced_overflow = True
             if route.snapshot.stage_for_depth(candidate).pool_id in entry.denied_destination_pools:
@@ -541,6 +548,15 @@ class NativeAttemptAccounting:
             )
             if tool_search_round:
                 dispatch_reason = TOOL_SEARCH_ROUND
+            elif candidate != current_depth:
+                dispatch_reason, preferred_deployment = ejection_disclosure(
+                    self._health,
+                    keys,
+                    route,
+                    failover.untried if failover is not None else ladder,
+                    candidate,
+                    (dispatch_reason, preferred_deployment),
+                )
             try:
                 attempt_id = self._write_ledger.start_attempt(
                     snapshot=route.snapshot,

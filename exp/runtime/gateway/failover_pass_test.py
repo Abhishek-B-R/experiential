@@ -11,6 +11,7 @@ from typing import cast
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.catalog import GatewayRungDispatchPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_accounting_test import (
     _admit,
@@ -19,6 +20,7 @@ from exp.runtime.gateway.native_accounting_test import (
     _settle,
     _start,
 )
+from exp.runtime.gateway.native_execution import deployment_health_key
 
 _BAD_GATEWAY: JsonObject = {
     "failure_class": "provider_internal",
@@ -101,40 +103,82 @@ def test_a_first_dial_onto_the_same_full_rung_is_still_refused() -> None:
     assert cast("JsonObject", refused["failure"])["failure_class"] == "throttled"
 
 
-def test_the_forced_pass_stops_at_the_pro_ceiling_and_keeps_the_original_failure() -> None:
-    """A rung already at 1.5x its bound refuses even a failover: the 502 is the answer."""
+def _fail_over(registry: NativeAttemptAccounting, request_id: str) -> JsonObject:
+    """Start ``request_id`` on B (route B, A), fail it with a 502, and reserve its failover."""
+    started = _start(registry, ordinal=0, request_id=request_id)
+    assert started["route_depth"] == 0
+    _settle(
+        registry,
+        attempt_id=str(started["attempt_id"]),
+        outcome="failed",
+        finalize=False,
+        failure=_BAD_GATEWAY,
+        request_id=request_id,
+    )
+    entry = registry.entry(request_id)
+    assert entry is not None
+    entry.ordinary_attempt_counts[0] = 2
+    return _start(registry, ordinal=1, current_depth=0, failure=_BAD_GATEWAY, request_id=request_id)
+
+
+def test_forced_failover_passes_are_capped_and_then_refused_with_a_retryable_429() -> None:
+    """Half the bound of forced passes may ride on A; past that, a fast 429, never the 502."""
     ledger = _RecordingLedger()
     registry = NativeAttemptAccounting(ledger)
-    lane_a, lane_b = _refusing_pair()
-    _fill(registry, (lane_a, lane_b), 2, "occupied")
-    # A third request already overflowed A as a failover (2 x 1.5 = 3 slots).
-    for request_id, ordinal in (("first-failover", 1), ("second-failover", 1)):
+    lane_a, lane_b = _refusing_pair(bound_a=4)
+    _fill(registry, (lane_a, lane_b), 4, "occupied")
+    for request_id in ("failover-1", "failover-2", "failover-3"):
         _admit(registry, (lane_b, lane_a), request_id=request_id)
-        started = _start(registry, ordinal=0, request_id=request_id)
-        _settle(
-            registry,
-            attempt_id=str(started["attempt_id"]),
-            outcome="failed",
-            finalize=False,
-            failure=_BAD_GATEWAY,
-            request_id=request_id,
+    # ceil(4 x 0.5) = 2 forced failover passes on top of A's bound of 4.
+    assert _fail_over(registry, "failover-1")["route_depth"] == 1
+    second = _fail_over(registry, "failover-2")
+    assert second["route_depth"] == 1
+    refused = _fail_over(registry, "failover-3")
+    assert refused["exhausted"] is True
+    failure = cast("JsonObject", refused["failure"])
+    assert failure["failure_class"] == "throttled"
+    assert failure["retry_after_seconds"] == 5
+    assert registry.rung_admission_counters()[2] == 1
+    # A settled forced pass frees its slot under the cap for the next failover.
+    _settle(
+        registry,
+        attempt_id=str(second["attempt_id"]),
+        outcome="completed",
+        finalize=True,
+        request_id="failover-2",
+    )
+    _admit(registry, (lane_b, lane_a), request_id="failover-4")
+    assert _fail_over(registry, "failover-4")["route_depth"] == 1
+
+
+def test_a_failover_with_no_untried_rung_keeps_the_original_failure() -> None:
+    """Nothing untried and nothing shed: the dead rung's own failure is the answer."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    _lane_a, lane_b = _refusing_pair()
+    _admit(registry, (lane_b,), request_id="alone")
+    exhausted = _fail_over(registry, "alone")
+    assert exhausted["exhausted"] is True
+    assert cast("JsonObject", exhausted["failure"])["failure_class"] == "provider_internal"
+
+
+def test_an_attempt_dialed_past_an_ejected_lane_discloses_lane_ejected() -> None:
+    """The ejected lead is ordered last; the attempt that replaced it names it."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    dead = _deployment("mp-dead", connection_sha256="b" * 64)
+    live = _deployment("mp-live", connection_sha256="c" * 64)
+    entry = _admit(registry, (dead, live), request_id="past-ejected")
+    dead_key = deployment_health_key(entry.authorization, dead)
+    for _ in range(3):
+        registry.health.failed(
+            dead_key,
+            GatewayFailure(failure_class=GatewayFailureClass.TRANSPORT, safe_message="refused"),
         )
-        entry = registry.entry(request_id)
-        assert entry is not None
-        entry.ordinary_attempt_counts[0] = 2
-        result = _start(
-            registry,
-            ordinal=ordinal,
-            current_depth=0,
-            failure=_BAD_GATEWAY,
-            request_id=request_id,
-        )
-        if request_id == "first-failover":
-            assert result["route_depth"] == 1
-        else:
-            assert result["exhausted"] is True
-            failure = cast("JsonObject", result["failure"])
-            assert failure["failure_class"] == "provider_internal"
+    started = _start(registry, ordinal=0, request_id="past-ejected")
+    assert started["route_depth"] == 1
+    assert ledger.started[-1]["dispatch_reason"] == "lane_ejected"
+    assert ledger.started[-1]["preferred_deployment_id"] == "mp-dead"
 
 
 def test_a_rung_skipped_at_the_first_dial_is_revisited_when_its_sibling_fails() -> None:

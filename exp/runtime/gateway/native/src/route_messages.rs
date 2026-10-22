@@ -218,7 +218,7 @@ pub(crate) async fn messages(
         route: &admission.route,
         policy: admission.policy(),
         deadline,
-        pre_first_byte_deadline: crate::server::pre_first_byte_deadline(&state, deadline),
+        pre_first_byte_deadline: state.first_byte_budget(deadline, &admission.route, &body_text),
         time_to_first_byte: state.time_to_first_byte,
         time_to_first_byte_slope_seconds_per_million_input_tokens: state
             .time_to_first_byte_slope_seconds_per_million_input_tokens,

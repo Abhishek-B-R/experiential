@@ -5,13 +5,16 @@ an instant 502) for twenty minutes, and every request on the route dialed it
 first: 7,000+ wasted dials. The revision-scoped health circuit
 (``DeploymentHealthRegistry``) keys on the authorization's catalog digest, so
 its memory restarts per revision view, and it counts timeouts and malformed
-streams alike. This tracker keys on the PHYSICAL lane (deployment id and
-connection digest, the ``rung_load_key``), so every request on the worker
-learns from every other one, and it counts only the failures that say the box
-itself is down: transport failures (refused, reset, unreachable) and provider
-5xx (``provider_internal``: 500, 502, 503, 504). A client 4xx, a throttle, or
-a timeout says nothing here (each has its own handling) and neither extends
-nor resets a streak; a success, or an open stream, closes it.
+streams alike. This tracker keys on the lane's deployment id exactly as the
+plan carries it (``mp-<model_provider uuid>`` for a host lane), across every
+revision view, so every request on the worker learns from every other one. A
+BYOK variant carries its own id (``mp-<row>-c-<connection>``) and so never
+inherits its host lane's ejection, nor the host lane a variant's. It counts
+only the failures that say the box itself is down: transport failures
+(refused, reset, unreachable) and provider 5xx (``provider_internal``: 500,
+502, 503, 504). A client 4xx, a throttle, or a timeout says nothing here (each
+has its own handling) and neither extends nor resets a streak; a success, or
+an open stream, closes it.
 
 ``failures`` such failures inside ``window_seconds`` (no success between them)
 eject the lane for ``cooldown_seconds``. An ejected lane is never removed:
@@ -36,8 +39,8 @@ from dataclasses import dataclass, field
 
 from exp.runtime.gateway.contracts import GatewayFailureClass
 
-LaneKey = tuple[str, str]
-"""``(deployment_id, connection_sha256)``: one physical lane on this worker."""
+LaneKey = str
+"""A deployment id exactly as the route carries it: one lane on this worker."""
 
 DEAD_LANE_FAILURES = frozenset(
     {GatewayFailureClass.TRANSPORT, GatewayFailureClass.PROVIDER_INTERNAL}

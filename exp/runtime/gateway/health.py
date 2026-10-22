@@ -71,8 +71,8 @@ def health_failure_cause(
 
 
 def _lane(key: DeploymentHealthKey) -> LaneKey:
-    """The physical lane behind a revision-scoped health key (deployment, connection)."""
-    return (key[1], key[2])
+    """The lane behind a revision-scoped health key: its deployment id alone."""
+    return key[1]
 
 
 @dataclass

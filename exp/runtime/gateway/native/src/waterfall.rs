@@ -377,7 +377,6 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
         // A rung a tool-search round rebuilt dials its rebuilt wire; the
         // route's own entry still answers every policy question above.
         let dial_wire = search_wires[depth].as_ref().unwrap_or(wire);
-        let first_byte_cap = failover_first_byte_cap(ctx, depth, &physical_counts, total_attempts);
         let mut end = run_attempt(
             ctx,
             guard,
@@ -386,7 +385,6 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
             &mut repaired[depth],
             repair_redial,
             &tool_search_rounds,
-            first_byte_cap,
         )
         .await;
         // Every pre-commit failure of a tenant origin answers opaquely; the
@@ -674,7 +672,9 @@ mod commit;
 pub(crate) use commit::is_semantic;
 mod fallback_rules;
 mod wire;
-pub(crate) use wire::{first_byte_allowance, first_token_allowance, open_phase_bound};
+pub(crate) use wire::{
+    first_byte_allowance, first_token_allowance, open_phase_bound, pre_first_byte_budget,
+};
 pub use wire::{DeploymentWire, RoutePolicy, WaterfallContext};
 
 mod empty;
@@ -688,7 +688,7 @@ use dispatch::{customer_owned, dispatch_headers};
 
 mod successor;
 pub(crate) use successor::successor_possible;
-use successor::{failover_first_byte_cap, throttle_backoff_delay};
+use successor::throttle_backoff_delay;
 
 mod search_round;
 

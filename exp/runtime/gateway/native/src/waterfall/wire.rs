@@ -314,6 +314,52 @@ pub(crate) fn first_byte_allowance(
     Duration::from_secs_f64((base + scaled).max(0.001))
 }
 
+/// What the pre-first-byte budget keeps beyond the slowest authored header
+/// allowance, so a rung that stalls out its whole allowance still leaves a
+/// successor time to answer its own headers.
+pub(crate) const PRE_FIRST_BYTE_RESERVE: Duration = Duration::from_secs(15);
+
+/// One request's pre-first-byte budget: the configured budget, raised to the
+/// longest AUTHORED first-byte allowance on the route (base plus the input
+/// slope for this request) plus `PRE_FIRST_BYTE_RESERVE`.
+///
+/// The configured budget also caps every dial's header wait
+/// (`WaterfallContext::capped`), so a self-hosted lane authoring 300 s for
+/// long prompts was cut at the budget instead: the authored value must win.
+/// Every rung counts, not only route index 0, because the control plane may
+/// dial another rung first (a lead shed at its bound, an open circuit) and a
+/// slow rung reached by failover deserves its allowance too. A rung that
+/// authors neither its base nor its slope adds nothing, so a route of
+/// unauthored lanes keeps the configured budget exactly. `None` (budget
+/// disabled) stays disabled.
+pub(crate) fn pre_first_byte_budget(
+    configured: Option<Duration>,
+    route: &[DeploymentWire],
+    default_base: Duration,
+    default_slope_seconds_per_million: f64,
+    approximate_input_tokens: f64,
+) -> Option<Duration> {
+    let configured = configured?;
+    let authored = route
+        .iter()
+        .filter(|wire| {
+            wire.time_to_first_byte_base_seconds.is_some()
+                || wire
+                    .time_to_first_byte_seconds_per_million_input_tokens
+                    .is_some()
+        })
+        .map(|wire| {
+            first_byte_allowance(
+                wire,
+                default_base,
+                default_slope_seconds_per_million,
+                approximate_input_tokens,
+            ) + PRE_FIRST_BYTE_RESERVE
+        })
+        .max();
+    Some(authored.map_or(configured, |floor| configured.max(floor)))
+}
+
 /// The effective first-TOKEN allowance for one attempt: the deployment's (or
 /// serving default's) flat first-token base plus the same input-scaled
 /// allowance the header bound uses (prefill delays both).
