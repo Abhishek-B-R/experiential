@@ -334,30 +334,25 @@ def _published_requires_dist() -> list[str]:
     return values
 
 
-@pytest.mark.parametrize(
-    ("original", "replacement", "message"),
-    [
+def test_release_requirements_reject_ranges_wildcards_and_versioned_self_reference() -> None:
+    """The published set passes; one wildcard, extra range or pinned self-reference fails.
+
+    The cases loop inside one test: the installed-release driver imports this module
+    without pytest, so module-level pytest decorators cannot appear here.
+    """
+    published = _published_requires_dist()
+    _assert_core_requirements("\n".join(f"Requires-Dist: {value}" for value in published))
+    cases = (
         ("filelock==", "filelock==3.*", "not an exact pin"),
         ("tinker==", 'tinker>=0.23; extra == "sft"', "not an exact pin"),
         ("experiential[sft]", 'experiential[sft]==0.7.216; extra == "dev"', "self-reference"),
-    ],
-)
-def test_release_requirements_reject_ranges_wildcards_and_versioned_self_reference(
-    original: str, replacement: str, message: str
-) -> None:
-    """The published set passes; one wildcard, extra range or pinned self-reference fails.
-
-    Args:
-        original: Prefix of the published requirement the case replaces.
-        replacement: The offending Requires-Dist value put in its place.
-        message: The guard's failure reason expected for that replacement.
-    """
-    values = _published_requires_dist()
-    _assert_core_requirements("\n".join(f"Requires-Dist: {value}" for value in values))
-    index = next(i for i, value in enumerate(values) if value.startswith(original))
-    values[index] = replacement
-    with pytest.raises(AssertionError, match=message):
-        _assert_core_requirements("\n".join(f"Requires-Dist: {value}" for value in values))
+    )
+    for original, replacement, message in cases:
+        values = list(published)
+        index = next(i for i, value in enumerate(values) if value.startswith(original))
+        values[index] = replacement
+        with pytest.raises(AssertionError, match=message):
+            _assert_core_requirements("\n".join(f"Requires-Dist: {value}" for value in values))
 
 
 def _assert_current_archive_members(
