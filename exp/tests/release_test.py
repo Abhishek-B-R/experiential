@@ -268,7 +268,7 @@ def _core_requirement_names(metadata: str) -> frozenset[str]:
 
 
 def _assert_core_requirements(metadata: str) -> None:
-    """Check SDK requirements, exact pins, the HTTPX2 security floor and Python-gated Capture."""
+    """Check SDK requirements, exact pins (extras too), HTTPX2 floor and Python-gated Capture."""
     _assert_allowed_requirements(metadata)
     requirements: dict[str, str] = {}
     for name, marker in _metadata_requirements(metadata):
@@ -284,7 +284,9 @@ def _assert_core_requirements(metadata: str) -> None:
     for value in headers.get_all("Requires-Dist", []):
         requirement = Requirement(re.sub(r"\s+", " ", value))
         name = requirement.name.casefold()
-        if name not in requirements:
+        if name == "experiential":
+            # The dev extra's experiential[sft] names this same release.
+            assert not requirement.specifier, f"self-reference carries a version: {value}"
             continue
         if name == "openai":
             # Callers' own code imports the SDK, so it alone stays a certified range.
@@ -293,9 +295,11 @@ def _assert_core_requirements(metadata: str) -> None:
             )
             continue
         specifiers = list(requirement.specifier)
-        assert len(specifiers) == 1 and specifiers[0].operator == "==", (
-            f"core requirement is not an exact pin: {value}"
-        )
+        assert (
+            len(specifiers) == 1
+            and specifiers[0].operator == "=="
+            and "*" not in specifiers[0].version
+        ), f"release requirement is not an exact pin: {value}"
         if name == "httpx2":
             assert Version(specifiers[0].version) >= Version("2.12"), (
                 f"HTTPX2 pin is below its security floor: {requirement.specifier}"
@@ -310,10 +314,37 @@ def test_core_dependency_markers_preserve_sdk_python_312() -> None:
     metadata = "\n".join(f"Requires-Dist: {requirement}" for requirement in project["dependencies"])
     _assert_core_requirements(metadata)
     _assert_core_requirements(metadata + "\n\nRequires-Dist: anthropic>=1.2")
-    _assert_core_requirements(metadata + '\nRequires-Dist: anthropic>=1.2; extra == "dev"')
+    _assert_core_requirements(metadata + '\nRequires-Dist: anthropic==1.2.0; extra == "dev"')
     for marker in ("", '; python_version >= "3.13"'):
         with pytest.raises(AssertionError, match="forbidden release requirement"):
             _assert_core_requirements(metadata + f"\nRequires-Dist: anthropic>=1.2{marker}")
+
+
+@pytest.mark.parametrize(
+    "extra_line",
+    [
+        "Requires-Dist: filelock==3.*",
+        'Requires-Dist: tinker>=0.23; extra == "sft"',
+        'Requires-Dist: experiential[sft]==0.7.216; extra == "dev"',
+    ],
+)
+def test_release_requirements_reject_ranges_wildcards_and_versioned_self_reference(
+    extra_line: str,
+) -> None:
+    """Wildcard equality, a range in an extra, and a pinned self-reference all fail the guard.
+
+    Args:
+        extra_line: One offending Requires-Dist header appended to the real metadata.
+    """
+    path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    project = tomllib.loads(path.read_text(encoding="utf-8"))["project"]
+    metadata = "\n".join(
+        f"Requires-Dist: {requirement}"
+        for requirement in project["dependencies"]
+        if not requirement.startswith(("filelock", "tinker"))
+    )
+    with pytest.raises(AssertionError):
+        _assert_core_requirements(metadata + "\n" + extra_line)
 
 
 def _assert_current_archive_members(
