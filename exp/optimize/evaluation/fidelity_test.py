@@ -36,8 +36,15 @@ from exp.simulation.retrieval import RAGLineageBinding, persist_trace_rag
 from exp.simulation.world_model.construction import ground_world_model_from_traces
 
 
-def source_project(root: Path) -> tuple[ProjectStore, FidelitySpec]:
-    """Persist a real source dataset and retrieval index without model construction."""
+def source_project(
+    root: Path, served_model_id: str | None = None
+) -> tuple[ProjectStore, FidelitySpec]:
+    """Persist a real source dataset and retrieval index without model construction.
+
+    Args:
+        root: Project root.
+        served_model_id: Optional catalog pin for the provider-reported model ID.
+    """
     project = ProjectStore(root, "fidelity-test")
     project.initialize(ProjectConfig(project_id="fidelity-test"))
     now = datetime.now(UTC)
@@ -53,6 +60,7 @@ def source_project(root: Path) -> tuple[ProjectStore, FidelitySpec]:
             "model": ModelRecord(
                 connection="http",
                 model="fixture-v1",
+                served_model_id=served_model_id,
                 billing_source=BillingSource.CUSTOMER_MANAGED,
                 capabilities=ModelCapabilities(
                     supports_tools=True,
@@ -220,6 +228,35 @@ def transition_reply(proposal: JsonObject) -> JsonHttpResponse:
     )
 
 
+def judge_reply(axes: JsonObject) -> JsonHttpResponse:
+    """Return the judge's submitted axes on the real provider tool-call wire."""
+    return JsonHttpResponse(
+        status_code=200,
+        body={
+            "model": "fixture-v1",
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "judge",
+                                "type": "function",
+                                "function": {
+                                    "name": "submit_proposal",
+                                    "arguments": json.dumps({"axes": axes}),
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+    )
+
+
 @pytest.mark.parametrize(
     ("json_output", "output_protocol"),
     [(False, "text"), (True, "text"), (False, "json-tool")],
@@ -291,36 +328,7 @@ def test_predictions_references_and_completed_replay(
             )
             for i in range(2)
         ]
-    wire = ScriptedJsonTransport(
-        predictions
-        + [
-            JsonHttpResponse(
-                status_code=200,
-                body={
-                    "model": "fixture-v1",
-                    "choices": [
-                        {
-                            "finish_reason": "tool_calls",
-                            "message": {
-                                "role": "assistant",
-                                "content": None,
-                                "tool_calls": [
-                                    {
-                                        "id": "judge",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "submit_proposal",
-                                            "arguments": json.dumps({"axes": axes}),
-                                        },
-                                    }
-                                ],
-                            },
-                        }
-                    ],
-                },
-            )
-        ]
-    )
+    wire = ScriptedJsonTransport(predictions + [judge_reply(axes)])
     monkeypatch.setattr(fidelity, "HttpxJsonTransport", lambda: wire)
     monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
     prepared = prepare_fidelity_evaluation(project, spec, code_revision="fixture")
@@ -406,3 +414,44 @@ def test_invalid_returned_proposal_is_not_committed_or_retried(
     assert result.mechanical["blocked_steps"] == 1
     assert result.judge_status == "failed"
     assert len(wire.requests) == 2
+
+
+def test_a_provider_answering_under_its_served_model_id_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Predictions and judging accept the catalog's served model ID, and only that one."""
+    project, spec = source_project(tmp_path, served_model_id="fixture-2026-10-01")
+    axes: JsonObject = {
+        d.dimension_id: {
+            "status": "assessed",
+            "score": 5,
+            "rationale": "Fixture match",
+            "evidence_refs": ["step-0"],
+            "critical_flags": [],
+        }
+        for d in spec.judge.definition.dimensions
+    }
+    responses = [
+        *(
+            reply(
+                json.dumps(
+                    {
+                        "message": "",
+                        "terminal": False,
+                        "state": {"seen": i + 1},
+                        "tool_results": [{"call_id": f"call-{i}", "content": f"reply-{i}"}],
+                    }
+                )
+            )
+            for i in range(2)
+        ),
+        judge_reply(axes),
+    ]
+    for response in responses:
+        response.body["model"] = "fixture-2026-10-01"
+    wire = ScriptedJsonTransport(responses)
+    monkeypatch.setattr(fidelity, "HttpxJsonTransport", lambda: wire)
+    monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
+    prepared = prepare_fidelity_evaluation(project, spec, code_revision="fixture")
+    result = execute_fidelity_evaluation(project, prepared)
+    assert result.judge_status == "completed" and result.mechanical["valid_steps"] == 2

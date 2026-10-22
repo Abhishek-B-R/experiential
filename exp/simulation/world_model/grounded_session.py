@@ -101,6 +101,7 @@ class GroundedTransitionEngine:
         maximum_output_tokens: Frozen output allowance shared with completion admission.
         json_object_output: Explicit structured-output treatment, false for plain text calls.
         output_protocol: Plain JSON text or one typed transition proposal.
+        served_model_id: Catalog pin for the provider-reported ID of the frozen model.
     """
 
     def __init__(
@@ -111,6 +112,7 @@ class GroundedTransitionEngine:
         maximum_output_tokens: int,
         json_object_output: bool = False,
         output_protocol: Literal["text", "json-tool"] = "text",
+        served_model_id: str | None = None,
     ) -> None:
         """Bind an existing predictor to a single public fixed-action task."""
         if maximum_output_tokens <= 0 or task.reference_answer is not None:
@@ -125,6 +127,11 @@ class GroundedTransitionEngine:
         self.maximum_output_tokens = maximum_output_tokens
         self.json_object_output = json_object_output
         self.output_protocol = output_protocol
+        self._models = [runtime.artifact.model]
+        if served_model_id is not None:
+            self._models.append(
+                runtime.artifact.model.model_copy(update={"model_id": served_model_id})
+            )
 
     @property
     def identity(self) -> Sha256:
@@ -215,7 +222,7 @@ class GroundedTransitionEngine:
     ) -> ProposedTransition:
         """Preserve raw text until the existing protocol parser validates the result."""
         response = ModelResponse.model_validate(proposal)
-        if response.model != self.runtime.artifact.model:
+        if response.model not in self._models:
             raise ValueError("grounded response model differs from the frozen artifact")
         if response.finish_reason != ModelFinishReason.COMPLETED:
             raise ValueError("grounded generation did not complete; raw output retained")
@@ -259,6 +266,7 @@ def open_grounded_session(
     maximum_output_tokens: int,
     json_object_output: bool = False,
     output_protocol: Literal["text", "json-tool"] = "text",
+    served_model_id: str | None = None,
     clock: Callable[[], datetime] | None = None,
     research_policy: OnlineResearchPolicy | None = None,
     research_complete: Completion | None = None,
@@ -286,6 +294,7 @@ def open_grounded_session(
         maximum_output_tokens: Frozen output capacity.
         json_object_output: Require provider JSON mode when the selected route supports it.
         output_protocol: Freeze text framing or typed native-value proposals.
+        served_model_id: Catalog pin for the provider-reported ID of the frozen model.
         clock: Optional aware clock for deterministic deadline qualification.
         research_policy: Explicit opt-in to past-reply feedback and provisional memory.
         research_complete: Separately metered investigator, required with research policy.
@@ -313,6 +322,7 @@ def open_grounded_session(
         maximum_output_tokens=maximum_output_tokens,
         json_object_output=json_object_output,
         output_protocol=output_protocol,
+        served_model_id=served_model_id,
     )
     research = None
     if research_selection is not None:

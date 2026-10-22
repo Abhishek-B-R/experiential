@@ -710,6 +710,7 @@ def execute_fidelity_evaluation(
             maximum_output_tokens=spec.budget("prediction").output_tokens,
             json_object_output=spec.json_object_output,
             output_protocol=spec.output_protocol,
+            served_model_id=predictor.served_model_id,
             research_policy=spec.online_research,
             research_selection=research_selection,
             research_complete=completion(investigating, structured=True, role="investigation")
