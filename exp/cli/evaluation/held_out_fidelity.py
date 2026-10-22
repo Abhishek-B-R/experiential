@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import AbstractContextManager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 from time import monotonic
 
 import typer
@@ -197,19 +198,29 @@ def execute_runs(
     i/n``, plus ``Replaying traces k/n`` as traces finish; without it, the panel owns a display.
     """
     total = len(registrations)
+    # Once any trace fails or the user interrupts, no further trace starts; running ones finish.
+    stopped = Event()
     try:
         with (
             nullcontext(progress) if progress is not None else progress_display(console) as hook,
             ThreadPoolExecutor(PANEL_CONCURRENCY) as pool,
         ):
+
+            def replay(index: int, prepared: PreparedFidelity) -> None:
+                """Replay one trace unless the panel has already stopped."""
+                if stopped.is_set():
+                    return
+                try:
+                    execute_fidelity_evaluation(
+                        store, prepared, progress=qualified(hook, f"trace {index}/{total}")
+                    )
+                except BaseException:
+                    stopped.set()
+                    raise
+
             report(hook, PANEL_STAGE, completed=0, total=total)
             futures = [
-                pool.submit(
-                    execute_fidelity_evaluation,
-                    store,
-                    prepared,
-                    progress=qualified(hook, f"trace {index}/{total}"),
-                )
+                pool.submit(replay, index, prepared)
                 for index, prepared in enumerate(registrations, start=1)
             ]
             try:
@@ -217,7 +228,7 @@ def execute_runs(
                     future.result()
                     report(hook, PANEL_STAGE, completed=finished, total=total)
             except BaseException:
-                # A failed or interrupted panel starts no queued trace; running traces finish.
+                stopped.set()
                 for future in futures:
                     future.cancel()
                 raise

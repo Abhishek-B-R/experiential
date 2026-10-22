@@ -32,20 +32,18 @@ def test_aggregate_line_reports_replies_fields_judge_and_coverage() -> None:
 def test_a_failed_trace_starts_none_of_the_queued_panel_traces(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only the traces already running finish after one fails; queued ones never buy calls."""
+    """When every call fails at once, no worker starts a trace after the first failure."""
     started: list[object] = []
-    lock, release = threading.Lock(), threading.Event()
+    lock = threading.Lock()
 
     def execute(_store: object, prepared: object, **_kwargs: object) -> None:
-        """Fail the first trace at once; hold the others briefly, as provider calls would."""
+        """Fail immediately, as a revoked key would."""
         with lock:
             started.append(prepared)
-        if prepared == 0:
-            raise ProviderTransportError("service unavailable", status_code=503)
-        release.wait(0.2)
+        raise ProviderTransportError("unauthorized", status_code=401)
 
     monkeypatch.setattr(held_out_fidelity, "execute_fidelity_evaluation", execute)
-    traces = tuple(range(PANEL_CONCURRENCY * 5))
+    traces = tuple(range(PANEL_CONCURRENCY * 25))
     with pytest.raises(typer.Exit):
         execute_runs(
             Console(file=io.StringIO()),
@@ -53,4 +51,4 @@ def test_a_failed_trace_starts_none_of_the_queued_panel_traces(
             cast("tuple[PreparedFidelity, ...]", traces),
             lambda _event: None,
         )
-    assert len(started) <= PANEL_CONCURRENCY + 1 < len(traces)
+    assert len(started) <= PANEL_CONCURRENCY
