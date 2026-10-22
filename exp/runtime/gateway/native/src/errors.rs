@@ -344,6 +344,34 @@ pub struct Failure {
     /// collapses to [`TENANT_ORIGIN_MESSAGE`] (see [`Self::public_error`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tenant_origin: bool,
+    /// Set only on a header-phase timeout: which bound expired. A lane that
+    /// spent its OWN first-byte allowance is a hung-lane strike; one cut by
+    /// the request's pre-first-byte budget (or deadline) is not, because
+    /// the budget is shared and a healthy fallback dialed late gets only its
+    /// remainder. Crosses the bridge as `header_timeout` (python
+    /// `GatewayHeaderTimeout`), read by the control plane's lane ejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_timeout: Option<HeaderTimeout>,
+}
+
+/// Which bound ended a dial waiting for its provider's response headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeaderTimeout {
+    /// The rung's own first-byte allowance expired: the lane did not answer.
+    Allowance,
+    /// The request's shared budget (or deadline) expired first.
+    Budget,
+}
+
+impl HeaderTimeout {
+    /// The boundary token, shared with python `GatewayHeaderTimeout`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Allowance => "allowance",
+            Self::Budget => "budget",
+        }
+    }
 }
 
 impl Failure {
@@ -362,6 +390,7 @@ impl Failure {
             rate_limit_headers: None,
             encrypted_reasoning_rejected: false,
             tenant_origin: false,
+            header_timeout: None,
         }
     }
 

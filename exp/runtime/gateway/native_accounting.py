@@ -464,7 +464,9 @@ class NativeAttemptAccounting:
                         break
                 else:
                     # A failover is never ended by a sibling's bound (failover_pass).
-                    candidate = forced_failover_target(failover, policy_sheds, shed_records)
+                    candidate = forced_failover_target(
+                        failover, policy_sheds, shed_records, self._health, keys
+                    )
                     if candidate is None:
                         refusal = failover_refusal(failover, entry.authorization, shed_records)
                         if refusal is not None:

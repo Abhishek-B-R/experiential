@@ -6,9 +6,14 @@ each with a refusing ``concurrency_bound``.
 
 from __future__ import annotations
 
+import json
+import time
 from typing import cast
 
+import pytest
+
 from exp.common.core.artifacts import JsonObject
+from exp.common.models import ModelCapabilities
 from exp.common.models.catalog import GatewayRungDispatchPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
@@ -20,7 +25,8 @@ from exp.runtime.gateway.native_accounting_test import (
     _settle,
     _start,
 )
-from exp.runtime.gateway.native_execution import deployment_health_key
+from exp.runtime.gateway.native_execution import deployment_health_key, rung_load_key
+from exp.runtime.gateway.native_rung_policy_test import _carded_reserve_rung
 
 _BAD_GATEWAY: JsonObject = {
     "failure_class": "provider_internal",
@@ -231,3 +237,125 @@ def test_a_failover_spills_sideways_before_it_forces_anything() -> None:
     spilled = _start(registry, ordinal=1, current_depth=0, failure=_BAD_GATEWAY, request_id="spill")
     assert spilled["route_depth"] == 2
     assert ledger.started[-1]["dispatch_reason"] == "queue_bound"
+
+
+# A refused connection exactly as the data plane classifies it
+# (`upstream.rs::transport_failure(None)`).
+_REFUSED: JsonObject = {
+    "failure_class": "transport",
+    "safe_message": "provider transport failed; retry the request",
+    "retryable_same_deployment": True,
+    "failover_eligible": True,
+}
+
+
+def _fail_with(
+    registry: NativeAttemptAccounting, request_id: str, failure: JsonObject
+) -> JsonObject:
+    """Start ``request_id`` on its lead, fail it with ``failure``, and reserve its failover."""
+    started = _start(registry, ordinal=0, request_id=request_id)
+    assert started["route_depth"] == 0
+    _settle(
+        registry,
+        attempt_id=str(started["attempt_id"]),
+        outcome="failed",
+        finalize=False,
+        failure=failure,
+        request_id=request_id,
+    )
+    entry = registry.entry(request_id)
+    assert entry is not None
+    entry.ordinary_attempt_counts[0] = 2
+    return _start(registry, ordinal=1, current_depth=0, failure=failure, request_id=request_id)
+
+
+def test_a_refused_lane_fails_over_onto_its_saturated_sibling_as_a_forced_pass() -> None:
+    """End to end on the accounting half: refused connect on B, A full, A forced."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    lane_a, lane_b = _refusing_pair()
+    _fill(registry, (lane_a, lane_b), 2, "occupied")
+    _admit(registry, (lane_b, lane_a), request_id="refused")
+    forced = _fail_with(registry, "refused", _REFUSED)
+    assert forced["route_depth"] == 1
+    assert ledger.started[-1]["deployment_id"] == "deployment-a"
+    assert ledger.started[-1]["dispatch_reason"] == "saturated_overflow"
+    assert registry.loads.failover_inflight(rung_load_key(lane_a)) == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        {
+            "failure_class": "throttled",
+            "safe_message": "provider throttled the request",
+            "retryable_same_deployment": False,
+            "failover_eligible": True,
+        },
+        {
+            "failure_class": "timeout",
+            "safe_message": "provider did not send response headers in time",
+            "retryable_same_deployment": False,
+            "failover_eligible": True,
+        },
+    ],
+)
+def test_a_throttle_or_timeout_never_forces_past_a_refusing_bound(failure: JsonObject) -> None:
+    """The failed rung is alive: no over-queued sibling; the original failure stands."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    lane_a, lane_b = _refusing_pair()
+    _fill(registry, (lane_a, lane_b), 2, "occupied")
+    _admit(registry, (lane_b, lane_a), request_id="alive")
+    result = _fail_with(registry, "alive", failure)
+    assert result["exhausted"] is True
+    assert cast("JsonObject", result["failure"])["failure_class"] == failure["failure_class"]
+    assert registry.loads.failover_inflight(rung_load_key(lane_a)) == 0
+
+
+@pytest.mark.parametrize("release", ["settle", "abandon", "sweep"])
+def test_a_forced_pass_frees_its_failover_slot_on_every_release_path(release: str) -> None:
+    """Settlement, abandonment and the deadline sweep each release the forced counter."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    lane_a, lane_b = _refusing_pair()
+    _fill(registry, (lane_a, lane_b), 2, "occupied")
+    entry = _admit(registry, (lane_b, lane_a), request_id="forced")
+    forced = _fail_with(registry, "forced", _REFUSED)
+    key = rung_load_key(lane_a)
+    assert registry.loads.failover_inflight(key) == 1
+    match release:
+        case "settle":
+            _settle(
+                registry,
+                attempt_id=str(forced["attempt_id"]),
+                outcome="completed",
+                finalize=True,
+                request_id="forced",
+            )
+        case "abandon":
+            registry.abandon(json.dumps({"request_id": "forced"}))
+        case _:
+            entry.deadline_monotonic = time.monotonic() - 60.0
+            registry.sweep_expired()
+    assert registry.loads.failover_inflight(key) == 0
+    assert registry.entry("forced") is None
+
+
+def test_a_forced_pass_never_takes_a_fast_reserve() -> None:
+    """A refusing lane's :fast reserve stays :fast's even for a dead-lane failover."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    reserve_lane = _carded_reserve_rung(saturation="refuse").model_copy(
+        update={"capabilities": ModelCapabilities(maximum_output_tokens=128_000)}
+    )
+    _lane_a, lane_b = _refusing_pair()
+    # Regular share of the bound-4 lane is 3; the fourth slot is :fast's.
+    _fill(registry, (reserve_lane,), 3, "regular")
+    _admit(registry, (lane_b, reserve_lane), request_id="dead-lead")
+    refused = _fail_with(registry, "dead-lead", _REFUSED)
+    assert refused["exhausted"] is True
+    failure = cast("JsonObject", refused["failure"])
+    assert failure["failure_class"] == "throttled"
+    assert registry.loads.fast_inflight(rung_load_key(reserve_lane)) == 0
+    assert registry.loads.failover_inflight(rung_load_key(reserve_lane)) == 0

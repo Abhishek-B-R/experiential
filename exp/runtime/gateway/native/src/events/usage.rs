@@ -5,7 +5,7 @@
 use serde_json::{Map, Value};
 
 use super::Usage;
-use cache_subsets::{cache_subsets, separate_written_reads, validate_cache_subsets};
+use cache_subsets::{cache_subsets, fit_cache_subsets, separate_written_reads};
 
 #[path = "usage/cache_subsets.rs"]
 mod cache_subsets;
@@ -324,12 +324,8 @@ impl OpenAiUsageAccumulator {
             "OpenAI image_tokens",
         )?;
         let total_tokens = count_if_present(object, "total_tokens", "OpenAI usage")?;
-        let (cached_input_tokens, cache_creation_input_tokens) = cache_subsets(
-            object,
-            input_details,
-            input_tokens,
-            self.writes_within_reads,
-        )?;
+        let (cached_input_tokens, cache_creation_input_tokens) =
+            cache_subsets(object, input_details)?;
         let cached_input_tokens = cached_input_tokens.filter(|_| !unreported[0]);
         let cache_creation_input_tokens = cache_creation_input_tokens.filter(|_| !unreported[1]);
         let cache_creation_1h_input_tokens = optional_usage_detail(
@@ -423,7 +419,7 @@ impl OpenAiUsageAccumulator {
         if self.writes_within_reads {
             separate_written_reads(&mut normalized)?;
         }
-        validate_cache_subsets(&normalized)?;
+        fit_cache_subsets(&mut normalized)?;
         normalized.output_tokens = normalized
             .output_tokens
             .map(|output| {

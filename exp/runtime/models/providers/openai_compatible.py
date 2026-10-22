@@ -69,6 +69,7 @@ from exp.runtime.models.providers.openrouter_routing import (
     OPENROUTER_PROVIDER_ID,
     openrouter_cache_writes_within_reads,
 )
+from exp.runtime.models.providers.prompt_cache_options import openai_prompt_cache_origin
 from exp.runtime.models.providers.reasoning_compat import (
     openai_reasoning_effort,
     require_sampling_reasoning_compatibility,
@@ -653,7 +654,12 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             # does may still reject an unknown top-level field, so the
             # declaration never widens what is sent, BYOK or not.
             forwards_prompt_cache_key=is_hunyuan_base_url(self._base_url),
+            forwards_prompt_cache_options=self._carries_prompt_cache_options(),
         )
+
+    def _carries_prompt_cache_options(self) -> bool:
+        """Whether this origin carries OpenAI's ``prompt_cache_options`` and breakpoints."""
+        return openai_prompt_cache_origin(self._base_url)
 
     def _completion_path(self) -> str:
         """Return the shared Chat Completions route."""

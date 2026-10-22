@@ -71,8 +71,8 @@ def health_failure_cause(
 
 
 def _lane(key: DeploymentHealthKey) -> LaneKey:
-    """The lane behind a revision-scoped health key: its deployment id alone."""
-    return key[1]
+    """The physical lane behind a health key: ``(deployment_id, connection_sha256)``."""
+    return (key[1], key[2])
 
 
 @dataclass
@@ -291,7 +291,7 @@ class DeploymentHealthRegistry:
             state = self._states.setdefault(key, _DeploymentHealth())
             state.half_open_probe = False
             state.last_resort_probe = False
-            self._lanes.failed(_lane(key), failure.failure_class, now)
+            self._lanes.failed(_lane(key), failure, now)
             if cause == "throttle":
                 state.throttle_until = max(
                     state.throttle_until,

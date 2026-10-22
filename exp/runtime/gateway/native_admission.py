@@ -79,6 +79,7 @@ from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
     plaintext_reasoning_lead_order,
 )
+from exp.runtime.models.providers.prompt_cache_options import honors_markers
 from exp.runtime.models.providers.protocol import NativeWireClient
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 from exp.runtime.openai_protocol.state import ProtocolNamespace, episode_namespace
@@ -519,7 +520,7 @@ def _prefer_cache_capable_rungs(
     stands ready: the pool's whole policy is prefix-cache preservation, and
     a marker-dropping first rung silently bills every turn's full context
     uncached (measured ~10x on a large system prompt). The reorder is
-    stable within each group, so certified order still breaks ties, and a
+    stable per group (house OpenRouter never leads; an order it leaves unmoved stands), and a
     route that narrowing left with NO marker-honoring rung is unchanged
     here: the dropped markers are already disclosed through the
     ``cache_control`` ``ignored_parameters`` entries. ``maximize_availability``
@@ -535,16 +536,14 @@ def _prefer_cache_capable_rungs(
     if len(resolved_wires) < 2 or not request_carries_cache_markers(provider_request):
         return route, resolved_wires
     marker_capable = tuple(
-        index
-        for index, (profile, _client) in enumerate(resolved_wires)
-        if profile.preserves_cache_control
+        i for i, (w, _) in enumerate(resolved_wires) if honors_markers(w, provider_request)
     )
     if not marker_capable or len(marker_capable) == len(resolved_wires):
         return route, resolved_wires
-    order = (
-        *marker_capable,
-        *(index for index in range(len(resolved_wires)) if index not in marker_capable),
-    )
+    order = (*marker_capable, *(i for i in range(len(resolved_wires)) if i not in marker_capable))
+    if order == tuple(range(len(resolved_wires))):
+        return route, resolved_wires
+    order = house_aggregator_last(order, route.deployments, [p for p, _ in resolved_wires])
     return (
         reorder_route_deployments(route, order),
         tuple(resolved_wires[index] for index in order),
@@ -633,7 +632,7 @@ def _affinity_ordered_rungs(
         marker_capable = frozenset(
             index
             for index, (profile, _client) in enumerate(resolved_wires)
-            if profile.preserves_cache_control
+            if honors_markers(profile, provider_request)
         )
         if marker_capable and len(marker_capable) < len(resolved_wires):
             order = (

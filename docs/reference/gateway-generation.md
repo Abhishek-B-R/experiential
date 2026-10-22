@@ -354,8 +354,8 @@ that an older relay already discarded.
 OpenAI's 12-hour prompt cache lifetime rides Responses `prompt_cache_options.ttl: "12h"`
 ([OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching): "In the
 Responses API, set `prompt_cache_options.ttl` to choose the minimum cache lifetime"). `"30m"` is
-the provider default and is accepted as already satisfied; any other value, and any
-`prompt_cache_options` on Chat (OpenAI's Chat answers 400 for `"12h"`), is refused. Admission
+the provider default and is accepted as already satisfied; any other value, and `"12h"` on Chat
+(OpenAI's Chat answers 400 for it; `"30m"` is Chat's only documented lifetime), is refused. Admission
 narrows the route to rungs declaring `supports_prompt_cache_ttl_12h` whose wire carries the field
 (OpenAI's own Responses API) and refuses the request with `unsupported_capability` on
 `prompt_cache_options.ttl` when none does, so no rung that would write at the default lifetime or
@@ -367,6 +367,31 @@ subset, disjoint from any one-hour subset, and is relayed as `cache_write_tokens
 `cache_creation_12h_input_nano_usd_per_million_tokens`, or at 2.5 times its input rate (OpenAI's
 published total write rate) when the card authors none, never at the 30-minute write rate. A
 12-hour request whose provider reports writes without the split bills every write at 12 hours.
+
+`prompt_cache_options.mode: "explicit"` and the content-block `prompt_cache_breakpoint`
+(`{"mode": "explicit", "ttl"?: ...}`) are accepted on both OpenAI surfaces
+(`exp/runtime/openai_protocol/prompt_cache_controls.py`). `mode: "implicit"` is the provider
+default and is never forwarded; any other mode, a breakpoint that is not that exact shape, and a
+breakpoint `ttl` other than the request's own lifetime (re-emitted breakpoints inherit it) are
+named 400s, as is `prewarm`. A text-block breakpoint rides the canonical ephemeral
+`cache_control` carrier at the same block, so per dialect:
+
+- OpenAI, Azure OpenAI (its `openai_deployments` surface) and OpenRouter, on Chat and Responses,
+  receive `prompt_cache_options` and every breakpoint in their own spelling
+  (`GatewayWireProfile.forwards_prompt_cache_options`; a marked instruction rides an input item,
+  since Responses `instructions` cannot hold one). Explicit-mode cache writes are reported and
+  billed through the same `cache_write_tokens` legs as implicit ones.
+- Anthropic and Bedrock cache at the same blocks as ephemeral `cache_control` / `cachePoint` at
+  their 5-minute default, never the dearer 1-hour lifetime, disclosed as
+  `prompt_cache_breakpoint->translated(cache_control_5m)`; they cache only at markers, so
+  explicit mode already holds there.
+- Every other wire (Gemini, Novita, vLLM and other OpenAI-compatible servers, Azure's Foundry
+  model-inference surface) never receives the fields. Like any cache marker they are kept while
+  some rung honors them, and only a route where none does discloses
+  `prompt_cache_options.mode->not_forwarded(provider_decides_caching)` and
+  `messages.content.prompt_cache_breakpoint->not_forwarded(...)`. A breakpoint on an image,
+  audio or file part, or inside a Responses tool output, is dropped with a
+  `->dropped(unsupported_media)` / `->dropped(unsupported_tool_output)` disclosure.
 
 Anthropic Messages and Bedrock Converse bill thinking inside `output_tokens` and publish no
 separate count, so their reasoning meter stays unknown for settlement. Chat and Responses

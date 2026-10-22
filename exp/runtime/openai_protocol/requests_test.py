@@ -3501,9 +3501,9 @@ def test_copilot_hardcoded_no_op_values_decode_on_both_openai_surfaces() -> None
         ),
         (
             decode_responses,
-            {"model": "coding", "input": "x", "prompt_cache_options": {"mode": "explicit"}},
+            {"model": "coding", "input": "x", "prompt_cache_options": {"mode": "auto"}},
             "prompt_cache_options.mode",
-            "implicit",
+            "explicit",
         ),
         (
             decode_responses,
@@ -3565,8 +3565,11 @@ def test_responses_prompt_cache_ttl_decodes_twelve_hours_and_accepts_the_default
     assert captured.value.detail.param == "prompt_cache_options.ttl"
 
 
-def test_chat_prompt_cache_options_stay_refused() -> None:
-    """OpenAI's Chat Completions answers 400 for ``ttl: "12h"`` (probed 2026-10-20)."""
+def test_chat_prompt_cache_twelve_hours_stays_a_named_rejection() -> None:
+    """OpenAI's Chat Completions answers 400 for ``ttl: "12h"`` (probed 2026-10-20).
+
+    The Chat reference documents ``"30m"`` as "currently the only supported value".
+    """
     with pytest.raises(OpenAIProtocolError) as captured:
         decode_chat(
             {
@@ -3575,7 +3578,8 @@ def test_chat_prompt_cache_options_stay_refused() -> None:
                 "prompt_cache_options": {"ttl": "12h"},
             }
         )
-    assert captured.value.detail.param == "prompt_cache_options"
+    assert captured.value.detail.code == "invalid_parameter"
+    assert captured.value.detail.param == "prompt_cache_options.ttl"
 
 
 def test_service_tier_decodes_on_both_openai_surfaces_and_rejects_unknown_values() -> None:

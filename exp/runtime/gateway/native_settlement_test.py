@@ -12,6 +12,7 @@ from exp.runtime.gateway.contracts import (
     GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
+    GatewayHeaderTimeout,
     GatewayRefusalReason,
     GatewayUsage,
 )
@@ -22,6 +23,7 @@ from exp.runtime.gateway.native_settlement import (
     _usage_from_payload,  # noqa: PLC2701 - direct unit coverage for normalization.
     accepts_keyword,
     exhausted_attempt_payload,
+    failure_from_boundary_payload,
     first_token_at_from_settlement,
     settlement_metadata,
     settlement_rate_limit,
@@ -895,3 +897,29 @@ def test_a_reported_zero_image_count_survives_settlement_parsing() -> None:
         {"input_tokens": 10, "output_tokens": 3, "image_output_tokens": 0}, []
     )
     assert usage is not None and usage.image_output_tokens == 0
+
+
+@pytest.mark.parametrize(
+    ("token", "expected"),
+    [
+        ("allowance", GatewayHeaderTimeout.ALLOWANCE),
+        ("budget", GatewayHeaderTimeout.BUDGET),
+        ("someday", None),
+        (None, None),
+    ],
+)
+def test_the_header_timeout_phase_crosses_both_boundaries_typed(
+    token: str | None, expected: GatewayHeaderTimeout | None
+) -> None:
+    """Settlement and reservation payloads both carry the typed phase; unknown fails closed."""
+    payload: JsonObject = {
+        "failure_class": "timeout",
+        "safe_message": "provider did not send response headers in time",
+        "failover_eligible": True,
+    }
+    if token is not None:
+        payload["header_timeout"] = token
+    _, settled = terminal_from_settlement({"outcome": "failed", "usage": None, "failure": payload})
+    assert settled is not None and settled.header_timeout is expected
+    reserved = failure_from_boundary_payload(payload)
+    assert reserved is not None and reserved.header_timeout is expected

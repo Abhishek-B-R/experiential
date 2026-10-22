@@ -4,21 +4,41 @@ from __future__ import annotations
 
 import pytest
 
-from exp.runtime.gateway.contracts import GatewayFailureClass
+from exp.runtime.gateway.contracts import (
+    GatewayFailure,
+    GatewayFailureClass,
+    GatewayHeaderTimeout,
+)
 from exp.runtime.gateway.lane_ejection import (
     EJECTION_COOLDOWN_ENV,
     EJECTION_FAILURES_ENV,
+    EJECTION_HEADER_TIMEOUTS_ENV,
+    EJECTION_HEADER_WINDOW_ENV,
     EJECTION_WINDOW_ENV,
     LaneEjectionPolicy,
     LaneEjections,
+    LaneKey,
 )
 
-_LANE = "mp-lane-a"
-_OTHER = "mp-lane-a-c-connection-one"
-_DEAD = GatewayFailureClass.PROVIDER_INTERNAL
+_LANE: LaneKey = ("mp-lane-a", "a" * 64)
+_OTHER: LaneKey = ("mp-lane-a-c-connection-one", "b" * 64)
 
 
-def _ejected_after_three(tracker: LaneEjections, lane: str, start: float) -> None:
+def _failure(failure_class: GatewayFailureClass, message: str = "scripted") -> GatewayFailure:
+    """One settled failure of ``failure_class``."""
+    return GatewayFailure(failure_class=failure_class, safe_message=message)
+
+
+_DEAD = _failure(GatewayFailureClass.PROVIDER_INTERNAL)
+_HUNG = GatewayFailure(
+    failure_class=GatewayFailureClass.TIMEOUT,
+    safe_message="provider did not send response headers in time",
+    header_timeout=GatewayHeaderTimeout.ALLOWANCE,
+)
+_CUT = _HUNG.model_copy(update={"header_timeout": GatewayHeaderTimeout.BUDGET})
+
+
+def _ejected_after_three(tracker: LaneEjections, lane: LaneKey, start: float) -> None:
     """Feed three dead-lane failures one second apart starting at ``start``."""
     for offset in (0.0, 1.0, 2.0):
         tracker.failed(lane, _DEAD, start + offset)
@@ -38,7 +58,7 @@ def test_policy_reads_operator_overrides_and_keeps_defaults() -> None:
 def test_three_dead_lane_failures_inside_the_window_eject_for_the_cooldown() -> None:
     """Refused or 5xx three times in ten seconds: ordered last for thirty seconds."""
     tracker = LaneEjections(LaneEjectionPolicy())
-    tracker.failed(_LANE, GatewayFailureClass.TRANSPORT, 0.0)
+    tracker.failed(_LANE, _failure(GatewayFailureClass.TRANSPORT), 0.0)
     tracker.failed(_LANE, _DEAD, 1.0)
     assert not tracker.ejected(_LANE, 1.5)
     tracker.failed(_LANE, _DEAD, 2.0)
@@ -60,21 +80,24 @@ def test_failures_spread_past_the_window_never_eject() -> None:
 
 
 @pytest.mark.parametrize(
-    "neutral",
+    "neutral_class",
     [
         GatewayFailureClass.INVALID_REQUEST,
         GatewayFailureClass.THROTTLED,
         GatewayFailureClass.TIMEOUT,
+        GatewayFailureClass.PROVIDER_AUTHENTICATION,
     ],
 )
 def test_client_errors_throttles_and_timeouts_neither_count_nor_reset(
-    neutral: GatewayFailureClass,
+    neutral_class: GatewayFailureClass,
 ) -> None:
-    """A 4xx, a 429, or a timeout says nothing about the box: the streak is unchanged."""
+    """A 4xx, a 429, or another timeout says nothing about the box and allocates nothing."""
     tracker = LaneEjections(LaneEjectionPolicy())
+    neutral = _failure(neutral_class)
     for _ in range(5):
         tracker.failed(_LANE, neutral, 0.0)
     assert not tracker.ejected(_LANE, 0.0)
+    assert tracker.tracked() == 0
     tracker.failed(_LANE, _DEAD, 0.0)
     tracker.failed(_LANE, _DEAD, 1.0)
     tracker.failed(_LANE, neutral, 1.5)
@@ -135,3 +158,69 @@ def test_zero_failures_disables_ejection() -> None:
     for at in range(10):
         tracker.failed(_LANE, _DEAD, float(at))
     assert not tracker.ejected(_LANE, 10.0)
+
+
+def test_policy_reads_the_header_timeout_overrides() -> None:
+    """The header-timeout streak has its own threshold and window."""
+    policy = LaneEjectionPolicy.from_environ(
+        {EJECTION_HEADER_TIMEOUTS_ENV: "3", EJECTION_HEADER_WINDOW_ENV: "120"}
+    )
+    assert policy.header_timeouts == 3 and policy.header_window_seconds == 120.0
+    assert LaneEjectionPolicy().header_timeouts == 2
+    assert LaneEjectionPolicy().header_window_seconds == 600.0
+
+
+def test_two_header_timeouts_in_ten_minutes_eject_a_hung_lane() -> None:
+    """A box that accepts connections and never answers is ejected on its own streak."""
+    tracker = LaneEjections(LaneEjectionPolicy())
+    tracker.failed(_LANE, _HUNG, 0.0)
+    assert not tracker.ejected(_LANE, 1.0)
+    tracker.failed(_LANE, _HUNG, 340.0)
+    assert tracker.ejected(_LANE, 340.0)
+    # Per lane: the variant keeps its own (empty) state.
+    assert not tracker.ejected(_OTHER, 340.0)
+    # Spread wider than the window, two header timeouts are not a hung lane.
+    spread = LaneEjections(LaneEjectionPolicy())
+    spread.failed(_LANE, _HUNG, 0.0)
+    spread.failed(_LANE, _HUNG, 601.0)
+    assert not spread.ejected(_LANE, 601.0)
+    # The header streak does not mix with the dead-lane streak.
+    mixed = LaneEjections(LaneEjectionPolicy())
+    mixed.failed(_LANE, _HUNG, 0.0)
+    mixed.failed(_LANE, _DEAD, 1.0)
+    mixed.failed(_LANE, _DEAD, 2.0)
+    assert not mixed.ejected(_LANE, 2.0)
+    # A failed half-open probe re-ejects on a header timeout too.
+    tracker.claimed(_LANE, 371.0)
+    tracker.failed(_LANE, _HUNG, 671.0)
+    assert tracker.ejected(_LANE, 672.0)
+
+
+def test_only_counted_failures_allocate_lane_state() -> None:
+    """A BYOK 401 or a client 400 on an untracked lane leaves no entry behind."""
+    tracker = LaneEjections(LaneEjectionPolicy())
+    for failure_class in (
+        GatewayFailureClass.PROVIDER_AUTHENTICATION,
+        GatewayFailureClass.INVALID_REQUEST,
+        GatewayFailureClass.THROTTLED,
+        GatewayFailureClass.TIMEOUT,
+    ):
+        tracker.failed(_LANE, _failure(failure_class), 0.0)
+    assert tracker.tracked() == 0
+    tracker.failed(_LANE, _DEAD, 0.0)
+    assert tracker.tracked() == 1
+    tracker.succeeded(_LANE)
+    assert tracker.tracked() == 0
+
+
+def test_a_budget_cut_header_timeout_is_no_strike() -> None:
+    """[A hung, B healthy but cut by the shared budget]: only A is ejected."""
+    tracker = LaneEjections(LaneEjectionPolicy())
+    hung: LaneKey = ("mp-glm-a", "a" * 64)
+    cut: LaneKey = ("mp-glm-b", "a" * 64)
+    for at in (0.0, 300.0):
+        tracker.failed(hung, _HUNG, at)
+        tracker.failed(cut, _CUT, at + 15.0)
+    assert tracker.ejected(hung, 316.0)
+    assert not tracker.ejected(cut, 316.0)
+    assert tracker.tracked() == 1

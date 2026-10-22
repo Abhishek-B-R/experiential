@@ -66,6 +66,9 @@ from exp.runtime.gateway.stream_contracts import (
     GatewayFailureClass as GatewayFailureClass,
 )
 from exp.runtime.gateway.stream_contracts import (
+    GatewayHeaderTimeout as GatewayHeaderTimeout,
+)
+from exp.runtime.gateway.stream_contracts import (
     GatewayRefusalReason as GatewayRefusalReason,
 )
 from exp.runtime.gateway.stream_contracts import (
@@ -656,6 +659,23 @@ class GatewayRequest(ContractModel):
     Routed only to rungs declaring ``supports_prompt_cache_ttl_12h`` and refused when none
     does. Like ``provider_cache_control`` it changes cache-write cost, never semantics, so
     it joins neither serialization nor replay identity."""
+    prompt_cache_mode: Literal["explicit"] | None = Field(default=None, exclude=True)
+    """OpenAI's ``prompt_cache_options.mode: "explicit"`` (both OpenAI surfaces).
+
+    Turns the provider's implicit breakpoint off so only content blocks marked with
+    ``prompt_cache_breakpoint`` are cached (none marked: nothing is written). Sent only on
+    rungs whose wire carries OpenAI's prompt-cache options; the Anthropic and Bedrock wires
+    already cache only at markers, every other wire drops it with disclosure. ``"implicit"``
+    is the provider default and is never carried. Cost, not semantics: it joins neither
+    serialization nor replay identity."""
+    prompt_cache_breakpoints: bool = Field(default=False, exclude=True)
+    """Whether the caller marked content blocks with OpenAI's ``prompt_cache_breakpoint``.
+
+    Each marker rides the canonical cache carriers as an ephemeral ``cache_control``,
+    so Anthropic and Bedrock rungs cache at the same boundary (their default lifetime).
+    This flag tells OpenAI-wire rungs that carry the field to re-emit those boundaries
+    as ``prompt_cache_breakpoint`` (``{"mode": "explicit"}``, inheriting the request
+    lifetime) and keeps every disclosure in the caller's spelling. Never identity."""
     service_tier: str | None = Field(default=None, max_length=64, exclude=True)
     """Caller provider processing tier, forwarded only on BYOK OpenAI-family
     rungs (routing and billing rules live at streaming_requests and

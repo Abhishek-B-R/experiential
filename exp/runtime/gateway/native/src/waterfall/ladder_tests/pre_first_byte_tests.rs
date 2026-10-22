@@ -136,6 +136,7 @@ fn an_authored_header_allowance_is_not_cut_at_the_configured_budget() {
         let budget = super::super::pre_first_byte_budget(
             Some(Duration::from_secs(1)),
             super::super::wire::PRE_FIRST_BYTE_RESERVE,
+            None,
             &route,
             Duration::from_secs(2),
             0.0,
@@ -146,5 +147,33 @@ fn an_authored_header_allowance_is_not_cut_at_the_configured_budget() {
             panic!("the lead's authored allowance must outlast the configured budget");
         };
         assert_eq!(committed.depth, 0);
+    });
+}
+
+#[test]
+fn only_a_lane_that_spent_its_own_allowance_takes_the_header_timeout_strike() {
+    block_on(async {
+        // [A hung, B healthy but slower than what the budget leaves]: A
+        // stalls out its own 1 s allowance; B is cut by the shared 1.5 s
+        // budget half a second into its 5 s allowance.
+        let harness = Harness::new();
+        let mut hung = wire("a", &spawn_stalled_rung().await, 0);
+        hung.time_to_first_byte_base_seconds = Some(1.0);
+        let mut cut = wire("b", &spawn_stalled_rung().await, 0);
+        cut.time_to_first_byte_base_seconds = Some(5.0);
+        let route = [hung, cut];
+        let (won, guard) = run_budgeted(&harness, &route, Some(Duration::from_millis(1_500))).await;
+        assert!(matches!(finish(guard, won).await, Won::Failed(_)));
+        let story = harness.story().await;
+        let settles = story["settles"].as_array().expect("settles");
+        let phases: Vec<&Value> = settles
+            .iter()
+            .map(|settle| &settle["failure"]["header_timeout"])
+            .collect();
+        assert_eq!(
+            phases,
+            [&json!("allowance"), &json!("budget")],
+            "{settles:?}"
+        );
     });
 }

@@ -423,6 +423,7 @@ fn an_authored_header_allowance_raises_the_pre_first_byte_budget() {
     let budget = pre_first_byte_budget(
         configured,
         wire::PRE_FIRST_BYTE_RESERVE,
+        None,
         &route,
         default_base,
         240.0,
@@ -439,6 +440,7 @@ fn an_authored_header_allowance_raises_the_pre_first_byte_budget() {
         pre_first_byte_budget(
             configured,
             wire::PRE_FIRST_BYTE_RESERVE,
+            None,
             &backup_slow,
             default_base,
             240.0,
@@ -451,6 +453,7 @@ fn an_authored_header_allowance_raises_the_pre_first_byte_budget() {
         pre_first_byte_budget(
             configured,
             wire::PRE_FIRST_BYTE_RESERVE,
+            None,
             &plain(2),
             default_base,
             240.0,
@@ -464,6 +467,7 @@ fn an_authored_header_allowance_raises_the_pre_first_byte_budget() {
         pre_first_byte_budget(
             configured,
             wire::PRE_FIRST_BYTE_RESERVE,
+            None,
             &short,
             default_base,
             240.0,
@@ -476,11 +480,86 @@ fn an_authored_header_allowance_raises_the_pre_first_byte_budget() {
         pre_first_byte_budget(
             None,
             wire::PRE_FIRST_BYTE_RESERVE,
+            None,
             &route,
             default_base,
             240.0,
             200_000.0
         ),
         None
+    );
+}
+
+#[test]
+fn the_raised_budget_stops_at_its_ceiling_and_never_lowers_the_configured_one() {
+    let configured = Some(Duration::from_secs(90));
+    let slow = [wire(Some(3_600.0), Some(0.0))];
+    // An hour authored on one rung is cut at the ceiling.
+    assert_eq!(
+        pre_first_byte_budget(
+            configured,
+            wire::PRE_FIRST_BYTE_RESERVE,
+            Some(wire::PRE_FIRST_BYTE_MAX),
+            &slow,
+            Duration::from_secs(15),
+            240.0,
+            1.0,
+        ),
+        Some(wire::PRE_FIRST_BYTE_MAX)
+    );
+    // A ceiling below the configured budget leaves the configured budget.
+    assert_eq!(
+        pre_first_byte_budget(
+            Some(Duration::from_secs(900)),
+            wire::PRE_FIRST_BYTE_RESERVE,
+            Some(wire::PRE_FIRST_BYTE_MAX),
+            &slow,
+            Duration::from_secs(15),
+            240.0,
+            1.0,
+        ),
+        Some(Duration::from_secs(900))
+    );
+}
+
+#[test]
+fn a_large_body_raises_the_budget_by_its_text_not_its_base64_media() {
+    // A 400k-character prompt plus a 4 MB inline image.
+    let prompt = "x".repeat(400_000);
+    let image = "A".repeat(4_000_000);
+    let body = format!(
+        r#"{{"messages":[{{"role":"user","content":[{{"type":"text","text":"{prompt}"}},{{"type":"image_url","image_url":{{"url":"data:image/png;base64,{image}"}}}}]}}]}}"#
+    );
+    let tokens = approximate_input_tokens(&body);
+    let text_only = (body.len() - image.len()) as f64 / 4.0;
+    assert!((tokens - text_only).abs() < 1.0, "{tokens} vs {text_only}");
+    // The lead authors a 240 s/M slope: ~100k tokens add ~24 s, not ~264 s.
+    let lead = [wire(Some(60.0), Some(240.0))];
+    let budget = pre_first_byte_budget(
+        Some(Duration::from_secs(90)),
+        wire::PRE_FIRST_BYTE_RESERVE,
+        Some(wire::PRE_FIRST_BYTE_MAX),
+        &lead,
+        Duration::from_secs(15),
+        240.0,
+        tokens,
+    )
+    .expect("budget enabled");
+    assert!(budget < Duration::from_secs(120), "{budget:?}");
+    // Even counted whole, the ceiling would hold it.
+    let whole = pre_first_byte_budget(
+        Some(Duration::from_secs(90)),
+        wire::PRE_FIRST_BYTE_RESERVE,
+        Some(wire::PRE_FIRST_BYTE_MAX),
+        &[wire(Some(400.0), Some(240.0))],
+        Duration::from_secs(15),
+        240.0,
+        body.len() as f64 / 4.0,
+    );
+    assert_eq!(whole, Some(wire::PRE_FIRST_BYTE_MAX));
+    // Text that merely mentions base64 is counted.
+    assert_eq!(
+        approximate_input_tokens(r#"{"a":";base64,abcd"}"#),
+        20.0 / 4.0
     );
 }

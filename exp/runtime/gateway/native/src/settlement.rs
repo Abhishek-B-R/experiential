@@ -124,26 +124,35 @@ fn settle_argument(
             wire
         }),
         "tool_names": tool_names,
-        "failure": failure.map(|failure| json!({
-            "failure_class": failure.failure_class.as_str(),
-            "safe_message": failure.safe_message,
-            // The provider's own sanitized rejection sentence (client-error
-            // class only); accounting persists it on the failed-attempt row so
-            // an operator sees WHY the provider refused the call.
-            "provider_detail": failure.provider_detail,
-            // The bounded refusal category (refusal class only), so the
-            // control plane can count refusals by reason without parsing the
-            // free-form provider_detail.
-            "refusal_reason": failure.refusal_reason.map(|reason| reason.as_str()),
-            // The customer's own BYOK credential/account failure: the ledger
-            // files it as the caller's invalid request (see
-            // native_accounting.ledger_failure).
-            "customer_owned": failure.customer_owned,
-            // The provider's own stated wait (a throttled open's integer
-            // Retry-After), so the control plane sizes the deployment's
-            // throttle window from it instead of the fixed default.
-            "retry_after_seconds": failure.retry_after_seconds,
-        })),
+        "failure": failure.map(|failure| {
+            let mut wire = json!({
+                "failure_class": failure.failure_class.as_str(),
+                "safe_message": failure.safe_message,
+                // The provider's own sanitized rejection sentence (client-error
+                // class only); accounting persists it on the failed-attempt row so
+                // an operator sees WHY the provider refused the call.
+                "provider_detail": failure.provider_detail,
+                // The bounded refusal category (refusal class only), so the
+                // control plane can count refusals by reason without parsing the
+                // free-form provider_detail.
+                "refusal_reason": failure.refusal_reason.map(|reason| reason.as_str()),
+                // The customer's own BYOK credential/account failure: the ledger
+                // files it as the caller's invalid request (see
+                // native_accounting.ledger_failure).
+                "customer_owned": failure.customer_owned,
+                // The provider's own stated wait (a throttled open's integer
+                // Retry-After), so the control plane sizes the deployment's
+                // throttle window from it instead of the fixed default.
+                "retry_after_seconds": failure.retry_after_seconds,
+            });
+            // Which bound ended a header-phase timeout, so lane ejection
+            // strikes only a lane that spent its own allowance; only a
+            // header timeout carries the key.
+            if let Some(phase) = failure.header_timeout {
+                wire["header_timeout"] = json!(phase.as_str());
+            }
+            wire
+        }),
         "finalize": finalize,
         "opened": opened,
         // Explicit HTTP-rejection provenance for decisions only. Unknown

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass, GatewayHeaderTimeout
 from exp.runtime.gateway.health import (
     PLAN_WINDOW_MAXIMUM_SECONDS,
     DeploymentHealthKey,
@@ -374,3 +374,27 @@ def test_an_ejected_lane_is_ordered_last_across_revisions_and_claimed_last() -> 
     assert health.order(keys, [0, 1]) == [1, 0]
     health.succeeded(dead)
     assert health.order(keys, [0, 1]) == [0, 1]
+
+
+def test_a_hung_lane_is_ejected_on_header_timeouts_and_a_byok_variant_is_not() -> None:
+    """Two header timeouts in ten minutes order the lane last; its BYOK variant keeps its order."""
+    clock = [0.0]
+    health = DeploymentHealthRegistry(
+        failure_threshold=100,
+        lane_ejection=LaneEjectionPolicy(),
+        clock=lambda: clock[0],
+    )
+    hung = ("revision-one", "mp-hung", "connection-house")
+    variant = ("revision-one", "mp-hung-c-connection-one", "connection-byok")
+    live = ("revision-one", "mp-live", "connection-house")
+    timeout = GatewayFailure(
+        failure_class=GatewayFailureClass.TIMEOUT,
+        safe_message="provider did not send response headers in time",
+        header_timeout=GatewayHeaderTimeout.ALLOWANCE,
+    )
+    health.failed(hung, timeout)
+    clock[0] = 300.0
+    assert health.order((hung, live), [0, 1]) == [0, 1]
+    health.failed(hung, timeout)
+    assert health.order((hung, live), [0, 1]) == [1, 0]
+    assert not health.lane_ejected(variant)

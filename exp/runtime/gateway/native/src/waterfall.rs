@@ -280,6 +280,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 // A throttle's stated wait survives too, so an exhausted
                 // throttle ladder advertises it as `Retry-After`.
                 "retry_after_seconds": failure.retry_after_seconds,
+                "header_timeout": failure.header_timeout.map(|phase| phase.as_str()),
             })),
         }));
         let started_text = match ctx.bridge.call("start_attempt", argument).await {
@@ -673,7 +674,8 @@ pub(crate) use commit::is_semantic;
 mod fallback_rules;
 mod wire;
 pub(crate) use wire::{
-    first_byte_allowance, first_token_allowance, open_phase_bound, pre_first_byte_budget,
+    approximate_input_tokens, attribute_header_timeout, first_byte_allowance,
+    first_token_allowance, open_phase_bound, pre_first_byte_budget, PRE_FIRST_BYTE_MAX,
     PRE_FIRST_BYTE_RESERVE,
 };
 pub use wire::{DeploymentWire, RoutePolicy, WaterfallContext};

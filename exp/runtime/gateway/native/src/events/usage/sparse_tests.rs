@@ -330,14 +330,19 @@ fn responses_sparse_raw_counters_match_whole_report_and_never_fold_twice() {
 }
 
 #[test]
-fn sparse_response_cache_is_checked_when_input_arrives_later() {
+fn sparse_response_cache_is_fitted_when_input_arrives_later() {
     let mut accumulator = OpenAiUsageAccumulator::default();
     accumulator
         .update_responses(Some(&json!({"input_tokens_details":{"cached_tokens":200}})))
         .unwrap();
-    assert!(accumulator
+    // An input below the earlier read count is raised to cover it, while the
+    // provider's own raw count stays retained for later reports.
+    let fitted = accumulator
         .update_responses(Some(&json!({"input_tokens":100,"output_tokens":1})))
-        .is_err());
+        .unwrap()
+        .unwrap();
+    assert_eq!(fitted.input_tokens, Some(200));
+    assert_eq!(fitted.cached_input_tokens, Some(200));
     let valid = accumulator
         .update_responses(Some(&json!({"input_tokens":250,"output_tokens":1})))
         .unwrap()
