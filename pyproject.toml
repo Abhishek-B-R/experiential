@@ -128,11 +128,14 @@ python-version = "3.12"
 # Supply-chain cooldown: resolution only picks distributions uploaded at least
 # 7 days before the lock is written, so a compromised release is usually
 # yanked before it can enter uv.lock. Packages this project publishes itself
-# are exempt. Exempt any other package only for an urgent security fix, and say
-# why here. certifi 2026.10.19 (2026-10-20) drops emSign roots whose intermediate
-# CA keys were compromised (GHSA-6q48-6c7w-9gw2).
+# are exempt. Exempt any other package only for an urgent security fix, with a
+# cutoff date that admits exactly the fixed release and a removal date.
+# certifi: 2026.10.19 (uploaded 2026-10-20) drops emSign roots whose intermediate
+# CA keys were compromised (GHSA-6q48-6c7w-9gw2). Remove this entry after
+# 2026-10-27, when the 7-day window covers that release; until then no later
+# certifi release is eligible.
 exclude-newer = "7 days"
-exclude-newer-package = { experiential = false, exp-gateway-native = false, exp-mitmproxy = false, exp-mitmproxy-rs = false, certifi = false }
+exclude-newer-package = { experiential = false, exp-gateway-native = false, exp-mitmproxy = false, exp-mitmproxy-rs = false, certifi = "2026-10-21T00:00:00Z" }
 
 [tool.uv.sources]
 # The one permitted path source (AGENTS.md "One package"): repo checkouts rebuild the

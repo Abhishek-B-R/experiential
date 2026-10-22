@@ -36,7 +36,7 @@
 
 # Known advisories in the committed lockfiles: OSV-Scanner reads uv.lock and
 # the native crate's Cargo.lock and fails on any advisory that
-# .gitlab/ci/osv-scanner.toml does not override with a reason and an expiry.
+# .gitlab/ci/osv-scanner.toml does not accept by ID with a reason and an expiry.
 gate-dependency-audit:
   extends: [.tools]
   stage: test

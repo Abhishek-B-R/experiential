@@ -15,7 +15,7 @@ exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for 
 exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
-certifi = false
+certifi = "2026-10-21T00:00:00Z"
 exp-gateway-native = false
 exp-mitmproxy = false
 exp-mitmproxy-rs = false
