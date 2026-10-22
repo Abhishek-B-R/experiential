@@ -135,6 +135,7 @@ fn an_authored_header_allowance_is_not_cut_at_the_configured_budget() {
         let route = [lead, wire("backup", &spawn_stalled_rung().await, 0)];
         let budget = super::super::pre_first_byte_budget(
             Some(Duration::from_secs(1)),
+            super::super::wire::PRE_FIRST_BYTE_RESERVE,
             &route,
             Duration::from_secs(2),
             0.0,

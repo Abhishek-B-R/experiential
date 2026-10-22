@@ -238,8 +238,9 @@ every untried rung refuses, the request ends with the fast retryable `lane_satur
 **Pre-first-byte budget.** The budget (`pre_first_byte_budget_seconds`, 90 s by default for a plane
 whose host sets nothing) bounds everything before the caller's first byte and caps every dial's header
 wait. A request's budget is raised to the longest AUTHORED first-byte allowance on its route (base
-plus the input slope for this prompt) plus 15 s, so a self-hosted lane authoring 300 s for long
-prompts is never cut at the default; routes of lanes that author nothing keep the configured budget.
+plus the input slope for this prompt) plus a 15 s reserve
+(`EXP_GATEWAY_PRE_FIRST_BYTE_RESERVE_SECONDS` overrides it), so a self-hosted lane authoring 300 s
+for long prompts is never cut at the default; routes of lanes that author nothing keep the configured budget.
 Fast failures (refused, 5xx, transport) fail over at once as before; a header timeout fails over only
 while budget remains.
 

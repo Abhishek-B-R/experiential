@@ -79,6 +79,11 @@ pub struct ServeConfig {
     /// the edge proxy's 100 s origin timeout; zero or negative disables it.
     #[serde(default = "default_pre_first_byte_budget_seconds")]
     pub pre_first_byte_budget_seconds: f64,
+    /// What a request's budget keeps beyond its route's longest AUTHORED
+    /// first-byte allowance when that allowance raises the budget
+    /// (`waterfall::pre_first_byte_budget`).
+    #[serde(default = "default_pre_first_byte_reserve_seconds")]
+    pub pre_first_byte_reserve_seconds: f64,
     #[serde(default = "default_callback_permits")]
     pub callback_permits: usize,
     /// Worker-wide bound on provider output retained across streams.
@@ -123,6 +128,10 @@ fn default_time_to_first_token_seconds() -> f64 {
 /// within 100 s; stopping new attempts at 90 s keeps our retryable error.
 fn default_pre_first_byte_budget_seconds() -> f64 {
     90.0
+}
+
+fn default_pre_first_byte_reserve_seconds() -> f64 {
+    crate::waterfall::PRE_FIRST_BYTE_RESERVE.as_secs_f64()
 }
 
 fn default_max_active_requests() -> usize {
@@ -172,6 +181,8 @@ pub(crate) struct AppState {
     pub(crate) time_to_first_token: Duration,
     /// The pre-first-byte budget (`None`: disabled).
     pub(crate) pre_first_byte_budget: Option<Duration>,
+    /// The reserve kept past the longest authored first-byte allowance.
+    pub(crate) pre_first_byte_reserve: Duration,
     /// Settlement writes still in flight, held open through graceful shutdown.
     pub(crate) pending_settlements: Arc<AtomicUsize>,
     /// Requests handled since start; the idle reclaim loop trims the
@@ -225,6 +236,9 @@ pub async fn run(
         ),
         pre_first_byte_budget: (config.pre_first_byte_budget_seconds > 0.0)
             .then(|| Duration::from_secs_f64(config.pre_first_byte_budget_seconds)),
+        pre_first_byte_reserve: Duration::from_secs_f64(
+            config.pre_first_byte_reserve_seconds.max(0.0),
+        ),
         pending_settlements: pending_settlements.clone(),
         handled_requests: handled_requests.clone(),
         replays: Arc::new(ReplayStore::new()),
@@ -519,6 +533,7 @@ impl AppState {
     ) -> Option<Instant> {
         let budget = crate::waterfall::pre_first_byte_budget(
             self.pre_first_byte_budget,
+            self.pre_first_byte_reserve,
             route,
             self.time_to_first_byte,
             self.time_to_first_byte_slope_seconds_per_million_input_tokens,

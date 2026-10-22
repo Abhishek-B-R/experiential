@@ -420,8 +420,15 @@ fn an_authored_header_allowance_raises_the_pre_first_byte_budget() {
     let mut lead = wire(Some(300.0), None);
     lead.deployment_id = "lead".to_string();
     let route = [lead, wire(None, None)];
-    let budget = pre_first_byte_budget(configured, &route, default_base, 240.0, 200_000.0)
-        .expect("budget stays enabled");
+    let budget = pre_first_byte_budget(
+        configured,
+        wire::PRE_FIRST_BYTE_RESERVE,
+        &route,
+        default_base,
+        240.0,
+        200_000.0,
+    )
+    .expect("budget stays enabled");
     assert_eq!(
         budget,
         Duration::from_secs(348) + wire::PRE_FIRST_BYTE_RESERVE
@@ -429,23 +436,51 @@ fn an_authored_header_allowance_raises_the_pre_first_byte_budget() {
     // A slow backup reached by failover counts as much as the lead.
     let backup_slow = [wire(None, None), wire(Some(300.0), Some(0.0))];
     assert_eq!(
-        pre_first_byte_budget(configured, &backup_slow, default_base, 240.0, 1.0),
+        pre_first_byte_budget(
+            configured,
+            wire::PRE_FIRST_BYTE_RESERVE,
+            &backup_slow,
+            default_base,
+            240.0,
+            1.0
+        ),
         Some(Duration::from_secs(300) + wire::PRE_FIRST_BYTE_RESERVE)
     );
     // Lanes that author nothing keep the configured budget, however large the prompt.
     assert_eq!(
-        pre_first_byte_budget(configured, &plain(2), default_base, 240.0, 900_000.0),
+        pre_first_byte_budget(
+            configured,
+            wire::PRE_FIRST_BYTE_RESERVE,
+            &plain(2),
+            default_base,
+            240.0,
+            900_000.0
+        ),
         configured
     );
     // An authored allowance below the budget never shrinks it.
     let short = [wire(Some(20.0), Some(0.0))];
     assert_eq!(
-        pre_first_byte_budget(configured, &short, default_base, 240.0, 1.0),
+        pre_first_byte_budget(
+            configured,
+            wire::PRE_FIRST_BYTE_RESERVE,
+            &short,
+            default_base,
+            240.0,
+            1.0
+        ),
         configured
     );
     // A disabled budget stays disabled.
     assert_eq!(
-        pre_first_byte_budget(None, &route, default_base, 240.0, 200_000.0),
+        pre_first_byte_budget(
+            None,
+            wire::PRE_FIRST_BYTE_RESERVE,
+            &route,
+            default_base,
+            240.0,
+            200_000.0
+        ),
         None
     );
 }

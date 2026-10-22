@@ -674,6 +674,7 @@ mod fallback_rules;
 mod wire;
 pub(crate) use wire::{
     first_byte_allowance, first_token_allowance, open_phase_bound, pre_first_byte_budget,
+    PRE_FIRST_BYTE_RESERVE,
 };
 pub use wire::{DeploymentWire, RoutePolicy, WaterfallContext};
 

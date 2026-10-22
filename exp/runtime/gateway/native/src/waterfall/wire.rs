@@ -314,14 +314,15 @@ pub(crate) fn first_byte_allowance(
     Duration::from_secs_f64((base + scaled).max(0.001))
 }
 
-/// What the pre-first-byte budget keeps beyond the slowest authored header
-/// allowance, so a rung that stalls out its whole allowance still leaves a
-/// successor time to answer its own headers.
+/// The default of what the pre-first-byte budget keeps beyond the slowest
+/// authored header allowance (`ServeConfig::pre_first_byte_reserve_seconds`),
+/// so a rung that stalls out its whole allowance still leaves a successor
+/// time to answer its own headers.
 pub(crate) const PRE_FIRST_BYTE_RESERVE: Duration = Duration::from_secs(15);
 
 /// One request's pre-first-byte budget: the configured budget, raised to the
 /// longest AUTHORED first-byte allowance on the route (base plus the input
-/// slope for this request) plus `PRE_FIRST_BYTE_RESERVE`.
+/// slope for this request) plus `reserve`.
 ///
 /// The configured budget also caps every dial's header wait
 /// (`WaterfallContext::capped`), so a self-hosted lane authoring 300 s for
@@ -334,6 +335,7 @@ pub(crate) const PRE_FIRST_BYTE_RESERVE: Duration = Duration::from_secs(15);
 /// disabled) stays disabled.
 pub(crate) fn pre_first_byte_budget(
     configured: Option<Duration>,
+    reserve: Duration,
     route: &[DeploymentWire],
     default_base: Duration,
     default_slope_seconds_per_million: f64,
@@ -354,7 +356,7 @@ pub(crate) fn pre_first_byte_budget(
                 default_base,
                 default_slope_seconds_per_million,
                 approximate_input_tokens,
-            ) + PRE_FIRST_BYTE_RESERVE
+            ) + reserve
         })
         .max();
     Some(authored.map_or(configured, |floor| configured.max(floor)))
