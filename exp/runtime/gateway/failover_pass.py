@@ -1,0 +1,188 @@
+"""One failover reservation walk: the untried ladder, its sideways spill, and its forced pass.
+
+When a dispatched rung fails before commitment with a failover-eligible
+failure, the accounting bridge reserves a successor. Two production failures
+(2026-10-21, a route of two self-hosted lanes with refusing bounds) shaped
+this walk:
+
+- The successor's rung slot shed on its own refusing bound and the walk ended
+  as exhausted, answering the caller the ORIGINAL 502 although a live rung
+  had only been full for a moment. A refusing bound protects the worker from
+  a slow lane holding every admission permit, which matters for a fresh
+  request; a request whose rung already failed has nowhere else to go. So a
+  failover first spills sideways to every other untried rung like any shed,
+  and only when every one of them shed does it FORCE a pass on the first shed
+  rung, at the overflow ceiling a Pro caller gets on that rung
+  (``lane_saturation.priority_overflow_ceiling``). A rung at that ceiling, a
+  hard class cap or ``:fast`` reserve, or a rate-window shed (pacing the
+  operator authored to stay under the provider's own limit) is skipped for the
+  next shed rung, and only when every shed rung refuses does the walk end
+  with the original failure.
+- A rung skipped at the request's first dial (its bound was full) was never
+  revisited when the rung dialed instead failed: successors were only later
+  rungs. The ladder is every depth this request has not dispatched, earlier
+  ones included, in route order (``native_fallback_rules.untried_depths``),
+  and the sideways spill walks the rest of that ladder rather than only the
+  depths after the shed one.
+
+A first dial keeps its own rules unchanged (``lane_saturation``): a fresh
+request is still refused at a full refusing lane.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
+from exp.runtime.gateway.native_execution import InflightRequest, claim_route_from
+from exp.runtime.gateway.native_fallback_rules import route_fallback_rules, untried_depths
+from exp.runtime.gateway.rung_admission import RungShed
+
+
+@dataclass
+class FailoverPass:
+    """The successor walk of one failover reservation.
+
+    Attributes:
+        untried: Every depth the failover may land on, fixed at the walk's
+            start: not dispatched yet in this request and admitted by the
+            ``failover_only_on`` rules, in route order.
+        ladder: The untried depths not yet shed or skipped in this walk.
+        forced: Depths this walk already tried to force past their bound.
+        forcing: Whether the current candidate is a forced pass.
+    """
+
+    untried: tuple[int, ...]
+    ladder: tuple[int, ...]
+    forced: set[int] = field(default_factory=set)
+    forcing: bool = False
+
+    @classmethod
+    def begin(
+        cls, entry: InflightRequest, failure: GatewayFailure | None, current_depth: object
+    ) -> FailoverPass | None:
+        """Start the walk for a failure that may advance, else ``None``.
+
+        A first dial (no failure, no depth) is not a failover. A failure the
+        route policy would not advance (a client error, an unopted refusal)
+        keeps the historical walk: same-rung redials only.
+
+        Args:
+            entry: The owning in-flight request.
+            failure: The classified failure the data plane reported, if any.
+            current_depth: The depth that failed, as the data plane sent it.
+
+        Returns:
+            The walk, or ``None`` when this reservation is not a failover.
+        """
+        if failure is None or not isinstance(current_depth, int):
+            return None
+        refusal = (
+            failure.failure_class == GatewayFailureClass.REFUSAL
+            and entry.authorization.refusal_failover
+        )
+        if not (failure.failover_eligible or refusal):
+            return None
+        untried = untried_depths(
+            route_fallback_rules(entry.route), failure, entry.attempt_counts, current_depth
+        )
+        return cls(untried=untried, ladder=untried)
+
+    def sideways(
+        self,
+        health: DeploymentHealthRegistry,
+        keys: tuple[DeploymentHealthKey, ...],
+        candidate: int,
+    ) -> int | None:
+        """Claim the next untried depth after ``candidate`` shed or was skipped.
+
+        A forced pass that shed again ends its own try: the caller moves on
+        to the next forced target rather than spilling once more.
+
+        Args:
+            health: The worker's circuit registry.
+            keys: One health key per route depth.
+            candidate: The depth that just shed or was skipped.
+
+        Returns:
+            The next claimed depth, or ``None`` when the ladder is spent.
+        """
+        if self.forcing:
+            self.forcing = False
+            return None
+        self.ladder = tuple(depth for depth in self.ladder if depth != candidate)
+        return claim_route_from(health, keys, 0, self.ladder) if self.ladder else None
+
+    def forced_target(
+        self,
+        policy_sheds: list[tuple[int, str]],
+        shed_records: dict[int, RungShed],
+    ) -> int | None:
+        """The next shed untried depth to force past its bound, or ``None`` to give up.
+
+        Args:
+            policy_sheds: ``(depth, reason)`` for every policy bypass this
+                reservation, in walk order.
+            shed_records: The registry's shed per bypassed depth.
+
+        Returns:
+            The depth to force-admit, marking this walk's pass as forced.
+        """
+        for depth, _reason in policy_sheds:
+            shed = shed_records.get(depth)
+            if (
+                depth in self.forced
+                or depth not in self.untried
+                or shed is None
+                or shed.overflow_ceiling
+                or shed.reason == "rate_limit"
+            ):
+                continue
+            self.forced.add(depth)
+            self.forcing = True
+            return depth
+        return None
+
+
+def forced_failover_target(
+    failover: FailoverPass | None,
+    policy_sheds: list[tuple[int, str]],
+    shed_records: dict[int, RungShed],
+) -> int | None:
+    """The failover's next forced pass (``FailoverPass.forced_target``), or ``None``.
+
+    Args:
+        failover: The failover walk, or ``None`` when this is not a failover.
+        policy_sheds: ``(depth, reason)`` for every policy bypass this reservation.
+        shed_records: The registry's shed per bypassed depth.
+
+    Returns:
+        The depth to force-admit, or ``None`` when the walk ends.
+    """
+    return None if failover is None else failover.forced_target(policy_sheds, shed_records)
+
+
+def sideways_claim(
+    failover: FailoverPass | None,
+    health: DeploymentHealthRegistry,
+    keys: tuple[DeploymentHealthKey, ...],
+    ladder: tuple[int, ...],
+    candidate: int,
+) -> int | None:
+    """Claim where a shed or skipped ``candidate`` spills.
+
+    Args:
+        failover: The failover walk, or ``None`` for a first dial or a walk
+            that never fails over (the historical later-only spill).
+        health: The worker's circuit registry.
+        keys: One health key per route depth.
+        ladder: The reservation's eligible depths (used without a failover).
+        candidate: The depth that shed or was skipped.
+
+    Returns:
+        The next claimed depth, or ``None`` when nothing is left.
+    """
+    if failover is None:
+        return claim_route_from(health, keys, candidate + 1, ladder)
+    return failover.sideways(health, keys, candidate)

@@ -37,7 +37,7 @@ from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegi
 from exp.runtime.gateway.model_plan import project_stage_selection
 from exp.runtime.gateway.native_capture import PendingCapture
 from exp.runtime.gateway.native_dead_rungs import ADMISSION_DEAD_ERRORS, DeadRung, dead_rung
-from exp.runtime.gateway.native_fallback_rules import FallbackRules, eligible_depths
+from exp.runtime.gateway.native_fallback_rules import FallbackRules, untried_depths
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_settlement import deployment_operation_key
 from exp.runtime.gateway.reasoning_carrier import ReasoningCarrierAuthority
@@ -389,6 +389,8 @@ def claim_route_from(
     every healthy claim and bounded probe is unavailable, the first
     non-throttled route is dispatched anyway, subject only to the request
     deadline and to throttle windows the provider explicitly requested.
+    A lane this worker ejected as a dead box (``lane_ejection``) is walked
+    last in every pass, never dropped: a route with nothing else still dials it.
 
     Args:
         health: Revision-isolated circuit and throttle registry.
@@ -401,9 +403,10 @@ def claim_route_from(
     Returns:
         The claimed route index, or ``None`` when nothing is claimable.
     """
-    candidates = [
-        index for index in (range(len(keys)) if depths is None else depths) if index >= start
-    ]
+    candidates = health.order(
+        keys,
+        [index for index in (range(len(keys)) if depths is None else depths) if index >= start],
+    )
     for claim in (health.claim, health.claim_last_resort, health.claim_forced):
         for route_index in candidates:
             if claim(keys[route_index]):
@@ -437,7 +440,10 @@ def next_route_candidate(
     The hard total cap ends the ladder, a retryable failure redials the same
     deployment while its bounded count and a health claim allow, and otherwise
     a failover-eligible failure (or an opted-in typed refusal) advances to the
-    next claimable deployment.
+    first claimable deployment this request has not dispatched yet, in route
+    order: a rung skipped earlier (shed at its bound, passed over by affinity
+    order) is revisited before later ones, and a rung already dispatched is
+    never dialed again except by the same-deployment redial above.
 
     A pool authoring ``throttle_redial`` turns a throttle into a bounded
     backoff-and-redial on the warm rung first: when the data plane reports it
@@ -548,13 +554,14 @@ def next_route_candidate(
             return None
     refusal_eligible = failure.failure_class == GatewayFailureClass.REFUSAL and refusal_failover
     rules = fallback_rules or (None,) * len(keys)
-    depths = eligible_depths(
+    depths = untried_depths(
         rules,
-        current_depth + 1,
         failure,
+        physical_counts,
+        current_depth,
         unrestricted=failure.failover_eligible or refusal_eligible,
     )
-    return claim_route_from(health, keys, current_depth + 1, depths) if depths else None
+    return claim_route_from(health, keys, 0, depths) if depths else None
 
 
 @dataclass(frozen=True)

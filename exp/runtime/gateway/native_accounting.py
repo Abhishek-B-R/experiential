@@ -28,6 +28,11 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
 )
 from exp.runtime.gateway.disconnect_estimate import settled_terminal
+from exp.runtime.gateway.failover_pass import (
+    FailoverPass,
+    forced_failover_target,
+    sideways_claim,
+)
 from exp.runtime.gateway.guardrails.session import discard_guardrails
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.lane_saturation import lane_saturated_failure, overflow_target
@@ -49,7 +54,6 @@ from exp.runtime.gateway.native_execution import (
     claim_route_from,
     deployment_health_key,
     dispatch_disclosure,
-    rung_load_key,
 )
 from exp.runtime.gateway.native_fallback_rules import eligible_ladder, rule_fallback_reason
 from exp.runtime.gateway.native_recovery import (
@@ -63,6 +67,7 @@ from exp.runtime.gateway.native_request_settlement import RequestSettlements
 from exp.runtime.gateway.native_rung_policy import (
     bind_sticky_dispatch,
     failed_dispatch_candidate,
+    record_attempt_health,
     record_cache_fraction,
     reserve_rung_slot,
     shed_keeps_rung,
@@ -77,7 +82,6 @@ from exp.runtime.gateway.native_settlement import (
     failure_from_boundary_payload,
     ledger_failure,
     settlement_metadata,
-    settlement_rate_limit,
     terminal_from_settlement,
     tool_search_requests_from_terminal,
     tool_search_requests_kwarg,
@@ -204,20 +208,20 @@ class NativeAttemptAccounting:
         reserved_tokens: int,
         force: bool,
         rate_retry: bool = False,
+        failover: bool = False,
     ) -> str | RungShed | None:
-        """Reserve one policy-bounded slot on a rung, or report the shed.
+        """Reserve one slot through ``reserve_rung_slot``, counting every shed.
 
         Args:
             entry: The owning in-flight request (organization and weight).
             deployment: The claimed rung about to dispatch.
-            reserved_tokens: Worst-case tokens this dispatch reserves, counted
-                against the rung's token window when one is authored.
+            reserved_tokens: Worst-case tokens this dispatch reserves.
             force: Admit past soft policy limits when overflow is explicitly allowed.
             rate_retry: Skip only rate-window checks after scheduled backoff.
+            failover: The reservation is a failover's forced pass.
 
         Returns:
-            An opaque reservation ticket, the shed disclosure, or ``None``
-            when the rung authors no admission policy (the untouched default).
+            A ticket, the shed disclosure, or ``None`` without an admission policy.
         """
         result = reserve_rung_slot(
             self._loads,
@@ -227,6 +231,7 @@ class NativeAttemptAccounting:
             reserved_tokens=reserved_tokens,
             force=force,
             rate_retry=rate_retry,
+            failover_pass=failover,
         )
         if isinstance(result, RungShed):
             with self._lock:
@@ -381,6 +386,7 @@ class NativeAttemptAccounting:
         redial_depth: int | None = None  # The rung a post-backoff redial re-dials.
         tool_search_round = False
         reasoning_repair = data.get("reasoning_repair") is True and isinstance(current_depth, int)
+        failover = FailoverPass.begin(entry, failure, current_depth)
         if failure is not None and isinstance(current_depth, int):
             candidate, disposition = failed_dispatch_candidate(
                 health=self._health,
@@ -455,10 +461,14 @@ class NativeAttemptAccounting:
                             self._rung_saturation_refusals += 1
                         break
                 else:
-                    break
+                    # A failover is never ended by a sibling's bound (failover_pass).
+                    candidate = forced_failover_target(failover, policy_sheds, shed_records)
+                    if candidate is None:
+                        break
+                    forced_overflow = True
             if route.snapshot.stage_for_depth(candidate).pool_id in entry.denied_destination_pools:
                 self._health.release_probe(keys[candidate])
-                candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
+                candidate = sideways_claim(failover, self._health, keys, ladder, candidate)
                 continue
             if not entry.attempt_policy.permits(
                 entry.total_attempts, entry.attempt_counts[candidate]
@@ -494,6 +504,7 @@ class NativeAttemptAccounting:
                 reserved_tokens=reserved_input_tokens + reserved_output_tokens,
                 force=forced_overflow,
                 rate_retry=forced_overflow and candidate == redial_depth,
+                failover=failover is not None and failover.forcing,
             )
             if isinstance(ticket, RungShed):
                 record_departure(
@@ -517,7 +528,7 @@ class NativeAttemptAccounting:
                         self._rung_saturation_refusals += 1
                     break
                 if not forced_overflow:
-                    candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
+                    candidate = sideways_claim(failover, self._health, keys, ladder, candidate)
                 continue
             throttle_backoff = candidate == redial_depth
             dispatch_reason, preferred_deployment = dispatch_disclosure(
@@ -561,7 +572,7 @@ class NativeAttemptAccounting:
                     entry.denied_destination_pools.add(denied_pool)
                     last_failure = budget_quota_failure()
                     forced_overflow = False
-                    candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
+                    candidate = sideways_claim(failover, self._health, keys, ladder, candidate)
                     continue
                 if exc.scope_kind is not BudgetScopeKind.DEPLOYMENT:
                     error = (
@@ -583,7 +594,7 @@ class NativeAttemptAccounting:
                 # A forced reservation belongs only to the selected rung, never
                 # a later destination reached after this one's budget rejection.
                 forced_overflow = False
-                candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
+                candidate = sideways_claim(failover, self._health, keys, ladder, candidate)
                 continue
             except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
                 # A reservation that raised before returning an attempt id
@@ -705,7 +716,15 @@ class NativeAttemptAccounting:
                 entry.pending_settlement = data
             raise authority_error(exc) from exc
         failure = terminal.failure
-        self._record_health(entry, attempt_id, opened=opened, failure=failure, settlement=data)
+        record_attempt_health(
+            self._health,
+            self._loads,
+            entry,
+            attempt_id,
+            opened=opened,
+            failure=failure,
+            settlement=data,
+        )
         self._record_cache_fraction(entry, attempt_id, terminal)
         record_session_outcome(
             self.recovery,
@@ -763,8 +782,8 @@ class NativeAttemptAccounting:
                 return "{}"
             try:
                 if entry.active_attempt_id is not None:
-                    self._record_health(
-                        entry, entry.active_attempt_id, opened=False, failure=failure
+                    record_attempt_health(
+                        self._health, self._loads, entry, entry.active_attempt_id, failure=failure
                     )
                     self._finish_attempt(
                         attempt_id=entry.active_attempt_id,
@@ -816,56 +835,6 @@ class NativeAttemptAccounting:
             )
         except Exception:  # noqa: BLE001 - the original sanitized admission error wins.
             return False
-
-    def _record_health(
-        self,
-        entry: InflightRequest,
-        attempt_id: str,
-        *,
-        opened: bool,
-        failure: GatewayFailure | None,
-        settlement: JsonObject | None = None,
-    ) -> None:
-        """Apply one settled attempt's outcome to the deployment circuits.
-
-        Restore successful opens; exhausted provider windows throttle until reset.
-
-        Args:
-            entry: The owning in-flight request.
-            attempt_id: The settled attempt.
-            opened: Whether the provider dispatch opened successfully.
-            failure: The terminal failure, or ``None`` for a success.
-            settlement: The settlement payload carrying the harvested rate-limit headers.
-        """
-        # Slot and health releases are idempotent across settlement, abandon, and sweep.
-        self._loads.release_attempt(attempt_id)
-        depth = entry.attempt_depths.get(attempt_id)
-        if depth is None:
-            return
-        deployment = entry.route.deployments[depth]
-        key = deployment_health_key(entry.authorization, deployment)
-        if opened:
-            self._health.dispatch_opened(key)
-        if failure is not None:
-            policy = deployment.gateway.dispatch
-            if failure.failure_class == GatewayFailureClass.THROTTLED and (
-                policy is not None
-                and (
-                    policy.concurrency_bound is not None
-                    or policy.requests_per_minute is not None
-                    or policy.tokens_per_minute is not None
-                )
-            ):
-                # Clamp the learned ceiling to the observed rate; recovery creep
-                # rediscovers headroom. Only admission-participating rungs reserve
-                # through the registry, providing a real window and enforcing the ceiling.
-                self._loads.record_throttle(rung_load_key(deployment))
-            self._health.failed(key, failure)
-        else:
-            self._health.succeeded(key)
-        exhausted = settlement_rate_limit(settlement).exhausted_reset_after_seconds
-        if exhausted is not None:
-            self._health.exhausted(key, exhausted)
 
     def _record_cache_fraction(
         self, entry: InflightRequest, attempt_id: str, terminal: GatewayEvent
@@ -977,8 +946,14 @@ class NativeAttemptAccounting:
             return False
         failure = terminal.failure
         opened = settlement is not None and settlement.get("opened") is True
-        self._record_health(
-            entry, attempt_id, opened=opened, failure=failure, settlement=settlement
+        record_attempt_health(
+            self._health,
+            self._loads,
+            entry,
+            attempt_id,
+            opened=opened,
+            failure=failure,
+            settlement=settlement,
         )
         # Cache-priority observations must not depend on which settlement path succeeds.
         self._record_cache_fraction(entry, attempt_id, terminal)

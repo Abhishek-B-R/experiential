@@ -221,6 +221,28 @@ applies the same rule after commitment, when every committed event was one it ca
 Provider-internal retry layers are disabled so every
 possible billable dispatch is visible to the gateway ledger.
 
+**Which rung a failover reaches.** A pre-commit failover-eligible failure advances to the first
+claimable rung this request has NOT dispatched yet, in route order, so a rung skipped earlier (shed
+at its bound on the first dial, or passed over by affinity order) is revisited before later ones;
+a rung already dispatched is never dialed again except by the same-deployment redial. Both halves
+agree: the data plane's `successor_possible` counts any untried rung, and the control plane's
+`untried_depths` claims it. A failover is never ended by a sibling's saturation bound: a successor
+that sheds spills sideways to the other untried rungs, and only when every one of them shed is the
+first shed rung admitted as a forced pass (`saturated_overflow`) at the overflow ceiling a Pro
+caller gets on that rung (1.5x the bound unless authored). A rung at that ceiling, a hard class cap
+or `:fast` reserve, or a rate-window shed is skipped, and only when all refuse does the request end
+with the original failure. A first dial keeps the refusing-bound 429. While an untried rung could
+take a header timeout, a dial's first-byte (header) wait is capped at the pre-first-byte budget
+minus 15 s, so a rung authoring a longer allowance than the budget still leaves room to fail over;
+the last untried rung keeps its full allowance. Each worker also ejects a dead lane on its own: three
+transport failures or provider 5xx (refused, 502, 503, 504) on one physical lane (deployment and
+connection, across catalog revisions) within 10 s order that lane LAST in every claim walk for 30 s
+(never removed, so a single-rung route still dials it); after the cooldown one request probes it, a
+success restores its order and a dead-lane failure re-ejects it. Client 4xx, throttles and timeouts
+neither count nor reset the streak. `EXP_GATEWAY_LANE_EJECTION_FAILURES` (0 disables),
+`EXP_GATEWAY_LANE_EJECTION_WINDOW_SECONDS` and `EXP_GATEWAY_LANE_EJECTION_COOLDOWN_SECONDS` override
+the thresholds; nothing is published to the catalog.
+
 **Per-rung conditional failover (`failover_only_on`).** A deployment may restrict itself to
 failover duty for a named set of failures (a customer's trusted-access OpenAI key taking only the
 house rung's `refusal:cyber_policy`); see [gateway-failover-rules.md](gateway-failover-rules.md).

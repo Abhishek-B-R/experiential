@@ -451,7 +451,10 @@ def test_later_child_denial_keeps_root_failure_terminal(tmp_path: Path) -> None:
         _request("chain-budget"),
         time.monotonic() + 30,
         total_attempts=1,
-        attempt_counts=[0, 1, 0],
+        # The dial that failed was depth 0 (``current_depth`` below); the
+        # ledger row at depth 1 above only spends the root allowance, so the
+        # child at depth 1 is still this request's untried successor.
+        attempt_counts=[1, 0, 0],
     )
     accounting.register(entry)
     with pytest.raises(NativeBridgeError) as caught:

@@ -21,6 +21,10 @@ use std::time::{Duration, Instant};
 #[path = "google_cache.rs"]
 mod google_cache;
 
+/// `first_byte_cap` pulls the header wait in so a timed-out dial still leaves
+/// room to fail over (`successor::failover_first_byte_cap`); `None` keeps the
+/// authored allowance.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_attempt(
     ctx: &WaterfallContext<'_>,
     guard: &mut AttemptGuard,
@@ -29,6 +33,7 @@ pub(super) async fn run_attempt(
     repaired: &mut Option<Value>,
     reactive_repair: bool,
     search_rounds: &[ToolSearchRound],
+    first_byte_cap: Option<Instant>,
 ) -> AttemptEnd {
     let Some(dialect) = Dialect::from_str(&wire.dialect) else {
         // Admission validated every dialect; reaching here is wire drift.
@@ -110,7 +115,9 @@ pub(super) async fn run_attempt(
             ctx.approximate_input_tokens,
         )
     };
-    let mut first_byte_deadline = ctx.capped(Instant::now() + first_byte_allowance_for());
+    let header_deadline = |at: Instant| first_byte_cap.map_or(at, |cap| at.min(cap));
+    let mut first_byte_deadline =
+        header_deadline(ctx.capped(Instant::now() + first_byte_allowance_for()));
     // The first-token bound the relay enforces once the headers are in: its
     // own base (thinking models on a chat wire stream nothing for a minute
     // and more), the same input slope, absolute from the same dial.
@@ -182,7 +189,8 @@ pub(super) async fn run_attempt(
         {
             inject = false;
             refusal_unconfirmed = true;
-            first_byte_deadline = ctx.capped(Instant::now() + first_byte_allowance_for());
+            first_byte_deadline =
+                header_deadline(ctx.capped(Instant::now() + first_byte_allowance_for()));
             first_token_deadline = ctx.capped(Instant::now() + first_token_allowance_for());
             continue 'dial;
         }
@@ -308,8 +316,9 @@ pub(super) async fn run_attempt(
                         inject = false;
                         refusal_unconfirmed = true;
                         guard.forget_discarded_dial();
-                        first_byte_deadline =
-                            ctx.capped(Instant::now() + first_byte_allowance_for());
+                        first_byte_deadline = header_deadline(
+                            ctx.capped(Instant::now() + first_byte_allowance_for()),
+                        );
                         first_token_deadline =
                             ctx.capped(Instant::now() + first_token_allowance_for());
                         continue 'dial;
@@ -448,8 +457,9 @@ pub(super) async fn run_attempt(
                         inject = false;
                         refusal_unconfirmed = true;
                         guard.forget_discarded_dial();
-                        first_byte_deadline =
-                            ctx.capped(Instant::now() + first_byte_allowance_for());
+                        first_byte_deadline = header_deadline(
+                            ctx.capped(Instant::now() + first_byte_allowance_for()),
+                        );
                         first_token_deadline =
                             ctx.capped(Instant::now() + first_token_allowance_for());
                         continue 'dial;

@@ -377,6 +377,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
         // A rung a tool-search round rebuilt dials its rebuilt wire; the
         // route's own entry still answers every policy question above.
         let dial_wire = search_wires[depth].as_ref().unwrap_or(wire);
+        let first_byte_cap = failover_first_byte_cap(ctx, depth, &physical_counts, total_attempts);
         let mut end = run_attempt(
             ctx,
             guard,
@@ -385,6 +386,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
             &mut repaired[depth],
             repair_redial,
             &tool_search_rounds,
+            first_byte_cap,
         )
         .await;
         // Every pre-commit failure of a tenant origin answers opaquely; the
@@ -568,6 +570,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                         total_attempts,
                         counts[depth],
                         depth,
+                        &physical_counts,
                         &failure,
                         refusal_eligible,
                     );
@@ -685,7 +688,7 @@ use dispatch::{customer_owned, dispatch_headers};
 
 mod successor;
 pub(crate) use successor::successor_possible;
-use successor::throttle_backoff_delay;
+use successor::{failover_first_byte_cap, throttle_backoff_delay};
 
 mod search_round;
 
@@ -695,6 +698,8 @@ mod ladder_tests;
 mod progress_tests;
 #[cfg(test)]
 mod repair_ladder_tests;
+#[cfg(test)]
+mod revisit_ladder_tests;
 #[cfg(test)]
 mod tenant_ladder_tests;
 #[cfg(test)]

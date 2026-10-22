@@ -1890,6 +1890,7 @@ class TestLaneSaturation:
             reserved_tokens: int,
             force: bool,
             rate_retry: bool = False,
+            failover: bool = False,
         ) -> str | RungShed | None:
             """Fill capacity after the initial rate decision and fail on a repeated hard refusal."""
             assert len(calls) < 2, "stale shed retried a hard-refused overflow target"
@@ -1899,6 +1900,7 @@ class TestLaneSaturation:
                 reserved_tokens=reserved_tokens,
                 force=force,
                 rate_retry=rate_retry,
+                failover=failover,
             )
             calls.append(
                 (force, rate_retry, result.reason if isinstance(result, RungShed) else "admitted")
@@ -1989,6 +1991,7 @@ class TestLaneSaturation:
             reserved_tokens: int,
             force: bool,
             rate_retry: bool = False,
+            failover: bool = False,
         ) -> str | RungShed | None:
             """Advance the deadline or durably abandon before the next selection."""
             nonlocal calls
@@ -2000,6 +2003,7 @@ class TestLaneSaturation:
                 reserved_tokens=reserved_tokens,
                 force=force,
                 rate_retry=rate_retry,
+                failover=failover,
             )
             assert isinstance(result, RungShed)
             if interruption == "deadline":

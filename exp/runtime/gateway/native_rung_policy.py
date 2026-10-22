@@ -23,6 +23,7 @@ import threading
 import time
 from collections.abc import Callable
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.class_throttles import (
     class_concurrency_cap,
@@ -42,11 +43,13 @@ from exp.runtime.gateway.native_execution import (
     THROTTLE_FAILOVER_COLD,
     InflightRequest,
     ThrottleDisposition,
+    deployment_health_key,
     next_route_candidate,
     rung_load_key,
     throttle_disposition,
 )
 from exp.runtime.gateway.native_fallback_rules import route_fallback_rules
+from exp.runtime.gateway.native_settlement import settlement_rate_limit
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed, RungShedReason
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
@@ -63,6 +66,7 @@ def reserve_rung_slot(
     reserved_tokens: int,
     force: bool,
     rate_retry: bool = False,
+    failover_pass: bool = False,
 ) -> str | RungShed | None:
     """Reserve one policy-bounded slot on a rung, or report the shed.
 
@@ -75,6 +79,10 @@ def reserve_rung_slot(
             against the rung's token window when one is authored.
         force: Admit past soft policy limits when overflow is explicitly allowed.
         rate_retry: Skip only rate-window checks after scheduled backoff.
+        failover_pass: A forced pass of a FAILOVER (``failover_pass``): a
+            refusing bound admits it as it would a Pro caller's overflow,
+            capped at the Pro ceiling, so a request whose rung already failed
+            is never ended by a sibling's saturation bound.
 
     Returns:
         An opaque reservation ticket, the shed disclosure, or ``None``
@@ -144,7 +152,8 @@ def reserve_rung_slot(
     # a rung with an always-on reserve, the reserved slots stay its own.
     fast = fast_on_rung(entry.authorization, deployment)
     fast_reserve = fast_reserve_slots(deployment)
-    priority = entry.authorization.priority_admission
+    # A failover's forced pass overflows like the top priority level.
+    priority = 2 if failover_pass else entry.authorization.priority_admission
     result = loads.reserve(
         rung_load_key(deployment),
         organization_id=entry.authorization.organization_id,
@@ -545,3 +554,57 @@ def record_cache_fraction(
         cached_tokens=0 if cached is None else cached,
         input_tokens=usage.input_tokens,
     )
+
+
+def record_attempt_health(
+    health: DeploymentHealthRegistry,
+    loads: RungLoadRegistry,
+    entry: InflightRequest,
+    attempt_id: str,
+    *,
+    opened: bool = False,
+    failure: GatewayFailure | None,
+    settlement: JsonObject | None = None,
+) -> None:
+    """Apply one settled attempt's outcome to the deployment circuits and lane ejection.
+
+    Restore successful opens; exhausted provider windows throttle until reset.
+
+    Args:
+        health: The worker's circuit, throttle and lane-ejection registry.
+        loads: The worker's per-rung load registry (slot release, learned ceiling).
+        entry: The owning in-flight request.
+        attempt_id: The settled attempt.
+        opened: Whether the provider dispatch opened successfully.
+        failure: The terminal failure, or ``None`` for a success.
+        settlement: The settlement payload carrying the harvested rate-limit headers.
+    """
+    # Slot and health releases are idempotent across settlement, abandon, and sweep.
+    loads.release_attempt(attempt_id)
+    depth = entry.attempt_depths.get(attempt_id)
+    if depth is None:
+        return
+    deployment = entry.route.deployments[depth]
+    key = deployment_health_key(entry.authorization, deployment)
+    if opened:
+        health.dispatch_opened(key)
+    if failure is not None:
+        policy = deployment.gateway.dispatch
+        if failure.failure_class == GatewayFailureClass.THROTTLED and (
+            policy is not None
+            and (
+                policy.concurrency_bound is not None
+                or policy.requests_per_minute is not None
+                or policy.tokens_per_minute is not None
+            )
+        ):
+            # Clamp the learned ceiling to the observed rate; recovery creep
+            # rediscovers headroom. Only admission-participating rungs reserve
+            # through the registry, providing a real window and enforcing the ceiling.
+            loads.record_throttle(rung_load_key(deployment))
+        health.failed(key, failure)
+    else:
+        health.succeeded(key)
+    exhausted = settlement_rate_limit(settlement).exhausted_reset_after_seconds
+    if exhausted is not None:
+        health.exhausted(key, exhausted)

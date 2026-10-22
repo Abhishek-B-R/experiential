@@ -1,6 +1,7 @@
 //! The waterfall's successor rules: whether a classified pre-commit failure
-//! leaves any later dispatch possible, and the wait before a throttled rung
-//! is re-dialed.
+//! leaves any later dispatch possible, the wait before a throttled rung is
+//! re-dialed, and how much of the pre-first-byte budget a rung's header wait
+//! must leave for its successor.
 
 use std::time::{Duration, Instant};
 
@@ -10,9 +11,11 @@ use crate::relay::remaining;
 use crate::throttle_backoff::{jitter_unit, BackoffQuery, ThrottleRedial};
 
 /// Whether the classified failure leaves any successor dispatch possible
-/// under the rust-side facts (caps, flags, remaining route, deadline). The
+/// under the rust-side facts (caps, flags, untried rungs, deadline). The
 /// control plane re-checks with health and budget state and may still answer
-/// with exhaustion.
+/// with exhaustion. `dispatched` counts physical dispatches per route index:
+/// a failover may land on ANY rung not yet dispatched in this request,
+/// earlier skipped rungs included (`fallback_rules::successor_available`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn successor_possible(
     policy: RoutePolicy,
@@ -21,6 +24,7 @@ pub(crate) fn successor_possible(
     total_attempts: u32,
     same_deployment_attempts: u32,
     depth: usize,
+    dispatched: &[u32],
     failure: &Failure,
     refusal_eligible: bool,
 ) -> bool {
@@ -35,10 +39,51 @@ pub(crate) fn successor_possible(
     let failover = fallback_rules::successor_available(
         route,
         depth,
+        dispatched,
         failure,
         failure.failover_eligible || refusal_eligible,
     );
     same || failover
+}
+
+/// What a rung's first-byte (header) wait leaves of the pre-commit budget
+/// for a successor: enough for a fresh dial to answer its headers.
+pub(crate) const FAILOVER_FIRST_BYTE_RESERVE: Duration = Duration::from_secs(15);
+
+/// The instant a dial at `depth` must stop waiting for headers so a header
+/// timeout can still fail over, or `None` to keep the authored allowance.
+///
+/// A rung's authored first-byte allowance can exceed the whole pre-first-byte
+/// budget (production, 2026-10-21: a self-hosted lane authored 300 s against
+/// the 90 s budget, so every header timeout ended the request with nothing
+/// left to dial). While an untried rung could take a header timeout (a
+/// failover-eligible `timeout`, never redialed on the same rung) and the
+/// attempt cap allows one more dispatch, the wait is capped at the pre-commit
+/// deadline minus `FAILOVER_FIRST_BYTE_RESERVE`. The last untried rung (and a
+/// single-rung route) keeps its full allowance, and a budget already inside
+/// the reserve is left alone rather than cut to nothing. `dispatched` must
+/// already count this dial; `total_attempts` likewise.
+pub(super) fn failover_first_byte_cap(
+    ctx: &WaterfallContext<'_>,
+    depth: usize,
+    dispatched: &[u32],
+    total_attempts: u32,
+) -> Option<Instant> {
+    if !ctx.policy.permits(total_attempts, 0) {
+        return None;
+    }
+    let stall = Failure::new(
+        FailureClass::Timeout,
+        "provider did not send response headers in time",
+    )
+    .with_retry(false, true);
+    if !fallback_rules::successor_available(ctx.route, depth, dispatched, &stall, true) {
+        return None;
+    }
+    let cap = ctx
+        .pre_commit_deadline()
+        .checked_sub(FAILOVER_FIRST_BYTE_RESERVE)?;
+    (cap > Instant::now()).then_some(cap)
 }
 
 /// The wait before re-dialing a throttled rung, or `None` when the ladder
