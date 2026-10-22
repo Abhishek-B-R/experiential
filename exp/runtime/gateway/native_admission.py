@@ -519,7 +519,7 @@ def _prefer_cache_capable_rungs(
     stands ready: the pool's whole policy is prefix-cache preservation, and
     a marker-dropping first rung silently bills every turn's full context
     uncached (measured ~10x on a large system prompt). The reorder is
-    stable within each group, so certified order still breaks ties, and a
+    stable within each group (certified order breaks ties; house OpenRouter never leads), and a
     route that narrowing left with NO marker-honoring rung is unchanged
     here: the dropped markers are already disclosed through the
     ``cache_control`` ``ignored_parameters`` entries. ``maximize_availability``
@@ -545,8 +545,6 @@ def _prefer_cache_capable_rungs(
         *marker_capable,
         *(index for index in range(len(resolved_wires)) if index not in marker_capable),
     )
-    # The grouping never leads with a host-funded OpenRouter rung (owner rule:
-    # OpenRouter is never the first lane), as on affinity pools.
     order = house_aggregator_last(order, route.deployments, [p for p, _ in resolved_wires])
     return (
         reorder_route_deployments(route, order),
