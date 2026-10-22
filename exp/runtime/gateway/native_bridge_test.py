@@ -425,6 +425,58 @@ def test_request_class_reaches_the_admission_only_when_the_host_sets_one(
     assert classed["priority_class"] == 6
 
 
+@pytest.mark.parametrize("provider", ("anthropic", "openai-compatible"))
+def test_openrouter_sampling_extras_forward_or_drop_per_rung_never_refuse(
+    tmp_path: Path, provider: str
+) -> None:
+    """``repetition_penalty`` / ``min_p`` / ``top_a`` are admitted on every rung.
+
+    Neither an Anthropic rung nor a generic OpenAI-compatible rung that is not
+    marked self-hosted (a reseller that may refuse unknown fields) carries
+    them: the real admission bridge dispatches without any of them and names
+    each drop in ``ignored_parameters``. A self-hosted vLLM rung's forwarding
+    is covered in native_rungs_test.
+    """
+    _manager, key = _configured_gateway(
+        tmp_path,
+        provider=provider,
+        capabilities=ModelCapabilities(maximum_output_tokens=2_048),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "local-test-key"})
+    )
+    body = {**json.loads(_chat_body()), "repetition_penalty": 1.1, "min_p": 0.05, "top_a": 0.2}
+    admission = _admit(control, key, json.dumps(body))
+    route = admission["route"]
+    assert isinstance(route, list) and isinstance(route[0], dict)
+    payload = route[0]["upstream_payload"]
+    assert isinstance(payload, dict)
+    ignored = admission["ignored_parameters"]
+    assert isinstance(ignored, list)
+    assert not {"repetition_penalty", "min_p", "top_a"} & set(payload)
+    for name in ("repetition_penalty", "min_p", "top_a"):
+        assert f"{name}->dropped(unsupported_by_provider)" in ignored
+    assert "attempt_id" in _start_first(control, admission)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("repetition_penalty", 0), ("repetition_penalty", 3.0), ("min_p", "0.1"), ("top_a", -1)),
+)
+def test_an_invalid_sampling_extra_is_a_named_400(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    """Admission validates the extras' type and range before any rung is chosen."""
+    control, raw_key = _control_plane(tmp_path)
+    body = {**json.loads(_chat_body()), field: value}
+    with pytest.raises(NativeBridgeError) as refused:
+        _admit(control, raw_key, json.dumps(body))
+    public_error = json.loads(refused.value.public_error_json)
+    assert public_error["status_code"] == 400
+    assert public_error["code"] == "invalid_parameter"
+    assert public_error["param"] == field
+
+
 def test_a_plain_priority_tier_never_jumps_the_permit_queue(tmp_path: Path) -> None:
     """``service_tier`` priority without ``:fast`` keeps the caller's own permit class.
 
@@ -4114,9 +4166,11 @@ def test_metrics_snapshot_counts_a_replayed_retained_settlement(tmp_path: Path) 
 
 def test_metrics_snapshot_counts_a_swept_abandoned_attempt(tmp_path: Path) -> None:
     """An abandoned admission closed by the sweep moves the cancellation counter."""
-    control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.01)
+    # The deadline must outlast admission itself (a 10 ms budget raced local
+    # snapshot preparation on a loaded CI runner) and then lapse before the sweep.
+    control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.5)
     _admit(control, raw_key, _chat_body())
-    time.sleep(0.05)
+    time.sleep(0.6)
     with mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0):
         control._accounting.sweep_expired()  # noqa: SLF001 - the timer normally drives this.
 

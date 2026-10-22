@@ -77,20 +77,14 @@ gate-tests:
     - |
       case "$SHARD" in
         rest)
-          # Two known-red tests are deselected by node id; every other test is strict.
-          # - repo_layout_test.py::test_non_test_hand_authored_files_stay_below_one_thousand_lines:
-          #   four hand-authored files on main are over the 999-line cap
-          #   (exp/runtime/gateway/contracts.py, exp/runtime/models/providers/bedrock.py,
-          #   exp/runtime/models/providers/openai_compatible.py,
-          #   exp/runtime/openai_protocol/requests.py). Remove once they are split.
-          # - release_test.py::test_installed_wheel_no_spend_release_evidence: installs
-          #   freshly built wheels plus git-pinned capture dependencies into a new
-          #   environment and fails in this setup; .github/workflows/gate.yml deselects
-          #   it from the Linux shards too.
+          # One known-red test is deselected by node id; every other test is strict.
+          # release_test.py::test_installed_wheel_no_spend_release_evidence installs
+          # freshly built wheels plus git-pinned capture dependencies into a new
+          # environment and fails in this setup; .github/workflows/gate.yml deselects
+          # it from the Linux shards too.
           paths="exp --ignore=exp/optimize/router --ignore=exp/runtime/gateway
             --ignore=exp/optimize/evaluation --ignore=exp/optimize/model/sft/tinker_test.py
             --ignore=exp/simulation/tests/comparison_evidence_test.py
-            --deselect=exp/tests/repo_layout_test.py::test_non_test_hand_authored_files_stay_below_one_thousand_lines
             --deselect=exp/tests/release_test.py::test_installed_wheel_no_spend_release_evidence" ;;
         router-hosted)
           paths="exp/optimize/router/hosted_test.py exp/optimize/router/automatic" ;;

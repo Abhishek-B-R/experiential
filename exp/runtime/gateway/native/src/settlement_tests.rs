@@ -373,7 +373,7 @@ fn settle_argument_retains_cache_write_counts_and_unknowns() {
             None,
             None,
             None,
-            0,
+            WebSearchMeter::default(),
             0,
         );
         let parsed: Value = serde_json::from_str(&argument).expect("valid json");
@@ -396,7 +396,10 @@ fn settle_argument_bills_web_searches_only_on_the_finalizing_settlement() {
             None,
             None,
             None,
-            requests,
+            WebSearchMeter {
+                requests: requests,
+                ..WebSearchMeter::default()
+            },
             0,
         );
         serde_json::from_str(&argument).expect("valid json")
@@ -406,6 +409,60 @@ fn settle_argument_bills_web_searches_only_on_the_finalizing_settlement() {
     // second time, and an unsearched request omits the key entirely.
     assert!(settle(false, 1).get("web_search_requests").is_none());
     assert!(settle(true, 0).get("web_search_requests").is_none());
+}
+
+#[test]
+fn settle_argument_carries_web_search_results_and_vendor_cost_beside_the_count() {
+    let settle = |finalize: bool, meter: WebSearchMeter| -> Value {
+        let argument = settle_argument(
+            "req",
+            "att",
+            "completed",
+            None,
+            &[],
+            None,
+            finalize,
+            true,
+            None,
+            None,
+            None,
+            meter,
+            0,
+        );
+        serde_json::from_str(&argument).expect("valid json")
+    };
+    let costed = WebSearchMeter {
+        requests: 1,
+        results: 5,
+        cost_nano_usd: Some(12_000_000),
+    };
+    let finalized = settle(true, costed);
+    assert_eq!(finalized["web_search_requests"], json!(1));
+    assert_eq!(finalized["web_search_results"], json!(5));
+    assert_eq!(finalized["web_search_cost_nano_usd"], json!(12_000_000));
+    // No vendor report: the results ride alone and the cost key is absent.
+    let unreported = settle(
+        true,
+        WebSearchMeter {
+            cost_nano_usd: None,
+            ..costed
+        },
+    );
+    assert_eq!(unreported["web_search_results"], json!(5));
+    assert!(unreported.get("web_search_cost_nano_usd").is_none());
+    // Neither rides a non-finalizing settlement or an unsearched request.
+    let partial = settle(false, costed);
+    assert!(partial.get("web_search_results").is_none());
+    assert!(partial.get("web_search_cost_nano_usd").is_none());
+    let unsearched = settle(
+        true,
+        WebSearchMeter {
+            requests: 0,
+            ..costed
+        },
+    );
+    assert!(unsearched.get("web_search_results").is_none());
+    assert!(unsearched.get("web_search_cost_nano_usd").is_none());
 }
 
 #[test]
@@ -423,7 +480,7 @@ fn settle_argument_bills_tool_search_rounds_only_on_the_finalizing_settlement() 
             None,
             None,
             None,
-            0,
+            WebSearchMeter::default(),
             rounds,
         );
         serde_json::from_str(&argument).expect("valid json")
@@ -444,6 +501,7 @@ fn settle_argument_preserves_upstream_provider_and_cache_ttl_usage_together() {
         cached_input_tokens: Some(100),
         cache_creation_input_tokens: Some(600),
         cache_creation_1h_input_tokens: Some(200),
+        cache_creation_12h_input_tokens: None,
         reasoning_tokens: None,
         billed_units: None,
         cache_writes_read_back: false,
@@ -461,7 +519,7 @@ fn settle_argument_preserves_upstream_provider_and_cache_ttl_usage_together() {
         None,
         None,
         Some("Azure"),
-        0,
+        WebSearchMeter::default(),
         0,
     );
     let parsed: Value = serde_json::from_str(&named).expect("valid json");
@@ -484,7 +542,7 @@ fn settle_argument_preserves_upstream_provider_and_cache_ttl_usage_together() {
         None,
         None,
         None,
-        0,
+        WebSearchMeter::default(),
         0,
     );
     let parsed: Value = serde_json::from_str(&unnamed).expect("valid json");
@@ -506,7 +564,7 @@ fn settle_argument_carries_first_token_at_only_when_observed() {
         Some(observed),
         None,
         None,
-        0,
+        WebSearchMeter::default(),
         0,
     );
     let parsed: Value = serde_json::from_str(&with_token).expect("valid json");
@@ -528,7 +586,7 @@ fn settle_argument_carries_first_token_at_only_when_observed() {
         None,
         None,
         None,
-        0,
+        WebSearchMeter::default(),
         0,
     );
     let parsed: Value = serde_json::from_str(&without).expect("valid json");
@@ -553,7 +611,7 @@ fn settle_argument_carries_the_sanitized_provider_detail_on_a_failed_attempt() {
         None,
         None,
         None,
-        0,
+        WebSearchMeter::default(),
         0,
     );
     let parsed: Value = serde_json::from_str(&argument).expect("valid json");
@@ -579,7 +637,7 @@ fn settle_argument_carries_the_sanitized_provider_detail_on_a_failed_attempt() {
         None,
         None,
         None,
-        0,
+        WebSearchMeter::default(),
         0,
     );
     let parsed: Value = serde_json::from_str(&owned_argument).expect("valid json");
@@ -603,7 +661,7 @@ fn settle_argument_carries_the_sanitized_provider_detail_on_a_failed_attempt() {
         None,
         None,
         None,
-        0,
+        WebSearchMeter::default(),
         0,
     );
     let parsed: Value = serde_json::from_str(&bare_argument).expect("valid json");
@@ -634,7 +692,7 @@ fn settle_argument_carries_rate_limit_facts_when_harvested() {
         None,
         throttled.rate_limit_headers.as_deref(),
         None,
-        0,
+        WebSearchMeter::default(),
         0,
     );
     let parsed: Value = serde_json::from_str(&argument).expect("valid json");
@@ -658,7 +716,7 @@ fn settle_argument_carries_rate_limit_facts_when_harvested() {
         None,
         Some(&headers),
         None,
-        0,
+        WebSearchMeter::default(),
         0,
     );
     let parsed: Value = serde_json::from_str(&success).expect("valid json");
@@ -675,7 +733,7 @@ fn settle_argument_carries_rate_limit_facts_when_harvested() {
         None,
         None,
         None,
-        0,
+        WebSearchMeter::default(),
         0,
     );
     let parsed: Value = serde_json::from_str(&bare).expect("valid json");
@@ -722,7 +780,7 @@ fn settle_argument_keeps_a_reported_zero_image_count_and_omits_an_unreported_one
             None,
             None,
             None,
-            0,
+            WebSearchMeter::default(),
             0,
         );
         serde_json::from_str(&argument).expect("valid json")
@@ -733,4 +791,39 @@ fn settle_argument_keeps_a_reported_zero_image_count_and_omits_an_unreported_one
         json!(1_120)
     );
     assert!(settle(None)["usage"].get("image_output_tokens").is_none());
+}
+
+#[test]
+fn settle_argument_carries_the_twelve_hour_write_subset_only_when_observed() {
+    let mut usage = Usage {
+        input_tokens: Some(3_250),
+        output_tokens: Some(5),
+        cached_input_tokens: Some(0),
+        cache_creation_input_tokens: Some(3_247),
+        cache_creation_12h_input_tokens: Some(3_247),
+        ..Usage::default()
+    };
+    let settle = |usage: &Usage| -> Value {
+        let argument = settle_argument(
+            "req",
+            "att",
+            "completed",
+            Some(usage),
+            &[],
+            None,
+            true,
+            true,
+            None,
+            None,
+            None,
+            WebSearchMeter::default(),
+            0,
+        );
+        serde_json::from_str::<Value>(&argument).expect("valid json")["usage"].clone()
+    };
+    assert_eq!(settle(&usage)["cache_creation_12h_input_tokens"], 3_247);
+    usage.cache_creation_12h_input_tokens = None;
+    assert!(settle(&usage)
+        .get("cache_creation_12h_input_tokens")
+        .is_none());
 }

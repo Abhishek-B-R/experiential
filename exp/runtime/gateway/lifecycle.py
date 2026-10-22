@@ -29,12 +29,12 @@ from exp.common.models import (
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayTarget,
     ProjectTarget,
 )
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
 from exp.runtime.gateway.interfaces import GatewayControlStore, ProjectTargetResolver
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger

@@ -1,4 +1,6 @@
-"""Normalize native Bedrock Converse responses and cache usage."""
+"""Translate Amazon Bedrock Converse responses into EXP's shared completion contract."""
+
+from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import cast

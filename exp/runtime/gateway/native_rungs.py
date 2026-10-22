@@ -14,11 +14,17 @@ wire fails closed here, never dispatching unconstrained.
 
 A rung whose authored dispatch policy sets ``upstream_priority`` (a self-hosted
 vLLM lane) carries the caller's admission level as vLLM's ``priority`` field.
+
+OpenRouter's sampling extras (``repetition_penalty``, ``min_p``, ``top_a``) are
+set on each rung whose wire carries them and disclosed as dropped on the rest
+(``rung_sampling_extras``), so the same request is honored on an OpenRouter or
+self-hosted vLLM rung and served without them on a strict one.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import JsonObject, sha256_bytes
 from exp.common.models.gateway_catalog import ExactModelDeployment
@@ -34,6 +40,12 @@ from exp.runtime.gateway.reasoning_carrier import (
     scheme_for_profile,
 )
 from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.sampling_extras import (
+    OPENROUTER_SAMPLING_EXTRAS,
+    VLLM_SAMPLING_EXTRAS,
+    SamplingExtraName,
+    forward_sampling_extras,
+)
 from exp.runtime.models.providers import (
     emulated_gateway_capabilities,
     emulated_stop_sequences,
@@ -63,6 +75,12 @@ from exp.runtime.models.providers.protocol import (
 )
 from exp.runtime.models.providers.wire_messages import anthropic_request_headers
 
+NOVITA_HOST = "api.novita.ai"
+"""Novita's origin host: its rungs pin a conversation by ``x-session-id``."""
+
+NOVITA_SESSION_HEADER = "x-session-id"
+"""The header Novita routes cache affinity by (configured on the house account)."""
+
 ZDR_CONSTRAINT_CAPABILITY = "zero_data_retention_constraint"
 """The capability a flagged rung's wire must express, named on the refusal."""
 
@@ -89,6 +107,7 @@ class RungDispatch:
     output_disclosure: str | None
     developer_disclosure: str | None
     reserved_output_tokens: int
+    sampling_disclosures: tuple[str, ...] = ()
 
     @property
     def disclosures(self) -> tuple[str, ...]:
@@ -99,6 +118,7 @@ class RungDispatch:
                 self.parallel_disclosure,
                 self.output_disclosure,
                 self.developer_disclosure,
+                *self.sampling_disclosures,
             )
             if disclosure is not None
         )
@@ -164,6 +184,11 @@ def build_rung_dispatch(
     upstream_payload = image_aware_stream_payload(
         profile, rung_request, capabilities, deployment.provider
     )
+    upstream_payload, sampling_disclosures = forward_sampling_extras(
+        upstream_payload,
+        rung_request.sampling_extras,
+        rung_sampling_extras(deployment, profile.dialect),
+    )
     if rung_request.provider_preferences is not None and openrouter_chat_wire(
         deployment.provider, profile.dialect
     ):
@@ -201,6 +226,7 @@ def build_rung_dispatch(
         upstream_payload, request_headers = zdr_constrained_dispatch(
             deployment, profile, upstream_payload
         )
+    request_headers = with_session_affinity(profile, rung_request, request_headers)
     upstream_body, signer = frozen_dispatch(profile, client, upstream_payload)
     wire_entry = deployment_wire_entry(
         route,
@@ -248,7 +274,37 @@ def build_rung_dispatch(
         output_disclosure=output_disclosure,
         developer_disclosure=developer_disclosure,
         reserved_output_tokens=output_bound,
+        sampling_disclosures=sampling_disclosures,
     )
+
+
+def rung_sampling_extras(
+    deployment: ExactModelDeployment, dialect: str
+) -> frozenset[SamplingExtraName]:
+    """The OpenRouter sampling extras one rung's wire carries.
+
+    OpenRouter's Chat Completions wire documents all three. A self-hosted vLLM
+    rung (the host authored ``upstream_priority`` on it, the same signal that
+    sends vLLM's ``priority`` field) takes ``repetition_penalty`` and ``min_p``
+    but has no ``top_a``. Every other wire carries none: the catalog's generic
+    ``openai-compatible`` provider also covers resellers (Groq, Mistral, xAI,
+    Cerebras and others) that refuse unknown body fields with a 400, and a
+    provider 400 does not fail over, so the extras are dropped there with
+    disclosure rather than sent.
+
+    Args:
+        deployment: The rung.
+        dialect: The rung's resolved wire dialect.
+
+    Returns:
+        The extras to set on this rung's payload.
+    """
+    if openrouter_chat_wire(deployment.provider, dialect):
+        return OPENROUTER_SAMPLING_EXTRAS
+    policy = deployment.gateway.dispatch
+    if dialect == "openai_compatible" and policy is not None and policy.upstream_priority:
+        return VLLM_SAMPLING_EXTRAS
+    return frozenset()
 
 
 def zdr_constrained_dispatch(
@@ -278,3 +334,33 @@ def zdr_constrained_dispatch(
         constrain_openrouter_zero_data_retention(upstream_payload),
         openrouter_metadata_headers(dict(profile.headers)),
     )
+
+
+def with_session_affinity(
+    profile: GatewayWireProfile,
+    rung_request: GatewayRequest,
+    request_headers: dict[str, str] | None,
+) -> dict[str, str] | None:
+    """Name the conversation in ``x-session-id`` on a rung served from Novita's origin.
+
+    Novita pins a session to the server holding its prefix cache when the
+    request carries this header; its value is the tenant-namespaced
+    ``provider_session_id`` admission derived, never the caller's raw key. A
+    request with no session id (prompt caching off, or no user turn) and every
+    other origin keep their headers unchanged.
+
+    Args:
+        profile: The rung's resolved wire profile.
+        rung_request: The request this rung dispatches.
+        request_headers: Per-request headers already composed, or ``None`` for
+            the profile's static headers.
+
+    Returns:
+        The headers to dispatch with, the profile's static ones merged in when
+        the session header is added.
+    """
+    session_id = rung_request.provider_session_id
+    if session_id is None or (urlsplit(profile.url).hostname or "").lower() != NOVITA_HOST:
+        return request_headers
+    base = dict(profile.headers) if request_headers is None else request_headers
+    return {**base, NOVITA_SESSION_HEADER: session_id}

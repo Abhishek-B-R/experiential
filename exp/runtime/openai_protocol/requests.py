@@ -32,6 +32,7 @@ from exp.runtime.gateway.reasoning_carrier import (
     parse_reasoning_content_carrier,
     scheme_for_carrier,
 )
+from exp.runtime.gateway.sampling_extras import SAMPLING_EXTRA_FIELDS, sampling_extras_of
 from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.cache_control import (
     drop_opencode_cache_control,
@@ -283,6 +284,7 @@ def decode_chat(
         _without_chat_message_extensions(payload),
         extension_fields={
             "top_k",
+            *SAMPLING_EXTRA_FIELDS,
             "reasoning_effort",
             "enable_thinking",
             "thinking_budget",
@@ -366,6 +368,7 @@ def decode_chat(
             top_k=request.top_k,
             frequency_penalty=request.frequency_penalty,
             presence_penalty=request.presence_penalty,
+            sampling_extras=sampling_extras_of(request),
             logprobs=request.logprobs,
             top_logprobs=request.top_logprobs,
             reasoning_effort=thinking.reasoning_effort,
@@ -563,6 +566,13 @@ def decode_responses(
             safety_identifier=request.safety_identifier,
             user=request.user,
             prompt_cache_key=request.prompt_cache_key,
+            # "30m" is OpenAI's default lifetime, already satisfied; only "12h" routes.
+            prompt_cache_ttl=(
+                "12h"
+                if request.prompt_cache_options is not None
+                and request.prompt_cache_options.ttl == "12h"
+                else None
+            ),
             service_tier=request.service_tier,
             idempotency_key=idempotency_key,
             client_request_id=client_request_id,

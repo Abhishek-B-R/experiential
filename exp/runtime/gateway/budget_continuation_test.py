@@ -27,12 +27,12 @@ from exp.runtime.gateway.budgets_test import (
     _unknown_attempt,
 )
 from exp.runtime.gateway.contracts import (
-    ExecutionSnapshot,
     GatewayEvent,
     GatewayEventKind,
     GatewayServiceTierAdmission,
     GatewayUsage,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.model_plan import model_execution_snapshot
 from exp.runtime.gateway.model_plan_test import catalog as model_catalog
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting, NativeBridgeError
