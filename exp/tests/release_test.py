@@ -34,6 +34,7 @@ if os.environ.get("EXP_INSTALLED_RELEASE_EVIDENCE") != "1":
     import pytest
     from packaging.requirements import Requirement
     from packaging.specifiers import SpecifierSet
+    from packaging.version import Version
 
 BUILT_DIST_ENV = "EXP_BUILT_DIST_DIR"
 FORBIDDEN_REQUIREMENTS = frozenset(
@@ -267,7 +268,7 @@ def _core_requirement_names(metadata: str) -> frozenset[str]:
 
 
 def _assert_core_requirements(metadata: str) -> None:
-    """Check SDK requirements, the HTTPX2 security floor and Python-gated Capture."""
+    """Check SDK requirements, exact pins, the HTTPX2 security floor and Python-gated Capture."""
     _assert_allowed_requirements(metadata)
     requirements: dict[str, str] = {}
     for name, marker in _metadata_requirements(metadata):
@@ -282,9 +283,22 @@ def _assert_core_requirements(metadata: str) -> None:
     headers = Parser().parsestr(metadata, headersonly=True)
     for value in headers.get_all("Requires-Dist", []):
         requirement = Requirement(re.sub(r"\s+", " ", value))
-        if requirement.name.casefold() == "httpx2" and requirement.marker is None:
-            assert requirement.specifier == SpecifierSet(">=2.12,<3"), (
-                f"unexpected HTTPX2 security constraint: {requirement.specifier}"
+        name = requirement.name.casefold()
+        if name not in requirements:
+            continue
+        if name == "openai":
+            # Callers' own code imports the SDK, so it alone stays a certified range.
+            assert requirement.specifier == SpecifierSet(">=3.0,<4"), (
+                f"unexpected OpenAI SDK range: {requirement.specifier}"
+            )
+            continue
+        specifiers = list(requirement.specifier)
+        assert len(specifiers) == 1 and specifiers[0].operator == "==", (
+            f"core requirement is not an exact pin: {value}"
+        )
+        if name == "httpx2":
+            assert Version(specifiers[0].version) >= Version("2.12"), (
+                f"HTTPX2 pin is below its security floor: {requirement.specifier}"
             )
 
 
