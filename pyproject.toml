@@ -10,6 +10,7 @@ dependencies = [
     # because `exp.common.core.locks` imports it and Unix-only `fcntl` is not a portable boundary.
     "exp-gateway-native>=0.3.167,<0.4",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
     "filelock>=3.12",
+    "jsonschema>=4.23,<5",  # Validate induced local-only tool and state contracts.
     "ijson>=3.4,<4",  # incremental parsing of local trace archives
     "typer>=0.16",
     "click>=8.2",  # pins no_args_is_help semantics: help + usage-error exit 2 (<8.2 exited 0)
@@ -45,6 +46,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+prompt-optimization = ["gepa>=0.1.4,<0.2"]
 # Persisted supervised fine-tuning uses the native Tinker SDK and cookbook renderer surface.
 sft = ["tinker>=0.23,<0.24", "tinker-cookbook>=0.4.3,<0.5"]
 dev = [
@@ -58,6 +60,7 @@ dev = [
     "packaging>=24",  # Compare Cargo SemVer and Python prerelease versions in release guards.
     "ty>=0.0.1a1",
     "experiential[sft]",
+    "experiential[prompt-optimization]",
     # Builds the optional Rust gateway data-plane extension (exp_gateway_native).
     "maturin>=1.7,<2",
     # WebSocket client for the Responses-over-WebSocket gateway e2e tests.
@@ -70,6 +73,9 @@ exp = "exp.cli:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["exp"]

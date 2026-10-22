@@ -6,6 +6,10 @@ import typer
 
 from exp.cli.shared.options import ROOT_OPTION
 
+FIDELITY_OPTION = typer.Option(
+    None, "--fidelity", help="Evaluate a pinned simulation-fidelity workload."
+)
+
 
 def evaluate(
     project: str | None = typer.Argument(None, metavar="PROJECT"),
@@ -30,6 +34,7 @@ def evaluate(
     ),
     yes: bool = typer.Option(False, "--yes", "-y"),
     non_interactive: bool = typer.Option(False, "--non-interactive"),
+    fidelity: Path | None = FIDELITY_OPTION,
 ) -> None:
     """Evaluate models against a project's simulated scenarios and configured judge.
 
@@ -46,7 +51,32 @@ def evaluate(
         dry_run: Stop before credentials and provider calls.
         yes: Confirm the quote, including any budget warning.
         non_interactive: Disable terminal questions.
+        fidelity: Explicit reconstruction workload, separate from worker-model evaluation.
     """
+    if fidelity is not None:
+        if (
+            project is None
+            or resume is not None
+            or report is not None
+            or any(
+                value is not None
+                for value in (models, repeats, concurrency, maximum_steps, maximum_output_tokens)
+            )
+        ):
+            raise typer.BadParameter(
+                "--fidelity requires PROJECT and cannot combine with worker-evaluation options"
+            )
+        from exp.cli.evaluation.fidelity import run_fidelity
+
+        run_fidelity(
+            project,
+            fidelity,
+            root=root,
+            yes=yes,
+            non_interactive=non_interactive,
+            dry_run=dry_run,
+        )
+        return
     # Defer the application graph at command dispatch, keeping config/help independent.
     from exp.cli.evaluation.flow import run_evaluation
 

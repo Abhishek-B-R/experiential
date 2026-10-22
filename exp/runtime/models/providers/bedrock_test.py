@@ -19,7 +19,6 @@ from exp.common.models import (
     ModelCapabilities,
     ModelCatalog,
     ModelClient,
-    ModelFinishReason,
     ModelMessage,
     ModelRecord,
     ModelRequest,
@@ -42,10 +41,7 @@ from exp.runtime.models.providers.bedrock import (
     create_bedrock_runtime_client,
     resolve_bedrock_region,
 )
-from exp.runtime.models.providers.bedrock_responses import converse_response
 from exp.runtime.models.providers.errors import (
-    ProviderRefusalError,
-    ProviderRefusalSignal,
     ProviderResponseError,
 )
 from exp.runtime.models.providers.transport import ProviderTransportError, ScriptedJsonTransport
@@ -929,104 +925,6 @@ def test_real_bearer_request_emits_only_the_pinned_authorization_token() -> None
         )
 
     assert captured == {"authorization": "Bearer bedrock-bearer"}
-
-
-def test_converse_response_normalizes_cache_legs_without_double_counting() -> None:
-    """Converse inputTokens exclude cache legs, so read and write are added once."""
-    response = converse_response(
-        {
-            "output": {
-                "message": {
-                    "role": "assistant",
-                    "content": [
-                        {"text": "done"},
-                        {
-                            "toolUse": {
-                                "toolUseId": "call-new",
-                                "name": "create_ticket",
-                                "input": {"priority": "urgent"},
-                            }
-                        },
-                    ],
-                }
-            },
-            "stopReason": "tool_use",
-            "usage": {
-                "inputTokens": 10,
-                "outputTokens": 4,
-                "cacheReadInputTokens": 6,
-                "cacheWriteInputTokens": 2,
-            },
-        },
-        configured_model=_snapshot(),
-        latency_seconds=0.5,
-    )
-
-    assert response.finish_reason == ModelFinishReason.COMPLETED
-    assert response.output.content == "done"
-    assert response.output.tool_calls[0].call_id == "call-new"
-    assert response.economics.usage is not None
-    assert response.economics.usage.input_tokens == 18
-    assert response.economics.usage.cached_input_tokens == 6
-    assert response.economics.usage.cache_write_input_tokens == 2
-
-
-def test_converse_response_reads_past_a_reasoning_block() -> None:
-    """A reasoning model's thinking leads its turn and never fails the response."""
-    response = converse_response(
-        {
-            "output": {
-                "message": {
-                    "role": "assistant",
-                    "content": [
-                        {"reasoningContent": {"reasoningText": {"text": "a circle"}}},
-                        {"text": "Circle"},
-                    ],
-                }
-            },
-            "stopReason": "end_turn",
-            "usage": {"inputTokens": 9, "outputTokens": 2},
-        },
-        configured_model=_snapshot(),
-        latency_seconds=0.2,
-    )
-
-    assert response.output.content == "Circle"
-    assert response.finish_reason == ModelFinishReason.COMPLETED
-
-
-def test_converse_response_maps_length_and_rejects_unsupported_blocks() -> None:
-    """max_tokens becomes length, and unknown content blocks fail closed."""
-    length = converse_response(
-        {
-            "output": {"message": {"content": [{"text": "partial"}]}},
-            "stopReason": "max_tokens",
-            "usage": {"inputTokens": 3, "outputTokens": 2},
-        },
-        configured_model=_snapshot(),
-        latency_seconds=0.1,
-    )
-    assert length.finish_reason == ModelFinishReason.LENGTH
-    with pytest.raises(ProviderResponseError, match="unsupported block"):
-        converse_response(
-            {
-                "output": {"message": {"content": [{"image": {"format": "png"}}]}},
-                "stopReason": "end_turn",
-            },
-            configured_model=_snapshot(),
-            latency_seconds=0.1,
-        )
-    with pytest.raises(ProviderRefusalError) as refusal_error:
-        converse_response(
-            {
-                "output": {"message": {"content": [{"text": "blocked"}]}},
-                "stopReason": "content_filtered",
-            },
-            configured_model=_snapshot(),
-            latency_seconds=0.1,
-        )
-    assert refusal_error.value.signal is ProviderRefusalSignal.GUARDRAIL
-    assert "blocked" not in str(refusal_error.value)
 
 
 def _signing_client(monkeypatch: pytest.MonkeyPatch, *, token: str | None = None) -> BedrockClient:

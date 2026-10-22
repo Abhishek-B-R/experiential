@@ -1204,6 +1204,18 @@ def test_typed_content_parts_concatenate_text_and_reject_non_object_parts() -> N
             )
 
 
+def test_tool_argument_duplicate_keys_are_rejected_before_typed_replay() -> None:
+    """Raw arguments cannot collapse duplicates into an apparently valid cached proposal."""
+    with pytest.raises(OpenAICompatibleResponseError, match="duplicate JSON keys"):
+        parse_openai_wire_tool_call(
+            {
+                "id": "answer",
+                "function": {"name": "submit_proposal", "arguments": '{"value":1,"value":2}'},
+            },
+            0,
+        )
+
+
 @pytest.mark.parametrize("asked", [None, "url", "b64_json"])
 def test_inline_images_forces_base64_whatever_the_caller_asked(
     asked: Literal["url", "b64_json"] | None,
