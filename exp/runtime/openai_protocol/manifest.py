@@ -10,7 +10,7 @@ from exp.runtime.gateway.compatibility import (
 )
 from exp.runtime.gateway.contracts import GatewayApiSurface
 from exp.runtime.gateway.sampling_extras import SAMPLING_EXTRA_FIELDS
-from exp.runtime.openai_protocol.errors import unsupported_field
+from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 
 
 def _field(
@@ -131,14 +131,15 @@ CHAT_MANIFEST = CompatibilityManifest(
         # Audio INPUT rides ``messages`` as an ``input_audio`` content part and
         # is admitted per route; ``audio`` and ``modalities`` request audio
         # OUTPUT, which no route serves.
-        # Explicit prompt-cache boundaries: Chat callers can name cache
-        # breakpoints. No rung honors those selectors yet, so they stay
-        # refused rather than silently dropped. The ``prompt_cache_boundaries``
-        # capability records that decision for catalog metadata; implicit
-        # prefix caching is a different fact.
+        # OpenAI's prompt-cache options (``mode``, ``ttl``) and the content-block
+        # ``prompt_cache_breakpoint`` markers they govern: forwarded on OpenAI-wire
+        # rungs that carry them (OpenAI, Azure OpenAI, OpenRouter), breakpoints
+        # mapped to ephemeral ``cache_control`` on Anthropic and Bedrock, dropped
+        # with disclosure elsewhere (prompt_cache_breakpoints.py). Chat's lifetime
+        # is "30m" only; "12h" is a named 400 pointing at the Responses API.
         _field(
             "prompt_cache_options",
-            CompatibilityDisposition.UNSUPPORTED,
+            CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
             "prompt_cache_boundaries",
         ),
         # Retention only sets how long a provider keeps a cached prefix and
@@ -203,13 +204,18 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         _field("reasoning", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
         _field("top_logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
-        # Accepted only at their no-op values (the wire models enforce them):
-        # Copilot hardcodes truncation:"disabled" and
-        # prompt_cache_options:{"mode":"implicit"} on every Responses request,
-        # and both describe exactly the behavior this gateway already serves
-        # (context is never truncated; served routes cache implicitly).
+        # Accepted only at its no-op value (the wire model enforces it): Copilot
+        # hardcodes truncation:"disabled" on every Responses request, and the
+        # gateway never truncates context.
         _field("truncation", CompatibilityDisposition.SUPPORTED),
-        _field("prompt_cache_options", CompatibilityDisposition.SUPPORTED),
+        # Same handling as the Chat surface, plus the "12h" lifetime routed to
+        # rungs declaring it. Copilot's hardcoded {"mode": "implicit"} is the
+        # provider default and is never forwarded.
+        _field(
+            "prompt_cache_options",
+            CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
+            "prompt_cache_boundaries",
+        ),
         # ``include_obfuscation`` padding is never emitted, so ``false`` is
         # honored and ``true`` is disclosed as ignored
         # (``client_field_repairs.accept_responses_stream_options``).
@@ -298,6 +304,36 @@ RESPONSES_INCLUDE_PATHS_REJECTED = frozenset(
 a server-tool or stored-content surface this gateway does not retain (image
 input is served, but the gateway does not echo the caller's image back), so
 honoring the selector is impossible and accepting it would be silent."""
+
+
+def responses_include_options(include: tuple[str, ...] | None) -> tuple[bool, bool, bool]:
+    """Validate the closed ``include`` selector list.
+
+    Args:
+        include: Raw caller include paths.
+
+    Returns:
+        The encrypted-reasoning, output-text-logprobs and web-search-sources
+        selectors.
+
+    Raises:
+        OpenAIProtocolError: An include path is not supported by this gateway.
+    """
+    if include is None:
+        return False, False, False
+    for path in include:
+        if path not in RESPONSES_INCLUDE_PATHS_ACCEPTED:
+            raise invalid_field(
+                "include",
+                f"The include path {path!r} is not supported by this gateway. "
+                "Only 'reasoning.encrypted_content', 'message.output_text.logprobs' "
+                "and 'web_search_call.action.sources' are available.",
+            )
+    return (
+        "reasoning.encrypted_content" in include,
+        "message.output_text.logprobs" in include,
+        "web_search_call.action.sources" in include,
+    )
 
 
 RESPONSES_INPUT_ITEM_FIELDS_ACCEPTED: dict[str, frozenset[str]] = {

@@ -24,6 +24,12 @@ from exp.runtime.models.providers.instruction_turns import (
     fold_trailing_instruction_turns,
 )
 from exp.runtime.models.providers.openai_item_ids import openai_issued_item_id
+from exp.runtime.models.providers.prompt_cache_breakpoints import (
+    carries_breakpoints,
+    chat_breakpoints,
+    responses_breakpoints,
+)
+from exp.runtime.models.providers.prompt_cache_options import prompt_cache_options_payload
 from exp.runtime.models.providers.reasoning_compat import (
     anthropic_reasoning_effort,
     openai_reasoning_effort,
@@ -105,6 +111,7 @@ def openai_responses_stream_payload(
     sampling_requires_reasoning_none: bool = False,
     forwards_service_tier: bool = False,
     forwards_prompt_cache_key: bool = False,
+    forwards_prompt_cache_options: bool = False,
     omits_output_token_limit: bool = False,
     requests_reasoning_summary: bool = False,
     forwards_web_search_sources: bool = True,
@@ -127,6 +134,10 @@ def openai_responses_stream_payload(
             ``web_search_call.action.sources`` include selector. OpenRouter's
             Responses endpoint relays OpenAI's web search but refuses the
             selector ("Invalid Responses API request"), so it is left off there.
+        forwards_prompt_cache_options: Whether this origin carries
+            ``prompt_cache_options.mode`` and ``prompt_cache_breakpoint``. A
+            marked instruction then rides an input item, since top-level
+            ``instructions`` cannot hold a breakpoint.
 
     Returns:
         Native Responses request with storage disabled and streaming enabled.
@@ -147,6 +158,7 @@ def openai_responses_stream_payload(
     request = request.model_copy(
         update={"messages": fold_tool_result_attachments(request.messages, kinds=("document",))}
     )
+    breakpoints = forwards_prompt_cache_options and request.prompt_cache_breakpoints
     for message in request.messages:
         if message.provider_native_item is not None:
             # Codex-native input items (tool namespaces, freeform tool
@@ -164,12 +176,17 @@ def openai_responses_stream_payload(
             if message.content is None:
                 raise ProviderResponseError("instruction messages require text")
             # Leading instructions ride the instructions field; one arriving
-            # after conversation began keeps its position as an input item.
-            if items:
-                items.append({"role": message.role, "content": message.content})
+            # after conversation began, or carrying a cache breakpoint, keeps its
+            # position as an input item.
+            if items or (breakpoints and carries_breakpoints(message)):
+                item: JsonObject = {"role": message.role, "content": message.content}
+                items.append(responses_breakpoints(message, item) if breakpoints else item)
             else:
                 instructions.append(message.content)
                 instruction_roles.append(message.role)
+        elif breakpoints and message.role in {"user", "tool"}:
+            # One input item each; assistant history carries no input breakpoints.
+            items.extend(responses_breakpoints(message, item) for item in responses_items(message))
         else:
             items.extend(responses_items(message))
     if not items and instructions:
@@ -269,10 +286,15 @@ def openai_responses_stream_payload(
         # changes cache-hit cost, never semantics, so rungs that do not route
         # by it omit it structurally with no decline and no disclosure.
         payload["prompt_cache_key"] = request.provider_prompt_cache_key
-    if request.prompt_cache_ttl is not None:
-        # Admission reaches this wire with a lifetime only on a rung declaring
-        # ``supports_prompt_cache_ttl_12h``; the default "30m" is never sent.
-        payload["prompt_cache_options"] = {"ttl": request.prompt_cache_ttl}
+    # Admission reaches this wire with a lifetime only on a rung declaring
+    # ``supports_prompt_cache_ttl_12h``; the defaults ("implicit", "30m") are never sent.
+    cache_options = prompt_cache_options_payload(
+        mode=request.prompt_cache_mode,
+        ttl=request.prompt_cache_ttl,
+        forwards_options=forwards_prompt_cache_options,
+    )
+    if cache_options is not None:
+        payload["prompt_cache_options"] = cache_options
     # Native OpenAI Responses has no top-k request field. Never trust a
     # mistaken route declaration to send this extension to the API.
     del supports_top_k
@@ -323,6 +345,7 @@ def openai_compatible_stream_payload(
     forwards_service_tier: bool = False,
     forwards_prompt_cache_key: bool = False,
     forwards_cache_control: bool = False,
+    forwards_prompt_cache_options: bool = False,
     reasoning_off_via_chat_template: bool = False,
     reasoning_via_thinking_toggle: bool = False,
     reasoning_off_via_thinking_disabled: bool = False,
@@ -370,6 +393,9 @@ def openai_compatible_stream_payload(
             system message only as the very first message (the official Qwen3.6+
             template raises otherwise), so every other instruction turn is folded
             into user text; see ``fold_instruction_turns_after_the_first``.
+        forwards_prompt_cache_options: Whether this origin carries
+            ``prompt_cache_options.mode`` and ``prompt_cache_breakpoint``; caller
+            breakpoints then re-emit in that spelling instead of ``cache_control``.
 
     Returns:
         Chat Completions request that always asks the provider for terminal usage.
@@ -394,16 +420,23 @@ def openai_compatible_stream_payload(
         # The rung's template 400s on any system turn past the first; the
         # text stays where the caller put it, as user text.
         messages = fold_instruction_turns_after_the_first(messages)
+    breakpoints = forwards_prompt_cache_options and request.prompt_cache_breakpoints
     wire_messages = [
         openai_chat_message(
             message,
             reasoning_route_sha256=reasoning_route_sha256,
             reasoning_output_exposed=reasoning_output_exposed,
             deepseek_reasoning_history=deepseek_reasoning_history,
-            forwards_cache_control=forwards_cache_control,
+            # The caller's breakpoints re-emit in their own spelling below.
+            forwards_cache_control=forwards_cache_control and not breakpoints,
         )
         for message in messages
     ]
+    if breakpoints:
+        wire_messages = [
+            chat_breakpoints(message, wire)
+            for message, wire in zip(messages, wire_messages, strict=True)
+        ]
     if request.json_object_output:
         _instruct_json_object(wire_messages)
     payload: JsonObject = {
@@ -466,6 +499,12 @@ def openai_compatible_stream_payload(
     if request.provider_prompt_cache_key is not None and forwards_prompt_cache_key:
         # Cache-affinity key, matching the native Responses lane.
         payload["prompt_cache_key"] = request.provider_prompt_cache_key
+    # Chat's only lifetime is the "30m" default (decode refuses "12h").
+    cache_options = prompt_cache_options_payload(
+        mode=request.prompt_cache_mode, ttl=None, forwards_options=forwards_prompt_cache_options
+    )
+    if cache_options is not None:
+        payload["prompt_cache_options"] = cache_options
     if supports_reasoning and effective_reasoning_effort is not None:
         if reasoning_via_thinking_toggle:
             payload["thinking"] = {

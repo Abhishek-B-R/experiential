@@ -213,6 +213,32 @@ class GatewayWireProfile:
             self.dialect == "openai_compatible" and self.forwards_cache_control
         )
 
+    forwards_prompt_cache_options: bool = False
+    """Whether this rung's wire carries OpenAI's explicit prompt-caching controls.
+
+    ``prompt_cache_options.mode`` and the content-block ``prompt_cache_breakpoint``
+    markers (https://developers.openai.com/api/docs/guides/prompt-caching). True only
+    on origins that document or relay them: OpenAI's own API, Azure OpenAI and
+    OpenRouter (``prompt_cache_options.openai_prompt_cache_origin``). Every other
+    OpenAI-shaped server keeps the fields off its wire: a strict one answers an
+    unknown field with a 400.
+    """
+
+    def honors_cache_markers(self, *, openai_breakpoints: bool) -> bool:
+        """Whether this rung caches at the caller's explicit cache markers.
+
+        Args:
+            openai_breakpoints: Whether the caller marked blocks with OpenAI's
+                ``prompt_cache_breakpoint`` (``GatewayRequest.prompt_cache_breakpoints``),
+                which OpenAI-wire rungs carrying the field re-emit as such.
+
+        Returns:
+            True when the markers reach the provider in a form it caches at.
+        """
+        return self.preserves_cache_control or (
+            openai_breakpoints and self.forwards_prompt_cache_options
+        )
+
     minimum_temperature: float = 0.0
     """Smallest temperature value accepted by this provider wire."""
 

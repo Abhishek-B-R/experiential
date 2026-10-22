@@ -44,6 +44,7 @@ from exp.runtime.models.providers.errors import (
     require_object,
 )
 from exp.runtime.models.providers.openai_compatible import OpenAIEmbeddingMixin
+from exp.runtime.models.providers.prompt_cache_options import openai_prompt_cache_origin
 from exp.runtime.models.providers.reasoning_compat import (
     openai_reasoning_effort,
     require_sampling_reasoning_compatibility,
@@ -320,6 +321,10 @@ class OpenAIClient(OpenAIEmbeddingMixin):
             forwards_prompt_cache_key=True,
             # Responses prompt_cache_options.ttl (the 12-hour cache lifetime).
             forwards_prompt_cache_ttl=True,
+            # prompt_cache_options.mode and prompt_cache_breakpoint, where the
+            # origin documents or relays them (a Novita or custom Responses root
+            # does not).
+            forwards_prompt_cache_options=openai_prompt_cache_origin(self._base_url),
         )
 
     def _completion_path(self) -> str:
