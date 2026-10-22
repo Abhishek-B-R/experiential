@@ -22,6 +22,9 @@ class SimulationKnowledge(ContractModel):
         research_history: Investigations limited to the permitted source pool.
         prediction_guidance: Tunable interpretation guidance under the fixed wire protocol.
         transfer_context: Explicit prior library selection, separate from target episode count.
+        authored: Declares rules, contracts, claims, unknowns and guidance hand-written rather
+            than derived from recorded traces, so held-out evaluation accepts them without
+            source traces. Research notes and library entries always need provenance.
     """
 
     source_trace_ids: tuple[str, ...] = ()
@@ -32,6 +35,7 @@ class SimulationKnowledge(ContractModel):
     research_history: tuple[ResearchNote, ...] = ()
     prediction_guidance: str = ""
     transfer_context: JsonObject = Field(default_factory=dict)
+    authored: bool = Field(default=False, strict=True, exclude_if=not_)
 
     @property
     def identity(self) -> Sha256:

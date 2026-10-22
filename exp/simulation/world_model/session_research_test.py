@@ -1,13 +1,15 @@
 """Online feedback reaches later requests without replacing candidate state or scores."""
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from filelock import Timeout
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
+from exp.common.project import ArtifactStore, ProjectPaths
 from exp.optimize.evaluation import fidelity
 from exp.optimize.evaluation.fidelity import (
     execute_fidelity_evaluation,
@@ -16,10 +18,120 @@ from exp.optimize.evaluation.fidelity import (
 from exp.optimize.evaluation.fidelity_test import source_project, transition_reply
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
-from exp.runtime.sessions.store import SessionStore
+from exp.runtime.sessions.store import SessionBinding, SessionStore
+from exp.simulation.engines.transition import Completion
 from exp.simulation.retrieval.jev import JEVCueSelector, JEVPolicy
 from exp.simulation.retrieval.selection import AllOriginals, SelectionQuery
 from exp.simulation.world_model.session_research import OnlineResearchPolicy, SessionResearch
+
+
+def deferred_research(tmp_path: Path, complete: Completion) -> SessionResearch:
+    """Open a real durable research owner with two completed single-tool predictions."""
+    store = SessionStore(tmp_path / "sessions.sqlite")
+    store.create_session(
+        "session-a",
+        SessionBinding(
+            deadline=datetime.now(UTC) + timedelta(minutes=5),
+            target_id="fixture@1",
+            initialization_receipt_sha256="a" * 64,
+            knowledge_sha256="b" * 64,
+            corpus_sha256="c" * 64,
+            representation_sha256="d" * 64,
+            execution_policy_sha256="e" * 64,
+        ),
+        {
+            "transitions": [
+                {"operation_id": step, "actions": [{"name": "read"}], "replies": ["wrong"]}
+                for step in ("step-0", "step-1")
+            ]
+        },
+    )
+    selector = AllOriginals()
+    return SessionResearch(
+        session_id="session-a",
+        policy=OnlineResearchPolicy(
+            feedback_source="native",
+            selection_policy_sha256=selector.identity,
+            maximum_updates=1,
+            notes_reach_predictions=False,
+        ),
+        store=store,
+        artifacts=ArtifactStore(ProjectPaths(tmp_path, "research")),
+        complete=complete,
+        lock_path=tmp_path / "session.lock",
+        clock=lambda: datetime.now(UTC),
+        code_revision="fixture",
+        selection=selector,
+    )
+
+
+def investigation_reply() -> JsonObject:
+    """Return a scoped interpretation without claiming a transferable rule."""
+    return {
+        "discrepancy": "read differs",
+        "hypothesis": "state may be missing",
+        "scope": "this read",
+        "uncertainty": "hidden state is unknown",
+        "supersedes": [],
+        "transferable": False,
+        "observable_cue": "",
+    }
+
+
+@pytest.mark.parametrize("failed_first", [False, True])
+def test_deferred_budget_is_session_wide_even_after_failed_intent(
+    tmp_path: Path, failed_first: bool
+) -> None:
+    """Splitting feedback into batches cannot buy more than the registered cap."""
+    calls: list[str] = []
+
+    def complete(body: JsonObject, identity: str) -> JsonObject:
+        calls.append(identity)
+        if failed_first:
+            raise RuntimeError("provider outcome unknown")
+        return investigation_reply()
+
+    research = deferred_research(tmp_path, complete)
+    first = research.observe_all([("step-0", "observed")], "native")
+    assert isinstance(first[0], RuntimeError if failed_first else dict)
+    second = research.observe_all([("step-1", "observed")], "native")
+    assert len(calls) == 1
+    assert isinstance(second[0], dict)
+    assert second[0]["investigation"] is None
+    assert second[0]["investigation_skipped"] == "session investigation budget exhausted"
+    assert research.observe_all([("step-1", "observed")], "native") == second
+    assert len(calls) == 1
+
+
+def test_deferred_feedback_holds_session_lease_during_provider_call(tmp_path: Path) -> None:
+    """Another owner must not submit feedback or dispatch while a batch is settling."""
+    calls: list[str] = []
+
+    def complete(body: JsonObject, identity: str) -> JsonObject:
+        calls.append(identity)
+        if len(calls) == 1:
+            with pytest.raises(Timeout):
+                research.observe_all([("step-1", "observed")], "native")
+        return investigation_reply()
+
+    research = deferred_research(tmp_path, complete)
+    records = research.observe_all([("step-0", "observed")], "native")
+    assert isinstance(records[0], dict)
+    assert records[0]["investigation"] == investigation_reply()
+
+
+def test_deferred_duplicate_feedback_is_refused_before_dispatch(tmp_path: Path) -> None:
+    """One batch cannot race two writes or investigations for the same operation."""
+    calls: list[str] = []
+
+    def complete(body: JsonObject, identity: str) -> JsonObject:
+        calls.append(identity)
+        return investigation_reply()
+
+    research = deferred_research(tmp_path, complete)
+    with pytest.raises(ValueError, match="repeat"):
+        research.observe_all([("step-0", "observed"), ("step-0", "observed")], "native")
+    assert calls == []
 
 
 def structured_reply(value: JsonObject) -> JsonHttpResponse:
@@ -72,6 +184,8 @@ def test_next_turn_and_restart_preserve_feedback_without_state_rescue(
         "scope": "current entry after call-0",
         "uncertainty": "One read does not establish all entries or their update rules",
         "supersedes": [],
+        "transferable": True,
+        "observable_cue": "the same tool and arguments",
     }
     axes = {
         dimension.dimension_id: {
@@ -88,14 +202,20 @@ def test_next_turn_and_restart_preserve_feedback_without_state_rescue(
             transition_reply(
                 {
                     "observations": [{"call_id": "call-0", "reply": "wrong", "encoding": "json"}],
-                    "effect": {"kind": "replace", "state": {"seen": 1}},
+                    "effect": {
+                        "kind": "edits",
+                        "edits": [{"op": "set", "path": ["seen"], "value": 1}],
+                    },
                 }
             ),
             *([structured_reply(investigation)] if generate_hypotheses else []),
             transition_reply(
                 {
                     "observations": [{"call_id": "call-1", "reply": "reply-1", "encoding": "json"}],
-                    "effect": {"kind": "replace", "state": {"seen": 2}},
+                    "effect": {
+                        "kind": "edits",
+                        "edits": [{"op": "set", "path": ["seen"], "value": 2}],
+                    },
                 }
             ),
             structured_reply({"axes": axes}),
@@ -213,7 +333,10 @@ def test_failed_investigation_retains_wrong_step_and_blocks_unqualified_suffix(
             transition_reply(
                 {
                     "observations": [{"call_id": "call-0", "reply": "wrong", "encoding": "json"}],
-                    "effect": {"kind": "replace", "state": {"seen": 1}},
+                    "effect": {
+                        "kind": "edits",
+                        "edits": [{"op": "set", "path": ["seen"], "value": 1}],
+                    },
                 }
             ),
             structured_reply(
@@ -223,6 +346,8 @@ def test_failed_investigation_retains_wrong_step_and_blocks_unqualified_suffix(
                     "scope": "Current entry",
                     "uncertainty": "Only one read observed",
                     "supersedes": ["nonexistent-investigation"],
+                    "transferable": True,
+                    "observable_cue": "the same tool and arguments",
                 }
             ),
             structured_reply({"axes": {}}),

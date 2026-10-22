@@ -13,8 +13,8 @@ from exp.optimize.evaluation.fidelity import (
     PreparedFidelity,
     execute_fidelity_evaluation,
     prepare_fidelity_evaluation,
-    saved_memory_receipt,
 )
+from exp.optimize.evaluation.fidelity_memory import saved_memory_receipt
 from exp.optimize.evaluation.tests.fidelity_memory_test import (
     RoutedTransport,
     judged,
@@ -46,7 +46,7 @@ def test_saved_cli_replay_finishes_memory_publication(
         raise RuntimeError("publication interrupted")
 
     with monkeypatch.context() as patch:
-        patch.setattr(fidelity, "_consume_trajectory", interrupted)
+        patch.setattr(fidelity, "consume_trajectory", interrupted)
         with pytest.raises(RuntimeError, match="publication interrupted"):
             execute_fidelity_evaluation(project, prepared)
     assert saved_memory_receipt(project, prepared) is None

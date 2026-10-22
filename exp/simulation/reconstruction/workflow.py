@@ -247,19 +247,25 @@ def _call(
     code_revision: str,
     prompt_name: str | None = None,
     original_inputs: JsonObject | None = None,
+    guidance: str = "",
 ) -> tuple[JsonObject, str]:
-    """Persist an exclusive intent and raw response; failures never automatically retry."""
+    """Persist an exclusive intent and raw response; failures never automatically retry.
+
+    Registered constructor ``guidance`` is rendered into the request before the intent is
+    saved, so the saved request is exactly the one dispatched.
+    """
     if deadline.tzinfo is None or clock() >= deadline:
         raise ValueError("An unexpired aware deadline is required before dispatch")
     identity = stable_id("reconstruction", {"run_id": run_id, "phase": phase})
     prompt = (
         files("exp.simulation.reconstruction")
         .joinpath("prompts", (prompt_name or phase) + ".txt")
-        .read_text()
+        .read_text(encoding="utf-8")
     )
     request: JsonObject = {
         "messages": [
             {"role": "system", "content": prompt},
+            *([{"role": "developer", "content": guidance}] if guidance else []),
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, allow_nan=False)},
         ]
     }
@@ -373,6 +379,7 @@ def reconstruct(
     clock: Callable[[], datetime],
     deadline: datetime,
     code_revision: str,
+    guidance: str = "",
 ) -> ReconstructionBundle:
     """Propose an initial interface and dynamics from raw public inputs, without a parent.
 
@@ -381,7 +388,8 @@ def reconstruct(
     layout before a separate behavioral call. Each response is retained unchanged and
     bound to the admitted bundle. Optional layout format repair allows one separately
     recorded correction of schema errors, never a retry based on native scores. Neither
-    strategy claims native correctness.
+    strategy claims native correctness. Registered ``guidance`` is part of every saved
+    request.
     """
     if citation_protocol not in ("pointers", "indexed"):
         raise ValueError("Unsupported citation protocol")
@@ -439,6 +447,7 @@ def reconstruct(
             clock=clock,
             deadline=deadline,
             code_revision=code_revision,
+            guidance=guidance,
         )
         assert supplied_tools is not None
         stages.append(stage)
@@ -464,6 +473,7 @@ def reconstruct(
                 clock=clock,
                 deadline=deadline,
                 code_revision=code_revision,
+                guidance=guidance,
             )
             stages.append(stage)
             layout = _StateLayout.model_validate(response)
@@ -507,6 +517,7 @@ def reconstruct(
         clock=clock,
         deadline=deadline,
         code_revision=code_revision,
+        guidance=guidance,
     )
     if layout is not None:
         behavior = (

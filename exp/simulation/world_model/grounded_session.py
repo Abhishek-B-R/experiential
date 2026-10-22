@@ -1,12 +1,12 @@
 """Run the existing grounded predictor through the shared durable commit owner."""
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from exp.common.core.artifacts import JsonObject, Sha256, sha256_json
+from exp.common.core.artifacts import ArtifactInput, JsonObject, Sha256, sha256_json
 from exp.common.core.json_schema import expand_local_references
 from exp.common.models import (
     AssistantAction,
@@ -22,11 +22,12 @@ from exp.common.tasks import TaskCase, ToolSchema
 from exp.runtime.environments import Observation
 from exp.runtime.sessions.store import SessionBinding, SessionStore
 from exp.simulation.engines.text.prompt import (
-    RECONSTRUCTED_JSON_TOOL_SYSTEM_PROMPT,
+    MemoryContext,
     parse_world_model_transition,
     validate_transition_action,
 )
 from exp.simulation.engines.transition import (
+    ApplyEdits,
     Completion,
     PreparedPrediction,
     ProposedObservation,
@@ -34,8 +35,11 @@ from exp.simulation.engines.transition import (
     ReplaceState,
     TransitionEngine,
 )
+from exp.simulation.retrieval import load_rag_index
+from exp.simulation.retrieval.contracts import RAGTransition
 from exp.simulation.retrieval.selection import EvidencePolicy
 from exp.simulation.world_model.durable import DurableWorldModelSession, SessionPolicy
+from exp.simulation.world_model.experience_memory import retrieved_source
 from exp.simulation.world_model.runtime import GroundedWorldModel
 from exp.simulation.world_model.session_research import (
     OnlineResearchPolicy,
@@ -45,14 +49,16 @@ from exp.simulation.world_model.session_research import (
 
 
 class _GroundedJsonProposal(ProposedTransition):
-    """Typed observations using the grounded engine's existing replacement semantics.
+    """Typed observations plus compact edits to the candidate state.
 
     Attributes:
-        effect: Complete model-authored replacement, excluding compact edits.
+        effect: Ordered set/delete/append/remove_value edits to the current candidate state.
+            Re-writing the complete state every turn dominated output tokens; an edit that does
+            not apply is refused and asked again like any invalid proposal.
         terminal: Tool observations cannot terminate the actor before delivery.
     """
 
-    effect: ReplaceState
+    effect: ApplyEdits
     terminal: Literal[False] = False
 
 
@@ -71,16 +77,10 @@ def frame_grounded_output(
     if output_protocol == "json-tool":
         framed = framed.model_copy(
             update={
-                "messages": (
-                    framed.messages[0].model_copy(
-                        update={"content": RECONSTRUCTED_JSON_TOOL_SYSTEM_PROMPT}
-                    ),
-                    *framed.messages[1:],
-                ),
                 "tools": (
                     ToolSchema(
                         name="submit_transition",
-                        description="Submit observations and the complete candidate state.",
+                        description="Submit observations and edits to the candidate state.",
                         input_schema=expand_local_references(
                             _GroundedJsonProposal.model_json_schema()
                         ),
@@ -147,14 +147,23 @@ class GroundedTransitionEngine:
                 "output_tokens": self.maximum_output_tokens,
                 "json_object_output": self.json_object_output,
                 "output_protocol": self.output_protocol,
-                "protocol": "grounded-typed-response-v2",
+                "protocol": "grounded-typed-response-v3",
             }
         )
 
     def prepare(
-        self, state: JsonObject, history: tuple[JsonObject, ...], actions: tuple[ToolCall, ...]
+        self,
+        state: JsonObject,
+        history: tuple[JsonObject, ...],
+        actions: tuple[ToolCall, ...],
+        *,
+        memory: MemoryContext | None = None,
     ) -> PreparedPrediction:
-        """Frame and pack the original typed request before physical dispatch."""
+        """Render the typed context once, pack it, and frame the output protocol.
+
+        Memory enters as typed channels before rendering, so packing and capacity admission
+        see the complete request and no caller edits serialized prompt text.
+        """
         names = {tool.name for tool in self.task.tools}
         if not actions or any(action.name not in names for action in actions):
             raise ValueError("declare every supplied action in the public task tools")
@@ -185,6 +194,8 @@ class GroundedTransitionEngine:
             excluded_lineage_ids=(self.task.lineage_group_id,),
             maximum_output_tokens=self.maximum_output_tokens,
             state=state,
+            memory=memory,
+            output_protocol=self.output_protocol,
         ).fit_context(self.runtime.capabilities, self.runtime.token_counter)
         framed = frame_grounded_output(
             prepared.request,
@@ -262,6 +273,12 @@ def open_grounded_session(
     research_selection: EvidencePolicy | None = None,
     research_prior: Mapping[str, JsonObject] | None = None,
     research_prior_identity: JsonObject | None = None,
+    research_overview: Sequence[JsonObject] = (),
+    research_prior_sources: Mapping[str, Sequence[ArtifactInput]] | None = None,
+    research_overview_sources: Sequence[ArtifactInput] = (),
+    research_overview_view: Callable[[frozenset[str]], list[JsonObject]] | None = None,
+    research_overview_sources_of: Callable[[Sequence[JsonObject]], Sequence[ArtifactInput]]
+    | None = None,
 ) -> DurableWorldModelSession:
     """Open one candidate world using public context and the existing guarded store.
 
@@ -284,6 +301,11 @@ def open_grounded_session(
         research_selection: Exact registered query-dependent selector for session notes.
         research_prior: Active research from a frozen memory version of earlier trajectories.
         research_prior_identity: Memory version identity, required with prior research.
+        research_overview: Budgeted memory overview delivered with every prediction.
+        research_prior_sources: Source trajectories behind each prior record.
+        research_overview_sources: Source trajectories behind the overview rows.
+        research_overview_view: Re-renders the overview minus this session's retired notes.
+        research_overview_sources_of: Resolves sources behind each delivered overview.
 
     Returns:
         Durable session; no reference state or tool outcomes are used to initialize it.
@@ -304,6 +326,28 @@ def open_grounded_session(
     )
     research = None
     if research_selection is not None:
+        index: dict[str, RAGTransition] = {}
+
+        def retrieved_sources_of(ids: Sequence[str]) -> tuple[ArtifactInput, ...]:
+            """Typed sources for the recorded traces behind retrieved transitions."""
+            if not index:
+                rag = load_rag_index(artifacts, runtime.artifact.serving_rag.artifact_id)
+                index.update((row.transition_id, row) for row in rag.transitions)
+            missing = [key for key in ids if key not in index]
+            if missing:
+                raise ValueError("retrieved transition is absent from the simulator's index")
+            rows = sorted({(index[key].trace_id, index[key].lineage_id) for key in ids})
+            return tuple(
+                retrieved_source(
+                    artifacts,
+                    trace_id=trace,
+                    task_lineage=lineage,
+                    created_at=(clock or (lambda: datetime.now(UTC)))(),
+                    code_revision=policy.code_revision,
+                )
+                for trace, lineage in rows
+            )
+
         research = SessionResearch(
             selection=research_selection,
             session_id=session_id,
@@ -316,6 +360,12 @@ def open_grounded_session(
             code_revision=policy.code_revision,
             prior=research_prior,
             prior_identity=research_prior_identity,
+            overview=research_overview,
+            prior_sources=research_prior_sources,
+            overview_sources=research_overview_sources,
+            overview_view=research_overview_view,
+            overview_sources_of=research_overview_sources_of,
+            retrieved_sources_of=retrieved_sources_of,
         )
         engine = ResearchTransitionEngine(engine, research)
     binding = SessionBinding(

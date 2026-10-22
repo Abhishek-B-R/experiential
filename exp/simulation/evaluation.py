@@ -18,8 +18,11 @@ from exp.common.evaluations.reconstruction import (
 )
 from exp.common.models import ToolCall
 from exp.common.models.client import RequestCapacityExceeded
+from exp.common.progress import ProgressHook, report
 from exp.common.project import ArtifactStore
 from exp.runtime.models.budget import SpendLimitReached
+from exp.runtime.models.providers.transport import ProviderTransportError
+from exp.runtime.models.structured_completion import CompletionNotDispatched
 from exp.simulation.engines.transition import Completion
 from exp.simulation.world_model.durable import DurableWorldModelSession
 
@@ -50,11 +53,19 @@ def evaluate_workflow(
     code_revision: str,
     evaluation_id: ArtifactId | None = None,
     reply_feedback_source: str | None = None,
+    progress: ProgressHook | None = None,
+    feedback_after_predictions: bool = False,
 ) -> DualReport:
     """Run without native rescue; retain blocked slots and a separate receipt identity.
 
+    With ``feedback_after_predictions`` (pinned memory delivery), every step is predicted
+    first and replies are disclosed and investigated only afterwards, together, so a failed
+    investigation never prevents a prediction.
+
     Matched parent/child evaluations share a public workload ID but must use distinct
-    evaluation IDs for their immutable request and result artifacts.
+    evaluation IDs for their immutable request and result artifacts. ``progress`` observes
+    each simulated turn as an exact completed/total count; after a hard stop it reports
+    the turns actually simulated, qualified as stopped, never the blocked remainder.
     """
     if session.transitions:
         raise ValueError("a scored workflow requires a fresh initialized session")
@@ -82,6 +93,8 @@ def evaluate_workflow(
     feedback_receipts: list[JsonObject] = []
     feedback_error: str | None = None
     for index, action in enumerate(workload.actions):
+        if not stopped:
+            report(progress, "Simulating turns", completed=index, total=len(workload.actions))
         before = session.state
         if stopped:
             steps.append(WorkflowStep(step=index, action=actions[index], status="blocked"))
@@ -100,6 +113,10 @@ def evaluate_workflow(
                     error_type="budget_exhausted",
                 )
             )
+        except (ProviderTransportError, CompletionNotDispatched):
+            # Infrastructure, not simulator behavior: no result is saved, so the run stays
+            # incomplete (shown, exit non-zero) instead of scoring the rest as misses.
+            raise
         except Exception as error:  # noqa: BLE001 - execution failures retain planned suffixes.
             stopped = True
             steps.append(
@@ -127,7 +144,7 @@ def evaluate_workflow(
                     after=session.state,
                 )
             )
-            if reply_feedback_source is not None:
+            if reply_feedback_source is not None and not feedback_after_predictions:
                 try:
                     feedback_receipts.append(
                         session.observe_reply_feedback(
@@ -139,6 +156,28 @@ def evaluate_workflow(
                 except Exception as error:  # noqa: BLE001 - failed adaptation blocks future slots.
                     feedback_error = type(error).__name__
                     stopped = True
+    if reply_feedback_source is not None and feedback_after_predictions and not stopped:
+        # Whole-trace boundary: every step is predicted before any reply is disclosed, so an
+        # investigation can never decide which predictions exist.
+        report(progress, "Investigating misses")
+        settled = session.observe_all_reply_feedback(
+            [
+                (action.call_id, references.steps[i].reply)
+                for i, action in enumerate(workload.actions)
+            ],
+            source=reply_feedback_source,
+        )
+        feedback_receipts = [row for row in settled if not isinstance(row, Exception)]
+        failures = [row for row in settled if isinstance(row, Exception)]
+        feedback_error = type(failures[0]).__name__ if failures else None
+    simulated = sum(step.status != "blocked" for step in steps)
+    report(
+        progress,
+        "Simulating turns",
+        completed=simulated,
+        total=len(workload.actions),
+        detail="stopped" if simulated < len(workload.actions) else None,
+    )
     context = session.evaluation_context
     if reply_feedback_source is not None:
         sources = context.get("sources", {})

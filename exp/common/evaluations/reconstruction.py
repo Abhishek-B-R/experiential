@@ -4,8 +4,9 @@ import copy
 import json
 from collections.abc import Callable
 from datetime import datetime
+from operator import not_
 from pathlib import Path
-from typing import Literal, Self
+from typing import Annotated, Literal, Self
 
 from filelock import FileLock
 from pydantic import Field, model_validator
@@ -165,7 +166,9 @@ class JudgeConfig(ContractModel):
         model_identity: Registered judge model identity.
         calibration: Provisional until independently validated.
         protocol: Versioned ordered-list or code-owned keyed criterion envelope.
-        mechanical_feedback: Explicitly expose blinded exact-check summaries to the judge."""
+        mechanical_feedback: Explicitly expose blinded exact-check summaries to the judge.
+        per_turn: The same single judge call also scores every criterion for each step.
+            Omitted when off, so earlier configurations keep their identity."""
 
     definition: JudgeDefinition
     prompt: str = Field(min_length=1)
@@ -173,6 +176,7 @@ class JudgeConfig(ContractModel):
     calibration: Literal["provisional"] = "provisional"
     protocol: Literal["ordered-v1", "keyed-v2", "keyed-v3"] = "ordered-v1"
     mechanical_feedback: bool = Field(default=False, strict=True)
+    per_turn: bool = Field(default=False, strict=True, exclude_if=not_)
 
     @model_validator(mode="after")
     def rubric(self) -> Self:
@@ -229,6 +233,51 @@ class JudgeOutput(ContractModel):
     axes: tuple[JudgeAxis, ...] = Field(min_length=5, max_length=5)
 
 
+class TurnJudgement(ContractModel):
+    """Model-owned rubric scores for one step, judged on that step alone.
+
+    Attributes:
+        scores: Every registered criterion, as an integer 1-5 or null when that step
+            cannot be judged on it.
+        rationale: One short explanation of the step's scores."""
+
+    scores: dict[str, Annotated[int, Field(strict=True, ge=1, le=5)] | None]
+    rationale: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def bounded(self) -> Self:
+        """Require a nonblank explanation; scores are strict integers 1-5 by type."""
+        if not self.rationale.strip():
+            raise ValueError("Nonblank explanation required")
+        return self
+
+
+class TurnOutcome(ContractModel):
+    """Per-step measurements: deterministic reply-field agreement and optional judge scores.
+
+    Attributes:
+        step: Planned slot index.
+        fields_matched: Reply leaf fields equal to the recorded reply, when one is recorded.
+        fields_total: Union of leaf fields in both replies. A step that produced no reply
+            (failed or blocked) reproduces none of the recorded leaves. Absent only when no
+            recorded reply exists. Divergence is ``1 - matched / total``.
+        scores: Per-criterion judge scores for this step, empty unless judged per turn.
+        rationale: Judge explanation for this step, when judged."""
+
+    step: int = Field(ge=0, strict=True)
+    fields_matched: int | None = Field(default=None, ge=0, strict=True)
+    fields_total: int | None = Field(default=None, ge=1, strict=True)
+    scores: dict[str, int | None] = Field(default_factory=dict)
+    rationale: str | None = None
+
+    @property
+    def divergence(self) -> float | None:
+        """Share of reply leaf fields that differ from the recorded reply."""
+        if self.fields_matched is None or self.fields_total is None:
+            return None
+        return 1 - self.fields_matched / self.fields_total
+
+
 class DualReport(ContractModel):
     """Independent mechanical truth and a mandatory, explicit judge outcome.
 
@@ -242,7 +291,8 @@ class DualReport(ContractModel):
         judge_status: Completed, failed, or not dispatched.
         judge_failure: Explicit unavailable/failure explanation.
         axes: All five scores or all explicit unavailable outcomes.
-        mechanical: Independent exactness, continuity and availability measures."""
+        mechanical: Independent exactness, continuity and availability measures.
+        turns: One outcome per planned step; absent on reports written before turns."""
 
     workflow_id: str
     knowledge_sha256: Sha256 | None = None
@@ -254,12 +304,15 @@ class DualReport(ContractModel):
     judge_failure: str | None = None
     axes: tuple[AxisOutcome, ...]
     mechanical: JsonObject
+    turns: tuple[TurnOutcome, ...] = Field(default=(), exclude_if=not_)
 
     @model_validator(mode="after")
     def judge_inventory(self) -> Self:
         """Validate the declared evaluation inventory and unavailable outcomes."""
         if len(self.axes) != 5 or len({a.dimension_id for a in self.axes}) != 5:
             raise ValueError("Every dual report requires five distinct judge outcomes")
+        if self.turns and tuple(t.step for t in self.turns) != tuple(range(self.planned_steps)):
+            raise ValueError("Per-turn outcomes must cover every planned step in order")
         if self.judge_status == "completed" and any(
             a.status not in ("assessed", "unassessable") for a in self.axes
         ):
@@ -284,10 +337,12 @@ def default_judge(
 ) -> JudgeConfig:
     """Return separately versioned behavioral or comparison-style provisional criteria."""
     assets = Path(__file__).with_name("reconstruction_prompts")
-    definition = JudgeDefinition.model_validate_json((assets / (rubric + ".json")).read_text())
+    definition = JudgeDefinition.model_validate_json(
+        (assets / (rubric + ".json")).read_text(encoding="utf-8")
+    )
     prompt = (
         assets / ("judge-keyed.txt" if protocol in ("keyed-v2", "keyed-v3") else "judge.txt")
-    ).read_text()
+    ).read_text(encoding="utf-8")
     if protocol == "keyed-v3":
         prompt += (
             "\nProtocol keyed-v3: Every criterion must explicitly include score. "
@@ -302,8 +357,49 @@ def default_judge(
     )
 
 
-def judge_wire_schema(config: JudgeConfig) -> JsonObject:
-    """Derive the ordered wire inventory from the registered rubric, not a second list."""
+def judge_wire_schema(config: JudgeConfig, steps: int = 0) -> JsonObject:
+    """Derive the ordered wire inventory from the registered rubric, not a second list.
+
+    A per-turn configuration also requires ``turns``, keyed ``step-N`` for each of the
+    ``steps`` planned steps, with every criterion scored 1-5 or null for that step.
+    """
+    schema = _axes_wire_schema(config)
+    if config.per_turn and steps:
+        score: JsonObject = {
+            "anyOf": [{"type": "integer", "minimum": 1, "maximum": 5}, {"type": "null"}]
+        }
+        ids = [d.dimension_id for d in config.definition.dimensions]
+        turn: JsonObject = {
+            "type": "object",
+            "properties": {
+                "scores": {
+                    "type": "object",
+                    "properties": {key: copy.deepcopy(score) for key in ids},
+                    "required": ids,
+                    "additionalProperties": False,
+                },
+                "rationale": {"type": "string", "minLength": 1},
+            },
+            "required": ["scores", "rationale"],
+            "additionalProperties": False,
+        }
+        keys = [f"step-{index}" for index in range(steps)]
+        properties = schema["properties"]
+        required = schema.get("required", [])
+        if not isinstance(properties, dict) or not isinstance(required, list):
+            raise ValueError("judge wire schema lacks an object envelope")
+        properties["turns"] = {
+            "type": "object",
+            "properties": {key: copy.deepcopy(turn) for key in keys},
+            "required": list(keys),
+            "additionalProperties": False,
+        }
+        schema["required"] = [*required, "turns"]
+    return schema
+
+
+def _axes_wire_schema(config: JudgeConfig) -> JsonObject:
+    """Whole-workflow criterion envelope for the configured protocol."""
     schema = JudgeOutput.model_json_schema()
     axis_schema = schema["$defs"]["JudgeAxis"]
     if config.protocol in ("keyed-v2", "keyed-v3"):
@@ -483,6 +579,154 @@ def mechanical_checks(evidence: WorkflowEvidence, references: EvaluationReferenc
     }
 
 
+def reply_fields(actual: JsonValue, expected: JsonValue) -> tuple[int, int]:
+    """Count matching leaf fields of two replies, over the union of their leaf paths.
+
+    A leaf is a scalar, null or empty container, keyed by its path; a path present on only
+    one side is a mismatch, and leaves compare with ``strict_equal``.
+    """
+    paths = _leaves(actual).keys() | _leaves(expected).keys()
+    return len(paths) - len(field_differences(actual, expected)), len(paths)
+
+
+def field_differences(actual: JsonValue, expected: JsonValue) -> list[JsonObject]:
+    """List each divergent leaf, sorted by path with list indices in numeric order.
+
+    A side that lacks the leaf is flagged missing; when that side holds a non-empty container
+    at the same path instead, its value is that container, so a reply is never shown as absent
+    merely because it has more structure there.
+    """
+    left, right = _leaves(actual), _leaves(expected)
+    rows: list[JsonObject] = []
+    for path in sorted(left.keys() | right.keys(), key=_path_order):
+        if path in left and path in right and strict_equal(left[path], right[path]):
+            continue
+        actual_found, actual_value = _value_at(actual, path)
+        expected_found, expected_value = _value_at(expected, path)
+        rows.append(
+            {
+                "path": render_path(path),
+                "actual": actual_value,
+                "expected": expected_value,
+                "actual_missing": not actual_found,
+                "expected_missing": not expected_found,
+            }
+        )
+    return rows
+
+
+def render_path(path: tuple[str | int, ...]) -> str:
+    """Unambiguous path text: identifier keys dotted, other keys quoted, indices bracketed."""
+    parts = []
+    for part in path:
+        if isinstance(part, int):
+            parts.append(f"[{part}]")
+        elif part.isidentifier():
+            parts.append(("." if parts else "") + part)
+        else:
+            parts.append(f"[{json.dumps(part, ensure_ascii=False)}]")
+    return "".join(parts)
+
+
+def _path_order(path: tuple[str | int, ...]) -> tuple[tuple[int, int, str], ...]:
+    """Sort key: list indices numerically, keys by text."""
+    return tuple((0, part, "") if isinstance(part, int) else (1, 0, part) for part in path)
+
+
+def _value_at(value: JsonValue, path: tuple[str | int, ...]) -> tuple[bool, JsonValue]:
+    """The value at a leaf path, and whether the path exists."""
+    for part in path:
+        if isinstance(part, int) and isinstance(value, list) and part < len(value):
+            value = value[part]
+        elif isinstance(part, str) and isinstance(value, dict) and part in value:
+            value = value[part]
+        else:
+            return False, None
+    return True, value
+
+
+def _leaves(
+    value: JsonValue, path: tuple[str | int, ...] = ()
+) -> dict[tuple[str | int, ...], JsonValue]:
+    """Map every leaf path of a JSON value to its leaf."""
+    if isinstance(value, dict) and value:
+        return {k: v for key, item in value.items() for k, v in _leaves(item, (*path, key)).items()}
+    if isinstance(value, list) and value:
+        return {k: v for i, item in enumerate(value) for k, v in _leaves(item, (*path, i)).items()}
+    return {path: value}
+
+
+def turn_outcomes(
+    evidence: WorkflowEvidence,
+    references: EvaluationReferences,
+    judged: dict[str, TurnJudgement] | None = None,
+) -> tuple[TurnOutcome, ...]:
+    """Per-step reply-field agreement, with the judge's per-step scores when supplied.
+
+    A step with a recorded reply but no simulated one (failed or blocked) matches none of the
+    recorded leaves, so it counts as divergent rather than as not comparable.
+    """
+    rows: list[TurnOutcome] = []
+    for step in evidence.steps:
+        reference = references.steps[step.step] if references.steps else None
+        matched: int | None = None
+        total: int | None = None
+        if reference is not None and reference.reply_available:
+            if step.status == "valid":
+                matched, total = reply_fields(step.reply, reference.reply)
+            else:
+                matched, total = 0, len(_leaves(reference.reply))
+        judgement = (judged or {}).get(f"step-{step.step}")
+        rows.append(
+            TurnOutcome(
+                step=step.step,
+                fields_matched=matched,
+                fields_total=total,
+                scores=dict(judgement.scores) if judgement else {},
+                rationale=judgement.rationale if judgement else None,
+            )
+        )
+    return tuple(rows)
+
+
+def saved_turn_outcomes(
+    artifacts: ArtifactStore, artifact_id: str, report: DualReport
+) -> tuple[TurnOutcome, ...] | None:
+    """Per-step outcomes of a saved evaluation, recomputed from its exact saved inputs.
+
+    Field agreement always follows the current deterministic definition, so reports written
+    under an earlier one read the same; judge scores are taken from the report as saved.
+
+    Args:
+        artifacts: Store holding the evaluation intent.
+        artifact_id: The evaluation's report artifact identity.
+        report: The saved report.
+
+    Returns:
+        One outcome per planned step, or None when the evaluation inputs are not saved.
+    """
+    intent = artifact_id + "-intent"
+    if not artifacts.exists(intent):
+        return None
+    evidence = WorkflowEvidence.model_validate_json(artifacts.read_bytes(intent, "evidence.json"))
+    references = EvaluationReferences.model_validate_json(
+        artifacts.read_bytes(intent, "references.json")
+    )
+    judged = {
+        f"step-{turn.step}": TurnJudgement(scores=turn.scores, rationale=turn.rationale)
+        for turn in report.turns
+        if turn.scores and turn.rationale
+    }
+    return turn_outcomes(evidence, references, judged)
+
+
+_PER_TURN = (
+    "Also score each step on its own under turns.step-N: give every criterion an integer "
+    "1-5 for that step alone, or null when that step gives no basis for it, and one short "
+    "rationale. Per-step scores never change the whole-workflow axes."
+)
+
+
 class JudgeNotRun(RuntimeError):
     """The registered judge was not dispatched, for example because budget was exhausted."""
 
@@ -521,24 +765,21 @@ def _evaluate_locked(
         | {f"source-{i}" for i in range(len(evidence.sources))}
         | {f"check-{i}" for i in range(len(references.independent_checks))}
     )
+    wire = judge_wire_schema(judge, len(evidence.steps))
+    content: JsonObject = {
+        "rubric": judge.definition.model_dump(mode="json"),
+        "required_dimension_order": [d.dimension_id for d in judge.definition.dimensions],
+        "output_schema": wire,
+        "allowed_evidence_refs": sorted(allowed),
+        "workflow": public,
+    }
+    if judge.per_turn:
+        content["per_turn_instructions"] = _PER_TURN
     body: JsonObject = {
-        "response_schema": judge_wire_schema(judge),
+        "response_schema": wire,
         "messages": [
             {"role": "system", "content": judge.prompt},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "rubric": judge.definition.model_dump(mode="json"),
-                        "required_dimension_order": [
-                            d.dimension_id for d in judge.definition.dimensions
-                        ],
-                        "output_schema": judge_wire_schema(judge),
-                        "allowed_evidence_refs": sorted(allowed),
-                        "workflow": public,
-                    }
-                ),
-            },
+            {"role": "user", "content": json.dumps(content)},
         ],
     }
     envelope = ArtifactEnvelope(
@@ -570,6 +811,7 @@ def _evaluate_locked(
         )
     status: Literal["completed", "failed", "unknown", "not_run"] = "completed"
     failure = None
+    judged: dict[str, TurnJudgement] | None = None
     try:
         if artifacts.exists(artifact_id + "-response"):
             raw = json.loads(artifacts.read_bytes(artifact_id + "-response", "response.json"))
@@ -585,6 +827,9 @@ def _evaluate_locked(
                 envelope=envelope,
                 files={"response.json": raw},
             )
+        if judge.per_turn:
+            judged = _turn_judgements(raw, judge, len(evidence.steps))
+            raw = {key: value for key, value in raw.items() if key != "turns"}
         if judge.protocol in ("keyed-v2", "keyed-v3"):
             keyed = raw.get("axes")
             ids = tuple(d.dimension_id for d in judge.definition.dimensions)
@@ -610,18 +855,21 @@ def _evaluate_locked(
             AxisOutcome.model_validate(axis.model_dump(mode="json")) for axis in output.axes
         )
     except JudgeDispatchUnknown as error:
+        judged = None
         status, failure = "unknown", str(error)
         axes = tuple(
             AxisOutcome(dimension_id=a.dimension_id, status="judge_unknown", rationale=failure)
             for a in judge.definition.dimensions
         )
     except (JudgeNotRun, RequestCapacityExceeded) as error:
+        judged = None
         status, failure = "not_run", str(error)
         axes = tuple(
             AxisOutcome(dimension_id=a.dimension_id, status="not_run", rationale=failure)
             for a in judge.definition.dimensions
         )
     except Exception as error:  # noqa: BLE001 - judge failures remain in the complete denominator.
+        judged = None
         status, failure = "failed", type(error).__name__
         axes = tuple(
             AxisOutcome(dimension_id=a.dimension_id, status="judge_failure", rationale=failure)
@@ -638,6 +886,7 @@ def _evaluate_locked(
         judge_failure=failure,
         axes=axes,
         mechanical=mechanical,
+        turns=turn_outcomes(evidence, references, judged),
     )
     parent = artifact_input(artifacts.read(artifact_id + "-intent").manifest)
     artifacts.write_json(
@@ -649,6 +898,19 @@ def _evaluate_locked(
         files={"report.json": report.model_dump(mode="json")},
     )
     return report
+
+
+def _turn_judgements(raw: JsonObject, judge: JudgeConfig, steps: int) -> dict[str, TurnJudgement]:
+    """Validate per-step scores against the planned steps and registered criteria."""
+    turns = raw.get("turns")
+    keys = {f"step-{index}" for index in range(steps)}
+    if not isinstance(turns, dict) or set(turns) != keys:
+        raise ValueError("judge per-turn scores differ from the planned steps")
+    ids = {d.dimension_id for d in judge.definition.dimensions}
+    judged = {key: TurnJudgement.model_validate(value) for key, value in turns.items()}
+    if any(set(turn.scores) != ids for turn in judged.values()):
+        raise ValueError("judge per-turn scores differ from the registered criteria")
+    return judged
 
 
 def evaluate(

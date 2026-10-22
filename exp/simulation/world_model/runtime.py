@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
+from typing import Literal
 
 from exp.common.core.artifacts import (
     ArtifactInput,
@@ -13,6 +14,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import (
     AssistantAction,
+    Embedding,
     ModelCapabilities,
     ModelClient,
     ModelMessage,
@@ -24,6 +26,7 @@ from exp.common.tasks import TaskCase, ToolSchema
 from exp.simulation.engines.text.packing import pack_world_model_request
 from exp.simulation.engines.text.prompt import (
     RECONSTRUCTED_TEXT_PROMPT_VERSION,
+    MemoryContext,
     TextWorldModelTransition,
     build_world_model_request,
     candidate_rag_actions,
@@ -37,6 +40,7 @@ from exp.simulation.engines.text.tokens import (
     bound_unpublished_output,
 )
 from exp.simulation.retrieval import (
+    RAGIndex,
     RAGMatch,
     RAGQuery,
     TraceRAGRetriever,
@@ -50,6 +54,7 @@ from exp.simulation.world_model.artifact import (
     GroundedWorldModelArtifact,
     grounded_world_model_content,
     grounded_world_model_prompt_sha256,
+    persist_grounded_world_model,
 )
 
 
@@ -178,6 +183,8 @@ class GroundedWorldModel:
         maximum_output_tokens: int,
         state: JsonObject | None = None,
         json_object_output: bool = False,
+        memory: MemoryContext | None = None,
+        output_protocol: Literal["text", "json-tool"] = "text",
     ) -> PreparedGroundedWorldModelCall:
         """Retrieve and frame one fit- or serving-bound grounded text transition.
 
@@ -189,6 +196,8 @@ class GroundedWorldModel:
             maximum_output_tokens: Explicit provider output ceiling.
             state: Private environment state retained between simulated turns.
             json_object_output: Provider JSON control included in required framing.
+            memory: Typed cross-trajectory memory rendered into its authority channels.
+            output_protocol: Text transition or typed-proposal system instructions.
 
         Returns:
             Exact request and retrieved evidence before provider dispatch.
@@ -200,7 +209,26 @@ class GroundedWorldModel:
             maximum_output_tokens=maximum_output_tokens,
             state=state,
             json_object_output=json_object_output,
+            memory=memory,
+            output_protocol=output_protocol,
         )
+        if self.artifact.original_evidence == "none":
+            # Memory-first profile: no recorded transition is retrieved for any prediction.
+            request = build_world_model_request(
+                task,
+                visible_messages=visible_messages,
+                candidate_response=candidate_response,
+                grounded_examples=(),
+                knowledge=self.artifact.knowledge,
+                maximum_output_tokens=maximum_output_tokens,
+                state=state,
+                memory=memory,
+                output_protocol=output_protocol,
+            )
+            request = request.model_copy(update={"json_object_output": json_object_output})
+            return PreparedGroundedWorldModelCall(
+                request=request, matches=(), action=candidate_response
+            )
         queries = tuple(
             RAGQuery(
                 task=task.instruction,
@@ -243,6 +271,8 @@ class GroundedWorldModel:
             knowledge=self.artifact.knowledge,
             maximum_output_tokens=maximum_output_tokens,
             state=state,
+            memory=memory,
+            output_protocol=output_protocol,
         )
         request = request.model_copy(update={"json_object_output": json_object_output})
         return PreparedGroundedWorldModelCall(
@@ -259,6 +289,8 @@ class GroundedWorldModel:
         state: JsonObject | None = None,
         json_object_output: bool = False,
         maximum_input_tokens: int | None = None,
+        memory: MemoryContext | None = None,
+        output_protocol: Literal["text", "json-tool"] = "text",
     ) -> None:
         """Admit required framing before retrieval or its paid-work accounting window.
 
@@ -270,6 +302,8 @@ class GroundedWorldModel:
             state: Complete private environment state retained between simulated turns.
             json_object_output: Provider JSON control included in token accounting.
             maximum_input_tokens: Optional stricter frozen request reservation.
+            memory: Typed cross-trajectory memory counted as required content.
+            output_protocol: Text transition or typed-proposal system instructions.
 
         Raises:
             ValueError: The output allowance is not positive.
@@ -283,6 +317,8 @@ class GroundedWorldModel:
             knowledge=self.artifact.knowledge,
             maximum_output_tokens=maximum_output_tokens,
             state=state,
+            memory=memory,
+            output_protocol=output_protocol,
         ).model_copy(update={"json_object_output": json_object_output})
         # Admission may bind unpublished output around required content. Retrieval still uses
         # the original allowance so optional examples yield before actual output is bound.
@@ -453,6 +489,12 @@ def load_grounded_world_model(
     world_model_input = artifact_input(stored.manifest)
     artifact = _load_verified_artifact(store, world_model_input)
     loaded_rag = load_rag_index(store, artifact.serving_rag.artifact_id)
+    if artifact.original_evidence == "none":
+        if embedder is not None:
+            raise ValueError("a memory-first simulator embeds no retrieval queries")
+        embedder = RAGEmbedderBinding(
+            client=_NoRetrievalQueries(), snapshot=loaded_rag.index.embedder
+        )
     return GroundedWorldModel(
         artifact_input=world_model_input,
         artifact=artifact,
@@ -502,6 +544,50 @@ def verify_grounded_world_model_artifact(
     return load_grounded_world_model_artifact(store, world_model_input)
 
 
+class _NoRetrievalQueries:
+    """Embedding seam of a memory-first simulator, which never retrieves recorded evidence."""
+
+    def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
+        """Refuse every query; a memory-first prediction never reaches retrieval.
+
+        Raises:
+            ValueError: Always.
+        """
+        raise ValueError("a memory-first simulator never embeds retrieval queries")
+
+
+def persist_memory_first_world_model(
+    store: ArtifactStore, world_model_input: ArtifactInput
+) -> ArtifactInput:
+    """Persist the same world model in the memory-first profile, as its own simulator.
+
+    The result keeps the built model, prompt, knowledge and serving-index identity (the stored
+    evidence corpus) but retrieves no recorded transition: predictions read only the task,
+    the visible history and learned memory. No embedder is needed to serve it. Its identity is
+    content-derived, so repeated calls return the same artifact.
+
+    Args:
+        store: Project-local immutable artifact store.
+        world_model_input: Exact completed grounded world-model manifest pointer.
+
+    Returns:
+        Manifest pointer of the memory-first grounded world model.
+    """
+    artifact = _load_verified_artifact(store, world_model_input)
+    persisted = persist_grounded_world_model(
+        store,
+        artifact.serving_rag,
+        model_alias=artifact.model_alias,
+        model=artifact.model,
+        created_at=artifact.created_at,
+        code_revision=artifact.code_revision,
+        top_k=artifact.top_k,
+        knowledge=artifact.knowledge,
+        original_evidence="none",
+    )
+    return artifact_input(persisted.manifest)
+
+
 def bind_fit_grounded_world_model(
     store: ArtifactStore,
     world_model_input: ArtifactInput,
@@ -529,8 +615,74 @@ def bind_fit_grounded_world_model(
             identity differs.
     """
     artifact = _load_verified_artifact(store, world_model_input)
+    _require_fit_subset(store, artifact, fit_retriever.index)
+    return GroundedWorldModel(
+        artifact_input=world_model_input,
+        artifact=artifact,
+        retriever=fit_retriever,
+        client=client,
+        capabilities=capabilities,
+        token_counter=token_counter or Utf8UpperBoundTokenCounter(),
+    )
+
+
+def persist_fit_only_world_model(
+    store: ArtifactStore,
+    world_model_input: ArtifactInput,
+    fit_rag_input: ArtifactInput,
+) -> ArtifactInput:
+    """Persist the same world model over the build's fit-only index, as its own simulator.
+
+    The build's serving index also holds held-out traces, so a simulator measured or used on
+    held-out tasks must retrieve from the fit-only index instead. The result keeps the exact
+    model, prompt, knowledge, reranker and top-k of the built world model; only its index
+    changes. Its identity is content-derived, so repeated calls return the same artifact.
+
+    Args:
+        store: Project-local immutable artifact store.
+        world_model_input: Exact completed grounded world-model manifest pointer.
+        fit_rag_input: The same build's fit-only RAG index.
+
+    Returns:
+        Manifest pointer of the fit-only grounded world model.
+
+    Raises:
+        ValueError: The index is not the fit-only subset of this world model's serving index.
+    """
+    artifact = _load_verified_artifact(store, world_model_input)
+    fit = load_rag_index(store, fit_rag_input.artifact_id)
+    if artifact_input(fit.manifest) != fit_rag_input:
+        raise ValueError("fit RAG manifest differs from its selected input")
+    _require_fit_subset(store, artifact, fit.index)
+    persisted = persist_grounded_world_model(
+        store,
+        fit_rag_input,
+        model_alias=artifact.model_alias,
+        model=artifact.model,
+        created_at=artifact.created_at,
+        code_revision=artifact.code_revision,
+        top_k=artifact.top_k,
+        knowledge=artifact.knowledge,
+        selection_policy_sha256=artifact.selection_policy_sha256,
+    )
+    return artifact_input(persisted.manifest)
+
+
+def _require_fit_subset(
+    store: ArtifactStore, artifact: GroundedWorldModelArtifact, fit: RAGIndex
+) -> None:
+    """Require a fit-only index built from the same graph as the artifact's serving index.
+
+    Args:
+        store: Project-local immutable artifact store.
+        artifact: Verified grounded world model whose serving index covers fit and held out.
+        fit: Candidate fit-only index envelope.
+
+    Raises:
+        ValueError: Partition scope, source, schema, embedder, lineage, top-k, or transition
+            identity differs.
+    """
     serving = load_rag_index(store, artifact.serving_rag.artifact_id)
-    fit = fit_retriever.index
     if artifact_input(serving.manifest) != artifact.serving_rag:
         raise ValueError("grounded world-model serving RAG manifest digest changed")
     if serving.index.included_partitions != ("fit", "held_out"):
@@ -558,14 +710,6 @@ def bind_fit_grounded_world_model(
     )
     if fit.transition_ids != serving_fit_ids:
         raise ValueError("fit RAG transitions differ from the serving index fit subset")
-    return GroundedWorldModel(
-        artifact_input=world_model_input,
-        artifact=artifact,
-        retriever=fit_retriever,
-        client=client,
-        capabilities=capabilities,
-        token_counter=token_counter or Utf8UpperBoundTokenCounter(),
-    )
 
 
 def _load_verified_artifact(
@@ -607,6 +751,7 @@ def _load_verified_artifact(
         code_revision=artifact.code_revision,
         knowledge=artifact.knowledge,
         selection_policy_sha256=artifact.selection_policy_sha256,
+        original_evidence=artifact.original_evidence,
     )
     if stable_id("grounded-world-model", content) != artifact_id:
         raise ValueError("grounded world-model artifact ID differs from its complete content")

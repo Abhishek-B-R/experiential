@@ -18,7 +18,11 @@ from exp.common.models import (
 )
 from exp.common.project import ProjectConfig, ProjectStore
 from exp.runtime.models.budget import RequestBudget
-from exp.runtime.models.structured_completion import CompletionPlan, StructuredCompletion
+from exp.runtime.models.structured_completion import (
+    CompletionPlan,
+    ReturnedOutputRejected,
+    StructuredCompletion,
+)
 
 
 class _Client:
@@ -171,8 +175,11 @@ def test_named_tool_output_uses_actual_schema_and_validates_response(tmp_path: P
             ToolCall(call_id="invalid", name="submit_proposal", arguments={"invented": True}),
         )
     )
-    with pytest.raises(ValueError, match="violates its schema"):
+    from jsonschema import ValidationError
+
+    with pytest.raises(ReturnedOutputRejected) as refused:
         complete(body, "tool-invalid")
+    assert isinstance(refused.value.__cause__, ValidationError)
 
 
 def test_response_under_the_catalog_served_model_id_is_admitted(tmp_path: Path) -> None:

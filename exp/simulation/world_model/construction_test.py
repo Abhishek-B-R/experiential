@@ -96,9 +96,12 @@ def test_bound_task_exposes_inferred_tools_without_native_documentation(tmp_path
         default_top_k=1,
     )
 
+    dispatched: dict[str, JsonObject] = {}
+
     def complete(body: JsonObject, operation: str) -> JsonObject:
         """Provide a deterministic constructor proposal for the observed read interface."""
         assert "Native-policy-secret" not in json.dumps(body)
+        dispatched[operation] = body
         return {
             "interface": {
                 "tools": [
@@ -141,7 +144,14 @@ def test_bound_task_exposes_inferred_tools_without_native_documentation(tmp_path
         deadline=now + timedelta(minutes=1),
         code_revision="test",
         top_k=1,
+        construction_guidance="Prefer fields the observations show.",
     )
+    for operation, body in dispatched.items():
+        saved = json.loads(project.artifacts.read_bytes(operation + "-intent", "request.json"))
+        assert saved["request"] == body
+        assert {"role": "developer", "content": "Prefer fields the observations show."} in (
+            saved["request"]["messages"]
+        )
     native_task = TaskCase(
         task_id="target",
         lineage_group_id="target-user",

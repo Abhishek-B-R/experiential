@@ -14,8 +14,11 @@ from exp.common.evaluations.reconstruction import (
     WorkflowStep,
     default_judge,
     evaluate,
+    field_differences,
     judge_wire_schema,
     mechanical_checks,
+    reply_fields,
+    turn_outcomes,
 )
 from exp.common.project import ArtifactManifest, ProjectConfig, ProjectStore
 
@@ -396,3 +399,169 @@ def test_strict_keyed_judge_requires_the_score_its_parser_needs() -> None:
         assert isinstance(value, dict) and isinstance(value["required"], list)
         assert "score" in value["required"]
     assert sha256_json(config) != sha256_json(default_judge("glm", protocol="keyed-v2"))
+
+
+def test_reply_fields_count_leaf_agreement_over_both_replies() -> None:
+    """Missing, extra and retyped leaves all count as divergent fields."""
+    actual: JsonValue = {"ok": True, "items": [{"color": "black", "price": 1}], "note": []}
+    expected: JsonValue = {"ok": True, "items": [{"color": "red", "price": 1.0, "size": "L"}]}
+    assert reply_fields(actual, expected) == (1, 5)
+    assert reply_fields(expected, expected) == (4, 4)
+    assert reply_fields(None, None) == (1, 1)
+
+
+def test_per_turn_scores_come_from_the_same_single_judge_call(tmp_path: Path) -> None:
+    """One request carries the per-step inventory; scores land beside field divergence."""
+    import json
+
+    project = ProjectStore(tmp_path, "turns")
+    project.initialize(ProjectConfig(project_id="turns"))
+    judge = default_judge("scripted", protocol="keyed-v3").model_copy(update={"per_turn": True})
+    ids = [axis.dimension_id for axis in judge.definition.dimensions]
+    bad = evidence().model_copy(
+        update={"steps": (evidence().steps[0].model_copy(update={"reply": ["invented"]}),)}
+    )
+    calls: list[JsonObject] = []
+
+    def complete(body: JsonObject, identity: str) -> JsonObject:
+        """Score the workflow and its single step in one response."""
+        calls.append(body)
+        messages = body["messages"]
+        assert isinstance(messages, list) and isinstance(messages[1], dict)
+        payload = json.loads(str(messages[1]["content"]))
+        assert "per_turn_instructions" in payload
+        assert body["response_schema"] == judge_wire_schema(judge, 1)
+        axis = {
+            "status": "assessed",
+            "score": 2,
+            "rationale": "Reply differs.",
+            "evidence_refs": ["step-0", "reference-step-0"],
+            "critical_flags": [],
+        }
+        return {
+            "axes": {key: axis for key in ids},
+            "turns": {
+                "step-0": {
+                    "scores": {key: (2 if key == ids[0] else None) for key in ids},
+                    "rationale": "The read invents an item.",
+                }
+            },
+        }
+
+    report = evaluate(
+        bad,
+        references(),
+        judge=judge,
+        complete=complete,
+        artifacts=project.artifacts,
+        artifact_id="turns",
+        clock=lambda: NOW,
+        code_revision="test",
+    )
+    assert len(calls) == 1 and report.judge_status == "completed"
+    (turn,) = report.turns
+    assert (turn.fields_matched, turn.fields_total, turn.divergence) == (0, 2, 1.0)
+    assert turn.scores[ids[0]] == 2 and turn.scores[ids[1]] is None
+    assert turn.rationale == "The read invents an item."
+    assert "per_turn" not in default_judge("scripted").model_dump(mode="json")
+
+
+def test_malformed_per_turn_scores_fail_the_judge_but_keep_divergence(tmp_path: Path) -> None:
+    """A response missing a planned step is refused; deterministic divergence remains."""
+    project = ProjectStore(tmp_path, "turns-bad")
+    project.initialize(ProjectConfig(project_id="turns-bad"))
+    judge = default_judge("scripted", protocol="keyed-v3").model_copy(update={"per_turn": True})
+    axis = {
+        "status": "assessed",
+        "score": 5,
+        "rationale": "Exact.",
+        "evidence_refs": ["step-0"],
+        "critical_flags": [],
+    }
+    report = evaluate(
+        evidence(),
+        references(),
+        judge=judge,
+        complete=lambda body, identity: {
+            "axes": {a.dimension_id: axis for a in judge.definition.dimensions},
+            "turns": {},
+        },
+        artifacts=project.artifacts,
+        artifact_id="turns-bad",
+        clock=lambda: NOW,
+        code_revision="test",
+    )
+    assert report.judge_status == "failed"
+    (turn,) = report.turns
+    assert (turn.fields_matched, turn.fields_total, turn.scores) == (1, 1, {})
+
+
+@pytest.mark.parametrize("bad", [True, "4", 2.0])
+def test_per_turn_scores_are_strict_integers(tmp_path: Path, bad: JsonValue) -> None:
+    """A boolean, string or float score is refused, never shown as a coerced integer."""
+    project = ProjectStore(tmp_path, "strict-turns")
+    project.initialize(ProjectConfig(project_id="strict-turns"))
+    judge = default_judge("scripted", protocol="keyed-v3").model_copy(update={"per_turn": True})
+    ids = [axis.dimension_id for axis in judge.definition.dimensions]
+    axis = {
+        "status": "assessed",
+        "score": 5,
+        "rationale": "Exact.",
+        "evidence_refs": ["step-0"],
+        "critical_flags": [],
+    }
+    report = evaluate(
+        evidence(),
+        references(),
+        judge=judge,
+        complete=lambda body, identity: {
+            "axes": {key: axis for key in ids},
+            "turns": {"step-0": {"scores": dict.fromkeys(ids, bad), "rationale": "Scored."}},
+        },
+        artifacts=project.artifacts,
+        artifact_id="strict-turns",
+        clock=lambda: NOW,
+        code_revision="test",
+    )
+    assert report.judge_status == "failed"
+    assert all(not turn.scores for turn in report.turns)
+
+
+def test_a_turn_without_a_simulated_reply_reproduces_none_of_the_recorded_fields() -> None:
+    """Failed and blocked steps with a recorded reply count as divergent, not incomparable."""
+    recorded: JsonValue = {"ok": True, "items": [1, 2]}
+    steps = (
+        WorkflowStep(step=0, action={"name": "read"}, status="failure", before={"items": []}),
+        WorkflowStep(step=1, action={"name": "read"}, status="blocked"),
+    )
+    refs = EvaluationReferences(
+        capability="recorded_reference_only",
+        steps=tuple(
+            ReferenceStep(step=i, action={"name": "read"}, reply_available=True, reply=recorded)
+            for i in range(2)
+        ),
+    )
+    turns = turn_outcomes(evidence().model_copy(update={"steps": steps}), refs)
+    assert [(t.fields_matched, t.fields_total, t.divergence) for t in turns] == [(0, 3, 1.0)] * 2
+    unreferenced = turn_outcomes(
+        evidence().model_copy(update={"steps": steps}),
+        EvaluationReferences(capability="description_only"),
+    )
+    assert all(t.divergence is None for t in unreferenced)
+
+
+def test_difference_paths_are_unambiguous_and_sorted_numerically() -> None:
+    """Dotted keys are quoted, indices sort numerically, and containers are not shown absent."""
+    actual: JsonValue = {"a.b": 1, "a": {"b": 2}, "rows": list(range(12)), "x": {"y": None}}
+    expected: JsonValue = {"a.b": 0, "a": {"b": 3}, "rows": [*range(10), 0, 0], "x": {}}
+    rows = field_differences(actual, expected)
+    assert [row["path"] for row in rows] == [
+        "a.b",
+        '["a.b"]',
+        "rows[10]",
+        "rows[11]",
+        "x",
+        "x.y",
+    ]
+    container = next(row for row in rows if row["path"] == "x")
+    assert container["actual"] == {"y": None} and not container["actual_missing"]

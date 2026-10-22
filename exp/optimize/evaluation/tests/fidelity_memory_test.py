@@ -20,25 +20,33 @@ from exp.common.models import (
     load_model_catalog,
     write_model_catalog,
 )
-from exp.common.project import ArtifactStore, ProjectStore
+from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.optimize.evaluation import fidelity
 from exp.optimize.evaluation.fidelity import (
     FidelityRetrieval,
     FidelitySpec,
     execute_fidelity_evaluation,
     prepare_fidelity_evaluation,
+)
+from exp.optimize.evaluation.fidelity_memory import (
     saved_memory_receipt,
 )
 from exp.optimize.evaluation.fidelity_test import source_project, transition_reply
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
+from exp.simulation.engines.text.knowledge import SimulationKnowledge
 from exp.simulation.evaluation import FixedWorkflow
 from exp.simulation.retrieval.jev import JEVCueSelector, JEVPolicy
-from exp.simulation.world_model.artifact import GroundedWorldModelArtifact
+from exp.simulation.world_model.artifact import (
+    GroundedWorldModelArtifact,
+    persist_grounded_world_model,
+)
 from exp.simulation.world_model.experience_memory import (
+    MemoryVersion,
     memory_head,
     memory_records,
     publish_trajectory,
 )
+from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 from exp.simulation.world_model.session_research import OnlineResearchPolicy
 from exp.simulation.world_model.session_research_test import payload, structured_reply
 
@@ -165,14 +173,14 @@ def trajectory(
         "retrieval": {
             "jev_alias": "jev",
             "jev": JEVPolicy(candidate_limit=4).model_dump(mode="json"),
-            "memory_top_k": 2,
+            "memory_top_k": 4,
         },
         "memory": {"lineage": "fixture-memory", "mode": mode, "checkpoint": checkpoint},
     }
     if mode == "learn":
         selector = JEVCueSelector(
             policy=JEVPolicy(candidate_limit=4),
-            top_k=2,
+            top_k=4,
             decide=lambda request: {},
             record=lambda receipt: None,
         )
@@ -196,7 +204,10 @@ def predicted(call_id: str, reply: str) -> JsonHttpResponse:
     return transition_reply(
         {
             "observations": [{"call_id": call_id, "reply": reply, "encoding": "json"}],
-            "effect": {"kind": "replace", "state": {"last": call_id}},
+            "effect": {
+                "kind": "edits",
+                "edits": [{"op": "set", "path": ["last"], "value": call_id}],
+            },
         }
     )
 
@@ -210,6 +221,8 @@ def investigation(label: str) -> JsonHttpResponse:
             "scope": f"{label} entry reads",
             "uncertainty": "One observation only",
             "supersedes": [],
+            "transferable": True,
+            "observable_cue": "the same tool and arguments",
         }
     )
 
@@ -279,7 +292,7 @@ def test_learning_reuse_restart_duplicate_and_frozen_checkpoint(
     assert first_b["environment_state"] == {}
     assert notes(wire, 0, "session") == []
     assert notes(wire, 0, "prior_trajectories") == research_a
-    assert "alpha-reply-1" not in json.dumps(first_b)
+    assert "beta-reply" not in json.dumps(first_b)
     receipt_b = saved_memory_receipt(project, prepared_b)
     assert receipt_b is not None and receipt_b["version"] == 2
     research_b = receipt_b["research_ids"]
@@ -344,16 +357,26 @@ def test_learning_reuse_restart_duplicate_and_frozen_checkpoint(
     shown = CliRunner().invoke(
         app,
         ["eval", "fidelity-test", "--root", str(tmp_path), "--fidelity", str(spec_path)]
-        + ["--non-interactive"],
+        + ["--non-interactive", "--verbose"],
     )
     assert shown.exit_code == 0, shown.output
     assert "frozen run read v1" in shown.output and "Whole trajectory exact: no" in shown.output
+    assert "read v1, unchanged" in shown.output
+
+
+def minimal(reply: str) -> JsonObject:
+    """A one-step consumed trajectory owned by its own task lineage."""
+    return {
+        "task_lineage": "task-" + reply,
+        "actions": [{"name": "read", "arguments": {}}],
+        "observed_replies": [reply],
+    }
 
 
 def test_boundaries_refuse_wrong_scope_stale_parent_and_missing_reranker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Memory cannot cross simulators/selectors, fork, or bypass an artifact-bound reranker."""
+    """Memory cannot cross knowledge, fork, or bypass an artifact-bound reranker."""
     project, base = memory_project(tmp_path)
     with pytest.raises(ValueError, match="checkpoint"):
         trajectory(base, "bad", "k", "frozen")
@@ -362,52 +385,55 @@ def test_boundaries_refuse_wrong_scope_stale_parent_and_missing_reranker(
         prepare_fidelity_evaluation(project, missing, code_revision="fixture")
     store = project.artifacts
     now = datetime.now(UTC)
-    first, created = publish_trajectory(
-        store,
-        lineage="scope",
-        parent=None,
-        world_model=base.world_model,
-        selection_policy_sha256="0" * 64,
-        trajectory={"actions": [], "observed_replies": ["one"]},
-        research=(),
-        created_at=now,
-        code_revision="fixture",
-    )
-    assert created and first.version == 1
-    with pytest.raises(ValueError, match="different simulator or selector"):
-        publish_trajectory(
+    simulator = load_grounded_world_model_artifact(store, base.world_model)
+
+    def publish(parent: MemoryVersion | None, reply: str, selector: str) -> MemoryVersion:
+        """Publish one minimal trajectory under the given memory selector."""
+        version, _ = publish_trajectory(
             store,
             lineage="scope",
-            parent=first,
+            parent=parent,
             world_model=base.world_model,
-            selection_policy_sha256="1" * 64,
-            trajectory={"actions": [], "observed_replies": ["two"]},
+            selection_policy_sha256=selector,
+            trajectory=minimal(reply),
             research=(),
             created_at=now,
             code_revision="fixture",
+            publisher="fixture",
         )
-    publish_trajectory(
+        return version
+
+    first = publish(None, "one", "0" * 64)
+    assert first.version == 1 and first.knowledge_identity is not None
+    second = publish(first, "two", "1" * 64)
+    assert second.version == 2
+    assert second.serving_policy is not None
+    assert second.serving_policy["memory_selector_sha256"] == "1" * 64
+    with pytest.raises(ValueError, match="advanced"):
+        publish(first, "three", "0" * 64)
+    changed = persist_grounded_world_model(
         store,
-        lineage="scope",
-        parent=first,
-        world_model=base.world_model,
-        selection_policy_sha256="0" * 64,
-        trajectory={"actions": [], "observed_replies": ["two"]},
-        research=(),
+        simulator.serving_rag,
+        model_alias=simulator.model_alias,
+        model=simulator.model,
         created_at=now,
         code_revision="fixture",
+        top_k=simulator.top_k,
+        knowledge=SimulationKnowledge(rules="other"),
+        selection_policy_sha256=simulator.selection_policy_sha256,
     )
-    with pytest.raises(ValueError, match="advanced"):
+    with pytest.raises(ValueError, match="different knowledge"):
         publish_trajectory(
             store,
             lineage="scope",
-            parent=first,
-            world_model=base.world_model,
+            parent=second,
+            world_model=artifact_input(changed.manifest),
             selection_policy_sha256="0" * 64,
-            trajectory={"actions": [], "observed_replies": ["three"]},
+            trajectory=minimal("four"),
             research=(),
             created_at=now,
             code_revision="fixture",
+            publisher="fixture",
         )
     unbound = base.model_copy(update={"run_id": "unbound"})
     original = fidelity.load_grounded_world_model_artifact
@@ -440,7 +466,9 @@ def test_wire_tool_schemas_are_reference_free_and_string_effects_stay_invalid(
             "observations": [
                 {"call_id": "traj-wire-1", "reply": "alpha-reply-1", "encoding": "json"}
             ],
-            "effect": json.dumps({"kind": "replace", "state": {"last": "traj-wire-1"}}),
+            "effect": json.dumps(
+                {"kind": "edits", "edits": [{"op": "set", "path": ["last"], "value": "x"}]}
+            ),
         }
     )
     wire = RoutedTransport(
