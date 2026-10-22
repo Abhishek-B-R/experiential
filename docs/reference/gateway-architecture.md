@@ -221,6 +221,16 @@ applies the same rule after commitment, when every committed event was one it ca
 Provider-internal retry layers are disabled so every
 possible billable dispatch is visible to the gateway ledger.
 
+**DeepSeek DSML markup is never relayed as text.** On the OpenAI-compatible wire, content that
+could open a DeepSeek DSML tool-call tag (`<｜DSML｜…`, U+FF5C bars, optionally closing, after
+duplicated `<` or whitespace) is held back; any other `<` is released as soon as the next characters
+rule the marker out. A confirmed DSML block is parsed leniently (a space after `｜DSML｜`, `calls`
+for `function_calls`, `string="true|false"` typing): complete invokes become ordinary tool calls,
+and anything else (a lost opening, a stray closing tag) fails the attempt as `malformed_response`
+("the model emitted a malformed tool call; retry the request"), failover-eligible before
+commitment, with the markup dropped. Every caller surface encodes from these events, so Chat,
+Responses, Messages and non-streaming answers share the guard.
+
 **Per-rung conditional failover (`failover_only_on`).** A deployment may restrict itself to
 failover duty for a named set of failures (a customer's trusted-access OpenAI key taking only the
 house rung's `refusal:cyber_policy`); see [gateway-failover-rules.md](gateway-failover-rules.md).
