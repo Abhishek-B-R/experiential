@@ -568,6 +568,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                         total_attempts,
                         counts[depth],
                         depth,
+                        &physical_counts,
                         &failure,
                         refusal_eligible,
                     );
@@ -671,7 +672,10 @@ mod commit;
 pub(crate) use commit::is_semantic;
 mod fallback_rules;
 mod wire;
-pub(crate) use wire::{first_byte_allowance, first_token_allowance, open_phase_bound};
+pub(crate) use wire::{
+    first_byte_allowance, first_token_allowance, open_phase_bound, pre_first_byte_budget,
+    PRE_FIRST_BYTE_RESERVE,
+};
 pub use wire::{DeploymentWire, RoutePolicy, WaterfallContext};
 
 mod empty;
@@ -695,6 +699,8 @@ mod ladder_tests;
 mod progress_tests;
 #[cfg(test)]
 mod repair_ladder_tests;
+#[cfg(test)]
+mod revisit_ladder_tests;
 #[cfg(test)]
 mod tenant_ladder_tests;
 #[cfg(test)]

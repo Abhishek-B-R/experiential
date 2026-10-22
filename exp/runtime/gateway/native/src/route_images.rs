@@ -255,6 +255,7 @@ async fn run_ladder(
                     total_attempts,
                     counts[depth],
                     depth,
+                    &counts,
                     &failure,
                     false,
                 );
