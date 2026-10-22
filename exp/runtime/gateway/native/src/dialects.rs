@@ -496,6 +496,8 @@ pub struct Normalizer {
     // (`finish_openai_compatible_stream`), and the flag records that reading.
     output_token_cap: Option<u64>,
     unreported_stop_read_as_length: bool,
+    // OpenAI-compatible content held back while it could be DSML markup.
+    dsml: openai::dsml::DsmlGuard,
 }
 
 /// Longest upstream label kept from a stream (mirrors the python settlement bound).
@@ -548,6 +550,7 @@ impl Normalizer {
             retained: crate::retained::RetainedLease::default(),
             output_token_cap: None,
             unreported_stop_read_as_length: false,
+            dsml: Default::default(),
         }
     }
 
