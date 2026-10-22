@@ -10,9 +10,9 @@ from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.lane_saturation import (
     DEFAULT_BOUND_OVERFLOW_FACTORS,
     DEFAULT_LANE_SHARE,

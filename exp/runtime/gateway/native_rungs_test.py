@@ -28,18 +28,20 @@ from exp.runtime.gateway.budgets_test import _accepted_chain, _activate_chain, _
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayMessage,
     GatewayRequest,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.model_plan import model_execution_snapshot, project_stage_selection
 from exp.runtime.gateway.model_plan_test import catalog as staged_catalog
 from exp.runtime.gateway.native_execution import select_route_deployments
 from exp.runtime.gateway.native_rungs import (
+    NOVITA_SESSION_HEADER,
     ZDR_CONSTRAINT_CAPABILITY,
     RungDispatch,
     build_rung_dispatch,
+    with_session_affinity,
 )
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -47,6 +49,7 @@ from exp.runtime.models.providers.errors import ProviderCapabilityError, Provide
 from exp.runtime.models.providers.openrouter_routing import OPENROUTER_METADATA_HEADER
 from exp.runtime.models.providers.protocol import NativeWireClient
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
+from exp.runtime.openai_protocol.requests import decode_chat
 
 _AUTHORIZATION = AuthorizationSnapshot(
     request_id="request-one",
@@ -925,3 +928,144 @@ def test_reasoning_off_on_an_openrouter_rung_ignores_upstreams_that_think_anyway
     on = payload_for("high")
     assert on["reasoning"] == {"effort": "high"}
     assert "provider" not in on
+
+
+_NOVITA_PROFILE = GatewayWireProfile(
+    dialect="openai_compatible",
+    url="https://api.novita.ai/v3/openai/chat/completions",
+    headers={"Authorization": "Bearer k"},
+    model_id="deepseek/deepseek-v4.1-flash",
+)
+
+
+def test_a_novita_rung_names_the_conversation_in_x_session_id() -> None:
+    """Novita pins by session: the derived id rides beside the static headers."""
+    request = _request().model_copy(update={"provider_session_id": "xpls-abc"})
+
+    assert with_session_affinity(_NOVITA_PROFILE, request, None) == {
+        "Authorization": "Bearer k",
+        NOVITA_SESSION_HEADER: "xpls-abc",
+    }
+    composed = {"Authorization": "Bearer k", "anthropic-beta": "x"}
+    assert with_session_affinity(_NOVITA_PROFILE, request, composed) == {
+        **composed,
+        NOVITA_SESSION_HEADER: "xpls-abc",
+    }
+
+
+def test_other_origins_and_sessionless_requests_keep_their_headers() -> None:
+    """Only Novita's host gets the header, and only when a session id was derived."""
+    request = _request().model_copy(update={"provider_session_id": "xpls-abc"})
+    assert with_session_affinity(_profile(), request, None) is None
+    assert with_session_affinity(_NOVITA_PROFILE, _request(), None) is None
+
+
+def test_the_session_header_reaches_the_frozen_wire_entry() -> None:
+    """build_rung_dispatch carries the header into what the data plane sends."""
+    rung = _deployment("novita-rung", "novita")
+    route = _route((rung,))
+    request = _request().model_copy(update={"provider_session_id": "xpls-abc"})
+    entry = build_rung_dispatch(
+        route,
+        rung,
+        _NOVITA_PROFILE,
+        _NoSigningClient(),
+        provider_request=request,
+        public_request=request,
+        authorization=route.snapshot.authorization,
+    ).wire_entry
+    assert entry["headers"] == {"Authorization": "Bearer k", NOVITA_SESSION_HEADER: "xpls-abc"}
+
+
+def _extras_dispatch(provider: str, dialect: str, *, self_hosted: bool = False) -> RungDispatch:
+    """Freeze one rung for a decoded Chat request carrying all three sampling extras.
+
+    ``self_hosted`` authors ``upstream_priority`` on the rung, the host's mark
+    of a self-hosted vLLM server.
+    """
+    request = decode_chat(
+        {
+            "model": "public-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "repetition_penalty": 1.1,
+            "min_p": 0.05,
+            "top_a": 0.2,
+        }
+    ).request.model_copy(update={"include_usage": True})
+    rung = _deployment(f"{provider}-rung", provider)
+    if self_hosted:
+        rung = rung.model_copy(
+            update={
+                "gateway": rung.gateway.model_copy(
+                    update={"dispatch": GatewayRungDispatchPolicy(upstream_priority=True)}
+                )
+            }
+        )
+    route = _route((rung,))
+    return build_rung_dispatch(
+        route,
+        rung,
+        _profile(dialect),
+        _NoSigningClient(),
+        provider_request=request,
+        public_request=request,
+        authorization=route.snapshot.authorization,
+    )
+
+
+def test_a_vllm_rung_receives_repetition_penalty_and_min_p() -> None:
+    """A self-hosted vLLM rung (upstream_priority authored) forwards vLLM's extras."""
+    dispatch = _extras_dispatch("openai-compatible", "openai_compatible", self_hosted=True)
+    payload = dispatch.wire_entry["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert payload["repetition_penalty"] == 1.1
+    assert payload["min_p"] == 0.05
+    # vLLM has no top_a: the rung dispatches without it and the drop is named.
+    assert "top_a" not in payload
+    assert dispatch.disclosures == ("top_a->dropped(unsupported_by_provider)",)
+
+
+def test_an_openrouter_rung_receives_every_sampling_extra() -> None:
+    """OpenRouter documents all three extras, so nothing is dropped."""
+    dispatch = _extras_dispatch("openrouter", "openai_compatible")
+    payload = dispatch.wire_entry["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert (payload["repetition_penalty"], payload["min_p"], payload["top_a"]) == (1.1, 0.05, 0.2)
+    assert dispatch.disclosures == ()
+
+
+@pytest.mark.parametrize(
+    ("provider", "dialect"),
+    (
+        ("openai", "openai_responses"),
+        ("anthropic", "anthropic_messages"),
+        ("openrouter", "openai_responses"),
+        # A generic OpenAI-compatible reseller (Groq, Mistral, xAI) is not a
+        # self-hosted vLLM server and may refuse unknown fields.
+        ("openai-compatible", "openai_compatible"),
+    ),
+)
+def test_a_strict_rung_drops_every_sampling_extra_with_disclosure(
+    provider: str, dialect: str
+) -> None:
+    """OpenAI and Anthropic wires refuse the extras, so they are dropped, never sent."""
+    dispatch = _extras_dispatch(provider, dialect)
+    payload = dispatch.wire_entry["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert not {"repetition_penalty", "min_p", "top_a"} & set(payload)
+    assert dispatch.sampling_disclosures == (
+        "repetition_penalty->dropped(unsupported_by_provider)",
+        "min_p->dropped(unsupported_by_provider)",
+        "top_a->dropped(unsupported_by_provider)",
+    )
+
+
+def test_a_request_without_extras_dispatches_unchanged() -> None:
+    """No extras sent means no payload keys and no disclosure on any wire."""
+    rung = _deployment("vllm", "openai-compatible")
+    dispatch = _dispatch(_route((rung,)), rung)
+    payload = dispatch.wire_entry["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert not {"repetition_penalty", "min_p", "top_a"} & set(payload)
+    assert dispatch.disclosures == ()

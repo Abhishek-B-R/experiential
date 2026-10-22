@@ -164,6 +164,52 @@ def test_chat_decoder_admits_sampling_penalties() -> None:
     assert request.presence_penalty == -0.25
 
 
+def test_chat_decoder_admits_openrouter_sampling_extras_off_request_identity() -> None:
+    """repetition_penalty/min_p/top_a decode onto the excluded carrier.
+
+    A request without them keeps its exact digest; a request with them joins
+    replay identity, so a reused operation key with different extras conflicts.
+    """
+    base: JsonObject = {"model": "coding", "messages": [{"role": "user", "content": "hi"}]}
+    plain = decode_chat(base).request
+    assert plain.sampling_extras is None
+    assert provider_replay_authority(plain) is None
+    extras = decode_chat({**base, "repetition_penalty": 1, "min_p": 0.05, "top_a": 0.2}).request
+    assert extras.sampling_extras is not None
+    assert extras.sampling_extras.present() == (
+        ("repetition_penalty", 1.0),
+        ("min_p", 0.05),
+        ("top_a", 0.2),
+    )
+    assert "repetition_penalty" not in extras.model_dump()
+    other = decode_chat({**base, "repetition_penalty": 1.2}).request
+    digests = {canonical_request_sha256(item) for item in (plain, extras, other)}
+    assert len(digests) == 3
+    assert canonical_request_sha256(plain) == sha256_json(plain)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("repetition_penalty", 0),
+        ("repetition_penalty", 2.01),
+        ("min_p", 1.5),
+        ("min_p", "0.1"),
+        ("top_a", True),
+    ),
+)
+def test_chat_decoder_refuses_an_invalid_sampling_extra_by_name(
+    field: str, value: JsonValue
+) -> None:
+    """Each extra keeps its type and OpenRouter's range: a bad value is a named 400."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {"model": "coding", "messages": [{"role": "user", "content": "hi"}], field: value}
+        )
+    assert captured.value.detail.code == "invalid_parameter"
+    assert captured.value.detail.param == field
+
+
 def test_chat_legacy_max_tokens_reaches_native_responses_as_max_output_tokens() -> None:
     """A Chat request using legacy max_tokens serves a native Responses max_output_tokens.
 
@@ -3483,6 +3529,53 @@ def test_non_default_values_of_accepted_no_op_fields_stay_named_rejections(
     assert captured.value.detail.code == "invalid_parameter"
     assert captured.value.detail.param == param
     assert fragment in captured.value.detail.message
+
+
+def test_responses_prompt_cache_ttl_decodes_twelve_hours_and_accepts_the_default() -> None:
+    """``"12h"`` lands on the carrier; ``"30m"`` and an omitted mode are already satisfied.
+
+    OpenAI (https://developers.openai.com/api/docs/guides/prompt-caching): "In
+    the Responses API, set prompt_cache_options.ttl to choose the minimum cache
+    lifetime", "30m" (default) or "12h"; "Unsupported values return 400".
+    """
+    twelve = decode_responses(
+        {"model": "coding", "input": "x", "prompt_cache_options": {"ttl": "12h"}}
+    )
+    assert twelve.request.prompt_cache_ttl == "12h"
+    assert twelve.request.ignored_parameters == ()
+    # A cost hint, never identity or serialized request state.
+    assert "prompt_cache_ttl" not in twelve.request.model_dump(mode="json")
+    plain = decode_responses({"model": "coding", "input": "x"})
+    assert canonical_request_sha256(twelve.request) == canonical_request_sha256(plain.request)
+    for options in ({"ttl": "30m"}, {"mode": "implicit", "ttl": "30m"}, {}):
+        default = decode_responses(
+            {"model": "coding", "input": "x", "prompt_cache_options": options}
+        )
+        assert default.request.prompt_cache_ttl is None
+    both = decode_responses(
+        {
+            "model": "coding",
+            "input": "x",
+            "prompt_cache_options": {"mode": "implicit", "ttl": "12h"},
+        }
+    )
+    assert both.request.prompt_cache_ttl == "12h"
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_responses({"model": "coding", "input": "x", "prompt_cache_options": {"ttl": "1h"}})
+    assert captured.value.detail.param == "prompt_cache_options.ttl"
+
+
+def test_chat_prompt_cache_options_stay_refused() -> None:
+    """OpenAI's Chat Completions answers 400 for ``ttl: "12h"`` (probed 2026-10-20)."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "x"}],
+                "prompt_cache_options": {"ttl": "12h"},
+            }
+        )
+    assert captured.value.detail.param == "prompt_cache_options"
 
 
 def test_service_tier_decodes_on_both_openai_surfaces_and_rejects_unknown_values() -> None:

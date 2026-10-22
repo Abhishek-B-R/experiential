@@ -392,7 +392,9 @@ absorb sideways as `rate_limit` BEFORE the provider answers 429; token accountin
 dispatch's conservative worst-case reserved input plus output tokens at reservation, with a
 burst allowance admitting a single over-cap reservation into an EMPTY window (a prompt whose
 worst case exceeds the whole per-worker cap must stay admissible, then blocks the window until
-it slides out). The working
+it slides out). `max_prompt_tokens` keeps a prompt at least that long (lower-bound estimate,
+prompt only) off the rung when an uncapped rung of the same model remains after the window,
+capability and tier narrowing (`prompt_size.prompt_cap_indexes`), for a dedicated low-batch replica. The working
 request ceiling is additionally calibrated passively per worker: a provider throttle settlement
 clamps a learned ceiling to ninety percent of the rate observed in the window at that moment,
 every unthrottled recovery minute creeps it back up by five percent (at least one request, capped
@@ -540,67 +542,7 @@ created, in-progress, output, and exactly one terminal lifecycle. Provider tool-
 are accumulated in original order and validated only at the complete-call boundary.
 
 `exp/runtime/anthropic_protocol` is the only Anthropic Messages wire implementation, serving
-`POST /v1/messages` for Anthropic SDK callers over the same canonical gateway request. Callers
-authenticate with `x-api-key` (the Anthropic SDK default) or a standard Bearer header; both carry
-the same virtual key, and every failure on this surface is rendered in the Anthropic error
-envelope `{"type": "error", "error": {...}}`. The decoder translates text, `tool_use`,
-`tool_result`, `thinking`, and `redacted_thinking` blocks faithfully, and carries the caller's
-`context_management` object verbatim (shallow-validated as an object; Anthropic rungs receive it
-byte-for-byte together with its required `anthropic-beta` token, while non-Anthropic routes drop
-it with `ignored_parameters` disclosure) (thinking history rides an
-opaque provider-reasoning carrier with byte-exact signatures, and a caller `thinking`
-configuration is forwarded verbatim on models that honor it, overriding the catalog's
-adaptive default. Budgeted-thinking support and support for disabling thinking are separate
-model capabilities: a valid explicit off setting is preserved, and an unsupported off setting
-is refused before dispatch. A numeric thinking budget no rung carries takes the disclosed
-`route_effort_ladder` snap. A bare `{type: enabled}` without a numeric budget can use a disclosed derived
-budget that fits the effective per-rung output cap, or an admissible effort on an effort wire;
-an impossible requested configuration is refused instead of disabling thinking. An explicit
-budget at or above `max_tokens` is refused on `thinking.budget_tokens`. See
-[generation limits and interrupted streams](gateway-generation.md) for output-cap provenance,
-partial tool calls, connection-loss handling, and the accounting boundary), requires
-`max_tokens` (a ceiling under 1024 with no reasoning signal of the caller's own, on a route whose
-every rung reasons by default and offers a `none` tier, dispatches at `reasoning_effort: none`
-disclosed as `reasoning_effort->none(max_tokens_headroom)`, so the reply is text rather than
-thinking cut off at the ceiling), and validates `cache_control`. Both Messages and Chat
-Completions retain message/text breakpoints on canonical carriers. Anthropic (including Claude
-on Azure Foundry) forwards them, Bedrock translates them into `cachePoint` blocks, and OpenRouter
-forwards them on its Chat wire. Generic Chat adapters disclose marker omission in
-`x-experiential-ignored-parameters`; a provider label or cached price does not prove support.
-`maximize_cache` prefers marker-preserving adapters but may fall back to another provider or
-an adapter that drops markers; it is not a cache-capability requirement or hit guarantee.
-Cache markers retain their requested TTL. Gateway reservations require the corresponding
-five-minute or one-hour price; settlement uses provider-observed TTL counts, never the request
-marker. Missing rates or incomplete TTL evidence remain unknown rather than using another rate.
-Responses expose observed cache reads and writes; absent write counts remain unknown.
-The decoder also
-carries the provider-native tool annotations (`strict`,
-`eager_input_streaming`, `defer_loading`, `allowed_callers`, `input_examples`; each accepted
-bare by the live API, verified 2026-08-30) and `inference_geo` verbatim on Anthropic rungs with
-disclosure-drops elsewhere, keeps every official SDK tool and top-level field a recorded
-decision behind an SDK-surface drift gate in
-`exp/runtime/anthropic_protocol/manifest.py`, and carries user `image` and PDF `document` blocks
-as typed content parts (base64 or URL source, optional `title`, cache marker) that admission
-checks against the route's `supports_image_input` / `supports_pdf_input` (and the `_url_input`
-variants for remote sources) before dispatch, so a rung that cannot carry the attachment
-rejects it loudly instead of answering from the surrounding text. Anthropic server tools are
-decided per type by the same manifest: verified `web_search_*` entries forward verbatim after
-the converted custom tools, their streamed output (`server_tool_use`, `web_search_tool_result`,
-citation-bearing text blocks, and the `pause_turn` stop reason) reaches the caller intact on
-both response paths, and a next-turn echo of those blocks (each carried verbatim as a
-whole-message block) re-serves byte-for-byte; every other Anthropic-defined tool type is
-rejected by name because the data plane does not yet carry its result blocks. Like the thinking
-carriers, server tools replay only on the Anthropic wire. A MIXED route (an Anthropic rung beside
-another) rejects them by name; a route with NO Anthropic rung serves the turn without them,
-dropping the declared tool (`tools.web_search->dropped(unsupported_by_provider)`), its echoed
-`server_tool_use` / `*_tool_result` history blocks
-(`messages.server_tool_blocks->dropped(unsupported_by_provider)`), the citations of a cited
-answer whose text stays (`messages.content.citations->dropped(unsupported_by_provider)`), and a
-selector that named the tool (`tool_choice->dropped(unsupported_by_provider)`), because Claude
-Code recovers on its own once WebSearch is simply absent while a 400 kills the turn (two
-production turns on 2026-09-11). The terminal `message_delta` usage
-report supersedes the `message_start` input legs when present, because server-tool turns re-read
-fetched results as input and the start-frame count severely undercounts the billed total.
+`POST /v1/messages`; its contract is in [Anthropic Messages protocol](gateway-anthropic-protocol.md).
 
 Gateway-executed web search is documented in [gateway-web-search.md](gateway-web-search.md);
 gateway-executed tool search in [gateway-tool-search.md](gateway-tool-search.md).
@@ -621,7 +563,15 @@ leading system/developer messages, which every turn of a session and every reque
 system prompt repeat verbatim; the first user turn when there is no system prompt) stands in, so
 a Terminus-style loop is pinned to the node holding its cached stem for its whole session with
 no client change (measured through the gateway on a hot stem: 9/10 hits keyed vs 4/10 unkeyed). The derived key is dispatch state on the provider request only;
-the public request, its digests, and replay identity never carry it. A host that sets `AuthorizationSnapshot.prompt_caching_disabled` (an organization that turned prompt caching off) gets none of this: admission (`exp/runtime/gateway/prompt_caching.py`) derives no key, skips rendezvous and sticky placement so every pool keeps its certified order, binds no Google cache resource, removes every caller `cache_control` marker before payloads are built (each path disclosed with `->not_forwarded(organization_prompt_caching_off)`, the caller's `prompt_cache_key` included), classes the request as a fresh session for lane spill, and discloses `prompt_caching->best_effort(provider_caches_implicitly)` unless every admitted rung is Anthropic's API or Claude on Vertex AI, which cache only at markers. LiteLLM message dumps
+the public request, its digests, and replay identity never carry it. Novita pins a session to the
+server holding its prefix cache by an `x-session-id` header instead (enabled on the house account
+2026-10-21; before it, a long DeepSeek conversation crossing Novita's context-length pools or a
+failover reprocessed up to 520,000 prompt tokens cold), so rungs on `api.novita.ai` also carry a
+`provider_session_id` there (`exp/runtime/gateway/native_rungs.py::with_session_affinity`). Its
+material separates conversations, unlike the stem key, which every session of one agent shares
+and which would pin them all to one server: the caller's `prompt_cache_key` when present,
+otherwise the conversation's opening (every message through the first user turn), namespaced
+the same way. A host that sets `AuthorizationSnapshot.prompt_caching_disabled` (an organization that turned prompt caching off) gets none of this: admission (`exp/runtime/gateway/prompt_caching.py`) derives no key or session id, skips rendezvous and sticky placement so every pool keeps its certified order, binds no Google cache resource, removes every caller `cache_control` marker before payloads are built (each path disclosed with `->not_forwarded(organization_prompt_caching_off)`, the caller's `prompt_cache_key` included), classes the request as a fresh session for lane spill, and discloses `prompt_caching->best_effort(provider_caches_implicitly)` unless every admitted rung is Anthropic's API or Claude on Vertex AI, which cache only at markers. LiteLLM message dumps
 (`provider_specific_fields`, null `thinking_blocks` / `reasoning_items` / `images`) decode when
 echoed back verbatim: the object is dropped with a `messages.provider_specific_fields`
 disclosure and the empty forms are accepted like the SDK's own empty keys, while populated
@@ -861,6 +811,13 @@ e.g. `temperature->1.0(route_minimum)` ([gateway-generation.md](gateway-generati
 admission drops it with `top_k->dropped(unsupported_by_provider)` because defaults still serve.
 `frequency_penalty` and `presence_penalty` follow their per-rung capability truth and otherwise
 drop with `<parameter>->dropped(unsupported_by_provider)`. These are soft preferences.
+OpenRouter's Chat sampling extras `repetition_penalty` (0 to 2, exclusive of 0), `min_p` and
+`top_a` (0 to 1) are accepted on every Chat request, as OpenRouter accepts them: each rung whose
+wire carries a field receives it (OpenRouter all three; a self-hosted vLLM rung, one whose
+dispatch policy authors `upstream_priority` such as an Experiential Cloud lane, `repetition_penalty`
+and `min_p`), and every other rung, generic OpenAI-compatible resellers included, dispatches
+without it, disclosed as `<parameter>->dropped(unsupported_by_provider)`. A value of
+the wrong type or outside its range is still a 400 naming the field.
 Chat token probabilities are opt-in on verified compatible rungs; see [Chat token probabilities](chat-logprobs.md).
 Native Responses probabilities use their own capability and selector; see [Responses output probabilities](responses-logprobs.md).
 A caller
@@ -906,32 +863,6 @@ A valid native thinking configuration is kept by narrowing the route before cons
 translation. A route that offers reasoning but cannot honor the requested control is not
 silently served at its default depth. See [generation controls](gateway-generation.md).
 
-On the Messages stream, `message_start.message.usage` is a PRE-DISPATCH figure and
-`message_delta.usage` is the authoritative one. Every Messages usage object (`message_start`,
-`message_delta`, and the non-streamed body) carries Anthropic's four legs, always present and
-`0` when the provider reported none: `input_tokens` (uncached input), `cache_creation_input_tokens`,
-`cache_read_input_tokens`, and `output_tokens`. The cache legs come out of the normalized
-folded total the ledger bills: an Anthropic rung's own `cache_read_input_tokens` /
-`cache_creation_input_tokens`, an OpenAI-wire rung's `prompt_tokens_details.cached_tokens`
-(Chat) or `input_tokens_details.cached_tokens` (Responses), Gemini's `cachedContentTokenCount`,
-Bedrock's `cacheReadInputTokens`; Anthropic and Bedrock report cache writes. Other rungs
-carry `cache_creation_input_tokens: 0`. The start frame carries what the upstream already
-reported before content — an Anthropic upstream's own start-frame input and cache meters,
-mirrored — and otherwise the control plane's pre-dispatch count of the prompt (the reservation
-estimator without its headroom, carried on the admission as `input_token_estimate`, the same
-count `count_tokens` answers) in Anthropic's documented start shape,
-`{"input_tokens": N, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 1}`
-(nothing is cached before dispatch). The count covers the system blocks, every turn's content
-blocks (tool_use and tool_result included), and each tool definition, so a Claude Code session
-reads in the thousands there; a two-digit figure is a two-digit prompt (Claude Code's own
-startup probes), never a stub. An OpenAI-wire upstream reports nothing before its final chunk,
-so without the estimate its `message_start` showed the zero placeholder that clients reading
-input from the start frame alone (Claude Code) display as 0 input tokens. `message_delta.usage`
-carries the provider's final meters plus the platform's cost extensions; the official Anthropic
-SDK accumulators (Python and TypeScript) copy every usage field present on `message_delta`, so
-their final message shows the true counts. The estimate is display-only: the encoder keeps it
-apart from the usage it settles from, so it never reaches `message_delta` or the ledger, which
-bill the provider's report.
 Gemini `modelStatus` is not preserved; catalogs must leave `reports_model_status` false until the response contract carries it.
 
 Commit-independent headers are available before streaming begins. Route-dependent headers are

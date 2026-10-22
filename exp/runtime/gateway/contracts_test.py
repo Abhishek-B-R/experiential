@@ -17,7 +17,6 @@ from exp.runtime.gateway.compatibility import (
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
@@ -29,6 +28,7 @@ from exp.runtime.gateway.contracts import (
     ProjectTarget,
     StructuredTextFormat,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.replay_identity import canonical_request_sha256
 from exp.runtime.gateway.tool_search.contracts import GatewayToolSearch
 

@@ -40,6 +40,7 @@ before (``started_attempt_payload``).
 from __future__ import annotations
 
 import json
+import math
 
 from exp.common.models.catalog import BillingSource
 from exp.common.models.gateway_catalog import ExactModelDeployment
@@ -88,6 +89,9 @@ def is_self_hosted_rung(deployment: ExactModelDeployment) -> bool:
 def rung_saturation(loads: RungLoadRegistry, deployment: ExactModelDeployment) -> float | None:
     """The rung's in-flight load as a fraction of its bound on this worker.
 
+    On a rung with a ``:fast`` reserve it is the regular count over the
+    regular share (``bound`` minus the reserve).
+
     The bound is the rung's authored ``concurrency_bound``, else the worker's
     default lane share; ``None`` when the rung is unbounded (no saturation
     signal exists, so a threshold-gated pace never applies there).
@@ -100,7 +104,13 @@ def rung_saturation(loads: RungLoadRegistry, deployment: ExactModelDeployment) -
     )
     if bound is None:
         return None
-    return loads.inflight(rung_load_key(deployment)) / bound
+    key = rung_load_key(deployment)
+    # Under a :fast reserve the paced traffic lives in the regular share, so
+    # saturation is the regular count over that share and still reaches 1.0.
+    reserve = fast_reserve_slots(deployment)
+    if reserve is not None:
+        return (loads.inflight(key) - loads.fast_inflight(key)) / (bound - reserve)
+    return loads.inflight(key) / bound
 
 
 def attempt_output_pace(
@@ -184,6 +194,29 @@ def fast_on_rung(authorization: AuthorizationSnapshot, deployment: ExactModelDep
         and is_self_hosted_rung(deployment)
         and deployment.gateway.prices.priority is not None
     )
+
+
+def fast_reserve_slots(deployment: ExactModelDeployment) -> int | None:
+    """In-flight slots per worker kept for ``:fast`` on this rung, or ``None``.
+
+    Only a self-hosted rung with a priority card and an authored bound keeps a
+    reserve (``GatewayRungDispatchPolicy.fast_reserve_fraction``): the regular
+    share is ``(1 - fraction) * bound`` rounded half up, at least one, and the
+    reserve is the rest. A bound too small to split (1, or 2 at 0.25) keeps no
+    reserve rather than reserving everything.
+    """
+    policy = deployment.gateway.dispatch
+    if (
+        policy is None
+        or policy.fast_reserve_fraction is None
+        or policy.concurrency_bound is None
+        or not is_self_hosted_rung(deployment)
+        or deployment.gateway.prices.priority is None
+    ):
+        return None
+    bound = policy.concurrency_bound
+    regular = max(1, math.floor((1 - policy.fast_reserve_fraction) * bound + 0.5))
+    return bound - regular if regular < bound else None
 
 
 def fast_request(request: GatewayRequest, authorization: AuthorizationSnapshot) -> GatewayRequest:

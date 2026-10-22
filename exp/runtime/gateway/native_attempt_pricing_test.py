@@ -18,7 +18,11 @@ from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.common.models.model import BillingSource, ModelCapabilities
 from exp.runtime.gateway.attempt_tokens import worst_case_output_tokens
 from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind, SQLiteBudgetStore
-from exp.runtime.gateway.contracts import AttemptId, ExecutionSnapshot, GatewayServiceTierAdmission
+from exp.runtime.gateway.contracts import (
+    AttemptId,
+    GatewayServiceTierAdmission,
+)
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.ledger_test import (
     FakeLedgerClock,

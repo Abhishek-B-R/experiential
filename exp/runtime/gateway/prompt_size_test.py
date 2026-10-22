@@ -8,17 +8,18 @@ import base64
 import pytest
 
 from exp.common.models.content import ImageContentPart, TextContentPart
+from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.common.models.model import ModelCapabilities, ToolCall
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayMessage,
     GatewayRequest,
     GatewayToolDefinition,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.prompt_size import (
     MAXIMUM_BYTES_PER_TOKEN,
     TEMPLATE_RESERVE_TOKENS,
@@ -26,6 +27,7 @@ from exp.runtime.gateway.prompt_size import (
     clamp_output_to_context_window,
     context_window_compatible_indexes,
     minimum_prompt_tokens,
+    prompt_cap_indexes,
     prompt_text_bytes,
 )
 from exp.runtime.gateway.routing import GatewayRoute
@@ -281,3 +283,31 @@ def test_the_window_clamp_leaves_fitting_permissive_and_hopeless_requests_alone(
     permissive = _route(_deployment("open", None), _deployment("large", 2_000))
     request = _request("hi", max_tokens=10_000_000)
     assert clamp_output_to_context_window(permissive, request) == (request, ())
+
+
+def _capped(deployment: ExactModelDeployment, cap: int) -> ExactModelDeployment:
+    """``deployment`` with an authored prompt cap (a dedicated :fast replica)."""
+    return deployment.model_copy(
+        update={
+            "gateway": deployment.gateway.model_copy(
+                update={"dispatch": GatewayRungDispatchPolicy(max_prompt_tokens=cap)}
+            )
+        }
+    )
+
+
+def test_a_prompt_cap_skips_its_rung_by_prompt_only() -> None:
+    """A long prompt leaves the capped replica for the main lane; a big max_tokens never does."""
+    route = _route(_capped(_deployment("fast", 200_000), 1_000), _deployment("main", 200_000))
+    assert prompt_cap_indexes(route, _request(_tokens(999))) is None
+    assert prompt_cap_indexes(route, _request(_tokens(1_000))) == (1,)
+    assert prompt_cap_indexes(route, _request(_tokens(10), max_tokens=100_000)) is None
+
+
+def test_capped_rungs_stay_when_no_uncapped_rung_of_their_model_is_left() -> None:
+    """Every rung capped: kept, never a refusal. A cap never moves a request to another model."""
+    alone = _route(_capped(_deployment("fast", 200_000), 1_000))
+    assert prompt_cap_indexes(alone, _request(_tokens(2_000))) is None
+    other_model = _deployment("other", 200_000).model_copy(update={"exact_model_id": "exact-two"})
+    mixed = _route(_capped(_deployment("fast", 200_000), 1_000), other_model)
+    assert prompt_cap_indexes(mixed, _request(_tokens(2_000))) is None

@@ -31,7 +31,6 @@ from exp.runtime.gateway.budgets import (
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayEvent,
     GatewayFailure,
@@ -42,6 +41,7 @@ from exp.runtime.gateway.contracts import (
     GatewayServiceTierSettlement,
     GatewayUsage,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.ledger import AttemptRejectedError
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,

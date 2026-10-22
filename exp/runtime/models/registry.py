@@ -521,7 +521,11 @@ class RuntimeModelCatalog:
             # the OpenAI-deployments wire (which 404s `api_not_supported` for
             # them). A known Anthropic model on an Azure connection routes there;
             # every other azure model keeps the OpenAI-compatible AzureClient.
-            if known_model_metadata("anthropic", snapshot.model_id) is not None:
+            # ``model`` is the operator-chosen DEPLOYMENT name, so a Claude
+            # deployment named anything but its model id is recognized through
+            # ``served_model_id``, the model the deployment answers as. The
+            # request still names the deployment.
+            if _azure_anthropic_model(snapshot.model_id, record.served_model_id):
                 anthropic_client = AnthropicClient(
                     model=snapshot,
                     api_key=api_key,
@@ -857,6 +861,24 @@ SUPPORTED_PROVIDERS = frozenset(_HTTP_PROVIDERS) | {
     "vertex",
 }
 """Every provider identifier the runtime registry can construct a client for."""
+
+
+def _azure_anthropic_model(deployment: str, served_model_id: str | None) -> bool:
+    """Whether an Azure deployment serves a known Anthropic model.
+
+    Args:
+        deployment: The Azure deployment name the request addresses.
+        served_model_id: The model the deployment answers as, when the catalog
+            pins one; it names the model behind an operator-chosen deployment.
+
+    Returns:
+        True when either names a model the Anthropic metadata table knows.
+    """
+    return any(
+        known_model_metadata("anthropic", model_id) is not None
+        for model_id in (deployment, served_model_id)
+        if model_id is not None
+    )
 
 
 def _supports_flag(capabilities: ModelCapabilities, name: str) -> bool:

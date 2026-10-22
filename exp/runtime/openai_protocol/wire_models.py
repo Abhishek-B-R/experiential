@@ -27,6 +27,7 @@ from exp.common.models.content import (
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort
 from exp.runtime.gateway.reasoning_carrier import MAXIMUM_REASONING_CARRIER_BYTES
 from exp.runtime.gateway.request_policy import GatewayRequestPolicy
+from exp.runtime.gateway.sampling_extras import SamplingExtraFields
 from exp.runtime.gateway.service_tiers import ServiceTier
 from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.cache_control import EphemeralCacheControl
@@ -548,7 +549,7 @@ class _ChatTemplateKwargs(_WireModel):
     preserve_thinking: bool | None = None
 
 
-class _ChatRequest(_WireModel):
+class _ChatRequest(SamplingExtraFields, _WireModel):
     """Closed gateway Chat Completions request profile.
 
     Attributes:
@@ -914,7 +915,7 @@ _ResponsesInputItem = _ResponseMessage | _ResponsesOutputItem
 
 
 class _PromptCacheOptions(_WireModel):
-    """Responses prompt-cache selector, accepted only in its implicit mode.
+    """Responses prompt-cache selector: implicit mode and a minimum cache lifetime.
 
     VS Code Copilot's custom-endpoint provider hardcodes
     ``{"mode": "implicit"}`` on every Responses request (wire-captured
@@ -922,9 +923,17 @@ class _PromptCacheOptions(_WireModel):
     already do, so the value is accepted as already satisfied; any other
     mode names behavior this gateway does not provide and stays a closed
     rejection.
+
+    Attributes:
+        mode: ``"implicit"`` or omitted (OpenAI's default for GPT-5.6 and later).
+        ttl: OpenAI's minimum cache lifetime. ``"30m"`` is the provider default
+            and is accepted as already satisfied. ``"12h"`` is forwarded only to
+            rungs that declare ``supports_prompt_cache_ttl_12h``, and is refused
+            when none does. Any other value is refused here, as OpenAI refuses it.
     """
 
-    mode: Literal["implicit"]
+    mode: Literal["implicit"] | None = None
+    ttl: Literal["30m", "12h"] | None = None
 
 
 class _ResponsesRequest(_WireModel):

@@ -302,6 +302,10 @@ def prepare_route_requests(
         ):
             route = select_route_deployments(route, tier_indexes)
             resolved_wires = tuple(resolved_wires[index] for index in tier_indexes)
+    # Rung prompt caps after window, capability and tier narrowing (prompt_cap_indexes).
+    if (uncapped := prompt_size.prompt_cap_indexes(route, request)) is not None:
+        route = select_route_deployments(route, uncapped)
+        resolved_wires = tuple(resolved_wires[index] for index in uncapped)
 
     admitted_request = request
     coercion_disclosures: tuple[str, ...] = admission_disclosures
@@ -587,10 +591,11 @@ def _affinity_ordered_rungs(
     pin a conversation to a dead lane. The cache-marker guarantee composes: a
     cache-marked request on a route mixing marker-honoring and marker-dropping
     wires still dispatches the marker-honoring group first, ordered within
-    each group. The other failover modes are untouched; prompt caching off, or a
-    ``:fast`` request (host-ordered, least-loaded first), keeps the certified order.
+    each group. The other failover modes are untouched; prompt caching off keeps
+    the certified order. A ``:fast`` request is placed like any other: its
+    dedicated replicas keep their prefix cache warm per conversation.
     """
-    if authorization.prompt_caching_disabled or authorization.fast:
+    if authorization.prompt_caching_disabled:
         return route, resolved_wires, AffinityPlacement()
     if route.snapshot.model_stages or accounting.recovery_host is not None:
         return stage_affinity_ordered_rungs(

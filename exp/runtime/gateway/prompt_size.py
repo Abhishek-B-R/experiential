@@ -246,3 +246,38 @@ def context_window_compatible_indexes(
             "larger context window."
         )
     raise ProviderParameterError(message=message, param=param, code=CONTEXT_LENGTH_EXCEEDED_CODE)
+
+
+def prompt_cap_indexes(route: GatewayRoute, request: GatewayRequest) -> tuple[int, ...] | None:
+    """The rungs to keep once ``max_prompt_tokens`` caps are applied, or ``None`` to keep all.
+
+    A rung whose authored prompt cap (``GatewayRungDispatchPolicy.max_prompt_tokens``)
+    the prompt's lower-bound estimate reaches is dropped, counting the prompt
+    only (a large ``max_tokens`` never drops it), but only when an uncapped
+    rung of the same exact model stays on the route: the cap is a preference
+    (a dedicated low-batch replica keeping long cold prefills off), never a
+    reason to refuse or to move the request to another model. It runs after
+    the window, capability and tier narrowing; the generation-profile and
+    protocol narrowing follow it, which a dedicated replica of the same model
+    on the same wire passes exactly as its main lane does.
+    """
+    minimum = prompt_text_bytes(request) // MAXIMUM_BYTES_PER_TOKEN
+    capped: set[int] = set()
+    for index, deployment in enumerate(route.deployments):
+        dispatch = deployment.gateway.dispatch
+        cap = None if dispatch is None else dispatch.max_prompt_tokens
+        if cap is not None and minimum >= cap:
+            capped.add(index)
+    if not capped:
+        return None
+    served_models = {
+        deployment.exact_model_id
+        for index, deployment in enumerate(route.deployments)
+        if index not in capped
+    }
+    keep = tuple(
+        index
+        for index, deployment in enumerate(route.deployments)
+        if index not in capped or deployment.exact_model_id not in served_models
+    )
+    return None if len(keep) == len(route.deployments) else keep
