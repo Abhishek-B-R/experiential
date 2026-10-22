@@ -474,7 +474,11 @@ Media priced per character, second, or image settles its billed units on the uni
 at reservation ([gateway-media-surfaces.md](gateway-media-surfaces.md)).
 
 Normalized usage follows OpenAI subset semantics on every wire: `reasoning_tokens` counts a subset
-of `output_tokens`; cache reads and writes are disjoint subsets of `input_tokens`.
+of `output_tokens`; cache reads and writes are disjoint subsets of `input_tokens`. A report whose
+reads plus writes exceed its own input total (Moonshot's Kimi relayed by Novita does this on some
+prompts) settles rather than failing the finished generation: both cache legs are kept as reported
+and the input total is raised to cover them, so no reported cache token is dropped or priced lower,
+and the native data plane logs `cache_subsets_exceed_input` with the counts.
 `cache_creation_input_tokens` crosses the hosted settlement callback; Chat exposes it as
 `prompt_tokens_details.cache_write_tokens`. Hosted settlement prices each observed subset at
 its own rate; the local SQLite cost estimate still lacks a separate cache-write rate. Wires that report reasoning outside
