@@ -594,6 +594,22 @@ def test_audit_learns_fit_traces_then_measures_held_out_on_final_memory(
     assert len(provider.requests) == purchased, "the learned audit replays without calls"
 
 
+def test_identical_repeat_fit_traces_complete_the_audit_without_a_relearn_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeats are learned traces that publish no version, so learning is reported complete."""
+    episodes = [
+        *(episode(i) for i in range(USERS)),
+        *({**episode(i), "repeat": "-again"} for i in range(USERS)),
+    ]
+    provider = SimulatedProvider(episodes, learnable=True)
+    root, store, _ = build_project(tmp_path, monkeypatch, provider, episodes=episodes)
+    output = held_out_command(root, 3)
+    fit = USERS - len(held_out_lineages(store))
+    assert f"learned {2 * fit}/{2 * fit} fit traces · memory v{fit}" in output
+    assert "run the audit again" not in output
+
+
 def _import_id(store: ProjectStore) -> str:
     """The stored trace import the project was built from."""
     import_id = store.load_project().trace_import_id

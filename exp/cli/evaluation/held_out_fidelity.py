@@ -38,7 +38,13 @@ from exp.optimize.evaluation.held_out_fidelity import (
     register_held_out_fidelity,
     saved_held_out_results,
 )
-from exp.optimize.evaluation.trace_learning import fit_cases, learning_curve
+from exp.optimize.evaluation.trace_learning import (
+    fit_cases,
+    learned_runs,
+    learning_curve,
+    learning_plan,
+    recorded_plan,
+)
 from exp.optimize.evaluation.trace_replay import ReplayAggregate, ReplayResult, aggregate
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.models.structured_completion import CompletionNotDispatched
@@ -119,10 +125,16 @@ def run_held_out_fidelity(
                 )
             )
         fit = len(fit_cases(store))
-        if panel.memory_version is not None and panel.memory_version < fit:
+        # Count learned traces, not versions: an identical repeat trace publishes no version.
+        learned = (
+            len(learned_runs(store, learning_plan(store, scope="fit")))
+            if recorded_plan(store, "fit")
+            else 0
+        )
+        if panel.memory_version is not None and learned < fit:
             screen.print(
                 f"[yellow]warning[/yellow] memory v{panel.memory_version} learned "
-                f"{panel.memory_version} of {fit} fit traces; run the audit again to finish "
+                f"{learned} of {fit} fit traces; run the audit again to finish "
                 "learning and measure the fully learned simulator"
             )
         if dry_run:
@@ -318,7 +330,6 @@ def run_audit(
     from exp.cli.build.learning import BuildLearning, resolve_memory_recall, run_learning
     from exp.cli.build.summary import learning_lines, save_details
     from exp.common.models import load_model_catalog
-    from exp.optimize.evaluation.trace_learning import learning_curve, recorded_plan
 
     started = monotonic()
     console = Console(theme=EXP_THEME)
