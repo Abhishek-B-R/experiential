@@ -540,10 +540,7 @@ def _prefer_cache_capable_rungs(
     )
     if not marker_capable or len(marker_capable) == len(resolved_wires):
         return route, resolved_wires
-    order = (
-        *marker_capable,
-        *(index for index in range(len(resolved_wires)) if index not in marker_capable),
-    )
+    order = (*marker_capable, *(i for i in range(len(resolved_wires)) if i not in marker_capable))
     if order == tuple(range(len(resolved_wires))):
         return route, resolved_wires
     order = house_aggregator_last(order, route.deployments, [p for p, _ in resolved_wires])
