@@ -351,7 +351,7 @@ fn ensure_remaining(deadline: Instant) -> Result<(), Failure> {
     if Instant::now() >= deadline {
         Err(Failure::new(
             FailureClass::Timeout,
-            "gateway execution deadline exceeded",
+            crate::relay::DEADLINE_BEFORE_OUTPUT_MESSAGE,
         ))
     } else {
         Ok(())

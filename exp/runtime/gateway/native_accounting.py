@@ -98,6 +98,14 @@ from exp.runtime.openai_protocol.errors import public_failure_error
 _SWEEP_GRACE_SECONDS = 5.0
 _SWEEP_INTERVAL_SECONDS = 5.0
 _SWEEP_BATCH = 16
+
+# The request deadline ran out between attempts, before any provider answered.
+# The streaming relay names the other case (output already flowing) itself.
+DEADLINE_BEFORE_ANSWER_MESSAGE: Final = (
+    "the request reached the gateway's time limit before any provider finished "
+    "answering; retry the request"
+)
+
 _logger = logging.getLogger(__name__)
 
 
@@ -371,7 +379,7 @@ class NativeAttemptAccounting:
         if time.monotonic() >= entry.deadline_monotonic:
             failure = GatewayFailure(
                 failure_class=GatewayFailureClass.TIMEOUT,
-                safe_message="gateway execution deadline exceeded",
+                safe_message=DEADLINE_BEFORE_ANSWER_MESSAGE,
             )
             self.finish_request_quietly(entry.authorization, failure)
             with self._lock:
@@ -443,7 +451,7 @@ class NativeAttemptAccounting:
                     failure_class=GatewayFailureClass.TIMEOUT
                     if active
                     else GatewayFailureClass.CANCELLED,
-                    safe_message="gateway execution deadline exceeded"
+                    safe_message=DEADLINE_BEFORE_ANSWER_MESSAGE
                     if active
                     else "gateway request was cancelled",
                 )
