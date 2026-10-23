@@ -263,7 +263,10 @@ def decode_chat(
     OpenCode may attach an Anthropic-style ``cache_control`` annotation on
     Chat messages and on text content parts. Supported ephemeral forms are
     validated outside official OpenAI validation and retained on canonical
-    cache carriers for adapters that support them. Other unknown nested fields stay rejected. The
+    cache carriers for adapters that support them. Unknown keys on messages, their
+    tool calls and content parts are dropped with disclosure
+    (:mod:`exp.runtime.openai_protocol.unknown_message_fields`); every other unknown
+    nested field stays rejected. The
     Vercel AI SDK's camelCase ``promptCacheKey`` is folded onto
     ``prompt_cache_key`` first, so it decodes as the documented wire field.
 

@@ -815,49 +815,51 @@ def test_chat_decoder_rejects_malformed_text_part_cache_control() -> None:
     assert captured.value.detail.param == "messages.0.content.0.cache_control"
 
 
-def test_chat_decoder_still_rejects_unknown_nested_message_fields() -> None:
-    """Dropping cache_control must not weaken unrelated unknown nested fields."""
-    with pytest.raises(OpenAIProtocolError) as captured:
-        decode_chat(
-            {
-                "model": "coding",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": "hello",
-                        "cache_control": {"type": "ephemeral"},
-                        "providerOptions": {},
-                    }
-                ],
-            }
-        )
-    param = captured.value.detail.param
-    assert param == "messages.0.providerOptions"
+def test_chat_decoder_drops_unknown_message_fields_beside_cache_control() -> None:
+    """An unknown message key is dropped with disclosure; cache_control still rides."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "hello",
+                    "cache_control": {"type": "ephemeral"},
+                    "providerOptions": {},
+                }
+            ],
+        }
+    )
+    assert "messages.providerOptions->dropped(unknown_message_field)" in (
+        decoded.request.ignored_parameters
+    )
+    assert decoded.request.messages[0].provider_text_blocks[0]["cache_control"] is not None
 
 
-def test_chat_decoder_still_rejects_unknown_text_part_fields_with_cache_control() -> None:
-    """A valid text-part cache_control drop still rejects other extra part keys."""
-    with pytest.raises(OpenAIProtocolError) as captured:
-        decode_chat(
-            {
-                "model": "coding",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "hello",
-                                "cache_control": {"type": "ephemeral"},
-                                "future": 1,
-                            }
-                        ],
-                    }
-                ],
-            }
-        )
-    param = captured.value.detail.param
-    assert param is not None and param.startswith("messages.0.content")
+def test_chat_decoder_drops_unknown_text_part_fields_beside_cache_control() -> None:
+    """An unknown text-part key is dropped with disclosure; its cache_control still rides."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "hello",
+                            "cache_control": {"type": "ephemeral"},
+                            "future": 1,
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    assert decoded.request.ignored_parameters[0] == (
+        "messages.content.future->dropped(unknown_message_field)"
+    )
+    assert decoded.request.messages[0].provider_text_blocks[0]["cache_control"] is not None
 
 
 def test_chat_decoder_accepts_opencode_nucleus_and_usage_stream_shape() -> None:
@@ -5104,16 +5106,16 @@ def test_chat_decoder_rejects_misplaced_or_malformed_reasoning_details() -> None
         )
     assert bad_type.value.detail.param == "messages.0.reasoning_details.0.type"
     # An unknown message key whose name collides with a Responses item variant
-    # label is still reported as the caller's field, not swallowed to the
-    # message index (``reasoning`` used to render as ``messages.0``).
-    with pytest.raises(OpenAIProtocolError) as unknown:
-        decode_chat(
-            {
-                "model": "coding",
-                "messages": [{"role": "user", "content": "hi", "compaction": 1}],
-            }
-        )
-    assert unknown.value.detail.param == "messages.0.compaction"
+    # label is the caller's own field: it is dropped and named as such.
+    unknown = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi", "compaction": 1}],
+        }
+    )
+    assert unknown.request.ignored_parameters == (
+        "messages.compaction->dropped(unknown_message_field)",
+    )
 
 
 def test_provider_zdr_demand_decodes_on_both_openai_surfaces() -> None:
@@ -5651,9 +5653,9 @@ def test_chat_message_client_annotations_are_dropped_with_one_disclosure_each() 
     )
     assert tagged.request.messages == plain.request.messages
     assert tagged.request.ignored_parameters == (
-        "messages.cot_summary->dropped(client_annotation)",
         "messages.timestamp->dropped(client_annotation)",
         "messages.startsNewUserRequest->dropped(client_annotation)",
+        "messages.cot_summary->dropped(client_annotation)",
     )
 
 
