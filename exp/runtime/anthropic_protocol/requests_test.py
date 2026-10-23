@@ -902,7 +902,7 @@ def test_a_valid_tool_result_document_never_takes_the_blame_for_a_bad_sibling() 
         )
     assert excinfo.value.detail.param == "messages.0.content.0.content.1"
     assert "unsupported block type 'mystery'" in excinfo.value.detail.message
-    assert "text, image, and document sub-blocks" in excinfo.value.detail.message
+    assert "text, image, document, and tool_reference sub-blocks" in excinfo.value.detail.message
 
 
 def test_a_union_miss_never_reports_the_string_arm() -> None:
@@ -2695,3 +2695,133 @@ def test_an_unknown_content_block_type_is_named_instead_of_the_text_arm() -> Non
     assert excinfo.value.detail.param == "messages.0.content.1.type"
     assert "'container_upload'" in excinfo.value.detail.message
     assert "Input should be 'text'" not in excinfo.value.detail.message
+
+
+_DEFERRED_SCHEMA: JsonObject = {"type": "object", "properties": {"q": {"type": "string"}}}
+
+
+def _claude_code_tool_search_body(*, stream: bool) -> JsonObject:
+    """A Messages body shaped like Claude Code's client-side ToolSearch turn.
+
+    The caller declares its own ToolSearch tool and two deferred MCP tools
+    (no server tool-search tool), the model called ToolSearch, and the
+    tool_result loads one deferred tool with a ``tool_reference`` block.
+    """
+    return _body(
+        stream=stream,
+        tools=[
+            {"name": "Bash", "input_schema": {"type": "object"}},
+            {"name": "ToolSearch", "input_schema": {"type": "object"}},
+            {
+                "name": "mcp__github__create_issue",
+                "input_schema": _DEFERRED_SCHEMA,
+                "defer_loading": True,
+            },
+            {
+                "name": "mcp__slack__post_message",
+                "input_schema": _DEFERRED_SCHEMA,
+                "defer_loading": True,
+            },
+        ],
+        messages=[
+            {"role": "user", "content": "open an issue"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "ToolSearch",
+                        "input": {"query": "select:mcp__github__create_issue"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [
+                            {"type": "tool_reference", "tool_name": "mcp__github__create_issue"}
+                        ],
+                    }
+                ],
+            },
+        ],
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_tool_reference_blocks_inside_tool_results_ride_the_tool_message(stream: bool) -> None:
+    """Claude Code's ToolSearch result decodes instead of 400ing the session.
+
+    The reference is not content: it rides the tool message's reference
+    carrier, the result text stays empty, and the deferred markers stay on
+    the canonical tools.
+    """
+    decoded = decode_messages(_claude_code_tool_search_body(stream=stream))
+
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.role == "tool"
+    assert tool_message.tool_call_id == "toolu_1"
+    assert tool_message.content == ""
+    assert tool_message.content_parts == ()
+    assert tool_message.tool_references == ("mcp__github__create_issue",)
+    assert decoded.request.stream is stream
+    assert decoded.request.tool_search is None
+    assert [tool.defer_loading for tool in decoded.request.tools] == [None, None, True, True]
+
+
+def test_a_tool_reference_beside_text_keeps_the_text_and_moves_its_marker() -> None:
+    """A mixed result keeps its text; a reference's cache marker lands on the result."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [
+                                {"type": "text", "text": "found:"},
+                                {
+                                    "type": "tool_reference",
+                                    "tool_name": "Lookup",
+                                    "cache_control": {"type": "ephemeral"},
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ]
+        )
+    )
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.content == "found:"
+    assert tool_message.tool_references == ("Lookup",)
+    assert tool_message.cache_control == {"type": "ephemeral"}
+
+
+def test_a_malformed_tool_reference_is_rejected_by_field() -> None:
+    """A reference without a tool name is still refused, naming the sub-block."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "content": [{"type": "tool_reference"}],
+                            }
+                        ],
+                    }
+                ]
+            )
+        )
+    assert excinfo.value.detail.param is not None
+    assert excinfo.value.detail.param.startswith("messages.0.content.0.content.0")
