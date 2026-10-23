@@ -28,7 +28,7 @@ from exp.runtime.gateway.contracts import (
     GatewayToolDefinition,
 )
 from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice, GatewayCustomToolChoice
-from exp.runtime.models.providers.adaptive_thinking_budget import budgeted_enabled_config
+from exp.runtime.models.providers.adaptive_thinking_budget import budgeted_enabled_request
 from exp.runtime.models.providers.dialect_dispatch import (
     TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE,
     strip_tool_result_documents,
@@ -86,10 +86,6 @@ or ``reasoning.effort``) states the depth and the thinking config beside it is
 therefore redundant. Named so a caller never reads it as a stripped depth:
 Harbor read a bare ``thinking`` as "effort high does not apply" (2026-09-11)."""
 
-
-THINKING_TRANSLATED_DISCLOSURE = "thinking.type->enabled"
-"""Disclosure recorded when an adaptive thinking config is translated to a
-budgeted ``enabled`` config for a budgeted-enabled Anthropic route."""
 
 THINKING_NO_SERVABLE_TIER_DROP_DISCLOSURE = "thinking->dropped(no_servable_tier)"
 """Disclosure recorded when the route CAN reason but no tier of its ladder
@@ -163,16 +159,13 @@ def _coerce_adaptive_budget(
 ) -> RequestCoercion | None:
     """Translate an adaptive thinking config for a budgeted-enabled route, disclosed.
 
-    See :func:`adaptive_thinking_budget.budgeted_enabled_config` for when the
-    translation applies and how the budget is chosen.
+    See :func:`adaptive_thinking_budget.budgeted_enabled_request` for when the
+    translation applies, how the budget is chosen, and why an effort drops.
     """
-    translated = budgeted_enabled_config(profiles, request)
+    translated = budgeted_enabled_request(profiles, request)
     if translated is None:
         return None
-    return RequestCoercion(
-        request=request.model_copy(update={"provider_thinking_config": translated}),
-        disclosures=(THINKING_TRANSLATED_DISCLOSURE,),
-    )
+    return RequestCoercion(request=translated[0], disclosures=translated[1])
 
 
 THINKING_HEADROOM_DISCLOSURE = "reasoning_effort->none(max_tokens_headroom)"

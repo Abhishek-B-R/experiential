@@ -632,6 +632,49 @@ def test_adaptive_thinking_translates_to_a_budget_on_a_budgeted_route() -> None:
     assert coercion.disclosures == ("thinking.type->enabled",)
 
 
+def test_adaptive_thinking_beside_an_effort_serves_as_the_budget_on_a_budgeted_route() -> None:
+    """Claude Code's shape for a model it does not know reaches Haiku 4.5 as one budget.
+
+    Haiku 4.5 rejects both ``adaptive`` and ``output_config.effort`` by name, so
+    the translated budget is the only depth on the wire and the effort drops,
+    disclosed under the caller's field. An off effort is not translated on, and
+    an effort the decoder does not recognize keeps the provider's refusal.
+    """
+    profile = _budgeted_haiku_profile()
+    request = decode_messages(
+        {
+            "model": "claude-haiku-4.5",
+            "max_tokens": 32_000,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive", "display": "omitted"},
+            "output_config": {"effort": "high"},
+        }
+    ).request
+    coercion = coerce_generation_parameters((profile,), request)
+    assert coercion is not None
+    assert coercion.disclosures == (
+        "thinking.type->enabled",
+        "output_config.effort->dropped(superseded_by_thinking_budget)",
+    )
+    _public, provider = route_generation_parameter_requests((profile,), coercion.request)
+    payload = dialect_stream_payload(profile, provider)
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": 16_000, "display": "omitted"}
+    assert "output_config" not in payload
+
+    off = _messages_request(
+        provider_thinking_config={"type": "adaptive"},
+        reasoning_effort="none",
+        maximum_output_tokens=8_000,
+    )
+    assert coerce_generation_parameters((profile,), off) is None
+    unknown = _messages_request(
+        provider_thinking_config={"type": "adaptive"},
+        provider_output_config={"effort": "hyperdrive"},
+        maximum_output_tokens=8_000,
+    )
+    assert coerce_generation_parameters((profile,), unknown) is None
+
+
 def test_adaptive_thinking_with_a_legal_caller_budget_keeps_that_budget() -> None:
     """The model rejects ``adaptive`` by name, so a budget-carrying adaptive
     config still translates to enabled — honoring the caller's own depth."""
