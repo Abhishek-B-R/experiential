@@ -222,7 +222,10 @@ budget-capable rung, the budget snaps to the nearest tier the route's effort lad
 (under 2k tokens `low`, under 8k `medium`, under 24k `high`, above that `xhigh`; `0` asks for
 off and `-1` for the lane's default depth), disclosed as
 `thinking.budget_tokens->reasoning_effort:<tier>(route_effort_ladder)`. Only a route with no
-reasoning tier refuses it, and a budget beside an explicit effort stays refused.
+reasoning tier refuses it, and a budget beside an explicit effort stays refused. Haiku 4.5
+rejects adaptive thinking and `output_config.effort` by name, so `thinking: {type: "adaptive"}`
+there becomes a budget derived from `max_tokens` (`thinking.type->enabled`), and a recognized
+effort beside it drops as `output_config.effort->dropped(superseded_by_thinking_budget)`.
 
 The Chat field `thinking_budget` preserves the caller's numeric control on qualified
 Anthropic, Gemini 2.5, and native Qwen Cloud routes. Use it as an OpenAI SDK `extra_body`
