@@ -350,8 +350,10 @@ fn independently_rounded_live_scores_preserve_provider_answers_and_usage() {
 #[test]
 fn rounding_never_excuses_infeasible_scores_or_high_precision_disagreement() {
     for (probabilities, score) in [
-        (vec![1.0, 0.0, 0.0, 0.0, 0.0], 0.03),
-        (vec![0.0, 0.0, 0.0, 0.0, 1.0], 3.97),
+        // A unit bin may have absorbed the folded residual of four bins just
+        // under half a hundredth each (latent expectation up to 0.05), never more.
+        (vec![1.0, 0.0, 0.0, 0.0, 0.0], 0.06),
+        (vec![0.0, 0.0, 0.0, 0.0, 1.0], 3.94),
         (vec![0.0, 0.87, 0.13, 0.0, 0.0], 1.5),
         (vec![0.0, 0.87, 0.13, 0.0, 0.0], 1.12001),
         (vec![0.0, 0.87, 0.13, 0.0, 0.0], 1.120000000005),
@@ -409,11 +411,12 @@ fn rounding_extrema_match_an_independent_three_bin_enumeration() {
         }
         let minimum = *possible.iter().min().unwrap();
         let maximum = *possible.iter().max().unwrap();
+        let (low, high) = score_envelope(&probabilities).expect("hundredth bins");
         for score_hundredths in 0..=200 {
             let feasible =
                 score_hundredths * 4 + 2 >= minimum && score_hundredths * 4 - 2 <= maximum;
             assert_eq!(
-                score_matches_distribution(score_hundredths as f64 / 100.0, &probabilities),
+                score_meets_envelope(score_hundredths as f64 / 100.0, low, high),
                 feasible,
                 "{probabilities:?}, score={score_hundredths}"
             );

@@ -739,6 +739,22 @@ fn score_matches_distribution(score: f64, probabilities: &[f64]) -> bool {
     let Some((minimum, maximum)) = score_envelope(probabilities) else {
         return false;
     };
+    if score_meets_envelope(score, minimum, maximum) {
+        return true;
+    }
+    // TypeSafe also publishes bins rounded to hundredths whose residual was
+    // folded into one highest bin so the total reads exactly one, while its
+    // score keeps the unrounded expectation (production 2026-10-23: 0.71 beside
+    // [0.49, 0.37, 0.11, 0.03], whose independent envelope tops out at 0.70).
+    // That folded bin can sit up to half a hundredth per other bin away from
+    // its latent value, so it gets its own envelope; nothing wider is excused.
+    residual_envelope(probabilities)
+        .is_some_and(|(minimum, maximum)| score_meets_envelope(score, minimum, maximum))
+}
+
+/// Whether a score, read at the precision it was reported to, meets an
+/// envelope in half-hundredths.
+fn score_meets_envelope(score: f64, minimum: i64, maximum: i64) -> bool {
     // The score is rounded at the precision the provider REPORTED it to
     // (TypeSafe answers `score=3.9` beside bins whose latent expectation is
     // 3.87, production 2026-10-17), so it stands for the closed interval of
@@ -783,6 +799,54 @@ fn score_envelope(probabilities: &[f64]) -> Option<(i64, i64)> {
     Some((minimum, maximum))
 }
 
+/// Extreme expectations, in half-hundredths, of the latent unit distributions
+/// behind hundredth bins published by rounding every bin and folding the
+/// normalization residual into one bin that rounded highest; `None` unless every
+/// bin is hundredth-valued and the published total is exactly one.
+///
+/// Every other bin stays inside its half-hundredth rounding interval and the
+/// folding bin carries whatever mass is left. A bin is a folding candidate only
+/// if some latent distribution lets it round highest: rounding to hundredths
+/// keeps it within one hundredth below every other bin, which is necessary at
+/// the other bins' lower bounds (the assignment that leaves it the most mass).
+/// The extremes then fill each other bin at the bound its weight favors.
+fn residual_envelope(probabilities: &[f64]) -> Option<(i64, i64)> {
+    let published = probabilities
+        .iter()
+        .map(|value| hundredths(*value))
+        .sum::<Option<i64>>()?;
+    if published != 100 {
+        return None;
+    }
+    let bounds = rounding_bounds(probabilities)?;
+    let mut envelope: Option<(i64, i64)> = None;
+    for folded in 0..bounds.len() {
+        let others = || {
+            bounds
+                .iter()
+                .enumerate()
+                .filter(move |(index, _)| *index != folded)
+        };
+        let lower_sum: i64 = others().map(|(_, (low, _))| low).sum();
+        let highest_lower = others().map(|(_, (low, _))| *low).max().unwrap_or(0);
+        if highest_lower + lower_sum > 202 {
+            continue;
+        }
+        let base = 200 * folded as i64;
+        let (mut minimum, mut maximum) = (base, base);
+        for (index, (low, high)) in others() {
+            let weight = index as i64 - folded as i64;
+            let (least, most) = if weight > 0 { (low, high) } else { (high, low) };
+            minimum += weight * least;
+            maximum += weight * most;
+        }
+        envelope = Some(envelope.map_or((minimum, maximum), |(low, high)| {
+            (low.min(minimum), high.max(maximum))
+        }));
+    }
+    envelope
+}
+
 /// A score rejection that names the numbers it was judged on.
 ///
 /// The reason is replaced by the generic malformed-response message on the
@@ -796,14 +860,18 @@ fn score_mismatch(reason: &str, score: f64, probabilities: &[f64]) -> Failure {
         .map(f64::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let envelope = score_envelope(probabilities).map_or_else(
-        || "none".to_string(),
-        |(minimum, maximum)| format!("[{},{}]", minimum as f64 / 200.0, maximum as f64 / 200.0),
-    );
+    let render = |envelope: Option<(i64, i64)>| {
+        envelope.map_or_else(
+            || "none".to_string(),
+            |(minimum, maximum)| format!("[{},{}]", minimum as f64 / 200.0, maximum as f64 / 200.0),
+        )
+    };
     malformed(&format!(
         "{reason} (score={score}, expected={}, probabilities=[{bins}], \
-         rounding_envelope={envelope}, tolerance={PROBABILITY_TOLERANCE})",
-        expected_score(probabilities)
+         rounding_envelope={}, residual_envelope={}, tolerance={PROBABILITY_TOLERANCE})",
+        expected_score(probabilities),
+        render(score_envelope(probabilities)),
+        render(residual_envelope(probabilities)),
     ))
 }
 

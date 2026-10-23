@@ -62,6 +62,7 @@ fn a_rejected_score_names_its_numbers_in_the_ledger_detail() {
         "expected=1.13",
         "probabilities=[0,0.87,0.13,0,0]",
         "rounding_envelope=[1.12,1.15]",
+        "residual_envelope=[1.12,1.16]",
         "tolerance=0.000001",
     ] {
         assert!(
@@ -76,4 +77,156 @@ fn a_rejected_score_names_its_numbers_in_the_ledger_detail() {
         "provider returned a malformed response; retry the request"
     );
     assert!(boundary.provider_detail.unwrap().contains("score=1.5"));
+}
+
+#[test]
+fn a_score_beside_a_folded_rounding_residual_is_admitted() {
+    // Production 2026-10-23 (jev-latest via typesafe, 82 refusals in three
+    // hours, numbers only): TypeSafe rounds every bin to hundredths, folds the
+    // residual into the highest bin so the total reads exactly one, and keeps
+    // the unrounded expectation as the score. Four levels miss the independent
+    // envelope by exactly 0.03, five levels by 0.04.
+    for (probabilities, score) in [
+        (vec![0.49, 0.37, 0.11, 0.03], 0.71),
+        (vec![0.62, 0.26, 0.08, 0.04], 0.57),
+        (vec![0.73, 0.18, 0.06, 0.03], 0.36),
+        (vec![0.47, 0.36, 0.13, 0.04], 0.71),
+        (vec![0.44, 0.3, 0.16, 0.1], 0.95),
+        (vec![0.6900000000000001, 0.21, 0.06, 0.04], 0.48),
+        (vec![0.6799999999999999, 0.2, 0.08, 0.04], 0.45),
+        (vec![0.3, 0.5, 0.15, 0.03, 0.02], 0.93),
+        (vec![0.02, 0.01, 0.05, 0.52, 0.4], 3.23),
+    ] {
+        let independent = score_envelope(&probabilities).expect("unit hundredth bins");
+        assert!(
+            !score_meets_envelope(score, independent.0, independent.1),
+            "{probabilities:?} {score} is outside the independent envelope"
+        );
+        let (admitted, provider) = score_payload(&probabilities, score);
+        let (public, _) = public_decisions(provider.clone(), &admitted)
+            .expect("a folded rounding residual explains the score");
+        assert_eq!(public["answers"], provider["answers"]);
+    }
+    // One hundredth further is refused: the folded bin sits at most half a
+    // hundredth per other bin from its latent value.
+    for (probabilities, score) in [
+        (vec![0.49, 0.37, 0.11, 0.03], 0.72),
+        (vec![0.49, 0.37, 0.11, 0.03], 0.64),
+        (vec![0.3, 0.5, 0.15, 0.03, 0.02], 0.92),
+        (vec![0.02, 0.01, 0.05, 0.52, 0.4], 3.22),
+    ] {
+        let (admitted, provider) = score_payload(&probabilities, score);
+        assert!(public_decisions(provider, &admitted)
+            .expect_err("beyond the folded residual")
+            .safe_message
+            .contains("residual_envelope=["));
+    }
+    // A middle highest bin folds less: [0.3, 0.6, 0.1] spans only [0.79, 0.81]
+    // under folding, so 0.82 is still refused.
+    assert!(!score_matches_distribution(0.82, &[0.3, 0.6, 0.1]));
+    // Bins that do not total exactly one were not folded.
+    assert_eq!(residual_envelope(&[0.33, 0.33, 0.33]), None);
+    assert_eq!(residual_envelope(&[0.333, 0.333, 0.334]), None);
+}
+
+#[test]
+fn the_folded_residual_envelope_matches_an_independent_enumeration() {
+    // Latent bins on a quarter-hundredth grid (twice the half-hundredth rounding
+    // ties), rounded to hundredths with ties either way, then the residual folded
+    // into each bin that rounded highest: the extremes of every latent
+    // expectation that publishes exactly these bins, in half-hundredths. Shares
+    // nothing with the envelope's bound-filling algorithm.
+    fn enumerate(probabilities: &[f64]) -> (i64, i64) {
+        let published: Vec<i64> = probabilities
+            .iter()
+            .map(|p| (p * 100.0).round() as i64)
+            .collect();
+        let count = published.len();
+        let mut extremes: Option<(i64, i64)> = None;
+        let mut latent = vec![0_i64; count];
+        fn walk(
+            index: usize,
+            latent: &mut Vec<i64>,
+            published: &[i64],
+            extremes: &mut Option<(i64, i64)>,
+        ) {
+            let count = published.len();
+            if index + 1 == count {
+                let last = 400 - latent[..index].iter().sum::<i64>();
+                if !(0..=400).contains(&last) {
+                    return;
+                }
+                latent[index] = last;
+                let options: Vec<Vec<i64>> = latent
+                    .iter()
+                    .map(|units| match units % 4 {
+                        2 => vec![units / 4, units / 4 + 1],
+                        remainder if remainder > 2 => vec![units / 4 + 1],
+                        _ => vec![units / 4],
+                    })
+                    .collect();
+                let mut rounded = vec![0_i64; count];
+                round_each(0, &options, &mut rounded, latent, published, extremes);
+                return;
+            }
+            let center = published[index] * 4;
+            for units in (center - 12).max(0)..=(center + 12).min(400) {
+                latent[index] = units;
+                walk(index + 1, latent, published, extremes);
+            }
+        }
+        fn round_each(
+            index: usize,
+            options: &[Vec<i64>],
+            rounded: &mut Vec<i64>,
+            latent: &[i64],
+            published: &[i64],
+            extremes: &mut Option<(i64, i64)>,
+        ) {
+            if index == options.len() {
+                let highest = *rounded.iter().max().unwrap();
+                let residual = 100 - rounded.iter().sum::<i64>();
+                for folded in 0..rounded.len() {
+                    if rounded[folded] != highest {
+                        continue;
+                    }
+                    let matches = rounded.iter().enumerate().all(|(i, value)| {
+                        published[i] == value + if i == folded { residual } else { 0 }
+                    });
+                    if matches {
+                        // Quarter-hundredths to half-hundredths: exact, the
+                        // envelope's extremes sit on the half-hundredth grid.
+                        let value: i64 = latent.iter().enumerate().map(|(i, q)| i as i64 * q).sum();
+                        *extremes = Some(extremes.map_or((value, value), |(low, high)| {
+                            (low.min(value), high.max(value))
+                        }));
+                    }
+                }
+                return;
+            }
+            for choice in &options[index] {
+                rounded[index] = *choice;
+                round_each(index + 1, options, rounded, latent, published, extremes);
+            }
+        }
+        walk(0, &mut latent, &published, &mut extremes);
+        let (low, high) = extremes.expect("the published bins are reachable");
+        (low / 2, high / 2)
+    }
+    for probabilities in [
+        vec![0.49, 0.37, 0.11, 0.03],
+        vec![0.3, 0.5, 0.15, 0.03, 0.02],
+        vec![0.02, 0.01, 0.05, 0.52, 0.4],
+        vec![1.0, 0.0, 0.0, 0.0, 0.0],
+        vec![0.0, 0.87, 0.13, 0.0, 0.0],
+        vec![0.33, 0.34, 0.01, 0.32],
+        vec![0.5, 0.5],
+        vec![0.3, 0.6, 0.1],
+    ] {
+        assert_eq!(
+            residual_envelope(&probabilities),
+            Some(enumerate(&probabilities)),
+            "{probabilities:?}"
+        );
+    }
 }
