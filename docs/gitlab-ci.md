@@ -58,6 +58,11 @@ for `python-package`, the area's inputs in the **Run pipeline** form:
   `MATURIN_VERSION` and `RUST_TOOLCHAIN` in `.tools`. Container images are
   pinned by digest, and every install reads `uv.lock` and `Cargo.lock` as
   committed (`--locked`).
+- **Dependency audit.** `gate-dependency-audit` runs OSV-Scanner
+  (`OSV_SCANNER_VERSION`, checksum-verified) over `uv.lock` and the native
+  crate's `Cargo.lock`, and fails on any known advisory. An accepted advisory
+  is one `IgnoredVulns` entry in `.gitlab/ci/osv-scanner.toml`, by ID, with a
+  reason and an `ignoreUntil` date; new advisories always fail.
 - **Ordering.** Jobs order with `needs:`; a job without dependencies sets
   `needs: []` so it starts at once. Values pass between jobs through
   `artifacts:reports:dotenv`, and files through `artifacts:`.

@@ -34,6 +34,26 @@
     - !reference [.snippets, rust]
     - uv sync --locked --extra dev
 
+# Known advisories in the committed lockfiles: OSV-Scanner reads uv.lock and
+# the native crate's Cargo.lock and fails on any advisory that
+# .gitlab/ci/osv-scanner.toml does not accept by ID with a reason and an expiry.
+gate-dependency-audit:
+  extends: [.tools]
+  stage: test
+  image: python:3.13.17-trixie@sha256:2d90366719bf27f9a26d3496b34bfe44fc383b10e7360ca316152f7b348f4f92
+  needs: []
+  timeout: 10m
+  interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $RUN_WORKFLOW == "gate"
+  script:
+    - curl -fsSL --proto '=https' --retry 3 -o /tmp/osv-scanner "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+    - echo "${OSV_SCANNER_SHA256}  /tmp/osv-scanner" | sha256sum --check --strict -
+    - chmod +x /tmp/osv-scanner
+    - >-
+      /tmp/osv-scanner scan source --config .gitlab/ci/osv-scanner.toml
+      --lockfile uv.lock --lockfile exp/runtime/gateway/native/Cargo.lock
+
 gate-rust:
   extends: [.gate]
   script:
