@@ -7,7 +7,7 @@
 .gate:
   extends: [.tools]
   stage: test
-  image: python:3.13-trixie
+  image: python:3.13.17-trixie@sha256:2d90366719bf27f9a26d3496b34bfe44fc383b10e7360ca316152f7b348f4f92
   needs: []
   timeout: 1h
   interruptible: true
@@ -32,22 +32,22 @@
   before_script:
     - !reference [.snippets, uv]
     - !reference [.snippets, rust]
-    - uv sync --extra dev
+    - uv sync --locked --extra dev
 
 gate-rust:
   extends: [.gate]
   script:
     - rustup component add rustfmt clippy
     - cargo fmt --check --manifest-path exp/runtime/gateway/native/Cargo.toml
-    - cargo clippy --manifest-path exp/runtime/gateway/native/Cargo.toml --no-default-features -- -D warnings
+    - cargo clippy --locked --manifest-path exp/runtime/gateway/native/Cargo.toml --no-default-features -- -D warnings
     # The crate's unit-test binary links the image's libpython.
     - export PYO3_PYTHON="$CI_PROJECT_DIR/.venv/bin/python"
     - export LD_LIBRARY_PATH="$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    - cargo test --manifest-path exp/runtime/gateway/native/Cargo.toml --no-default-features
+    - cargo test --locked --manifest-path exp/runtime/gateway/native/Cargo.toml --no-default-features
     # Explicit cache crosses the real Python and native bridge.
     - export PYTHONPATH="$CI_PROJECT_DIR:$(.venv/bin/python -c 'import site; print(site.getsitepackages()[0])')"
     - >-
-      cargo test --manifest-path exp/runtime/gateway/native/Cargo.toml --no-default-features
+      cargo test --locked --manifest-path exp/runtime/gateway/native/Cargo.toml --no-default-features
       waterfall::attempt::google_cache::bridge_tests::real_python_control_plane_creates_and_reuses_through_bridge
       -- --ignored --exact
     - unset PYTHONPATH

@@ -69,7 +69,7 @@ dev = [
 exp = "exp.cli:main"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
@@ -120,6 +120,14 @@ convention = "google"
 "**/*_test.py" = ["D"]
 [tool.ty.environment]
 python-version = "3.12"
+
+[tool.uv]
+# Supply-chain cooldown: resolution only picks distributions uploaded at least
+# 7 days before the lock is written, so a compromised release is usually
+# yanked before it can enter uv.lock. Packages this project publishes itself
+# are exempt. Exempt any other package only for an urgent security fix.
+exclude-newer = "7 days"
+exclude-newer-package = { experiential = false, exp-gateway-native = false, exp-mitmproxy = false, exp-mitmproxy-rs = false }
 
 [tool.uv.sources]
 # The one permitted path source (AGENTS.md "One package"): repo checkouts rebuild the
