@@ -1,5 +1,9 @@
 //! Bounded provider events, committed to one deployment and drained by HTTP surfaces.
 
+mod deadline;
+pub use deadline::{
+    stream_timeout_failure, DEADLINE_BEFORE_OUTPUT_MESSAGE, DEADLINE_WHILE_GENERATING_MESSAGE,
+};
 mod progress;
 
 use std::collections::VecDeque;
@@ -81,21 +85,6 @@ pub fn event_retained_bytes(event: &Event) -> usize {
         Event::SafeguardResults(results) => crate::dialects::records_retained_bytes(results)
             .unwrap_or(MAXIMUM_RETAINED_OUTPUT_BYTES.saturating_add(1)),
         _ => 64,
-    }
-}
-
-/// Classify one mid-stream chunk timeout the way the python transport does:
-/// a stalled provider read is a retryable transport failure unless the
-/// request's own deadline is exhausted.
-pub fn stream_timeout_failure(deadline: Instant) -> Failure {
-    if remaining(deadline).is_zero() {
-        Failure::new(FailureClass::Timeout, "gateway execution deadline exceeded")
-    } else {
-        Failure::new(
-            FailureClass::Transport,
-            "provider transport failed; retry the request",
-        )
-        .with_retry(true, true)
     }
 }
 
@@ -402,6 +391,12 @@ impl UpstreamRelay {
     /// ready: Tokio's timeout polls a ready future before its timer.
     fn read_failure(&self, deadline: Instant, phase_timeout: Duration) -> Option<Failure> {
         if remaining(deadline).is_zero() {
+            if self.last_progress_at.is_some() {
+                return Some(Failure::new(
+                    FailureClass::Timeout,
+                    DEADLINE_WHILE_GENERATING_MESSAGE,
+                ));
+            }
             return Some(stream_timeout_failure(deadline));
         }
         if self.provider_tools.active() {
