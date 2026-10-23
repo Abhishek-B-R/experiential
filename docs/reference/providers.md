@@ -231,10 +231,11 @@ one within half a hundredth, and a thousandth-valued one within half a thousandt
 distribution's achievable weighted index. TypeSafe may also publish bins that were each
 rounded to hundredths with the normalization residual folded into one bin that rounded
 highest, beside a score computed from the unrounded distribution; when the published total is
-exactly 1, a score is also admitted against that convention's achievable weighted index, where
-every other bin stays within half a hundredth and only a bin that could have rounded highest may
-absorb the residual (four levels allow 0.01 more than independent rounding, five levels up to
-0.02). A whole-number score is read at tenths. Precision is
+exactly 1, a score is also admitted against that convention's exact achievable weighted index:
+every other bin stays within half a hundredth, and the bin that absorbed the residual must itself
+have rounded at least as high as every other published bin, which also bounds how far it can
+drift on a near tie (four levels allow up to 0.01 more than independent rounding, five levels up
+to 0.02). A whole-number score is read at tenths. Precision is
 read from the number itself, so a hundredth-rounded score ending in zero (`1.10`) is read at
 tenths. Finer-precision totals, winners and scores keep the exact checks. A rejected score
 records its numbers (score, recomputed expectation, bins, achievable rounding envelope, folded
