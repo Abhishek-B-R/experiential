@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Protocol, runtime_checkable
@@ -88,6 +88,26 @@ class InternalClassifierClient(Protocol):
         request. A transport that cannot prove that returns ``None``, which keeps
         the complete-request bound in force.
         """
+        ...
+
+    def input_projection(
+        self, *, check: GuardrailCheck
+    ) -> Callable[[GatewayRequest], GatewayRequest] | None:
+        """Return the adapter's bounded-subject projection, or ``None``.
+
+        A projection maps a request to a small one the adapter inspects
+        identically. A transport that cannot prove that returns ``None``, which
+        keeps the complete request as the subject.
+        """
+        ...
+
+
+@runtime_checkable
+class ProjectingClassifier(Protocol):
+    """An input adapter that reads only a bounded projection of the request."""
+
+    def project_input(self, request: GatewayRequest) -> GatewayRequest:
+        """Return a bounded request this adapter inspects exactly like ``request``."""
         ...
 
 
@@ -179,6 +199,15 @@ class DirectClassifierClient:
         if not isinstance(adapter, WindowedClassifier):
             return None
         return adapter.configuration_digest
+
+    def input_projection(
+        self, *, check: GuardrailCheck
+    ) -> Callable[[GatewayRequest], GatewayRequest] | None:
+        """Return the bound adapter's bounded-subject projection when it has one."""
+        adapter = self._registry.require(check.adapter_id)
+        if not isinstance(adapter, ProjectingClassifier):
+            return None
+        return adapter.project_input
 
 
 class ClassifierLookup(Protocol):

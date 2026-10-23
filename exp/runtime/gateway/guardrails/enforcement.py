@@ -320,6 +320,16 @@ class GuardrailEngine:
         retained = self._observations.max_subject_bytes
         bounds = tuple(self._input_limit(policy) for policy in policies)
         limit = min(retained, max(retained if bound is None else bound for bound in bounds))
+        projection = (
+            self._observation_projection(policies)
+            if all(bound is None for bound in bounds)
+            else None
+        )
+        if projection is not None:
+            # Every check reads only a bounded projection, so that is the whole
+            # subject: built fresh from immutable text, it needs no detaching
+            # copy, and no step below walks the complete conversation.
+            request = projection(request)
         if observation_subject_exceeds(request, limit):
             outcomes = tuple(
                 GuardrailOutcome.UNSUPPORTED
@@ -332,9 +342,10 @@ class GuardrailEngine:
             for policy, outcome in zip(policies, outcomes, strict=True):
                 self._emit_observation(policy, None, outcome, 0.0)
             return
-        # Frozen contracts can contain mutable JSON containers owned by the caller.
-        # Detach once so the hashed, budgeted and asynchronously inspected subject agrees.
-        request = request.model_copy(deep=True)
+        if projection is None:
+            # Frozen contracts can contain mutable JSON containers owned by the caller.
+            # Detach once so the hashed, budgeted and asynchronously inspected subject agrees.
+            request = request.model_copy(deep=True)
         subject: bytes | None = None
         try:
             subject = observation_subject_bytes(request)
@@ -360,6 +371,27 @@ class GuardrailEngine:
                 deadline_monotonic=deadline_monotonic,
                 size=size,
             )
+
+    def _observation_projection(
+        self, policies: tuple[GuardrailPolicy, ...]
+    ) -> Callable[[GatewayRequest], GatewayRequest] | None:
+        """Return the one projection every observed input check reads, or ``None``."""
+        shared: Callable[[GatewayRequest], GatewayRequest] | None = None
+        for policy in policies:
+            for check in policy.input_checks:
+                try:
+                    projection = self._client.input_projection(check=check)
+                except Exception:  # noqa: BLE001 - unresolvable adapters see the complete subject.
+                    return None
+                if projection is None:
+                    return None
+                if shared is None:
+                    shared = projection
+                elif getattr(projection, "__func__", projection) is not getattr(
+                    shared, "__func__", shared
+                ):
+                    return None
+        return shared
 
     def _submit_observation(
         self,
