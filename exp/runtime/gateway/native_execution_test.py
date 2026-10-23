@@ -9,12 +9,14 @@ import pytest
 from exp.common.models.catalog import GatewayDeploymentMetadata
 from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
+from exp.runtime.gateway import native_execution
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
     GatewayApiSurface,
     GatewayFailure,
     GatewayFailureClass,
+    GatewayMessage,
     GatewayRequest,
 )
 from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
@@ -23,6 +25,7 @@ from exp.runtime.gateway.native_execution import (
     THROTTLE_BACKOFF,
     THROTTLE_FAILOVER_COLD,
     THROTTLE_SURFACED_CACHE_PRESERVING,
+    InflightRequest,
     claim_route_from,
     deployment_wire_entry,
     dispatch_disclosure,
@@ -1245,3 +1248,37 @@ def test_failover_eligibility_matrix_follows_the_classifier_flags(
         maximum_same_deployment_attempts=1,
     )
     assert candidate == expected
+
+
+def test_input_reservation_is_tokenized_once_per_request_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failover and redial attempts reuse the count; a replaced request recounts once."""
+    calls: list[GatewayRequest] = []
+    real = native_execution.worst_case_input_tokens
+
+    def counting(request: GatewayRequest) -> int:
+        """Record every tokenizer pass."""
+        calls.append(request)
+        return real(request)
+
+    monkeypatch.setattr(native_execution, "worst_case_input_tokens", counting)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hello " * 100),),
+    )
+    entry = InflightRequest(
+        authorization=_route().snapshot.authorization,
+        route=_route(),
+        request=request,
+        deadline_monotonic=1.0,
+    )
+    first = entry.reserved_input_tokens()
+    assert [entry.reserved_input_tokens() for _ in range(3)] == [first] * 3
+    assert len(calls) == 1
+    entry.request = request.model_copy(
+        update={"messages": (GatewayMessage(role="user", content="hi"),)}
+    )
+    assert entry.reserved_input_tokens() < first
+    assert entry.reserved_input_tokens() < first
+    assert len(calls) == 2

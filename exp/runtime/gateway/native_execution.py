@@ -19,6 +19,7 @@ from exp.common.models.gateway_catalog import (
     ExactModelDeployment,
     FailoverMode,
 )
+from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayFailure,
@@ -246,6 +247,17 @@ class InflightRequest:
     public_request: GatewayRequest | None = None
     tool_search: ToolSearchState | None = None
     explicit_cache_state: NativeCacheState | None = field(default=None, repr=False)
+    # ``request``'s input-token reservation keyed by the object it counted;
+    # a tool-search round that replaces the request recounts once.
+    input_reservation: tuple[ServingRequest, int] | None = field(default=None, repr=False)
+
+    def reserved_input_tokens(self) -> int:
+        """Return the input-token reservation, tokenizing the request at most once."""
+        memo = self.input_reservation
+        if memo is None or memo[0] is not self.request:
+            memo = (self.request, worst_case_input_tokens(self.request))
+            self.input_reservation = memo
+        return memo[1]
 
     def __post_init__(self) -> None:
         """Size the per-deployment attempt counters to the frozen route."""

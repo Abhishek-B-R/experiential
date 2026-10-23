@@ -40,7 +40,7 @@ from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingR
 from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.gateway.replay_identity import provider_replay_authority
-from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
+from exp.runtime.gateway.reservation_tokenizer import reservation_token_bound
 from exp.runtime.gateway.video.contracts import VideoRequest
 from exp.runtime.models.providers.generation_parameter_validation import require_output_bound
 
@@ -336,10 +336,15 @@ class _PromptCounter:
         return value
 
     def counted(self) -> int:
-        """Tokenize the gathered prompt once, without headroom."""
+        """Tokenize the gathered prompt once, without headroom.
+
+        The tokenizer reads at most a bounded window of the prompt; text past
+        it is bounded by its UTF-8 length (never fewer than its BPE tokens), so
+        an oversized prompt over-reserves rather than holding a bridge thread.
+        """
         counted = 0
         if self._chunks:
-            counted = len(reservation_encoder().encode_ordinary("\n".join(self._chunks)))
+            counted = reservation_token_bound("\n".join(self._chunks))
         return counted + self._fixed + self._opaque_bytes // OPAQUE_BYTES_PER_TOKEN
 
     def total(self) -> int:
