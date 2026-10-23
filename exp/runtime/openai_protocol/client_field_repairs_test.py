@@ -10,7 +10,6 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.openai_protocol.client_field_repairs import (
-    CHAT_IMAGE_DIMENSIONS_DROPPED,
     OUTPUT_CONFIG_DROPPED,
     OUTPUT_CONFIG_EFFORT_IGNORED,
     OUTPUT_CONFIG_EFFORT_TRANSLATED,
@@ -197,7 +196,7 @@ def test_chat_image_dimensions_and_message_agent_are_stripped() -> None:
     )
     assert decoded.request.ignored_parameters == (
         "messages.agent->dropped(client_annotation)",
-        CHAT_IMAGE_DIMENSIONS_DROPPED,
+        "messages.content.image_url.dimensions->dropped(client_annotation)",
     )
 
 

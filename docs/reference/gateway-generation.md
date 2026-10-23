@@ -117,16 +117,18 @@ its original position; `store=false` means the provider resolves nothing by ID.
 - Responses `text.format.type: "json_object"` selects the same schema-free JSON mode
   as Chat `response_format: {"type": "json_object"}`.
 - A key the gateway does not define on a conversation object is dropped before dispatch
-  instead of refused: on Chat messages, their assistant `tool_calls` entries and their
-  content parts, on Responses `message` input items and their content parts, and on
-  Messages turns. Chat apps stamp their own bookkeeping on the history they replay
+  instead of refused: on Chat messages, their assistant `tool_calls` entries, their
+  content parts and each part's media object (`image_url`, `video_url`, `input_audio`,
+  `file`; the Vercel AI SDK sends `image_url.providerOptions`), on Responses `message`
+  input items and their content parts, and on Messages turns. Chat apps stamp their own bookkeeping on the history they replay
   (WorkBuddy's `conversationRequestId`, `isInternalToolCall`, `model_id`), so a refusal
   failed every later turn. Each dropped key is named once per request, as
-  `messages.<field>`, `messages.tool_calls.<field>` or `messages.content.<field>`
-  (`input.` on Responses) `->dropped(unknown_message_field)`. Keys traced to one
-  client keep `client_annotation` as the reason: Copilot Chat's `cot_id` and
-  `cot_summary`, the `timestamp` and `startsNewUserRequest` other agents stamp, and
-  WorkBuddy CLI's `agent`. Field names are reduced to `[A-Za-z0-9_]`, at most 64
+  `messages.<field>`, `messages.tool_calls.<field>`, `messages.content.<field>` or
+  `messages.content.image_url.<field>` (`input.` on Responses)
+  `->dropped(unknown_message_field)`. Keys traced to one client keep
+  `client_annotation` as the reason: Copilot Chat's `cot_id` and `cot_summary`, the
+  `timestamp` and `startsNewUserRequest` other agents stamp, WorkBuddy CLI's `agent`, and
+  an image's `image_url.dimensions` size hint. Field names are reduced to `[A-Za-z0-9_]`, at most 64
   characters, and at most 16 keys are named; the rest are counted in one
   `messages.*->dropped(<n>_more_unknown_message_fields)` entry. Defined fields keep
   their typed refusal for a bad value, unknown keys inside a tool call's `function`

@@ -2461,10 +2461,6 @@ def test_chat_image_media_type_hint_preserves_the_url_contract(
         ({"url": "https://example.test/image", "media_type": {}}, "media_type"),
         ({"url": "https://example.test/image", "media_type": "image/svg+xml"}, "media_type"),
         ({"url": "https://example.test/image", "media_type": ""}, "media_type"),
-        (
-            {"url": "https://example.test/image", "media_type": "image/png", "unknown": True},
-            "unknown",
-        ),
         ({"url": "ftp://example.test/image", "media_type": "image/png"}, None),
         ({"url": "data:image/png;base64,%%%", "media_type": "image/png"}, None),
     ],
@@ -2472,7 +2468,11 @@ def test_chat_image_media_type_hint_preserves_the_url_contract(
 def test_chat_image_media_type_hint_keeps_image_validation_strict(
     image_url: JsonObject, param: str | None
 ) -> None:
-    """The MIME hint cannot admit malformed images, unsupported hints, or unknown fields."""
+    """The MIME hint cannot admit malformed images or unsupported hints.
+
+    Unknown keys inside ``image_url`` are dropped with disclosure instead
+    (``unknown_message_fields_test``); a malformed hint still refuses.
+    """
     with pytest.raises(OpenAIProtocolError) as raised:
         decode_chat(
             {

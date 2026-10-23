@@ -72,12 +72,6 @@ STREAM_OBFUSCATION_IGNORED = "stream_options.include_obfuscation->ignored(not_em
 
 _STREAM_OPTION_FIELDS = frozenset({"include_obfuscation", "reasoning_summary_delivery"})
 
-CHAT_IMAGE_DIMENSIONS_DROPPED = "messages.content.image_url.dimensions->dropped(client_annotation)"
-"""Disclosure recorded when an image part's client-side ``dimensions`` hint is removed.
-
-The image bytes or URL define the picture; no provider wire takes a caller
-size hint on an image part, so removing it changes nothing sent."""
-
 THINKING_DISPLAY_DROPPED = "thinking.display->dropped(not_carried)"
 """Disclosure recorded when a Chat ``thinking.display`` preference is removed.
 
@@ -491,49 +485,6 @@ def drop_chat_thinking_display(payload: JsonObject) -> tuple[JsonObject, tuple[s
     return {**payload, "thinking": stripped}, disclosures
 
 
-def drop_chat_image_dimensions(
-    payload: JsonObject,
-) -> tuple[JsonObject, tuple[str, ...]]:
-    """Remove image-part ``dimensions`` hints from Chat messages.
-
-    Args:
-        payload: Parsed Chat Completions body.
-
-    Returns:
-        The original payload when no image part carries one; otherwise a copy
-        without them plus one disclosure.
-    """
-    raw_messages = payload.get("messages")
-    if not isinstance(raw_messages, list):
-        return payload, ()
-    dropped_dimensions = False
-    messages: list[JsonValue] = []
-    for message in raw_messages:
-        if not isinstance(message, dict):
-            messages.append(message)
-            continue
-        content = message.get("content")
-        if isinstance(content, list):
-            parts: list[JsonValue] = []
-            changed = False
-            for part in content:
-                image = part.get("image_url") if isinstance(part, dict) else None
-                if isinstance(part, dict) and isinstance(image, dict) and "dimensions" in image:
-                    part = {
-                        **part,
-                        "image_url": {k: v for k, v in image.items() if k != "dimensions"},
-                    }
-                    changed = True
-                parts.append(part)
-            if changed:
-                dropped_dimensions = True
-                message = {**message, "content": parts}
-        messages.append(message)
-    if not dropped_dimensions:
-        return payload, ()
-    return {**payload, "messages": messages}, (CHAT_IMAGE_DIMENSIONS_DROPPED,)
-
-
 def normalize_responses_call_arguments(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
     """Repair ``function_call`` items whose ``arguments`` are not a JSON-object string.
 
@@ -603,7 +554,6 @@ def repair_chat(
 ) -> tuple[JsonObject, tuple[str, ...]]:
     """Apply every Chat repair, appending its disclosures to ``disclosures``."""
     payload, names = drop_chat_participant_names(payload)
-    payload, dimensions = drop_chat_image_dimensions(payload)
     payload, unknown = drop_unknown_chat_message_fields(payload)
     payload, output_config = translate_chat_output_config(payload)
     payload, hints = drop_unforwarded_hints(payload)
@@ -614,7 +564,6 @@ def repair_chat(
         *disclosures,
         *unknown,
         *names,
-        *dimensions,
         *output_config,
         *hints,
         *stream,

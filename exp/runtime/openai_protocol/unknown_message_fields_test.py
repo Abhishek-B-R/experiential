@@ -163,6 +163,113 @@ def test_unknown_tool_call_and_content_part_keys_are_dropped() -> None:
     assert decoded.request.messages[0].content == "look"
 
 
+def test_ai_sdk_image_part_provider_options_are_dropped_inside_image_url() -> None:
+    """The Vercel AI SDK's ``image_url.providerOptions`` is dropped; the image is unchanged."""
+    image: JsonObject = {"url": "https://example.test/a.png", "detail": "high"}
+    tagged = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {**image, "providerOptions": {"openai": {}}},
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+    plain = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this?"},
+                        {"type": "image_url", "image_url": image},
+                    ],
+                }
+            ],
+        }
+    )
+    assert tagged.request.messages == plain.request.messages
+    assert tagged.request.ignored_parameters == (
+        "messages.content.image_url.providerOptions->dropped(unknown_message_field)",
+    )
+    assert canonical_request_sha256(tagged.request) == canonical_request_sha256(plain.request)
+
+
+def test_audio_and_file_media_objects_tolerate_unknown_keys() -> None:
+    """``input_audio`` and ``file`` objects drop extras like ``image_url`` does."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": "UklGRg==", "format": "wav", "uiId": 1},
+                        },
+                        {
+                            "type": "file",
+                            "file": {"file_id": "file-abc", "providerOptions": {}},
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+    assert decoded.request.ignored_parameters == (
+        "messages.content.input_audio.uiId->dropped(unknown_message_field)",
+        "messages.content.file.providerOptions->dropped(unknown_message_field)",
+    )
+
+
+@pytest.mark.parametrize(
+    ("part", "param"),
+    (
+        (
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://example.test/a.png",
+                    "detail": "ultra",
+                    "providerOptions": {},
+                },
+            },
+            "messages.0.content.0.image_url.detail",
+        ),
+        (
+            {"type": "image_url", "image_url": {"url": "", "providerOptions": {}}},
+            "messages.0.content.0.image_url.url",
+        ),
+        (
+            {"type": "input_audio", "input_audio": {"data": "", "format": "wav", "x": 1}},
+            "messages.0.content.0.input_audio.data",
+        ),
+        (
+            {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": 7, "x": 1}},
+            "messages.0.content.0.input_audio.format",
+        ),
+    ),
+)
+def test_a_media_object_field_with_a_bad_value_is_still_refused(
+    part: JsonObject, param: str
+) -> None:
+    """Dropping unknown media keys never loosens ``url``, ``detail``, ``data`` or ``format``."""
+    refusal = _rejection({"model": "coding", "messages": [{"role": "user", "content": [part]}]})
+    assert refusal.status_code == 400
+    assert refusal.detail.code == "invalid_parameter"
+    assert refusal.detail.param == param
+
+
 def test_researched_client_annotations_keep_their_reason() -> None:
     """Keys traced to one client (Copilot, WorkBuddy CLI) stay ``client_annotation``."""
     decoded = decode_chat(

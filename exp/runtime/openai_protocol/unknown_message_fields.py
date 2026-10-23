@@ -8,7 +8,9 @@ provider defines these keys, and a named 400 for one fails every later turn
 of the conversation, because the client replays the same history on retry.
 
 So a key the gateway's wire model does not define is removed from a message,
-from an assistant tool call, and from a content part before the strict wire
+from an assistant tool call, from a content part, and from a part's media
+object (``image_url``, ``video_url``, ``input_audio``, ``file``; the Vercel AI
+SDK puts ``providerOptions`` inside ``image_url``) before the strict wire
 models read the body. The removal is disclosed in ``ignored_parameters`` and
 never reaches a provider: dispatch is built from the validated wire models,
 which by then hold only defined fields. Every DEFINED key keeps its strict
@@ -28,7 +30,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from typing import get_args
+from typing import NamedTuple, get_args
 
 from pydantic import BaseModel
 
@@ -67,7 +69,22 @@ GitHub Copilot Chat stamps ``cot_id`` and ``cot_summary``, other agents
 
 _CHAT_REASONS: Mapping[str, str] = dict.fromkeys(CHAT_MESSAGE_CLIENT_ANNOTATIONS, CLIENT_ANNOTATION)
 
+_MEDIA_REASONS: Mapping[str, str] = {"dimensions": CLIENT_ANNOTATION}
+"""Media-object keys traced to one client: a caller size hint on an image."""
+
 _NON_IDENTIFIER = re.compile(r"[^A-Za-z0-9_]")
+
+
+class _PartKeys(NamedTuple):
+    """Keys one content-part kind accepts.
+
+    Attributes:
+        part: Keys on the part object itself.
+        media: Accepted keys of each media object, by the part field holding it.
+    """
+
+    part: frozenset[str]
+    media: Mapping[str, frozenset[str]]
 
 
 def _model_keys(model: type[BaseModel]) -> frozenset[str]:
@@ -78,12 +95,30 @@ def _model_keys(model: type[BaseModel]) -> frozenset[str]:
     return frozenset(keys)
 
 
-def _part_keys_by_type() -> Mapping[str, frozenset[str]]:
-    """Map each content-part ``type`` value to the keys its wire model accepts."""
-    keys: dict[str, frozenset[str]] = {}
+def _nested_model(annotation: object) -> type[BaseModel] | None:
+    """Return the wire model a field holds, unwrapping ``X | None``, else None."""
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    models = [arg for arg in get_args(annotation) if _nested_model(arg) is not None]
+    return _nested_model(models[0]) if len(models) == 1 else None
+
+
+def _part_keys_by_type() -> Mapping[str, _PartKeys]:
+    """Map each content-part ``type`` value to its accepted keys and media objects.
+
+    A part's media object (``image_url``, ``video_url``, ``input_audio``,
+    ``file``) is the field whose type is itself a wire model; its accepted keys
+    are recorded under the field name.
+    """
+    keys: dict[str, _PartKeys] = {}
     for model in get_args(get_args(_ContentPart)[0]):
+        nested = {
+            (field.alias or name): _model_keys(inner)
+            for name, field in model.model_fields.items()
+            if (inner := _nested_model(field.annotation)) is not None
+        }
         for value in get_args(model.model_fields["type"].annotation):
-            keys[value] = _model_keys(model)
+            keys[value] = _PartKeys(_model_keys(model), nested)
     return keys
 
 
@@ -173,14 +208,22 @@ class DroppedKeys:
 
 
 def _strip_parts(content: JsonValue, dropped: DroppedKeys) -> JsonValue:
-    """Strip unknown keys from every content part whose ``type`` is a known kind."""
+    """Strip unknown keys from known-kind content parts and their media objects."""
     if not isinstance(content, list):
         return content
     parts: list[JsonValue] = []
     for part in content:
         known = _PART_KEYS.get(part.get("type")) if isinstance(part, dict) else None
-        if isinstance(part, dict) and isinstance(known, frozenset):
-            part = dropped.strip(part, known, "content")
+        if isinstance(part, dict) and known is not None:
+            part = dropped.strip(part, known.part, "content")
+            for field, media_keys in known.media.items():
+                media = part.get(field)
+                if isinstance(media, dict):
+                    stripped = dropped.strip(
+                        media, media_keys, f"content.{field}", reasons=_MEDIA_REASONS
+                    )
+                    if stripped is not media:
+                        part = {**part, field: stripped}
         parts.append(part)
     return parts
 
