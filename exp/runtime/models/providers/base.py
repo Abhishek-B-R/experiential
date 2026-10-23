@@ -390,8 +390,14 @@ class GatewayWireProfile:
     decisions surface off every other wire."""
 
     images_url: str | None = None
-    """Full OpenAI-wire ``/images/generations`` endpoint for this connection,
-    sharing ``headers``; ``None`` when the connection speaks no images wire."""
+    """Full image-generation endpoint for this connection, sharing ``headers``:
+    the OpenAI-wire ``/images/generations`` URL, or a Bedrock Stability model's
+    InvokeModel URL; ``None`` when the connection speaks no images wire."""
+
+    images_wire: Literal["openai", "bedrock_stability"] = "openai"
+    """The body and answer shape ``images_url`` speaks: the OpenAI Images API, or
+    Stability AI's Bedrock InvokeModel body (one image per call, signed per
+    dispatch like every Bedrock body)."""
 
     speech_url: str | None = None
     transcriptions_url: str | None = None
