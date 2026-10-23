@@ -11,7 +11,7 @@ dependencies = [
     # version moves only by a reviewed edit, and [tool.uv] keeps it 7 days old.
     # Cross-platform advisory locking for durable registries edited in place. Declared directly
     # because `exp.common.core.locks` imports it and Unix-only `fcntl` is not a portable boundary.
-    "exp-gateway-native==0.3.169",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
+    "exp-gateway-native==0.3.170",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
     "filelock==3.32.0",
     "jsonschema==4.26.0",  # Validate induced local-only tool and state contracts.
     "ijson==3.5.1",  # incremental parsing of local trace archives
