@@ -10,6 +10,7 @@ from pydantic import (
     Field,
     StrictBool,
     StrictInt,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -43,7 +44,10 @@ from exp.runtime.openai_protocol.prompt_cache_controls import (
     ResponsesPromptCacheOptions,
 )
 from exp.runtime.openai_protocol.reasoning_replay import ReasoningDetail
-from exp.runtime.openai_protocol.tool_call_extra_content import ToolCallExtraContent
+from exp.runtime.openai_protocol.tool_call_extra_content import (
+    ThoughtSignature,
+    ToolCallExtraContent,
+)
 from exp.runtime.openai_protocol.web_search import ChatPlugin, WebSearchOptions
 
 
@@ -264,7 +268,9 @@ class _AssistantToolCall(_WireModel):
     content part of recent messages; when that part is a tool call the hint
     lands inside this entry, so the supported ephemeral form is accepted and
     carried for the one wire that can honor it. ``extra_content`` carries
-    Gemini's thought signature back with the call it was issued for.
+    Gemini's thought signature back with the call it was issued for;
+    ``thought_signature`` is the same signature as some Gemini bridges spell
+    it, directly on the call (see ``tool_call_extra_content``).
     """
 
     id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
@@ -272,6 +278,7 @@ class _AssistantToolCall(_WireModel):
     function: _FunctionCall
     cache_control: EphemeralCacheControl | None = None
     extra_content: ToolCallExtraContent | None = None
+    thought_signature: ThoughtSignature | None = None
     index: int | None = Field(default=None, ge=0)
     """Streaming delta ordinal, validated and dropped.
 
@@ -281,6 +288,20 @@ class _AssistantToolCall(_WireModel):
     across 99 organizations in the 7 days to 2026-09-15). It orders nothing
     here: the array position already does.
     """
+
+    @field_validator("thought_signature")
+    @classmethod
+    def _require_one_signature(cls, value: str | None, info: ValidationInfo) -> str | None:
+        """Refuse a call whose two signature spellings name different signatures."""
+        extra = info.data.get("extra_content")
+        if value is not None and extra is not None and extra.google is not None:
+            if extra.google.thought_signature != value:
+                raise ValueError(
+                    "the call carries two different thought signatures; send the one "
+                    "Gemini returned, as 'extra_content.google.thought_signature' or "
+                    "'thought_signature'"
+                )
+        return value
 
 
 class _Message(_WireModel):

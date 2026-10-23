@@ -342,9 +342,11 @@ class ToolCall(ContractModel):
     the replayed call carries Google's documented placeholder, which Google
     warns may degrade reasoning. Chat and Responses callers round-trip it as
     ``extra_content.google.thought_signature``, the shape Google's own
-    OpenAI-compatible endpoint uses. Only the Gemini and Vertex wires read it;
-    every other wire ignores it. Excluded from serialization like the other
-    replay fields, and joins gateway replay identity explicitly.
+    OpenAI-compatible endpoint uses; a Chat tool call also accepts it as a
+    top-level ``thought_signature``. Only the Gemini and Vertex wires read it;
+    every other wire ignores it (a Chat route with no such rung discloses it).
+    Excluded from serialization like the other replay fields, and joins
+    gateway replay identity explicitly.
     """
 
     @model_validator(mode="after")
