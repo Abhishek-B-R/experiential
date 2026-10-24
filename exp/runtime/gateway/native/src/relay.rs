@@ -2,7 +2,7 @@
 
 mod deadline;
 pub use deadline::{
-    stream_timeout_failure, DEADLINE_BEFORE_OUTPUT_MESSAGE, DEADLINE_WHILE_GENERATING_MESSAGE,
+    deadline_while_generating, stream_timeout_failure, DEADLINE_BEFORE_OUTPUT_MESSAGE,
 };
 mod progress;
 
@@ -392,10 +392,7 @@ impl UpstreamRelay {
     fn read_failure(&self, deadline: Instant, phase_timeout: Duration) -> Option<Failure> {
         if remaining(deadline).is_zero() {
             if self.last_progress_at.is_some() {
-                return Some(Failure::new(
-                    FailureClass::Timeout,
-                    DEADLINE_WHILE_GENERATING_MESSAGE,
-                ));
+                return Some(deadline_while_generating());
             }
             return Some(stream_timeout_failure(deadline));
         }
@@ -423,6 +420,14 @@ impl UpstreamRelay {
     /// Dialects that yield usage directly keep their last yielded report.
     pub fn usage_before_failure(&self, reported: Option<Usage>) -> Option<Usage> {
         self.normalizer.observed_usage().cloned().or(reported)
+    }
+
+    /// Whether the provider already declared this stream's terminal (a
+    /// decoded terminal is queued, or a declared finish is draining its
+    /// trailer). Such a stream ends on that terminal even past the deadline.
+    pub fn terminal_pending(&self) -> bool {
+        self.normalizer.metadata_drain_started().is_some()
+            || self.ready.iter().any(Event::is_terminal)
     }
 
     /// The wall-clock time this relay yielded its first output token, or

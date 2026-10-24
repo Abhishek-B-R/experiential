@@ -19,6 +19,11 @@ answers stop on their own";
 pub const DEADLINE_BEFORE_OUTPUT_MESSAGE: &str = "the request reached the gateway's time \
 limit before the provider started answering; retry the request";
 
+/// The terminal failure of a committed stream whose total deadline ran out.
+pub fn deadline_while_generating() -> Failure {
+    Failure::new(FailureClass::Timeout, DEADLINE_WHILE_GENERATING_MESSAGE)
+}
+
 /// Classify one mid-stream chunk timeout the way the python transport does:
 /// a stalled provider read is a retryable transport failure unless the
 /// request's own deadline is exhausted.

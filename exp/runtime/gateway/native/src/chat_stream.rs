@@ -132,11 +132,12 @@ pub(super) async fn stream_response(
 
         let mut prefix: std::collections::VecDeque<Event> = committed.prefix.drain(..).collect();
         loop {
-            if crate::relay::remaining(deadline).is_zero() {
-                committed.relay.close_transport();
-                log_stream_exit(&request_id, "delivery_deadline");
-                guard.settle_cancelled(usage.as_ref(), &tool_names).await;
-                return;
+            if crate::relay::remaining(deadline).is_zero() && !committed.relay.terminal_pending() {
+                // The caller is still connected: name the cut instead of
+                // closing a stream that would read as a clean end. A terminal
+                // the provider already declared still ends the stream; the
+                // relay yields it at once past the deadline.
+                fail_stream!(crate::relay::deadline_while_generating())
             }
             let event = if let Some(event) = prefix.pop_front() {
                 event

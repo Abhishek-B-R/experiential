@@ -353,7 +353,7 @@ async fn settled_responses_response(
             return error_response(&collection_public_error(&failure.clone().boundary()));
         }
     }
-    let headers = served_headers(admission, client_request_id.as_deref(), served);
+    let headers = served_headers(admission, client_request_id.as_deref(), served.clone());
     if admission.stream {
         let body = match encode_responses_sse(admission, served.depth, created_at, &events, None) {
             Ok(body) => body,
@@ -800,10 +800,12 @@ async fn stream_responses(
 
         let mut prefix: std::collections::VecDeque<Event> = committed.prefix.drain(..).collect();
         'stream: loop {
-            if crate::relay::remaining(deadline).is_zero() {
-                committed.relay.close_transport();
-                guard.settle_cancelled(usage.as_ref(), &tool_names).await;
-                return;
+            if crate::relay::remaining(deadline).is_zero() && !committed.relay.terminal_pending() {
+                // The caller is still connected: name the cut instead of
+                // closing a stream that would read as a clean end. A terminal
+                // the provider already declared still ends the stream; the
+                // relay yields it at once past the deadline.
+                fail_stream!(crate::relay::deadline_while_generating())
             }
             let event = if let Some(event) = prefix.pop_front() {
                 event
