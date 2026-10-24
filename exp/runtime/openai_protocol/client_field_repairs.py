@@ -1,21 +1,21 @@
 """Disclosed repairs for client fields that carry no meaning a provider can act on.
 
 Some widely deployed OpenAI-surface clients attach fields the gateway cannot
-forward but whose removal cannot change the answer: GitHub Copilot Chat tags
-Chat messages with its own ``cot_id`` and ``cot_summary``, other agents stamp
-``timestamp`` or ``startsNewUserRequest`` on them, LiteLLM echoes assistant
+forward but whose removal cannot change the answer: chat apps stamp their own
+bookkeeping keys on Chat messages (removed by
+:mod:`exp.runtime.openai_protocol.unknown_message_fields`), LiteLLM echoes assistant
 output items with a lifecycle ``status`` or ``phase`` but without the item
 ``id`` those markers belong to, Codex Desktop tags Responses input items with
 ``internal_chat_message_metadata_passthrough``, the OpenAI SDK sends
 Responses ``stream_options``, OpenCode sends Anthropic's ``output_config`` on
-Chat, WorkBuddy CLI tags Chat messages with ``agent``, and agents attach
-determinism and cache-retention hints (``seed``, ``prompt_cache_retention``) no
-route forwards, and image clients send OpenRouter's Chat ``modalities`` of text
-and image, which the route's own declared output modalities already decide. A
+Chat, agents attach determinism and cache-retention hints (``seed``,
+``prompt_cache_retention``) no route forwards, and image clients send
+OpenRouter's Chat ``modalities`` of text and image, which the route's own
+declared output modalities already decide. A
 named 400 for any of them fails every request the client makes, so each is
 removed here, before the compatibility manifest and the wire models read the
 body, and every removal that changes what the caller asked for is named in
-``ignored_parameters``. Any other unknown field keeps its named rejection.
+``ignored_parameters``. Any other unknown top-level field keeps its named rejection.
 """
 
 from __future__ import annotations
@@ -27,29 +27,13 @@ from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.runtime.openai_protocol.errors import invalid_field
 from exp.runtime.openai_protocol.manifest import RESPONSES_REASONING_EFFORTS_ACCEPTED
 from exp.runtime.openai_protocol.responses_probe import drop_gateway_web_search_items
-
-CHAT_COT_ID_DROPPED = "messages.cot_id->dropped(client_annotation)"
-"""Disclosure recorded when a Chat message's client-side ``cot_id`` tag is removed."""
-
-CHAT_COT_SUMMARY_DROPPED = "messages.cot_summary->dropped(client_annotation)"
-"""Disclosure recorded when a Chat message's client-side ``cot_summary`` is removed."""
-
-CHAT_TIMESTAMP_DROPPED = "messages.timestamp->dropped(client_annotation)"
-"""Disclosure recorded when a Chat message's client-side ``timestamp`` is removed."""
-
-CHAT_STARTS_NEW_USER_REQUEST_DROPPED = "messages.startsNewUserRequest->dropped(client_annotation)"
-"""Disclosure recorded when a Chat message's ``startsNewUserRequest`` flag is removed."""
+from exp.runtime.openai_protocol.unknown_message_fields import (
+    drop_unknown_chat_message_fields,
+    drop_unknown_responses_message_fields,
+)
 
 CHAT_PARTICIPANT_NAME_DROPPED = "messages.name->dropped(participant_name)"
 """Disclosure recorded when a non-tool Chat message's participant ``name`` is removed."""
-
-_CHAT_CLIENT_ANNOTATIONS: tuple[tuple[str, str], ...] = (
-    ("cot_id", CHAT_COT_ID_DROPPED),
-    ("cot_summary", CHAT_COT_SUMMARY_DROPPED),
-    ("timestamp", CHAT_TIMESTAMP_DROPPED),
-    ("startsNewUserRequest", CHAT_STARTS_NEW_USER_REQUEST_DROPPED),
-)
-"""Client bookkeeping keys no provider defines on a Chat message, in disclosure order."""
 
 _PARTICIPANT_NAME_ROLES = frozenset({"system", "developer", "user", "assistant"})
 """Roles whose ``name`` is OpenAI's optional participant label.
@@ -87,15 +71,6 @@ STREAM_OBFUSCATION_IGNORED = "stream_options.include_obfuscation->ignored(not_em
 """Disclosure recorded when stream obfuscation padding is requested but never emitted."""
 
 _STREAM_OPTION_FIELDS = frozenset({"include_obfuscation", "reasoning_summary_delivery"})
-
-CHAT_AGENT_DROPPED = "messages.agent->dropped(client_annotation)"
-"""Disclosure recorded when WorkBuddy CLI's per-message ``agent`` tag is removed."""
-
-CHAT_IMAGE_DIMENSIONS_DROPPED = "messages.content.image_url.dimensions->dropped(client_annotation)"
-"""Disclosure recorded when an image part's client-side ``dimensions`` hint is removed.
-
-The image bytes or URL define the picture; no provider wire takes a caller
-size hint on an image part, so removing it changes nothing sent."""
 
 THINKING_DISPLAY_DROPPED = "thinking.display->dropped(not_carried)"
 """Disclosure recorded when a Chat ``thinking.display`` preference is removed.
@@ -187,48 +162,41 @@ def chat_output_cap(
     )
 
 
-def drop_chat_message_client_annotations(
+def drop_chat_participant_names(
     payload: JsonObject,
 ) -> tuple[JsonObject, tuple[str, ...]]:
-    """Remove client bookkeeping keys and participant names from Chat messages.
+    """Remove the participant ``name`` from non-tool Chat messages.
 
-    GitHub Copilot Chat stamps ``cot_id`` and ``cot_summary`` on messages it
-    replays, and other agents stamp ``timestamp`` or ``startsNewUserRequest``.
-    No provider defines them, so they are client bookkeeping with nothing to
-    forward. ``name`` on a system, developer, user, or assistant message is
-    OpenAI's optional participant label: no other provider wire carries it,
-    so it is removed with its own disclosure rather than refused.
+    ``name`` on a system, developer, user, or assistant message is OpenAI's
+    optional participant label: no other provider wire carries it, so it is
+    removed with its own disclosure rather than refused. On a tool message it
+    attributes the result and is kept.
 
     Args:
         payload: Parsed Chat Completions body.
 
     Returns:
-        The original payload when no message carries any of them; otherwise a
-        copy without them plus one disclosure per removed key kind.
+        The original payload when no such message carries a name; otherwise a
+        copy without them plus one disclosure.
     """
     raw_messages = payload.get("messages")
     if not isinstance(raw_messages, list):
         return payload, ()
-    removed: set[str] = set()
+    removed = False
     messages: list[JsonValue] = []
     for message in raw_messages:
-        if not isinstance(message, dict):
+        if (
+            not isinstance(message, dict)
+            or message.get("role") not in _PARTICIPANT_NAME_ROLES
+            or "name" not in message
+        ):
             messages.append(message)
             continue
-        keys = {key for key, _ in _CHAT_CLIENT_ANNOTATIONS if key in message}
-        if message.get("role") in _PARTICIPANT_NAME_ROLES and "name" in message:
-            keys.add("name")
-        if not keys:
-            messages.append(message)
-            continue
-        removed |= keys
-        messages.append({key: value for key, value in message.items() if key not in keys})
+        removed = True
+        messages.append({key: value for key, value in message.items() if key != "name"})
     if not removed:
         return payload, ()
-    disclosures = tuple(
-        disclosure for key, disclosure in _CHAT_CLIENT_ANNOTATIONS if key in removed
-    ) + ((CHAT_PARTICIPANT_NAME_DROPPED,) if "name" in removed else ())
-    return {**payload, "messages": messages}, disclosures
+    return {**payload, "messages": messages}, (CHAT_PARTICIPANT_NAME_DROPPED,)
 
 
 def drop_responses_client_items(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
@@ -517,57 +485,6 @@ def drop_chat_thinking_display(payload: JsonObject) -> tuple[JsonObject, tuple[s
     return {**payload, "thinking": stripped}, disclosures
 
 
-def drop_chat_message_agent_and_image_dimensions(
-    payload: JsonObject,
-) -> tuple[JsonObject, tuple[str, ...]]:
-    """Remove WorkBuddy's message ``agent`` tag and image-part ``dimensions`` hints.
-
-    Args:
-        payload: Parsed Chat Completions body.
-
-    Returns:
-        The original payload when neither appears; otherwise a copy without
-        them plus one disclosure per removed kind.
-    """
-    raw_messages = payload.get("messages")
-    if not isinstance(raw_messages, list):
-        return payload, ()
-    dropped_agent = False
-    dropped_dimensions = False
-    messages: list[JsonValue] = []
-    for message in raw_messages:
-        if not isinstance(message, dict):
-            messages.append(message)
-            continue
-        if "agent" in message:
-            dropped_agent = True
-            message = {key: value for key, value in message.items() if key != "agent"}
-        content = message.get("content")
-        if isinstance(content, list):
-            parts: list[JsonValue] = []
-            changed = False
-            for part in content:
-                image = part.get("image_url") if isinstance(part, dict) else None
-                if isinstance(part, dict) and isinstance(image, dict) and "dimensions" in image:
-                    part = {
-                        **part,
-                        "image_url": {k: v for k, v in image.items() if k != "dimensions"},
-                    }
-                    changed = True
-                parts.append(part)
-            if changed:
-                dropped_dimensions = True
-                message = {**message, "content": parts}
-        messages.append(message)
-    if not dropped_agent and not dropped_dimensions:
-        return payload, ()
-    disclosures = (
-        *((CHAT_AGENT_DROPPED,) if dropped_agent else ()),
-        *((CHAT_IMAGE_DIMENSIONS_DROPPED,) if dropped_dimensions else ()),
-    )
-    return {**payload, "messages": messages}, disclosures
-
-
 def normalize_responses_call_arguments(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
     """Repair ``function_call`` items whose ``arguments`` are not a JSON-object string.
 
@@ -636,8 +553,8 @@ def repair_chat(
     payload: JsonObject, disclosures: tuple[str, ...]
 ) -> tuple[JsonObject, tuple[str, ...]]:
     """Apply every Chat repair, appending its disclosures to ``disclosures``."""
-    payload, annotations = drop_chat_message_client_annotations(payload)
-    payload, message_parts = drop_chat_message_agent_and_image_dimensions(payload)
+    payload, names = drop_chat_participant_names(payload)
+    payload, unknown = drop_unknown_chat_message_fields(payload)
     payload, output_config = translate_chat_output_config(payload)
     payload, hints = drop_unforwarded_hints(payload)
     payload, stream = drop_chat_stream_options_without_stream(payload)
@@ -645,8 +562,8 @@ def repair_chat(
     payload = accept_chat_output_modalities(payload)
     return payload, (
         *disclosures,
-        *annotations,
-        *message_parts,
+        *unknown,
+        *names,
         *output_config,
         *hints,
         *stream,
@@ -668,6 +585,7 @@ def repair_responses(
     payload, items = drop_responses_client_items(drop_gateway_web_search_items(payload))
     payload, markers = drop_unanchored_output_markers(payload)
     payload, arguments = normalize_responses_call_arguments(payload)
+    payload, unknown = drop_unknown_responses_message_fields(payload)
     payload, hints = drop_unforwarded_hints(payload)
     payload, stream = accept_responses_stream_options(payload)
-    return payload, (*disclosures, *items, *markers, *arguments, *hints, *stream)
+    return payload, (*disclosures, *items, *markers, *arguments, *unknown, *hints, *stream)

@@ -88,6 +88,7 @@ from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPrefe
 from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import validate_manifest
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
+from exp.runtime.openai_protocol.unknown_message_fields import drop_unknown_message_keys
 
 
 class _TextBlock(AnthropicWireModel):
@@ -195,6 +196,10 @@ class _Message(AnthropicWireModel):
     role: Literal["user", "assistant", "system"]
     content: str | tuple[_ContentBlock, ...]
     cache_control: CacheControl | None = None
+
+
+_MESSAGE_KEYS = frozenset(_Message.model_fields)
+"""Keys an Anthropic turn object may carry."""
 
 
 class _Tool(AnthropicWireModel):
@@ -391,6 +396,10 @@ def _decode(
     anthropic_beta: str | None,
 ) -> DecodedGatewayRequest:
     """Validate ``payload`` against ``wire`` and build the canonical request."""
+    # Clients stamp their own bookkeeping on the turns they replay; a key no
+    # turn defines is removed with disclosure rather than failing the whole
+    # conversation. Content blocks and top-level fields stay strict.
+    payload, unknown_disclosures = drop_unknown_message_keys(payload, _MESSAGE_KEYS)
     validate_manifest(payload, MESSAGES_MANIFEST)
     request = validate_wire(payload, wire)
     require_served_server_tool_types(request.tools)
@@ -476,7 +485,11 @@ def _decode(
             ),
             inference_geo=request.inference_geo,
             provider_beta_tokens=forwarded_betas,
-            ignored_parameters=(*dropped_beta_disclosures, *channels.disclosures),
+            ignored_parameters=(
+                *unknown_disclosures,
+                *dropped_beta_disclosures,
+                *channels.disclosures,
+            ),
             gateway=request.gateway,
             zdr_requested=request.provider is not None and request.provider.demands_zdr,
             provider_preferences=(

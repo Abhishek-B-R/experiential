@@ -10,9 +10,6 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.openai_protocol.client_field_repairs import (
-    CHAT_AGENT_DROPPED,
-    CHAT_COT_ID_DROPPED,
-    CHAT_IMAGE_DIMENSIONS_DROPPED,
     OUTPUT_CONFIG_DROPPED,
     OUTPUT_CONFIG_EFFORT_IGNORED,
     OUTPUT_CONFIG_EFFORT_TRANSLATED,
@@ -26,39 +23,12 @@ from exp.runtime.openai_protocol.client_field_repairs import (
     STREAM_OPTIONS_NOT_STREAMING,
     THINKING_DISPLAY_DROPPED,
     accept_responses_stream_options,
-    drop_chat_message_client_annotations,
     drop_unanchored_output_markers,
     drop_unforwarded_hints,
     translate_chat_output_config,
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
-
-
-def test_untagged_chat_payload_is_returned_unchanged() -> None:
-    """No ``cot_id`` means no copy and no disclosure."""
-    payload: JsonObject = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
-    repaired, disclosures = drop_chat_message_client_annotations(payload)
-    assert repaired is payload
-    assert disclosures == ()
-
-
-def test_cot_id_is_removed_from_every_message_without_mutating_the_caller() -> None:
-    """Every tagged message loses the tag; one disclosure names the removal."""
-    payload: JsonObject = {
-        "model": "m",
-        "messages": [
-            {"role": "user", "content": "hi", "cot_id": "a"},
-            {"role": "assistant", "content": "yo", "cot_id": "b"},
-        ],
-    }
-    repaired, disclosures = drop_chat_message_client_annotations(payload)
-    assert repaired["messages"] == [
-        {"role": "user", "content": "hi"},
-        {"role": "assistant", "content": "yo"},
-    ]
-    assert disclosures == (CHAT_COT_ID_DROPPED,)
-    assert cast("list[JsonObject]", payload["messages"])[0]["cot_id"] == "a"
 
 
 def test_markers_with_an_item_id_are_kept() -> None:
@@ -225,8 +195,8 @@ def test_chat_image_dimensions_and_message_agent_are_stripped() -> None:
         }
     )
     assert decoded.request.ignored_parameters == (
-        CHAT_AGENT_DROPPED,
-        CHAT_IMAGE_DIMENSIONS_DROPPED,
+        "messages.agent->dropped(client_annotation)",
+        "messages.content.image_url.dimensions->dropped(client_annotation)",
     )
 
 
