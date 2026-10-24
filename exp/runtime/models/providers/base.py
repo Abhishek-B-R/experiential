@@ -279,6 +279,15 @@ class GatewayWireProfile:
     """Full OpenAI-wire ``/images/generations`` endpoint for this connection,
     sharing ``headers``; ``None`` when the connection speaks no images wire."""
 
+    anthropic_vertex_version: str | None = None
+    """Set ONLY on an ``anthropic_messages`` rung served through Vertex AI
+    (Claude on Vertex). When present, the dispatch body builder drops the
+    top-level ``model`` field (the model is in the ``:rawPredict`` URL) and sets
+    ``anthropic_version`` to this value, which is how Vertex carries the version
+    that direct Anthropic sends in the ``anthropic-version`` HEADER. ``None`` on
+    direct Anthropic / Bedrock / Azure-Foundry Claude, whose bodies name the
+    model and omit ``anthropic_version``."""
+
     @property
     def replays_plaintext_reasoning(self) -> bool:
         """Whether this rung forwards caller plaintext ``reasoning_content`` verbatim.

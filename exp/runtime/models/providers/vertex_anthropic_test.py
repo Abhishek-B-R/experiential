@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+import pytest
+
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import EmbeddingClient, ModelClient
+from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
+from exp.runtime.models.providers.dialect_dispatch import (
+    _apply_vertex_anthropic_envelope,
+    dialect_stream_payload,
+)
+from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.openai_compatible_test import _request, _snapshot
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.models.providers.vertex import (
@@ -14,8 +22,7 @@ from exp.runtime.models.providers.vertex import (
 )
 
 _BASE_URL = (
-    "https://us-east5-aiplatform.googleapis.com/v1"
-    "/projects/fixture-project/locations/us-east5"
+    "https://us-east5-aiplatform.googleapis.com/v1/projects/fixture-project/locations/us-east5"
 )
 _MODEL = "publishers/anthropic/models/claude-opus-4-5@20250514"
 
@@ -69,9 +76,7 @@ def test_completion_posts_the_anthropic_envelope_to_raw_predict() -> None:
     assert not isinstance(client, EmbeddingClient)
     assert response.output.content == "Working."
     url, headers, payload = transport.requests[0]
-    assert url == (
-        f"{_BASE_URL}/publishers/anthropic/models/claude-opus-4-5@20250514:rawPredict"
-    )
+    assert url == (f"{_BASE_URL}/publishers/anthropic/models/claude-opus-4-5@20250514:rawPredict")
     assert headers["authorization"] == "Bearer fixture-bearer-token"
     assert "x-api-key" not in headers
     assert "anthropic-version" not in headers
@@ -101,6 +106,48 @@ def test_stream_profile_pins_the_anthropic_sse_route() -> None:
     assert profile.headers["authorization"] == "Bearer fixture-bearer-token"
     assert profile.reasoning_wire_format == "anthropic_adaptive"
     assert profile.supports_reasoning is True
+
+
+def test_dispatch_body_drops_model_and_sets_vertex_anthropic_version() -> None:
+    """The ACTUAL gateway path (dialect_stream_payload) emits the Vertex envelope."""
+    client = VertexAnthropicClient(
+        model=_snapshot("vertex", _MODEL),
+        api_key='{"placeholder": true}',
+        base_url=_BASE_URL,
+        token_provider=lambda: "fixture-bearer-token",
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="Preserve these controls."),),
+        maximum_output_tokens=128,
+    )
+
+    payload = dialect_stream_payload(client.gateway_wire_profile(), request)
+
+    # Vertex names the model in the URL and reads the version from the body.
+    assert "model" not in payload
+    assert payload["anthropic_version"] == VERTEX_ANTHROPIC_VERSION
+    assert payload["stream"] is True
+    assert payload["messages"]
+
+
+def test_dispatch_refuses_an_anthropic_files_handle() -> None:
+    """A Files handle (no Files API on Vertex) fails clearly so admission reroutes."""
+    with pytest.raises(ProviderCapabilityError):
+        _apply_vertex_anthropic_envelope(
+            {
+                "model": "claude-opus-4-5@20250514",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "document", "source": {"type": "file", "file_id": "file_x"}}
+                        ],
+                    }
+                ],
+            },
+            VERTEX_ANTHROPIC_VERSION,
+        )
 
 
 def test_token_provider_is_read_for_every_profile() -> None:

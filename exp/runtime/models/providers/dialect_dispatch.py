@@ -110,6 +110,57 @@ def fireworks_continuation_required(profile: GatewayWireProfile, request: Gatewa
     )
 
 
+def _refuse_vertex_anthropic_file_handle(node: object) -> None:
+    """Raise if a built Messages body references an Anthropic Files handle.
+
+    Vertex AI serves the Anthropic Messages wire but has NO Files API, so a
+    request carrying a ``file_id`` reference (an uploaded-document or container
+    handle) cannot be served there. Refusing clearly lets route admission prefer
+    a direct-Anthropic / Bedrock Claude rung that does support Files, rather than
+    the Vertex endpoint 400ing the request upstream. Inline content (base64
+    ``source``) is unaffected.
+
+    Args:
+        node: A JSON subtree of the built request body.
+
+    Raises:
+        ProviderCapabilityError: A Files handle appears anywhere in the body.
+    """
+    if isinstance(node, dict):
+        source = node.get("source")
+        if (
+            node.get("type") == "file"
+            or "file_id" in node
+            or (isinstance(source, dict) and source.get("type") == "file")
+        ):
+            raise ProviderCapabilityError(capability="anthropic_files")
+        for value in node.values():
+            _refuse_vertex_anthropic_file_handle(value)
+    elif isinstance(node, list):
+        for value in node:
+            _refuse_vertex_anthropic_file_handle(value)
+
+
+def _apply_vertex_anthropic_envelope(payload: JsonObject, anthropic_version: str) -> None:
+    """Rewrite a native Messages body in place for Claude on Vertex AI.
+
+    Vertex names the model in the ``:rawPredict`` URL and reads the version from
+    the body, the inverse of direct Anthropic (model in body, version in header).
+    Files handles are refused first (Vertex has no Files API).
+
+    Args:
+        payload: The native streaming Messages body built for the anthropic wire.
+        anthropic_version: The ``anthropic_version`` value Vertex requires.
+
+    Raises:
+        ProviderCapabilityError: The request references an Anthropic Files handle.
+    """
+    _refuse_vertex_anthropic_file_handle(payload.get("messages"))
+    _refuse_vertex_anthropic_file_handle(payload.get("system"))
+    payload.pop("model", None)
+    payload["anthropic_version"] = anthropic_version
+
+
 def dialect_stream_payload(
     profile: GatewayWireProfile,
     provider_request: GatewayRequest,
@@ -157,7 +208,7 @@ def dialect_stream_payload(
             forwards_prompt_cache_key=profile.forwards_prompt_cache_key,
         )
     if profile.dialect == "anthropic_messages":
-        return anthropic_messages_stream_payload(
+        payload = anthropic_messages_stream_payload(
             profile.model_id,
             provider_request,
             supports_temperature=profile.supports_temperature,
@@ -171,6 +222,9 @@ def dialect_stream_payload(
             supports_reasoning=profile.supports_reasoning,
             reasoning_effort=required_reasoning_effort,
         )
+        if profile.anthropic_vertex_version is not None:
+            _apply_vertex_anthropic_envelope(payload, profile.anthropic_vertex_version)
+        return payload
     if profile.dialect == "gemini_generate_content":
         return gemini_generate_content_stream_payload(
             profile.model_id,

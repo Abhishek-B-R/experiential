@@ -693,6 +693,16 @@ class VertexAnthropicClient(ProviderHttpClient):
             supports_reasoning=self._supports_reasoning,
             reasoning_wire_format="anthropic_adaptive",
             reasoning_effort=self._reasoning_effort,
+            # The marker the shared dispatch body builder keys on to emit the
+            # Vertex-correct envelope (drop top-level "model", add
+            # "anthropic_version"); this is the path EVERY real gateway request
+            # takes, not the blocking _build_request below.
+            # NOT LIVE-VERIFIED and left for the connection/catalog step to
+            # validate against live Vertex: prompt-caching cache_control (incl.
+            # the 1h TTL) availability and billing parity, extended-thinking
+            # budgets, and max_tokens ceilings on Vertex-Anthropic vs direct
+            # Anthropic. Batch is out of scope.
+            anthropic_vertex_version=VERTEX_ANTHROPIC_VERSION,
         )
 
     def _completion_path(self) -> str:
