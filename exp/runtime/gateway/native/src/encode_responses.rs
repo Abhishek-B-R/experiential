@@ -703,6 +703,7 @@ impl ResponsesSseEncoder {
             arguments: String::new(),
             status,
             done: false,
+            close_deferred: false,
             custom,
         };
         let frame = self.event(
@@ -774,8 +775,48 @@ impl ResponsesSseEncoder {
             }
             state.status = Some(status);
         }
-        state.done = true;
+        if matches!(
+            state.status,
+            None | Some(ProviderOutputItemStatus::InProgress)
+        ) {
+            state.status = Some(ProviderOutputItemStatus::Completed);
+        }
+        if self.earlier_item_open(OutputSlot::Tool(index)) {
+            // Item completion follows output order, the order
+            // response.completed.output lists: a chat-wire turn completes its
+            // calls while the progress message (and any reasoning) before
+            // them stays open until the terminal, and a client that records
+            // items as they complete (Codex) would replay the calls ahead of
+            // the message, a history chat-wire providers reject. `finish`
+            // closes every open item in output order.
+            self.tools
+                .get_mut(&index)
+                .expect("tool just resolved")
+                .close_deferred = true;
+            return Ok(Vec::new());
+        }
+        self.tools.get_mut(&index).expect("tool just resolved").done = true;
         Ok(self.close_tool(index, ProviderOutputItemStatus::Completed))
+    }
+
+    /// Whether an output item listed before `slot` has not emitted its
+    /// `output_item.done` yet.
+    fn earlier_item_open(&self, slot: OutputSlot) -> bool {
+        self.output_order
+            .iter()
+            .take_while(|earlier| !earlier.same_item(slot))
+            .any(|earlier| match *earlier {
+                // A provider-reserved slot without state yet has emitted no
+                // `output_item.added`, so it holds nothing back.
+                OutputSlot::Message(key) => self.messages.get(&key).is_some_and(|s| !s.done),
+                OutputSlot::Tool(index) => self.tools.get(&index).is_some_and(|s| !s.done),
+                OutputSlot::Reasoning(index) => self.reasoning.get(&index).is_some_and(|s| !s.done),
+                OutputSlot::HostedTool(index) => self.hosted.get(&index).is_some_and(|s| !s.done),
+                OutputSlot::FireworksReasoning => self
+                    .fireworks_reasoning
+                    .as_ref()
+                    .is_some_and(|state| !state.done),
+            })
     }
 
     /// Resolve one already-started, still-open tool index.
@@ -783,7 +824,7 @@ impl ResponsesSseEncoder {
         let state = self.tools.get_mut(&index).ok_or_else(|| {
             invalid_provider_stream("Responses tool event arrived before tool-call start.")
         })?;
-        if state.done {
+        if state.done || state.close_deferred {
             return Err(invalid_provider_stream(
                 "Responses tool event arrived after item completion.",
             ));
