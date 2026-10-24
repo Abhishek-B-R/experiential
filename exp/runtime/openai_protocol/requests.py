@@ -266,9 +266,8 @@ def decode_chat(
     cache carriers for adapters that support them. Unknown keys on messages, their
     tool calls and content parts are dropped with disclosure
     (:mod:`exp.runtime.openai_protocol.unknown_message_fields`); every other unknown
-    nested field stays rejected. The
-    Vercel AI SDK's camelCase ``promptCacheKey`` is folded onto
-    ``prompt_cache_key`` first, so it decodes as the documented wire field.
+    nested field stays rejected. The Vercel AI SDK's camelCase ``promptCacheKey`` is
+    folded onto ``prompt_cache_key`` first, so it decodes as the documented wire field.
 
     Args:
         payload: Parsed JSON request body.
