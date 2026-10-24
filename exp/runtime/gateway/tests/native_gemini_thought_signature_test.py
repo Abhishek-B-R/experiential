@@ -273,6 +273,38 @@ def test_chat_callers_echoing_the_message_return_the_real_signature(
     assert _signatures(_replayed_model_parts(upstream)) == [_SIGNATURE, None]
 
 
+def test_a_chat_caller_echoing_the_signature_directly_on_the_call_returns_it(
+    served: tuple[str, str, _Upstream],
+) -> None:
+    """``thought_signature`` on the call (some Gemini bridges' spelling) replays the same way.
+
+    The response is served with no ignored-parameters disclosure: the Gemini
+    rung reads the signature, so nothing the caller sent was dropped.
+    """
+    base, key, upstream = served
+    turn: list[JsonObject] = [{"role": "user", "content": "Weather in Paris and Tokyo?"}]
+    first = _post(
+        base, key, "chat/completions", {"model": "gemini", "messages": turn, "tools": _TOOLS}
+    )
+    calls = first.json()["choices"][0]["message"]["tool_calls"]
+    flattened = []
+    for call in calls:
+        flat = {key: value for key, value in call.items() if key != "extra_content"}
+        if "extra_content" in call:
+            flat["thought_signature"] = call["extra_content"]["google"]["thought_signature"]
+        flattened.append(flat)
+    history = [
+        *turn,
+        {"role": "assistant", "content": None, "tool_calls": flattened},
+        *({"role": "tool", "tool_call_id": call["id"], "content": "sunny"} for call in calls),
+    ]
+    second = _post(
+        base, key, "chat/completions", {"model": "gemini", "messages": history, "tools": _TOOLS}
+    )
+    assert "x-experiential-ignored-parameters" not in second.json()
+    assert _signatures(_replayed_model_parts(upstream)) == [_SIGNATURE, None]
+
+
 def test_a_chat_caller_that_drops_the_signature_falls_back_to_the_placeholder(
     served: tuple[str, str, _Upstream],
 ) -> None:

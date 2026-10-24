@@ -19,6 +19,7 @@ from exp.common.models.content import (
     MediaHandle,
     VideoContentPart,
 )
+from exp.common.models.model import MAXIMUM_THOUGHT_SIGNATURE_CHARACTERS
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
     GatewayApiSurface,
@@ -5812,6 +5813,130 @@ def test_gemini_thought_signatures_decode_from_chat_and_responses_extra_content(
     )
     assert "extra_content" not in json.dumps(payload)
     assert signature not in json.dumps(payload)
+
+
+def _directly_signed_chat_history(call_fields: JsonObject) -> JsonObject:
+    """One Chat continuation echoing a Gemini tool call with extra call fields."""
+    body = _signed_chat_history(None)
+    messages = cast(list[JsonObject], body["messages"])
+    call = cast(list[JsonObject], messages[1]["tool_calls"])[0]
+    call.update(call_fields)
+    return body
+
+
+def test_a_chat_tool_call_accepts_the_signature_directly_on_the_call() -> None:
+    """``thought_signature`` on the call is the canonical signature under another name.
+
+    Both spellings decode to the same replayed signature and the same request
+    identity, and a call carrying both is accepted when they agree.
+    """
+    signature = "c2lnbmF0dXJlLWE="
+    canonical = decode_chat(_signed_chat_history(signature)).request
+    direct = decode_chat(_directly_signed_chat_history({"thought_signature": signature})).request
+    both = decode_chat(
+        _directly_signed_chat_history(
+            {
+                "thought_signature": signature,
+                "extra_content": {"google": {"thought_signature": signature}},
+            }
+        )
+    ).request
+    for request in (direct, both):
+        assert request.messages[1].tool_calls[0].provider_thought_signature == signature
+        assert canonical_request_sha256(request) == canonical_request_sha256(canonical)
+    assert direct.ignored_parameters == canonical.ignored_parameters
+    assert (
+        decode_chat(_directly_signed_chat_history({"thought_signature": None}))
+        .request.messages[1]
+        .tool_calls[0]
+        .provider_thought_signature
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "fragment"),
+    [
+        (123, "expected a string, but got an integer"),
+        (["c2ln"], "expected a string, but got an array"),
+        ("not base64!", "must be the base64 signature Gemini returned"),
+        ("", "expected a non-empty string"),
+        ("QQ==" * (MAXIMUM_THOUGHT_SIGNATURE_CHARACTERS // 4 + 1), "at most 1,048,576 characters"),
+    ],
+)
+def test_a_malformed_direct_thought_signature_is_refused_naming_its_field(
+    value: JsonValue, fragment: str
+) -> None:
+    """A non-string, non-base64, empty or oversized direct signature is a named 400."""
+    with pytest.raises(OpenAIProtocolError) as rejected:
+        decode_chat(_directly_signed_chat_history({"thought_signature": value}))
+    assert rejected.value.detail.param == "messages.1.tool_calls.0.thought_signature"
+    assert rejected.value.detail.code == "invalid_parameter"
+    assert fragment in rejected.value.detail.message
+
+
+@pytest.mark.parametrize("spelling", ["direct", "extra_content"])
+def test_a_direct_signature_reaches_gemini_and_is_disclosed_as_dropped_elsewhere(
+    spelling: str,
+) -> None:
+    """Either spelling replays on a Gemini rung and is disclosed where no rung reads it."""
+    from exp.runtime.models.providers.gemini_requests import THOUGHT_SIGNATURE_DROPPED
+    from exp.runtime.models.providers.streaming_requests import (
+        route_generation_parameter_requests,
+    )
+
+    signature = "c2lnbmF0dXJlLWE="
+    request = decode_chat(
+        _directly_signed_chat_history({"thought_signature": signature})
+        if spelling == "direct"
+        else _signed_chat_history(signature)
+    ).request
+    gemini = GatewayWireProfile(
+        dialect="gemini_generate_content", url="https://gemini.test", model_id="gemini-3"
+    )
+    openai = GatewayWireProfile(
+        dialect="openai_compatible", url="https://openai.test/v1", model_id="gpt-5.5"
+    )
+
+    public, provider = route_generation_parameter_requests((gemini,), request)
+    assert THOUGHT_SIGNATURE_DROPPED not in public.ignored_parameters
+    contents = cast(
+        list[JsonObject],
+        dialect_stream_payload(gemini, provider.model_copy(update={"stream": True}))["contents"],
+    )
+    model_parts = cast(list[JsonObject], contents[1]["parts"])
+    assert model_parts[0]["thoughtSignature"] == signature
+
+    public, provider = route_generation_parameter_requests((openai,), request)
+    assert THOUGHT_SIGNATURE_DROPPED in public.ignored_parameters
+    payload = json.dumps(
+        dialect_stream_payload(openai, provider.model_copy(update={"stream": True}))
+    )
+    assert signature not in payload
+    assert "thought_signature" not in payload
+
+    # Kept while any rung reads it: a Gemini lead with a non-Gemini fallback.
+    public, _provider = route_generation_parameter_requests((gemini, openai), request)
+    assert THOUGHT_SIGNATURE_DROPPED not in public.ignored_parameters
+    unsigned, _provider = route_generation_parameter_requests(
+        (openai,), decode_chat(_signed_chat_history(None)).request
+    )
+    assert THOUGHT_SIGNATURE_DROPPED not in unsigned.ignored_parameters
+
+
+def test_two_different_signatures_on_one_call_are_refused() -> None:
+    """A call naming two different signatures cannot pick one silently."""
+    with pytest.raises(OpenAIProtocolError) as rejected:
+        decode_chat(
+            _directly_signed_chat_history(
+                {
+                    "thought_signature": "b3RoZXI=",
+                    "extra_content": {"google": {"thought_signature": "c2lnbmF0dXJlLWE="}},
+                }
+            )
+        )
+    assert rejected.value.detail.param == "messages.1.tool_calls.0.thought_signature"
+    assert "two different thought signatures" in rejected.value.detail.message
 
 
 def test_a_malformed_thought_signature_is_refused_naming_its_field() -> None:

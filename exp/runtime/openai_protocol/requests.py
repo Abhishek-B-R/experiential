@@ -806,7 +806,7 @@ def _tool_call(call: _AssistantToolCall, param: str) -> ToolCall:
             if call.cache_control is not None
             else None
         ),
-        provider_thought_signature=thought_signature(call.extra_content),
+        provider_thought_signature=thought_signature(call.extra_content, call.thought_signature),
     )
 
 

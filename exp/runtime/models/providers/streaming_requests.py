@@ -56,6 +56,7 @@ from exp.runtime.models.providers.errors import (
     UnsupportedReasoningEffortError,
 )
 from exp.runtime.models.providers.fireworks import require_responses_continuation_channel
+from exp.runtime.models.providers.gemini_requests import disclose_dropped_thought_signatures
 from exp.runtime.models.providers.generation_parameter_validation import (
     anthropic_reasoning_disengaged,
     disclose_anthropic_tool_schemas,
@@ -857,6 +858,7 @@ def route_generation_parameter_requests(
     require_tool_names_supported(profiles, request)
     disclose_anthropic_tool_schemas(profiles, request, ignored)
     disclose_system_fold(profiles, request, ignored)
+    disclose_dropped_thought_signatures(profiles, request, ignored)
 
     if request.include_web_search_sources and not all(
         profile.dialect == "openai_responses" for profile in profiles
