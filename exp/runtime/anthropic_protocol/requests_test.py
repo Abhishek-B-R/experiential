@@ -2695,3 +2695,58 @@ def test_an_unknown_content_block_type_is_named_instead_of_the_text_arm() -> Non
     assert excinfo.value.detail.param == "messages.0.content.1.type"
     assert "'container_upload'" in excinfo.value.detail.message
     assert "Input should be 'text'" not in excinfo.value.detail.message
+
+
+def test_claude_code_turn_level_output_config_is_dropped_with_disclosure() -> None:
+    """Production 2026-10-18 onward: Claude Code puts ``output_config`` on a turn.
+
+    claude-cli 2.1.282 through 2.1.310 (cli, sdk-cli, agent-sdk) sends
+    ``output_config`` inside ``messages[1]`` on some requests, and the strict
+    turn model answered 400 ``Unknown parameter 'messages.1.output_config'``
+    for a body Anthropic itself serves. The turn key is removed and named
+    once; the top-level ``output_config`` still carries the effort, and the
+    turn's own content is untouched.
+    """
+    decoded = decode_messages(
+        {
+            "model": "claude-fable-5",
+            "max_tokens": 64000,
+            "output_config": {"effort": "high"},
+            "messages": [
+                {"role": "user", "content": "Summarize the session."},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Working on it."}],
+                    "output_config": {"effort": "low"},
+                },
+                {"role": "user", "content": "Go on.", "output_config": {"format": None}},
+            ],
+        }
+    )
+    request = decoded.request
+    assert request.ignored_parameters == ("messages.output_config->dropped(unknown_message_field)",)
+    assert request.reasoning_effort == "high"
+    assert request.provider_output_config == {"effort": "high"}
+    assert [message.role for message in request.messages] == ["user", "assistant", "user"]
+    assert request.messages[1].content == "Working on it."
+
+
+def test_turn_key_drop_leaves_content_blocks_and_defined_turn_keys_strict() -> None:
+    """Only unknown keys on the turn object drop; blocks and defined keys stay refused."""
+    turn_extra = {"role": "user", "content": "hi", "output_config": {"effort": "high"}}
+    with pytest.raises(OpenAIProtocolError) as block_extra:
+        decode_messages(
+            _body(
+                messages=[
+                    turn_extra,
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "x", "output_config": {}}],
+                    },
+                ]
+            )
+        )
+    assert block_extra.value.detail.param == "messages.1.content.0.output_config"
+    with pytest.raises(OpenAIProtocolError) as bad_role:
+        decode_messages(_body(messages=[{**turn_extra, "role": "narrator"}]))
+    assert bad_role.value.detail.param == "messages.0.role"

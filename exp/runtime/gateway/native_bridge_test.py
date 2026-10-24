@@ -7697,6 +7697,46 @@ def test_workbuddy_message_bookkeeping_is_dropped_before_dispatch(tmp_path: Path
     assert tagged_scope == plain_scope
 
 
+def test_claude_code_turn_output_config_serves_on_the_messages_lane(tmp_path: Path) -> None:
+    """Claude Code's ``messages[1].output_config`` admits, disclosed, never forwarded.
+
+    Production 2026-10-18 onward: claude-cli 2.1.282 through 2.1.310 sent
+    ``output_config`` inside ``messages[1]`` and every such ``/v1/messages``
+    call was a 400 ``Unknown parameter 'messages.1.output_config'``, though
+    Anthropic serves the same body. The turn key is dropped before dispatch
+    and named once; the native Anthropic wire carries no turn-level key.
+    """
+    root = tmp_path / "anthropic-root"
+    root.mkdir()
+    _manager, raw_key = _configured_gateway(root, provider="anthropic")
+    components = load_gateway_components(
+        root,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    control = NativeControlPlane(components, request_timeout_seconds=120.0)
+    body = json.dumps(
+        {
+            "model": "coding",
+            "max_tokens": 32,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello", "output_config": {"effort": "high"}},
+                {"role": "user", "content": "and now?"},
+            ],
+        }
+    )
+    admission = _flatten_started(control, _admit(control, raw_key, body, surface="messages"))
+    assert admission["ignored_parameters"] == [
+        "messages.output_config->dropped(unknown_message_field)",
+    ]
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    upstream_messages = cast("list[JsonObject]", upstream["messages"])
+    assert [message["role"] for message in upstream_messages] == ["user", "assistant", "user"]
+    assert all(set(message) <= {"role", "content"} for message in upstream_messages)
+    assert "output_config" not in upstream
+
+
 @pytest.mark.parametrize("declared", (False, True))
 def test_developer_messages_reach_a_chat_wire_lane_as_system(
     tmp_path: Path, declared: bool

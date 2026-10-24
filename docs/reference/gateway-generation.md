@@ -120,7 +120,10 @@ its original position; `store=false` means the provider resolves nothing by ID.
   instead of refused: on Chat messages, their assistant `tool_calls` entries, their
   content parts and each part's media object (`image_url`, `video_url`, `input_audio`,
   `file`; the Vercel AI SDK sends `image_url.providerOptions`), on Responses `message`
-  input items and their content parts, and on Messages turns. Chat apps stamp their own bookkeeping on the history they replay
+  input items and their content parts, and on Messages turns (Claude Code 2.1.282 and
+  later sends `output_config` inside a turn, disclosed as
+  `messages.output_config->dropped(unknown_message_field)`; the top-level `output_config`
+  is unaffected). Chat apps stamp their own bookkeeping on the history they replay
   (WorkBuddy's `conversationRequestId`, `isInternalToolCall`, `model_id`), so a refusal
   failed every later turn. Each dropped key is named once per request, as
   `messages.<field>`, `messages.tool_calls.<field>`, `messages.content.<field>` or
