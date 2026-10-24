@@ -742,6 +742,17 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
             # restoration, which maps wire messages one to one.
             converted.append(chat_custom_call_messages(custom_calls[:1])[0])
             continue
+        if content is None and not calls and not provider_reasoning:
+            # A null or omitted ``content`` (Go clients drop an empty tool
+            # result under ``omitempty``) leaves the message empty. Name the
+            # field here: the canonical message refuses it in its own
+            # validator, which escaped decode as an unclassified 500.
+            param = f"{prefix}.{message_index}.content"
+            raise invalid_field(
+                param,
+                f"Invalid value for '{param}': a {message.role} message needs content. "
+                "Send a string (it may be empty) or an array of content parts.",
+            )
         converted.append(
             GatewayMessage(
                 role=message.role,
