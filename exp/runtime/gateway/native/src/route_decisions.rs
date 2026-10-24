@@ -739,6 +739,22 @@ fn score_matches_distribution(score: f64, probabilities: &[f64]) -> bool {
     let Some((minimum, maximum)) = score_envelope(probabilities) else {
         return false;
     };
+    if score_meets_envelope(score, minimum, maximum) {
+        return true;
+    }
+    // TypeSafe also publishes bins rounded to hundredths whose residual was
+    // folded into one highest bin so the total reads exactly one, while its
+    // score keeps the unrounded expectation (production 2026-10-23: 0.71 beside
+    // [0.49, 0.37, 0.11, 0.03], whose independent envelope tops out at 0.70).
+    // That folded bin can sit up to half a hundredth per other bin away from
+    // its latent value, so it gets its own exact envelope of that convention.
+    residual_envelope(probabilities)
+        .is_some_and(|(minimum, maximum)| score_meets_envelope(score, minimum, maximum))
+}
+
+/// Whether a score, read at the precision it was reported to, meets an
+/// envelope in half-hundredths.
+fn score_meets_envelope(score: f64, minimum: i64, maximum: i64) -> bool {
     // The score is rounded at the precision the provider REPORTED it to
     // (TypeSafe answers `score=3.9` beside bins whose latent expectation is
     // 3.87, production 2026-10-17), so it stands for the closed interval of
@@ -783,6 +799,85 @@ fn score_envelope(probabilities: &[f64]) -> Option<(i64, i64)> {
     Some((minimum, maximum))
 }
 
+/// Extreme expectations, in half-hundredths, of the latent unit distributions
+/// behind hundredth bins published by rounding every bin and folding the
+/// normalization residual into one bin that rounded highest; `None` unless every
+/// bin is hundredth-valued, the published total is exactly one, and some bin can
+/// have been the folded one.
+///
+/// The bound is exact (an independent enumeration of the convention reaches
+/// both extremes; see `score_tests`). In half-hundredth units, with published
+/// hundredths `p_i`, latent `q_i` and a folded bin `a`:
+///
+/// - every other bin rounded to its published value, so `q_i` lies in its
+///   closed rounding interval `[2p_i - 1, 2p_i + 1]` clipped to `[0, 200]`;
+/// - the folded bin holds the rest, `q_a = 200 - S` with `S = sum of q_i, i != a`,
+///   so the published total is one for every such `q`;
+/// - the folded bin rounded to some hundredth `r_a >= M = max of p_i, i != a`,
+///   which exists exactly when `q_a + 1 >= 2M`: `S <= 201 - 2M`, and `S <= 200`
+///   keeps `q_a` a probability.
+///
+/// That is a box with one budget on `S`, and the weighted index
+/// `200a + sum of (i - a) q_i` is linear, so its extremes are a fractional
+/// knapsack: start every other bin at its lower bound and spend the budget on
+/// the bins whose weight favors the extreme, largest weight first. Every
+/// coordinate is an integer, so the extremes are integers too.
+fn residual_envelope(probabilities: &[f64]) -> Option<(i64, i64)> {
+    let published = probabilities
+        .iter()
+        .map(|value| hundredths(*value))
+        .collect::<Option<Vec<i64>>>()?;
+    if published.iter().sum::<i64>() != 100 {
+        return None;
+    }
+    let bounds = rounding_bounds(probabilities)?;
+    let mut envelope: Option<(i64, i64)> = None;
+    for folded in 0..bounds.len() {
+        let others: Vec<(i64, i64, i64)> = bounds
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != folded)
+            .map(|(index, (low, high))| (index as i64 - folded as i64, *low, *high))
+            .collect();
+        let highest = published
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != folded)
+            .map(|(_, bin)| *bin)
+            .max()
+            .unwrap_or(0);
+        let budget = 200.min(201 - 2 * highest);
+        let lower_sum: i64 = others.iter().map(|(_, low, _)| low).sum();
+        if lower_sum > budget {
+            continue;
+        }
+        let base = 200 * folded as i64
+            + others
+                .iter()
+                .map(|(weight, low, _)| weight * low)
+                .sum::<i64>();
+        let extreme = |sign: i64| {
+            let mut favored: Vec<_> = others
+                .iter()
+                .filter(|(weight, _, _)| sign * weight > 0)
+                .collect();
+            favored.sort_by_key(|(weight, _, _)| -(sign * weight));
+            let (mut value, mut remaining) = (base, budget - lower_sum);
+            for (weight, low, high) in favored {
+                let added = remaining.min(high - low);
+                value += weight * added;
+                remaining -= added;
+            }
+            value
+        };
+        let (minimum, maximum) = (extreme(-1), extreme(1));
+        envelope = Some(envelope.map_or((minimum, maximum), |(low, high)| {
+            (low.min(minimum), high.max(maximum))
+        }));
+    }
+    envelope
+}
+
 /// A score rejection that names the numbers it was judged on.
 ///
 /// The reason is replaced by the generic malformed-response message on the
@@ -796,14 +891,18 @@ fn score_mismatch(reason: &str, score: f64, probabilities: &[f64]) -> Failure {
         .map(f64::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let envelope = score_envelope(probabilities).map_or_else(
-        || "none".to_string(),
-        |(minimum, maximum)| format!("[{},{}]", minimum as f64 / 200.0, maximum as f64 / 200.0),
-    );
+    let render = |envelope: Option<(i64, i64)>| {
+        envelope.map_or_else(
+            || "none".to_string(),
+            |(minimum, maximum)| format!("[{},{}]", minimum as f64 / 200.0, maximum as f64 / 200.0),
+        )
+    };
     malformed(&format!(
         "{reason} (score={score}, expected={}, probabilities=[{bins}], \
-         rounding_envelope={envelope}, tolerance={PROBABILITY_TOLERANCE})",
-        expected_score(probabilities)
+         rounding_envelope={}, residual_envelope={}, tolerance={PROBABILITY_TOLERANCE})",
+        expected_score(probabilities),
+        render(score_envelope(probabilities)),
+        render(residual_envelope(probabilities)),
     ))
 }
 
