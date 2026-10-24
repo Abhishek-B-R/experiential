@@ -85,6 +85,7 @@ from exp.runtime.models.providers.tinker_sampling import (
 from exp.runtime.models.providers.transport import JsonHttpTransport
 from exp.runtime.models.providers.typesafe import TYPESAFE_BASE_URL, TypeSafeClient
 from exp.runtime.models.providers.vertex import (
+    VertexAnthropicClient,
     VertexClient,
     VertexOpenAIClient,
     VertexTokenProviderFactory,
@@ -408,6 +409,30 @@ class RuntimeModelCatalog:
                 if self._vertex_token_provider_factory is None
                 else self._vertex_token_provider_factory(credentials_json=api_key)
             )
+            if vertex_wire_for_model(snapshot.model_id) == "anthropic_messages":
+                # A Claude model published on Vertex ("Claude on Vertex AI"): served over the
+                # native Anthropic Messages wire at publishers/anthropic/models/<model>, under
+                # the same OAuth bearer. Anthropic models expose no embedding surface.
+                anthropic_client = VertexAnthropicClient(
+                    model=snapshot,
+                    api_key=api_key,
+                    base_url=connection.base_url,
+                    transport=self._transport_factory(),
+                    token_provider=token_provider,
+                    supports_temperature=capabilities.supports_temperature,
+                    supports_top_p=_supports_top_p(capabilities),
+                    supports_top_k=_supports_flag(capabilities, "supports_top_k"),
+                    supports_reasoning=capabilities.supports_reasoning,
+                    reasoning_effort=capabilities.reasoning_effort,
+                )
+                return ResolvedModel(
+                    alias,
+                    snapshot,
+                    capabilities,
+                    anthropic_client,
+                    None,
+                    served_model_id=record.served_model_id,
+                )
             if vertex_wire_for_model(snapshot.model_id) == "openai_compatible":
                 # A Model Garden MaaS id: Vertex serves it only over its
                 # OpenAI-compatible route, so the compatible client's wire and
