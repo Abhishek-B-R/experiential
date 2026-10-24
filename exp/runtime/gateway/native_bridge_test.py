@@ -20,7 +20,7 @@ from uuid import uuid4
 import pytest
 
 import exp.runtime.gateway.native_bridge as native_bridge_module
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.common.models import (
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
@@ -457,6 +457,191 @@ def test_openrouter_sampling_extras_forward_or_drop_per_rung_never_refuse(
     for name in ("repetition_penalty", "min_p", "top_a"):
         assert f"{name}->dropped(unsupported_by_provider)" in ignored
     assert "attempt_id" in _start_first(control, admission)
+
+
+_CUT_OFF_ARGUMENTS = '{"path": "src/ma'
+"""A replayed call the model emitted cut off at ``max_tokens`` (a valid object prefix)."""
+
+
+def _history_with_malformed_call(surface: str, arguments: str) -> str:
+    """A tool-declaring body whose history replays one call carrying ``arguments``."""
+    tool: JsonObject = {
+        "name": "read",
+        "description": "Read one file.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+    }
+    if surface == "responses":
+        return json.dumps(
+            {
+                "model": "coding",
+                "tools": [{"type": "function", **tool}],
+                "input": [
+                    {"role": "user", "content": "go"},
+                    {
+                        "type": "function_call",
+                        "call_id": "c1",
+                        "name": "read",
+                        "arguments": arguments,
+                    },
+                    {"type": "function_call_output", "call_id": "c1", "output": "done"},
+                    {"role": "user", "content": "next"},
+                ],
+            }
+        )
+    return json.dumps(
+        {
+            "model": "coding",
+            "tools": [{"type": "function", "function": tool}],
+            "messages": [
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": arguments},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "done"},
+                {"role": "user", "content": "next"},
+            ],
+        }
+    )
+
+
+def _replayed_upstream_arguments(payload: JsonObject) -> list[JsonValue]:
+    """Every replayed call's arguments as the rung's upstream payload carries them."""
+    found: list[JsonValue] = []
+    for item in cast("list[JsonObject]", payload.get("input") or []):
+        if item.get("type") == "function_call":
+            found.append(item["arguments"])
+    for message in cast("list[JsonObject]", payload.get("messages") or []):
+        for call in cast("list[JsonObject]", message.get("tool_calls") or []):
+            found.append(cast("JsonObject", call["function"])["arguments"])
+        content = message.get("content")
+        for block in cast("list[JsonObject]", content if isinstance(content, list) else []):
+            if block.get("type") == "tool_use":
+                found.append(block["input"])
+    return found
+
+
+_CHAT_ARGUMENTS = "messages.tool_calls.function.arguments"
+
+
+@pytest.mark.parametrize(
+    ("provider", "surface", "arguments", "expected", "disclosure"),
+    (
+        (
+            "openai-compatible",
+            "chat",
+            _CUT_OFF_ARGUMENTS,
+            {"path": "src/ma"},
+            f"{_CHAT_ARGUMENTS}->repaired(truncated_json)",
+        ),
+        (
+            "openai-compatible",
+            "chat",
+            "not json",
+            {"_unparsed_arguments": "not json"},
+            f"{_CHAT_ARGUMENTS}->wrapped(invalid_json)",
+        ),
+        (
+            "openai-compatible",
+            "responses",
+            _CUT_OFF_ARGUMENTS,
+            {"path": "src/ma"},
+            "input.arguments->repaired(truncated_json)",
+        ),
+        (
+            "anthropic",
+            "chat",
+            _CUT_OFF_ARGUMENTS,
+            {"path": "src/ma"},
+            f"{_CHAT_ARGUMENTS}->repaired(truncated_json)",
+        ),
+        (
+            "anthropic",
+            "responses",
+            "[1, 2]",
+            {"_unparsed_arguments": "[1, 2]"},
+            "input.arguments->wrapped(non_object_json)",
+        ),
+    ),
+)
+def test_history_with_a_malformed_call_serves_its_disclosed_stand_in(
+    tmp_path: Path,
+    provider: str,
+    surface: str,
+    arguments: str,
+    expected: JsonObject,
+    disclosure: str,
+) -> None:
+    """A history replaying a malformed or cut-off call no longer 400s, so the session lives.
+
+    A generic OpenAI-compatible server decodes history arguments (vLLM
+    ``json.loads`` them) and Anthropic's ``tool_use.input`` must be an object,
+    so both rungs receive the object stand-in and the admission discloses it.
+    """
+    _manager, key = _configured_gateway(
+        tmp_path,
+        provider=provider,
+        capabilities=ModelCapabilities(maximum_output_tokens=2_048, supports_tools=True),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "local-test-key"})
+    )
+    admission = _admit(
+        control,
+        key,
+        _history_with_malformed_call(surface, arguments),
+        surface="responses" if surface == "responses" else None,
+    )
+    route = cast("list[JsonObject]", admission["route"])
+    sent = _replayed_upstream_arguments(cast("JsonObject", route[0]["upstream_payload"]))
+    if provider == "anthropic":
+        assert sent == [expected]
+    else:
+        assert [json.loads(cast("str", value)) for value in sent] == [expected]
+    assert disclosure in cast("list[str]", admission["ignored_parameters"])
+    assert "attempt_id" in _start_first(control, admission)
+
+
+@pytest.mark.parametrize("surface", ("chat", "responses"))
+def test_openai_rung_replays_malformed_history_arguments_byte_exact(
+    tmp_path: Path, surface: str
+) -> None:
+    """OpenAI's own API treats ``arguments`` as opaque: the text passes untouched, undisclosed."""
+    capabilities = ModelCapabilities(maximum_output_tokens=2_048, supports_tools=True)
+    streaming_tools = GatewayDeploymentCapabilities(
+        supports_streaming=True, supports_streaming_tool_arguments=True
+    )
+    _manager, key = _configured_pool_gateway(
+        tmp_path,
+        gateway_capabilities=(streaming_tools, streaming_tools),
+        api_key_envs=("TEST_ALPHA_KEY", "TEST_BETA_KEY"),
+        provider="openai",
+        provider_models=("gpt-5.6-sol", "gpt-5.6-sol"),
+        model_capabilities=(capabilities, capabilities),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path, environment={"TEST_ALPHA_KEY": "alpha", "TEST_BETA_KEY": "beta"}
+        )
+    )
+    for arguments in (_CUT_OFF_ARGUMENTS, "not json", "[1, 2]"):
+        admission = _admit(
+            control,
+            key,
+            _history_with_malformed_call(surface, arguments),
+            surface="responses" if surface == "responses" else None,
+        )
+        route = cast("list[JsonObject]", admission["route"])
+        payload = cast("JsonObject", route[0]["upstream_payload"])
+        assert _replayed_upstream_arguments(payload) == [arguments]
+        ignored = cast("list[str]", admission.get("ignored_parameters") or [])
+        assert not [entry for entry in ignored if "arguments->" in entry]
 
 
 @pytest.mark.parametrize(

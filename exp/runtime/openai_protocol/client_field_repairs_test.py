@@ -267,12 +267,25 @@ def test_responses_call_arguments_object_or_double_encoded_are_normalized(
     assert [call.arguments for call in calls] == [{"city": "Paris"}]
 
 
-@pytest.mark.parametrize("arguments", ("not json", "[1, 2]", json.dumps("plain text")))
-def test_responses_call_arguments_that_name_no_object_are_refused_clearly(
-    arguments: str,
+@pytest.mark.parametrize(
+    ("arguments", "treatment"),
+    (
+        ("not json", "invalid_json"),
+        ("[1, 2]", "non_object_json"),
+        (json.dumps("plain text"), "non_object_json"),
+    ),
+)
+def test_responses_call_arguments_that_name_no_object_are_served_with_a_stand_in(
+    arguments: str, treatment: str
 ) -> None:
-    """Arguments that encode no object keep the refusal naming the path."""
-    with pytest.raises(
-        OpenAIProtocolError, match=r"input\.0\.arguments' must encode one JSON object"
-    ):
-        decode_responses(_function_call_input(arguments))
+    """A replayed call whose text names no object keeps its text and gains a wrapper.
+
+    Refusing it bricked the session (every later turn replays the same call);
+    the rung decides which form it sends and discloses a rewrite there.
+    """
+    decoded = decode_responses(_function_call_input(arguments))
+    assert decoded.request.ignored_parameters == ()
+    (call,) = [call for message in decoded.request.messages for call in message.tool_calls]
+    assert call.raw_arguments == arguments
+    assert call.arguments == {"_unparsed_arguments": arguments}
+    assert call.arguments_treatment == treatment
