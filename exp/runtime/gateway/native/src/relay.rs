@@ -422,14 +422,6 @@ impl UpstreamRelay {
         self.normalizer.observed_usage().cloned().or(reported)
     }
 
-    /// Whether the provider already declared this stream's terminal (a
-    /// decoded terminal is queued, or a declared finish is draining its
-    /// trailer). Such a stream ends on that terminal even past the deadline.
-    pub fn terminal_pending(&self) -> bool {
-        self.normalizer.metadata_drain_started().is_some()
-            || self.ready.iter().any(Event::is_terminal)
-    }
-
     /// The wall-clock time this relay yielded its first output token, or
     /// `None` if it has not produced one yet. Read at settlement to report
     /// the winning attempt's time-to-first-token.

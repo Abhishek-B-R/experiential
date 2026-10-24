@@ -1247,3 +1247,4 @@ def test_azure_responses_surface_dispatches_over_the_native_responses_wire(
     assert profile.headers["api-key"] == "foundry-secret"
     assert "Authorization" not in profile.headers
     assert profile.forwards_prompt_cache_key is True
+    assert profile.forwards_prompt_cache_ttl is False

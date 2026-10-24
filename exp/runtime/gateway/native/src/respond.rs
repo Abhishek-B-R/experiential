@@ -331,9 +331,6 @@ fn capture_frame_bounded(
     true
 }
 
-/// Deliver one public frame bounded by the request deadline, so a connected
-/// client that stops reading cannot pin the admission permit and the upstream
-/// connection forever. `false` means the client is gone or out of time.
 /// How long a stream's terminal frames (its failure event, the done
 /// sentinel) may still take to reach a connected caller once the request
 /// deadline itself has run out. Without it the frame that names a deadline
@@ -347,6 +344,9 @@ pub(crate) fn terminal_send_deadline(deadline: Instant) -> Instant {
     deadline.max(Instant::now() + TERMINAL_FRAME_GRACE)
 }
 
+/// Deliver one public frame bounded by the request deadline, so a connected
+/// client that stops reading cannot pin the admission permit and the upstream
+/// connection forever. `false` means the client is gone or out of time.
 pub(crate) async fn send_bounded(
     sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
     deadline: Instant,
