@@ -14,7 +14,9 @@ block because a cache hint changes cost, not semantics; ``image`` and PDF
 ``document`` blocks are retained as canonical content parts so a route that
 declares the matching input capability carries them — including ``image``
 and ``document`` sub-blocks inside ``tool_result`` content (tool screenshots
-and tool-returned files), which ride the tool message's content parts;
+and tool-returned files), which ride the tool message's content parts, and
+``tool_reference`` sub-blocks (a client-side tool search loading deferred
+tools), which ride the tool message's reference names;
 ``video`` blocks are rejected because the wire defines none. Unknown or
 unsupported fields are rejected with a field-specific error, never silently
 dropped. Errors raise
@@ -50,11 +52,14 @@ from exp.runtime.anthropic_protocol.media_blocks import (
     CacheControl,
     DocumentBlock,
     ImageBlock,
+    ToolReferenceBlock,
     cache_marker,
     document_part_from_block,
     image_part_from_block,
     plain_document_text,
+    tool_reference_cache_marker,
     tool_result_parts,
+    tool_result_references,
     tool_result_text,
 )
 from exp.runtime.anthropic_protocol.reasoning_channels import (
@@ -88,6 +93,7 @@ from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPrefe
 from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import validate_manifest
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
+from exp.runtime.openai_protocol.unknown_message_fields import drop_unknown_message_keys
 
 
 class _TextBlock(AnthropicWireModel):
@@ -143,9 +149,12 @@ class _ToolResultBlock(AnthropicWireModel):
     tool_use_id: str = Field(min_length=1, max_length=256)
     # Image and PDF document sub-blocks are real Anthropic wire (tool
     # screenshots and tool-returned files: Claude Code's Read tool emits both
-    # routinely); rejecting them wedges the caller's session because the block
-    # is baked into history.
-    content: str | tuple[_TextBlock | ImageBlock | DocumentBlock, ...] | None = None
+    # routinely), and so are tool_reference sub-blocks (Claude Code's
+    # client-side ToolSearch loads deferred tools with them); rejecting any of
+    # them wedges the caller's session because the block is baked into history.
+    content: (
+        str | tuple[_TextBlock | ImageBlock | DocumentBlock | ToolReferenceBlock, ...] | None
+    ) = None
     is_error: bool = False
     cache_control: CacheControl | None = None
 
@@ -195,6 +204,10 @@ class _Message(AnthropicWireModel):
     role: Literal["user", "assistant", "system"]
     content: str | tuple[_ContentBlock, ...]
     cache_control: CacheControl | None = None
+
+
+_MESSAGE_KEYS = frozenset(_Message.model_fields)
+"""Keys an Anthropic turn object may carry."""
 
 
 class _Tool(AnthropicWireModel):
@@ -391,6 +404,10 @@ def _decode(
     anthropic_beta: str | None,
 ) -> DecodedGatewayRequest:
     """Validate ``payload`` against ``wire`` and build the canonical request."""
+    # Clients stamp their own bookkeeping on the turns they replay; a key no
+    # turn defines is removed with disclosure rather than failing the whole
+    # conversation. Content blocks and top-level fields stay strict.
+    payload, unknown_disclosures = drop_unknown_message_keys(payload, _MESSAGE_KEYS)
     validate_manifest(payload, MESSAGES_MANIFEST)
     request = validate_wire(payload, wire)
     require_served_server_tool_types(request.tools)
@@ -476,7 +493,11 @@ def _decode(
             ),
             inference_geo=request.inference_geo,
             provider_beta_tokens=forwarded_betas,
-            ignored_parameters=(*dropped_beta_disclosures, *channels.disclosures),
+            ignored_parameters=(
+                *unknown_disclosures,
+                *dropped_beta_disclosures,
+                *channels.disclosures,
+            ),
             gateway=request.gateway,
             zdr_requested=request.provider is not None and request.provider.demands_zdr,
             provider_preferences=(
@@ -946,15 +967,15 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                     content_parts=tool_result_parts(
                         block.content, f"{param}.content.{block_index}"
                     ),
+                    tool_references=tool_result_references(block.content),
                     tool_call_id=block.tool_use_id,
                     tool_is_error=block.is_error,
                     # The marker Claude Code puts on its conversation
                     # breakpoints usually lands on a tool_result block; it
-                    # re-emits with the block on Anthropic rungs.
-                    cache_control=(
-                        block.cache_control.model_dump(mode="json", exclude_none=True)
-                        if block.cache_control is not None
-                        else None
+                    # re-emits with the block on Anthropic rungs. A marker on
+                    # a reference sub-block bounds the same prefix.
+                    cache_control=cache_marker(
+                        block.cache_control or tool_reference_cache_marker(block.content)
                     ),
                 )
             )

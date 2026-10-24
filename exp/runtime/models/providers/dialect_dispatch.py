@@ -45,6 +45,10 @@ from exp.runtime.models.providers.thinking_budget import (
     require_thinking_budget_support,
     thinking_budget_value,
 )
+from exp.runtime.models.providers.tool_references import (
+    NATIVE_TOOL_REFERENCE_DIALECT,
+    resolve_client_tool_search,
+)
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
@@ -427,6 +431,79 @@ def _forces_tool_choice(request: GatewayRequest) -> bool:
     )
 
 
+def _is_anthropic_files_block(block: object) -> bool:
+    """Whether one Anthropic content block is a Files-API reference.
+
+    A Files reference is a ``file`` block or an image/document block whose own
+    ``source`` is ``{"type": "file", ...}`` (a ``file_id`` handle). This inspects
+    ONLY the block's own type and source — NEVER a ``tool_use`` block's ``input``,
+    a ``tool_result`` block's ``content``, or a tool schema, which carry ARBITRARY
+    caller JSON that may legitimately contain keys like ``file_id`` or
+    ``{"type": "file"}`` and must not be mistaken for a Files handle.
+
+    Args:
+        block: One entry from a message's ``content`` array.
+
+    Returns:
+        True only for a genuine Anthropic Files reference block.
+    """
+    if not isinstance(block, dict):
+        return False
+    if block.get("type") == "file":
+        return True
+    source = block.get("source")
+    return isinstance(source, dict) and source.get("type") == "file"
+
+
+def _refuse_vertex_anthropic_file_handle(messages: object) -> None:
+    """Raise if any message's content carries an Anthropic Files reference.
+
+    Vertex AI serves the Anthropic Messages wire but has NO Files API, so a
+    request with a ``file_id`` handle (image or document source) cannot be served
+    there. Refusing clearly lets route admission prefer a direct-Anthropic /
+    Bedrock Claude rung that does support Files, rather than the Vertex endpoint
+    400ing upstream. Inline content (base64 ``source``) and tool use are
+    unaffected: only the direct content blocks of each message are inspected, not
+    the arbitrary caller JSON inside ``tool_use``/``tool_result`` blocks.
+
+    Args:
+        messages: The built body's ``messages`` array.
+
+    Raises:
+        ProviderCapabilityError: A direct content block is a Files reference.
+    """
+    if not isinstance(messages, list):
+        return
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if _is_anthropic_files_block(block):
+                raise ProviderCapabilityError(capability="anthropic_files")
+
+
+def _apply_vertex_anthropic_envelope(payload: JsonObject, anthropic_version: str) -> None:
+    """Rewrite a native Messages body in place for Claude on Vertex AI.
+
+    Vertex names the model in the ``:rawPredict`` URL and reads the version from
+    the body, the inverse of direct Anthropic (model in body, version in header).
+    Files handles are refused first (Vertex has no Files API).
+
+    Args:
+        payload: The native streaming Messages body built for the anthropic wire.
+        anthropic_version: The ``anthropic_version`` value Vertex requires.
+
+    Raises:
+        ProviderCapabilityError: The request references an Anthropic Files handle.
+    """
+    _refuse_vertex_anthropic_file_handle(payload.get("messages"))
+    payload.pop("model", None)
+    payload["anthropic_version"] = anthropic_version
+
+
 def dialect_stream_payload(
     profile: GatewayWireProfile,
     provider_request: GatewayRequest,
@@ -444,6 +521,12 @@ def dialect_stream_payload(
         ProviderCapabilityError: The request uses a capability this dialect
             cannot preserve.
     """
+    if profile.dialect != NATIVE_TOOL_REFERENCE_DIALECT:
+        # Only Anthropic expands tool_reference blocks and honors
+        # defer_loading without a tool-search tool; every other wire gets the
+        # references as text and every deferred tool loaded (OpenAI refuses
+        # the marker without its hosted tool_search).
+        provider_request = resolve_client_tool_search(provider_request)
     if (
         provider_request.tools
         and (
@@ -530,6 +613,8 @@ def dialect_stream_payload(
         )
         if profile.inference_geo is not None:
             payload["inference_geo"] = profile.inference_geo
+        if profile.anthropic_vertex_version is not None:
+            _apply_vertex_anthropic_envelope(payload, profile.anthropic_vertex_version)
         return payload
     if profile.dialect == "gemini_generate_content":
         payload = gemini_generate_content_stream_payload(

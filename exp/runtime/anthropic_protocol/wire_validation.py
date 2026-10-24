@@ -157,9 +157,10 @@ def rejected_block_hint(payload: JsonObject) -> tuple[str, str] | None:
                     hint = _REJECTED_BLOCK_HINTS.get(inner_type)
                     if hint is not None:
                         return inner_param, hint
-                    if inner_type not in ("text", "image", "document"):
+                    if inner_type not in ("text", "image", "document", "tool_reference"):
                         return inner_param, (
-                            f"unsupported block type '{inner_type}' inside tool_result "
-                            "content; only text, image, and document sub-blocks are supported."
+                            f"unsupported block type '{inner_type[:64]}' inside tool_result "
+                            "content; only text, image, document, and tool_reference "
+                            "sub-blocks are supported."
                         )
     return None

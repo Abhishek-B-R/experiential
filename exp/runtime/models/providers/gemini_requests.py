@@ -9,13 +9,15 @@ builders import it without creating a cycle through the streaming stack.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Literal, cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
+from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
 from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.models.providers.audios import gemini_audio_part
-from exp.runtime.models.providers.base import DEFAULT_MAXIMUM_OUTPUT_TOKENS
+from exp.runtime.models.providers.base import DEFAULT_MAXIMUM_OUTPUT_TOKENS, GatewayWireProfile
 from exp.runtime.models.providers.documents import gemini_document_part
 from exp.runtime.models.providers.images import gemini_image_part
 from exp.runtime.models.providers.instruction_turns import (
@@ -40,6 +42,39 @@ A replayed call carries its real signature when the caller echoed one
 literal, which Google documents for replaying a call whose signature was not
 retained.
 """
+
+
+THOUGHT_SIGNATURE_DROPPED = "messages.tool_calls.thought_signature->dropped(no_gemini_rung)"
+"""Disclosure recorded when echoed Chat thought signatures reach no rung that reads them.
+
+Only the Gemini generateContent wire (Gemini and Vertex) replays a signature;
+every other wire omits it, so a Chat caller that echoed one, in either
+spelling, learns at admission that no rung on the route will receive it.
+"""
+
+
+def disclose_dropped_thought_signatures(
+    profiles: Iterable[GatewayWireProfile],
+    request: GatewayRequest,
+    ignored: list[str],
+) -> None:
+    """Record :data:`THOUGHT_SIGNATURE_DROPPED` when no rung can replay a signature.
+
+    Like block-level cache markers, the signature is kept while ANY rung reads
+    it (the Gemini rung replays it, the others omit it) and disclosed only
+    when none does. Nothing is recorded for a Chat request without one.
+    """
+    if (
+        request.surface == GatewayApiSurface.CHAT_COMPLETIONS
+        and any(
+            call.provider_thought_signature is not None
+            for message in request.messages
+            for call in message.tool_calls
+        )
+        and not any(profile.dialect == "gemini_generate_content" for profile in profiles)
+        and THOUGHT_SIGNATURE_DROPPED not in ignored
+    ):
+        ignored.append(THOUGHT_SIGNATURE_DROPPED)
 
 
 def gemini_model_path(model_id: str) -> str:

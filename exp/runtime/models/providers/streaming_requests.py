@@ -56,6 +56,7 @@ from exp.runtime.models.providers.errors import (
     UnsupportedReasoningEffortError,
 )
 from exp.runtime.models.providers.fireworks import require_responses_continuation_channel
+from exp.runtime.models.providers.gemini_requests import disclose_dropped_thought_signatures
 from exp.runtime.models.providers.generation_parameter_validation import (
     anthropic_reasoning_disengaged,
     disclose_anthropic_tool_schemas,
@@ -113,6 +114,7 @@ from exp.runtime.models.providers.thinking_budget import (
     thinking_budget_value,
     thinking_budget_wire_field,
 )
+from exp.runtime.models.providers.tool_references import disclose_client_tool_search
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
@@ -474,6 +476,8 @@ def route_generation_parameter_requests(
     # alone, and every other combination folded into a user turn after the
     # tool run, each disclosed once per route (dialect_dispatch).
     disclose_tool_result_attachment_folds(profiles, request.messages, ignored)
+    # Tool-result references and deferred tools: see tool_references.py.
+    disclose_client_tool_search(profiles, request, ignored)
 
     disclose_gemini_missing_tool_results(profiles, request.messages, ignored)
     # Only the Anthropic wire has a tool-result error flag. Every other wire
@@ -854,6 +858,7 @@ def route_generation_parameter_requests(
     require_tool_names_supported(profiles, request)
     disclose_anthropic_tool_schemas(profiles, request, ignored)
     disclose_system_fold(profiles, request, ignored)
+    disclose_dropped_thought_signatures(profiles, request, ignored)
 
     if request.include_web_search_sources and not all(
         profile.dialect == "openai_responses" for profile in profiles

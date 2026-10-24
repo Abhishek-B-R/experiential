@@ -38,6 +38,7 @@ use crate::upstream::open_decision_stream;
 use crate::waterfall::{successor_possible, DeploymentWire, RoutePolicy, StartResponse};
 use body_budget::reserve_body;
 use openai::{openai_decision_usage, public_openai_decisions};
+use residual::residual_envelope;
 
 const PROBABILITY_TOLERANCE: f64 = 1e-6;
 
@@ -739,6 +740,22 @@ fn score_matches_distribution(score: f64, probabilities: &[f64]) -> bool {
     let Some((minimum, maximum)) = score_envelope(probabilities) else {
         return false;
     };
+    if score_meets_envelope(score, minimum, maximum) {
+        return true;
+    }
+    // TypeSafe also publishes bins rounded to hundredths whose residual was
+    // folded into one highest bin so the total reads exactly one, while its
+    // score keeps the unrounded expectation (production 2026-10-23: 0.71 beside
+    // [0.49, 0.37, 0.11, 0.03], whose independent envelope tops out at 0.70).
+    // That folded bin can sit up to half a hundredth per other bin away from
+    // its latent value, so it gets its own exact envelope of that convention.
+    residual_envelope(probabilities)
+        .is_some_and(|(minimum, maximum)| score_meets_envelope(score, minimum, maximum))
+}
+
+/// Whether a score, read at the precision it was reported to, meets an
+/// envelope in half-hundredths.
+fn score_meets_envelope(score: f64, minimum: i64, maximum: i64) -> bool {
     // The score is rounded at the precision the provider REPORTED it to
     // (TypeSafe answers `score=3.9` beside bins whose latent expectation is
     // 3.87, production 2026-10-17), so it stands for the closed interval of
@@ -796,14 +813,18 @@ fn score_mismatch(reason: &str, score: f64, probabilities: &[f64]) -> Failure {
         .map(f64::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let envelope = score_envelope(probabilities).map_or_else(
-        || "none".to_string(),
-        |(minimum, maximum)| format!("[{},{}]", minimum as f64 / 200.0, maximum as f64 / 200.0),
-    );
+    let render = |envelope: Option<(i64, i64)>| {
+        envelope.map_or_else(
+            || "none".to_string(),
+            |(minimum, maximum)| format!("[{},{}]", minimum as f64 / 200.0, maximum as f64 / 200.0),
+        )
+    };
     malformed(&format!(
         "{reason} (score={score}, expected={}, probabilities=[{bins}], \
-         rounding_envelope={envelope}, tolerance={PROBABILITY_TOLERANCE})",
-        expected_score(probabilities)
+         rounding_envelope={}, residual_envelope={}, tolerance={PROBABILITY_TOLERANCE})",
+        expected_score(probabilities),
+        render(score_envelope(probabilities)),
+        render(residual_envelope(probabilities)),
     ))
 }
 
@@ -969,6 +990,8 @@ mod openai;
 #[cfg(test)]
 #[path = "route_decisions/openai_tests.rs"]
 mod openai_tests;
+#[path = "route_decisions/residual.rs"]
+mod residual;
 #[cfg(test)]
 #[path = "route_decisions/score_tests.rs"]
 mod score_tests;

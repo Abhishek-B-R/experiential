@@ -1266,6 +1266,82 @@ def test_windowed_observation_records_large_requests_instead_of_unsupported() ->
     assert adapter.input_calls == 1
 
 
+class _ProjectingClassifier(_WindowedClassifier):
+    """Windowed adapter that reads only the last message, and records what it read."""
+
+    def __init__(self) -> None:
+        """Start with no inspected subjects."""
+        super().__init__()
+        self.projected = 0
+        self.seen: list[GatewayRequest] = []
+
+    def project_input(self, request: GatewayRequest) -> GatewayRequest:
+        """Keep only the last message."""
+        self.projected += 1
+        return GatewayRequest(surface=request.surface, messages=request.messages[-1:])
+
+    async def inspect_input(
+        self, *, request: GatewayRequest, check: GuardrailCheck
+    ) -> ClassifierVerdict:
+        """Record the subject the observer handed over."""
+        self.seen.append(request)
+        return await super().inspect_input(request=request, check=check)
+
+
+def test_projected_observation_never_copies_or_encodes_the_complete_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A large agent request is observed through its bounded projection only."""
+    recorded = threading.Event()
+
+    class Recording(GuardrailEngine):
+        """Signal when the observation finished."""
+
+        def _record_observation(
+            self,
+            policy: GuardrailPolicy,
+            check: GuardrailCheck | None,
+            outcome: GuardrailOutcome,
+            latency_seconds: float,
+        ) -> None:
+            """Wake the test."""
+            del policy, check, outcome, latency_seconds
+            recorded.set()
+
+    def refuse_deep_copy(self: GatewayRequest, **kwargs: object) -> GatewayRequest:
+        """The projected path must not detach the complete request."""
+        raise AssertionError("observation deep-copied the complete request")
+
+    policy = GuardrailPolicy(
+        policy_id="observer",
+        protected=True,
+        mode="observe",
+        checks=(_check("classify", timeout_ms=1000),),
+    )
+    adapter = _ProjectingClassifier()
+    # Retained capacity far below the complete request: only the projection fits.
+    engine = Recording(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({"scripted": adapter})),
+        monotonic=time.monotonic,
+        max_observation_bytes=4_096,
+    )
+    request = _request(*("x" * 1_000 for _ in range(50)), "the latest turn")
+    monkeypatch.setattr(GatewayRequest, "model_copy", refuse_deep_copy)
+    try:
+        engine.observe_inputs(
+            policies=(policy,), request=request, deadline_monotonic=time.monotonic() + 5
+        )
+        assert recorded.wait(2)
+    finally:
+        engine.close(timeout_seconds=2)
+
+    assert adapter.projected == 1
+    assert [message.content for item in adapter.seen for message in item.messages] == [
+        "the latest turn"
+    ]
+
+
 def test_oversized_tool_schema_is_rejected_without_calling_the_adapter() -> None:
     """Tool descriptions and schemas count toward the request subject bound."""
     request = GatewayRequest(

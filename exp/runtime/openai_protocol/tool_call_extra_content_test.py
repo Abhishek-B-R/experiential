@@ -20,6 +20,13 @@ def test_google_thought_signature_is_read_from_the_documented_shape() -> None:
     assert thought_signature(extra) == "c2lnbmF0dXJlLWE="
 
 
+def test_a_direct_signature_is_read_when_extra_content_carries_none() -> None:
+    """The top-level spelling is the signature unless the canonical block names one."""
+    assert thought_signature(None, "c2lnbmF0dXJlLWE=") == "c2lnbmF0dXJlLWE="
+    empty = ToolCallExtraContent.model_validate({})
+    assert thought_signature(empty, "c2lnbmF0dXJlLWE=") == "c2lnbmF0dXJlLWE="
+
+
 @pytest.mark.parametrize("payload", [None, {}, {"google": None}])
 def test_absent_signatures_read_as_none(payload: dict[str, None] | None) -> None:
     """No object, an empty object, or a null Google block carries no signature."""

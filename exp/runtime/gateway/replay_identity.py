@@ -110,6 +110,9 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
             authority["tool_calls"] = retained_calls
         if message.tool_is_error:
             authority["tool_is_error"] = True
+        if message.tool_references:
+            # A loaded deferred tool changes what the model can call.
+            authority["tool_references"] = list(message.tool_references)
         if message.provider_tool_name is not None:
             authority["provider_tool_name"] = message.provider_tool_name
         if message.provider_tool_namespace is not None:

@@ -116,10 +116,27 @@ its original position; `store=false` means the provider resolves nothing by ID.
   a non-streaming call as `stream_options->ignored(stream_false)`.
 - Responses `text.format.type: "json_object"` selects the same schema-free JSON mode
   as Chat `response_format: {"type": "json_object"}`.
-- Chat messages carrying GitHub Copilot Chat's `cot_id` tag decode; the tag is
-  disclosed as `messages.cot_id->dropped(client_annotation)`. Its `cot_summary`, and the
-  `timestamp` and `startsNewUserRequest` bookkeeping other agents stamp on messages, are
-  dropped the same way, each under its own `messages.<field>->dropped(client_annotation)`.
+- A key the gateway does not define on a conversation object is dropped before dispatch
+  instead of refused: on Chat messages, their assistant `tool_calls` entries, their
+  content parts and each part's media object (`image_url`, `video_url`, `input_audio`,
+  `file`; the Vercel AI SDK sends `image_url.providerOptions`), on Responses `message`
+  input items and their content parts, and on Messages turns (Claude Code 2.1.282 and
+  later sends `output_config` inside a turn, disclosed as
+  `messages.output_config->dropped(unknown_message_field)`; the top-level `output_config`
+  is unaffected). Chat apps stamp their own bookkeeping on the history they replay
+  (WorkBuddy's `conversationRequestId`, `isInternalToolCall`, `model_id`), so a refusal
+  failed every later turn. Each dropped key is named once per request, as
+  `messages.<field>`, `messages.tool_calls.<field>`, `messages.content.<field>` or
+  `messages.content.image_url.<field>` (`input.` on Responses)
+  `->dropped(unknown_message_field)`. Keys traced to one client keep
+  `client_annotation` as the reason: Copilot Chat's `cot_id` and `cot_summary`, the
+  `timestamp` and `startsNewUserRequest` other agents stamp, WorkBuddy CLI's `agent`, and
+  an image's `image_url.dimensions` size hint. Field names are reduced to `[A-Za-z0-9_]`, at most 64
+  characters, and at most 16 keys are named; the rest are counted in one
+  `messages.*->dropped(<n>_more_unknown_message_fields)` entry. Defined fields keep
+  their typed refusal for a bad value, unknown keys inside a tool call's `function`
+  object, inside a Messages content block, or on other Responses item types stay
+  refused, and an unknown top-level parameter is still `unsupported_parameter`.
 - OpenAI's optional participant `name` on a system, developer, user or assistant message is
   dropped, disclosed as `messages.name->dropped(participant_name)`. On tool messages `name`
   still attributes the result.
