@@ -110,35 +110,58 @@ def fireworks_continuation_required(profile: GatewayWireProfile, request: Gatewa
     )
 
 
-def _refuse_vertex_anthropic_file_handle(node: object) -> None:
-    """Raise if a built Messages body references an Anthropic Files handle.
+def _is_anthropic_files_block(block: object) -> bool:
+    """Whether one Anthropic content block is a Files-API reference.
 
-    Vertex AI serves the Anthropic Messages wire but has NO Files API, so a
-    request carrying a ``file_id`` reference (an uploaded-document or container
-    handle) cannot be served there. Refusing clearly lets route admission prefer
-    a direct-Anthropic / Bedrock Claude rung that does support Files, rather than
-    the Vertex endpoint 400ing the request upstream. Inline content (base64
-    ``source``) is unaffected.
+    A Files reference is a ``file`` block or an image/document block whose own
+    ``source`` is ``{"type": "file", ...}`` (a ``file_id`` handle). This inspects
+    ONLY the block's own type and source — NEVER a ``tool_use`` block's ``input``,
+    a ``tool_result`` block's ``content``, or a tool schema, which carry ARBITRARY
+    caller JSON that may legitimately contain keys like ``file_id`` or
+    ``{"type": "file"}`` and must not be mistaken for a Files handle.
 
     Args:
-        node: A JSON subtree of the built request body.
+        block: One entry from a message's ``content`` array.
+
+    Returns:
+        True only for a genuine Anthropic Files reference block.
+    """
+    if not isinstance(block, dict):
+        return False
+    if block.get("type") == "file":
+        return True
+    source = block.get("source")
+    return isinstance(source, dict) and source.get("type") == "file"
+
+
+def _refuse_vertex_anthropic_file_handle(messages: object) -> None:
+    """Raise if any message's content carries an Anthropic Files reference.
+
+    Vertex AI serves the Anthropic Messages wire but has NO Files API, so a
+    request with a ``file_id`` handle (image or document source) cannot be served
+    there. Refusing clearly lets route admission prefer a direct-Anthropic /
+    Bedrock Claude rung that does support Files, rather than the Vertex endpoint
+    400ing upstream. Inline content (base64 ``source``) and tool use are
+    unaffected: only the direct content blocks of each message are inspected, not
+    the arbitrary caller JSON inside ``tool_use``/``tool_result`` blocks.
+
+    Args:
+        messages: The built body's ``messages`` array.
 
     Raises:
-        ProviderCapabilityError: A Files handle appears anywhere in the body.
+        ProviderCapabilityError: A direct content block is a Files reference.
     """
-    if isinstance(node, dict):
-        source = node.get("source")
-        if (
-            node.get("type") == "file"
-            or "file_id" in node
-            or (isinstance(source, dict) and source.get("type") == "file")
-        ):
-            raise ProviderCapabilityError(capability="anthropic_files")
-        for value in node.values():
-            _refuse_vertex_anthropic_file_handle(value)
-    elif isinstance(node, list):
-        for value in node:
-            _refuse_vertex_anthropic_file_handle(value)
+    if not isinstance(messages, list):
+        return
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if _is_anthropic_files_block(block):
+                raise ProviderCapabilityError(capability="anthropic_files")
 
 
 def _apply_vertex_anthropic_envelope(payload: JsonObject, anthropic_version: str) -> None:
@@ -156,7 +179,6 @@ def _apply_vertex_anthropic_envelope(payload: JsonObject, anthropic_version: str
         ProviderCapabilityError: The request references an Anthropic Files handle.
     """
     _refuse_vertex_anthropic_file_handle(payload.get("messages"))
-    _refuse_vertex_anthropic_file_handle(payload.get("system"))
     payload.pop("model", None)
     payload["anthropic_version"] = anthropic_version
 

@@ -150,6 +150,41 @@ def test_dispatch_refuses_an_anthropic_files_handle() -> None:
         )
 
 
+def test_dispatch_allows_tool_calls_whose_args_mention_file_keys() -> None:
+    """Caller JSON in tool_use.input / tool_result is NOT a Files handle; allowed."""
+    payload: JsonObject = {
+        "model": "claude-opus-4-5@20250514",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tu_1",
+                        "name": "lookup",
+                        "input": {"file_id": "abc", "nested": {"type": "file"}},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_1",
+                        "content": [{"type": "text", "text": '{"file_id": "abc"}'}],
+                    }
+                ],
+            },
+        ],
+    }
+
+    _apply_vertex_anthropic_envelope(payload, VERTEX_ANTHROPIC_VERSION)
+
+    assert "model" not in payload
+    assert payload["anthropic_version"] == VERTEX_ANTHROPIC_VERSION
+
+
 def test_token_provider_is_read_for_every_profile() -> None:
     """Each profile build mints a fresh bearer so the hourly refresh is never stale."""
     tokens = iter(["token-one", "token-two"])
