@@ -12,7 +12,7 @@ from typing import Final
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
+from exp.runtime.gateway.attempt_tokens import worst_case_output_tokens
 from exp.runtime.gateway.budget_continuation import denied_destination_pool
 from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
 from exp.runtime.gateway.class_throttles import (
@@ -439,8 +439,8 @@ class NativeAttemptAccounting:
         forced_overflow = False
         capacity_refused = False
         shed_records: dict[int, RungShed] = {}
-        # Tokenize the input reservation once per ladder walk for all candidates.
-        reserved_input_tokens = worst_case_input_tokens(entry.request)
+        # Tokenize the input reservation once per request for every attempt.
+        reserved_input_tokens = entry.reserved_input_tokens()
         while True:
             with self._lock:
                 active = self._inflight.get(request_id) is entry and entry.pending_abandon is None
