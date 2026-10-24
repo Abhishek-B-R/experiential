@@ -7802,3 +7802,152 @@ def test_responses_instructions_reach_a_chat_wire_lane_as_system(tmp_path: Path)
     assert isinstance(messages, list)
     assert messages[0] == {"role": "system", "content": "Answer in French."}
     assert admission["ignored_parameters"] == [DEVELOPER_ROLE_REWRITE_DISCLOSURE]
+
+
+def _tool_change_body(*, count_only: bool = False) -> str:
+    """A Claude Code late-tool-additions turn on the Messages lane.
+
+    One deferred MCP tool is added by reference, one tool is defined by
+    value, and one is withdrawn, all in the mid-conversation system turn
+    Claude Code appends after a user turn.
+    """
+    schema: JsonObject = {"type": "object", "properties": {"q": {"type": "string"}}}
+    payload: JsonObject = {
+        "model": "coding",
+        "tools": [
+            {"name": "Bash", "input_schema": schema},
+            {"name": "mcp__github__create_issue", "input_schema": schema, "defer_loading": True},
+            {"name": "mcp__slack__post_message", "input_schema": schema, "defer_loading": True},
+        ],
+        "messages": [
+            {"role": "user", "content": "open an issue"},
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "<system-reminder>MCP tools changed.</system-reminder>",
+                    },
+                    {
+                        "type": "tool_removal",
+                        "tool": {"type": "tool_reference", "name": "mcp__slack__post_message"},
+                    },
+                    {
+                        "type": "tool_addition",
+                        "tool": {"type": "tool_reference", "name": "mcp__github__create_issue"},
+                    },
+                    {
+                        "type": "tool_addition",
+                        "tool": {
+                            "type": "tool_definition",
+                            "definition": {"name": "mcp__linear__create", "input_schema": schema},
+                        },
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                ],
+            },
+        ],
+    }
+    if not count_only:
+        payload["max_tokens"] = 64
+    return json.dumps(payload)
+
+
+_TOOL_CHANGE_DISCLOSURES = (
+    "messages.content.tool_removal->text",
+    "messages.content.tool_addition->tools",
+)
+
+
+def test_claude_code_tool_changes_serve_on_an_anthropic_messages_rung(tmp_path: Path) -> None:
+    """``tool_addition`` / ``tool_removal`` admit on the Messages lane, applied and stated.
+
+    Production 2026-10-18 onward: claude-cli 2.1.293 through 2.1.310 sent
+    tool changes in a mid-conversation system turn, and every such
+    ``/v1/messages`` call was a 400 ``unsupported content block type
+    'tool_addition'`` though Anthropic serves the same body. On a native
+    Anthropic rung the added tool dispatches without ``defer_loading``, the
+    defined tool joins ``tools``, the withdrawn tool stays declared and
+    deferred, and the system turn's changes ride as text after the reminder,
+    the block's cache marker on its line.
+    """
+    root = tmp_path / "anthropic-root"
+    root.mkdir()
+    _manager, raw_key = _configured_gateway(
+        root,
+        provider="anthropic",
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(root, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}),
+        request_timeout_seconds=120.0,
+    )
+
+    admission = _flatten_started(
+        control, _admit(control, raw_key, _tool_change_body(), surface="messages")
+    )
+
+    ignored = cast("list[str]", admission["ignored_parameters"])
+    assert all(disclosure in ignored for disclosure in _TOOL_CHANGE_DISCLOSURES)
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    tools = cast("list[JsonObject]", upstream["tools"])
+    assert [(tool["name"], tool.get("defer_loading")) for tool in tools] == [
+        ("Bash", None),
+        ("mcp__github__create_issue", None),
+        ("mcp__slack__post_message", True),
+        ("mcp__linear__create", None),
+    ]
+    messages = cast("list[JsonObject]", upstream["messages"])
+    assert [message["role"] for message in messages] == ["user"]
+    blocks = cast("list[JsonObject]", messages[0]["content"])
+    text = "".join(str(block.get("text", "")) for block in blocks)
+    assert "Tool removed: mcp__slack__post_message." in text
+    assert "Tool added: mcp__github__create_issue." in text
+    assert "Tool added: mcp__linear__create." in text
+    assert blocks[-1]["cache_control"] == {"type": "ephemeral"}
+    assert "tool_addition" not in json.dumps(upstream)
+
+
+def test_claude_code_tool_changes_serve_on_a_chat_wire_rung(tmp_path: Path) -> None:
+    """A Chat-wire rung receives every tool loaded and the changes as instruction text."""
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "local-test-key"})
+    )
+
+    admission = _admit(control, raw_key, _tool_change_body(), surface="messages")
+
+    ignored = cast("list[str]", admission["ignored_parameters"])
+    assert all(disclosure in ignored for disclosure in _TOOL_CHANGE_DISCLOSURES)
+    route = admission["route"]
+    assert isinstance(route, list) and isinstance(route[0], dict)
+    payload = route[0]["upstream_payload"]
+    assert isinstance(payload, dict)
+    tools = cast("list[JsonObject]", payload["tools"])
+    assert [cast("JsonObject", tool["function"])["name"] for tool in tools] == [
+        "Bash",
+        "mcp__github__create_issue",
+        "mcp__slack__post_message",
+        "mcp__linear__create",
+    ]
+    assert "defer_loading" not in json.dumps(payload)
+    wire_text = json.dumps(_payload_messages(admission))
+    assert "Tool removed: mcp__slack__post_message." in wire_text
+    assert "Tool added: mcp__linear__create." in wire_text
+    assert "tool_addition" not in json.dumps(payload)
+
+
+def test_count_tokens_counts_a_tool_change_turn(tmp_path: Path) -> None:
+    """``count_tokens`` accepts the same turn (production refused it too) and counts it."""
+    control, raw_key = _control_plane(tmp_path)
+    counted = json.loads(
+        control.count_tokens(
+            json.dumps({"raw_key": raw_key, "body": _tool_change_body(count_only=True)})
+        )
+    )
+    assert isinstance(counted["input_tokens"], int)
+    assert counted["input_tokens"] > 0
