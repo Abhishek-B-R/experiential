@@ -9,10 +9,10 @@ dependencies = [
     # Every requirement here and in the extras is an exact pin, except `openai`: callers'
     # own code imports that SDK next to this package, so it stays a certified range. A
     # version moves only by a reviewed edit, and [tool.uv] keeps it 7 days old.
+    "exp-gateway-native==0.3.170",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
     # Cross-platform advisory locking for durable registries edited in place. Declared directly
     # because `exp.common.core.locks` imports it and Unix-only `fcntl` is not a portable boundary.
-    "exp-gateway-native==0.3.170",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
-    "filelock==3.32.0",
+    "filelock==4.2.1",
     "jsonschema==4.26.0",  # Validate induced local-only tool and state contracts.
     "ijson==3.5.1",  # incremental parsing of local trace archives
     "typer==0.26.8",
@@ -134,8 +134,10 @@ python-version = "3.12"
 # CA keys were compromised (GHSA-6q48-6c7w-9gw2). Remove this entry after
 # 2026-10-27, when the 7-day window covers that release; until then no later
 # certifi release is eligible.
+# filelock: 4.2.1 (uploaded 2026-10-17) fixes ReadWriteLock reopening its database
+# by name (GHSA-v4x8-3wr5-3wq8, high). Remove this entry after 2026-10-24.
 exclude-newer = "7 days"
-exclude-newer-package = { experiential = false, exp-gateway-native = false, exp-mitmproxy = false, exp-mitmproxy-rs = false, certifi = "2026-10-21T00:00:00Z" }
+exclude-newer-package = { experiential = false, exp-gateway-native = false, exp-mitmproxy = false, exp-mitmproxy-rs = false, certifi = "2026-10-21T00:00:00Z", filelock = "2026-10-18T00:00:00Z" }
 
 [tool.uv.sources]
 # The one permitted path source (AGENTS.md "One package"): repo checkouts rebuild the

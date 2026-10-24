@@ -330,7 +330,10 @@ def _published_requires_dist() -> list[str]:
     project = tomllib.loads(path.read_text(encoding="utf-8"))["project"]
     values = list(project["dependencies"])
     for extra, requirements in project["optional-dependencies"].items():
-        values += [f'{requirement}; extra == "{extra}"' for requirement in requirements]
+        for requirement in requirements:
+            spec, _, marker = requirement.partition(";")
+            marker = f"({marker.strip()}) and " if marker else ""
+            values.append(f'{spec.strip()}; {marker}extra == "{extra}"')
     return values
 
 

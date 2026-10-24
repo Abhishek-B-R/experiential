@@ -399,8 +399,10 @@ Rules of the road:
   sources or distributions may be added.
 - **Exact pins only**: every requirement in `[project.dependencies]` and the extras is an `==`
   pin, except `openai`, which callers' own code imports and which stays the certified
-  `>=3.0,<4` range. A version moves only by a reviewed edit, and `[tool.uv] exclude-newer`
-  keeps every resolved release at least 7 days old.
+  `>=3.0,<4` range, and the `dev` extra's unversioned `experiential[sft]` self-reference. A
+  version moves only by a reviewed edit, and `[tool.uv] exclude-newer` keeps every resolved
+  release at least 7 days old. Only packages this project publishes are exempt; an urgent
+  security fix gets a dated `exclude-newer-package` cutoff with a removal date, never `false`.
 - **Keep dependency ownership explicit**: published shared building blocks are normal PyPI
   requirements. Provider-neutral catalog metadata and immutable snapshots live under
   `exp/common/models/`; explicit runtime clients use the shared HTTP transport. A release resolves
