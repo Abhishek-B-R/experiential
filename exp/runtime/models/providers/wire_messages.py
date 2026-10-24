@@ -510,6 +510,22 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
                     run.append(block)
             if run:
                 result["content"] = run
+        if message.tool_references:
+            # A client-side tool search's loaded tools re-emit as the
+            # caller's reference blocks after the result's own content (a
+            # references-only result, the shape Claude Code's ToolSearch
+            # sends, is byte-identical); the provider expands each one into
+            # the named deferred tool's definition.
+            content = result["content"]
+            run = (
+                list(content)
+                if isinstance(content, list)
+                else ([{"type": "text", "text": content}] if content else [])
+            )
+            run.extend(
+                {"type": "tool_reference", "tool_name": name} for name in message.tool_references
+            )
+            result["content"] = run
         # Only the Anthropic wire can express a failed tool invocation; the
         # marker is emitted solely when set so existing payloads are unchanged.
         if message.tool_is_error:

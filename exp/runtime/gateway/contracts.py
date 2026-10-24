@@ -140,6 +140,16 @@ class GatewayMessage(ContractModel):
         capture_only_reasoning: Caller-visible copies accompanying sealed replay.
             Empty by default; excluded from serialization, provider dispatch and
             replay authority. Only content capture consumes this evidence.
+        tool_references: Deferred tools this tool result loads, in caller order
+            (Anthropic ``tool_reference`` sub-blocks a client-side tool search
+            returns). Valid only on tool messages. Native Anthropic Messages
+            re-emits them as reference blocks after the result's own content;
+            every other wire states each one as text and keeps the tool's full
+            definition in the dispatched tools (``tool_references.py`` in the
+            provider package). Excluded from serialization so reference-free
+            digests are unperturbed; a present reference changes what the model
+            can call, so it joins replay identity through
+            :func:`canonical_request_sha256`.
     """
 
     role: Literal["system", "developer", "user", "assistant", "tool"]
@@ -153,6 +163,9 @@ class GatewayMessage(ContractModel):
     )
     tool_is_error: bool = Field(default=False, exclude=True)
     """Whether this tool result reports a failed invocation; retained outside serialization."""
+    tool_references: tuple[Annotated[str, Field(min_length=1, max_length=256)], ...] = Field(
+        default=(), exclude=True
+    )
     provider_specific_fields: JsonObject | None = Field(default=None, exclude=True)
     """LiteLLM's echoed per-message ``provider_specific_fields``: accepted so verbatim
     replays keep working, dropped on every wire with a disclosure, excluded from
@@ -361,6 +374,8 @@ class GatewayMessage(ContractModel):
             raise ValueError("tool-result attribution is valid only for tool messages")
         if self.role != "tool" and self.tool_is_error:
             raise ValueError("tool_is_error is valid only for tool messages")
+        if self.role != "tool" and self.tool_references:
+            raise ValueError("tool_references are valid only for tool messages")
         if self.cache_control is not None and self.role != "tool":
             raise ValueError("message cache_control is valid only for tool messages")
         if self.provider_text_blocks:

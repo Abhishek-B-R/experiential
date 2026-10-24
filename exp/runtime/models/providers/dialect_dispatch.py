@@ -45,6 +45,10 @@ from exp.runtime.models.providers.thinking_budget import (
     require_thinking_budget_support,
     thinking_budget_value,
 )
+from exp.runtime.models.providers.tool_references import (
+    NATIVE_TOOL_REFERENCE_DIALECT,
+    resolve_client_tool_search,
+)
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
@@ -444,6 +448,12 @@ def dialect_stream_payload(
         ProviderCapabilityError: The request uses a capability this dialect
             cannot preserve.
     """
+    if profile.dialect != NATIVE_TOOL_REFERENCE_DIALECT:
+        # Only Anthropic expands tool_reference blocks and honors
+        # defer_loading without a tool-search tool; every other wire gets the
+        # references as text and every deferred tool loaded (OpenAI refuses
+        # the marker without its hosted tool_search).
+        provider_request = resolve_client_tool_search(provider_request)
     if (
         provider_request.tools
         and (

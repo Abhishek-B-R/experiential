@@ -8,7 +8,9 @@ than a fetchable URL; each form becomes the matching carrier of the canonical
 content part so a route that declares the capability forwards it and every
 other route refuses before dispatch. A ``tool_result`` carries the same image
 and document blocks (tool screenshots and tool-returned files), decoded here
-into the tool message's ordered parts.
+into the tool message's ordered parts, plus ``tool_reference`` blocks (a
+client-side tool search naming the deferred tools it loaded), decoded into the
+tool message's ordered reference names.
 """
 
 from __future__ import annotations
@@ -284,8 +286,66 @@ class TextBlockLike(Protocol):
         ...
 
 
-ToolResultContent = str | Sequence[TextBlockLike | ImageBlock | DocumentBlock] | None
+class ToolReferenceBlock(AnthropicWireModel):
+    """One ``tool_reference`` sub-block inside a ``tool_result``.
+
+    A client-side tool search (Claude Code's ToolSearch) answers with one
+    reference per deferred tool it loads; the provider expands each into the
+    named tool's full definition. Validity of the name (a tool the request
+    declares) is the provider's own rule on Anthropic rungs.
+
+    Attributes:
+        type: Always ``tool_reference``.
+        tool_name: The loaded tool's name, as declared in ``tools``.
+        cache_control: Optional caller cache marker; it re-emits on the
+            enclosing tool result (the same prompt boundary).
+    """
+
+    type: Literal["tool_reference"]
+    tool_name: str = Field(min_length=1, max_length=256)
+    cache_control: CacheControl | None = None
+
+
+ToolResultContent = (
+    str | Sequence[TextBlockLike | ImageBlock | DocumentBlock | ToolReferenceBlock] | None
+)
 """A validated ``tool_result.content``: a string, or its ordered sub-blocks."""
+
+
+def tool_result_references(content: ToolResultContent) -> tuple[str, ...]:
+    """Return the deferred tools a tool result loads, in caller order.
+
+    Args:
+        content: Validated ``tool_result.content``.
+
+    Returns:
+        The referenced tool names, ``()`` when the result loads none.
+    """
+    if content is None or isinstance(content, str):
+        return ()
+    return tuple(part.tool_name for part in content if isinstance(part, ToolReferenceBlock))
+
+
+def tool_reference_cache_marker(content: ToolResultContent) -> CacheControl | None:
+    """Return the cache marker the caller put on a tool result's last marked reference.
+
+    A marker on a reference sub-block bounds the same prompt prefix as one on
+    the enclosing tool result, so it re-emits there.
+
+    Args:
+        content: Validated ``tool_result.content``.
+
+    Returns:
+        The marker, or ``None`` when no reference carries one.
+    """
+    if content is None or isinstance(content, str):
+        return None
+    markers = [
+        part.cache_control
+        for part in content
+        if isinstance(part, ToolReferenceBlock) and part.cache_control is not None
+    ]
+    return markers[-1] if markers else None
 
 
 def cache_marker(marker: CacheControl | None) -> JsonObject | None:
@@ -320,7 +380,7 @@ def tool_result_text(content: ToolResultContent, param: str) -> str:
     """Flatten one tool result into the canonical tool-message text.
 
     A plain-text document is the caller's text, exactly as on a user turn;
-    image and PDF document sub-blocks contribute no text.
+    image, PDF document, and tool-reference sub-blocks contribute no text.
 
     Args:
         content: Validated ``tool_result.content``.
@@ -339,7 +399,7 @@ def tool_result_text(content: ToolResultContent, param: str) -> str:
             text = plain_document_text(part, f"{param}.content.{index}")
             if text is not None:
                 texts.append(text)
-        elif not isinstance(part, ImageBlock):
+        elif not isinstance(part, (ImageBlock, ToolReferenceBlock)):
             texts.append(part.text)
     return "".join(texts)
 
@@ -387,6 +447,10 @@ def tool_result_parts(content: ToolResultContent, param: str) -> tuple[MessageCo
                 parts.append(
                     TextContentPart(text=text, cache_control=cache_marker(part.cache_control))
                 )
+        elif isinstance(part, ToolReferenceBlock):
+            # A reference is not content: it rides the tool message's
+            # ``tool_references`` carrier (see ``tool_result_references``).
+            continue
         elif part.text:
             parts.append(
                 TextContentPart(text=part.text, cache_control=cache_marker(part.cache_control))

@@ -70,3 +70,20 @@ def test_rejected_block_hint_names_the_offending_block() -> None:
         ]
     }
     assert rejected_block_hint(document_only) is None
+    # A tool_reference is a served tool_result sub-block too (Claude Code's
+    # client-side ToolSearch), so it never takes the blame either.
+    reference_only: JsonObject = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": [{"type": "tool_reference", "tool_name": "Lookup"}],
+                    }
+                ],
+            }
+        ]
+    }
+    assert rejected_block_hint(reference_only) is None
