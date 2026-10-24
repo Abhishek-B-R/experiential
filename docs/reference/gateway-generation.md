@@ -137,6 +137,21 @@ its original position; `store=false` means the provider resolves nothing by ID.
   their typed refusal for a bad value, unknown keys inside a tool call's `function`
   object, inside a Messages content block, or on other Responses item types stay
   refused, and an unknown top-level parameter is still `unsupported_parameter`.
+- OpenAI's deprecated (not removed) function-calling shapes on Chat
+  ([API reference](https://platform.openai.com/docs/api-reference/chat/create)) are rewritten
+  to their `tools` spelling before dispatch: an assistant `function_call: {"name",
+  "arguments"}` becomes one `tool_calls` entry with the id `call_legacy_function_<message
+  index>`, disclosed as `messages.function_call->translated(tool_calls)`; a `{"role":
+  "function", "name", "content"}` result becomes a `tool` message answering the nearest
+  earlier unanswered call of that name, keeping its `name`, disclosed as
+  `messages.role->translated(function_as_tool)` (a documented `content: null` result is sent
+  as `""`, `messages.content->translated(null_function_result_as_empty)`); the `functions`
+  parameter becomes `tools` (`functions->translated(tools)`) and `function_call: "none" |
+  "auto" | {"name"}` becomes `tool_choice` (`function_call->translated(tool_choice)`). What
+  cannot be paired exactly is a 400 `invalid_parameter` naming the field: a result whose name
+  matches no waiting call (`messages.N.name`), a call no result answers or one beside
+  `tool_calls` (`messages.N.function_call`), and `functions` / `function_call` beside `tools` /
+  `tool_choice`.
 - OpenAI's optional participant `name` on a system, developer, user or assistant message is
   dropped, disclosed as `messages.name->dropped(participant_name)`. On tool messages `name`
   still attributes the result.
