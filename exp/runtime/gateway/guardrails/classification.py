@@ -40,6 +40,7 @@ from exp.runtime.gateway.guardrails.classification_cache import (
 from exp.runtime.gateway.guardrails.classification_window import (
     ClassificationWindow,
     classification_window,
+    window_projection,
 )
 from exp.runtime.gateway.guardrails.contracts import (
     ClassifierCoverageError,
@@ -256,6 +257,10 @@ class DecisionModelClassifier:
                 }
             )
         ).hexdigest()
+
+    def project_input(self, request: GatewayRequest) -> GatewayRequest:
+        """Return the bounded subject this check reads identically to ``request``."""
+        return window_projection(request)
 
     @property
     def configuration_digest(self) -> str:

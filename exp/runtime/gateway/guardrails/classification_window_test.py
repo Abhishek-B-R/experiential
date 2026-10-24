@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+
 import pytest
 from pydantic import ValidationError
 
@@ -9,8 +11,10 @@ from exp.common.models import ToolCall
 from exp.common.models.content import ImageContentPart, TextContentPart
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.gateway.guardrails.classification_window import (
+    MAX_PRIOR_MESSAGES,
     ClassificationWindow,
     classification_window,
+    window_projection,
 )
 
 _PNG = (
@@ -155,3 +159,58 @@ def test_window_bounds_cannot_exceed_one_decision_request() -> None:
     """Window settings that could overflow the decision input limit are rejected."""
     with pytest.raises(ValidationError, match="at most 30000 characters"):
         ClassificationWindow(latest_user_chars=20_000, prior_messages=8, prior_chars=2_000)
+
+
+def _random_message(rng: random.Random, index: int) -> GatewayMessage:
+    """A message of a random role whose text length straddles every cut point."""
+    role = rng.choice(("system", "developer", "user", "user", "assistant", "tool"))
+    length = rng.choice((0, 1, 50, 1_499, 1_501, 14_999, 15_001, 29_999, 30_001, 30_003, 70_000))
+    body = "".join(rng.choice("ab \n") for _ in range(min(length, 64)))
+    text = (body * (length // max(len(body), 1) + 1))[:length] if body else ""
+    if role == "tool":
+        return GatewayMessage(
+            role="tool",
+            content=text,
+            tool_call_id=f"call-{index}",
+            tool_is_error=rng.random() < 0.3,
+        )
+    if not text:
+        if role == "assistant":
+            return GatewayMessage(
+                role="assistant",
+                tool_calls=(ToolCall(call_id=f"call-{index}", name="run", arguments={}),),
+            )
+        return GatewayMessage(role=role, content=rng.choice(("", "   ")))
+    return GatewayMessage(role=role, content=text)
+
+
+def test_window_projection_reads_identically_for_every_window() -> None:
+    """The observer's bounded subject never changes what a classification check sees."""
+    rng = random.Random(3)
+    windows = [
+        ClassificationWindow(),
+        ClassificationWindow(system_chars=0, latest_user_chars=1, prior_messages=0, prior_chars=1),
+        ClassificationWindow(
+            system_chars=6_000, latest_user_chars=6_000, prior_messages=8, prior_chars=2_250
+        ),
+        ClassificationWindow(
+            system_chars=0, latest_user_chars=30_000, prior_messages=0, prior_chars=1
+        ),
+        ClassificationWindow(
+            system_chars=29_999, latest_user_chars=1, prior_messages=0, prior_chars=1
+        ),
+        ClassificationWindow(
+            system_chars=0, latest_user_chars=1, prior_messages=1, prior_chars=29_998
+        ),
+    ]
+    for _ in range(150):
+        messages = tuple(_random_message(rng, index) for index in range(rng.randint(1, 30)))
+        request = GatewayRequest(surface=GatewayApiSurface.CHAT_COMPLETIONS, messages=messages)
+        projection = window_projection(request)
+        assert len(projection.messages) <= 2 + MAX_PRIOR_MESSAGES + sum(
+            message.role in ("system", "developer") for message in messages
+        )
+        for window in windows:
+            assert classification_window(projection, window) == classification_window(
+                request, window
+            )
