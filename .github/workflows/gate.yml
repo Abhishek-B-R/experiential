@@ -205,9 +205,11 @@ jobs:
       - name: Install the project and its dev extras
         run: uv sync --locked --extra dev
       - name: non-live tests
+        # The system-keychain case mocks subprocesses but still stats the real
+        # system path. Keep the other mocked trust-guard cases enabled.
         run: >-
           uv run pytest -n 4 --dist worksteal -q -k "not live"
-          --deselect=exp/runtime/capture/certificates_test.py::test_unsafe_default_keychain_never_installs_trust
+          --deselect='exp/runtime/capture/certificates_test.py::test_unsafe_default_keychain_never_installs_trust["/Library/Keychains/System.keychain"]'
           ${{ matrix.paths }}
           --ignore=exp/optimize/router/tests/composition_evidence_test.py
 
@@ -230,7 +232,7 @@ jobs:
           uv run exp capture --help
           uv run pytest -q exp/cli/app_test.py exp/cli/capture exp/runtime/capture \
             exp/tests/release_test.py -k "not installed_wheel" \
-            --deselect=exp/runtime/capture/certificates_test.py::test_unsafe_default_keychain_never_installs_trust
+            --deselect='exp/runtime/capture/certificates_test.py::test_unsafe_default_keychain_never_installs_trust["/Library/Keychains/System.keychain"]'
 
   darwin-scope:
     # The macOS evidence job is the most expensive check here (macOS bills 10x)
@@ -376,7 +378,7 @@ jobs:
         run: >-
           uv run pytest -q exp/runtime/capture exp/cli/capture
           --deselect=exp/runtime/capture/certificates_test.py::test_real_tls_chains_enforce_exact_dns_and_deny_ip_scope
-          --deselect=exp/runtime/capture/certificates_test.py::test_unsafe_default_keychain_never_installs_trust
+          --deselect='exp/runtime/capture/certificates_test.py::test_unsafe_default_keychain_never_installs_trust["/Library/Keychains/System.keychain"]'
       - name: W16 router and bounded local-process evidence
         env:
           EXP_RELEASE_REVISION: ${{ github.sha }}

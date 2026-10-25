@@ -415,7 +415,7 @@ Rules of the road:
   pushes build and smoke-test without publishing. Publication requires a protected release
   tag (`v<version>`) reachable from main, or an explicit latest-release replay on protected
   main, and uses PyPI trusted publishing from the `pypi` environment. Only the isolated
-  publish job has `id-token: write`. Publish the native distribution before the flagship.
+  publish jobs have `id-token: write`. Publish the native distribution before the flagship.
   `docs/gitlab-ci.md` documents GitHub operation and the retained GitLab configuration.
 
 ## Docs

@@ -32,8 +32,9 @@ GitHub release to an immutable commit before any build job starts.
 Both PyPI projects (`experiential` and `exp-gateway-native`) require a
 GitHub trusted publisher with owner `experientiallabs`, repository
 `experiential`, workflow `python-package.yml`, and environment `pypi`.
-Only the isolated publish job gets `id-token: write`; builds and smoke tests
-receive no publishing credentials. Native files upload first. Existing
+Only the isolated publish jobs get `id-token: write`; builds and smoke tests
+receive no publishing credentials. The flagship upload job depends on the native
+upload job so native files upload first. Existing
 filenames are skipped so a flagship-only release can reuse a published
 native version. No PyPI API token is required by the GitHub workflow.
 

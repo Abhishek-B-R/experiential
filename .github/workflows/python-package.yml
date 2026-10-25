@@ -61,7 +61,7 @@ jobs:
           ref = os.environ['GITHUB_REF']
           tag = ref.removeprefix('refs/tags/') if ref.startswith('refs/tags/') else ''
           replay = event == 'workflow_dispatch' and os.environ['SOURCE'] == 'latest-release'
-          publish = bool(tag) or os.environ['PUBLISH'] == 'true'
+          publish = (event == 'push' and bool(tag)) or os.environ['PUBLISH'] == 'true'
           if replay:
               release = json.loads(subprocess.check_output(
                   ['gh', 'api', f"repos/{os.environ['GITHUB_REPOSITORY']}/releases/latest"],
@@ -261,7 +261,7 @@ jobs:
           path: ${{ runner.temp }}/dist/*
           if-no-files-found: error
 
-  publish:
+  publish-native:
     if: needs.source.outputs.publish == 'true'
     needs: [source, native-linux, native-desktop, package]
     runs-on: ubuntu-latest
@@ -275,15 +275,25 @@ jobs:
           pattern: native-*
           merge-multiple: true
           path: native-dist
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: experiential-distributions
-          path: dist
       - name: Publish the native dependency first
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: native-dist/
           skip-existing: true
+
+  publish:
+    if: needs.source.outputs.publish == 'true'
+    needs: [source, publish-native]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: experiential-distributions
+          path: dist
       - name: Publish the flagship package
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
