@@ -11,7 +11,9 @@ Responses ``stream_options``, OpenCode sends Anthropic's ``output_config`` on
 Chat, agents attach determinism and cache-retention hints (``seed``,
 ``prompt_cache_retention``) no route forwards, and image clients send
 OpenRouter's Chat ``modalities`` of text and image, which the route's own
-declared output modalities already decide. A
+declared output modalities already decide. OpenRouter's deprecated
+``include_reasoning`` boolean is rewritten to the ``reasoning.exclude`` it
+aliases. A
 named 400 for any of them fails every request the client makes, so each is
 removed here, before the compatibility manifest and the wire models read the
 body, and every removal that changes what the caller asked for is named in
@@ -100,6 +102,16 @@ PROMPT_CACHE_RETENTION_IGNORED = "prompt_cache_retention->ignored(not_forwarded)
 
 Retention changes only how long a provider keeps a cached prefix; served
 routes cache implicitly at their own retention, so the answer is unchanged."""
+
+INCLUDE_REASONING_TRANSLATED = "include_reasoning->translated(reasoning.exclude)"
+"""Disclosure recorded when OpenRouter's ``include_reasoning: false`` becomes ``reasoning.exclude``.
+
+OpenRouter documents the legacy boolean as ``include_reasoning: true`` meaning
+``reasoning: {}`` and ``include_reasoning: false`` meaning
+``reasoning: {exclude: true}`` (docs "Reasoning Tokens", Legacy Parameters,
+https://openrouter.ai/docs/guides/best-practices/reasoning-tokens, read
+2026-10-24). ``true`` asks for the default (reasoning returned where the model
+produces it) and ``null`` for nothing, so both are removed without disclosure."""
 
 RESPONSES_ARGUMENTS_SERIALIZED = "input.arguments->serialized(json_object)"
 """Disclosure recorded when a ``function_call`` item's ``arguments`` arrive as an object."""
@@ -485,6 +497,54 @@ def drop_chat_thinking_display(payload: JsonObject) -> tuple[JsonObject, tuple[s
     return {**payload, "thinking": stripped}, disclosures
 
 
+def translate_chat_include_reasoning(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
+    """Consume OpenRouter's deprecated ``include_reasoning`` boolean on a Chat request.
+
+    ``false`` is rewritten to ``reasoning.exclude: true`` (merged into any
+    ``reasoning`` object the caller sent) and disclosed; ``true`` and ``null``
+    are removed silently, since both ask for the default. A value that
+    contradicts an explicit ``reasoning.exclude`` is refused naming both fields.
+
+    Args:
+        payload: Parsed Chat Completions body.
+
+    Returns:
+        The payload without ``include_reasoning`` (and with ``reasoning.exclude``
+        when translated), plus its disclosure.
+
+    Raises:
+        OpenAIProtocolError: The value is not a boolean, or it contradicts
+            ``reasoning.exclude``.
+    """
+    if "include_reasoning" not in payload:
+        return payload, ()
+    include = payload["include_reasoning"]
+    remaining = {key: value for key, value in payload.items() if key != "include_reasoning"}
+    if include is None:
+        return remaining, ()
+    if not isinstance(include, bool):
+        raise invalid_field(
+            "include_reasoning",
+            "include_reasoning must be a boolean. Prefer reasoning.exclude, which it aliases.",
+        )
+    reasoning = remaining.get("reasoning")
+    exclude = reasoning.get("exclude") if isinstance(reasoning, dict) else None
+    if isinstance(exclude, bool) and exclude == include:
+        raise invalid_field(
+            "include_reasoning",
+            f"include_reasoning: {str(include).lower()} conflicts with reasoning.exclude: "
+            f"{str(exclude).lower()}. Send reasoning.exclude alone.",
+        )
+    if include:
+        return remaining, ()
+    if reasoning is None:
+        remaining["reasoning"] = {"exclude": True}
+    elif isinstance(reasoning, dict):
+        remaining["reasoning"] = {**reasoning, "exclude": True}
+    # Any other ``reasoning`` value keeps its own named refusal from the wire model.
+    return remaining, (INCLUDE_REASONING_TRANSLATED,)
+
+
 def normalize_responses_call_arguments(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
     """Repair ``function_call`` items whose ``arguments`` are not a JSON-object string.
 
@@ -559,6 +619,7 @@ def repair_chat(
     payload, hints = drop_unforwarded_hints(payload)
     payload, stream = drop_chat_stream_options_without_stream(payload)
     payload, display = drop_chat_thinking_display(payload)
+    payload, include_reasoning = translate_chat_include_reasoning(payload)
     payload = accept_chat_output_modalities(payload)
     return payload, (
         *disclosures,
@@ -568,6 +629,7 @@ def repair_chat(
         *hints,
         *stream,
         *display,
+        *include_reasoning,
     )
 
 
