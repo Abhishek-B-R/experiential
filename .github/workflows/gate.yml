@@ -207,8 +207,10 @@ jobs:
       - name: non-live tests
         # The system-keychain case mocks subprocesses but still stats the real
         # system path. Keep the other mocked trust-guard cases enabled.
+        # Match GitLab's terminal detection: Typer otherwise forces ANSI for
+        # GITHUB_ACTIONS even when CliRunner captures non-terminal output.
         run: >-
-          uv run pytest -n 4 --dist worksteal -q -k "not live"
+          env -u GITHUB_ACTIONS uv run pytest -n 4 --dist worksteal -q -k "not live"
           --deselect='exp/runtime/capture/certificates_test.py::test_unsafe_default_keychain_never_installs_trust["/Library/Keychains/System.keychain"]'
           ${{ matrix.paths }}
           --ignore=exp/optimize/router/tests/composition_evidence_test.py
