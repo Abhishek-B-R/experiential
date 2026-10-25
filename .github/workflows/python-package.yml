@@ -21,7 +21,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.source }}-${{ inputs.publish }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -148,12 +148,15 @@ jobs:
           - name: macos-arm64
             runner: macos-latest
             target: aarch64-apple-darwin
+            uv-checksum: cf40e0c6a202190ccd9e0406dcfdd5b2d6668a9a5c779b17948963df32aafe5b
           - name: macos-x86_64
             runner: macos-15-intel
             target: x86_64-apple-darwin
+            uv-checksum: 2e4108f5395397c8bc5d43bf83d3bdbb2d0e92b90d0efa607756be704905fa33
           - name: windows-x86_64
             runner: windows-latest
             target: x86_64-pc-windows-msvc
+            uv-checksum: cae6a3bc25239f83dffb467a4b180508d9da23986c04639ebfa44e43e6a84bff
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -166,6 +169,7 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           version: ${{ env.UV_VERSION }}
+          checksum: ${{ matrix.uv-checksum }}
           python-version: '3.12'
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
@@ -207,6 +211,7 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           version: ${{ env.UV_VERSION }}
+          checksum: 89eadd7c76fc063887959510d5ba0ab1264dfd5f1143b925ddb73021a40acf16
           python-version: '3.12'
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
