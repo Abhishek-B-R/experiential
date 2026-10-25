@@ -274,7 +274,7 @@ uv run pytest -q
      `exp/runtime/models/providers/`.
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.
-   - `.github/`: the gate and gateway-latency workflows.
+   - `.github/`: the gate, gateway-latency, and python-package workflows and dependency audit policy.
    - `.gitlab/`: GitLab CI. `.gitlab/ci/` holds one file per pipeline area, included by the
      root `.gitlab-ci.yml`; `docs/gitlab-ci.md` describes the conventions.
 
@@ -410,12 +410,13 @@ Rules of the road:
 - **Gate scoping**: the root gate is `uv run ruff check .`, `uv run ty check`, `uv run pytest -q`,
   all over the single `testpaths = ["exp"]`. Tests are inline `*_test.py` beside the module they
   cover. There is exactly one ruff config and one ty config, at the root.
-- **Publishing**: `.gitlab/ci/python-package.yml` builds and publishes the flagship
-  `experiential` distribution and the `exp-gateway-native` abi3 wheel matrix; the publish job
-  runs only for a protected release tag pipeline (`v<version>`) or an explicit latest-release
-  replay on `main`, deploys to the `pypi` environment, and uploads each distribution with its own
-  protected, masked project-scoped API token (`PYPI_TOKEN_EXP_GATEWAY_NATIVE`,
-  `PYPI_TOKEN_EXPERIENTIAL`), whose environment scope is `pypi` so no other job sees them.
+- **Publishing**: `.github/workflows/python-package.yml` builds the flagship
+  `experiential` distribution and the `exp-gateway-native` abi3 wheel matrix. PRs and main
+  pushes build and smoke-test without publishing. Publication requires a protected release
+  tag (`v<version>`) reachable from main, or an explicit latest-release replay on protected
+  main, and uses PyPI trusted publishing from the `pypi` environment. Only the isolated
+  publish job has `id-token: write`. Publish the native distribution before the flagship.
+  `docs/gitlab-ci.md` documents GitHub operation and the retained GitLab configuration.
 
 ## Docs
 

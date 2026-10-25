@@ -1,12 +1,56 @@
-# GitLab CI
+# CI and package publishing
 
-The repository lives at `gitlab.com/experiential-labs-group/experiential`.
+GitHub is the destination for active development at
+`github.com/experientiallabs/experiential`. The GitLab configuration below is
+retained for reproducibility during the cutover. Do not create release tags
+on both hosts: each host can independently start a publishing pipeline.
+
+## GitHub workflows
+
+- `gate.yml` runs the quality checks, Rust checks, Python test shards, macOS
+  evidence, Windows snapshot authority, and the dependency audit on PRs and
+  main pushes. The audit carries the existing OSV advisory exceptions and
+  expiry dates in `.github/osv-scanner.toml`. Native macOS certificate
+  verification and the system-Keychain path fixture are excluded; CI does
+  not access Keychain. Linux retains the OpenSSL certificate checks.
+- `gateway-latency.yml` retains the mock-only latency report and main badge
+  update. The larger benchmark runner remains an explicit manual option.
+- `python-package.yml` builds the flagship sdist and wheel, and native abi3
+  wheels for Linux x86_64 and aarch64, macOS x86_64 and arm64, and Windows
+  x86_64. Every target imports its wheel. Linux also builds the native sdist.
+  Installed-wheel SDK evidence and a Python 3.13 Capture smoke test gate
+  publication. PRs and main pushes build without publishing.
+
+A protected `v<version>` tag whose commit is reachable from main publishes
+through the `pypi` environment. Its version must equal `pyproject.toml`, the
+Python and Cargo native versions must agree, and a deferred native release
+marker blocks publication. Manual runs default to a build of the selected
+ref. A publishing replay must run from protected main, select
+`latest-release`, and explicitly enable `publish`. It resolves the latest
+GitHub release to an immutable commit before any build job starts.
+
+Both PyPI projects (`experiential` and `exp-gateway-native`) require a
+GitHub trusted publisher with owner `experientiallabs`, repository
+`experiential`, workflow `python-package.yml`, and environment `pypi`.
+Only the isolated publish job gets `id-token: write`; builds and smoke tests
+receive no publishing credentials. Native files upload first. Existing
+filenames are skipped so a flagship-only release can reuse a published
+native version. No PyPI API token is required by the GitHub workflow.
+
+Protect `v*` tags against unauthorized creation, updates, and deletion, and
+restrict the `pypi` environment to protected release tags and protected main
+for replays. Configure these settings and both trusted publishers before
+creating the first GitHub release tag. Keep existing GitLab publishing
+credentials until the cutover has been verified, then retire that publisher
+separately.
+
+## Retained GitLab configuration
+
+The retained source repository is `gitlab.com/experiential-labs-group/experiential`.
 `.gitlab-ci.yml` holds only the pipeline-wide settings and includes every file
 in `.gitlab/ci/`. Each file there owns one pipeline area and is named after it;
 the areas are `python-package` and `gate`. `.gitlab/ci/_templates.yml` holds the
-shared hidden keys: pinned tool versions and install snippets. The gate and
-gateway-latency workflows under `.github/workflows/` have no runner; the `gate`
-area runs the former's Linux jobs on demand.
+shared hidden keys: pinned tool versions and install snippets. The GitLab `gate` area runs the Linux jobs on demand.
 
 ## Pipelines and triggers
 

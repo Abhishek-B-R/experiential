@@ -145,5 +145,5 @@ exclude-newer-package = { experiential = false, exp-gateway-native = false, exp-
 exp-gateway-native = { path = "exp/runtime/gateway/native" }
 
 # Immutable development pins for Capture's reviewed forks; release metadata uses PyPI names.
-exp-mitmproxy = { git = "https://gitlab.com/experiential-labs-group/mitmproxy.git", rev = "95b902a8ffb0b02da8a8888d6cb86f0fa9255e5b" }
-exp-mitmproxy-rs = { git = "https://gitlab.com/experiential-labs-group/mitmproxy_rs.git", rev = "866da0a0aff1a8e57def4da6a941fca0c44dd98d", subdirectory = "mitmproxy-rs" }
+exp-mitmproxy = { git = "https://github.com/experientiallabs/mitmproxy.git", rev = "95b902a8ffb0b02da8a8888d6cb86f0fa9255e5b" }
+exp-mitmproxy-rs = { git = "https://github.com/experientiallabs/mitmproxy_rs.git", rev = "866da0a0aff1a8e57def4da6a941fca0c44dd98d", subdirectory = "mitmproxy-rs" }
