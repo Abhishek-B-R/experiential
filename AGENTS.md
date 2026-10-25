@@ -274,9 +274,10 @@ uv run pytest -q
      `exp/runtime/models/providers/`.
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.
-   - `.github/`: the gate, gateway-latency, and python-package workflows and dependency audit policy.
+   - `.github/`: the gate, gateway-latency, and python-package workflows.
    - `.gitlab/`: GitLab CI. `.gitlab/ci/` holds one file per pipeline area, included by the
-     root `.gitlab-ci.yml`; `docs/gitlab-ci.md` describes the conventions.
+     root `.gitlab-ci.yml`; its `osv-scanner.toml` is the shared advisory policy for both CI
+     systems. `docs/gitlab-ci.md` describes the conventions.
 
    Scratch work has no home in this repo. One-off scripts, experiment runners, scratchpads, and
    drafts go outside the checkout (`/tmp`, a personal directory, or the Notion experiments area

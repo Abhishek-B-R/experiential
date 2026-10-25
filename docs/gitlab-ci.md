@@ -10,7 +10,8 @@ on both hosts: each host can independently start a publishing pipeline.
 - `gate.yml` runs the quality checks, Rust checks, Python test shards, macOS
   evidence, Windows snapshot authority, and the dependency audit on PRs and
   main pushes. The audit carries the existing OSV advisory exceptions and
-  expiry dates in `.github/osv-scanner.toml`. Native macOS certificate
+  expiry dates in the shared `.gitlab/ci/osv-scanner.toml` policy. Both CI
+  systems read this one file. Native macOS certificate
   verification and the system-Keychain path fixture are excluded; CI does
   not access Keychain. Linux retains the OpenSSL certificate checks.
 - `gateway-latency.yml` retains the mock-only latency report and main badge
