@@ -493,8 +493,10 @@ def normalize_responses_call_arguments(payload: JsonObject) -> tuple[JsonObject,
     Some replaying clients send the object itself, or a string whose JSON
     value is again a string encoding the object (double-encoded). Both name
     the same arguments unambiguously, so they are re-encoded as the one
-    canonical string with disclosure. Anything else (a non-JSON string, an
-    array, a number) keeps the decoder's named refusal.
+    canonical string with disclosure. Any other string (non-JSON, or JSON that
+    is no object) is a replayed call the decoder serves through its object
+    stand-in (``tool_argument_repairs``); a non-string value keeps the wire
+    model's named refusal.
 
     Args:
         payload: Parsed Responses body.
