@@ -155,6 +155,9 @@ its original position; `store=false` means the provider resolves nothing by ID.
 - OpenAI's optional participant `name` on a system, developer, user or assistant message is
   dropped, disclosed as `messages.name->dropped(participant_name)`. On tool messages `name`
   still attributes the result.
+- A Chat system, developer, user or tool message whose `content` is null or omitted (Go clients
+  drop an empty tool result under `omitempty`) is refused with `400 invalid_parameter` naming
+  `messages.<n>.content`; an empty string is content and is accepted.
 - `chat_template_kwargs.preserve_thinking` is accepted and disclosed as
   `chat_template_kwargs.preserve_thinking->ignored(not_forwarded)`: no wire receives
   `chat_template_kwargs` verbatim.
