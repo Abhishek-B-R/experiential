@@ -7697,6 +7697,116 @@ def test_workbuddy_message_bookkeeping_is_dropped_before_dispatch(tmp_path: Path
     assert tagged_scope == plain_scope
 
 
+def test_legacy_function_calling_history_dispatches_as_tools_on_a_chat_rung(
+    tmp_path: Path,
+) -> None:
+    """A deprecated ``functions`` conversation admits, rewritten to tools and disclosed.
+
+    Production 2026-10-24: an AsyncOpenAI 1.109.1 client replaying a history
+    with an assistant ``function_call`` turn was refused ``Invalid value for
+    'messages.44.function_call'`` on every turn, though OpenAI still serves the
+    deprecated shapes. The chat rung receives the ``tool_calls`` / ``tool``
+    spelling, never the legacy keys, and the keyed replay scope equals that of
+    the same history written with tools.
+    """
+    root = tmp_path / "gateway"
+    root.mkdir()
+    _manager, raw_key = _configured_gateway(
+        root,
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(root, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}),
+        request_timeout_seconds=120.0,
+    )
+    function = {
+        "name": "lookup",
+        "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+    }
+    legacy = json.dumps(
+        {
+            "model": "coding",
+            "functions": [function],
+            "function_call": "auto",
+            "messages": [
+                {"role": "user", "content": "find it"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "function_call": {"name": "lookup", "arguments": '{"q":"it"}'},
+                },
+                {"role": "function", "name": "lookup", "content": "found"},
+                {"role": "user", "content": "thanks"},
+            ],
+        }
+    )
+    modern = json.dumps(
+        {
+            "model": "coding",
+            "tools": [{"type": "function", "function": function}],
+            "tool_choice": "auto",
+            "messages": [
+                {"role": "user", "content": "find it"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_legacy_function_1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": '{"q":"it"}'},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_legacy_function_1",
+                    "name": "lookup",
+                    "content": "found",
+                },
+                {"role": "user", "content": "thanks"},
+            ],
+        }
+    )
+    admission = _flatten_started(control, _admit(control, raw_key, legacy))
+    assert admission["ignored_parameters"] == [
+        "messages.function_call->translated(tool_calls)",
+        "messages.role->translated(function_as_tool)",
+        "functions->translated(tools)",
+        "function_call->translated(tool_choice)",
+    ]
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    assert "functions" not in upstream and "function_call" not in upstream
+    assert upstream["tool_choice"] == "auto"
+    tools = cast("list[JsonObject]", upstream["tools"])
+    assert [cast("JsonObject", tool["function"])["name"] for tool in tools] == ["lookup"]
+    messages = cast("list[JsonObject]", upstream["messages"])
+    assert [message["role"] for message in messages] == ["user", "assistant", "tool", "user"]
+    assert all("function_call" not in message for message in messages)
+    calls = cast("list[JsonObject]", messages[1]["tool_calls"])
+    assert [call["id"] for call in calls] == ["call_legacy_function_1"]
+    assert messages[2]["tool_call_id"] == "call_legacy_function_1"
+    legacy_scope = _claim_scope(control, raw_key, legacy, idempotency_key="legacy-op")
+    modern_scope = _claim_scope(control, raw_key, modern, idempotency_key="legacy-op")
+    assert legacy_scope == modern_scope
+    unpaired = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "find it"},
+                {"role": "function", "name": "lookup", "content": "found"},
+            ],
+        }
+    )
+    with pytest.raises(NativeBridgeError) as refused:
+        control.admit(json.dumps({"raw_key": raw_key, "body": unpaired}))
+    error = json.loads(refused.value.public_error_json)
+    assert error["status_code"] == 400
+    assert error["code"] == "invalid_parameter"
+    assert error["param"] == "messages.1.name"
+
+
 def test_claude_code_turn_output_config_serves_on_the_messages_lane(tmp_path: Path) -> None:
     """Claude Code's ``messages[1].output_config`` admits, disclosed, never forwarded.
 

@@ -25,6 +25,7 @@ from typing import Literal
 
 from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.runtime.openai_protocol.errors import invalid_field
+from exp.runtime.openai_protocol.legacy_functions import translate_legacy_functions
 from exp.runtime.openai_protocol.manifest import RESPONSES_REASONING_EFFORTS_ACCEPTED
 from exp.runtime.openai_protocol.responses_probe import drop_gateway_web_search_items
 from exp.runtime.openai_protocol.unknown_message_fields import (
@@ -552,7 +553,17 @@ def _double_encoded_object(arguments: JsonValue) -> str | None:
 def repair_chat(
     payload: JsonObject, disclosures: tuple[str, ...]
 ) -> tuple[JsonObject, tuple[str, ...]]:
-    """Apply every Chat repair, appending its disclosures to ``disclosures``."""
+    """Apply every Chat repair, appending its disclosures to ``disclosures``.
+
+    The deprecated ``functions`` shapes are rewritten first
+    (:mod:`exp.runtime.openai_protocol.legacy_functions`), so the rewritten
+    ``tool`` messages and ``tool_calls`` entries pass through the same repairs
+    as modern ones.
+
+    Raises:
+        OpenAIProtocolError: A legacy function-calling shape cannot be paired.
+    """
+    payload, legacy = translate_legacy_functions(payload)
     payload, names = drop_chat_participant_names(payload)
     payload, unknown = drop_unknown_chat_message_fields(payload)
     payload, output_config = translate_chat_output_config(payload)
@@ -562,6 +573,7 @@ def repair_chat(
     payload = accept_chat_output_modalities(payload)
     return payload, (
         *disclosures,
+        *legacy,
         *unknown,
         *names,
         *output_config,
