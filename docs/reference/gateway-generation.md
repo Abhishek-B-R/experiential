@@ -307,6 +307,13 @@ Sources: [Anthropic extended thinking](https://platform.claude.com/docs/en/build
 OpenRouter's `reasoning.max_tokens` remains unsupported on Chat. Remove that numeric
 budget and select an effort, or use the supported numeric controls above on a qualified route.
 
+OpenRouter's deprecated `include_reasoning` boolean is accepted on Chat as the alias its
+[reasoning tokens guide](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens)
+documents: `false` becomes `reasoning.exclude: true` (disclosed as
+`include_reasoning->translated(reasoning.exclude)`, then under `exclude`'s own disclosed
+omission policy, `reasoning.exclude->dropped(not_carried)`), while `true` (the default) and `null`
+are consumed silently. A value contradicting an explicit `reasoning.exclude` is a 400 naming both.
+
 ## Truncated tools
 
 Streaming tool argument fragments retain their order and bytes. Missing arguments, an empty
