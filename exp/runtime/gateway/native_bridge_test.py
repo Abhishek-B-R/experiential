@@ -5982,7 +5982,9 @@ def test_capability_rejection_names_the_public_request_field(
     assert recorded, "the rejection records a durable failure"
     ledger = recorded[-1]
     assert ledger.failure_class == GatewayFailureClass.UNSUPPORTED_CAPABILITY
-    assert ledger.safe_message.endswith("(field: input.0.role)")
+    assert ledger.safe_message.endswith(
+        "(field: input.0.role; this model route does not support developer role messages)"
+    )
     assert "developer_messages" not in ledger.safe_message
     assert "canary" not in ledger.safe_message
 
