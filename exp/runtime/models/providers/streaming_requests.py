@@ -477,7 +477,6 @@ def route_generation_parameter_requests(
     # alone, and every other combination folded into a user turn after the
     # tool run, each disclosed once per route (dialect_dispatch).
     disclose_tool_result_attachment_folds(profiles, request.messages, ignored)
-    # Tool-result references and deferred tools: see tool_references.py.
     disclose_client_tool_search(profiles, request, ignored)
 
     disclose_gemini_missing_tool_results(profiles, request.messages, ignored)
