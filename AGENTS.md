@@ -4,6 +4,19 @@ Experiential builds immutable task evidence from agent traces, composes and fits
 runs those routers on loopback, and executes bounded SFT from persisted datasets. All importable
 code lives under `exp/`; benchmark data arrives as a dependency (see rule 6).
 
+## Product and repository boundaries
+
+Make open-source Experiential excellent for individual users. Keep enterprise operations,
+organization management, billing, and deployment orchestration in other repos. Enterprise
+builders can build that layer themselves, but this boundary must never compromise our
+gateway's performance, security, or maintainability.
+
+Public code, documentation, commit messages, PR descriptions, and comments must describe the
+standalone open-source behavior. Keep private repository links, internal deployment details,
+customer information, and private operational or experiment evidence in private repos or local
+records. Limit disclosure cleanup to sensitive cases; preserve legitimate public interfaces
+and ordinary technical terminology. Keep shared interfaces small, performant, and reliable.
+
 ## Toolchain
 
 Managed with `uv`; lint/format with `ruff`; type-check with `ty`.
@@ -378,6 +391,9 @@ uv run pytest -q
     | Model choice | `exp/common/models/catalog_roles.py` | Catalog roles, not new flags |
     | Provider calls and retries | `exp/runtime/models/registry.py`, `exp/runtime/models/providers/transport.py` | `RuntimeModelCatalog`, `RetryPolicy` |
     | Producer revision | `exp/common/release_revision.py` | `installed_release_revision` |
+    | Gateway execution bindings | `exp/runtime/gateway/native/src/execution_binding.rs`, `exp/runtime/gateway/native/src/bridge.rs` | Hosts explicitly supply callback targets and resource handles; bound bridges retain them through requests, callbacks and detached cleanup. Individual execution uses the direct process bridge. Hosted identity and allocation policy belong to the host |
+    | Gateway active-request capacity | `exp/runtime/gateway/native/src/permit_queue.rs`, `exp/runtime/gateway/native/src/dispatch_capacity.rs` | `PermitQueue.acquire_scoped` grants global and supplied capacity together; shared `DispatchPermit` ownership retains both through terminal accounting |
+    | Gateway accounting recovery rotation | `exp/runtime/gateway/native_accounting_recovery.py` | `RecoveryRotation` rotates stable work identities within one control plane; admission never runs recovery I/O |
 
     Keep this table current. A change that introduces an owner for a new concern adds its row in
     the same commit.

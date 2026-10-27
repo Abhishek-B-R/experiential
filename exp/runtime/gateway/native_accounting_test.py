@@ -33,6 +33,7 @@ from exp.runtime.gateway.contracts import (
     DirectTarget,
     GatewayApiSurface,
     GatewayEvent,
+    GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
     GatewayMessage,
@@ -62,6 +63,7 @@ from exp.runtime.gateway.native_settlement import (
 )
 from exp.runtime.gateway.recovery import (
     FrozenRecoveryBinding,
+    RecoveryHost,
     RecoveryLease,
     RecoveryObservation,
     RecoverySnapshot,
@@ -328,10 +330,12 @@ class _RecordingLedger:
         return certify_no_effects and authorization.request_id not in self.started_request_ids
 
 
-def _registry() -> tuple[NativeAttemptAccounting, _RecordingLedger, InflightRequest]:
+def _registry(
+    *, background_recovery: bool = True
+) -> tuple[NativeAttemptAccounting, _RecordingLedger, InflightRequest]:
     """Compose one registry over a two-deployment certified route."""
     ledger = _RecordingLedger()
-    registry = NativeAttemptAccounting(ledger)  # type: ignore[arg-type]
+    registry = NativeAttemptAccounting(ledger, background_recovery=background_recovery)  # type: ignore[arg-type]
     deployments = (
         _deployment("deployment-a", connection_sha256="b" * 64),
         _deployment("deployment-b", connection_sha256="c" * 64),
@@ -950,6 +954,36 @@ def test_predispatch_and_provider_terminal_settlements_do_not_invent_disconnect_
     assert terminal.usage_incomplete_due_to_disconnect is False
 
 
+@pytest.mark.parametrize("opened", [None, False, True])
+@pytest.mark.parametrize("paid_prework", [False, True])
+def test_settlement_preserves_private_execution_observation(
+    opened: bool | None, paid_prework: bool
+) -> None:
+    """The write seam receives witnessed facts without a meter or customer waiver."""
+    registry, ledger, entry = _registry(background_recovery=False)
+    entry.no_paid_prework = not paid_prework
+    started = _start(registry, ordinal=0)
+    payload: JsonObject = {
+        "request_id": entry.authorization.request_id,
+        "attempt_id": started["attempt_id"],
+        "outcome": "failed",
+        "usage": None,
+        "failure": {"failure_class": "transport", "safe_message": "transport failed"},
+        "finalize": True,
+    }
+    if opened is not None:
+        payload["opened"] = opened
+    registry.settle(json.dumps(payload))
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None
+    assert terminal.attempt_stream_opened is opened
+    assert terminal.attempt_paid_prework is (None if opened is None else paid_prework)
+    assert terminal.usage is None
+    assert not terminal.accounting_release_reservation
+    assert not terminal.decision_provider_rejected
+    registry.close()
+
+
 def _start(
     registry: NativeAttemptAccounting,
     *,
@@ -1001,6 +1035,75 @@ def _settle(
             }
         )
     )
+
+
+def test_poison_recovery_item_retains_its_meter_without_stopping_later_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing host observation cannot terminate or starve the recovery loop."""
+    from unittest.mock import Mock
+
+    from exp.runtime.gateway import native_accounting
+
+    monkeypatch.setattr(NativeAttemptAccounting, "_sweep_loop", lambda self: None)
+    ledger = _RecordingLedger()
+    accounting = NativeAttemptAccounting(ledger)
+    deployments = (_deployment("lead", connection_sha256="b" * 64),)
+    first = _admit(accounting, deployments, request_id="poison", organization_id="first")
+    second = _admit(accounting, deployments, request_id="healthy", organization_id="second")
+    for request_id in ("poison", "healthy"):
+        attempt = _start(accounting, ordinal=0, request_id=request_id)
+        ledger.fail_finishes = 1
+        with pytest.raises(NativeBridgeError):
+            _settle(
+                accounting,
+                attempt_id=str(attempt["attempt_id"]),
+                outcome="completed",
+                finalize=True,
+                request_id=request_id,
+            )
+    assert first.pending_settlement is not None
+    assert second.pending_settlement is not None
+    retained = first.pending_settlement
+    original = native_accounting.settled_terminal
+    good = original(second.pending_settlement, second, loads=accounting.loads)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            native_accounting,
+            "settled_terminal",
+            Mock(side_effect=[ValueError("invalid recovery observation"), good]),
+        )
+        accounting.sweep_expired()
+    assert first.pending_settlement == retained
+    assert accounting.entry("healthy") is None
+    with pytest.raises(NativeBridgeError):
+        accounting.require_clear()
+    accounting.sweep_expired()
+    assert accounting.entry("poison") is None
+    assert len(ledger.finished) == 2
+
+
+def test_host_scheduled_recovery_keeps_failed_close_owned_until_acknowledged() -> None:
+    """Manual scheduling creates no thread and preserves a failed meter across close."""
+    ledger = _RecordingLedger()
+    accounting = NativeAttemptAccounting(ledger, background_recovery=False)
+    assert accounting._sweeper is None
+    deployments = (_deployment("lead", connection_sha256="b" * 64),)
+    entry = _admit(accounting, deployments, request_id="request-one")
+    attempt = _start(accounting, ordinal=0)
+    ledger.fail_finishes = 1
+    with pytest.raises(NativeBridgeError):
+        _settle(
+            accounting, attempt_id=str(attempt["attempt_id"]), outcome="completed", finalize=True
+        )
+    assert not accounting.close(timeout_seconds=0)
+    assert accounting.entry(entry.authorization.request_id) is entry
+    with pytest.raises(NativeBridgeError):
+        accounting.require_clear()
+    accounting.sweep_expired()
+    assert accounting.close(timeout_seconds=0)
+    assert accounting.entry(entry.authorization.request_id) is None
+    assert len(ledger.finished) == 1
 
 
 def _retryable_failure() -> JsonObject:
@@ -1223,7 +1326,9 @@ def test_ordinal_mismatch_is_a_wire_contract_failure() -> None:
 def test_abandon_without_an_active_attempt_finalizes_the_request_row() -> None:
     """Abandoning an accepted request with no reservation closes the request."""
     registry, ledger, _entry = _registry()
-    assert registry.abandon(json.dumps({"request_id": "request-one"})) == "{}"
+    assert json.loads(registry.abandon(json.dumps({"request_id": "request-one"}))) == {
+        "terminalized": True
+    }
     assert [failure.failure_class.value for failure in ledger.finished_requests] == ["cancelled"]
     assert registry.entry("request-one") is None
 
@@ -1260,6 +1365,80 @@ def test_replayed_cancellation_preserves_successful_open_health(opened: bool, sw
     assert registry.entry(entry.authorization.request_id) is None
     registry.health.failed(key, transport)
     assert registry.health.suppressed(key) is (not opened)
+
+
+@pytest.mark.parametrize("swept", [False, True])
+def test_graceful_retirements_preserve_retries_prior_failures_and_unknown_usage(
+    monkeypatch: pytest.MonkeyPatch, swept: bool
+) -> None:
+    """Two connection retirements retain both receipts without tripping or healing the circuit."""
+    registry, ledger, entry = _registry(background_recovery=False)
+    registry.recovery_host = RecoveryHostFake()
+
+    def unexpected_observation(
+        recovery: SessionRecoveryRegistry,
+        host: RecoveryHost | None,
+        observed: InflightRequest,
+        attempt_id: str,
+        usage: GatewayUsage | None,
+        failure: GatewayFailure | None,
+    ) -> None:
+        """A graceful retirement must produce neither a departure nor a success."""
+        if observed is entry:
+            raise AssertionError("connection retirement reached recovery history")
+        record_session_outcome(recovery, host, observed, attempt_id, usage, failure)
+
+    monkeypatch.setattr(
+        "exp.runtime.gateway.native_accounting.record_session_outcome", unexpected_observation
+    )
+    key = deployment_health_key(entry.authorization, entry.route.deployment)
+    transport = GatewayFailure(
+        failure_class=GatewayFailureClass.TRANSPORT, safe_message="transport failure"
+    )
+    registry.health.failed(key, transport)
+    for ordinal in range(2):
+        started = _start(
+            registry,
+            ordinal=ordinal,
+            current_depth=None if ordinal == 0 else 0,
+            failure=None
+            if ordinal == 0
+            else {
+                "failure_class": "transport",
+                "safe_message": "transport failure",
+                "retryable_same_deployment": True,
+                "failover_eligible": True,
+            },
+        )
+        argument = json.dumps(
+            {
+                "request_id": entry.authorization.request_id,
+                "attempt_id": started["attempt_id"],
+                "outcome": "failed",
+                "failure": {"failure_class": "transport", "safe_message": "transport failure"},
+                "usage": None,
+                "opened": False,
+                "graceful_transport_retirement": True,
+                "finalize": ordinal == 1,
+            }
+        )
+        if swept:
+            ledger.fail_finishes = 1
+            with pytest.raises(NativeBridgeError):
+                registry.settle(argument)
+            assert entry.pending_settlement == json.loads(argument)
+            registry.sweep_expired()
+        else:
+            registry.settle(argument)
+        assert not registry.health.suppressed(key)
+    assert len(ledger.finished) == 2
+    assert len({row["attempt_id"] for row in ledger.finished}) == 2
+    for terminal in ledger.terminal_events:
+        assert terminal is not None and terminal.usage is None
+        assert not terminal.decision_provider_rejected
+        assert not terminal.accounting_release_reservation
+    registry.health.failed(key, transport)
+    assert registry.health.suppressed(key)
 
 
 def test_sweep_cancels_the_active_attempt_after_the_deadline() -> None:
@@ -2498,7 +2677,9 @@ class TestRungDispatchPolicy:
         _admit(registry, deployments, request_id="request-1")
         _admit(registry, deployments, request_id="request-2")
         assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
-        assert registry.abandon(json.dumps({"request_id": "request-1"})) == "{}"
+        assert json.loads(registry.abandon(json.dumps({"request_id": "request-1"}))) == {
+            "terminalized": True
+        }
         assert registry.loads.inflight(("deployment-a", "b" * 64)) == 0
         assert _start(registry, ordinal=0, request_id="request-2")["route_depth"] == 0
 
@@ -4414,6 +4595,10 @@ def test_abandon_during_committed_reservation_retains_and_closes_late_attempt(
     try:
         assert committed.wait(5)
         accounting.abandon(json.dumps({"request_id": "late-reservation"}))
+        # Cancellation intent while reserve still owns the request lock is not
+        # a failed ledger write and must not fence sibling admissions.
+        accounting.require_clear()
+        assert not accounting.accounting_healthy
         assert accounting.entry("late-reservation") is entry
         assert not ledger.finished_requests and not ledger.finished
         if failed_cleanup:
@@ -4426,6 +4611,8 @@ def test_abandon_during_committed_reservation_retains_and_closes_late_attempt(
         assert len(errors) == 1 and isinstance(errors[0], NativeBridgeError)
         assert not results and accounting.entry("late-reservation") is entry
         assert entry.active_attempt_id is not None and not ledger.finished
+        with pytest.raises(NativeBridgeError):
+            accounting.require_clear()
         accounting.sweep_expired()
     else:
         assert not errors and results and results[0].get("exhausted") is True
@@ -4524,6 +4711,7 @@ def _retained_settlement(
     monkeypatch.setattr(NativeAttemptAccounting, "_sweep_loop", lambda self: None)
     ledger, host, clock = _RecordingLedger(), RecoveryHostFake(), Clock(now=990)
     accounting = NativeAttemptAccounting(ledger, recovery_host=host)
+    assert accounting._sweeper is not None
     accounting._sweeper.join(timeout=5)
     accounting.recovery = SessionRecoveryRegistry(clock=clock)
     entry = recovery_entry()
@@ -4552,6 +4740,47 @@ def _retained_settlement(
     return accounting, ledger, clock, entry, payload
 
 
+def test_delayed_sweep_cannot_clear_a_newer_attempts_observed_meter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sweep selected before a newer attempt cannot commit or clear its predecessor."""
+    monkeypatch.setattr(NativeAttemptAccounting, "_sweep_loop", lambda self: None)
+    accounting, ledger, entry = _registry()
+    first = _start(accounting, ordinal=0)
+    payload = {
+        "request_id": "request-one",
+        "attempt_id": first["attempt_id"],
+        "outcome": "failed",
+        "usage": {"input_tokens": 101, "output_tokens": 11},
+        "failure": _retryable_failure(),
+        "finalize": False,
+    }
+    ledger.fail_finishes = 1
+    with pytest.raises(NativeBridgeError):
+        accounting.settle(json.dumps(payload))
+    selected = entry.pending_settlement
+    assert selected is not None
+    accounting.settle(json.dumps(payload))
+    second = _start(accounting, ordinal=1, failure=_retryable_failure())
+    newer = {
+        **payload,
+        "attempt_id": second["attempt_id"],
+        "finalize": True,
+        "usage": {"input_tokens": 303, "output_tokens": 33},
+    }
+    ledger.fail_finishes = 1
+    with pytest.raises(NativeBridgeError):
+        accounting.settle(json.dumps(newer))
+    assert not accounting._settle_swept("request-one", entry, selected)
+    assert entry.pending_settlement == newer
+    accounting.sweep_expired()
+    assert entry.pending_settlement is None
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None and terminal.usage is not None
+    assert terminal.usage.input_tokens == 303
+    assert terminal.usage.output_tokens == 33
+
+
 @pytest.mark.parametrize("failing", [False, True])
 def test_concurrent_settle_and_sweep_observe_recovery_once(
     monkeypatch: pytest.MonkeyPatch, failing: bool
@@ -4559,7 +4788,7 @@ def test_concurrent_settle_and_sweep_observe_recovery_once(
     """Serialized ledger retries cannot renew cache residency or duplicate a recovery failure."""
     accounting, ledger, clock, entry, payload = _retained_settlement(monkeypatch, failing=failing)
     original_key = native_recovery.session_cache_key
-    paused, release, sweep_finished_write = threading.Event(), threading.Event(), threading.Event()
+    paused, release = threading.Event(), threading.Event()
     finish = accounting._finish_attempt
     ledger_lock = threading.Lock()
     successful_writes: set[str] = set()
@@ -4573,7 +4802,7 @@ def test_concurrent_settle_and_sweep_observe_recovery_once(
         finalize_request: bool = True,
         **metadata: object,
     ) -> None:
-        """Serialize idempotent ledger delivery and signal after the swept write returns."""
+        """Observe which caller actually delivers the retained terminal write."""
         with ledger_lock:
             calls.append(threading.current_thread().name)
             if attempt_id not in successful_writes:
@@ -4585,8 +4814,6 @@ def test_concurrent_settle_and_sweep_observe_recovery_once(
                     **metadata,
                 )
                 successful_writes.add(attempt_id)
-        if threading.current_thread().name == "swept-retry":
-            sweep_finished_write.set()
 
     monkeypatch.setattr(accounting, "_finish_attempt", observed_finish)
     derived: list[str] = []
@@ -4621,7 +4848,8 @@ def test_concurrent_settle_and_sweep_observe_recovery_once(
     try:
         assert paused.wait(5)
         swept.start()
-        assert sweep_finished_write.wait(5)
+        swept.join(5)
+        assert not swept.is_alive()
         clock.now = 1010
     finally:
         release.set()
@@ -4631,7 +4859,7 @@ def test_concurrent_settle_and_sweep_observe_recovery_once(
     assert not direct.is_alive() and not swept.is_alive() and not errors
     assert len(derived) == 1
     assert accounting.entry(entry.authorization.request_id) is None
-    assert calls == ["direct-retry", "swept-retry"]
+    assert calls == ["direct-retry"]
     assert successful_writes == {str(payload["attempt_id"])}
     assert len(ledger.finished) == 1
     assert len(ledger.terminal_events) == 2  # Initial failed delivery and one durable terminal.
@@ -4662,3 +4890,316 @@ def test_delayed_first_sweep_does_not_renew_expired_cache_evidence(
     )
     assert len(ledger.finished) == 1
     assert decision.deployment_id is None and decision.warm_remaining_seconds == 0
+
+
+def test_recovery_shutdown_retains_transport_ownership_until_blocking_write_ends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host cannot close the durable client while recovery still owns a write."""
+    from exp.runtime.gateway import native_accounting
+
+    entered, release = threading.Event(), threading.Event()
+    ledger = _RecordingLedger()
+    original_recover = native_accounting.recover_expired
+
+    def recover(accounting: NativeAttemptAccounting) -> None:
+        # Other tests may still own sweepers. Their callback cannot satisfy
+        # this instance's synchronization or inherit its blocking transport.
+        if accounting._write_ledger is not ledger:
+            original_recover(accounting)
+            return
+        entered.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(native_accounting, "_SWEEP_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(native_accounting, "recover_expired", recover)
+    accounting = NativeAttemptAccounting(ledger)
+    try:
+        assert entered.wait(5)
+        assert not accounting.close(0)
+        release.set()
+        assert accounting.close(5)
+        assert accounting.close(0)
+    finally:
+        release.set()
+        accounting.close(5)
+
+
+def test_idle_recovery_shutdown_flushes_retained_request_meter() -> None:
+    """Close wakes an idle sweep and cannot discard a known failed-write meter."""
+    ledger = _RecordingLedger()
+    accounting = NativeAttemptAccounting(ledger)
+    failure = GatewayFailure(failure_class=GatewayFailureClass.CANCELLED, safe_message="cancelled")
+    ledger.fail_request_finishes = 1
+    with pytest.raises(RuntimeError):
+        accounting.request_settlements.finish(
+            _authorization(_DIGEST), failure, certify_no_effects=False, web_search_requests=1
+        )
+    assert not accounting.accounting_healthy
+    assert accounting.close(5)
+    assert ledger.request_search_meters == [1]
+    assert accounting.accounting_healthy
+
+
+def test_observed_meter_owns_abandonment_before_waiting_for_execution_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanup winning the gate after observation cannot replace the exact meter."""
+    accounting, ledger, entry = _registry()
+    attempt_id = str(_start(accounting, ordinal=0)["attempt_id"])
+    gate = entry.execution_lock
+    cleanups: list[object] = []
+
+    class InterceptGate:
+        """Run competing cleanup exactly before the observed callback takes its gate."""
+
+        def __enter__(self) -> None:
+            accounting.require_clear()
+            assert accounting.accounting_healthy
+            cleanups.append(
+                json.loads(accounting.abandon(json.dumps({"request_id": "request-one"})))
+            )
+            gate.acquire()
+
+        def __exit__(self, *_exception: object) -> None:
+            gate.release()
+
+        def acquire(self, *, blocking: bool) -> bool:
+            return gate.acquire(blocking=blocking)
+
+        def release(self) -> None:
+            gate.release()
+
+    monkeypatch.setattr(entry, "execution_lock", InterceptGate())
+    accounting.settle(
+        json.dumps(
+            {
+                "request_id": entry.authorization.request_id,
+                "attempt_id": attempt_id,
+                "outcome": "completed",
+                "usage": {"input_tokens": 123, "output_tokens": 12},
+                "finalize": True,
+                "opened": True,
+            }
+        )
+    )
+    assert cleanups == [{"terminalized": False}]
+    assert len(ledger.finished) == 1
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None and terminal.kind is GatewayEventKind.COMPLETED
+    assert terminal.usage is not None
+    assert (terminal.usage.input_tokens, terminal.usage.output_tokens) == (123, 12)
+    assert accounting.close(5)
+
+
+def test_shutdown_waits_for_an_admitted_attempt_before_its_terminal_callback() -> None:
+    """A dropped data-plane task keeps recovery ownership until deadline abandonment."""
+    accounting, ledger, entry = _registry()
+    _start(accounting, ordinal=0)
+    try:
+        assert not accounting.close(0.01)
+        assert not ledger.finished
+        entry.deadline_monotonic = time.monotonic() - 10
+        assert accounting.close(5)
+        assert accounting.entry(entry.authorization.request_id) is None
+        assert len(ledger.finished) == 1
+        terminal = ledger.terminal_events[-1]
+        assert terminal is not None and terminal.kind is GatewayEventKind.FAILED
+        assert terminal.usage is None
+    finally:
+        entry.deadline_monotonic = time.monotonic() - 10
+        accounting.close(5)
+
+
+@pytest.mark.parametrize("request_only", [False, True])
+def test_shutdown_keeps_recovery_alive_for_an_in_progress_terminal_write(
+    monkeypatch: pytest.MonkeyPatch, request_only: bool
+) -> None:
+    """A first commit failing after close starts still has an owner to retry its meter."""
+    from unittest.mock import DEFAULT, Mock
+
+    accounting, ledger, entry = _registry()
+    attempt_id = "" if request_only else str(_start(accounting, ordinal=0)["attempt_id"])
+    entered, release = threading.Event(), threading.Event()
+    failure = GatewayFailure(failure_class=GatewayFailureClass.CANCELLED, safe_message="cancelled")
+
+    def delayed_first_write(*_args: object, **_kwargs: object) -> object:
+        """Fail only the first commit, after shutdown has attempted a bounded join."""
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+            raise RuntimeError("write failed after close began")
+        return DEFAULT
+
+    if request_only:
+        monkeypatch.setattr(
+            ledger,
+            "finish_request",
+            Mock(wraps=ledger.finish_request, side_effect=delayed_first_write),
+        )
+    else:
+        monkeypatch.setattr(
+            accounting,
+            "_finish_attempt",
+            Mock(wraps=ledger.finish_attempt, side_effect=delayed_first_write),
+        )
+
+    def finish() -> None:
+        """Deliver one terminal callback and allow its failure to transfer to recovery."""
+        with pytest.raises((RuntimeError, NativeBridgeError)):
+            if request_only:
+                accounting.request_settlements.finish(
+                    entry.authorization, failure, web_search_requests=1
+                )
+            else:
+                accounting.settle(
+                    json.dumps(
+                        {
+                            "request_id": entry.authorization.request_id,
+                            "attempt_id": attempt_id,
+                            "outcome": "completed",
+                            "usage": {"input_tokens": 123, "output_tokens": 12},
+                            "finalize": True,
+                            "opened": True,
+                        }
+                    )
+                )
+
+    writer = threading.Thread(target=finish)
+    writer.start()
+    try:
+        assert entered.wait(5)
+        assert accounting.accounting_healthy
+        accounting.require_clear()
+        if not request_only:
+            entry.deadline_monotonic = time.monotonic() - 10
+            assert json.loads(
+                accounting.abandon(json.dumps({"request_id": entry.authorization.request_id}))
+            ) == {"terminalized": False}
+        assert not accounting.close(0.01)
+    finally:
+        release.set()
+        writer.join(5)
+    assert accounting.close(5)
+    assert ledger.request_search_meters == ([1] if request_only else [])
+    assert len(ledger.finished) == (0 if request_only else 1)
+    if not request_only:
+        terminal = ledger.terminal_events[-1]
+        assert terminal is not None and terminal.kind is GatewayEventKind.COMPLETED
+        assert terminal.usage is not None
+        assert (terminal.usage.input_tokens, terminal.usage.output_tokens) == (123, 12)
+
+
+@pytest.mark.parametrize("fail_observed_write", [False, True])
+def test_meter_arriving_during_abandonment_stays_owned_until_exact_ack(
+    monkeypatch: pytest.MonkeyPatch, fail_observed_write: bool
+) -> None:
+    """An unknown write already in flight cannot erase a newly retained exact meter."""
+    from unittest.mock import DEFAULT, Mock
+
+    monkeypatch.setattr(NativeAttemptAccounting, "_sweep_loop", lambda self: None)
+    accounting, ledger, entry = _registry()
+    attempt_id = str(_start(accounting, ordinal=0)["attempt_id"])
+    abandoned_write, release, observed_waiting = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+    gate = entry.execution_lock
+
+    class ObservedGate:
+        """Signal after the observed callback retains its meter but before it gets the gate."""
+
+        def __enter__(self) -> None:
+            observed_waiting.set()
+            gate.acquire()
+
+        def __exit__(self, *_exception: object) -> None:
+            gate.release()
+
+        def acquire(self, *, blocking: bool) -> bool:
+            return gate.acquire(blocking=blocking)
+
+        def release(self) -> None:
+            gate.release()
+
+    fail_next_observed = fail_observed_write
+
+    def delayed_abandonment(**fields: object) -> object:
+        """Pause the unknown write, then optionally reject the first exact-meter delivery."""
+        nonlocal fail_next_observed
+        terminal = fields["terminal_event"]
+        assert isinstance(terminal, GatewayEvent)
+        if terminal.kind is GatewayEventKind.FAILED:
+            abandoned_write.set()
+            assert release.wait(5)
+        elif fail_next_observed:
+            fail_next_observed = False
+            raise RuntimeError("exact write temporarily unavailable")
+        return DEFAULT
+
+    monkeypatch.setattr(entry, "execution_lock", ObservedGate())
+    finish = Mock(wraps=ledger.finish_attempt, side_effect=delayed_abandonment)
+    monkeypatch.setattr(accounting, "_finish_attempt", finish)
+    payload = {
+        "request_id": entry.authorization.request_id,
+        "attempt_id": attempt_id,
+        "outcome": "completed",
+        "usage": {"input_tokens": 123, "output_tokens": 12},
+        "finalize": True,
+        "opened": True,
+    }
+    abandonment: list[object] = []
+    failures: list[BaseException] = []
+
+    def abandon() -> None:
+        """Begin conservative cleanup before the observed callback arrives."""
+        try:
+            abandonment.append(
+                json.loads(accounting.abandon(json.dumps({"request_id": "request-one"})))
+            )
+        except BaseException as error:  # noqa: BLE001 - propagate worker failures to the test.
+            failures.append(error)
+
+    def settle() -> None:
+        """Deliver exact usage while the abandonment writer holds the execution gate."""
+        try:
+            accounting.settle(json.dumps(payload))
+        except BaseException as error:  # noqa: BLE001 - propagate worker failures to the test.
+            failures.append(error)
+
+    cleanup = threading.Thread(target=abandon)
+    observed = threading.Thread(target=settle)
+    cleanup.start()
+    try:
+        assert abandoned_write.wait(5)
+        observed.start()
+        assert observed_waiting.wait(5)
+        assert entry.pending_settlement == payload
+    finally:
+        release.set()
+        cleanup.join(5)
+        if observed.ident is not None:
+            observed.join(5)
+    assert not cleanup.is_alive() and not observed.is_alive()
+    assert abandonment == [{"terminalized": False}]
+    if fail_observed_write:
+        assert len(failures) == 1 and isinstance(failures[0], NativeBridgeError)
+        assert accounting.entry("request-one") is entry
+        assert entry.pending_settlement == payload
+        assert not accounting.close(0.01)
+        first_observed = finish.call_args.kwargs
+        accounting.sweep_expired()
+        assert finish.call_args.kwargs == first_observed
+    else:
+        assert not failures
+    assert finish.call_count == (3 if fail_observed_write else 2)
+    assert accounting.entry("request-one") is None
+    assert accounting.close(5)
+    assert len(ledger.finished) == 2
+    unknown, exact = ledger.terminal_events
+    assert unknown is not None and unknown.kind is GatewayEventKind.FAILED
+    assert unknown.usage is None
+    assert exact is not None and exact.kind is GatewayEventKind.COMPLETED
+    assert exact.usage is not None
+    assert (exact.usage.input_tokens, exact.usage.output_tokens) == (123, 12)

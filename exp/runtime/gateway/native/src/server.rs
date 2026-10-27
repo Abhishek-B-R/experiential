@@ -4,6 +4,10 @@
 //! The chat, Responses, and Messages surfaces live in their `route_*`
 //! modules; unknown routes answer the native 404 in the OpenAI envelope.
 
+#[cfg(test)]
+#[path = "server_usage_tests.rs"]
+mod usage_tests;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -175,6 +179,7 @@ pub(crate) struct AppState {
     pub(crate) bridge: Arc<Bridge>,
     pub(crate) http: crate::upstream::UpstreamClient,
     pub(crate) permits: Arc<Semaphore>,
+    pub(crate) dispatch_capacity: Arc<crate::dispatch_capacity::DispatchCapacity>,
     /// The order waiting requests take `permits` in (FIFO unless configured).
     pub(crate) permit_queue: Arc<crate::permit_queue::PermitQueue>,
     pub(crate) request_timeout: Duration,
@@ -220,6 +225,7 @@ pub async fn run(
     on_listening: Option<Py<PyAny>>,
     guardrail_detectors: Arc<DetectorMap>,
     capture: Option<Arc<crate::capture::collector::Collector>>,
+    execution_bindings: Option<crate::execution_binding::ExecutionBindings>,
 ) -> Result<(), String> {
     let connect_timeout = Duration::from_secs_f64(config.connect_timeout_seconds.max(0.001));
     let http = crate::upstream::build_client(connect_timeout, config.public_upstreams_only)?;
@@ -230,6 +236,7 @@ pub async fn run(
         bridge,
         http,
         permits: Arc::new(Semaphore::new(max_active_requests)),
+        dispatch_capacity: Arc::new(crate::dispatch_capacity::DispatchCapacity::new()),
         permit_queue: Arc::new(crate::permit_queue::PermitQueue::new(
             config.permit_priority_aging_seconds,
         )),
@@ -311,7 +318,22 @@ pub async fn run(
     } else {
         app
     };
-    let app = app.fallback(unknown_route).with_state(state);
+    let permits = state.permits.clone();
+    let permit_queue = state.permit_queue.clone();
+    let app = app.fallback(unknown_route);
+    let bindings_enabled = execution_bindings.is_some();
+    let app = if let Some(bindings) = execution_bindings {
+        app.layer(axum::middleware::from_fn_with_state(
+            bindings,
+            crate::execution_context::bind_execution,
+        ))
+    } else {
+        app
+    };
+    let app = app.with_state(crate::execution_context::ServerState {
+        base: state,
+        bindings_enabled,
+    });
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port))
         .await
         .map_err(|error| format!("failed to bind {}:{}: {error}", config.host, config.port))?
@@ -327,14 +349,22 @@ pub async fn run(
             .map_err(|error| format!("on_listening callback failed: {error}"))?;
     }
     let graceful = Duration::from_secs_f64(config.graceful_timeout_seconds.max(0.1));
-    let server =
-        axum::serve(listener, app).with_graceful_shutdown(shutdown_requested(shutdown.clone()));
+    let server_shutdown = shutdown.clone();
+    let drain_permits = permits.clone();
+    let drain_queue = permit_queue.clone();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown_requested(server_shutdown).await;
+        drain_permits.close();
+        drain_queue.close();
+    });
     // A stop request starts the graceful drain above; the arm below bounds
     // it, so a stuck stream cannot hold shutdown past the configured timeout.
     let outcome = tokio::select! {
         outcome = server => outcome.map_err(|error| format!("gateway server failed: {error}")),
         _ = async {
             shutdown_requested(shutdown).await;
+            permits.close();
+            permit_queue.close();
             tokio::time::sleep(graceful).await;
         } => Ok(()),
     };

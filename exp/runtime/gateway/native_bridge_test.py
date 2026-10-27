@@ -363,6 +363,57 @@ def _chat_body(*, model: str = "coding", stream: bool = False) -> str:
     return json.dumps(payload)
 
 
+@pytest.mark.parametrize("background_recovery", [False, True])
+@pytest.mark.parametrize("failure_point", ["tokenizer", "videos", "video_poller"])
+def test_failed_control_plane_initialization_leaves_no_background_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    background_recovery: bool,
+    failure_point: str,
+) -> None:
+    """Repeated constructor failures leave no unreachable recovery or video thread."""
+    _configured_gateway(tmp_path)
+    components = load_gateway_components(
+        tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+    )
+    started: list[threading.Thread] = []
+    original_start = threading.Thread.start
+
+    def track_start(thread: threading.Thread) -> None:
+        """Observe real owned workers and inject a video thread creation failure."""
+        if thread.name in {"exp-native-settlement-sweep", "gateway-video-poller"}:
+            started.append(thread)
+            if failure_point == "video_poller" and thread.name == "gateway-video-poller":
+                raise RuntimeError("startup fault")
+        original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", track_start)
+    if failure_point == "tokenizer":
+        monkeypatch.setattr(
+            native_bridge_module,
+            "reservation_encoder",
+            mock.Mock(side_effect=RuntimeError("startup fault")),
+        )
+    elif failure_point == "videos":
+        monkeypatch.setattr(
+            NativeControlPlane, "_bind_videos", mock.Mock(side_effect=RuntimeError("startup fault"))
+        )
+    try:
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="startup fault"):
+                NativeControlPlane(components, background_recovery=background_recovery)
+            assert not any(thread.is_alive() for thread in started)
+        if failure_point == "video_poller":
+            assert sum(thread.name == "exp-native-settlement-sweep" for thread in started) == (
+                2 if background_recovery else 0
+            )
+        else:
+            assert not started
+    finally:
+        components.write_ledger.close()
+        components.ledger.close()
+
+
 def _admit(
     control: NativeControlPlane,
     raw_key: str,
@@ -2346,9 +2397,9 @@ def test_failed_settlement_keeps_the_attempt_retryable(tmp_path: Path) -> None:
     ):
         with pytest.raises(NativeBridgeError):
             control.settle(settlement)
-    # A transient failure does not latch readiness; the data plane retries.
-    assert control.readiness("{}") == "true"
+        assert control.readiness("{}") == "false"
     assert control.settle(settlement) == "{}"
+    assert control.readiness("{}") == "true"
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
 
@@ -2497,7 +2548,8 @@ def test_abandoned_inflight_attempts_are_swept_after_the_deadline(
     with (
         mock.patch("exp.runtime.gateway.native_bridge.time", native_time),
         mock.patch("exp.runtime.gateway.native_accounting.time", native_time),
-        mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0),
+        mock.patch("exp.runtime.gateway.native_accounting_recovery.time", native_time),
+        mock.patch("exp.runtime.gateway.native_accounting_recovery._SWEEP_GRACE_SECONDS", 0.0),
     ):
         clock.elapsed += setup_elapsed
         abandoned = _admit_started(control, raw_key, _chat_body())
@@ -2511,6 +2563,9 @@ def test_abandoned_inflight_attempts_are_swept_after_the_deadline(
         clock.elapsed += 0.002 + setup_elapsed
         assert clock.monotonic() > entry.deadline_monotonic
         second = _admit(control, raw_key, _chat_body())
+        # Admission does not sweep another request on its critical path.
+        assert control._accounting.entry(request_id) is entry  # noqa: SLF001
+        control._accounting.sweep_expired()  # noqa: SLF001 - the timer drives recovery.
         assert control._accounting.entry(request_id) is None  # noqa: SLF001
         assert control._accounting.entry(str(second["request_id"])) is not None  # noqa: SLF001
         control._accounting.sweep_expired()  # noqa: SLF001
@@ -4356,7 +4411,7 @@ def test_metrics_snapshot_counts_a_swept_abandoned_attempt(tmp_path: Path) -> No
     control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.5)
     _admit(control, raw_key, _chat_body())
     time.sleep(0.6)
-    with mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0):
+    with mock.patch("exp.runtime.gateway.native_accounting_recovery._SWEEP_GRACE_SECONDS", 0.0):
         control._accounting.sweep_expired()  # noqa: SLF001 - the timer normally drives this.
 
     snapshot = control.metrics_snapshot()

@@ -23,7 +23,6 @@ from exp.runtime.gateway.class_throttles import (
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayEvent,
-    GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
 )
@@ -41,8 +40,15 @@ from exp.runtime.gateway.ledger import AttemptRejectedError
 from exp.runtime.gateway.model_chain_authority import require_bound_model_chain_authority
 from exp.runtime.gateway.native_accounting_errors import (
     NativeBridgeError,
+    accounting_recovering_error,
     authority_error,
     internal_protocol_error,
+)
+from exp.runtime.gateway.native_accounting_recovery import (
+    RecoveryRotation,
+    recover_expired,
+    recover_until_stopped,
+    recovery_drained,
 )
 from exp.runtime.gateway.native_attempt_pricing import deployment_priced_at, priced_attempt
 from exp.runtime.gateway.native_components import SyncWriteLedger
@@ -82,6 +88,7 @@ from exp.runtime.gateway.native_settlement import (
     budget_quota_protocol_error,
     exhausted_attempt_payload,
     failure_from_boundary_payload,
+    graceful_transport_retirement,
     ledger_failure,
     settlement_metadata,
     terminal_from_settlement,
@@ -95,12 +102,9 @@ from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 from exp.runtime.openai_protocol.errors import public_failure_error
 
-_SWEEP_GRACE_SECONDS = 5.0
 _SWEEP_INTERVAL_SECONDS = 5.0
-_SWEEP_BATCH = 16
 
-# The request deadline ran out between attempts, before any provider answered.
-# The streaming relay names the other case (output already flowing) itself.
+# The deadline expired before a provider answered; the relay names the streaming case.
 DEADLINE_BEFORE_ANSWER_MESSAGE: Final = (
     "the request reached the gateway's time limit before any provider finished "
     "answering; retry the request"
@@ -116,8 +120,8 @@ TOOL_SEARCH_ROUND: Final = "tool_search_round"
 class NativeAttemptAccounting:
     """Registry of admitted requests and their durable attempt settlements.
 
-    A lock protects Rust callbacks; timed and opportunistic sweeps bound abandoned
-    reservations. Failed terminal writes block readiness until startup reconciliation.
+    A lock protects Rust callbacks; a background sweep owns abandoned reservations.
+    Failed terminal writes block this control plane's admission until recovery.
     """
 
     def __init__(
@@ -128,6 +132,7 @@ class NativeAttemptAccounting:
         cache_sample_gate: Callable[[str], bool] | None = None,
         recovery_host: RecoveryHost | None = None,
         default_lane_bound: int | None = None,
+        background_recovery: bool = True,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         """Bind the durable ledger and start the settlement sweep.
@@ -136,6 +141,8 @@ class NativeAttemptAccounting:
             write_ledger: Blocking durable request and attempt ledger.
             budget_error_factory: Optional mapping for a rejected reservation.
             default_lane_bound: Per-worker cap for rungs authoring no bound (lane_saturation).
+            background_recovery: Start the owned recovery thread. False requires
+                the host to serialize periodic sweeps and keep doing so through close.
             clock: Aware wall clock that dates each attempt's start for off-peak pricing.
             cache_sample_gate: Predicate admitting a settled attempt to the cache-priority
                 EWMA. Hosts exclude promo-funded samples so subsidized replay cannot buy
@@ -155,19 +162,21 @@ class NativeAttemptAccounting:
         self._sticky = StickySpillRegistry()
         self._inflight: dict[str, InflightRequest] = {}
         self._lock = threading.Lock()
-        self._accounting_healthy = True
+        self._active_settlements = 0
+        self._retained_recovery = RecoveryRotation[tuple[str, InflightRequest]](
+            lambda item: item[0]
+        )
+        self._abandoned_recovery = RecoveryRotation[tuple[str, InflightRequest]](
+            lambda item: item[0]
+        )
         self._sweep_retained_replayed = 0
         self._sweep_abandoned_cancelled = 0
-        # Admission-time dead-rung skips: a request served off a fallback
-        # because a certified rung could not be resolved for dispatch, and the
-        # subset of those where the skipped rung was the lead.
+        # Unresolvable certified rungs skipped at admission, including skipped leads.
         self._admission_dead_rungs_skipped = 0
         self._admission_parameter_coercions = 0
         self._admission_lead_rungs_skipped = 0
-        # Dispatch-policy outcomes: rungs bypassed at their bound, rate
-        # window, fresh-session threshold, or their organization's fair
-        # share, and dispatches forced past a bound because no other rung
-        # could serve. The per-reason counters split the aggregate.
+        # Count bypasses by bound, rate, fresh-session and tenant-share limits,
+        # plus forced dispatches when no other rung can serve.
         self._rung_admission_sheds = 0
         self._rung_saturated_overflows = 0
         self._rung_saturation_refusals = 0
@@ -183,17 +192,36 @@ class NativeAttemptAccounting:
         self._throttle_backoff_redials = 0
         self._throttle_backoff_forced = 0
         # Reconcile retained writes and abandoned requests even without new traffic.
-        self._sweeper = threading.Thread(
-            target=self._sweep_loop,
-            name="exp-native-settlement-sweep",
-            daemon=True,
-        )
-        self._sweeper.start()
+        self._stop_sweeper = threading.Event()
+        self._sweeper: threading.Thread | None = None
+        if background_recovery:
+            self._sweeper = threading.Thread(
+                target=self._sweep_loop,
+                name="exp-native-settlement-sweep",
+                daemon=True,
+            )
+            self._sweeper.start()
 
     @property
     def accounting_healthy(self) -> bool:
         """Return whether every durable terminal write has landed."""
-        return self._accounting_healthy and not self.request_settlements.pending
+        with self._lock:
+            pending = any(
+                entry.settlement_write_failed or entry.pending_abandon is not None
+                for entry in self._inflight.values()
+            )
+        return not pending and not self.request_settlements.pending
+
+    def require_clear(self) -> None:
+        """Refuse new work while this control plane owns a failed accounting write."""
+        self.request_settlements.require_clear()
+        with self._lock:
+            pending = any(
+                entry.settlement_write_failed or entry.abandon_write_failed
+                for entry in self._inflight.values()
+            )
+        if pending:
+            raise NativeBridgeError(accounting_recovering_error())
 
     @property
     def health(self) -> DeploymentHealthRegistry:
@@ -706,18 +734,48 @@ class NativeAttemptAccounting:
             NativeBridgeError: The terminal write failed; the retained entry lets either
                 the data plane or the deadline sweep retry the original settlement.
         """
+        with self._lock:
+            self._active_settlements += 1
+        try:
+            return self._settle(argument)
+        finally:
+            with self._lock:
+                self._active_settlements -= 1
+
+    def _settle(self, argument: str) -> str:
+        """Commit one observed outcome while the caller retains shutdown ownership."""
         data = json.loads(argument)
         request_id = str(data["request_id"])
         with self._lock:
             entry = self._inflight.get(request_id)
-        if entry is None:
-            return "{}"
+            if entry is None:
+                return "{}"
+            if entry.pending_settlement is not None:
+                if entry.pending_settlement["attempt_id"] != data["attempt_id"]:
+                    raise NativeBridgeError(accounting_recovering_error())
+                data = entry.pending_settlement
+            else:
+                entry.pending_settlement = data
+        with entry.execution_lock:
+            if self.entry(request_id) is not entry or entry.pending_settlement is not data:
+                return "{}"
+            return self._commit_settlement(request_id, entry, data)
+
+    def _commit_settlement(self, request_id: str, entry: InflightRequest, data: JsonObject) -> str:
+        """Write the exact observed meter while holding the request execution gate."""
         attempt_id = str(data["attempt_id"])
         finalize = bool(data.get("finalize", True))
         opened = bool(data.get("opened", False))
         parsed = terminal_from_settlement(data, surface=entry.authorization.surface)
         retain_recovery_observation_time(self.recovery, entry, attempt_id)
         terminal, failure = settled_terminal(data, entry, parsed=parsed, loads=self._loads)
+        # Missing response provenance stays unknown. A timeout sweep or a
+        # provider-shaped event cannot manufacture a native phase observation.
+        if isinstance(data.get("opened"), bool):
+            terminal = terminal.with_attempt_observation(
+                stream_opened=data["opened"] is True,
+                paid_prework=not entry.no_paid_prework,
+            )
         try:
             self._finish_attempt(
                 attempt_id=attempt_id,
@@ -740,6 +798,7 @@ class NativeAttemptAccounting:
             # Both retry paths retain the original outcome, usage and tier evidence.
             with self._lock:
                 entry.pending_settlement = data
+                entry.settlement_write_failed = True
             raise authority_error(exc) from exc
         failure = terminal.failure
         record_attempt_health(
@@ -752,15 +811,19 @@ class NativeAttemptAccounting:
             settlement=data,
         )
         self._record_cache_fraction(entry, attempt_id, terminal)
-        record_session_outcome(
-            self.recovery,
-            self.recovery_host,
-            entry,
-            attempt_id,
-            None if terminal.usage_estimated else terminal.usage,
-            recovery_failure(data, failure),
-        )
+        if not graceful_transport_retirement(data, failure):
+            record_session_outcome(
+                self.recovery,
+                self.recovery_host,
+                entry,
+                attempt_id,
+                None if terminal.usage_estimated else terminal.usage,
+                recovery_failure(data, failure),
+            )
         with self._lock:
+            if entry.pending_settlement == data:
+                entry.pending_settlement = None
+                entry.settlement_write_failed = False
             if finalize:
                 discard_guardrails(self._inflight.pop(request_id, None))
             elif entry.active_attempt_id == attempt_id:
@@ -778,7 +841,7 @@ class NativeAttemptAccounting:
                 ``failure`` (defaulting to a cancellation).
 
         Returns:
-            An empty JSON object; an unknown request is a no-op.
+            Whether the request is terminalized; an unknown request is already closed.
 
         Raises:
             NativeBridgeError: The terminal write failed; the entry remains for retry.
@@ -788,24 +851,27 @@ class NativeAttemptAccounting:
         with self._lock:
             entry = self._inflight.get(request_id)
         if entry is None:
-            return "{}"
+            return '{"terminalized":true}'
         failure = failure_from_boundary_payload(data.get("failure")) or GatewayFailure(
             failure_class=GatewayFailureClass.CANCELLED,
             safe_message="gateway request was cancelled",
         )
         with self._lock:
             if self._inflight.get(request_id) is not entry:
-                return "{}"
+                return '{"terminalized":true}'
             if entry.pending_abandon is None:
                 entry.pending_abandon = failure
             failure = entry.pending_abandon
         if entry.guardrails is not None:
             failure = entry.guardrails.settlement_failure() or failure
         if not entry.execution_lock.acquire(blocking=False):
-            return "{}"
+            return '{"terminalized":false}'
         try:
-            if self.entry(request_id) is not entry:
-                return "{}"
+            with self._lock:
+                if self._inflight.get(request_id) is not entry:
+                    return '{"terminalized":true}'
+                if entry.pending_settlement is not None:
+                    return '{"terminalized":false}'
             try:
                 if entry.active_attempt_id is not None:
                     record_attempt_health(
@@ -813,11 +879,7 @@ class NativeAttemptAccounting:
                     )
                     self._finish_attempt(
                         attempt_id=entry.active_attempt_id,
-                        terminal_event=GatewayEvent(
-                            kind=GatewayEventKind.FAILED,
-                            sequence_number=0,
-                            failure=failure,
-                        ),
+                        terminal_event=GatewayEvent.for_accounting_recovery(failure=failure),
                         failure=failure,
                         finalize_request=True,
                         **web_search_requests_kwarg(
@@ -833,10 +895,17 @@ class NativeAttemptAccounting:
                         else 0,
                     )
             except Exception as exc:  # noqa: BLE001 - the data plane retries.
+                with self._lock:
+                    entry.abandon_write_failed = True
                 raise authority_error(exc) from exc
             with self._lock:
+                # A meter may arrive while the unknown cancellation is writing.
+                # A ledger can upgrade pending usage; a conflicting terminal
+                # owner must retain the evidence instead of reporting a drain.
+                if entry.pending_settlement is not None:
+                    return '{"terminalized":false}'
                 discard_guardrails(self._inflight.pop(request_id, None))
-            return "{}"
+            return '{"terminalized":true}'
         finally:
             entry.execution_lock.release()
 
@@ -877,123 +946,43 @@ class NativeAttemptAccounting:
 
     def _sweep_loop(self) -> None:
         """Periodically reconcile retained or expired attempts for the process lifetime."""
-        while True:
-            time.sleep(_SWEEP_INTERVAL_SECONDS)
-            self.sweep_expired()
+        recover_until_stopped(self, _SWEEP_INTERVAL_SECONDS)
+
+    def close(self, timeout_seconds: float = 10.0) -> bool:
+        """Stop owned recovery before a host closes its durable transport.
+
+        Hosts drain data-plane callbacks first. A timeout leaves the transport
+        owned by recovery; the caller must not close it underneath that thread.
+        Durable reservations remain pending when no trustworthy meter exists.
+        """
+        if not 0 <= timeout_seconds <= 300:
+            raise ValueError("recovery shutdown timeout must be between zero and 300 seconds")
+        self._stop_sweeper.set()
+        if self._sweeper is not None:
+            self._sweeper.join(timeout_seconds)
+            if self._sweeper.is_alive():
+                return False
+        return recovery_drained(self)
 
     def sweep_expired(self) -> None:
-        """Recover retained settlements and close abandoned requests.
-
-        Retained writes replay the original outcome, usage, and finalize flag.
-        Expired requests close as cancelled through their active attempt, or request row
-        if none exists. This covers broken wire contracts and data-plane crashes short
-        of process death. Repeated attempt-write failures latch accounting unhealthy.
-        """
-        self.request_settlements.retry(_SWEEP_BATCH)
-        now = time.monotonic()
-        with self._lock:
-            retained = [
-                (request_id, entry)
-                for request_id, entry in self._inflight.items()
-                if entry.pending_settlement is not None
-            ][:_SWEEP_BATCH]
-            abandoned = [
-                (request_id, entry)
-                for request_id, entry in self._inflight.items()
-                if entry.pending_settlement is None
-                and (
-                    entry.pending_abandon is not None
-                    or entry.deadline_monotonic + _SWEEP_GRACE_SECONDS < now
-                )
-            ][:_SWEEP_BATCH]
-        for request_id, entry in retained:
-            settlement = entry.pending_settlement
-            if settlement is None:
-                continue
-            terminal, failure = settled_terminal(settlement, entry, loads=self._loads)
-            if self._settle_swept(
-                request_id,
-                entry,
-                attempt_id=str(settlement["attempt_id"]),
-                terminal=terminal,
-                failure=failure,
-                finalize=bool(settlement.get("finalize", True)),
-                settlement=settlement,
-            ):
-                with self._lock:
-                    entry.pending_settlement = None
-                    self._sweep_retained_replayed += 1
-        for request_id, entry in abandoned:
-            try:
-                self.abandon(json.dumps({"request_id": request_id}))
-            except NativeBridgeError:
-                self._accounting_healthy = False
-                continue
-            with self._lock:
-                if self._inflight.get(request_id) is not entry:
-                    self._sweep_abandoned_cancelled += 1
+        """Recover a fair bounded selection without running in admission callbacks."""
+        recover_expired(self)
 
     def _settle_swept(
         self,
         request_id: str,
         entry: InflightRequest,
-        *,
-        attempt_id: str,
-        terminal: GatewayEvent,
-        failure: GatewayFailure | None,
-        finalize: bool,
-        settlement: JsonObject | None = None,
+        settlement: JsonObject,
     ) -> bool:
-        """Replay the retained settlement, keeping it for another retry on failure.
-
-        Returns:
-            Whether the swept terminal write reached the ledger.
-        """
-        try:
-            self._finish_attempt(
-                attempt_id=attempt_id,
-                terminal_event=terminal,
-                failure=failure,
-                finalize_request=finalize,
-                **settlement_metadata(
-                    settlement,
-                    self._finish_attempt,
-                    **tier_settlement(entry, attempt_id),
-                ),
-                **web_search_requests_kwarg(
-                    self._finish_attempt, web_search_requests_from_terminal(terminal)
-                ),
-                **tool_search_requests_kwarg(
-                    self._finish_attempt, tool_search_requests_from_terminal(terminal)
-                ),
-            )
-        except Exception:  # noqa: BLE001 - keep the entry; the sweep retries.
-            self._accounting_healthy = False
+        """Replay owned evidence, skipping busy requests and stale sweep selections."""
+        if not entry.execution_lock.acquire(blocking=False):
             return False
-        failure = terminal.failure
-        opened = settlement is not None and settlement.get("opened") is True
-        record_attempt_health(
-            self._health,
-            self._loads,
-            entry,
-            attempt_id,
-            opened=opened,
-            failure=failure,
-            settlement=settlement,
-        )
-        # Cache-priority observations must not depend on which settlement path succeeds.
-        self._record_cache_fraction(entry, attempt_id, terminal)
-        record_session_outcome(
-            self.recovery,
-            self.recovery_host,
-            entry,
-            attempt_id,
-            None if terminal.usage_estimated else terminal.usage,
-            recovery_failure(settlement, failure),
-        )
-        with self._lock:
-            if finalize:
-                discard_guardrails(self._inflight.pop(request_id, None))
-            elif entry.active_attempt_id == attempt_id:
-                entry.active_attempt_id = None
-        return True
+        try:
+            if self.entry(request_id) is not entry or entry.pending_settlement != settlement:
+                return False
+            self._commit_settlement(request_id, entry, settlement)
+            return True
+        except Exception:  # noqa: BLE001 - keep the entry; the sweep retries.
+            return False
+        finally:
+            entry.execution_lock.release()

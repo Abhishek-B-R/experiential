@@ -221,6 +221,7 @@ and takes the same ladder as the billed empty stop. The Messages surface
 applies the same rule after commitment, when every committed event was one it cannot render.
 Provider-internal retry layers are disabled so every
 possible billable dispatch is visible to the gateway ledger.
+See [graceful connection retirement](gateway-failover-rules.md#graceful-connection-retirement) for the health-only HTTP/2 hint.
 
 **Which rung a failover reaches.** A pre-commit failover-eligible failure advances to the first
 claimable rung this request has NOT dispatched yet, in route order, so a rung skipped earlier (shed
@@ -979,10 +980,9 @@ key is rejected with the standard 401 error.
 Source buckets conserve attempt, token, known-cost, unknown-cost, and terminal-state totals but do
 not partition logical request counts. Estimated cost is attribution, not a provider invoice.
 
-The process owns readiness from preflight through bounded drain. New work is rejected after drain
-starts. Admitted tasks, upstream streams, disconnect cleanup, replay ownership, continuation state,
-and final ledger settlement are process-owned and bounded. A stuck cancellation cannot prevent the
-terminal flusher from attempting content-free settlement.
+The process owns readiness from preflight through bounded drain and rejects new work once drain starts.
+It owns and bounds admitted tasks, upstream streams, disconnect cleanup, replay, continuation state,
+and final ledger settlement. Stuck cancellation cannot stop content-free terminal flusher attempts.
 
 ## Certification boundary
 

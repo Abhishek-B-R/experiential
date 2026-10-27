@@ -10,6 +10,7 @@ use axum::response::Response;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::dispatch_capacity::DispatchPermit;
 use crate::encode_responses::ResponsesEnvelope;
 use crate::errors::empty_completion_headers;
 use crate::errors::{Failure, FailureClass, PublicError};
@@ -354,6 +355,29 @@ pub(crate) async fn wire_drift_response(
     error_response(&PublicError::internal())
 }
 
+/// Take one data-plane permit before the body is read (no admission or attempt
+/// guard exists yet), under the same request deadline.
+pub(crate) async fn pre_admission_permit(
+    state: &AppState,
+    deadline: Instant,
+) -> Result<DispatchPermit, PublicError> {
+    let acquire = state.dispatch_capacity.acquire(
+        state.bridge.execution.as_ref(),
+        &state.permits,
+        &state.permit_queue,
+        None,
+    );
+    match tokio::time::timeout_at(deadline.into(), acquire).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(Failure::new(
+            FailureClass::Timeout,
+            "gateway execution queue deadline exceeded",
+        )
+        .public_error()),
+    }
+}
+
 /// Wait for one bounded active-dispatch permit after admission, like the
 /// python executor: protocol and authority errors answer immediately even at
 /// capacity, and a queue-deadline expiry terminalizes the accepted request.
@@ -362,22 +386,28 @@ pub(crate) async fn acquire_permit(
     guard: &mut AttemptGuard,
     deadline: Instant,
     priority_class: Option<u8>,
-) -> Result<tokio::sync::OwnedSemaphorePermit, Box<Response>> {
+) -> Result<crate::dispatch_capacity::DispatchPermit, Box<Response>> {
     let permit_wait_started = Instant::now();
-    let acquire = state.permit_queue.acquire(&state.permits, priority_class);
+    let acquire = state.dispatch_capacity.acquire(
+        guard.bridge.execution.as_ref(),
+        &state.permits,
+        &state.permit_queue,
+        priority_class,
+    );
     match tokio::time::timeout_at(deadline.into(), acquire).await {
         Ok(Ok(permit)) => {
             METRICS.permit_wait_ms.record(permit_wait_started.elapsed());
+            guard.hold_dispatch(permit.clone());
             Ok(permit)
         }
-        Ok(Err(_)) => {
-            guard
-                .abandon(&Failure::new(
-                    FailureClass::Cancelled,
-                    "gateway is draining and is not accepting new requests",
-                ))
-                .await;
-            Err(Box::new(error_response(&PublicError::draining())))
+        Ok(Err(error)) => {
+            let class = match error.code.as_str() {
+                "invalid_key" => FailureClass::Authentication,
+                "gateway_draining" => FailureClass::Cancelled,
+                _ => FailureClass::Internal,
+            };
+            guard.abandon(&Failure::new(class, &error.message)).await;
+            Err(Box::new(error_response(&error)))
         }
         Err(_) => {
             let failure = Failure::new(

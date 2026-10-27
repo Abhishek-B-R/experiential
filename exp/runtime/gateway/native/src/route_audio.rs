@@ -26,6 +26,7 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use crate::dispatch_capacity::DispatchPermit;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
@@ -33,9 +34,8 @@ use axum::response::Response;
 use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use tokio::sync::OwnedSemaphorePermit;
 
-use crate::admission::{new_guard, wire_drift_response};
+use crate::admission::{new_guard, pre_admission_permit, wire_drift_response};
 use crate::audio_upload::{measure_upload, read_upload, AudioUpload};
 use crate::dialects::{Dialect, MAXIMUM_RETAINED_OUTPUT_BYTES, OUTPUT_OVERFLOW_MESSAGE};
 use crate::encode::compact_json;
@@ -208,23 +208,6 @@ pub(crate) async fn transcriptions(
 /// for the short fields, so an oversized body never reaches the bridge.
 const MAXIMUM_SPEECH_BODY_BYTES: usize = 128 * 1024;
 
-/// Take one data-plane permit before the body is read (no admission or attempt
-/// guard exists yet), under the same request deadline.
-async fn pre_admission_permit(
-    state: &AppState,
-    deadline: Instant,
-) -> Result<OwnedSemaphorePermit, PublicError> {
-    match tokio::time::timeout_at(deadline.into(), state.permits.clone().acquire_owned()).await {
-        Ok(Ok(permit)) => Ok(permit),
-        Ok(Err(_)) => Err(PublicError::draining()),
-        Err(_) => Err(Failure::new(
-            FailureClass::Timeout,
-            "gateway execution queue deadline exceeded",
-        )
-        .public_error()),
-    }
-}
-
 fn upload_deadline_error() -> PublicError {
     PublicError::new(
         408,
@@ -245,7 +228,7 @@ async fn serve(
     body_key: &str,
     body_value: Value,
     job: Job<'_>,
-    permit: OwnedSemaphorePermit,
+    permit: DispatchPermit,
 ) -> Response {
     let deadline = started + state.request_timeout;
     if Instant::now() >= deadline {
@@ -279,6 +262,7 @@ async fn serve(
         _ => return wire_drift_response(state, &admission_value, started).await,
     };
     let mut guard = new_guard(state, admission.request_id.clone(), started);
+    guard.hold_dispatch(permit.clone());
     let _permit = permit;
     match run_ladder(state, &admission, raw_key, &mut guard, deadline, &job).await {
         Err(error) => error_response(&error),

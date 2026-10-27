@@ -60,10 +60,18 @@ fn envelope_response(rendered: &str) -> Response {
 /// so a burst of large uploads cannot bypass the plane's memory admission.
 pub(crate) async fn acquire_batch_permit(
     state: &AppState,
-) -> Result<tokio::sync::OwnedSemaphorePermit, PublicError> {
-    match tokio::time::timeout(state.request_timeout, state.permits.clone().acquire_owned()).await {
+    headers: &HeaderMap,
+) -> Result<crate::dispatch_capacity::DispatchPermit, PublicError> {
+    bearer_key(headers)?;
+    let acquire = state.dispatch_capacity.acquire(
+        state.bridge.execution.as_ref(),
+        &state.permits,
+        &state.permit_queue,
+        None,
+    );
+    match tokio::time::timeout(state.request_timeout, acquire).await {
         Ok(Ok(permit)) => Ok(permit),
-        Ok(Err(_)) => Err(PublicError::draining()),
+        Ok(Err(error)) => Err(error),
         Err(_) => Err(PublicError::new(
             429,
             "unavailable_route",
@@ -102,7 +110,7 @@ pub(crate) async fn batches_create(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let _permit = match acquire_batch_permit(&state).await {
+    let _permit = match acquire_batch_permit(&state, &headers).await {
         Ok(permit) => permit,
         Err(error) => return error_response(&error),
     };
@@ -148,7 +156,7 @@ pub(crate) async fn batches_list(
     headers: HeaderMap,
     Query(query): Query<BatchListQuery>,
 ) -> Response {
-    let _permit = match acquire_batch_permit(&state).await {
+    let _permit = match acquire_batch_permit(&state, &headers).await {
         Ok(permit) => permit,
         Err(error) => return error_response(&error),
     };
@@ -171,7 +179,7 @@ pub(crate) async fn batches_retrieve(
     headers: HeaderMap,
     Path(batch_id): Path<String>,
 ) -> Response {
-    let _permit = match acquire_batch_permit(&state).await {
+    let _permit = match acquire_batch_permit(&state, &headers).await {
         Ok(permit) => permit,
         Err(error) => return error_response(&error),
     };
@@ -189,7 +197,7 @@ pub(crate) async fn batches_cancel(
     headers: HeaderMap,
     Path(batch_id): Path<String>,
 ) -> Response {
-    let _permit = match acquire_batch_permit(&state).await {
+    let _permit = match acquire_batch_permit(&state, &headers).await {
         Ok(permit) => permit,
         Err(error) => return error_response(&error),
     };
@@ -223,7 +231,7 @@ pub(crate) async fn files_create(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Response {
-    let _permit = match acquire_batch_permit(&state).await {
+    let _permit = match acquire_batch_permit(&state, &headers).await {
         Ok(permit) => permit,
         Err(error) => return error_response(&error),
     };
@@ -289,7 +297,7 @@ pub(crate) async fn files_retrieve(
     headers: HeaderMap,
     Path(file_id): Path<String>,
 ) -> Response {
-    let _permit = match acquire_batch_permit(&state).await {
+    let _permit = match acquire_batch_permit(&state, &headers).await {
         Ok(permit) => permit,
         Err(error) => return error_response(&error),
     };
@@ -307,7 +315,7 @@ pub(crate) async fn files_content(
     headers: HeaderMap,
     Path(file_id): Path<String>,
 ) -> Response {
-    let _permit = match acquire_batch_permit(&state).await {
+    let _permit = match acquire_batch_permit(&state, &headers).await {
         Ok(permit) => permit,
         Err(error) => return error_response(&error),
     };

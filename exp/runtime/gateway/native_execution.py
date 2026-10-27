@@ -151,13 +151,17 @@ class InflightRequest:
             empty; untiered and customer-managed attempts have no entry.
         recovery_observed_at: First validated terminal receipt epoch per reserved attempt;
             retries never renew cache residency or failure cooldowns.
-        recovery_observation_lock: Serializes recovery observation timestamps and effects
+        recovery_observation_lock: Serializes recovery timestamps, effects and frozen estimates
             for this request only, never held across ledger I/O or host callbacks.
         estimated_cache_fractions: First cached-fraction sample used to price each attempt's
             disconnect estimate; retained retries reuse it without creating observed warmth.
-        execution_lock: Serializes reservation, abandonment and estimated-fraction retention
-            for this request only; fraction reads and tokenization run outside it.
+        execution_lock: Serializes reservation, settlement and abandonment for this request
+            only, so cleanup cannot replace an observed meter while it is being committed.
         pending_abandon: Terminal failure retained while a reservation is in flight.
+        abandon_write_failed: Whether abandonment attempted durable cleanup and failed;
+            waiting for an active execution alone is not an accounting failure.
+        settlement_write_failed: Whether the retained terminal write needs recovery;
+            an observed meter waiting for its first commit does not fence admission.
         ordinary_attempt_counts: Per-route failure-retry counts, initialized from physical
             counts; semantic tool turns and reasoning-repair successors do not increment them.
         attempt_policy: Effective caller bounds, defaulting to the operator's retry mechanics.
@@ -195,11 +199,13 @@ class InflightRequest:
     attempt_depths: dict[str, int] = field(default_factory=dict)
     attempt_service_tiers: dict[str, GatewayServiceTierAdmission] = field(default_factory=dict)
     estimated_cache_fractions: dict[str, float] = field(default_factory=dict)
-    # The exact settlement the data plane could not land; the sweep replays it
-    # verbatim so a completed outcome and its usage are never downgraded.
+    # Retain the first observed settlement before waiting for the execution gate.
+    # The sweep replays it verbatim if delivery fails.
     pending_settlement: JsonObject | None = None
+    settlement_write_failed: bool = False
     execution_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     pending_abandon: GatewayFailure | None = None
+    abandon_write_failed: bool = False
     # Responses-only retention facts consumed by ``remember`` after a
     # successful terminal; chat attempts carry ``None``.
     continuation: ContinuationContext | None = None

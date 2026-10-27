@@ -177,9 +177,8 @@ class NativeControlPlane(
 ):
     """Authority and accounting callbacks for the native data plane.
 
-    Rust worker threads share the group-commit writer and the locked in-flight
-    registry. Opportunistic sweeps bound abandoned reservations to the request
-    deadline plus the sweep grace.
+    Rust worker threads share the writer and in-flight registry. Background
+    recovery bounds abandoned reservations to their deadline plus sweep grace.
     """
 
     def __init__(
@@ -201,6 +200,7 @@ class NativeControlPlane(
         default_lane_bound: int | None = None,
         explicit_cache: ExplicitCacheHost | None = None,
         automatic_cache: AutomaticCacheHost | None = None,
+        background_recovery: bool = True,
     ) -> None:
         """Bind loaded gateway components for serving.
 
@@ -227,18 +227,21 @@ class NativeControlPlane(
                 No client markers are required; content never enters host callbacks.
             explicit_cache: Durable host policy and resource accounting for marked Google
                 prefixes. None disables explicit cache operations; generation is unchanged.
+            background_recovery: Own a periodic recovery thread by default. False
+                lets a host schedule serialized recover_accounting calls, including
+                after native execution stops until accounting_drained is true.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
+        self._background_recovery = background_recovery
         validate_guardrail_engine(guardrails)
         self._automatic_cache = automatic_cache
         self._explicit_cache = validate_cache_hosts(explicit_cache, automatic_cache)
         self._capture = capture
         # Optional batch lane; without it every batch route answers not-enabled.
         self._batches = getattr(components, "batches", None)
-        # Hosted compositions have no local group-commit writer; they settle
-        # directly through their own synchronous ledger.
+        # Hosted compositions settle directly through their synchronous ledger.
         group_writer = getattr(components, "write_ledger", None)
         self._write_ledger: SyncWriteLedger = (
             SyncGroupCommitLedger(group_writer) if group_writer is not None else components.ledger
@@ -258,6 +261,9 @@ class NativeControlPlane(
         self._guardrail_detectors = deterministic.compile_native_detectors(
             {} if guardrails is None else guardrails.deterministic_specifications
         )
+        # Finish fallible initialization before background workers can retain the ledger.
+        reservation_encoder()
+        self._bind_videos(start_poller=False)
         # Shared accounting owns reservations, health, recovery and deadline cleanup.
         self._accounting = NativeAttemptAccounting(
             self._write_ledger,
@@ -265,32 +271,20 @@ class NativeControlPlane(
             cache_sample_gate=cache_sample_gate,
             recovery_host=recovery_host,
             default_lane_bound=default_lane_bound,
+            background_recovery=background_recovery,
         )
-        self._bind_videos()  # the optional /v1/videos engine and its settlement poller
-        # Every reservation tokenizes its prompt; build the packaged BPE now so
-        # a fresh process pays that once at bind time, never on its first
-        # request, and a corrupt table fails startup with its own message.
-        reservation_encoder()
+        try:
+            if self._videos is not None:
+                self._videos.start_poller()
+        except BaseException:
+            # No request can yet enter, so this registry has no retained writes.
+            self._accounting.close()
+            raise
 
     @property
     def guardrail_detectors(self) -> dict[str, deterministic.NativeDetector]:
         """Return the compiled deterministic rules the data plane enforces."""
         return dict(self._guardrail_detectors)
-
-    @property
-    def request_timeout_seconds(self) -> float:
-        """Return the per-request budget shared with the data plane."""
-        return self._request_timeout_seconds
-
-    @property
-    def reconciled_expired_requests(self) -> int:
-        """Return crashed requests reconciled at startup."""
-        return self._components.reconciled_expired_requests
-
-    @property
-    def reconciled_unknown_attempts(self) -> int:
-        """Return crashed attempts reconciled at startup."""
-        return self._components.reconciled_unknown_attempts
 
     def admit(self, argument: str) -> str:
         """Decode, authorize, inspect, route, and durably accept one request.
@@ -310,8 +304,6 @@ class NativeControlPlane(
                 capability admission failed.
         """
         assert_not_internal_classification()
-        self._accounting.sweep_expired()
-        self._accounting.request_settlements.require_clear()
         data = json.loads(argument)
         surface = str(data.get("surface", "chat"))
         decoded = self._decode_body(
@@ -335,6 +327,7 @@ class NativeControlPlane(
             )
             authorization = authorize_serving_model_chains(self._components, authorization)
             authorization = with_client_identity(authorization, data)  # reporting-only app facts
+            self._accounting.require_clear()
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             mapped = _authority_error(exc)
             pointer = self._batch_pointer_error(alias=decoded.alias, mapped=mapped)

@@ -49,7 +49,7 @@ use crate::waterfall::{
 
 /// Anthropic-enveloped variant of `error_response` for the Messages surface,
 /// mirroring `anthropic_error_response` in the python engine.
-fn messages_error_response(error: &PublicError) -> Response {
+pub(crate) fn messages_error_response(error: &PublicError) -> Response {
     let mut builder = Response::builder()
         .status(
             StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -66,7 +66,7 @@ fn messages_error_response(error: &PublicError) -> Response {
 /// Anthropic callers present `x-api-key` (their SDK default) or a standard
 /// Bearer header; both carry the same virtual key, mirroring the python
 /// engine's `presented_api_key`.
-fn messages_api_key(headers: &HeaderMap) -> Result<String, PublicError> {
+pub(crate) fn messages_api_key(headers: &HeaderMap) -> Result<String, PublicError> {
     if let Some(value) = headers
         .get("x-api-key")
         .and_then(|value| value.to_str().ok())
@@ -542,7 +542,7 @@ async fn completed_messages(
     mut guard: AttemptGuard,
     mut committed: CommittedAttempt,
     deadline: Instant,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: crate::dispatch_capacity::DispatchPermit,
 ) -> Response {
     let _permit = permit;
     let phase_timeout = admission.phase_timeout(committed.depth);
@@ -586,7 +586,7 @@ async fn guarded_messages(
     mut guard: AttemptGuard,
     mut committed: CommittedAttempt,
     deadline: Instant,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: crate::dispatch_capacity::DispatchPermit,
 ) -> Response {
     let _permit = permit;
     let phase_timeout = admission.phase_timeout(committed.depth);
@@ -646,7 +646,7 @@ async fn stream_messages(
     guard: AttemptGuard,
     committed: CommittedAttempt,
     deadline: Instant,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: crate::dispatch_capacity::DispatchPermit,
     incremental_guardrail: bool,
 ) -> Response {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);

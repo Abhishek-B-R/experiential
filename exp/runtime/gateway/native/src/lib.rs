@@ -14,6 +14,7 @@ mod bridge;
 mod capture;
 mod codex_native_inversion;
 mod dialects;
+mod dispatch_capacity;
 mod encode;
 mod encode_messages;
 mod encode_responses;
@@ -21,6 +22,8 @@ mod error_envelope;
 mod errors;
 mod events;
 mod eventstream;
+mod execution_binding;
+mod execution_context;
 mod first_token_bound;
 mod guardrails;
 mod image_output;
@@ -164,7 +167,7 @@ impl RegexDetector {
     }
 }
 
-/// Collect the adapter-keyed detectors handed to `serve`.
+/// Snapshot the adapter-keyed detectors supplied by one execution owner.
 fn collect_detectors(detectors: Option<&Bound<'_, PyDict>>) -> PyResult<DetectorMap> {
     let mut compiled: DetectorMap = HashMap::new();
     let Some(mapping) = detectors else {
@@ -206,7 +209,9 @@ fn shutdown_handle() -> ShutdownHandle {
 /// `RegexDetector`, so an admission whose output chain is deterministic runs
 /// entirely in the data plane instead of calling `enforce_output`.
 #[pyfunction]
-#[pyo3(signature = (control_plane, config_json, shutdown=None, on_listening=None, guardrail_detectors=None, capture=None))]
+#[pyo3(signature = (control_plane, config_json, shutdown=None, on_listening=None, guardrail_detectors=None, capture=None, execution_bindings=None))]
+// Keep the public Python positional ABI; Python is an implicit eighth argument.
+#[allow(clippy::too_many_arguments)]
 fn serve(
     py: Python<'_>,
     control_plane: Py<PyAny>,
@@ -215,6 +220,7 @@ fn serve(
     on_listening: Option<Py<PyAny>>,
     guardrail_detectors: Option<&Bound<'_, PyDict>>,
     capture: Option<&capture::python::CaptureCollector>,
+    execution_bindings: Option<&execution_binding::ExecutionBindings>,
 ) -> PyResult<()> {
     let config: ServeConfig = serde_json::from_str(config_json)
         .map_err(|error| PyValueError::new_err(format!("invalid serve config: {error}")))?;
@@ -223,6 +229,7 @@ fn serve(
     let bridge = Arc::new(
         Bridge::new(control_plane, config.callback_permits).map_err(PyRuntimeError::new_err)?,
     );
+    let execution_bindings = execution_bindings.cloned();
     let stop = shutdown.and_then(ShutdownHandle::take_receiver);
     let capture = capture.map(|collector| collector.inner.clone());
     let outcome = py.detach(move || {
@@ -237,6 +244,7 @@ fn serve(
             on_listening,
             detectors,
             capture,
+            execution_bindings,
         ))
     });
     outcome.map_err(PyRuntimeError::new_err)
@@ -686,6 +694,8 @@ const MODEL_STAGE_CONTRACT_VERSION: u32 = 1;
 #[pymodule]
 fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ShutdownHandle>()?;
+    module.add_class::<execution_binding::ExecutionHandle>()?;
+    module.add_class::<execution_binding::ExecutionBindings>()?;
     module.add_class::<RegexDetector>()?;
     module.add_class::<capture::python::CaptureCollector>()?;
     module.add_class::<capture::python::CaptureResponse>()?;
@@ -707,6 +717,23 @@ fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod module_tests {
     use super::*;
+
+    #[test]
+    fn pinned_digest_buffer_keeps_cursor_valid_after_compression_panic() {
+        use sha2::digest::{block_buffer::EagerBuffer, consts::U4};
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        // GHSA-qwgh-2vcv-g2f7 requires an inline position byte. Our pinned
+        // implementation keeps its position separate from the input buffer.
+        let mut buffer = EagerBuffer::<U4>::new(&[1, 2]);
+        let failure = catch_unwind(AssertUnwindSafe(|| {
+            buffer.digest_blocks(&[3, 0xff], |_| panic!("compression failure"));
+        }));
+        assert!(failure.is_err());
+        assert_eq!(buffer.get_pos(), 2);
+        buffer.digest_blocks(&[4, 5], |_| {});
+        assert_eq!(buffer.get_pos(), 0);
+    }
 
     #[test]
     fn exports_compiled_model_stage_contract() {

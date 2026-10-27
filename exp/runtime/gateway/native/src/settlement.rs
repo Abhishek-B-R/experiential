@@ -170,6 +170,10 @@ fn settle_argument(
         // retention-free upstream answered.
         "upstream_provider": upstream_provider,
     });
+    if !opened && failure.is_some_and(|failure| failure.graceful_transport_retirement) {
+        // Health hints cannot certify zero usage or release an unknown hold.
+        argument["graceful_transport_retirement"] = json!(true);
+    }
     // The gateway's own pre-dispatch web searches, a request-level cost the
     // control plane bills once: only the settlement that closes the request
     // carries the count, so a failed rung's non-finalizing settlement can
@@ -282,6 +286,7 @@ pub struct AttemptGuard {
     /// finalizing settlement.
     tool_search_requests: u32,
     observation: Observation,
+    dispatch: Option<crate::dispatch_capacity::DispatchPermit>,
 }
 
 /// Holds one unit of the shutdown drain counter for a detached stream task,
@@ -303,6 +308,10 @@ impl Drop for SettlementTask {
 }
 
 impl AttemptGuard {
+    /// Keep active execution capacity through final accounting, including detached cleanup.
+    pub(crate) fn hold_dispatch(&mut self, permit: crate::dispatch_capacity::DispatchPermit) {
+        self.dispatch = Some(permit);
+    }
     /// Count the owning detached task against graceful-shutdown draining.
     pub fn hold_task(&self) -> SettlementTask {
         SettlementTask::hold(self.pending.clone())
@@ -334,6 +343,7 @@ impl AttemptGuard {
             web_search: WebSearchMeter::default(),
             tool_search_requests: 0,
             observation: Observation::default(),
+            dispatch: None,
         }
     }
 
@@ -798,9 +808,11 @@ impl Drop for AttemptGuard {
             return;
         };
         let bridge = self.bridge.clone();
+        let dispatch = self.dispatch.take();
         let pending = self.pending.clone();
         pending.fetch_add(1, Ordering::SeqCst);
         handle.spawn(async move {
+            let _dispatch = dispatch;
             deliver(&bridge, method, argument).await;
             pending.fetch_sub(1, Ordering::SeqCst);
         });

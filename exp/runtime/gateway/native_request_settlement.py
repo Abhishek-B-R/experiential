@@ -7,9 +7,12 @@ from dataclasses import dataclass, field
 from inspect import signature
 
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayFailure
-from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
+from exp.runtime.gateway.native_accounting_errors import (
+    NativeBridgeError,
+    accounting_recovering_error,
+)
+from exp.runtime.gateway.native_accounting_recovery import RecoveryRotation
 from exp.runtime.gateway.native_components import SyncWriteLedger
-from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 
 @dataclass
@@ -22,6 +25,7 @@ class _Settlement:
         certify_no_effects: Whether accounting can certify no paid work occurred.
         web_search_requests: Completed search count to persist with the request.
         retained: Whether a failed write needs recovery, false initially.
+        committed: Durable result shared by concurrent callers, initially unknown.
         lock: Per-request lock serializing terminal writes and recovery attempts.
     """
 
@@ -30,6 +34,7 @@ class _Settlement:
     certify_no_effects: bool
     web_search_requests: int
     retained: bool = False
+    committed: bool | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -50,6 +55,7 @@ class RequestSettlements:
         self._ledger = ledger
         self._pending: dict[str, _Settlement] = {}
         self._lock = threading.Lock()
+        self._recovery = RecoveryRotation[_Settlement](lambda item: item.authorization.request_id)
 
     @property
     def pending(self) -> bool:
@@ -57,16 +63,16 @@ class RequestSettlements:
         with self._lock:
             return any(settlement.retained for settlement in self._pending.values())
 
+    @property
+    def outstanding(self) -> bool:
+        """Whether any terminal write still owns the transport, including its first commit."""
+        with self._lock:
+            return bool(self._pending)
+
     def require_clear(self) -> None:
-        """Refuse new paid admission work while a previous request's meter is uncommitted."""
+        """Refuse new paid work while this registry retains a failed meter write."""
         if self.pending:
-            raise NativeBridgeError(
-                OpenAIProtocolError(
-                    status_code=503,
-                    code="accounting_unavailable",
-                    message="Request accounting is recovering. Retry later.",
-                )
-            )
+            raise NativeBridgeError(accounting_recovering_error())
 
     def finish(
         self,
@@ -92,6 +98,8 @@ class RequestSettlements:
     def _commit(self, settlement: _Settlement) -> bool:
         """Serialize duplicate finish/sweep writers without blocking other requests."""
         with settlement.lock:
+            if settlement.committed is not None:
+                return settlement.committed
             try:
                 committed = self._ledger.finish_request(
                     authorization=settlement.authorization,
@@ -103,15 +111,18 @@ class RequestSettlements:
                 with self._lock:
                     settlement.retained = True
                 raise
+            settlement.committed = committed is True
             with self._lock:
                 if self._pending.get(settlement.authorization.request_id) is settlement:
                     del self._pending[settlement.authorization.request_id]
-            return committed is True
+            return settlement.committed
 
     def retry(self, limit: int) -> None:
         """Replay bounded retained writes verbatim; a repeated failure keeps its owner."""
         with self._lock:
-            pending = [item for item in self._pending.values() if item.retained][:limit]
+            pending = self._recovery.select(
+                [item for item in self._pending.values() if item.retained], limit
+            )
         for settlement in pending:
             try:
                 self._commit(settlement)

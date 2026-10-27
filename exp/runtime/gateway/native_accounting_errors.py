@@ -44,6 +44,8 @@ def authority_error(exception: Exception) -> NativeBridgeError:
     Returns:
         A boundary error carrying the matching public OpenAI error.
     """
+    if isinstance(exception, NativeBridgeError):
+        return exception
     return NativeBridgeError(boundary_protocol_error(exception))
 
 
@@ -54,4 +56,13 @@ def internal_protocol_error() -> OpenAIProtocolError:
         code="internal_error",
         message="The gateway request failed.",
         error_type="api_error",
+    )
+
+
+def accounting_recovering_error() -> OpenAIProtocolError:
+    """Return a retryable refusal while this control plane recovers accounting."""
+    return OpenAIProtocolError(
+        status_code=503,
+        code="accounting_unavailable",
+        message="Request accounting is recovering. Retry later.",
     )

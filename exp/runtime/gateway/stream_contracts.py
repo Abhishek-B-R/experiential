@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import Field, TypeAdapter, model_validator
+from pydantic import Field, PrivateAttr, TypeAdapter, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.common.models.catalog_prices import MAXIMUM_UNIT_VARIANT_CHARACTERS, BilledUnitKind
@@ -238,6 +238,10 @@ class GatewayEvent(ContractModel):
 
     kind: GatewayEventKind
     sequence_number: int = Field(ge=0)
+    _accounting_recovery: bool = PrivateAttr(default=False)
+    _accounting_release_reservation: bool = PrivateAttr(default=False)
+    _attempt_stream_opened: bool | None = PrivateAttr(default=None)
+    _attempt_paid_prework: bool | None = PrivateAttr(default=None)
     text_delta: str | None = None
     reasoning_summary_output_index: int | None = Field(default=None, ge=0)
     reasoning_summary_index: int | None = Field(default=None, ge=0)
@@ -300,6 +304,53 @@ class GatewayEvent(ContractModel):
         Literal["delta", "text_done", "content_part_done", "item_done", "terminal"] | None
     ) = Field(default=None, alias="phase")
     responses_logprobs_records: tuple[JsonObject, ...] | None = Field(default=None, alias="records")
+
+    @property
+    def attempt_stream_opened(self) -> bool | None:
+        """Whether a provider stream opened; this does not classify HTTP error responses."""
+        return self._attempt_stream_opened
+
+    @property
+    def attempt_paid_prework(self) -> bool | None:
+        """Whether the admitted request may have paid prework, independent of its meter."""
+        return self._attempt_paid_prework
+
+    def with_attempt_observation(self, *, stream_opened: bool, paid_prework: bool) -> GatewayEvent:
+        """Attach execution facts privately without deciding a host's billing policy."""
+        event = self.model_copy()
+        event._attempt_stream_opened = stream_opened
+        event._attempt_paid_prework = paid_prework
+        return event
+
+    @property
+    def accounting_recovery(self) -> bool:
+        """Whether trusted local cleanup created this provisional, unmetered terminal."""
+        return self._accounting_recovery
+
+    @property
+    def accounting_release_reservation(self) -> bool:
+        """Whether trusted recovery explicitly waives the customer charge, not provider usage."""
+        return self._accounting_recovery and self._accounting_release_reservation
+
+    @classmethod
+    def for_accounting_recovery(
+        cls, *, failure: GatewayFailure, release_reservation: bool = False
+    ) -> GatewayEvent:
+        """Mark an internal unknown-liability write without accepting provenance from JSON.
+
+        The private attribute is absent from both the serialized event and its
+        input fields. Only recovery callers use this constructor; ordinary
+        provider terminal observations never acquire this capability.
+
+        Args:
+            failure: The locally inferred delivery outcome, without a provider meter.
+            release_reservation: Explicit customer waiver required by the recovery policy.
+                Provider usage stays unknown and a late exact meter cannot revoke the waiver.
+        """
+        event = cls(kind=GatewayEventKind.FAILED, sequence_number=0, failure=failure)
+        event._accounting_recovery = True
+        event._accounting_release_reservation = release_reservation
+        return event
 
     @model_validator(mode="after")
     def _require_event_payload(self) -> GatewayEvent:
