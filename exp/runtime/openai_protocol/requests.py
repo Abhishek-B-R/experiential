@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Collection, Sequence
 from typing import Literal, cast
 
@@ -81,6 +80,7 @@ from exp.runtime.openai_protocol.prompt_cache_key_alias import fold_prompt_cache
 from exp.runtime.openai_protocol.reasoning_replay import (
     ReplayedReasoningTooLong,
     fold_replayed_reasoning,
+    replayed_reasoning_disclosures,
 )
 from exp.runtime.openai_protocol.responses_input import (
     ReplayedFunctionCall,
@@ -102,6 +102,7 @@ from exp.runtime.openai_protocol.structured_text import (
     responses_json_object_output,
     responses_structured_text,
 )
+from exp.runtime.openai_protocol.tool_argument_repairs import replayed_tool_arguments
 from exp.runtime.openai_protocol.tool_call_extra_content import thought_signature
 from exp.runtime.openai_protocol.tool_choice import chat_tool_choice, responses_tool_choice
 from exp.runtime.openai_protocol.tool_search import chat_tool_search, responses_tool_search
@@ -358,7 +359,7 @@ def decode_chat(
                     and request.chat_template_kwargs.preserve_thinking is not None
                     else ()
                 ),
-                *_replayed_reasoning_disclosures(request.messages),
+                *replayed_reasoning_disclosures(request.messages),
             ),
             zdr_requested=request.provider is not None and request.provider.demands_zdr,
             provider_preferences=_provider_preferences(payload, request.provider),
@@ -541,7 +542,7 @@ def decode_responses(
                 *alias_disclosures,
                 *breakpoints.disclosures,
                 *cache_disclosures,
-                *_replayed_reasoning_disclosures(
+                *replayed_reasoning_disclosures(
                     ()
                     if isinstance(request.input, str)
                     else tuple(item for item in request.input if isinstance(item, _ResponseMessage))
@@ -673,8 +674,8 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
     custom_call_ids: set[str] = set()
     for message_index, message in enumerate(messages):
         calls = tuple(
-            _tool_call(call, f"{prefix}.{message_index}.tool_calls.{call_index}.function.arguments")
-            for call_index, call in enumerate(message.history_tool_calls)
+            _tool_call(call)
+            for call in message.history_tool_calls
             if not isinstance(call, ChatCustomToolCall)
         )
         custom_calls = tuple(
@@ -742,6 +743,17 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
             # restoration, which maps wire messages one to one.
             converted.append(chat_custom_call_messages(custom_calls[:1])[0])
             continue
+        if content is None and not calls and not provider_reasoning:
+            # A null or omitted ``content`` (Go clients drop an empty tool
+            # result under ``omitempty``) leaves the message empty. Name the
+            # field here: the canonical message refuses it in its own
+            # validator, which escaped decode as an unclassified 500.
+            param = f"{prefix}.{message_index}.content"
+            raise invalid_field(
+                param,
+                f"Invalid value for '{param}': a {message.role} message needs content. "
+                "Send a string (it may be empty) or an array of content parts.",
+            )
         converted.append(
             GatewayMessage(
                 role=message.role,
@@ -763,43 +775,21 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
     return tuple(converted)
 
 
-def _replayed_reasoning_disclosures(messages: Sequence[_Message]) -> tuple[str, ...]:
-    """Collect the OpenRouter replay disclosures owed across a transcript, once each."""
-    disclosures: list[str] = []
-    for message in messages:
-        try:
-            folded = fold_replayed_reasoning(
-                reasoning_content=message.reasoning_content,
-                reasoning=message.reasoning,
-                reasoning_details=message.reasoning_details,
-            )
-        except ReplayedReasoningTooLong:
-            # ``_messages`` names the field in its own 400 before this runs
-            # on the Chat path; the Responses path folds the same message.
-            continue
-        for disclosure in folded.disclosures:
-            if disclosure not in disclosures:
-                disclosures.append(disclosure)
-    return tuple(disclosures)
+def _tool_call(call: _AssistantToolCall) -> ToolCall:
+    """Parse one replayed call, keeping its exact text; text naming no object gets a stand-in.
 
-
-def _tool_call(call: _AssistantToolCall, param: str) -> ToolCall:
-    """Parse one complete tool call while retaining its exact raw argument string."""
+    Each rung's wire then takes the raw text or the stand-in (``history_tool_arguments``)."""
     # Some SDK stacks echo a zero-argument call as an empty string; the
     # canonical empty object mirrors the streaming completion seed, since no
     # provider wire accepts empty argument bytes.
-    raw_arguments = call.function.arguments or "{}"
-    try:
-        parsed = json.loads(raw_arguments)
-    except json.JSONDecodeError as exc:
-        raise invalid_field(param, f"'{param}' must encode one JSON object.") from exc
-    if not isinstance(parsed, dict):
-        raise invalid_field(param, f"'{param}' must encode one JSON object.")
+    raw_arguments = call.function.arguments if call.function.arguments.strip() else "{}"
+    arguments, treatment = replayed_tool_arguments(raw_arguments)
     return ToolCall(
         call_id=call.id,
         name=call.function.name,
-        arguments=cast(JsonObject, parsed),
+        arguments=arguments,
         raw_arguments=raw_arguments,
+        arguments_treatment=treatment,
         cache_control=(
             call.cache_control.model_dump(mode="json", exclude_none=True)
             if call.cache_control is not None
@@ -951,7 +941,7 @@ def _response_input_messages(
             replayed.append(
                 ReplayedFunctionCall(
                     index=index,
-                    call=_tool_call(wire_call, f"input.{index}.arguments").model_copy(
+                    call=_tool_call(wire_call).model_copy(
                         update={
                             "provider_item_id": item.id,
                             "provider_output_index": index,

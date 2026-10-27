@@ -1327,3 +1327,67 @@ def test_bounded_profile_keeps_reasoning_off_outside_adaptive_claude(
     assert profile.supports_reasoning is False
     assert profile.reasoning_wire_format == "none"
     assert profile.reasoning_effort is None
+
+
+def test_invoke_url_encodes_the_model_like_converse_stream() -> None:
+    """The InvokeModel route shares the ConverseStream model encoding."""
+    client = BedrockClient(
+        model=_snapshot("stability.sd3-5-large-v1:0"),
+        region="us-west-2",
+        environment={},
+        runtime_factory=None,
+    )
+    assert client.invoke_url() == (
+        "https://bedrock-runtime.us-west-2.amazonaws.com/model/stability.sd3-5-large-v1%3A0/invoke"
+    )
+
+
+def test_invoke_dispatch_signs_with_a_json_accept(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An image rung's InvokeModel POST signs a JSON accept, not an event stream."""
+    client = _signing_client(monkeypatch)
+    headers = client.sign_gateway_dispatch(url=client.invoke_url(), body='{"prompt":"x"}')
+    assert headers["accept"] == "application/json"
+    assert "accept;content-type;host;x-amz-date" in headers["Authorization"]
+    stream = client.sign_gateway_dispatch(url=client.converse_stream_url(), body='{"messages":[]}')
+    assert stream["accept"] == "application/vnd.amazon.eventstream"
+
+
+def test_invoke_dispatch_with_a_bearer_accepts_json() -> None:
+    """Bedrock API-key auth on an InvokeModel POST answers JSON."""
+    client = BedrockClient(
+        model=_snapshot("stability.stable-image-core-v1:1"),
+        region="us-west-2",
+        environment={},
+        bearer_token="explicit-bedrock-bearer",
+        runtime_factory=None,
+    )
+    headers = client.sign_gateway_dispatch(url=client.invoke_url(), body="{}")
+    assert headers == {
+        "authorization": "Bearer explicit-bedrock-bearer",
+        "content-type": "application/json",
+        "accept": "application/json",
+    }
+
+
+@pytest.mark.parametrize(
+    ("model_id", "wire"),
+    [
+        ("stability.stable-image-ultra-v1:1", "bedrock_stability"),
+        ("us.stability.stable-image-inpaint-v1:0", "bedrock_stability"),
+        ("us.anthropic.claude-sonnet-4-5", None),
+    ],
+)
+def test_only_a_stability_model_carries_the_images_wire(model_id: str, wire: str | None) -> None:
+    """A Stability model's profile names its InvokeModel URL; other models speak no images wire."""
+    client = BedrockClient(
+        model=_snapshot(model_id), region="us-east-1", environment={}, runtime_factory=None
+    )
+    profile = BoundedBedrockClient(client).gateway_wire_profile()
+    if wire is None:
+        assert profile.images_url is None
+        assert profile.images_wire == "openai"
+    else:
+        assert profile.images_url == client.invoke_url()
+        assert profile.images_wire == wire
+    assert profile.url == client.converse_stream_url()
+    assert profile.signs_request_body
