@@ -9,8 +9,10 @@ Google's implicit cache is not guaranteed. A native request with shared text and
 a different suffix can miss even when an identical repeat hits. This integration
 does not change implicit-cache accounting or claim that every request is eligible.
 
-The planner accepts plain text requests with leading system instructions followed
-by user messages. It considers up to eight whole-message prefixes, leaves the last
+Both endpoint families qualify: Vertex and the official Gemini Developer API
+(AI Studio, `generativelanguage.googleapis.com`, resources under
+`cachedContents/` with no project or location namespace). The planner accepts
+plain text requests with leading system instructions followed by user messages. It considers up to eight whole-message prefixes, leaves the last
 user message untouched, and caps resource bodies at 256 KiB. Explicit caller
 checkpoints, tools, assistant history, media and native carriers are left alone.
 Suffixes and generation controls, including response schemas, stay on generation;
@@ -20,7 +22,10 @@ selected. Small or one-off prompts continue normally without a cache create.
 The host receives only bounded prefix hashes and sizes. It selects a repeated
 candidate under the exact tenant/key/deployment/credential/endpoint scope. Only
 after the selected attempt has started may it durably reserve money and return
-one creator. The native transport measures that prefix with Vertex `countTokens`;
+one creator. The native transport measures that prefix with `countTokens`
+(Vertex takes the system instruction and tools beside `contents`; the Developer
+API takes them inside a `generateContentRequest`, which requires `contents`, so
+a Developer API candidate always caches at least one user message);
 a count failure or a result below the configured minimum records `not_created`
 and retains the original generation. This proves no create HTTP was sent. It is
 distinct from an ambiguous create timeout, which records `unknown` and retains

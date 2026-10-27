@@ -261,7 +261,7 @@ where
                     || !matches!(
                         tokio::time::timeout(
                             preflight_budget,
-                            count_tokens(http, wire, &payload),
+                            count_tokens(http, wire, &endpoint, &payload),
                         ).await,
                         Ok(Some(tokens)) if tokens >= minimum_tokens
                     ));
@@ -570,10 +570,11 @@ fn matching_create_url(expected: &Url, candidate: &str) -> bool {
     candidate == *expected
 }
 
-/// Count the exact Vertex prefix without creating a resource or retaining response content.
+/// Count the exact prefix without creating a resource or retaining response content.
 async fn count_tokens(
     http: &crate::upstream::UpstreamClient,
     wire: &DeploymentWire,
+    endpoint: &CacheEndpoint,
     payload: &Value,
 ) -> Option<u64> {
     let mut url = Url::parse(&wire.url).ok()?;
@@ -591,11 +592,38 @@ async fn count_tokens(
             body.insert(key.to_string(), value.clone());
         }
     }
+    let body = count_tokens_body(endpoint, payload, body)?;
     let response = request.json(&body).send().await.ok()?;
     if !response.status().is_success() {
         return None;
     }
     bounded_json(response).await?.get("totalTokens")?.as_u64()
+}
+
+/// Shape the countTokens body for the endpoint family that serves the prefix.
+///
+/// Vertex accepts the system instruction and tools beside `contents`. The Gemini
+/// Developer API accepts only `contents` or a `generateContentRequest`, which
+/// carries the model, system instruction and tools and requires `contents`; a
+/// prefix it cannot measure returns `None`, which the host reads as no create.
+fn count_tokens_body(
+    endpoint: &CacheEndpoint,
+    payload: &Value,
+    mut body: serde_json::Map<String, Value>,
+) -> Option<Value> {
+    if endpoint.resource_prefix != "cachedContents/" {
+        return Some(Value::Object(body));
+    }
+    let model = payload.get("model")?.as_str()?;
+    if body
+        .get("contents")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty)
+    {
+        return None;
+    }
+    body.insert("model".to_string(), json!(model));
+    Some(json!({ "generateContentRequest": body }))
 }
 
 /// Attach the admitted wire's authenticated headers, minus per-body framing and idempotency.
