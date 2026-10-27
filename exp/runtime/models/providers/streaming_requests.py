@@ -115,6 +115,7 @@ from exp.runtime.models.providers.thinking_budget import (
     thinking_budget_wire_field,
 )
 from exp.runtime.models.providers.tool_references import disclose_client_tool_search
+from exp.runtime.models.providers.tool_turn_order import disclose_tool_turn_text_fold
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
@@ -480,6 +481,7 @@ def route_generation_parameter_requests(
     disclose_client_tool_search(profiles, request, ignored)
 
     disclose_gemini_missing_tool_results(profiles, request.messages, ignored)
+    disclose_tool_turn_text_fold(profiles, request.messages, ignored)
     # Only the Anthropic wire has a tool-result error flag. Every other wire
     # folds the flag into the result text at encoding (a fixed prefix, see
     # ``folded_tool_error_content``) so the model still learns the invocation
