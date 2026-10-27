@@ -45,6 +45,35 @@ caller's `response_format` unchanged. Per-image billing is the same either way. 
 prices (2026-10-18): Grok Imagine Image $0.02, Imagine Image Quality $0.05, Imagine Image 2.0
 $0.04 per image.
 
+An Azure connection (`provider="azure"`, an Azure OpenAI or Foundry resource, `api-key` auth)
+serves image models on three wires chosen by the model family, matched on the lane's exact model
+id or its deployment name (verified against Microsoft Learn 2026-10-23):
+
+- **OpenAI Image API**: `gpt-image-*`, `FLUX-1.1-pro`, `FLUX.1-Kontext-pro`. The deployments path
+  `{resource}/openai/deployments/{deployment}/images/generations?api-version=...` (or the
+  `/openai/v1` root) with the OpenAI body unchanged. A connection on the Foundry model-inference
+  surface (`{resource}/models`), which has no images route, is sent to the deployments path at
+  `api-version=2025-04-01-preview`. Billing follows the lane's card (tokens or per image).
+- **MAI image API**: `MAI-Image-2.5`, `-2.5-Flash`, `-2.5-Pro`, `-2.6`, `-2.6-Flash`.
+  `{resource}/mai/v1/images/generations` with `{model: deployment, prompt, width, height}`; `size`
+  becomes `width`/`height` (each side at least 768 px, at most 1,048,576 pixels on the 2.5 models
+  and 2,359,296 on the 2.6 models) and `auto` or no size leaves the provider default.
+- **BFL provider API**: `FLUX.2-pro`, `FLUX.2-flex`.
+  `{resource}/providers/blackforestlabs/v1/{flux-2-pro|flux-2-flex}?api-version=preview` with
+  `Authorization: Bearer <api key>` and `{model: deployment, prompt, n: 1, width, height,
+  output_format}` (`png` or `jpeg`).
+
+The MAI and BFL wires return one image as `data[0].b64_json` with no token usage, so their rungs
+are admitted only with an `image` unit card (a rung without one is excluded and, alone, answers a
+400 naming the missing per-image price), and the caller always receives `b64_json`. A request
+these wires cannot honour faithfully excludes the rung with a 400 on the field rather than being
+changed: `n` above 1, a `size` outside the model's limits, `output_format: webp`, MAI's
+non-PNG formats, and OpenAI-only `quality`, `style`, `background`, `moderation`, or
+`output_compression`. Retired on Azure and not served: DALL·E 2 and 3 (DALL·E 3 retired
+2026-03-04), Stability AI's Stable Diffusion 3.5 Large, Stable Image Core and Ultra (retired
+2026-07-31), MAI-Image-2 and 2e (retired 2026-08-15), and Sora (`sora-2` 2025-12-08 retired
+2026-10-15, so Azure has no video model).
+
 ## Speech: `POST /v1/audio/speech`
 
 Text in (up to 4,096 characters, the OpenAI speech wire's cap), one audio file out. Served by

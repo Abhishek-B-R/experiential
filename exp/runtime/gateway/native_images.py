@@ -9,8 +9,15 @@ an ``image`` unit card (dall-e, xAI Grok Imagine) reserves ``n`` images at the
 request's ``quality/size`` variant and settles one unit per image returned;
 every other rung bills the provider's reported prompt and image tokens.
 
+An Azure rung dispatches on the wire its model family speaks
+(:mod:`exp.runtime.models.providers.azure_images`): the OpenAI Image API, the
+MAI image API, or the BFL FLUX.2 provider API. The MAI and BFL wires report no
+usage, so their rungs are admitted only with a per-image card, and a request
+they cannot serve faithfully (``n > 1``, an unrenderable size, an OpenAI-only
+control) excludes them rather than being silently changed.
+
 Deliberately absent: image edits and variations (multipart image input),
-streaming partial images, keyed replay, and non-OpenAI wires.
+streaming partial images, keyed replay, and other non-OpenAI-shaped wires.
 """
 
 from __future__ import annotations
@@ -57,6 +64,11 @@ from exp.runtime.gateway.native_execution import (
 from exp.runtime.gateway.native_settlement import gateway_updating_failure
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers import require_gateway_provider
+from exp.runtime.models.providers.azure_images import (
+    AzureImagesUnsupportedError,
+    azure_images_dispatch,
+    azure_images_wire,
+)
 from exp.runtime.models.providers.openai_compatible import openai_images_request
 from exp.runtime.models.providers.xai import is_xai_images_url
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
@@ -98,6 +110,32 @@ def unpriced_variant_error(variant: str) -> OpenAIProtocolError:
         ),
         param="size",
     )
+
+
+def unsupported_request_error(param: str, message: str) -> OpenAIProtocolError:
+    """Build the public 400 for a request no image rung can serve faithfully."""
+    return OpenAIProtocolError(
+        status_code=400, code="unsupported_value", message=message, param=param
+    )
+
+
+def unbillable_wire_error() -> OpenAIProtocolError:
+    """Build the public 400 for an image rung whose wire reports no usage and has no card."""
+    return OpenAIProtocolError(
+        status_code=400,
+        code="unsupported_capability",
+        message=(
+            "This model's provider reports no token usage, and its lane has no per-image "
+            "price, so it cannot be billed. Ask the organization admin to set a per-image price "
+            "on the lane, or choose another image model."
+        ),
+        param="model",
+    )
+
+
+def _azure_usage_free_wire(exact_model_id: str, deployment: str) -> bool:
+    """Whether one Azure rung's wire answers without token usage (MAI, BFL FLUX.2)."""
+    return azure_images_wire(exact_model_id, deployment) != "openai_images"
 
 
 def _per_image(prices: GatewayTokenPrices) -> bool:
@@ -194,24 +232,53 @@ def _admit_accepted(
         )
     serving: list[int] = []
     unpriced = False
+    unbillable = False
+    unsupported: AzureImagesUnsupportedError | None = None
     for index, (profile, _client) in zip(
         dispatchable.indexes, dispatchable.resolved_wires, strict=True
     ):
-        capabilities = route.deployments[index].capabilities
+        deployment = route.deployments[index]
+        capabilities = deployment.capabilities
         supports = None if capabilities is None else capabilities.supports_image_generation
         if not _images_rung(profile.images_url, supports):
             continue
-        prices = route.deployments[index].gateway.prices
+        prices = deployment.gateway.prices
         if _per_image(prices) and per_image_rate(prices, request) is None:
             # A per-image card with no rate for this quality/size could only
             # settle unpriced, so the rung is excluded (fail-closed).
             unpriced = True
             continue
+        if deployment.provider == "azure" and profile.images_url is not None:
+            if _azure_usage_free_wire(deployment.exact_model_id, profile.model_id) and not (
+                _per_image(prices)
+            ):
+                # MAI and BFL answers carry no usage; without a per-image card
+                # the rung could only settle unbilled (fail-closed).
+                unbillable = True
+                continue
+            try:
+                azure_images_dispatch(
+                    images_url=profile.images_url,
+                    headers=dict(profile.headers),
+                    deployment=profile.model_id,
+                    exact_model_id=deployment.exact_model_id,
+                    request=request,
+                    openai_body={},
+                )
+            except AzureImagesUnsupportedError as exc:
+                unsupported = unsupported or exc
+                continue
         serving.append(index)
     if not serving:
         _finish_unsupported(plane, authorization)
+        if unsupported is not None:
+            raise NativeBridgeError(
+                unsupported_request_error(unsupported.param, unsupported.message)
+            )
         if unpriced:
             raise NativeBridgeError(unpriced_variant_error(image_variant(request)))
+        if unbillable:
+            raise NativeBridgeError(unbillable_wire_error())
         raise NativeBridgeError(not_an_image_model_error(authorization.alias))
     served_wires = [
         wire
@@ -226,14 +293,33 @@ def _admit_accepted(
             images_url = profile.images_url
             if images_url is None:  # pragma: no cover - filtered above.
                 raise GatewayRoutingError("images rung lost its wire endpoint")
+            body = openai_images_request(
+                profile.model_id, request, inline_images=is_xai_images_url(images_url)
+            )
+            if deployment.provider == "azure":
+                dispatch = azure_images_dispatch(
+                    images_url=images_url,
+                    headers=dict(profile.headers),
+                    deployment=profile.model_id,
+                    exact_model_id=deployment.exact_model_id,
+                    request=request,
+                    openai_body=body,
+                )
+                wire_route.append(
+                    deployment_wire_entry(
+                        route,
+                        deployment,
+                        replace(profile, url=dispatch.url, headers=dispatch.headers),
+                        dispatch.body,
+                    )
+                )
+                continue
             wire_route.append(
                 deployment_wire_entry(
                     route,
                     deployment,
                     replace(profile, url=images_url),
-                    openai_images_request(
-                        profile.model_id, request, inline_images=is_xai_images_url(images_url)
-                    ),
+                    body,
                 )
             )
     except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
