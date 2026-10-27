@@ -508,8 +508,7 @@ def _admit_accepted(
                 payload = wire.payload
             upstream_body, signer = frozen_dispatch(dispatch_profile, client, payload)
             wire_route.append(
-                deployment_wire_entry(route, deployment, dispatch_profile, payload, upstream_body
-                )
+                deployment_wire_entry(route, deployment, dispatch_profile, payload, upstream_body)
             )
             signers.append(signer)
             bindings.append(
