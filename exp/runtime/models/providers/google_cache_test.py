@@ -748,8 +748,8 @@ def test_automatic_cache_skips_unsupported_shapes(shape: str) -> None:
     assert build_automatic_google_cache_plans(profile, request, _payload(request)) == ()
 
 
-def test_automatic_studio_plans_cache_whole_user_messages_under_the_key_free_collection() -> None:
-    """Gemini Developer API prefixes always carry contents and share across suffixes."""
+def test_automatic_studio_plans_cache_whole_messages_under_the_key_free_collection() -> None:
+    """Gemini Developer API prefixes share across suffixes and restore exactly."""
     profile = _profile()
     first = _request().model_copy(
         update={
@@ -778,8 +778,6 @@ def test_automatic_studio_plans_cache_whole_user_messages_under_the_key_free_col
         assert plan.create_url == "https://generativelanguage.googleapis.com/v1beta/cachedContents"
         assert plan.resource_prefix == "cachedContents/"
         assert plan.model == f"models/{_MODEL}"
-        # countTokens on this API needs contents, so no candidate is system-only.
-        assert plan.create_payload["contents"]
         assert plan.bind_vertex_project(None) is plan
     restored = deepcopy(pa[0].generation_payload)
     resource = pa[0].create_payload
@@ -792,8 +790,8 @@ def test_automatic_studio_plans_cache_whole_user_messages_under_the_key_free_col
     assert pa[0].apply("cachedContents/shared")["cachedContent"] == "cachedContents/shared"
 
 
-def test_automatic_studio_plans_skip_a_lone_system_prefix() -> None:
-    """A system prompt followed by one user message leaves nothing measurable to cache."""
+def test_automatic_studio_plans_offer_a_lone_system_prefix() -> None:
+    """A shared system prompt alone is the most reused Developer API prefix."""
     request = _request().model_copy(
         update={
             "messages": (
@@ -802,8 +800,11 @@ def test_automatic_studio_plans_skip_a_lone_system_prefix() -> None:
             )
         }
     )
-    assert build_automatic_google_cache_plans(_profile(), request, _payload(request)) == ()
-    assert build_automatic_google_cache_plans(_vertex_profile(), request, _payload(request))
+    (plan,) = build_automatic_google_cache_plans(_profile(), request, _payload(request))
+    assert plan.resource_prefix == "cachedContents/"
+    assert "contents" not in plan.create_payload
+    assert plan.create_payload["systemInstruction"] == _payload(request)["systemInstruction"]
+    assert plan.generation_payload["contents"] == _payload(request)["contents"]
 
 
 def _vertex_profile() -> GatewayWireProfile:

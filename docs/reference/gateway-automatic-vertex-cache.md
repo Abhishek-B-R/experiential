@@ -25,7 +25,8 @@ after the selected attempt has started may it durably reserve money and return
 one creator. The native transport measures that prefix with `countTokens`
 (Vertex takes the system instruction and tools beside `contents`; the Developer
 API takes them inside a `generateContentRequest`, which requires `contents`, so
-a Developer API candidate always caches at least one user message);
+a system-only prefix is counted with a one-character user turn and overcounts by
+that turn's few tokens);
 a count failure or a result below the configured minimum records `not_created`
 and retains the original generation. This proves no create HTTP was sent. It is
 distinct from an ambiguous create timeout, which records `unknown` and retains

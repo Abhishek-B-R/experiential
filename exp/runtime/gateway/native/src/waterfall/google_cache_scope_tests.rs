@@ -257,7 +257,41 @@ async fn automatic_studio_preflight_counts_a_generate_content_request() {
 }
 
 #[tokio::test]
-async fn automatic_studio_preflight_never_counts_a_prefix_without_contents() {
+async fn automatic_studio_preflight_counts_a_system_only_prefix_with_a_minimal_turn() {
+    let expires = expiry();
+    let (base, task) = server(vec![answer(200, &json!({"totalTokens": 100}).to_string())]).await;
+    let mut original = wire(&format!(
+        "{base}/v1beta/models/gemini-test:streamGenerateContent?alt=sse"
+    ));
+    original.automatic_cache = true;
+    let mut create = claim(&format!("{base}/v1beta/cachedContents"), &expires);
+    create["measure_tokens"] = json!(true);
+    create["minimum_tokens"] = json!(1024);
+    create["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("contents");
+    create["payload"]["systemInstruction"] = json!({"parts": [{"text": "system"}]});
+    let host = Host::new(vec![create, json!({"state":"unavailable"})]);
+    let result = execute_test(&original, &host, EndpointPolicy::Loopback)
+        .await
+        .unwrap();
+    assert!(result.is_none());
+    assert_eq!(host.calls()[1].1["outcome"], "not_created");
+    let requests = task.await.unwrap();
+    let body: Value = serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        body,
+        json!({"generateContentRequest": {
+            "model": "models/gemini-test",
+            "systemInstruction": {"parts": [{"text": "system"}]},
+            "contents": [{"role": "user", "parts": [{"text": "."}]}],
+        }})
+    );
+}
+
+#[tokio::test]
+async fn automatic_studio_preflight_never_counts_an_empty_prefix() {
     let expires = expiry();
     let (base, task) = server(vec![]).await;
     let mut original = wire(&format!(
@@ -266,9 +300,8 @@ async fn automatic_studio_preflight_never_counts_a_prefix_without_contents() {
     original.automatic_cache = true;
     let mut create = claim(&format!("{base}/v1beta/cachedContents"), &expires);
     create["measure_tokens"] = json!(true);
-    create["minimum_tokens"] = json!(4096);
+    create["minimum_tokens"] = json!(1024);
     create["payload"]["contents"] = json!([]);
-    create["payload"]["systemInstruction"] = json!({"parts": [{"text": "system"}]});
     let host = Host::new(vec![create, json!({"state":"unavailable"})]);
     let result = execute_test(&original, &host, EndpointPolicy::Loopback)
         .await

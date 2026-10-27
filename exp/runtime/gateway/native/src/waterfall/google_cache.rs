@@ -604,8 +604,11 @@ async fn count_tokens(
 ///
 /// Vertex accepts the system instruction and tools beside `contents`. The Gemini
 /// Developer API accepts only `contents` or a `generateContentRequest`, which
-/// carries the model, system instruction and tools and requires `contents`; a
-/// prefix it cannot measure returns `None`, which the host reads as no create.
+/// carries the model, system instruction and tools and requires `contents`. A
+/// system-only prefix (the most shared one) is therefore counted with a
+/// one-character user turn, which overcounts by that turn's few tokens: near
+/// the minimum a create can still be refused, which records `unknown` and
+/// keeps only its host hold, never a provider charge.
 fn count_tokens_body(
     endpoint: &CacheEndpoint,
     payload: &Value,
@@ -620,7 +623,13 @@ fn count_tokens_body(
         .and_then(Value::as_array)
         .is_none_or(Vec::is_empty)
     {
-        return None;
+        if !body.contains_key("systemInstruction") {
+            return None;
+        }
+        body.insert(
+            "contents".to_string(),
+            json!([{"role": "user", "parts": [{"text": "."}]}]),
+        );
     }
     body.insert("model".to_string(), json!(model));
     Some(json!({ "generateContentRequest": body }))

@@ -281,13 +281,9 @@ def build_automatic_google_cache_plans(
 
     Vertex and official Gemini Developer API (AI Studio) endpoints qualify.
     Only leading plain system/user text messages qualify, with at least one
-    original user message left uncached. A Gemini Developer API candidate
-    always carries at least one user message: its countTokens preflight
-    accepts the prefix only as a ``generateContentRequest``, which requires
-    ``contents``, so a system-only prefix could never be measured there. Plain
-    function definitions and their calling policy move into every candidate
-    resource (Google serves them from the cache and forbids repeating them on
-    the generation), so the digest covers
+    original user message left uncached. Plain function definitions and their
+    calling policy move into every candidate resource (Google serves them from
+    the cache and forbids repeating them on the generation), so the digest covers
     the toolset and different toolsets never share a cache. History, media,
     provider-native or server tools and native carriers retain ordinary
     generation. Caller cache hints on text (block or top-level
@@ -328,7 +324,7 @@ def build_automatic_google_cache_plans(
             return ()
         started = started or message.role == "user"
     system_count = sum(m.role == "system" for m in request.messages)
-    first = system_count if endpoint[2] == "cachedContents/" else max(0, system_count - 1)
+    first = max(0, system_count - 1)
     plans: list[GoogleCachePlan] = []
     # Cached text alone lower-bounds each resource body, so stop before copying
     # the whole payload for prefixes that cannot fit the byte ceiling.
