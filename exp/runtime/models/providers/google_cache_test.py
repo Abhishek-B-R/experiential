@@ -714,7 +714,7 @@ def test_jurisdictional_endpoint_requires_exact_host_and_location(location: str)
         assert build_google_cache_plan(_profile(invalid), _request(), _payload(_request())) is None
 
 
-@pytest.mark.parametrize("shape", ["history", "single", "oversized", "gemini"])
+@pytest.mark.parametrize("shape", ["history", "single", "oversized"])
 def test_automatic_cache_skips_unsupported_shapes(shape: str) -> None:
     """Automatic selection never invents message boundaries or caches history."""
 
@@ -745,9 +745,66 @@ def test_automatic_cache_skips_unsupported_shapes(shape: str) -> None:
                 )
             }
         )
-    elif shape == "gemini":
-        profile = _profile()
     assert build_automatic_google_cache_plans(profile, request, _payload(request)) == ()
+
+
+def test_automatic_studio_plans_cache_whole_messages_under_the_key_free_collection() -> None:
+    """Gemini Developer API prefixes share across suffixes and restore exactly."""
+    profile = _profile()
+    first = _request().model_copy(
+        update={
+            "messages": (
+                GatewayMessage(role="system", content="Follow the fictional inventory."),
+                GatewayMessage(role="user", content="Apple inventory: 42.\n" * 1024),
+                GatewayMessage(role="user", content="Batch 1"),
+                GatewayMessage(role="user", content="Return the count."),
+            )
+        }
+    )
+    second = first.model_copy(
+        update={
+            "messages": (
+                *first.messages[:2],
+                GatewayMessage(role="user", content="Batch 2"),
+                GatewayMessage(role="user", content="Return the count."),
+            )
+        }
+    )
+    a, b = _payload(first), _payload(second)
+    pa = build_automatic_google_cache_plans(profile, first, a)
+    pb = build_automatic_google_cache_plans(profile, second, b)
+    assert pa and pb and pa[0].prefix_sha256 == pb[0].prefix_sha256
+    for plan in pa:
+        assert plan.create_url == "https://generativelanguage.googleapis.com/v1beta/cachedContents"
+        assert plan.resource_prefix == "cachedContents/"
+        assert plan.model == f"models/{_MODEL}"
+        assert plan.bind_vertex_project(None) is plan
+    restored = deepcopy(pa[0].generation_payload)
+    resource = pa[0].create_payload
+    assert "systemInstruction" not in restored and "generationConfig" not in resource
+    restored["systemInstruction"] = resource["systemInstruction"]
+    restored["contents"] = cast("list[JsonValue]", resource["contents"]) + cast(
+        "list[JsonValue]", restored["contents"]
+    )
+    assert restored == a
+    assert pa[0].apply("cachedContents/shared")["cachedContent"] == "cachedContents/shared"
+
+
+def test_automatic_studio_plans_offer_a_lone_system_prefix() -> None:
+    """A shared system prompt alone is the most reused Developer API prefix."""
+    request = _request().model_copy(
+        update={
+            "messages": (
+                GatewayMessage(role="system", content="Fruit rules. " * 1024),
+                GatewayMessage(role="user", content="Count fruit."),
+            )
+        }
+    )
+    (plan,) = build_automatic_google_cache_plans(_profile(), request, _payload(request))
+    assert plan.resource_prefix == "cachedContents/"
+    assert "contents" not in plan.create_payload
+    assert plan.create_payload["systemInstruction"] == _payload(request)["systemInstruction"]
+    assert plan.generation_payload["contents"] == _payload(request)["contents"]
 
 
 def _vertex_profile() -> GatewayWireProfile:
