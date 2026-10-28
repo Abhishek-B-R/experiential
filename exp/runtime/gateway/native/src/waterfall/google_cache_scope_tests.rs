@@ -200,6 +200,118 @@ async fn automatic_preflight_counts_only_prefix_and_skips_below_minimum() {
 }
 
 #[tokio::test]
+async fn automatic_studio_preflight_counts_a_generate_content_request() {
+    for tokens in [4095, 6000] {
+        let expires = expiry();
+        let name = "cachedContents/test-cache";
+        let created =
+            json!({"name":name,"expireTime":expires.1,"usageMetadata":{"totalTokenCount":tokens}});
+        let mut replies = vec![answer(200, &json!({"totalTokens": tokens}).to_string())];
+        if tokens >= 4096 {
+            replies.push(answer(200, &created.to_string()));
+        }
+        let (base, task) = server(replies).await;
+        let mut original = wire(&format!(
+            "{base}/v1beta/models/gemini-test:streamGenerateContent?alt=sse"
+        ));
+        original.automatic_cache = true;
+        let mut create = claim(&format!("{base}/v1beta/cachedContents"), &expires);
+        create["measure_tokens"] = json!(true);
+        create["minimum_tokens"] = json!(4096);
+        create["payload"]["systemInstruction"] = json!({"parts": [{"text": "system"}]});
+        let host = Host::new(vec![
+            create,
+            if tokens >= 4096 {
+                ready(name)
+            } else {
+                json!({"state":"unavailable"})
+            },
+        ]);
+        let result = execute_test(&original, &host, EndpointPolicy::Loopback)
+            .await
+            .unwrap();
+        let requests = task.await.unwrap();
+        assert!(requests[0].starts_with("POST /v1beta/models/gemini-test:countTokens "));
+        let body: Value =
+            serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        // The Developer API refuses a top-level system instruction on countTokens.
+        assert_eq!(
+            body,
+            json!({"generateContentRequest": {
+                "model": "models/gemini-test",
+                "systemInstruction": {"parts": [{"text": "system"}]},
+                "contents": [{"role": "user", "parts": [{"text": "private prefix"}]}],
+            }})
+        );
+        if tokens < 4096 {
+            assert!(result.is_none());
+            assert_eq!(host.calls()[1].1["outcome"], "not_created");
+            assert_eq!(requests.len(), 1);
+        } else {
+            let overlaid = result.unwrap();
+            assert_eq!(overlaid.upstream_payload["cachedContent"], name);
+            assert_eq!(overlaid.automatic_cache_written_tokens, Some(tokens));
+            assert!(requests[1].starts_with("POST /v1beta/cachedContents "));
+        }
+    }
+}
+
+#[tokio::test]
+async fn automatic_studio_preflight_counts_a_system_only_prefix_with_a_minimal_turn() {
+    let expires = expiry();
+    let (base, task) = server(vec![answer(200, &json!({"totalTokens": 100}).to_string())]).await;
+    let mut original = wire(&format!(
+        "{base}/v1beta/models/gemini-test:streamGenerateContent?alt=sse"
+    ));
+    original.automatic_cache = true;
+    let mut create = claim(&format!("{base}/v1beta/cachedContents"), &expires);
+    create["measure_tokens"] = json!(true);
+    create["minimum_tokens"] = json!(1024);
+    create["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("contents");
+    create["payload"]["systemInstruction"] = json!({"parts": [{"text": "system"}]});
+    let host = Host::new(vec![create, json!({"state":"unavailable"})]);
+    let result = execute_test(&original, &host, EndpointPolicy::Loopback)
+        .await
+        .unwrap();
+    assert!(result.is_none());
+    assert_eq!(host.calls()[1].1["outcome"], "not_created");
+    let requests = task.await.unwrap();
+    let body: Value = serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        body,
+        json!({"generateContentRequest": {
+            "model": "models/gemini-test",
+            "systemInstruction": {"parts": [{"text": "system"}]},
+            "contents": [{"role": "user", "parts": [{"text": "."}]}],
+        }})
+    );
+}
+
+#[tokio::test]
+async fn automatic_studio_preflight_never_counts_an_empty_prefix() {
+    let expires = expiry();
+    let (base, task) = server(vec![]).await;
+    let mut original = wire(&format!(
+        "{base}/v1beta/models/gemini-test:streamGenerateContent?alt=sse"
+    ));
+    original.automatic_cache = true;
+    let mut create = claim(&format!("{base}/v1beta/cachedContents"), &expires);
+    create["measure_tokens"] = json!(true);
+    create["minimum_tokens"] = json!(1024);
+    create["payload"]["contents"] = json!([]);
+    let host = Host::new(vec![create, json!({"state":"unavailable"})]);
+    let result = execute_test(&original, &host, EndpointPolicy::Loopback)
+        .await
+        .unwrap();
+    assert!(result.is_none());
+    assert_eq!(host.calls()[1].1["outcome"], "not_created");
+    assert!(task.await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn short_deadline_skips_preflight_and_acknowledges_no_create() {
     let expires = expiry();
     let (base, task) = server(vec![]).await;

@@ -277,11 +277,12 @@ def build_automatic_google_cache_plans(
     request: GatewayRequest,
     upstream_payload: JsonObject,
 ) -> tuple[GoogleCachePlan, ...]:
-    """Offer bounded whole-message Vertex prefixes without adding caller markers.
+    """Offer bounded whole-message Google prefixes without adding caller markers.
 
+    Vertex and official Gemini Developer API (AI Studio) endpoints qualify.
     Only leading plain system/user text messages qualify, with at least one
     original user message left uncached. Plain function definitions and their
-    calling policy move into every candidate resource (Vertex serves them from
+    calling policy move into every candidate resource (Google serves them from
     the cache and forbids repeating them on the generation), so the digest covers
     the toolset and different toolsets never share a cache. History, media,
     provider-native or server tools and native carriers retain ordinary
@@ -304,7 +305,7 @@ def build_automatic_google_cache_plans(
     ):
         return ()
     endpoint = _cache_endpoint(profile)
-    if endpoint is None or endpoint[2] == "cachedContents/":
+    if endpoint is None:
         return ()
     started = False
     for message in request.messages:
